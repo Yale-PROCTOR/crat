@@ -2,7 +2,4 @@ target
 benchmarks/**/Cargo.lock
 benchmarks/analyses/
 benchmarks/tmp
-benchmarks/rs-resolved
-benchmarks/rs-io
-benchmarks/rs-union
-benchmarks/rs-union-io
+benchmarks/rs-*

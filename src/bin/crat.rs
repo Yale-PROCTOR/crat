@@ -94,6 +94,7 @@ struct Args {
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
+    Expand,
     Extern,
     Unsafe,
     Preprocess,
@@ -256,7 +257,7 @@ fn main() {
                     eprintln!("{output:?} is not a directory");
                     std::process::exit(1);
                 }
-                clear_dir(&output);
+                clear_dir(&output, &["target"]);
             } else if fs::create_dir(&output).is_err() {
                 eprintln!("Cannot create {output:?}");
                 std::process::exit(1);
@@ -287,6 +288,17 @@ fn main() {
             println!("{pass:?}");
         }
         match pass {
+            Pass::Expand => {
+                run_compiler_on_path(&file, |tcx| {
+                    let s = expander::expand(tcx);
+                    clear_dir(
+                        &dir,
+                        &["target", "build.rs", "Cargo.toml", "rust-toolchain"],
+                    );
+                    std::fs::write(&file, s).unwrap();
+                })
+                .unwrap();
+            }
             Pass::Extern => {
                 run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern(&config.r#extern, tcx)
@@ -363,14 +375,15 @@ fn main() {
     }
 }
 
-fn clear_dir(path: &Path) {
+fn clear_dir(path: &Path, excludes: &[&str]) {
     for entry in fs::read_dir(path).unwrap() {
         let entry_path = entry.unwrap().path();
+        let name = entry_path.file_name().unwrap();
+        if excludes.iter().any(|e| name == *e) {
+            continue;
+        }
         if entry_path.is_dir() {
-            let name = entry_path.file_name().unwrap();
-            if name != "target" {
-                fs::remove_dir_all(entry_path).unwrap();
-            }
+            fs::remove_dir_all(entry_path).unwrap();
         } else {
             fs::remove_file(entry_path).unwrap();
         }
