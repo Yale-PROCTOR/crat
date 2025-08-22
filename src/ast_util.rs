@@ -20,6 +20,31 @@ impl TransformationResult {
     }
 }
 
+pub fn foreach_crate<F: std::ops::FnMut(Crate)>(mut f: F, tcx: TyCtxt<'_>) {
+    tcx.resolver_for_lowering();
+
+    let source_map = tcx.sess.source_map();
+    let parse_sess = new_parse_sess();
+
+    for file in source_map.files().iter() {
+        if !matches!(
+            file.name,
+            FileName::Real(RealFileName::LocalPath(_)) | FileName::Custom(_)
+        ) {
+            continue;
+        }
+        let src = some_or!(file.src.as_ref(), continue);
+        let mut parser = rustc_parse::new_parser_from_source_str(
+            &parse_sess,
+            file.name.clone(),
+            src.to_string(),
+        )
+        .unwrap();
+        let krate = parser.parse_crate_mod().unwrap();
+        f(krate);
+    }
+}
+
 pub fn transform_ast<F: std::ops::FnMut(&mut Crate) -> bool>(
     mut f: F,
     tcx: TyCtxt<'_>,
