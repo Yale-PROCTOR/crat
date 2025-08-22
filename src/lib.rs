@@ -40,6 +40,7 @@ pub mod extern_resolver;
 pub mod finder;
 pub mod formatter;
 pub mod graph_util;
+pub mod hir_thir;
 pub mod io_replacer;
 pub mod ir_util;
 pub mod points_to;
