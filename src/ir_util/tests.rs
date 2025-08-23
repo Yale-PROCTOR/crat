@@ -2,7 +2,7 @@ use rustc_ast::{visit::Visitor, *};
 use rustc_hir::{self as hir, def_id::LocalModDefId};
 use rustc_span::FileName;
 
-use super::{AstToHir, MappingChecker};
+use super::*;
 use crate::{ast_util, compile_util};
 
 fn run_test(code: &str) {
@@ -57,9 +57,12 @@ fn run_test(code: &str) {
                 }
             })
             .unwrap();
-        let mut ast_to_hir = AstToHir::new(tcx);
-        ast_to_hir.map_items_to_items(items, hitems, false);
-        let mut checker = MappingChecker { ast_to_hir };
+        let mut mapper = AstToHirMapper::new(tcx);
+        mapper.map_items_to_items(items, hitems, false);
+        let mut checker = AstToHirChecker {
+            tcx,
+            ast_to_hir: mapper.ast_to_hir,
+        };
         for item in items {
             checker.visit_item(item);
         }
@@ -69,10 +72,13 @@ fn run_test(code: &str) {
         let borrowed = tcx.resolver_for_lowering().borrow();
         let mut expanded_crate = borrowed.1.as_ref().clone();
         drop(borrowed);
-        let mut ast_to_hir = AstToHir::new(tcx);
+        let mut mapper = AstToHirMapper::new(tcx);
         let module = tcx.hir_root_module();
-        ast_to_hir.map_crate_to_mod(&mut expanded_crate, module, true);
-        let mut checker = MappingChecker { ast_to_hir };
+        mapper.map_crate_to_mod(&mut expanded_crate, module, true);
+        let mut checker = AstToHirChecker {
+            tcx,
+            ast_to_hir: mapper.ast_to_hir,
+        };
         for item in &expanded_crate.items {
             checker.visit_item(item);
         }

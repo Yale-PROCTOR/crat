@@ -12,7 +12,7 @@ pub fn map_hir_to_thir<'tcx>(tcx: TyCtxt<'tcx>) -> HirToThir {
         let body = tcx.hir_body(body_id);
         let typeck_results = tcx.typeck(def_id);
         let (thir, texpr) = tcx.thir_body(def_id).unwrap();
-        let mut mapper = Mapper {
+        let mut mapper = HirToThirMapper {
             tcx,
             thir: &thir.borrow(),
             typeck_results,
@@ -32,7 +32,7 @@ pub struct HirToThir {
     pub stmts: FxHashMap<HirId, StmtId>,
 }
 
-struct Mapper<'a, 'tcx> {
+struct HirToThirMapper<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     thir: &'a thir::Thir<'tcx>,
     typeck_results: &'tcx TypeckResults<'tcx>,
@@ -40,7 +40,7 @@ struct Mapper<'a, 'tcx> {
 }
 
 // See `rustc_mir_build/src/thir/cx` for the lowering logic.
-impl<'tcx> Mapper<'_, 'tcx> {
+impl<'tcx> HirToThirMapper<'_, 'tcx> {
     fn map_expr_to_expr(&mut self, expr: &'tcx Expr<'tcx>, texpr_id: ExprId) {
         self.hir_to_thir.exprs.insert(expr.hir_id, texpr_id);
         let texpr = &self.thir.exprs[texpr_id];
