@@ -6,12 +6,13 @@ use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{FileName, RealFileName};
 
-use crate::{ast_hir, ast_util, rustc_ast::visit::Visitor};
+use crate::{ast_util, ir_util, rustc_ast::visit::Visitor};
 
 pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
     let borrowed = tcx.resolver_for_lowering().borrow();
     let mut expanded_crate = borrowed.1.as_ref().clone();
     drop(borrowed);
+
     let mut path_to_mod_id = FxHashMap::default();
     tcx.hir_for_each_module(|mod_id| {
         let def_path = tcx.def_path(mod_id.to_def_id());
@@ -46,15 +47,29 @@ pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
         let mut krate = parser.parse_crate_mod().unwrap();
         let mod_id = path_to_mod_id[&p];
         let (module, _, _) = tcx.hir_get_module(mod_id);
-        let mut ast_to_hir = ast_hir::AstToHir::new(tcx);
-        ast_to_hir.map_crate_to_mod(&mut krate, module, false);
-        let mut checker = ast_hir::MappingChecker { ast_to_hir };
+        let mut mapper = ir_util::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut krate, module, false);
+        let mut checker = ir_util::AstToHirChecker {
+            tcx,
+            ast_to_hir: mapper.ast_to_hir,
+        };
         for item in &krate.items {
             checker.visit_item(item);
         }
     }
 
-    let mut ast_to_hir = ast_hir::AstToHir::new(tcx);
+    let mut mapper = ir_util::AstToHirMapper::new(tcx);
     let module = tcx.hir_root_module();
-    ast_to_hir.map_crate_to_mod(&mut expanded_crate, module, true);
+    mapper.map_crate_to_mod(&mut expanded_crate, module, true);
+    let mut checker = ir_util::AstToHirChecker {
+        tcx,
+        ast_to_hir: mapper.ast_to_hir,
+    };
+    for item in &expanded_crate.items {
+        checker.visit_item(item);
+    }
+
+    let hir_to_thir = ir_util::map_hir_to_thir(tcx);
+    let mut checker = ir_util::HirToThirChecker { tcx, hir_to_thir };
+    tcx.hir_visit_all_item_likes_in_crate(&mut checker);
 }

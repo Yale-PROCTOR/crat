@@ -29,7 +29,6 @@ extern crate thin_vec;
 pub mod preprocessor;
 #[macro_use]
 pub mod ast_util;
-pub mod ast_hir;
 pub mod bin_file_adder;
 pub mod bit_set;
 pub mod check_unsafety;

@@ -5,21 +5,25 @@ use rustc_hir::{self as hir, HirId};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Ident, def_id::LocalDefId};
 
-pub struct AstToHir<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    next_node_id: NodeId,
+#[derive(Debug, Default)]
+pub struct AstToHir {
     pub global_map: NodeMap<LocalDefId>,
     pub local_map: NodeMap<HirId>,
 }
 
-impl<'tcx> AstToHir<'tcx> {
+pub struct AstToHirMapper<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    next_node_id: NodeId,
+    pub ast_to_hir: AstToHir,
+}
+
+impl<'tcx> AstToHirMapper<'tcx> {
     #[inline]
     pub fn new(tcx: TyCtxt<'tcx>) -> Self {
-        AstToHir {
+        AstToHirMapper {
             tcx,
             next_node_id: NodeId::ZERO,
-            global_map: NodeMap::default(),
-            local_map: NodeMap::default(),
+            ast_to_hir: AstToHir::default(),
         }
     }
 
@@ -28,7 +32,7 @@ impl<'tcx> AstToHir<'tcx> {
             *node_id = self.next_node_id;
             self.next_node_id += 1;
         }
-        self.global_map.insert(*node_id, def_id);
+        self.ast_to_hir.global_map.insert(*node_id, def_id);
     }
 
     fn add_local(&mut self, node_id: &mut NodeId, hir_id: HirId) {
@@ -36,7 +40,7 @@ impl<'tcx> AstToHir<'tcx> {
             *node_id = self.next_node_id;
             self.next_node_id += 1;
         }
-        self.local_map.insert(*node_id, hir_id);
+        self.ast_to_hir.local_map.insert(*node_id, hir_id);
     }
 
     pub fn map_crate_to_mod(&mut self, krate: &mut Crate, hmod: &hir::Mod<'tcx>, expanded: bool) {
@@ -1858,23 +1862,13 @@ impl<'tcx> AstToHir<'tcx> {
             }
         }
     }
-
-    pub fn get_global_node(&self, node_id: NodeId) -> Option<hir::Node<'tcx>> {
-        let def_id = self.global_map.get(&node_id)?;
-        Some(self.tcx.hir_node_by_def_id(*def_id))
-    }
-
-    pub fn get_local_node(&self, node_id: NodeId) -> Option<hir::Node<'tcx>> {
-        let hir_id = self.local_map.get(&node_id)?;
-        Some(self.tcx.hir_node(*hir_id))
-    }
 }
 
 macro_rules! define_global_getters {
     ( $( $fname:ident : $variant:path => $ret:ty ),+ $(,)? ) => {
         $(
-            pub fn $fname(&self, node_id: NodeId) -> Option<&'tcx $ret> {
-                let $variant(x) = self.get_global_node(node_id)? else { return None };
+            pub fn $fname<'tcx>(&self, node_id: NodeId, tcx: TyCtxt<'tcx>) -> Option<&'tcx $ret> {
+                let $variant(x) = self.get_global_node(node_id, tcx)? else { return None };
                 Some(x)
             }
         )+
@@ -1884,15 +1878,15 @@ macro_rules! define_global_getters {
 macro_rules! define_local_getters {
     ( $( $fname:ident : $variant:path => $ret:ty ),+ $(,)? ) => {
         $(
-            pub fn $fname(&self, node_id: NodeId) -> Option<&'tcx $ret> {
-                let $variant(x) = self.get_local_node(node_id)? else { return None };
+            pub fn $fname<'tcx>(&self, node_id: NodeId, tcx: TyCtxt<'tcx>) -> Option<&'tcx $ret> {
+                let $variant(x) = self.get_local_node(node_id, tcx)? else { return None };
                 Some(x)
             }
         )+
     };
 }
 
-impl<'tcx> AstToHir<'tcx> {
+impl AstToHir {
     define_global_getters! {
         get_item: hir::Node::Item => hir::Item<'tcx>,
         get_impl_item: hir::Node::ImplItem => hir::ImplItem<'tcx>,
@@ -1926,13 +1920,32 @@ impl<'tcx> AstToHir<'tcx> {
         get_const_block: hir::Node::ConstBlock => hir::ConstBlock,
         get_const_arg: hir::Node::ConstArg => hir::ConstArg<'tcx>,
     }
+
+    pub fn get_global_node<'tcx>(
+        &self,
+        node_id: NodeId,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<hir::Node<'tcx>> {
+        let def_id = self.global_map.get(&node_id)?;
+        Some(tcx.hir_node_by_def_id(*def_id))
+    }
+
+    pub fn get_local_node<'tcx>(
+        &self,
+        node_id: NodeId,
+        tcx: TyCtxt<'tcx>,
+    ) -> Option<hir::Node<'tcx>> {
+        let hir_id = self.local_map.get(&node_id)?;
+        Some(tcx.hir_node(*hir_id))
+    }
 }
 
-pub struct MappingChecker<'tcx> {
-    pub ast_to_hir: AstToHir<'tcx>,
+pub struct AstToHirChecker<'tcx> {
+    pub tcx: TyCtxt<'tcx>,
+    pub ast_to_hir: AstToHir,
 }
 
-impl<'a> Visitor<'a> for MappingChecker<'_> {
+impl<'a> Visitor<'a> for AstToHirChecker<'_> {
     fn visit_mac_call(&mut self, _: &'a MacCall) {
         // macro calls are not mapped to HIR nodes, so we skip them
     }
@@ -1943,28 +1956,28 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
 
     fn visit_foreign_item(&mut self, item: &'a ForeignItem) {
         self.ast_to_hir
-            .get_foreign_item(item.id)
+            .get_foreign_item(item.id, self.tcx)
             .unwrap_or_else(|| panic!("{item:?}"));
         visit::walk_item(self, item);
     }
 
     fn visit_item(&mut self, item: &'a Item) {
         self.ast_to_hir
-            .get_item(item.id)
+            .get_item(item.id, self.tcx)
             .unwrap_or_else(|| panic!("{item:?}"));
         visit::walk_item(self, item);
     }
 
     fn visit_local(&mut self, local: &'a Local) {
         self.ast_to_hir
-            .get_let_stmt(local.id)
+            .get_let_stmt(local.id, self.tcx)
             .unwrap_or_else(|| panic!("{local:?}"));
         visit::walk_local(self, local);
     }
 
     fn visit_block(&mut self, block: &'a Block) {
         self.ast_to_hir
-            .get_block(block.id)
+            .get_block(block.id, self.tcx)
             .unwrap_or_else(|| panic!("{block:?}"));
         visit::walk_block(self, block);
     }
@@ -1974,7 +1987,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
             // vararg
             return;
         }
-        // self.ast_to_hir.get_param(param.id).unwrap();
+        // self.ast_to_hir.get_param(param.id, self.tcx).unwrap();
         // visit::walk_param(self, param);
         // params in functions without bodies are not mapped to HIR nodes
         self.visit_ty(&param.ty);
@@ -1982,7 +1995,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
 
     fn visit_arm(&mut self, arm: &'a Arm) {
         self.ast_to_hir
-            .get_arm(arm.id)
+            .get_arm(arm.id, self.tcx)
             .unwrap_or_else(|| panic!("{arm:?}"));
         visit::walk_arm(self, arm);
     }
@@ -1993,7 +2006,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
             return;
         }
         self.ast_to_hir
-            .get_pat(pat.id)
+            .get_pat(pat.id, self.tcx)
             .unwrap_or_else(|| panic!("{pat:?}"));
         visit::walk_pat(self, pat);
     }
@@ -2001,7 +2014,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
     fn visit_anon_const(&mut self, c: &'a AnonConst) {
         let node = self
             .ast_to_hir
-            .get_local_node(c.id)
+            .get_local_node(c.id, self.tcx)
             .unwrap_or_else(|| panic!("{c:?}"));
         assert!(matches!(
             node,
@@ -2013,7 +2026,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         let node = self
             .ast_to_hir
-            .get_local_node(expr.id)
+            .get_local_node(expr.id, self.tcx)
             .unwrap_or_else(|| panic!("{expr:?}"));
         assert!(matches!(node, hir::Node::Expr(..) | hir::Node::PatExpr(..)));
         visit::walk_expr(self, expr);
@@ -2025,13 +2038,13 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
             TyKind::Infer => {
                 let node = self
                     .ast_to_hir
-                    .get_local_node(ty.id)
+                    .get_local_node(ty.id, self.tcx)
                     .unwrap_or_else(|| panic!("{ty:?}"));
                 assert!(matches!(node, hir::Node::Ty(..) | hir::Node::Infer(..)));
             }
             _ => {
                 self.ast_to_hir
-                    .get_ty(ty.id)
+                    .get_ty(ty.id, self.tcx)
                     .unwrap_or_else(|| panic!("{ty:?}"));
             }
         }
@@ -2040,14 +2053,14 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
 
     fn visit_generic_param(&mut self, param: &'a GenericParam) {
         self.ast_to_hir
-            .get_generic_param(param.id)
+            .get_generic_param(param.id, self.tcx)
             .unwrap_or_else(|| panic!("{param:?}"));
         visit::walk_generic_param(self, param);
     }
 
     fn visit_where_predicate(&mut self, pred: &'a WherePredicate) {
         self.ast_to_hir
-            .get_where_predicate(pred.id)
+            .get_where_predicate(pred.id, self.tcx)
             .unwrap_or_else(|| panic!("{pred:?}"));
         visit::walk_where_predicate(self, pred);
     }
@@ -2055,7 +2068,7 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
     fn visit_assoc_item(&mut self, item: &'a AssocItem, ctxt: visit::AssocCtxt) {
         let node = self
             .ast_to_hir
-            .get_global_node(item.id)
+            .get_global_node(item.id, self.tcx)
             .unwrap_or_else(|| panic!("{item:?}"));
         assert!(matches!(
             node,
@@ -2066,56 +2079,56 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
 
     fn visit_trait_ref(&mut self, tref: &'a TraitRef) {
         self.ast_to_hir
-            .get_trait_ref(tref.ref_id)
+            .get_trait_ref(tref.ref_id, self.tcx)
             .unwrap_or_else(|| panic!("{tref:?}"));
         visit::walk_trait_ref(self, tref);
     }
 
     fn visit_field_def(&mut self, fd: &'a FieldDef) {
         self.ast_to_hir
-            .get_field_def(fd.id)
+            .get_field_def(fd.id, self.tcx)
             .unwrap_or_else(|| panic!("{fd:?}"));
         visit::walk_field_def(self, fd);
     }
 
     fn visit_variant(&mut self, variant: &'a Variant) {
         self.ast_to_hir
-            .get_variant(variant.id)
+            .get_variant(variant.id, self.tcx)
             .unwrap_or_else(|| panic!("{variant:?}"));
         visit::walk_variant(self, variant);
     }
 
     fn visit_lifetime(&mut self, lifetime: &'a Lifetime, _: visit::LifetimeCtxt) {
         self.ast_to_hir
-            .get_lifetime(lifetime.id)
+            .get_lifetime(lifetime.id, self.tcx)
             .unwrap_or_else(|| panic!("{lifetime:?}"));
         visit::walk_lifetime(self, lifetime);
     }
 
     fn visit_path_segment(&mut self, seg: &'a PathSegment) {
         self.ast_to_hir
-            .get_path_segment(seg.id)
+            .get_path_segment(seg.id, self.tcx)
             .unwrap_or_else(|| panic!("{seg:?}"));
         visit::walk_path_segment(self, seg);
     }
 
     fn visit_assoc_item_constraint(&mut self, constraint: &'a AssocItemConstraint) {
         self.ast_to_hir
-            .get_assoc_item_constraint(constraint.id)
+            .get_assoc_item_constraint(constraint.id, self.tcx)
             .unwrap_or_else(|| panic!("{constraint:?}"));
         visit::walk_assoc_item_constraint(self, constraint);
     }
 
     fn visit_expr_field(&mut self, field: &'a ExprField) {
         self.ast_to_hir
-            .get_expr_field(field.id)
+            .get_expr_field(field.id, self.tcx)
             .unwrap_or_else(|| panic!("{field:?}"));
         visit::walk_expr_field(self, field);
     }
 
     fn visit_pat_field(&mut self, field: &'a PatField) {
         self.ast_to_hir
-            .get_pat_field(field.id)
+            .get_pat_field(field.id, self.tcx)
             .unwrap_or_else(|| panic!("{field:?}"));
         visit::walk_pat_field(self, field);
     }
@@ -2123,12 +2136,9 @@ impl<'a> Visitor<'a> for MappingChecker<'_> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         let node = self
             .ast_to_hir
-            .get_local_node(stmt.id)
+            .get_local_node(stmt.id, self.tcx)
             .unwrap_or_else(|| panic!("{stmt:?}"));
         assert!(matches!(node, hir::Node::Stmt(..) | hir::Node::Expr(..)));
         visit::walk_stmt(self, stmt);
     }
 }
-
-#[cfg(test)]
-mod tests;
