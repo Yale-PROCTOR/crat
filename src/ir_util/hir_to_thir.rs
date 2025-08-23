@@ -220,13 +220,18 @@ impl<'tcx> HirToThirMapper<'_, 'tcx> {
                     self.map_expr_to_expr(lhs, *tlhs);
                     self.map_expr_to_expr(rhs, *trhs);
                 } else {
-                    let thir::ExprKind::Binary {
+                    let (thir::ExprKind::Binary {
                         lhs: tlhs,
                         rhs: trhs,
                         ..
-                    } = &texpr.kind
+                    }
+                    | thir::ExprKind::LogicalOp {
+                        lhs: tlhs,
+                        rhs: trhs,
+                        ..
+                    }) = &texpr.kind
                     else {
-                        panic!("Not Binary:\n{texpr:?}")
+                        panic!("Not Binary/LogicalOp:\n{texpr:?}")
                     };
                     self.map_expr_to_expr(lhs, *tlhs);
                     self.map_expr_to_expr(rhs, *trhs);

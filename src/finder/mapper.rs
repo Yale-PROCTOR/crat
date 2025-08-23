@@ -12,6 +12,7 @@ pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
     let borrowed = tcx.resolver_for_lowering().borrow();
     let mut expanded_crate = borrowed.1.as_ref().clone();
     drop(borrowed);
+
     let mut path_to_mod_id = FxHashMap::default();
     tcx.hir_for_each_module(|mod_id| {
         let def_path = tcx.def_path(mod_id.to_def_id());
@@ -67,4 +68,8 @@ pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
     for item in &expanded_crate.items {
         checker.visit_item(item);
     }
+
+    let hir_to_thir = ir_util::map_hir_to_thir(tcx);
+    let mut checker = ir_util::HirToThirChecker { tcx, hir_to_thir };
+    tcx.hir_visit_all_item_likes_in_crate(&mut checker);
 }

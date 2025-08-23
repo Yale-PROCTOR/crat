@@ -460,6 +460,17 @@ fn test_expr_paren() {
 }
 
 #[test]
+fn test_expr_binary() {
+    run_test(
+        "
+        fn f() {
+            ((1 + 2) < (3 - 4)) && ((5 * 6) < (7 / 8)) ||
+                ((1 << 2) < (3 >> 4)) && ((5 | 6) < (7 & 8));
+        }",
+    )
+}
+
+#[test]
 fn test_stmt_let() {
     run_test(
         "
