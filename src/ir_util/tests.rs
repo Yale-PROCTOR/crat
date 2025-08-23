@@ -16,11 +16,14 @@ fn run_test(code: &str) {
         #![feature(closure_lifetime_binder)]
         #![feature(more_qualified_paths)]
         #![feature(box_patterns)]
-        #![feature(guard_patterns)]
         #![feature(unsafe_binders)]
         mod a {{ {code} }}"
     );
     compile_util::run_compiler_on_str(&code, |tcx| {
+        let borrowed = tcx.resolver_for_lowering().borrow();
+        let mut expanded_crate = borrowed.1.as_ref().clone();
+        drop(borrowed);
+
         let parse_sess = ast_util::new_parse_sess();
         let mut parser = rustc_parse::new_parser_from_source_str(
             &parse_sess,
@@ -66,12 +69,7 @@ fn run_test(code: &str) {
         for item in items {
             checker.visit_item(item);
         }
-    })
-    .unwrap();
-    compile_util::run_compiler_on_str(&code, |tcx| {
-        let borrowed = tcx.resolver_for_lowering().borrow();
-        let mut expanded_crate = borrowed.1.as_ref().clone();
-        drop(borrowed);
+
         let mut mapper = AstToHirMapper::new(tcx);
         let module = tcx.hir_root_module();
         mapper.map_crate_to_mod(&mut expanded_crate, module, true);
@@ -82,6 +80,10 @@ fn run_test(code: &str) {
         for item in &expanded_crate.items {
             checker.visit_item(item);
         }
+
+        let hir_to_thir = map_hir_to_thir(tcx);
+        let mut checker = HirToThirChecker { tcx, hir_to_thir };
+        tcx.hir_visit_all_item_likes_in_crate(&mut checker);
     })
     .unwrap();
 }
@@ -324,7 +326,7 @@ fn test_expr_loop() {
                 1;
                 break 'l 1;
                 continue 'l;
-            }
+            };
         }",
     )
 }
@@ -338,7 +340,7 @@ fn test_expr_match() {
                 true if true => 1,
                 true => 2,
                 false => 3,
-            }
+            };
         }",
     )
 }
@@ -348,9 +350,9 @@ fn test_expr_closure() {
     run_test(
         "
         fn f() {
-            for<'a> |_: &'a (), x: i32| x;
-            for<'a> |_: &'a (), x: i32| {
-                x;
+            |x: i32| x;
+            for<'a> |_: &'a (), x: i32| -> i32 {
+                x
             };
         }",
     )
@@ -539,7 +541,7 @@ fn test_pat_struct() {
         "
         fn f() {
             struct S { x: i32, y: i32, z: i32 }
-            match (S { x: 0, y: 1 }) {
+            match (S { x: 0, y: 1, z: 2 }) {
                 S { x, y: yy, .. } => {}
             }
         }",
@@ -669,19 +671,6 @@ fn test_pat_slice() {
                 [2, x @ ..] => {}
                 [..] => {}
                 [x @ ..] => {}
-            }
-        }",
-    )
-}
-
-#[test]
-fn test_pat_guard() {
-    run_test(
-        "
-        struct S(i32);
-        fn f() {
-            match S(0) {
-                S(x if true) => {}
             }
         }",
     )
@@ -974,6 +963,49 @@ fn test_generic_arg_infer() {
         fn g<T>(x: T) {}
         fn f() {
             g::<_>(0);
+        }
+        ",
+    )
+}
+
+#[test]
+fn test_adjustment_deref_some() {
+    run_test(
+        "
+        struct S(i32);
+        impl std::ops::Deref for S {
+            type Target = i32;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        fn f() {
+            S(0).overflowing_add(1);
+        }
+        ",
+    )
+}
+
+#[test]
+fn test_adjustment_borrow_raw_ptr() {
+    run_test(
+        "
+        fn f() {
+            let p: *mut i32 = &mut 0;
+        }
+        ",
+    )
+}
+
+#[test]
+fn test_adjustment_pointer() {
+    run_test(
+        "
+        trait T {}
+        struct S;
+        impl T for S {}
+        fn f() {
+            let x: &dyn T = &S;
         }
         ",
     )
