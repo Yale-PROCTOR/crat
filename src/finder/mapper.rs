@@ -72,4 +72,6 @@ pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
     let hir_to_thir = ir_util::map_hir_to_thir(tcx);
     let mut checker = ir_util::HirToThirChecker { tcx, hir_to_thir };
     tcx.hir_visit_all_item_likes_in_crate(&mut checker);
+
+    ir_util::map_thir_to_mir(tcx);
 }
