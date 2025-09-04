@@ -1,9 +1,10 @@
-use std::fmt::Write;
-
 use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def::DefKind};
 use rustc_middle::{
-    mir::{AggregateKind, Body, Location, Operand, Rvalue, StatementKind, UnOp},
+    mir::{
+        AggregateKind, Body, CastKind, Location, Place, Rvalue, Statement, StatementKind,
+        Terminator, TerminatorKind, UnOp,
+    },
     thir::{self, ExprId, ExprKind, Pat, PatKind, Thir, visit::Visitor as TVisitor},
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -80,51 +81,32 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 .push(location);
         }
 
-        let mk_debug_str = |span: Span| {
-            let mut s = String::new();
-            writeln!(s, "{span:?}").unwrap();
-            if let Some(locs) = stmt_span_to_locs.get(&span) {
-                for loc in locs {
-                    let stmt = &body.basic_blocks[loc.block].statements[loc.statement_index];
-                    writeln!(s, "  {loc:?}: {stmt:?}").unwrap();
-                }
-            }
-            if let Some(locs) = term_span_to_locs.get(&span) {
-                for loc in locs {
-                    let term = body.basic_blocks[loc.block].terminator();
-                    writeln!(s, "  {loc:?}: {:?}", term.kind).unwrap();
-                }
-            }
-            s
-        };
-
-        let ctx = Ctx {
+        let mut ctx = Ctx {
             tcx,
             thir: &thir,
             body: &body,
             stmt_span_to_locs: &stmt_span_to_locs,
             term_span_to_locs: &term_span_to_locs,
+
+            rhs_to_assigns: FxHashMap::default(),
+            expr_id_to_loc: FxHashMap::default(),
         };
 
-        let mut rhs_to_assigns = FxHashMap::default();
-        let mut expr_id_to_loc = FxHashMap::default();
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
             match expr.kind {
-                ExprKind::Assign { rhs, .. } => {
-                    rhs_to_assigns.insert(unwrap_scope(rhs, &thir), expr_id);
-                    let rhs = &thir[rhs];
-                    if let TyKind::Adt(adt_def, _) = rhs.ty.kind()
+                ExprKind::Assign { lhs, rhs } => {
+                    if let TyKind::Adt(adt_def, _) = thir[rhs].ty.kind()
                         && super::def_id_to_symbol(adt_def.did(), tcx)
                             .unwrap()
                             .as_str()
                             == "VaListImpl"
                     {
+                    } else if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span) {
+                        ctx.expr_id_to_loc.insert(expr_id, assign.loc);
+                        ctx.rhs_to_assigns
+                            .insert(unwrap_scope_and_use(rhs, &thir), assign);
                     } else {
-                        let locs = stmt_span_to_locs
-                            .get(&expr.span)
-                            .unwrap_or_else(|| panic!("{:?}", expr.span));
-                        validate_assign_locs(locs, expr.span, &body);
-                        expr_id_to_loc.insert(expr_id, *locs.last().unwrap());
+                        ctx.print_debug(expr.span);
                     }
                 }
                 ExprKind::If { .. } => {
@@ -147,131 +129,139 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Scope { .. } => {}
                 ExprKind::Box { .. } => panic!(),
                 ExprKind::If { .. } => {}
-                ExprKind::Call { .. } => {} // TODO
+                ExprKind::Call { .. } => {
+                    if let Some(loc) = ctx
+                        .find_call_location(expr_id)
+                        .or_else(|| ctx.find_transmute_location(expr_id))
+                    {
+                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                    } else {
+                        ctx.print_debug(expr.span);
+                    }
+                }
                 ExprKind::ByUse { .. } => panic!(),
                 ExprKind::Deref { .. } => {} // TODO
                 ExprKind::Binary { op, .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            if let Rvalue::BinaryOp(mop, _) = rvalue {
-                                *mop == op
-                            } else {
-                                false
-                            }
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
+                    ctx.handle_rvalue(expr_id, |rvalue| {
+                        if let Rvalue::BinaryOp(mop, _) = rvalue {
+                            *mop == op
                         } else {
-                            println!("{}", mk_debug_str(expr.span));
+                            false
                         }
-                    }
+                    });
                 }
                 ExprKind::LogicalOp { .. } => {} // TODO
-                ExprKind::Unary { op, .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) && matches!(op, UnOp::Neg) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            if let Rvalue::UnaryOp(mop, _) = rvalue {
-                                *mop == op
-                            } else {
-                                false
-                            }
+                ExprKind::Unary { op, .. } => match op {
+                    UnOp::Neg => {
+                        ctx.handle_rvalue(expr_id, |rvalue| {
+                            matches!(rvalue, Rvalue::UnaryOp(UnOp::Neg, _))
                         });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
-                        } else {
-                            println!("{}", mk_debug_str(expr.span));
-                        }
                     }
-                    // TODO: Not
+                    UnOp::Not => {} // TODO
+                    UnOp::PtrMetadata => panic!(),
+                },
+                ExprKind::Cast { .. } => {
+                    ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Cast(..)));
                 }
-                ExprKind::Cast { .. } => {}            // TODO
-                ExprKind::Use { .. } => {}             // TODO
-                ExprKind::NeverToAny { .. } => {}      // TODO
-                ExprKind::PointerCoercion { .. } => {} // TODO
-                ExprKind::Loop { .. } => {}            // TODO
-                ExprKind::Let { .. } => {}             // TODO
-                ExprKind::Match { .. } => {}           // TODO
-                ExprKind::Block { .. } => {}           // TODO
+                ExprKind::Use { .. } => {}
+                ExprKind::NeverToAny { .. } => {}
+                ExprKind::PointerCoercion { .. } => {
+                    ctx.handle_rvalue(expr_id, |rvalue| {
+                        matches!(
+                            rvalue,
+                            Rvalue::Cast(CastKind::PointerCoercion(..) | CastKind::PtrToPtr, _, _)
+                        )
+                    });
+                }
+                ExprKind::Loop { .. } => {}  // TODO
+                ExprKind::Let { .. } => {}   // TODO
+                ExprKind::Match { .. } => {} // TODO
+                ExprKind::Block { .. } => {} // TODO
                 ExprKind::Assign { .. } => {}
-                ExprKind::AssignOp { .. } => {
-                    let locs = stmt_span_to_locs
-                        .get(&expr.span)
-                        .unwrap_or_else(|| panic!("{:?}", expr.span));
-                    validate_assign_locs(locs, expr.span, &body);
-                    expr_id_to_loc.insert(expr_id, *locs.last().unwrap());
+                ExprKind::AssignOp { lhs, .. } => {
+                    if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span) {
+                        ctx.expr_id_to_loc.insert(expr_id, assign.loc);
+                    } else {
+                        ctx.print_debug(expr.span);
+                    }
                 }
                 ExprKind::Field { .. } => {}    // TODO
                 ExprKind::Index { .. } => {}    // TODO
                 ExprKind::VarRef { .. } => {}   // TODO
                 ExprKind::UpvarRef { .. } => {} // TODO
                 ExprKind::Borrow { .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            matches!(rvalue, Rvalue::Ref(..))
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
-                        } else {
-                            println!("{}", mk_debug_str(expr.span));
-                        }
-                    }
+                    ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Ref(..)));
                 }
                 ExprKind::RawBorrow { .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            matches!(rvalue, Rvalue::RawPtr(..))
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
-                        } else {
-                            println!("{}", mk_debug_str(expr.span));
-                        }
+                    ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::RawPtr(..)));
+                }
+                ExprKind::Break { .. } => {
+                    if let Some(loc) = ctx
+                        .find_goto_location(expr_id)
+                        .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
+                    {
+                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                    } else {
+                        ctx.print_debug(expr.span);
                     }
                 }
-                ExprKind::Break { .. } => {}    // TODO
-                ExprKind::Continue { .. } => {} // TODO
-                ExprKind::Return { .. } => {}
-                ExprKind::Become { .. } => todo!(),
-                ExprKind::ConstBlock { .. } => {} // TODO
-                ExprKind::Repeat { .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            matches!(rvalue, Rvalue::Repeat(..))
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
+                ExprKind::Continue { .. } => {}
+                ExprKind::Return { value } => {
+                    if let Some(loc) = ctx
+                        .find_goto_location(expr_id)
+                        .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
+                    {
+                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                    } else if let Some(value) = value {
+                        let value = unwrap_scope_and_use(value, &thir);
+                        let value_expr = &thir[value];
+                        if let Some(term_loc) = ctx
+                            .find_rvalue_location(value, |_| true)
+                            .map(|loc| ctx.terminator_of_last_assign(loc).unwrap())
+                            .or_else(|| {
+                                ctx.find_call_location(value)
+                                    .map(|loc| ctx.next_terminator_of_call(loc).unwrap())
+                            })
+                        {
+                            let term = ctx.get_terminator(term_loc);
+                            assert!(
+                                matches!(
+                                    term.kind,
+                                    TerminatorKind::Goto { .. }
+                                        | TerminatorKind::Return
+                                        | TerminatorKind::Drop { .. }
+                                ),
+                                "{:?}\n{:?}",
+                                expr.span,
+                                term.kind
+                            );
+                            ctx.expr_id_to_loc.insert(expr_id, term_loc);
                         } else {
-                            println!("{}", mk_debug_str(expr.span));
+                            ctx.print_debug(value_expr.span);
                         }
+                    } else {
+                        ctx.print_debug(expr.span);
                     }
+                }
+                ExprKind::Become { .. } => todo!(),
+                ExprKind::ConstBlock { .. } => {}
+                ExprKind::Repeat { .. } => {
+                    ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Repeat(..)));
                 }
                 ExprKind::Array { .. } => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            matches!(rvalue,
-                                Rvalue::Aggregate(box AggregateKind::Array(..), _) |
-                                Rvalue::Use(Operand::Constant(_))
-                            )
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
-                        } else {
-                            println!("{}", mk_debug_str(expr.span));
-                        }
-                    }
+                    ctx.handle_rvalue(expr_id, |rvalue| {
+                        matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Array(..), _))
+                    });
                 }
-                ExprKind::Tuple { .. } => todo!(),
+                ExprKind::Tuple { .. } => {
+                    ctx.handle_rvalue(expr_id, |rvalue| {
+                        matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Tuple, _))
+                    });
+                }
                 ExprKind::Adt(_) => {
-                    if !rhs_to_assigns.contains_key(&expr_id) {
-                        let loc = ctx.find_rvalue_location(expr.span, expr.ty, |rvalue| {
-                            matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Adt(..), _))
-                        });
-                        if let Some(loc) = loc {
-                            expr_id_to_loc.insert(expr_id, loc);
-                        } else {
-                            println!("{}", mk_debug_str(expr.span));
-                        }
-                    }
+                    ctx.handle_rvalue(expr_id, |rvalue| {
+                        matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Adt(..), _))
+                    });
                 }
                 ExprKind::PlaceTypeAscription { .. } => panic!(),
                 ExprKind::ValueTypeAscription { .. } => panic!(),
@@ -282,70 +272,249 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Literal { .. } => {}
                 ExprKind::NonHirLiteral { .. } => {} // TODO
                 ExprKind::ZstLiteral { .. } => {}
-                ExprKind::NamedConst { .. } => {} // TODO
-                ExprKind::ConstParam { .. } => {} // TODO
+                ExprKind::NamedConst { .. } => {}
+                ExprKind::ConstParam { .. } => {}
                 ExprKind::StaticRef { .. } => {}
-                ExprKind::InlineAsm(_) => {}      // TODO
-                ExprKind::OffsetOf { .. } => {}   // TODO
-                ExprKind::ThreadLocalRef(_) => {} // TODO
+                ExprKind::InlineAsm(_) => {}
+                ExprKind::OffsetOf { .. } => {} // TODO
+                ExprKind::ThreadLocalRef(_) => {}
                 ExprKind::Yield { .. } => todo!(),
             }
         }
     }
 }
 
-fn unwrap_scope(mut expr_id: ExprId, thir: &Thir<'_>) -> ExprId {
+fn unwrap_scope_and_use(mut expr_id: ExprId, thir: &Thir<'_>) -> ExprId {
     loop {
         let expr = &thir[expr_id];
-        if let ExprKind::Scope { value, .. } = expr.kind {
-            expr_id = value;
-        } else {
-            return expr_id;
+        match expr.kind {
+            ExprKind::Scope { value, .. } => {
+                expr_id = value;
+            }
+            ExprKind::Use { source } => {
+                expr_id = source;
+            }
+            _ => {
+                return expr_id;
+            }
         }
     }
+}
+
+struct Assign<'a, 'tcx> {
+    ty: Ty<'tcx>,
+    rvalue: &'a Rvalue<'tcx>,
+    loc: Location,
+    span: Span,
 }
 
 struct Ctx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    #[allow(unused)]
     thir: &'a Thir<'tcx>,
     body: &'a Body<'tcx>,
     stmt_span_to_locs: &'a FxHashMap<Span, Vec<Location>>,
-    #[allow(unused)]
     term_span_to_locs: &'a FxHashMap<Span, Vec<Location>>,
+
+    rhs_to_assigns: FxHashMap<ExprId, Assign<'a, 'tcx>>,
+    expr_id_to_loc: FxHashMap<ExprId, Location>,
 }
 
-impl<'tcx> Ctx<'_, 'tcx> {
-    fn find_rvalue_location<P: Fn(&Rvalue<'_>) -> bool>(
+impl<'a, 'tcx> Ctx<'a, 'tcx> {
+    #[inline]
+    fn find_stmt_location<P: Fn(&Place<'tcx>, &Rvalue<'tcx>) -> bool>(
         &self,
-        span: Span,
-        ty: Ty<'tcx>,
-        pat: P,
+        expr_id: ExprId,
+        unique: bool,
+        pred: P,
     ) -> Option<Location> {
-        let locs = self.stmt_span_to_locs.get(&span)?;
+        let expr = &self.thir[expr_id];
+        let locs = self.stmt_span_to_locs.get(&expr.span)?;
         let locs: Vec<_> = locs
             .iter()
             .copied()
             .filter(|loc| {
-                let stmt = &self.body.basic_blocks[loc.block].statements[loc.statement_index];
-                let StatementKind::Assign(box (_, rhs)) = &stmt.kind else { panic!() };
-                rhs.ty(&self.body.local_decls, self.tcx) == ty && pat(rhs)
+                let stmt = self.get_statement(*loc);
+                let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
+                pred(lhs, rhs)
             })
             .collect();
-        let [loc] = locs.as_slice() else { return None };
+        let [pre @ .., loc] = locs.as_slice() else { return None };
+        if unique && !pre.is_empty() {
+            return None;
+        }
         Some(*loc)
     }
-}
 
-fn validate_assign_locs(locs: &[Location], span: Span, body: &Body<'_>) {
-    for (i, loc) in locs.iter().enumerate() {
-        let stmt = body.stmt_at(*loc).left().unwrap();
-        let StatementKind::Assign(box (_, rhs)) = &stmt.kind else {
-            panic!("{span:?}");
-        };
-        if i < locs.len() - 1 {
-            assert!(matches!(rhs, Rvalue::CopyForDeref(_)), "{span:?}");
+    #[inline]
+    fn find_term_location<P: Fn(&TerminatorKind<'tcx>) -> bool>(
+        &self,
+        expr_id: ExprId,
+        unique: bool,
+        pred: P,
+    ) -> Option<Location> {
+        let expr = &self.thir[expr_id];
+        let locs = self.term_span_to_locs.get(&expr.span)?;
+        let locs: Vec<_> = locs
+            .iter()
+            .copied()
+            .filter(|loc| {
+                let term = self.get_terminator(*loc);
+                pred(&term.kind)
+            })
+            .collect();
+        let [pre @ .., loc] = locs.as_slice() else { return None };
+        if unique && !pre.is_empty() {
+            return None;
         }
+        Some(*loc)
+    }
+
+    fn find_goto_location(&self, expr_id: ExprId) -> Option<Location> {
+        self.find_term_location(expr_id, true, |k| matches!(k, TerminatorKind::Goto { .. }))
+    }
+
+    fn find_assign_ty_location<P: Fn(Ty<'tcx>) -> bool>(
+        &self,
+        expr_id: ExprId,
+        pred: P,
+    ) -> Option<Location> {
+        self.find_stmt_location(expr_id, false, |lhs, _| {
+            pred(lhs.ty(&self.body.local_decls, self.tcx).ty)
+        })
+    }
+
+    fn find_call_location(&self, expr_id: ExprId) -> Option<Location> {
+        self.find_term_location(expr_id, true, |k| {
+            let TerminatorKind::Call { destination, .. } = k else { return false };
+            destination.ty(&self.body.local_decls, self.tcx).ty == self.thir[expr_id].ty
+        })
+    }
+
+    fn find_transmute_location(&self, expr_id: ExprId) -> Option<Location> {
+        self.find_stmt_location(expr_id, true, |lhs, rhs| {
+            matches!(rhs, Rvalue::Cast(CastKind::Transmute, _, _))
+                && lhs.ty(&self.body.local_decls, self.tcx).ty == self.thir[expr_id].ty
+        })
+    }
+
+    fn find_rvalue_location<P: Fn(&Rvalue<'tcx>) -> bool>(
+        &self,
+        expr_id: ExprId,
+        pred: P,
+    ) -> Option<Location> {
+        self.find_stmt_location(expr_id, false, |lhs, rhs| {
+            lhs.ty(&self.body.local_decls, self.tcx).ty == self.thir[expr_id].ty && pred(rhs)
+        })
+    }
+
+    fn handle_rvalue<P: Fn(&Rvalue<'tcx>) -> bool>(&mut self, expr_id: ExprId, pred: P) {
+        let expr = &self.thir[expr_id];
+        if let Some(loc) = self.find_rvalue_location(expr_id, &pred) {
+            self.expr_id_to_loc.insert(expr_id, loc);
+        } else if let Some(assign) = self.rhs_to_assigns.get(&expr_id) {
+            if expr.ty == assign.ty && pred(assign.rvalue) {
+                self.expr_id_to_loc.insert(expr_id, assign.loc);
+            } else {
+                self.print_debug(assign.span);
+            }
+        } else {
+            self.print_debug(expr.span);
+        }
+    }
+
+    fn find_assign_location(&self, ty: Ty<'tcx>, span: Span) -> Option<Assign<'a, 'tcx>> {
+        let locs = self.stmt_span_to_locs.get(&span)?;
+        for (i, loc) in locs.iter().enumerate() {
+            let stmt = self.get_statement(*loc);
+            let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
+            if i < locs.len() - 1 {
+                if !matches!(rhs, Rvalue::CopyForDeref(_)) {
+                    break;
+                }
+            } else {
+                let lhs_ty = lhs.ty(&self.body.local_decls, self.tcx).ty;
+                if lhs_ty == ty {
+                    let assign = Assign {
+                        ty,
+                        rvalue: rhs,
+                        loc: *loc,
+                        span,
+                    };
+                    return Some(assign);
+                }
+            }
+        }
+        None
+    }
+
+    fn terminator_of_last_assign(&self, loc: Location) -> Option<Location> {
+        let bbd = &self.body.basic_blocks[loc.block];
+        for stmt in bbd.statements.iter().skip(loc.statement_index + 1) {
+            if matches!(stmt.kind, StatementKind::Assign { .. }) {
+                return None;
+            }
+        }
+        Some(Location {
+            block: loc.block,
+            statement_index: bbd.statements.len(),
+        })
+    }
+
+    fn next_terminator_of_call(&self, loc: Location) -> Option<Location> {
+        let term = self.get_terminator(loc);
+        let TerminatorKind::Call { target, .. } = &term.kind else { return None };
+        let block = (*target)?;
+        let bbd = &self.body.basic_blocks[block];
+        for stmt in &bbd.statements {
+            if matches!(stmt.kind, StatementKind::Assign { .. }) {
+                return None;
+            }
+        }
+        Some(Location {
+            block,
+            statement_index: bbd.statements.len(),
+        })
+    }
+
+    #[inline]
+    fn get_statement(&self, loc: Location) -> &'a Statement<'tcx> {
+        &self.body.basic_blocks[loc.block].statements[loc.statement_index]
+    }
+
+    #[inline]
+    fn get_terminator(&self, loc: Location) -> &'a Terminator<'tcx> {
+        let bbd = &self.body.basic_blocks[loc.block];
+        assert_eq!(loc.statement_index, bbd.statements.len());
+        bbd.terminator()
+    }
+
+    fn write_debug<W: std::io::Write>(&self, mut w: W, span: Span) {
+        writeln!(w, "{span:?}").unwrap();
+        if let Some(locs) = self.stmt_span_to_locs.get(&span) {
+            for loc in locs {
+                let stmt = self.get_statement(*loc);
+                writeln!(w, "  {loc:?}: {stmt:?}").unwrap();
+            }
+        }
+        if let Some(locs) = self.term_span_to_locs.get(&span) {
+            for loc in locs {
+                let term = self.get_terminator(*loc);
+                writeln!(w, "  {loc:?}: {:?}", term.kind).unwrap();
+            }
+        }
+    }
+
+    #[inline]
+    fn print_debug(&self, span: Span) {
+        self.write_debug(std::io::stdout(), span);
+    }
+
+    #[allow(unused)]
+    #[inline]
+    fn mk_debug_str(&self, span: Span) -> String {
+        let mut v = vec![];
+        self.write_debug(&mut v, span);
+        String::from_utf8(v).unwrap()
     }
 }
 
