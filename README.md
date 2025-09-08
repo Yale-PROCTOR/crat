@@ -18,6 +18,37 @@ cargo run --bin crat -- -o out_dir --pass preprocess benchmarks/rs/avl
 cargo run --bin crat-finder -- example benchmarks/rs/avl
 ```
 
+## Setup
+
+There is no specific requirement to build and run Crat.
+
+However, to compile and run benchmark programs, the following packages and tools
+are required:
+
+```bash
+apt-get install curl freeglut3-dev gcc git less libao-dev libasound2-dev \
+  libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libc6-dev \
+  libcrypt-dev libcurl4-gnutls-dev libev-dev libevent-dev libfftw3-dev \
+  libfuse-dev libfuse3-dev libgcrypt20-dev libgl-dev libglu1-mesa-dev \
+  libgmp-dev libidn2-dev libiniparser-dev libjson-c-dev liblzma-dev \
+  libncurses-dev libpcap0.8-dev libpcre3-dev libpq-dev libpulse-dev \
+  librdkafka-dev libreadline-dev librtlsdr-dev libselinux1-dev libssl-dev \
+  libunistring-dev libusb-1.0-0-dev libwww-perl libx11-dev libxau-dev \
+  libxcomposite-dev libxdamage-dev libxext-dev libxfixes-dev libxrandr-dev \
+  libxrender-dev locales make nettle-dev php7.4-cli postgresql-server-dev-12 \
+  pulseaudio redis-server squeezelite sudo time uuid-dev zlib1g-dev
+```
+
+```bash
+pip install pytest cram
+```
+
+In addition, the username should be `ubuntu`, and using Ubuntu 20.04 is
+recommended.
+
+You may use the `kaistplrg/crat-test-user:1.1.2` Docker image, which meets the
+above requirements.
+
 ## Benchmarks
 
 Benchmark programs are under `benchmarks/rs`. Each directory corresponds to each
