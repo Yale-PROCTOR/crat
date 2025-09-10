@@ -8,7 +8,40 @@ use rustc_middle::{
     thir::{self, ExprId, ExprKind, Pat, PatKind, Thir, visit::Visitor as TVisitor},
     ty::{Ty, TyCtxt, TyKind},
 };
-use rustc_span::Span;
+use rustc_span::{BytePos, Span};
+use smallvec::{SmallVec, smallvec};
+
+type Locations = SmallVec<[Location; 1]>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LoHi {
+    lo: BytePos,
+    hi: BytePos,
+}
+
+impl From<Span> for LoHi {
+    #[inline]
+    fn from(span: Span) -> Self {
+        Self {
+            lo: span.lo(),
+            hi: span.hi(),
+        }
+    }
+}
+
+impl From<LoHi> for Span {
+    #[inline]
+    fn from(lohi: LoHi) -> Self {
+        Self::with_root_ctxt(lohi.lo, lohi.hi)
+    }
+}
+
+impl std::fmt::Debug for LoHi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span: Span = (*self).into();
+        span.fmt(f)
+    }
+}
 
 pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
     for def_id in tcx.hir_body_owners() {
@@ -53,8 +86,8 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             }
         }
 
-        let mut stmt_span_to_locs: FxHashMap<Span, Vec<_>> = FxHashMap::default();
-        let mut term_span_to_locs: FxHashMap<Span, Vec<_>> = FxHashMap::default();
+        let mut stmt_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
+        let mut term_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
 
         for (bb, bbd) in body.basic_blocks.iter_enumerated() {
             for (i, stmt) in bbd.statements.iter().enumerate() {
@@ -66,7 +99,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     statement_index: i,
                 };
                 stmt_span_to_locs
-                    .entry(stmt.source_info.span)
+                    .entry(stmt.source_info.span.into())
                     .or_default()
                     .push(location);
             }
@@ -76,7 +109,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 statement_index: bbd.statements.len(),
             };
             term_span_to_locs
-                .entry(term.source_info.span)
+                .entry(term.source_info.span.into())
                 .or_default()
                 .push(location);
         }
@@ -89,7 +122,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             term_span_to_locs: &term_span_to_locs,
 
             rhs_to_assigns: FxHashMap::default(),
-            expr_id_to_loc: FxHashMap::default(),
+            expr_id_to_locs: FxHashMap::default(),
         };
 
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
@@ -101,15 +134,34 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             .as_str()
                             == "VaListImpl"
                     {
-                    } else if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span) {
-                        ctx.expr_id_to_loc.insert(expr_id, assign.loc);
+                    } else if let Some(assign) =
+                        ctx.find_assign_location(thir[lhs].ty, expr.span.into())
+                    {
+                        ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
                         ctx.rhs_to_assigns
                             .insert(unwrap_scope_and_use(rhs, &thir), assign);
                     } else {
-                        ctx.print_debug(expr.span);
+                        ctx.print_debug(expr.span.into());
                     }
                 }
-                ExprKind::If { .. } => {
+                ExprKind::If { cond, .. } => {
+                    ctx.print_debug(thir[cond].span.into());
+                    // if let Some(locs) = ctx.find_goto_locations(expr_id) {
+                    //     ctx.expr_id_to_locs.insert(expr_id, locs);
+                    // } else if let Some(loc) =
+                    //     ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit())
+                    // {
+                    //     ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
+                    // } else {
+                    //     let then_expr = &thir[unwrap_scope_and_use(then, &thir)];
+                    //     let else_expr_opt = else_opt.map(|e| &thir[unwrap_scope_and_use(e, &thir)]);
+                    //     if !(matches!(then_expr.kind, ExprKind::NeverToAny { .. })
+                    //         && else_expr_opt
+                    //             .is_none_or(|e| matches!(e.kind, ExprKind::NeverToAny { .. })))
+                    //     {
+                    //         ctx.print_debug(expr.span);
+                    //     }
+                    // }
                     // let then_expr = &thir[then];
                     // let locs = term_span_to_locs
                     //     .get(&then_expr.span)
@@ -134,9 +186,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         .find_call_location(expr_id)
                         .or_else(|| ctx.find_transmute_location(expr_id))
                     {
-                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
                     } else {
-                        ctx.print_debug(expr.span);
+                        ctx.print_debug(expr.span.into());
                     }
                 }
                 ExprKind::ByUse { .. } => panic!(),
@@ -179,10 +231,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Block { .. } => {} // TODO
                 ExprKind::Assign { .. } => {}
                 ExprKind::AssignOp { lhs, .. } => {
-                    if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span) {
-                        ctx.expr_id_to_loc.insert(expr_id, assign.loc);
+                    if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span.into()) {
+                        ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
                     } else {
-                        ctx.print_debug(expr.span);
+                        ctx.print_debug(expr.span.into());
                     }
                 }
                 ExprKind::Field { .. } => {}    // TODO
@@ -200,9 +252,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         .find_goto_location(expr_id)
                         .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
                     {
-                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
                     } else {
-                        ctx.print_debug(expr.span);
+                        ctx.print_debug(expr.span.into());
                     }
                 }
                 ExprKind::Continue { .. } => {}
@@ -211,7 +263,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         .find_goto_location(expr_id)
                         .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
                     {
-                        ctx.expr_id_to_loc.insert(expr_id, loc);
+                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
                     } else if let Some(value) = value {
                         let value = unwrap_scope_and_use(value, &thir);
                         let value_expr = &thir[value];
@@ -235,12 +287,14 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                                 expr.span,
                                 term.kind
                             );
-                            ctx.expr_id_to_loc.insert(expr_id, term_loc);
+                            ctx.expr_id_to_locs.insert(expr_id, smallvec![term_loc]);
+                        } else if let Some(locs) = ctx.find_goto_locations(value) {
+                            ctx.expr_id_to_locs.insert(expr_id, locs);
                         } else {
-                            ctx.print_debug(value_expr.span);
+                            ctx.print_debug(value_expr.span.into());
                         }
                     } else {
-                        ctx.print_debug(expr.span);
+                        ctx.print_debug(expr.span.into());
                     }
                 }
                 ExprKind::Become { .. } => todo!(),
@@ -268,15 +322,15 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::PlaceUnwrapUnsafeBinder { .. } => panic!(),
                 ExprKind::ValueUnwrapUnsafeBinder { .. } => panic!(),
                 ExprKind::WrapUnsafeBinder { .. } => panic!(),
-                ExprKind::Closure(_) => {} // TODO
+                ExprKind::Closure(_) => todo!(),
                 ExprKind::Literal { .. } => {}
-                ExprKind::NonHirLiteral { .. } => {} // TODO
+                ExprKind::NonHirLiteral { .. } => {}
                 ExprKind::ZstLiteral { .. } => {}
                 ExprKind::NamedConst { .. } => {}
                 ExprKind::ConstParam { .. } => {}
                 ExprKind::StaticRef { .. } => {}
                 ExprKind::InlineAsm(_) => {}
-                ExprKind::OffsetOf { .. } => {} // TODO
+                ExprKind::OffsetOf { .. } => todo!(),
                 ExprKind::ThreadLocalRef(_) => {}
                 ExprKind::Yield { .. } => todo!(),
             }
@@ -305,21 +359,48 @@ struct Assign<'a, 'tcx> {
     ty: Ty<'tcx>,
     rvalue: &'a Rvalue<'tcx>,
     loc: Location,
-    span: Span,
+    span: LoHi,
 }
 
 struct Ctx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
     body: &'a Body<'tcx>,
-    stmt_span_to_locs: &'a FxHashMap<Span, Vec<Location>>,
-    term_span_to_locs: &'a FxHashMap<Span, Vec<Location>>,
+    stmt_span_to_locs: &'a FxHashMap<LoHi, Locations>,
+    term_span_to_locs: &'a FxHashMap<LoHi, Locations>,
 
     rhs_to_assigns: FxHashMap<ExprId, Assign<'a, 'tcx>>,
-    expr_id_to_loc: FxHashMap<ExprId, Location>,
+    expr_id_to_locs: FxHashMap<ExprId, Locations>,
 }
 
 impl<'a, 'tcx> Ctx<'a, 'tcx> {
+    /// When `Some` is returned, it is guaranteed to be non-empty.
+    #[inline]
+    fn find_locations<P: Fn(Location) -> bool>(
+        &self,
+        expr_id: ExprId,
+        span_to_locs: &FxHashMap<LoHi, Locations>,
+        pred: P,
+    ) -> Option<Locations> {
+        let expr = &self.thir[expr_id];
+        let locs = span_to_locs.get(&expr.span.into())?;
+        let locs: Locations = locs.iter().copied().filter(|loc| pred(*loc)).collect();
+        if locs.is_empty() { None } else { Some(locs) }
+    }
+
+    #[inline]
+    fn find_stmt_locations<P: Fn(&Place<'tcx>, &Rvalue<'tcx>) -> bool>(
+        &self,
+        expr_id: ExprId,
+        pred: P,
+    ) -> Option<Locations> {
+        self.find_locations(expr_id, self.stmt_span_to_locs, |loc| {
+            let stmt = self.get_statement(loc);
+            let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
+            pred(lhs, rhs)
+        })
+    }
+
     #[inline]
     fn find_stmt_location<P: Fn(&Place<'tcx>, &Rvalue<'tcx>) -> bool>(
         &self,
@@ -327,22 +408,24 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         unique: bool,
         pred: P,
     ) -> Option<Location> {
-        let expr = &self.thir[expr_id];
-        let locs = self.stmt_span_to_locs.get(&expr.span)?;
-        let locs: Vec<_> = locs
-            .iter()
-            .copied()
-            .filter(|loc| {
-                let stmt = self.get_statement(*loc);
-                let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
-                pred(lhs, rhs)
-            })
-            .collect();
-        let [pre @ .., loc] = locs.as_slice() else { return None };
-        if unique && !pre.is_empty() {
-            return None;
+        let locs = self.find_stmt_locations(expr_id, pred)?;
+        if unique && locs.len() != 1 {
+            None
+        } else {
+            Some(locs[0])
         }
-        Some(*loc)
+    }
+
+    #[inline]
+    fn find_term_locations<P: Fn(&TerminatorKind<'tcx>) -> bool>(
+        &self,
+        expr_id: ExprId,
+        pred: P,
+    ) -> Option<Locations> {
+        self.find_locations(expr_id, self.term_span_to_locs, |loc| {
+            let term = self.get_terminator(loc);
+            pred(&term.kind)
+        })
     }
 
     #[inline]
@@ -352,25 +435,20 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         unique: bool,
         pred: P,
     ) -> Option<Location> {
-        let expr = &self.thir[expr_id];
-        let locs = self.term_span_to_locs.get(&expr.span)?;
-        let locs: Vec<_> = locs
-            .iter()
-            .copied()
-            .filter(|loc| {
-                let term = self.get_terminator(*loc);
-                pred(&term.kind)
-            })
-            .collect();
-        let [pre @ .., loc] = locs.as_slice() else { return None };
-        if unique && !pre.is_empty() {
-            return None;
+        let locs = self.find_term_locations(expr_id, pred)?;
+        if unique && locs.len() != 1 {
+            None
+        } else {
+            Some(locs[0])
         }
-        Some(*loc)
     }
 
     fn find_goto_location(&self, expr_id: ExprId) -> Option<Location> {
         self.find_term_location(expr_id, true, |k| matches!(k, TerminatorKind::Goto { .. }))
+    }
+
+    fn find_goto_locations(&self, expr_id: ExprId) -> Option<Locations> {
+        self.find_term_locations(expr_id, |k| matches!(k, TerminatorKind::Goto { .. }))
     }
 
     fn find_assign_ty_location<P: Fn(Ty<'tcx>) -> bool>(
@@ -410,19 +488,19 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     fn handle_rvalue<P: Fn(&Rvalue<'tcx>) -> bool>(&mut self, expr_id: ExprId, pred: P) {
         let expr = &self.thir[expr_id];
         if let Some(loc) = self.find_rvalue_location(expr_id, &pred) {
-            self.expr_id_to_loc.insert(expr_id, loc);
+            self.expr_id_to_locs.insert(expr_id, smallvec![loc]);
         } else if let Some(assign) = self.rhs_to_assigns.get(&expr_id) {
             if expr.ty == assign.ty && pred(assign.rvalue) {
-                self.expr_id_to_loc.insert(expr_id, assign.loc);
+                self.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
             } else {
                 self.print_debug(assign.span);
             }
         } else {
-            self.print_debug(expr.span);
+            self.print_debug(expr.span.into());
         }
     }
 
-    fn find_assign_location(&self, ty: Ty<'tcx>, span: Span) -> Option<Assign<'a, 'tcx>> {
+    fn find_assign_location(&self, ty: Ty<'tcx>, span: LoHi) -> Option<Assign<'a, 'tcx>> {
         let locs = self.stmt_span_to_locs.get(&span)?;
         for (i, loc) in locs.iter().enumerate() {
             let stmt = self.get_statement(*loc);
@@ -488,7 +566,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         bbd.terminator()
     }
 
-    fn write_debug<W: std::io::Write>(&self, mut w: W, span: Span) {
+    fn write_debug<W: std::io::Write>(&self, mut w: W, span: LoHi) {
         writeln!(w, "{span:?}").unwrap();
         if let Some(locs) = self.stmt_span_to_locs.get(&span) {
             for loc in locs {
@@ -505,13 +583,13 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     }
 
     #[inline]
-    fn print_debug(&self, span: Span) {
+    fn print_debug(&self, span: LoHi) {
         self.write_debug(std::io::stdout(), span);
     }
 
     #[allow(unused)]
     #[inline]
-    fn mk_debug_str(&self, span: Span) -> String {
+    fn mk_debug_str(&self, span: LoHi) -> String {
         let mut v = vec![];
         self.write_debug(&mut v, span);
         String::from_utf8(v).unwrap()
