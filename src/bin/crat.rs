@@ -66,7 +66,6 @@ enum Pass {
     Preprocess,
     Bin,
     Check,
-    Libc,
     OutParam,
     Lock,
     Union,
