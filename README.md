@@ -4,10 +4,24 @@
 
 ## Usage
 
+### Preparation
+
+You should first build the `deps_crate` crate, which provides dependencies to
+compile the Rust program to be transformed. You only need to do this once.
+
+```bash
+cd deps_crate
+cargo build
+```
+
 ### Crat
 
 ```bash
 # `out_dir` should be an existing directory.
+# `in_dir` should be an existing directory that contains `c2rust-lib.rs`.
+cargo run --bin crat -- -o out_dir --pass preprocess in_dir
+
+# Example:
 # This will create `out_dir/avl`.
 cargo run --bin crat -- -o out_dir --pass preprocess benchmarks/rs/avl
 ```
