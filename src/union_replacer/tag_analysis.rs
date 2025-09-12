@@ -44,7 +44,7 @@ pub struct Config {
     #[serde(default)]
     pub points_to_file: Option<PathBuf>,
     #[serde(default)]
-    pub target_unions: FxHashSet<String>,
+    pub targets: FxHashSet<String>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -228,7 +228,7 @@ pub fn analyze(conf: &Config, verbose: bool, tcx: TyCtxt<'_>) -> Statistics {
                 continue;
             }
             let u = def_id.expect_local();
-            if conf.target_unions.is_empty() || conf.target_unions.contains(&tcx.def_path_str(u)) {
+            if conf.targets.is_empty() || conf.targets.contains(&tcx.def_path_str(u)) {
                 unions.push(u);
                 union_to_struct.insert(u, (i, local_def_id));
                 struct_unions.push((i, u));

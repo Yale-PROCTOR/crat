@@ -32,9 +32,27 @@ struct Args {
 
     // Union
     #[arg(long, value_delimiter = ',', help = "Target unions to replace")]
-    target_union: Vec<String>,
-    #[arg(long, help = "File containing the result of points-to analysis")]
-    points_to_file: Option<PathBuf>,
+    union_target: Vec<String>,
+
+    // OutParam
+    #[arg(long, help = "Maximum number of states at loop heads")]
+    outparam_max_loop_head_states: Option<usize>,
+    #[arg(
+        long,
+        help = "Check aliasing of function parameters with global variables"
+    )]
+    outparam_check_global_alias: bool,
+    #[arg(long, help = "Check aliasing of function parameters with each other")]
+    outparam_check_param_alias: bool,
+    #[arg(long, help = "Disable widening in the analysis")]
+    outparam_no_widening: bool,
+    #[arg(
+        long,
+        help = "Enable simplification during output parameter transformation"
+    )]
+    outparam_simplify: bool,
+    #[arg(long, help = "File containing the result of output parameter analysis")]
+    outparam_analysis_file: Option<PathBuf>,
 
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
@@ -44,6 +62,8 @@ struct Args {
     analysis: Option<Analysis>,
     #[arg(long, help = "Path to the configuration file")]
     config: Option<PathBuf>,
+    #[arg(long, help = "File containing the result of points-to analysis")]
+    points_to_file: Option<PathBuf>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -89,6 +109,8 @@ struct Config {
     bin: bin_file_adder::Config,
     #[serde(default)]
     r#union: union_replacer::tag_analysis::Config,
+    #[serde(default)]
+    outparam: outparam_replacer::Config,
 
     #[serde(default)]
     verbose: bool,
@@ -172,11 +194,25 @@ fn main() {
         config.bin.ignores.push(arg);
     }
 
-    for u in args.target_union {
-        config.r#union.target_unions.insert(u);
+    for u in args.union_target {
+        config.r#union.targets.insert(u);
     }
     if args.points_to_file.is_some() {
-        config.r#union.points_to_file = args.points_to_file;
+        config.r#union.points_to_file = args.points_to_file.clone();
+    }
+
+    if let Some(v) = args.outparam_max_loop_head_states {
+        config.outparam.max_loop_head_states = v;
+    }
+    config.outparam.check_global_alias |= args.outparam_check_global_alias;
+    config.outparam.check_param_alias |= args.outparam_check_param_alias;
+    config.outparam.no_widening |= args.outparam_no_widening;
+    config.outparam.simplify |= args.outparam_simplify;
+    if args.outparam_analysis_file.is_some() {
+        config.outparam.analysis_file = args.outparam_analysis_file;
+    }
+    if args.points_to_file.is_some() {
+        config.outparam.points_to_file = args.points_to_file.clone();
     }
 
     let dir = if !config.passes.is_empty() {
@@ -201,9 +237,7 @@ fn main() {
         } else if config.inplace {
             args.input
         } else {
-            eprintln!(
-                "Output directory is required when running passes unless in-place is enabled"
-            );
+            eprintln!("Output directory should be specified when not running in-place");
             std::process::exit(1)
         }
     } else {
@@ -212,7 +246,7 @@ fn main() {
             std::process::exit(1);
         }
         if config.analysis_output.is_none() {
-            eprintln!("Analysis output file is required when running analysis");
+            eprintln!("Analysis output file should be specified when running analysis");
             std::process::exit(1);
         }
         args.input
@@ -283,7 +317,15 @@ fn main() {
                 .unwrap();
             }
             Analysis::OutParam => {
-                todo!()
+                run_compiler_on_path(&file, |tcx| {
+                    let res = outparam_replacer::ai::analysis::analyze(
+                        &config.outparam,
+                        config.verbose,
+                        tcx,
+                    );
+                    outparam_replacer::ai::analysis::write_analysis_result(&analysis_output, &res);
+                })
+                .unwrap();
             }
         }
     }
