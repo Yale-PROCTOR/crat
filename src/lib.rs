@@ -25,6 +25,7 @@ extern crate rustc_span;
 extern crate rustc_type_ir;
 extern crate smallvec;
 extern crate thin_vec;
+extern crate rustc_const_eval;
 
 pub mod preprocessor;
 #[macro_use]
