@@ -1,11 +1,14 @@
-use rustc_hash::FxHashMap;
+use etrace::some_or;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def::DefKind};
 use rustc_middle::{
     mir::{
-        AggregateKind, Body, CastKind, Location, Place, Rvalue, Statement, StatementKind,
-        Terminator, TerminatorKind, UnOp,
+        AggregateKind, BasicBlock, Body, CastKind, Location, Place, Rvalue, Statement,
+        StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
-    thir::{self, ExprId, ExprKind, Pat, PatKind, Thir, visit::Visitor as TVisitor},
+    thir::{
+        self, Expr, ExprId, ExprKind, LogicalOp, Pat, PatKind, Thir, visit::Visitor as TVisitor,
+    },
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::{BytePos, Span};
@@ -56,7 +59,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
         let thir = thir.borrow();
         let texpr = &thir[texpr];
 
-        let mut visitor = ThirVisitor {
+        let mut visitor = BindingVisitor {
             tcx,
             thir: &thir,
             bindings: FxHashMap::default(),
@@ -145,32 +148,53 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     }
                 }
                 ExprKind::If { cond, .. } => {
-                    ctx.print_debug(thir[cond].span.into());
-                    // if let Some(locs) = ctx.find_goto_locations(expr_id) {
-                    //     ctx.expr_id_to_locs.insert(expr_id, locs);
-                    // } else if let Some(loc) =
-                    //     ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit())
-                    // {
-                    //     ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
-                    // } else {
-                    //     let then_expr = &thir[unwrap_scope_and_use(then, &thir)];
-                    //     let else_expr_opt = else_opt.map(|e| &thir[unwrap_scope_and_use(e, &thir)]);
-                    //     if !(matches!(then_expr.kind, ExprKind::NeverToAny { .. })
-                    //         && else_expr_opt
-                    //             .is_none_or(|e| matches!(e.kind, ExprKind::NeverToAny { .. })))
-                    //     {
-                    //         ctx.print_debug(expr.span);
-                    //     }
-                    // }
-                    // let then_expr = &thir[then];
-                    // let locs = term_span_to_locs
-                    //     .get(&then_expr.span)
-                    //     .unwrap_or_else(|| panic!("{:?}", then_expr.span));
-                    // _show(expr.span, Some(locs));
-                    // let locs = term_span_to_locs
-                    //     .get(&expr.span)
-                    //     .unwrap_or_else(|| panic!("{:?}", expr.span));
-                    // _show(expr.span, Some(locs));
+                    let conds = cond_dest(cond, &thir);
+                    let mut true_targets = vec![];
+                    let mut false_targets = vec![];
+                    for cond in &conds {
+                        if let Some(targets) = ctx.find_switch_int(cond.expr_id) {
+                            let when_true = targets.otherwise();
+                            let when_false = targets.target_for_value(0);
+                            match cond.when_true {
+                                None => {}
+                                Some(true) => true_targets.push(when_true),
+                                Some(false) => false_targets.push(when_true),
+                            }
+                            match cond.when_false {
+                                None => {}
+                                Some(true) => true_targets.push(when_false),
+                                Some(false) => false_targets.push(when_false),
+                            }
+                        } else {
+                            ctx.print_debug(thir[cond.expr_id].span.into());
+                        }
+                    }
+                    let find_target = |targets: &[BasicBlock]| match targets {
+                        [] => panic!(),
+                        [bb] => *bb,
+                        _ => {
+                            let mut targets: Vec<_> = targets
+                                .iter()
+                                .map(|bb| {
+                                    let term = body.basic_blocks[*bb].terminator();
+                                    if let TerminatorKind::Goto { target } = term.kind {
+                                        vec![*bb, target]
+                                    } else {
+                                        vec![*bb]
+                                    }
+                                })
+                                .collect();
+                            let mut target = targets.pop().unwrap();
+                            for target1 in targets {
+                                target.retain(|bb| target1.contains(bb));
+                            }
+                            assert!(target.len() == 1, "{target:?}");
+                            target[0]
+                        }
+                    };
+                    let true_target = find_target(&true_targets);
+                    let false_target = find_target(&false_targets);
+                    assert_ne!(true_target, false_target);
                 }
                 _ => {}
             }
@@ -192,7 +216,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     }
                 }
                 ExprKind::ByUse { .. } => panic!(),
-                ExprKind::Deref { .. } => {} // TODO
+                ExprKind::Deref { .. } => {}
                 ExprKind::Binary { op, .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| {
                         if let Rvalue::BinaryOp(mop, _) = rvalue {
@@ -225,10 +249,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         )
                     });
                 }
-                ExprKind::Loop { .. } => {}  // TODO
+                ExprKind::Loop { .. } => {}
                 ExprKind::Let { .. } => {}   // TODO
                 ExprKind::Match { .. } => {} // TODO
-                ExprKind::Block { .. } => {} // TODO
+                ExprKind::Block { .. } => {}
                 ExprKind::Assign { .. } => {}
                 ExprKind::AssignOp { lhs, .. } => {
                     if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span.into()) {
@@ -237,10 +261,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         ctx.print_debug(expr.span.into());
                     }
                 }
-                ExprKind::Field { .. } => {}    // TODO
-                ExprKind::Index { .. } => {}    // TODO
-                ExprKind::VarRef { .. } => {}   // TODO
-                ExprKind::UpvarRef { .. } => {} // TODO
+                ExprKind::Field { .. } => {}
+                ExprKind::Index { .. } => {}
+                ExprKind::VarRef { .. } => {}
+                ExprKind::UpvarRef { .. } => {}
                 ExprKind::Borrow { .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Ref(..)));
                 }
@@ -335,6 +359,38 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Yield { .. } => todo!(),
             }
         }
+
+        for block in thir.blocks.iter() {
+            let expr_id = some_or!(block.expr, continue);
+            let expr_id = unwrap_scope_and_use(expr_id, &thir);
+            if is_place(&thir[expr_id]) {
+                ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)))
+            }
+
+            let mut visitor = ExprVisitor {
+                tcx,
+                thir: &thir,
+                exprs: FxHashSet::default(),
+            };
+            visitor.visit_block(block);
+            let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+            if bbs.is_empty() {
+                println!("{:?}", block.span);
+            }
+        }
+
+        for (_expr_id, expr) in thir.exprs.iter_enumerated() {
+            match expr.kind {
+                ExprKind::Loop { body: _body } => {}
+                ExprKind::If {
+                    then: _then,
+                    else_opt: _else_opt,
+                    ..
+                } => {}
+                ExprKind::Match { .. } => {} // TODO
+                _ => {}
+            }
+        }
     }
 }
 
@@ -353,6 +409,67 @@ fn unwrap_scope_and_use(mut expr_id: ExprId, thir: &Thir<'_>) -> ExprId {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CondWithDest {
+    expr_id: ExprId,
+    when_true: Option<bool>,
+    when_false: Option<bool>,
+}
+
+fn cond_dest(expr_id: ExprId, thir: &Thir<'_>) -> Vec<CondWithDest> {
+    let expr_id = unwrap_scope_and_use(expr_id, thir);
+    match thir[expr_id].kind {
+        ExprKind::LogicalOp { op, lhs, rhs } => {
+            let mut l = cond_dest(lhs, thir);
+            let r = cond_dest(rhs, thir);
+            match op {
+                LogicalOp::And => {
+                    for c in &mut l {
+                        c.when_true = c.when_true.filter(|b| !*b);
+                        c.when_false = c.when_false.filter(|b| !*b);
+                    }
+                }
+                LogicalOp::Or => {
+                    for c in &mut l {
+                        c.when_true = c.when_true.filter(|b| *b);
+                        c.when_false = c.when_false.filter(|b| *b);
+                    }
+                }
+            }
+            l.extend(r);
+            l
+        }
+        ExprKind::Unary { op: UnOp::Not, arg } => {
+            let mut v = cond_dest(arg, thir);
+            for c in &mut v {
+                c.when_true = c.when_true.map(|b| !b);
+                c.when_false = c.when_false.map(|b| !b);
+            }
+            v
+        }
+        _ => {
+            vec![CondWithDest {
+                expr_id,
+                when_true: Some(true),
+                when_false: Some(false),
+            }]
+        }
+    }
+}
+
+#[inline]
+fn is_place(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Literal { .. }
+            | ExprKind::Deref { .. }
+            | ExprKind::Field { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::VarRef { .. }
+            | ExprKind::UpvarRef { .. }
+    )
 }
 
 struct Assign<'a, 'tcx> {
@@ -449,6 +566,15 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
 
     fn find_goto_locations(&self, expr_id: ExprId) -> Option<Locations> {
         self.find_term_locations(expr_id, |k| matches!(k, TerminatorKind::Goto { .. }))
+    }
+
+    fn find_switch_int(&self, expr_id: ExprId) -> Option<&'a SwitchTargets> {
+        let loc = self.find_term_location(expr_id, true, |k| {
+            matches!(k, TerminatorKind::SwitchInt { .. })
+        })?;
+        let term = self.get_terminator(loc);
+        let TerminatorKind::SwitchInt { targets, .. } = &term.kind else { unreachable!() };
+        Some(targets)
     }
 
     fn find_assign_ty_location<P: Fn(Ty<'tcx>) -> bool>(
@@ -566,6 +692,18 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         bbd.terminator()
     }
 
+    #[inline]
+    fn collect_basic_blocks(&self, exprs: impl Iterator<Item = ExprId>) -> FxHashSet<BasicBlock> {
+        let mut bbs = FxHashSet::default();
+        for expr in exprs {
+            let locs = some_or!(self.expr_id_to_locs.get(&expr), continue);
+            for loc in locs {
+                bbs.insert(loc.block);
+            }
+        }
+        bbs
+    }
+
     fn write_debug<W: std::io::Write>(&self, mut w: W, span: LoHi) {
         writeln!(w, "{span:?}").unwrap();
         if let Some(locs) = self.stmt_span_to_locs.get(&span) {
@@ -596,14 +734,14 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     }
 }
 
-struct ThirVisitor<'a, 'tcx> {
+struct BindingVisitor<'a, 'tcx> {
     #[allow(unused)]
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
     bindings: FxHashMap<Span, HirId>,
 }
 
-impl<'a, 'tcx> TVisitor<'a, 'tcx> for ThirVisitor<'a, 'tcx> {
+impl<'a, 'tcx> TVisitor<'a, 'tcx> for BindingVisitor<'a, 'tcx> {
     fn thir(&self) -> &'a Thir<'tcx> {
         self.thir
     }
@@ -618,5 +756,28 @@ impl<'a, 'tcx> TVisitor<'a, 'tcx> for ThirVisitor<'a, 'tcx> {
             }
         }
         thir::visit::walk_pat(self, pat);
+    }
+}
+
+struct ExprVisitor<'a, 'tcx> {
+    #[allow(unused)]
+    tcx: TyCtxt<'tcx>,
+    thir: &'a Thir<'tcx>,
+    exprs: FxHashSet<ExprId>,
+}
+
+impl<'a, 'tcx> TVisitor<'a, 'tcx> for ExprVisitor<'a, 'tcx> {
+    fn thir(&self) -> &'a Thir<'tcx> {
+        self.thir
+    }
+
+    fn visit_expr(&mut self, expr: &'a thir::Expr<'tcx>) {
+        if let ExprKind::Scope { value, .. }
+        | ExprKind::Use { source: value }
+        | ExprKind::NeverToAny { source: value } = expr.kind
+        {
+            self.exprs.insert(value);
+        }
+        thir::visit::walk_expr(self, expr);
     }
 }
