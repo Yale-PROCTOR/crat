@@ -15,7 +15,10 @@ use rustc_errors::{
 use rustc_feature::UnstableFeatures;
 use rustc_hash::FxHashMap;
 use rustc_interface::Config;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::{
+    ty::TyCtxt,
+    mir::{Body, TerminatorKind},
+};
 use rustc_session::{
     EarlyDiagCtxt,
     config::{CrateType, ErrorOutputType, Input, Options},
@@ -211,4 +214,31 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
             path
         })
     })
+}
+
+pub fn body_to_str(body: &Body<'_>) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    writeln!(s, "{:?} {{", body.source.instance.def_id()).unwrap();
+    for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+        writeln!(s, "    {:?}:", bb).unwrap();
+        for stmt in &bbd.statements {
+            writeln!(s, "        {:?}", stmt).unwrap();
+        }
+        if !matches!(
+            bbd.terminator().kind,
+            TerminatorKind::Return | TerminatorKind::Assert { .. }
+        ) {
+            writeln!(s, "        {:?}", bbd.terminator().kind).unwrap();
+        }
+    }
+    writeln!(s, "}}").unwrap();
+    s
+}
+
+pub fn body_size(body: &Body<'_>) -> usize {
+    body.basic_blocks
+        .iter()
+        .map(|bbd| bbd.statements.len() + 1)
+        .sum()
 }
