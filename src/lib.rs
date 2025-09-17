@@ -2,6 +2,7 @@
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(iter_intersperse)]
+#![feature(map_try_insert)]
 
 extern crate rustc_abi;
 extern crate rustc_ast;
