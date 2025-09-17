@@ -3,11 +3,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def::DefKind};
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, Body, CastKind, Location, Place, Rvalue, Statement,
-        StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
+        AggregateKind, AssignOp, BasicBlock, Body, CastKind, Location, Operand, Place, Rvalue,
+        Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
     thir::{
-        self, Expr, ExprId, ExprKind, LogicalOp, Pat, PatKind, Thir, visit::Visitor as TVisitor,
+        self, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
+        visit::Visitor as TVisitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -77,28 +78,34 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
         let mut var_to_locals: FxHashMap<_, Vec<_>> = FxHashMap::default();
         for (local, local_decl) in body.local_decls.iter_enumerated() {
             let span = local_decl.source_info.span;
-            if let Some(hir_id) = visitor.bindings.get(&span) {
+            if let Some((hir_id, ty)) = visitor.bindings.get(&span)
+                && *ty == local_decl.ty
+            {
                 var_to_locals.entry(*hir_id).or_default().push(local);
             }
         }
 
-        for binding in visitor.bindings.values() {
-            let locals = var_to_locals.get(binding);
-            if locals.is_none() {
-                println!("{binding:?}");
+        for (hir_id, _) in visitor.bindings.values() {
+            let locals = var_to_locals.get(hir_id);
+            if let Some(locals) = locals
+                && locals.len() == 1
+            {
+            } else {
+                println!("{hir_id:?} {locals:?}");
             }
         }
 
         let mut stmt_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
         let mut term_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
 
-        for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+        for bb in body.basic_blocks.reverse_postorder() {
+            let bbd = &body.basic_blocks[*bb];
             for (i, stmt) in bbd.statements.iter().enumerate() {
                 if !matches!(stmt.kind, StatementKind::Assign { .. }) {
                     continue;
                 }
                 let location = Location {
-                    block: bb,
+                    block: *bb,
                     statement_index: i,
                 };
                 stmt_span_to_locs
@@ -108,7 +115,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             }
             let term = bbd.terminator();
             let location = Location {
-                block: bb,
+                block: *bb,
                 statement_index: bbd.statements.len(),
             };
             term_span_to_locs
@@ -125,7 +132,11 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             term_span_to_locs: &term_span_to_locs,
 
             rhs_to_assigns: FxHashMap::default(),
+            nested_logical_exprs: FxHashSet::default(),
             expr_id_to_locs: FxHashMap::default(),
+            block_to_bbs: FxHashMap::default(),
+            loop_to_bbs: FxHashMap::default(),
+            if_to_bbs: FxHashMap::default(),
         };
 
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
@@ -138,17 +149,21 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             == "VaListImpl"
                     {
                     } else if let Some(assign) =
-                        ctx.find_assign_location(thir[lhs].ty, expr.span.into())
+                        ctx.find_assign_location(thir[lhs].ty, expr.span.into(), false)
                     {
                         ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
-                        ctx.rhs_to_assigns
-                            .insert(unwrap_scope_and_use(rhs, &thir), assign);
+                        ctx.rhs_to_assigns.insert(unwrap_expr(rhs, &thir), assign);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
                 }
-                ExprKind::If { cond, .. } => {
-                    let conds = cond_dest(cond, &thir);
+                ExprKind::If {
+                    cond,
+                    then,
+                    else_opt,
+                    ..
+                } => {
+                    let conds = cond_dest(cond, &thir, &mut ctx.nested_logical_exprs);
                     let mut true_targets = vec![];
                     let mut false_targets = vec![];
                     for cond in &conds {
@@ -195,6 +210,40 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     let true_target = find_target(&true_targets);
                     let false_target = find_target(&false_targets);
                     assert_ne!(true_target, false_target);
+                    let if_blocks = IfBlocks {
+                        true_entry: true_target,
+                        false_entry: false_target,
+                        true_blocks: FxHashSet::default(),
+                        false_blocks: FxHashSet::default(),
+                    };
+                    ctx.if_to_bbs.insert(expr_id, if_blocks);
+
+                    if let Some(continue_id) = unique_continue_of_block(then, &thir) {
+                        let bb = &body.basic_blocks[true_target];
+                        let term = bb.terminator();
+                        assert!(matches!(term.kind, TerminatorKind::Goto { .. }));
+                        let location = Location {
+                            block: true_target,
+                            statement_index: bb.statements.len(),
+                        };
+                        ctx.expr_id_to_locs.insert(continue_id, smallvec![location]);
+                    }
+                    if let Some(els) = else_opt
+                        && let Some(continue_id) = unique_continue_of_block(els, &thir)
+                    {
+                        let bb = &body.basic_blocks[false_target];
+                        let term = bb.terminator();
+                        assert!(matches!(term.kind, TerminatorKind::Goto { .. }));
+                        let location = Location {
+                            block: false_target,
+                            statement_index: bb.statements.len(),
+                        };
+                        ctx.expr_id_to_locs.insert(continue_id, smallvec![location]);
+                    }
+                }
+                ExprKind::LogicalOp { lhs, rhs, .. } => {
+                    cond_dest(lhs, &thir, &mut ctx.nested_logical_exprs);
+                    cond_dest(rhs, &thir, &mut ctx.nested_logical_exprs);
                 }
                 _ => {}
             }
@@ -216,7 +265,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     }
                 }
                 ExprKind::ByUse { .. } => panic!(),
-                ExprKind::Deref { .. } => {}
+                ExprKind::Deref { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
                 ExprKind::Binary { op, .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| {
                         if let Rvalue::BinaryOp(mop, _) = rvalue {
@@ -226,14 +278,41 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         }
                     });
                 }
-                ExprKind::LogicalOp { .. } => {} // TODO
+                ExprKind::LogicalOp { .. } => {
+                    if !ctx.nested_logical_exprs.contains(&expr_id) {
+                        if let Some(stmt) = ctx.find_stmt_location(expr_id, true, |_, rhs| {
+                            matches!(rhs, Rvalue::Use(Operand::Constant(_)))
+                        }) && let Some(terms) = ctx.find_term_locations(expr_id, |term| {
+                            matches!(term, TerminatorKind::Goto { .. })
+                        }) && let (term, terms) = terms
+                            .into_iter()
+                            .partition::<Locations, _>(|l| l.block == stmt.block)
+                            && let [term] = &term[..]
+                            && stmt.statement_index + 1 == term.statement_index
+                            && !terms.is_empty()
+                        {
+                            let mut locs = SmallVec::with_capacity(1 + terms.len());
+                            locs.push(stmt);
+                            locs.extend(terms);
+                            ctx.expr_id_to_locs.insert(expr_id, locs);
+                        } else {
+                            ctx.print_debug(expr.span.into());
+                        }
+                    }
+                }
                 ExprKind::Unary { op, .. } => match op {
                     UnOp::Neg => {
                         ctx.handle_rvalue(expr_id, |rvalue| {
                             matches!(rvalue, Rvalue::UnaryOp(UnOp::Neg, _))
                         });
                     }
-                    UnOp::Not => {} // TODO
+                    UnOp::Not => {
+                        if !ctx.nested_logical_exprs.contains(&expr_id) {
+                            ctx.handle_rvalue(expr_id, |rvalue| {
+                                matches!(rvalue, Rvalue::UnaryOp(UnOp::Not, _))
+                            });
+                        }
+                    }
                     UnOp::PtrMetadata => panic!(),
                 },
                 ExprKind::Cast { .. } => {
@@ -254,17 +333,33 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Match { .. } => {} // TODO
                 ExprKind::Block { .. } => {}
                 ExprKind::Assign { .. } => {}
-                ExprKind::AssignOp { lhs, .. } => {
-                    if let Some(assign) = ctx.find_assign_location(thir[lhs].ty, expr.span.into()) {
+                ExprKind::AssignOp { op, lhs, .. } => {
+                    if let Some(assign) = ctx.find_assign_location(
+                        thir[lhs].ty,
+                        expr.span.into(),
+                        matches!(op, AssignOp::DivAssign | AssignOp::RemAssign),
+                    ) {
                         ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
                 }
-                ExprKind::Field { .. } => {}
-                ExprKind::Index { .. } => {}
-                ExprKind::VarRef { .. } => {}
-                ExprKind::UpvarRef { .. } => {}
+                ExprKind::Field { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
+                ExprKind::Index { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
+                ExprKind::VarRef { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
+                ExprKind::UpvarRef { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
                 ExprKind::Borrow { .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Ref(..)));
                 }
@@ -289,7 +384,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     {
                         ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
                     } else if let Some(value) = value {
-                        let value = unwrap_scope_and_use(value, &thir);
+                        let value = unwrap_expr(value, &thir);
                         let value_expr = &thir[value];
                         if let Some(term_loc) = ctx
                             .find_rvalue_location(value, |_| true)
@@ -347,7 +442,11 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::ValueUnwrapUnsafeBinder { .. } => panic!(),
                 ExprKind::WrapUnsafeBinder { .. } => panic!(),
                 ExprKind::Closure(_) => todo!(),
-                ExprKind::Literal { .. } => {}
+                ExprKind::Literal { .. } => {
+                    let _ = ctx.handle_rvalue_opt(expr_id, |rvalue| {
+                        matches!(rvalue, Rvalue::Use(Operand::Constant(_)))
+                    });
+                }
                 ExprKind::NonHirLiteral { .. } => {}
                 ExprKind::ZstLiteral { .. } => {}
                 ExprKind::NamedConst { .. } => {}
@@ -360,33 +459,85 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             }
         }
 
-        for block in thir.blocks.iter() {
-            let expr_id = some_or!(block.expr, continue);
-            let expr_id = unwrap_scope_and_use(expr_id, &thir);
-            if is_place(&thir[expr_id]) {
-                ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)))
-            }
-
-            let mut visitor = ExprVisitor {
-                tcx,
-                thir: &thir,
-                exprs: FxHashSet::default(),
-            };
-            visitor.visit_block(block);
-            let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
-            if bbs.is_empty() {
-                println!("{:?}", block.span);
-            }
-        }
-
-        for (_expr_id, expr) in thir.exprs.iter_enumerated() {
+        for (expr_id, expr) in thir.exprs.iter_enumerated() {
             match expr.kind {
-                ExprKind::Loop { body: _body } => {}
-                ExprKind::If {
-                    then: _then,
-                    else_opt: _else_opt,
-                    ..
-                } => {}
+                ExprKind::Block { block } => {
+                    let mut visitor = ExprVisitor {
+                        tcx,
+                        thir: &thir,
+                        exprs: FxHashSet::default(),
+                    };
+                    visitor.visit_expr(expr);
+                    let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+                    if !bbs.is_empty() {
+                        ctx.block_to_bbs.insert(block, bbs);
+                    } else if let Err(span) = ctx.handle_rvalue_opt(expr_id, |_| true) {
+                        ctx.print_debug(span);
+                    } else {
+                        let locs = ctx.expr_id_to_locs.get(&expr_id).unwrap();
+                        let bbs = locs.iter().map(|loc| loc.block).collect();
+                        ctx.block_to_bbs.insert(block, bbs);
+                    }
+                }
+                ExprKind::Loop { body } => {
+                    let body = unwrap_expr(body, &thir);
+                    let ExprKind::Block { block } = thir[body].kind else { panic!() };
+                    if let Some(bbs) = ctx.block_to_bbs.get(&block) {
+                        ctx.loop_to_bbs.insert(expr_id, bbs.clone());
+                    } else {
+                        ctx.print_debug(expr.span.into());
+                    }
+                }
+                ExprKind::If { then, else_opt, .. } => {
+                    let then = unwrap_expr(then, &thir);
+                    let ExprKind::Block { block } = thir[then].kind else { panic!() };
+                    if let Some(bbs) = ctx.block_to_bbs.get(&block) {
+                        let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
+                        if_blocks.true_blocks = bbs.clone();
+                        if_blocks.true_blocks.insert(if_blocks.true_entry);
+                    } else {
+                        ctx.print_debug(thir[then].span.into());
+                    }
+
+                    if let Some(els) = else_opt {
+                        let els = unwrap_expr(els, &thir);
+                        match thir[els].kind {
+                            ExprKind::Block { block } => {
+                                if let Some(bbs) = ctx.block_to_bbs.get(&block) {
+                                    let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
+                                    if_blocks.false_blocks = bbs.clone();
+                                    if_blocks.false_blocks.insert(if_blocks.false_entry);
+                                } else {
+                                    ctx.print_debug(thir[els].span.into())
+                                }
+                            }
+                            ExprKind::If { .. } => {
+                                let mut visitor = ExprVisitor {
+                                    tcx,
+                                    thir: &thir,
+                                    exprs: FxHashSet::default(),
+                                };
+                                visitor.visit_expr(&thir[els]);
+                                let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+                                if !bbs.is_empty() {
+                                    let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
+                                    if_blocks.false_blocks = bbs;
+                                    if_blocks.false_blocks.insert(if_blocks.false_entry);
+                                    debug_assert_eq!(
+                                        if_blocks
+                                            .true_blocks
+                                            .intersection(&if_blocks.false_blocks)
+                                            .count(),
+                                        0
+                                    );
+                                } else {
+                                    ctx.print_debug(thir[els].span.into());
+                                }
+                            }
+                            _ => panic!(),
+                        }
+                    }
+                }
                 ExprKind::Match { .. } => {} // TODO
                 _ => {}
             }
@@ -394,21 +545,36 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
     }
 }
 
-fn unwrap_scope_and_use(mut expr_id: ExprId, thir: &Thir<'_>) -> ExprId {
+fn unwrap_expr(mut expr_id: ExprId, thir: &Thir<'_>) -> ExprId {
     loop {
         let expr = &thir[expr_id];
         match expr.kind {
-            ExprKind::Scope { value, .. } => {
+            ExprKind::Scope { value, .. }
+            | ExprKind::Use { source: value }
+            | ExprKind::NeverToAny { source: value } => {
                 expr_id = value;
-            }
-            ExprKind::Use { source } => {
-                expr_id = source;
             }
             _ => {
                 return expr_id;
             }
         }
     }
+}
+
+fn unique_continue_of_block(expr_id: ExprId, thir: &Thir<'_>) -> Option<ExprId> {
+    let expr_id = unwrap_expr(expr_id, thir);
+    let ExprKind::Block { block } = thir[expr_id].kind else { return None };
+    let block = &thir.blocks[block];
+    if block.expr.is_some() {
+        return None;
+    }
+    let [stmt] = &block.stmts[..] else { return None };
+    let stmt = &thir[*stmt];
+    let StmtKind::Expr { expr: expr_id, .. } = stmt.kind else { return None };
+    let expr_id = unwrap_expr(expr_id, thir);
+    let expr = &thir[expr_id];
+    let ExprKind::Continue { .. } = expr.kind else { return None };
+    Some(expr_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -418,12 +584,17 @@ struct CondWithDest {
     when_false: Option<bool>,
 }
 
-fn cond_dest(expr_id: ExprId, thir: &Thir<'_>) -> Vec<CondWithDest> {
-    let expr_id = unwrap_scope_and_use(expr_id, thir);
+fn cond_dest(
+    expr_id: ExprId,
+    thir: &Thir<'_>,
+    logical_exprs: &mut FxHashSet<ExprId>,
+) -> Vec<CondWithDest> {
+    let expr_id = unwrap_expr(expr_id, thir);
     match thir[expr_id].kind {
         ExprKind::LogicalOp { op, lhs, rhs } => {
-            let mut l = cond_dest(lhs, thir);
-            let r = cond_dest(rhs, thir);
+            logical_exprs.insert(expr_id);
+            let mut l = cond_dest(lhs, thir, logical_exprs);
+            let r = cond_dest(rhs, thir, logical_exprs);
             match op {
                 LogicalOp::And => {
                     for c in &mut l {
@@ -442,7 +613,8 @@ fn cond_dest(expr_id: ExprId, thir: &Thir<'_>) -> Vec<CondWithDest> {
             l
         }
         ExprKind::Unary { op: UnOp::Not, arg } => {
-            let mut v = cond_dest(arg, thir);
+            logical_exprs.insert(expr_id);
+            let mut v = cond_dest(arg, thir, logical_exprs);
             for c in &mut v {
                 c.when_true = c.when_true.map(|b| !b);
                 c.when_false = c.when_false.map(|b| !b);
@@ -459,24 +631,24 @@ fn cond_dest(expr_id: ExprId, thir: &Thir<'_>) -> Vec<CondWithDest> {
     }
 }
 
-#[inline]
-fn is_place(expr: &Expr) -> bool {
-    matches!(
-        expr.kind,
-        ExprKind::Literal { .. }
-            | ExprKind::Deref { .. }
-            | ExprKind::Field { .. }
-            | ExprKind::Index { .. }
-            | ExprKind::VarRef { .. }
-            | ExprKind::UpvarRef { .. }
-    )
-}
-
+/// MIR assignment statement
 struct Assign<'a, 'tcx> {
     ty: Ty<'tcx>,
     rvalue: &'a Rvalue<'tcx>,
     loc: Location,
     span: LoHi,
+}
+
+/// MIR basic blocks related to THIR If expression
+struct IfBlocks {
+    /// The block reached first when the condition is true.
+    true_entry: BasicBlock,
+    /// The block reached first when the condition is false.
+    false_entry: BasicBlock,
+    /// All the blocks for the true branch.
+    true_blocks: FxHashSet<BasicBlock>,
+    /// All the blocks for the false branch. Empty when there is no else branch.
+    false_blocks: FxHashSet<BasicBlock>,
 }
 
 struct Ctx<'a, 'tcx> {
@@ -486,8 +658,42 @@ struct Ctx<'a, 'tcx> {
     stmt_span_to_locs: &'a FxHashMap<LoHi, Locations>,
     term_span_to_locs: &'a FxHashMap<LoHi, Locations>,
 
+    /// Rhs expression to the corresponding MIR assignment statement.
     rhs_to_assigns: FxHashMap<ExprId, Assign<'a, 'tcx>>,
+
+    /// Logical expressions (And, Or, Neg) used in the condition of an If or as an lhs or an rhs of
+    /// another And or Or. The result of such an expression is not stored to a Local.
+    nested_logical_exprs: FxHashSet<ExprId>,
+
+    /// expression to relavant locations
+    ///
+    /// For `Binary`, `Unary`, `Cast`, `PointerCoercion`, `Borrow`, `RawBorrow`, `Repeat`, `Array`,
+    /// `Tuple`, and `Adt`, the location of the single statement evaluating the expression. The lhs
+    /// stores the result.
+    ///
+    /// For `Deref`, `Field`, `Index`, `VarRef`, and `UpvarRef`, the location of the single
+    /// statement evaluating the expression. Such a statement may not exist if the expression is an
+    /// lvalue or a part of a longer place expression.
+    ///
+    /// For `LogicalOp`, the location of the single statement storing true or false as the result
+    /// *and* the locations of possibly multiple terminators performing the jump from other
+    /// branches.
+    ///
+    /// For `Assign` and `AssignOp`, the location of the single statement performing the
+    /// assignment.
+    ///
+    /// For `Break` and `Return`, the locations of possibly *multiple* terminators performing the
+    /// jump or the single statement that assigns the value associated with the expression.
     expr_id_to_locs: FxHashMap<ExprId, Locations>,
+
+    /// THIR block to MIR basic blocks
+    block_to_bbs: FxHashMap<BlockId, FxHashSet<BasicBlock>>,
+
+    /// THIR loop to MIR basic blocks
+    loop_to_bbs: FxHashMap<ExprId, FxHashSet<BasicBlock>>,
+
+    /// THIR If expression to MIR basic blocks
+    if_to_bbs: FxHashMap<ExprId, IfBlocks>,
 }
 
 impl<'a, 'tcx> Ctx<'a, 'tcx> {
@@ -573,7 +779,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             matches!(k, TerminatorKind::SwitchInt { .. })
         })?;
         let term = self.get_terminator(loc);
-        let TerminatorKind::SwitchInt { targets, .. } = &term.kind else { unreachable!() };
+        let TerminatorKind::SwitchInt { targets, .. } = &term.kind else { panic!() };
         Some(targets)
     }
 
@@ -611,28 +817,45 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         })
     }
 
-    fn handle_rvalue<P: Fn(&Rvalue<'tcx>) -> bool>(&mut self, expr_id: ExprId, pred: P) {
+    fn handle_rvalue_opt<P: Fn(&Rvalue<'tcx>) -> bool>(
+        &mut self,
+        expr_id: ExprId,
+        pred: P,
+    ) -> Result<(), LoHi> {
         let expr = &self.thir[expr_id];
         if let Some(loc) = self.find_rvalue_location(expr_id, &pred) {
             self.expr_id_to_locs.insert(expr_id, smallvec![loc]);
+            Ok(())
         } else if let Some(assign) = self.rhs_to_assigns.get(&expr_id) {
             if expr.ty == assign.ty && pred(assign.rvalue) {
                 self.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
+                Ok(())
             } else {
-                self.print_debug(assign.span);
+                Err(assign.span)
             }
         } else {
-            self.print_debug(expr.span.into());
+            Err(expr.span.into())
         }
     }
 
-    fn find_assign_location(&self, ty: Ty<'tcx>, span: LoHi) -> Option<Assign<'a, 'tcx>> {
+    fn handle_rvalue<P: Fn(&Rvalue<'tcx>) -> bool>(&mut self, expr_id: ExprId, pred: P) {
+        if let Err(span) = self.handle_rvalue_opt(expr_id, pred) {
+            self.print_debug(span);
+        }
+    }
+
+    fn find_assign_location(
+        &self,
+        ty: Ty<'tcx>,
+        span: LoHi,
+        allow_checks: bool,
+    ) -> Option<Assign<'a, 'tcx>> {
         let locs = self.stmt_span_to_locs.get(&span)?;
         for (i, loc) in locs.iter().enumerate() {
             let stmt = self.get_statement(*loc);
             let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
             if i < locs.len() - 1 {
-                if !matches!(rhs, Rvalue::CopyForDeref(_)) {
+                if !allow_checks && !matches!(rhs, Rvalue::CopyForDeref(_)) {
                     break;
                 }
             } else {
@@ -738,7 +961,7 @@ struct BindingVisitor<'a, 'tcx> {
     #[allow(unused)]
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
-    bindings: FxHashMap<Span, HirId>,
+    bindings: FxHashMap<Span, (HirId, Ty<'tcx>)>,
 }
 
 impl<'a, 'tcx> TVisitor<'a, 'tcx> for BindingVisitor<'a, 'tcx> {
@@ -747,9 +970,9 @@ impl<'a, 'tcx> TVisitor<'a, 'tcx> for BindingVisitor<'a, 'tcx> {
     }
 
     fn visit_pat(&mut self, pat: &'a Pat<'tcx>) {
-        if let PatKind::Binding { var, .. } = pat.kind {
-            let old = self.bindings.insert(pat.span, var.0);
-            if let Some(old) = old {
+        if let PatKind::Binding { var, ty, .. } = pat.kind {
+            let old = self.bindings.insert(pat.span, (var.0, ty));
+            if let Some((old, _)) = old {
                 let old = self.tcx.hir_name(old);
                 let var = self.tcx.hir_name(var.0);
                 println!("{old} {var}");
