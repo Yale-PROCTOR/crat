@@ -1593,7 +1593,7 @@ impl AbsInt {
     }
 
     fn neg(&self) -> Self {
-        self.unary(|n| -n)
+        self.unary(|n| n.wrapping_neg())
     }
 
     fn to_i8(&self) -> Self {
@@ -1670,15 +1670,15 @@ impl AbsInt {
     }
 
     pub fn add(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 + n2)
+        self.binary(other, |n1, n2| n1.wrapping_add(n2))
     }
 
     fn sub(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 - n2)
+        self.binary(other, |n1, n2| n1.wrapping_sub(n2))
     }
 
     fn mul(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 * n2)
+        self.binary(other, |n1, n2| n1.wrapping_mul(n2))
     }
 
     fn binary_nz<F: Fn(i128, i128) -> i128>(&self, other: &Self, f: F) -> Self {
@@ -1699,11 +1699,11 @@ impl AbsInt {
     }
 
     fn div(&self, other: &Self) -> Self {
-        self.binary_nz(other, |n1, n2| n1 / n2)
+        self.binary_nz(other, |n1, n2| n1.wrapping_div(n2))
     }
 
     fn rem(&self, other: &Self) -> Self {
-        self.binary_nz(other, |n1, n2| n1 % n2)
+        self.binary_nz(other, |n1, n2| n1.wrapping_rem(n2))
     }
 
     fn bit_xor(&self, other: &Self) -> Self {
@@ -1977,15 +1977,15 @@ impl AbsUint {
     }
 
     fn add(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 + n2)
+        self.binary(other, |n1, n2| n1.wrapping_add(n2))
     }
 
     fn sub(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 - n2)
+        self.binary(other, |n1, n2| n1.wrapping_sub(n2))
     }
 
     fn mul(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 * n2)
+        self.binary(other, |n1, n2| n1.wrapping_mul(n2))
     }
 
     fn binary_nz<F: Fn(u128, u128) -> u128>(&self, other: &Self, f: F) -> Self {
@@ -2006,11 +2006,11 @@ impl AbsUint {
     }
 
     fn div(&self, other: &Self) -> Self {
-        self.binary_nz(other, |n1, n2| n1 / n2)
+        self.binary_nz(other, |n1, n2| n1.wrapping_div(n2))
     }
 
     fn rem(&self, other: &Self) -> Self {
-        self.binary_nz(other, |n1, n2| n1 % n2)
+        self.binary_nz(other, |n1, n2| n1.wrapping_rem(n2))
     }
 
     fn bit_xor(&self, other: &Self) -> Self {
