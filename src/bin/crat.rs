@@ -201,9 +201,16 @@ fn main() {
         config.r#union.points_to_file = args.points_to_file.clone();
     }
 
-    if let Some(v) = args.outparam_max_loop_head_states {
-        config.outparam.max_loop_head_states = v;
-    }
+    config.outparam.max_loop_head_states = if let Some(v) = args.outparam_max_loop_head_states {
+        if v == 0 {
+            eprintln!("max_loop_head_states should be greater than 0");
+            std::process::exit(1);
+        }
+        v
+    } else {
+        usize::MAX
+    };
+
     config.outparam.check_global_alias |= args.outparam_check_global_alias;
     config.outparam.check_param_alias |= args.outparam_check_param_alias;
     config.outparam.no_widening |= args.outparam_no_widening;
