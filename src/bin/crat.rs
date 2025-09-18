@@ -35,7 +35,7 @@ struct Args {
     union_target: Vec<String>,
 
     // OutParam
-    #[arg(long, help = "Maximum number of states at loop heads")]
+    #[arg(long, value_parser = max_sensitivity_in_range, help = "Maximum number of states at loop heads")]
     outparam_max_loop_head_states: Option<usize>,
     #[arg(
         long,
@@ -58,7 +58,11 @@ struct Args {
         help = "Print the analysis times for the n functions with the longest times."
     )]
     outparam_function_times: Option<usize>,
-    #[arg(long, help = "Print analysis results of the specified functions")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Print analysis results of the specified functions"
+    )]
     outparam_print_functions: Vec<String>,
 
     #[arg(short, long, help = "Enable verbose output")]
@@ -208,27 +212,27 @@ fn main() {
         config.r#union.points_to_file = args.points_to_file.clone();
     }
 
-    config.outparam.max_loop_head_states = if let Some(v) = args.outparam_max_loop_head_states {
-        if v == 0 {
-            eprintln!("max_loop_head_states should be greater than 0");
-            std::process::exit(1);
-        }
-        v
-    } else {
-        usize::MAX
-    };
+    if let Some(v) = args.outparam_max_loop_head_states {
+        config.outparam.max_loop_head_states = v;
+    }
+
+    if config.outparam.max_loop_head_states == 0 {
+        config.outparam.max_loop_head_states = usize::MAX;
+    }
 
     config.outparam.check_global_alias |= args.outparam_check_global_alias;
     config.outparam.check_param_alias |= args.outparam_check_param_alias;
     config.outparam.no_widening |= args.outparam_no_widening;
     config.outparam.simplify |= args.outparam_simplify;
 
-    config.outparam.function_times = args.outparam_function_times;
     config
         .outparam
         .print_functions
         .extend(args.outparam_print_functions);
 
+    if args.outparam_function_times.is_some() {
+        config.outparam.function_times = args.outparam_function_times;
+    }
     if args.outparam_analysis_file.is_some() {
         config.outparam.analysis_file = args.outparam_analysis_file;
     }
@@ -377,5 +381,16 @@ fn copy_dir(src: &Path, dst: &Path, root: bool) {
             fs::create_dir(&dst_path).unwrap();
             copy_dir(&src_path, &dst_path, false);
         }
+    }
+}
+
+fn max_sensitivity_in_range(s: &str) -> Result<usize, String> {
+    let m: usize = s
+        .parse()
+        .map_err(|_| "max_loop_head_states must be a positive integer".to_string())?;
+    if m == 0 {
+        Err("max_loop_head_states must be greater than 0".to_string())
+    } else {
+        Ok(m)
     }
 }

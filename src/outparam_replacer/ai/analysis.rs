@@ -40,7 +40,7 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    compile_util, graph_util,
+    graph_util, ir_util,
     points_to::andersen::{self, Loc},
     ty_shape,
 };
@@ -217,7 +217,7 @@ pub fn analyze(
         callees.retain(|callee| funcs.contains(callee));
     }
 
-    let sccs = graph_util::sccs_copied::<DefId, true>(&call_graph);
+    let sccs = graph_util::sccs_copied::<DefId, false>(&call_graph);
     let transitive = graph_util::reflexive_transitive_closure(&call_graph);
     let po: Vec<_> = sccs.post_order().collect();
 
@@ -572,7 +572,7 @@ pub fn analyze(
             let f = tcx.def_path(*def_id).to_string_no_crate_verbose();
             let body = tcx.optimized_mir(*def_id);
             let blocks = body.basic_blocks.len();
-            let stmts = compile_util::body_size(body);
+            let stmts = ir_util::body_size(body);
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
     }
