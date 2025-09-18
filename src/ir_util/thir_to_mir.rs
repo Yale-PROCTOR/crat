@@ -1,10 +1,10 @@
 use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{BodyOwnerKind, HirId, def::DefKind};
+use rustc_hir::{BodyOwnerKind, HirId, def::DefKind, def_id::LocalDefId};
 use rustc_middle::{
     mir::{
-        AggregateKind, AssignOp, BasicBlock, BinOp, Body, CastKind, Location, Operand, Place,
-        Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
+        AggregateKind, AssignOp, BasicBlock, BinOp, Body, CastKind, Local, Location, Operand,
+        Place, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
     thir::{
         self, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
@@ -15,36 +15,62 @@ use rustc_middle::{
 use rustc_span::{BytePos, Span};
 use smallvec::{SmallVec, smallvec};
 
-type Locations = SmallVec<[Location; 1]>;
+pub type ThirToMir = FxHashMap<LocalDefId, ThirToMirBody>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct LoHi {
-    lo: BytePos,
-    hi: BytePos,
+/// `Thir` of THIR to `Body` of MIR
+#[derive(Debug, Default)]
+pub struct ThirToMirBody {
+    /// THIR binding's `HirId` to the corresponding MIR `Local`
+    pub binding_to_local: FxHashMap<HirId, Local>,
+
+    /// Thir expression to relavant locations
+    ///
+    /// For `Binary`, `Unary`, `Cast`, `PointerCoercion`, `Borrow`, `RawBorrow`, `Repeat`, `Array`,
+    /// `Tuple`, and `Adt`, the location of the single statement evaluating the expression. The lhs
+    /// stores the result.
+    ///
+    /// For `Deref`, `Field`, `Index`, `VarRef`, and `UpvarRef`, the location of the single
+    /// statement evaluating the expression. Such a statement may not exist if the expression is an
+    /// lvalue or a part of a longer place expression.
+    ///
+    /// For `LogicalOp`, the location of the single statement storing true or false as the result
+    /// *and* the locations of possibly multiple terminators performing the jump from other
+    /// branches.
+    ///
+    /// For `Assign` and `AssignOp`, the location of the single statement performing the
+    /// assignment.
+    ///
+    /// For `Return`, the locations of *possibly multiple* statements that assign the return value
+    /// to _0. When no return value is specified, the statement is _0 = (). When the return value
+    /// is an If, there are multiple statements, one for each branch.
+    ///
+    /// For `Break`, the locations of possibly *multiple* statements, just like for `Return`.
+    /// Currently, only the case without a value is supported.
+    pub expr_to_locs: FxHashMap<ExprId, Locations>,
+
+    /// THIR `Block` to MIR basic blocks
+    pub block_to_bbs: FxHashMap<BlockId, FxHashSet<BasicBlock>>,
+
+    /// THIR `Loop` expression to MIR basic blocks
+    pub loop_to_bbs: FxHashMap<ExprId, FxHashSet<BasicBlock>>,
+
+    /// THIR `If` expression to MIR basic blocks
+    pub if_to_bbs: FxHashMap<ExprId, IfBlocks>,
 }
 
-impl From<Span> for LoHi {
-    #[inline]
-    fn from(span: Span) -> Self {
-        Self {
-            lo: span.lo(),
-            hi: span.hi(),
-        }
-    }
-}
+pub type Locations = SmallVec<[Location; 1]>;
 
-impl From<LoHi> for Span {
-    #[inline]
-    fn from(lohi: LoHi) -> Self {
-        Self::with_root_ctxt(lohi.lo, lohi.hi)
-    }
-}
-
-impl std::fmt::Debug for LoHi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let span: Span = (*self).into();
-        span.fmt(f)
-    }
+/// MIR basic blocks related to THIR If expression
+#[derive(Debug)]
+pub struct IfBlocks {
+    /// The block reached first when the condition is true.
+    pub true_entry: BasicBlock,
+    /// The block reached first when the condition is false.
+    pub false_entry: BasicBlock,
+    /// All the blocks for the true branch.
+    pub true_blocks: FxHashSet<BasicBlock>,
+    /// All the blocks for the false branch. Empty when there is no else branch.
+    pub false_blocks: FxHashSet<BasicBlock>,
 }
 
 pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
@@ -89,13 +115,19 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             }
         }
 
+        let mut binding_to_local = FxHashMap::default();
         for (hir_id, _) in visitor.bindings.values() {
             let locals = var_to_locals.get(hir_id);
             if let Some(locals) = locals
-                && locals.len() == 1
+                && let [local, ..] = &locals[..]
             {
+                binding_to_local.insert(*hir_id, *local);
             } else {
-                println!("{hir_id:?} {locals:?}");
+                println!(
+                    "{hir_id:?} {} {}",
+                    tcx.def_path_str(hir_id.owner.def_id),
+                    tcx.hir_name(*hir_id)
+                );
             }
         }
 
@@ -132,16 +164,16 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
             tcx,
             thir: &thir,
             body: &body,
-            stmt_span_to_locs: &stmt_span_to_locs,
-            term_span_to_locs: &term_span_to_locs,
+
+            stmt_span_to_locs,
+            term_span_to_locs,
 
             rhs_to_assigns: FxHashMap::default(),
             nested_logical_exprs: FxHashSet::default(),
-            expr_id_to_locs: FxHashMap::default(),
-            block_to_bbs: FxHashMap::default(),
-            loop_to_bbs: FxHashMap::default(),
-            if_to_bbs: FxHashMap::default(),
+
+            thir_to_mir: ThirToMirBody::default(),
         };
+        ctx.thir_to_mir.binding_to_local = binding_to_local;
 
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
             match expr.kind {
@@ -155,7 +187,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     } else if let Some(assign) =
                         ctx.find_assign_location(thir[lhs].ty, expr.span.into(), false)
                     {
-                        ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
+                        ctx.thir_to_mir
+                            .expr_to_locs
+                            .insert(expr_id, smallvec![assign.loc]);
                         ctx.rhs_to_assigns.insert(unwrap_expr(rhs, &thir), assign);
                     } else {
                         ctx.print_debug(expr.span.into());
@@ -207,7 +241,6 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             for target1 in targets {
                                 target.retain(|bb| target1.contains(bb));
                             }
-                            assert!(target.len() == 1, "{target:?}");
                             target[0]
                         }
                     };
@@ -220,7 +253,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         true_blocks: FxHashSet::default(),
                         false_blocks: FxHashSet::default(),
                     };
-                    ctx.if_to_bbs.insert(expr_id, if_blocks);
+                    ctx.thir_to_mir.if_to_bbs.insert(expr_id, if_blocks);
 
                     if let Some(continue_id) = unique_continue_of_block(then, &thir) {
                         let bb = &body.basic_blocks[true_target];
@@ -230,7 +263,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             block: true_target,
                             statement_index: bb.statements.len(),
                         };
-                        ctx.expr_id_to_locs.insert(continue_id, smallvec![location]);
+                        ctx.thir_to_mir
+                            .expr_to_locs
+                            .insert(continue_id, smallvec![location]);
                     }
                     if let Some(els) = else_opt
                         && let Some(continue_id) = unique_continue_of_block(els, &thir)
@@ -242,7 +277,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             block: false_target,
                             statement_index: bb.statements.len(),
                         };
-                        ctx.expr_id_to_locs.insert(continue_id, smallvec![location]);
+                        ctx.thir_to_mir
+                            .expr_to_locs
+                            .insert(continue_id, smallvec![location]);
                     }
                 }
                 ExprKind::LogicalOp { lhs, rhs, .. } => {
@@ -276,7 +313,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         .find_call_location(expr_id)
                         .or_else(|| ctx.find_transmute_location(expr_id))
                     {
-                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
+                        ctx.thir_to_mir.expr_to_locs.insert(expr_id, smallvec![loc]);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -284,7 +321,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::ByUse { .. } => panic!(),
                 ExprKind::Binary { op, .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| {
-                        if overflow_check && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                        if overflow_check
+                            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                            && expr.ty.is_integral()
+                        {
                             matches!(rvalue, Rvalue::Use(Operand::Move(_)))
                         } else if let Rvalue::BinaryOp(mop, _) = rvalue {
                             *mop == op
@@ -309,7 +349,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             let mut locs = SmallVec::with_capacity(1 + terms.len());
                             locs.push(stmt);
                             locs.extend(terms);
-                            ctx.expr_id_to_locs.insert(expr_id, locs);
+                            ctx.thir_to_mir.expr_to_locs.insert(expr_id, locs);
                         } else {
                             ctx.print_debug(expr.span.into());
                         }
@@ -354,7 +394,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         expr.span.into(),
                         matches!(op, AssignOp::DivAssign | AssignOp::RemAssign),
                     ) {
-                        ctx.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
+                        ctx.thir_to_mir
+                            .expr_to_locs
+                            .insert(expr_id, smallvec![assign.loc]);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -369,7 +411,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     // TODO: handle break with value
                     assert!(value.is_none());
                     if let Some(loc) = ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()) {
-                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
+                        ctx.thir_to_mir.expr_to_locs.insert(expr_id, smallvec![loc]);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -399,7 +441,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                             .map(|loc| smallvec![loc])
                     };
                     if let Some(locs) = locs {
-                        ctx.expr_id_to_locs.insert(expr_id, locs);
+                        ctx.thir_to_mir.expr_to_locs.insert(expr_id, locs);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -452,20 +494,20 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     visitor.visit_expr(expr);
                     let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
                     if !bbs.is_empty() {
-                        ctx.block_to_bbs.insert(block, bbs);
+                        ctx.thir_to_mir.block_to_bbs.insert(block, bbs);
                     } else if let Err(span) = ctx.handle_rvalue_opt(expr_id, |_| true) {
                         ctx.print_debug(span);
                     } else {
-                        let locs = ctx.expr_id_to_locs.get(&expr_id).unwrap();
+                        let locs = ctx.thir_to_mir.expr_to_locs.get(&expr_id).unwrap();
                         let bbs = locs.iter().map(|loc| loc.block).collect();
-                        ctx.block_to_bbs.insert(block, bbs);
+                        ctx.thir_to_mir.block_to_bbs.insert(block, bbs);
                     }
                 }
                 ExprKind::Loop { body } => {
                     let body = unwrap_expr(body, &thir);
                     let ExprKind::Block { block } = thir[body].kind else { panic!() };
-                    if let Some(bbs) = ctx.block_to_bbs.get(&block) {
-                        ctx.loop_to_bbs.insert(expr_id, bbs.clone());
+                    if let Some(bbs) = ctx.thir_to_mir.block_to_bbs.get(&block) {
+                        ctx.thir_to_mir.loop_to_bbs.insert(expr_id, bbs.clone());
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -473,8 +515,8 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::If { then, else_opt, .. } => {
                     let then = unwrap_expr(then, &thir);
                     let ExprKind::Block { block } = thir[then].kind else { panic!() };
-                    if let Some(bbs) = ctx.block_to_bbs.get(&block) {
-                        let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
+                    if let Some(bbs) = ctx.thir_to_mir.block_to_bbs.get(&block) {
+                        let if_blocks = ctx.thir_to_mir.if_to_bbs.get_mut(&expr_id).unwrap();
                         if_blocks.true_blocks = bbs.clone();
                         if_blocks.true_blocks.insert(if_blocks.true_entry);
                     } else {
@@ -483,40 +525,26 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
 
                     if let Some(els) = else_opt {
                         let els = unwrap_expr(els, &thir);
-                        match thir[els].kind {
-                            ExprKind::Block { block } => {
-                                if let Some(bbs) = ctx.block_to_bbs.get(&block) {
-                                    let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
-                                    if_blocks.false_blocks = bbs.clone();
-                                    if_blocks.false_blocks.insert(if_blocks.false_entry);
-                                } else {
-                                    ctx.print_debug(thir[els].span.into())
-                                }
-                            }
-                            ExprKind::If { .. } => {
-                                let mut visitor = ExprVisitor {
-                                    tcx,
-                                    thir: &thir,
-                                    exprs: FxHashSet::default(),
-                                };
-                                visitor.visit_expr(&thir[els]);
-                                let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
-                                if !bbs.is_empty() {
-                                    let if_blocks = ctx.if_to_bbs.get_mut(&expr_id).unwrap();
-                                    if_blocks.false_blocks = bbs;
-                                    if_blocks.false_blocks.insert(if_blocks.false_entry);
-                                    debug_assert_eq!(
-                                        if_blocks
-                                            .true_blocks
-                                            .intersection(&if_blocks.false_blocks)
-                                            .count(),
-                                        0
-                                    );
-                                } else {
-                                    ctx.print_debug(thir[els].span.into());
-                                }
-                            }
-                            _ => panic!(),
+                        let mut visitor = ExprVisitor {
+                            tcx,
+                            thir: &thir,
+                            exprs: FxHashSet::default(),
+                        };
+                        visitor.visit_expr(&thir[els]);
+                        let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+                        if !bbs.is_empty() {
+                            let if_blocks = ctx.thir_to_mir.if_to_bbs.get_mut(&expr_id).unwrap();
+                            if_blocks.false_blocks = bbs;
+                            if_blocks.false_blocks.insert(if_blocks.false_entry);
+                            debug_assert_eq!(
+                                if_blocks
+                                    .true_blocks
+                                    .intersection(&if_blocks.false_blocks)
+                                    .count(),
+                                0
+                            );
+                        } else {
+                            ctx.print_debug(thir[els].span.into());
                         }
                     }
                 }
@@ -638,24 +666,12 @@ struct Assign<'a, 'tcx> {
     span: LoHi,
 }
 
-/// MIR basic blocks related to THIR If expression
-struct IfBlocks {
-    /// The block reached first when the condition is true.
-    true_entry: BasicBlock,
-    /// The block reached first when the condition is false.
-    false_entry: BasicBlock,
-    /// All the blocks for the true branch.
-    true_blocks: FxHashSet<BasicBlock>,
-    /// All the blocks for the false branch. Empty when there is no else branch.
-    false_blocks: FxHashSet<BasicBlock>,
-}
-
 struct Ctx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
     body: &'a Body<'tcx>,
-    stmt_span_to_locs: &'a FxHashMap<LoHi, Locations>,
-    term_span_to_locs: &'a FxHashMap<LoHi, Locations>,
+    stmt_span_to_locs: FxHashMap<LoHi, Locations>,
+    term_span_to_locs: FxHashMap<LoHi, Locations>,
 
     /// Rhs expression to the corresponding MIR assignment statement.
     rhs_to_assigns: FxHashMap<ExprId, Assign<'a, 'tcx>>,
@@ -664,39 +680,7 @@ struct Ctx<'a, 'tcx> {
     /// another And or Or. The result of such an expression is not stored to a Local.
     nested_logical_exprs: FxHashSet<ExprId>,
 
-    /// expression to relavant locations
-    ///
-    /// For `Binary`, `Unary`, `Cast`, `PointerCoercion`, `Borrow`, `RawBorrow`, `Repeat`, `Array`,
-    /// `Tuple`, and `Adt`, the location of the single statement evaluating the expression. The lhs
-    /// stores the result.
-    ///
-    /// For `Deref`, `Field`, `Index`, `VarRef`, and `UpvarRef`, the location of the single
-    /// statement evaluating the expression. Such a statement may not exist if the expression is an
-    /// lvalue or a part of a longer place expression.
-    ///
-    /// For `LogicalOp`, the location of the single statement storing true or false as the result
-    /// *and* the locations of possibly multiple terminators performing the jump from other
-    /// branches.
-    ///
-    /// For `Assign` and `AssignOp`, the location of the single statement performing the
-    /// assignment.
-    ///
-    /// For `Return`, the locations of *possibly multiple* statements that assign the return value
-    /// to _0. When no return value is specified, the statement is _0 = (). When the return value
-    /// is an If, there are multiple statements, one for each branch.
-    ///
-    /// For `Break`, the locations of possibly *multiple* statements, just like for `Return`.
-    /// Currently, only the case without a value is supported.
-    expr_id_to_locs: FxHashMap<ExprId, Locations>,
-
-    /// THIR block to MIR basic blocks
-    block_to_bbs: FxHashMap<BlockId, FxHashSet<BasicBlock>>,
-
-    /// THIR loop to MIR basic blocks
-    loop_to_bbs: FxHashMap<ExprId, FxHashSet<BasicBlock>>,
-
-    /// THIR If expression to MIR basic blocks
-    if_to_bbs: FxHashMap<ExprId, IfBlocks>,
+    thir_to_mir: ThirToMirBody,
 }
 
 impl<'a, 'tcx> Ctx<'a, 'tcx> {
@@ -720,7 +704,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         expr_id: ExprId,
         pred: P,
     ) -> Option<Locations> {
-        self.find_locations(expr_id, self.stmt_span_to_locs, |loc| {
+        self.find_locations(expr_id, &self.stmt_span_to_locs, |loc| {
             let stmt = self.get_statement(loc);
             let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
             pred(lhs, rhs)
@@ -748,7 +732,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         expr_id: ExprId,
         pred: P,
     ) -> Option<Locations> {
-        self.find_locations(expr_id, self.term_span_to_locs, |loc| {
+        self.find_locations(expr_id, &self.term_span_to_locs, |loc| {
             let term = self.get_terminator(loc);
             pred(&term.kind)
         })
@@ -819,11 +803,15 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     ) -> Result<(), LoHi> {
         let expr = &self.thir[expr_id];
         if let Some(loc) = self.find_rvalue_location(expr_id, &pred) {
-            self.expr_id_to_locs.insert(expr_id, smallvec![loc]);
+            self.thir_to_mir
+                .expr_to_locs
+                .insert(expr_id, smallvec![loc]);
             Ok(())
         } else if let Some(assign) = self.rhs_to_assigns.get(&expr_id) {
             if expr.ty == assign.ty && pred(assign.rvalue) {
-                self.expr_id_to_locs.insert(expr_id, smallvec![assign.loc]);
+                self.thir_to_mir
+                    .expr_to_locs
+                    .insert(expr_id, smallvec![assign.loc]);
                 Ok(())
             } else {
                 Err(assign.span)
@@ -885,7 +873,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     fn collect_basic_blocks(&self, exprs: impl Iterator<Item = ExprId>) -> FxHashSet<BasicBlock> {
         let mut bbs = FxHashSet::default();
         for expr in exprs {
-            let locs = some_or!(self.expr_id_to_locs.get(&expr), continue);
+            let locs = some_or!(self.thir_to_mir.expr_to_locs.get(&expr), continue);
             for loc in locs {
                 bbs.insert(loc.block);
             }
@@ -968,5 +956,35 @@ impl<'a, 'tcx> TVisitor<'a, 'tcx> for ExprVisitor<'a, 'tcx> {
             self.exprs.insert(value);
         }
         thir::visit::walk_expr(self, expr);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LoHi {
+    lo: BytePos,
+    hi: BytePos,
+}
+
+impl From<Span> for LoHi {
+    #[inline]
+    fn from(span: Span) -> Self {
+        Self {
+            lo: span.lo(),
+            hi: span.hi(),
+        }
+    }
+}
+
+impl From<LoHi> for Span {
+    #[inline]
+    fn from(lohi: LoHi) -> Self {
+        Self::with_root_ctxt(lohi.lo, lohi.hi)
+    }
+}
+
+impl std::fmt::Debug for LoHi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span: Span = (*self).into();
+        span.fmt(f)
     }
 }
