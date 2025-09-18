@@ -2822,9 +2822,10 @@ impl AbsPtr {
     pub fn get_arg(&self) -> Option<ArgIdx> {
         if let Self::Set(ptrs) = self
             && ptrs.len() == 1
-                && let AbsBase::Arg(i) = &ptrs.first().unwrap().base {
-                    return Some(*i);
-                }
+            && let AbsBase::Arg(i) = &ptrs.first().unwrap().base
+        {
+            return Some(*i);
+        }
         None
     }
 

@@ -424,16 +424,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 match &sig.decl.output {
                     hir::FnRetTy::Return(ty) => {
                         if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind
-                            && let hir::def::Res::Def(_, def_id) = path.res {
-                                let ty = self.def_id_to_string(def_id);
-                                let ty = ty.split("::").last().unwrap();
-                                let v = match ty {
-                                    "c_int" => AbsValue::top_int(),
-                                    "c_uint" => AbsValue::top_uint(),
-                                    _ => AbsValue::top(),
-                                };
-                                return v;
-                            }
+                            && let hir::def::Res::Def(_, def_id) = path.res
+                        {
+                            let ty = self.def_id_to_string(def_id);
+                            let ty = ty.split("::").last().unwrap();
+                            let v = match ty {
+                                "c_int" => AbsValue::top_int(),
+                                "c_uint" => AbsValue::top_uint(),
+                                _ => AbsValue::top(),
+                            };
+                            return v;
+                        }
                     }
                     hir::FnRetTy::DefaultReturn(_) => {
                         let name = item.ident.name.to_ident_string();
@@ -479,9 +480,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .filter_map(|(i, ty)| {
                 if let TyKind::RawPtr(ty, _) = ty.kind() {
                     if let TyKind::Adt(adt, _) = ty.kind()
-                        && self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
-                            return None;
-                        }
+                        && self.def_id_to_string(adt.did()).ends_with("::_IO_FILE")
+                    {
+                        return None;
+                    }
                     return Some(i);
                 }
                 None
@@ -1264,22 +1266,24 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
     fn get_write_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
         if let AbsPtr::Set(ptrs) = ptr
-            && ptrs.len() == 1 {
-                let mut ptr = ptrs.first().unwrap().clone();
-                ptr.projections.extend(projection.to_owned());
-                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.ptr_params) {
-                    return self.expands_path(&path);
-                }
+            && ptrs.len() == 1
+        {
+            let mut ptr = ptrs.first().unwrap().clone();
+            ptr.projections.extend(projection.to_owned());
+            if let Some((path, false)) = AbsPath::from_place(&ptr, &self.ptr_params) {
+                return self.expands_path(&path);
             }
+        }
         vec![]
     }
 
     fn get_write_bases_of_ptr(&self, ptr: &AbsPtr) -> Option<Vec<AbsBase>> {
         if let AbsPtr::Set(ptrs) = ptr
-            && ptrs.len() == 1 {
-                let ptr = ptrs.first().unwrap().clone();
-                return Some(vec![ptr.base]);
-            }
+            && ptrs.len() == 1
+        {
+            let ptr = ptrs.first().unwrap().clone();
+            return Some(vec![ptr.base]);
+        }
         None
     }
 
