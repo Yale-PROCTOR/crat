@@ -53,6 +53,13 @@ struct Args {
     outparam_simplify: bool,
     #[arg(long, help = "File containing the result of output parameter analysis")]
     outparam_analysis_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Print analysis times of the functions with top-n analysis time"
+    )]
+    outparam_function_times: Option<usize>,
+    #[arg(long, help = "Print analysis results of the specified functions")]
+    outparam_print_functions: Vec<String>,
 
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
@@ -215,6 +222,13 @@ fn main() {
     config.outparam.check_param_alias |= args.outparam_check_param_alias;
     config.outparam.no_widening |= args.outparam_no_widening;
     config.outparam.simplify |= args.outparam_simplify;
+
+    config.outparam.function_times = args.outparam_function_times;
+    config
+        .outparam
+        .print_functions
+        .extend(args.outparam_print_functions);
+
     if args.outparam_analysis_file.is_some() {
         config.outparam.analysis_file = args.outparam_analysis_file;
     }

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt::Write as _,
     path::Path,
 };
 
@@ -27,6 +28,7 @@ use rustc_mir_dataflow::Analysis as _;
 use rustc_span::{
     Span,
     def_id::{DefId, LocalDefId},
+    source_map::SourceMap,
 };
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -38,7 +40,7 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    graph_util,
+    compile_util, graph_util,
     points_to::andersen::{self, Loc},
     ty_shape,
 };
@@ -324,6 +326,13 @@ pub fn analyze(
                     call_info_map,
                     is_merged,
                 } = analyzer.analyze_body(body);
+                if config.print_functions.contains(&tcx.def_path_str(def_id)) {
+                    tracing::info!(
+                        "{:?}\n{}",
+                        def_id,
+                        analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
+                    );
+                }
 
                 let ret_location = return_location(body);
 
@@ -554,6 +563,18 @@ pub fn analyze(
     if config.max_loop_head_states <= 1 {
         wbrs.clear();
         rcfws.clear();
+    }
+
+    if let Some(n) = &config.function_times {
+        let mut analysis_times: Vec<_> = analysis_times.into_iter().collect();
+        analysis_times.sort_by_key(|(_, t)| u128::MAX - *t);
+        for (def_id, t) in analysis_times.iter().take(*n) {
+            let f = tcx.def_path(*def_id).to_string_no_crate_verbose();
+            let body = tcx.optimized_mir(*def_id);
+            let blocks = body.basic_blocks.len();
+            let stmts = compile_util::body_size(body);
+            println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
+        }
     }
 
     summaries
@@ -1898,4 +1919,48 @@ impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
         }
         self.super_statement(stmt, location);
     }
+}
+
+// For debugging
+fn analysis_result_to_string(
+    body: &Body<'_>,
+    states: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
+    source_map: &SourceMap,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut res = String::new();
+    for block in body.basic_blocks.indices() {
+        let bbd = &body.basic_blocks[block];
+        writeln!(&mut res, "block {block:?}")?;
+        for (statement_index, stmt) in bbd.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            if let Some(states) = states.get(&location) {
+                for state in states.values() {
+                    writeln!(&mut res, "{state:?}")?;
+                }
+            }
+            writeln!(&mut res, "{stmt:?}")?;
+            if let Ok(s) = source_map.span_to_snippet(stmt.source_info.span) {
+                writeln!(&mut res, "{s}")?;
+            }
+        }
+        if let Some(terminator) = bbd.terminator.as_ref() {
+            let location = Location {
+                block,
+                statement_index: bbd.statements.len(),
+            };
+            if let Some(states) = states.get(&location) {
+                for state in states.values() {
+                    writeln!(&mut res, "{state:?}")?;
+                }
+            }
+            writeln!(&mut res, "{terminator:?}")?;
+            if let Ok(s) = source_map.span_to_snippet(terminator.source_info.span) {
+                writeln!(&mut res, "{s}")?;
+            }
+        }
+    }
+    Ok(res)
 }

@@ -25,6 +25,12 @@ pub struct Config {
     pub simplify: bool,
     #[serde(default)]
     pub analysis_file: Option<PathBuf>,
+
+    // debug
+    #[serde(default)]
+    pub function_times: Option<usize>,
+    #[serde(default)]
+    pub print_functions: Vec<String>,
 }
 
 pub mod ai;
