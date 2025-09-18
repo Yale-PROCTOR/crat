@@ -1,10 +1,10 @@
 use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{HirId, def::DefKind};
+use rustc_hir::{BodyOwnerKind, HirId, def::DefKind};
 use rustc_middle::{
     mir::{
-        AggregateKind, AssignOp, BasicBlock, Body, CastKind, Location, Operand, Place, Rvalue,
-        Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
+        AggregateKind, AssignOp, BasicBlock, BinOp, Body, CastKind, Location, Operand, Place,
+        Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
     thir::{
         self, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
@@ -55,6 +55,10 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
         if super::def_id_to_symbol(def_id, tcx).unwrap().as_str() == "main" {
             continue;
         }
+        let overflow_check = matches!(
+            tcx.hir_body_owner_kind(def_id),
+            BodyOwnerKind::Const { .. } | BodyOwnerKind::Static(_)
+        );
 
         let (thir, texpr) = tcx.thir_body(def_id).unwrap();
         let thir = thir.borrow();
@@ -254,6 +258,19 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Scope { .. } => {}
                 ExprKind::Box { .. } => panic!(),
                 ExprKind::If { .. } => {}
+                ExprKind::Deref { .. }
+                | ExprKind::Field { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::VarRef { .. }
+                | ExprKind::UpvarRef { .. } => {
+                    let _ =
+                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
+                }
+                ExprKind::Literal { .. } | ExprKind::NamedConst { .. } => {
+                    let _ = ctx.handle_rvalue_opt(expr_id, |rvalue| {
+                        matches!(rvalue, Rvalue::Use(Operand::Constant(_)))
+                    });
+                }
                 ExprKind::Call { .. } => {
                     if let Some(loc) = ctx
                         .find_call_location(expr_id)
@@ -265,13 +282,11 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     }
                 }
                 ExprKind::ByUse { .. } => panic!(),
-                ExprKind::Deref { .. } => {
-                    let _ =
-                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
-                }
                 ExprKind::Binary { op, .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| {
-                        if let Rvalue::BinaryOp(mop, _) = rvalue {
+                        if overflow_check && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                            matches!(rvalue, Rvalue::Use(Operand::Move(_)))
+                        } else if let Rvalue::BinaryOp(mop, _) = rvalue {
                             *mop == op
                         } else {
                             false
@@ -344,33 +359,16 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         ctx.print_debug(expr.span.into());
                     }
                 }
-                ExprKind::Field { .. } => {
-                    let _ =
-                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
-                }
-                ExprKind::Index { .. } => {
-                    let _ =
-                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
-                }
-                ExprKind::VarRef { .. } => {
-                    let _ =
-                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
-                }
-                ExprKind::UpvarRef { .. } => {
-                    let _ =
-                        ctx.handle_rvalue_opt(expr_id, |rvalue| matches!(rvalue, Rvalue::Use(_)));
-                }
                 ExprKind::Borrow { .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::Ref(..)));
                 }
                 ExprKind::RawBorrow { .. } => {
                     ctx.handle_rvalue(expr_id, |rvalue| matches!(rvalue, Rvalue::RawPtr(..)));
                 }
-                ExprKind::Break { .. } => {
-                    if let Some(loc) = ctx
-                        .find_goto_location(expr_id)
-                        .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
-                    {
+                ExprKind::Break { value, .. } => {
+                    // TODO: handle break with value
+                    assert!(value.is_none());
+                    if let Some(loc) = ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()) {
                         ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
                     } else {
                         ctx.print_debug(expr.span.into());
@@ -378,40 +376,30 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 }
                 ExprKind::Continue { .. } => {}
                 ExprKind::Return { value } => {
-                    if let Some(loc) = ctx
-                        .find_goto_location(expr_id)
-                        .or_else(|| ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()))
-                    {
-                        ctx.expr_id_to_locs.insert(expr_id, smallvec![loc]);
-                    } else if let Some(value) = value {
-                        let value = unwrap_expr(value, &thir);
-                        let value_expr = &thir[value];
-                        if let Some(term_loc) = ctx
-                            .find_rvalue_location(value, |_| true)
-                            .map(|loc| ctx.terminator_of_last_assign(loc).unwrap())
-                            .or_else(|| {
-                                ctx.find_call_location(value)
-                                    .map(|loc| ctx.next_terminator_of_call(loc).unwrap())
-                            })
-                        {
-                            let term = ctx.get_terminator(term_loc);
-                            assert!(
-                                matches!(
-                                    term.kind,
-                                    TerminatorKind::Goto { .. }
-                                        | TerminatorKind::Return
-                                        | TerminatorKind::Drop { .. }
-                                ),
-                                "{:?}\n{:?}",
-                                expr.span,
-                                term.kind
-                            );
-                            ctx.expr_id_to_locs.insert(expr_id, smallvec![term_loc]);
-                        } else if let Some(locs) = ctx.find_goto_locations(value) {
-                            ctx.expr_id_to_locs.insert(expr_id, locs);
-                        } else {
-                            ctx.print_debug(value_expr.span.into());
+                    let locs = if let Some(value) = value {
+                        let mut values = smallvec![];
+                        find_return_values(value, &thir, &mut values);
+                        let mut locs = smallvec![];
+                        for v in &values {
+                            let loc = if matches!(thir[*v].kind, ExprKind::Call { .. }) {
+                                ctx.find_call_location(*v)
+                                    .or_else(|| ctx.find_transmute_location(*v))
+                            } else {
+                                ctx.find_rvalue_location(*v, |_| true)
+                            };
+                            locs.push(some_or!(loc, break));
                         }
+                        if locs.len() == values.len() {
+                            Some(locs)
+                        } else {
+                            None
+                        }
+                    } else {
+                        ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit())
+                            .map(|loc| smallvec![loc])
+                    };
+                    if let Some(locs) = locs {
+                        ctx.expr_id_to_locs.insert(expr_id, locs);
                     } else {
                         ctx.print_debug(expr.span.into());
                     }
@@ -437,19 +425,13 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     });
                 }
                 ExprKind::PlaceTypeAscription { .. } => panic!(),
-                ExprKind::ValueTypeAscription { .. } => panic!(),
+                ExprKind::ValueTypeAscription { .. } => {}
                 ExprKind::PlaceUnwrapUnsafeBinder { .. } => panic!(),
                 ExprKind::ValueUnwrapUnsafeBinder { .. } => panic!(),
                 ExprKind::WrapUnsafeBinder { .. } => panic!(),
                 ExprKind::Closure(_) => todo!(),
-                ExprKind::Literal { .. } => {
-                    let _ = ctx.handle_rvalue_opt(expr_id, |rvalue| {
-                        matches!(rvalue, Rvalue::Use(Operand::Constant(_)))
-                    });
-                }
                 ExprKind::NonHirLiteral { .. } => {}
                 ExprKind::ZstLiteral { .. } => {}
-                ExprKind::NamedConst { .. } => {}
                 ExprKind::ConstParam { .. } => {}
                 ExprKind::StaticRef { .. } => {}
                 ExprKind::InlineAsm(_) => {}
@@ -577,6 +559,23 @@ fn unique_continue_of_block(expr_id: ExprId, thir: &Thir<'_>) -> Option<ExprId> 
     Some(expr_id)
 }
 
+fn find_return_values(expr: ExprId, thir: &Thir<'_>, values: &mut SmallVec<[ExprId; 1]>) {
+    let expr = unwrap_expr(expr, thir);
+    match thir[expr].kind {
+        ExprKind::If { then, else_opt, .. } => {
+            find_return_values(then, thir, values);
+            find_return_values(else_opt.unwrap(), thir, values);
+        }
+        ExprKind::Block { block } => {
+            let block = &thir.blocks[block];
+            find_return_values(block.expr.unwrap(), thir, values);
+        }
+        _ => {
+            values.push(expr);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CondWithDest {
     expr_id: ExprId,
@@ -682,8 +681,12 @@ struct Ctx<'a, 'tcx> {
     /// For `Assign` and `AssignOp`, the location of the single statement performing the
     /// assignment.
     ///
-    /// For `Break` and `Return`, the locations of possibly *multiple* terminators performing the
-    /// jump or the single statement that assigns the value associated with the expression.
+    /// For `Return`, the locations of *possibly multiple* statements that assign the return value
+    /// to _0. When no return value is specified, the statement is _0 = (). When the return value
+    /// is an If, there are multiple statements, one for each branch.
+    ///
+    /// For `Break`, the locations of possibly *multiple* statements, just like for `Return`.
+    /// Currently, only the case without a value is supported.
     expr_id_to_locs: FxHashMap<ExprId, Locations>,
 
     /// THIR block to MIR basic blocks
@@ -764,14 +767,6 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         } else {
             Some(locs[0])
         }
-    }
-
-    fn find_goto_location(&self, expr_id: ExprId) -> Option<Location> {
-        self.find_term_location(expr_id, true, |k| matches!(k, TerminatorKind::Goto { .. }))
-    }
-
-    fn find_goto_locations(&self, expr_id: ExprId) -> Option<Locations> {
-        self.find_term_locations(expr_id, |k| matches!(k, TerminatorKind::Goto { .. }))
     }
 
     fn find_switch_int(&self, expr_id: ExprId) -> Option<&'a SwitchTargets> {
@@ -872,35 +867,6 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             }
         }
         None
-    }
-
-    fn terminator_of_last_assign(&self, loc: Location) -> Option<Location> {
-        let bbd = &self.body.basic_blocks[loc.block];
-        for stmt in bbd.statements.iter().skip(loc.statement_index + 1) {
-            if matches!(stmt.kind, StatementKind::Assign { .. }) {
-                return None;
-            }
-        }
-        Some(Location {
-            block: loc.block,
-            statement_index: bbd.statements.len(),
-        })
-    }
-
-    fn next_terminator_of_call(&self, loc: Location) -> Option<Location> {
-        let term = self.get_terminator(loc);
-        let TerminatorKind::Call { target, .. } = &term.kind else { return None };
-        let block = (*target)?;
-        let bbd = &self.body.basic_blocks[block];
-        for stmt in &bbd.statements {
-            if matches!(stmt.kind, StatementKind::Assign { .. }) {
-                return None;
-            }
-        }
-        Some(Location {
-            block,
-            statement_index: bbd.statements.len(),
-        })
     }
 
     #[inline]
