@@ -223,6 +223,16 @@ pub fn bitset_transitive_closure<T: Idx>(graph: &mut IndexVec<T, ChunkedBitSet<T
     }
 }
 
+pub fn reflexive_transitive_closure<T: Copy + Eq + std::hash::Hash>(
+    graph: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
+    let mut new_graph = transitive_closure(graph);
+    for v in graph.keys() {
+        new_graph.get_mut(v).unwrap().insert(*v);
+    }
+    new_graph
+}
+
 pub fn reachable_vertices<T: Copy + Eq + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,
     v: T,
