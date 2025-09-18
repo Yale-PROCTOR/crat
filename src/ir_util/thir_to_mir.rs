@@ -386,7 +386,9 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 ExprKind::Loop { .. } => {}
                 ExprKind::Let { .. } => {}   // TODO
                 ExprKind::Match { .. } => {} // TODO
-                ExprKind::Block { .. } => {}
+                ExprKind::Block { .. } => {
+                    let _ = ctx.handle_rvalue_opt(expr_id, |_| true);
+                }
                 ExprKind::Assign { .. } => {}
                 ExprKind::AssignOp { op, lhs, .. } => {
                     if let Some(assign) = ctx.find_assign_location(
@@ -499,15 +501,14 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     };
                     visitor.visit_expr(expr);
 
-                    let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+                    let mut bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
+                    if let Some(locs) = ctx.thir_to_mir.expr_to_locs.get(&expr_id) {
+                        bbs.extend(locs.iter().map(|loc| loc.block));
+                    }
                     if !bbs.is_empty() {
                         ctx.thir_to_mir.block_to_bbs.insert(block, bbs);
-                    } else if let Err(span) = ctx.handle_rvalue_opt(expr_id, |_| true) {
-                        ctx.print_debug("Block", span);
                     } else {
-                        let locs = ctx.thir_to_mir.expr_to_locs.get(&expr_id).unwrap();
-                        let bbs = locs.iter().map(|loc| loc.block).collect();
-                        ctx.thir_to_mir.block_to_bbs.insert(block, bbs);
+                        ctx.print_debug("Block", expr.span.into());
                     }
                 }
                 ExprKind::Loop { body } => {
@@ -532,13 +533,19 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
 
                     if let Some(els) = else_opt {
                         let els = unwrap_expr(els, &thir);
-                        let mut visitor = ExprVisitor {
-                            tcx,
-                            thir: &thir,
-                            exprs: FxHashSet::default(),
+                        let bbs = if let ExprKind::Block { block } = thir[els].kind
+                            && let Some(bbs) = ctx.thir_to_mir.block_to_bbs.get(&block)
+                        {
+                            bbs.clone()
+                        } else {
+                            let mut visitor = ExprVisitor {
+                                tcx,
+                                thir: &thir,
+                                exprs: FxHashSet::default(),
+                            };
+                            visitor.visit_expr(&thir[els]);
+                            ctx.collect_basic_blocks(visitor.exprs.into_iter())
                         };
-                        visitor.visit_expr(&thir[els]);
-                        let bbs = ctx.collect_basic_blocks(visitor.exprs.into_iter());
                         if !bbs.is_empty() {
                             let if_blocks = ctx.thir_to_mir.if_to_bbs.get_mut(&expr_id).unwrap();
                             if_blocks.false_blocks = bbs;
