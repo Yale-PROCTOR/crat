@@ -193,11 +193,10 @@ pub fn analyze(
     let mut inputs_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        if let Some(ident) = item.kind.ident() {
-            if ident.name.as_str() == "main" {
+        if let Some(ident) = item.kind.ident()
+            && ident.name.as_str() == "main" {
                 continue;
             }
-        }
         let inputs = if let rustc_hir::ItemKind::Fn { sig, .. } = &item.kind {
             sig.decl.inputs.len()
         } else {
@@ -512,11 +511,10 @@ pub fn analyze(
 
                                 let always_write = loop {
                                     if let Some(bb) = stack.pop() {
-                                        if let Some(musts) = bb_must.get(&bb) {
-                                            if !musts.contains(index) {
+                                        if let Some(musts) = bb_must.get(&bb)
+                                            && !musts.contains(index) {
                                                 break false;
                                             }
-                                        }
 
                                         let term = body.basic_blocks[bb].terminator();
                                         for bb in term.successors() {
@@ -575,23 +573,22 @@ pub fn analyze(
 fn return_location(body: &Body<'_>) -> Option<Location> {
     for block in body.basic_blocks.indices() {
         let bbd = &body.basic_blocks[block];
-        if let Some(terminator) = &bbd.terminator {
-            if terminator.kind == TerminatorKind::Return {
+        if let Some(terminator) = &bbd.terminator
+            && terminator.kind == TerminatorKind::Return {
                 let location = Location {
                     block,
                     statement_index: bbd.statements.len(),
                 };
                 return Some(location);
             }
-        }
     }
     None
 }
 
 fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
     for (i, stmt) in body.basic_blocks[bb].statements.iter().enumerate() {
-        if let StatementKind::Assign(rb) = &stmt.kind {
-            if (**rb).0.local.as_u32() == 0u32 {
+        if let StatementKind::Assign(rb) = &stmt.kind
+            && (**rb).0.local.as_u32() == 0u32 {
                 return Some((
                     stmt.source_info.span,
                     Location {
@@ -600,7 +597,6 @@ fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
                     },
                 ));
             }
-        }
     }
     let term = body.basic_blocks[bb].terminator();
     if let TerminatorKind::Call {
@@ -612,8 +608,7 @@ fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
         call_source: _,
         fn_span: _,
     } = term.kind
-    {
-        if destination.local.as_u32() == 0u32 {
+        && destination.local.as_u32() == 0u32 {
             return Some((
                 term.source_info.span,
                 Location {
@@ -622,7 +617,6 @@ fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
                 },
             ));
         }
-    }
     None
 }
 
@@ -1763,13 +1757,11 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if let ExprKind::Call(callee, _) = expr.kind {
-            if let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind {
-                if let Res::Def(DefKind::Fn, def_id) = path.res {
+        if let ExprKind::Call(callee, _) = expr.kind
+            && let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+                && let Res::Def(DefKind::Fn, def_id) = path.res {
                     self.callees.insert(def_id);
                 }
-            }
-        }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
 }
@@ -1803,13 +1795,11 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
                 self.callees.insert(callee.hir_id);
             }
             ExprKind::Path(QPath::Resolved(_, path)) => {
-                if !self.callees.contains(&expr.hir_id) {
-                    if let Res::Def(def_kind, def_id) = path.res {
-                        if def_kind.is_fn_like() {
+                if !self.callees.contains(&expr.hir_id)
+                    && let Res::Def(def_kind, def_id) = path.res
+                        && def_kind.is_fn_like() {
                             self.fn_ptrs.insert(def_id);
                         }
-                    }
-                }
             }
             _ => {}
         }
@@ -1885,11 +1875,10 @@ impl<'tcx> GlobalVisitor<'tcx> {
 
 impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _location: Location) {
-        if let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), _) = constant.const_ {
-            if let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id()) {
+        if let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), _) = constant.const_
+            && let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id()) {
                 self.globals.insert(def_id);
             }
-        }
     }
 
     fn visit_statement(&mut self, stmt: &Statement<'tcx>, location: Location) {

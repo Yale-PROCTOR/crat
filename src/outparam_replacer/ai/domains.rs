@@ -1492,7 +1492,7 @@ impl std::fmt::Debug for AbsInt {
                         if i != 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", n)?;
+                        write!(f, "{n}")?;
                     }
                     write!(f, "}}_i")
                 }
@@ -1803,7 +1803,7 @@ impl std::fmt::Debug for AbsUint {
                         if i != 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", n)?;
+                        write!(f, "{n}")?;
                     }
                     write!(f, "}}_u")
                 }
@@ -2517,7 +2517,7 @@ impl std::fmt::Debug for AbsList {
                     if i != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{:?}", v)?;
+                    write!(f, "{v:?}")?;
                 }
                 write!(f, "]")
             }
@@ -2610,7 +2610,7 @@ impl std::fmt::Debug for AbsPlace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.base)?;
         for elem in &self.projections {
-            write!(f, "{:?}", elem)?;
+            write!(f, "{elem:?}")?;
         }
         Ok(())
     }
@@ -2675,7 +2675,7 @@ impl std::fmt::Debug for AbsProjElem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Field(i) => write!(f, ".{}", i.index()),
-            Self::Index(i) => write!(f, "[{:?}]", i),
+            Self::Index(i) => write!(f, "[{i:?}]"),
         }
     }
 }
@@ -2699,7 +2699,7 @@ impl std::fmt::Debug for AbsPtr {
                         if i != 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{:?}", ptr)?;
+                        write!(f, "{ptr:?}")?;
                     }
                     write!(f, "}}")
                 }
@@ -2820,13 +2820,11 @@ impl AbsPtr {
     }
 
     pub fn get_arg(&self) -> Option<ArgIdx> {
-        if let Self::Set(ptrs) = self {
-            if ptrs.len() == 1 {
-                if let AbsBase::Arg(i) = &ptrs.first().unwrap().base {
+        if let Self::Set(ptrs) = self
+            && ptrs.len() == 1
+                && let AbsBase::Arg(i) = &ptrs.first().unwrap().base {
                     return Some(*i);
                 }
-            }
-        }
         None
     }
 
@@ -2875,7 +2873,7 @@ impl std::fmt::Debug for AbsOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Top => write!(f, "⊤_o"),
-            Self::Some(v) => write!(f, "Some({:?})", v),
+            Self::Some(v) => write!(f, "Some({v:?})"),
             Self::None => write!(f, "None"),
             Self::Bot => write!(f, "⊥_o"),
         }
@@ -2954,7 +2952,7 @@ impl std::fmt::Debug for AbsFn {
                         if i != 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{:?}", n)?;
+                        write!(f, "{n:?}")?;
                     }
                     write!(f, "}}")
                 }
@@ -3101,7 +3099,7 @@ impl std::fmt::Debug for MustPathSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MustPathSet::All => write!(f, "All"),
-            MustPathSet::Set(s) => write!(f, "{:?}", s),
+            MustPathSet::Set(s) => write!(f, "{s:?}"),
         }
     }
 }
@@ -3474,7 +3472,7 @@ impl std::fmt::Debug for MustLocalSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MustLocalSet::All => write!(f, "All"),
-            MustLocalSet::Set(s) => write!(f, "{:?}", s),
+            MustLocalSet::Set(s) => write!(f, "{s:?}"),
         }
     }
 }

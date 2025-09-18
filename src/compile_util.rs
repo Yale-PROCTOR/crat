@@ -221,9 +221,9 @@ pub fn body_to_str(body: &Body<'_>) -> String {
     let mut s = String::new();
     writeln!(s, "{:?} {{", body.source.instance.def_id()).unwrap();
     for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        writeln!(s, "    {:?}:", bb).unwrap();
+        writeln!(s, "    {bb:?}:").unwrap();
         for stmt in &bbd.statements {
-            writeln!(s, "        {:?}", stmt).unwrap();
+            writeln!(s, "        {stmt:?}").unwrap();
         }
         if !matches!(
             bbd.terminator().kind,

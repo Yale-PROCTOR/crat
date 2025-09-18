@@ -417,14 +417,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let node = self.tcx.hir_get_if_local(callee).unwrap();
         if let hir::Node::ImplItem(item) = node {
             let span_str = self.span_to_string(item.span);
-            assert_eq!(span_str, "BitfieldStruct", "{:?} {}", callee, span_str);
+            assert_eq!(span_str, "BitfieldStruct", "{callee:?} {span_str}");
             let reads2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
             reads.extend(reads2);
             if let hir::ImplItemKind::Fn(sig, _) = &item.kind {
                 match &sig.decl.output {
                     hir::FnRetTy::Return(ty) => {
-                        if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind {
-                            if let hir::def::Res::Def(_, def_id) = path.res {
+                        if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind
+                            && let hir::def::Res::Def(_, def_id) = path.res {
                                 let ty = self.def_id_to_string(def_id);
                                 let ty = ty.split("::").last().unwrap();
                                 let v = match ty {
@@ -434,11 +434,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                                 };
                                 return v;
                             }
-                        }
                     }
                     hir::FnRetTy::DefaultReturn(_) => {
                         let name = item.ident.name.to_ident_string();
-                        assert!(name.starts_with("set_"), "{:?}", callee);
+                        assert!(name.starts_with("set_"), "{callee:?}");
                         return AbsValue::bot();
                     }
                 }
@@ -479,11 +478,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .enumerate()
             .filter_map(|(i, ty)| {
                 if let TyKind::RawPtr(ty, _) = ty.kind() {
-                    if let TyKind::Adt(adt, _) = ty.kind() {
-                        if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
+                    if let TyKind::Adt(adt, _) = ty.kind()
+                        && self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
                             return None;
                         }
-                    }
                     return Some(i);
                 }
                 None
@@ -968,7 +966,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         }
                         AdtKind::Enum => {
                             assert_eq!(
-                                format!("{:?}", adt_def),
+                                format!("{adt_def:?}"),
                                 "std::option::Option",
                                 "{:?}",
                                 rvalue
@@ -1141,7 +1139,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     )
                 }
                 AdtKind::Enum => {
-                    let ty = format!("{:?}", adt);
+                    let ty = format!("{adt:?}");
                     match ty.as_str() {
                         "std::option::Option" => AbsValue::top_option(),
                         "libc::c_void" => AbsValue::top(),
@@ -1265,25 +1263,23 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     }
 
     fn get_write_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
-        if let AbsPtr::Set(ptrs) = ptr {
-            if ptrs.len() == 1 {
+        if let AbsPtr::Set(ptrs) = ptr
+            && ptrs.len() == 1 {
                 let mut ptr = ptrs.first().unwrap().clone();
                 ptr.projections.extend(projection.to_owned());
                 if let Some((path, false)) = AbsPath::from_place(&ptr, &self.ptr_params) {
                     return self.expands_path(&path);
                 }
             }
-        }
         vec![]
     }
 
     fn get_write_bases_of_ptr(&self, ptr: &AbsPtr) -> Option<Vec<AbsBase>> {
-        if let AbsPtr::Set(ptrs) = ptr {
-            if ptrs.len() == 1 {
+        if let AbsPtr::Set(ptrs) = ptr
+            && ptrs.len() == 1 {
                 let ptr = ptrs.first().unwrap().clone();
                 return Some(vec![ptr.base]);
             }
-        }
         None
     }
 
