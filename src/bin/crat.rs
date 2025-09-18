@@ -55,7 +55,7 @@ struct Args {
     outparam_analysis_file: Option<PathBuf>,
     #[arg(
         long,
-        help = "Print analysis times of the functions with top-n analysis time"
+        help = "Print the analysis times for the n functions with the longest times."
     )]
     outparam_function_times: Option<usize>,
     #[arg(long, help = "Print analysis results of the specified functions")]
