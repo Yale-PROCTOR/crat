@@ -1,16 +1,13 @@
-use rustc_hash::{FxHashMap, FxHashSet};
-
 use etrace::some_or;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::ChunkedBitSet};
 use rustc_middle::{
-  mir::{Local},
-  ty::{Ty, TyCtxt, TyKind, TypingEnv},
+    mir::Local,
+    ty::{Ty, TyCtxt, TyKind, TypingEnv},
 };
-use rustc_span::{
-    def_id::{DefId, LocalDefId},
-};
+use rustc_span::def_id::{DefId, LocalDefId};
 
-use crate::points_to::andersen::{Loc, LocNode, Solutions, PreAnalysisData};
+use crate::points_to::andersen::{Loc, LocNode, PreAnalysisData, Solutions};
 
 /// Preprocess points-to analysis to use for the output parameter detection
 #[derive(Debug)]

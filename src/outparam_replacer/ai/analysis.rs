@@ -9,24 +9,24 @@ use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
-    Expr, ExprKind, HirId, QPath,
 };
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
         BasicBlock, Body, Const, ConstOperand, ConstValue, Local, Location, Rvalue, Statement,
         StatementKind, Terminator, TerminatorKind,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::Analysis as _;
 use rustc_span::{
-    def_id::{DefId, LocalDefId},
     Span,
+    def_id::{DefId, LocalDefId},
 };
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -34,14 +34,13 @@ use typed_arena::Arena;
 
 use super::{
     domains::*,
-    semantics::{CallKind, TransferedTerminator},
     pre_analysis::{self, PreAnalysisContext},
+    semantics::{CallKind, TransferedTerminator},
 };
-
 use crate::{
+    graph_util,
     points_to::andersen::{self, Loc},
     ty_shape,
-    graph_util,
 };
 
 // TODO: Remove span translation
@@ -218,9 +217,7 @@ pub fn analyze(
 
     let sccs = graph_util::sccs_copied::<DefId, true>(&call_graph);
     let transitive = graph_util::reflexive_transitive_closure(&call_graph);
-    let po: Vec<_> = sccs
-        .post_order()
-        .collect();
+    let po: Vec<_> = sccs.post_order().collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
     let mut global_visitor = GlobalVisitor::new(tcx);
@@ -554,7 +551,6 @@ pub fn analyze(
         }
     }
 
-
     if config.max_loop_head_states <= 1 {
         wbrs.clear();
         rcfws.clear();
@@ -629,7 +625,6 @@ fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
     }
     None
 }
-
 
 pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
@@ -1402,12 +1397,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 })
                                 .unwrap_or(&bot);
 
-                            let mut joined = if loop_heads.contains(location) && !self.config.no_widening
-                            {
-                                next_state.widen(new_next_state)
-                            } else {
-                                next_state.join(new_next_state)
-                            };
+                            let mut joined =
+                                if loop_heads.contains(location) && !self.config.no_widening {
+                                    next_state.widen(new_next_state)
+                                } else {
+                                    next_state.join(new_next_state)
+                                };
                             if location.statement_index == 0 {
                                 joined.local.clear_dead_locals(dead_locals);
                             }
@@ -1521,7 +1516,6 @@ impl<'a> WorkList<'a> {
     }
 }
 
-
 // structs and functions used computing the FuncInfos
 #[derive(Debug, Clone)]
 struct FuncInfo {
@@ -1610,7 +1604,6 @@ impl TypeInfo {
         }
     }
 }
-
 
 fn get_param_tys<'tcx>(
     body: &Body<'tcx>,
@@ -1746,7 +1739,6 @@ fn get_dead_locals<'tcx>(
         })
         .collect()
 }
-
 
 // MIR, HIR Visitors
 struct CallVisitor<'tcx> {

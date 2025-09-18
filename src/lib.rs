@@ -7,6 +7,7 @@
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -26,7 +27,6 @@ extern crate rustc_span;
 extern crate rustc_type_ir;
 extern crate smallvec;
 extern crate thin_vec;
-extern crate rustc_const_eval;
 
 pub mod preprocessor;
 #[macro_use]

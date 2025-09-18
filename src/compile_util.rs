@@ -16,8 +16,8 @@ use rustc_feature::UnstableFeatures;
 use rustc_hash::FxHashMap;
 use rustc_interface::Config;
 use rustc_middle::{
-    ty::TyCtxt,
     mir::{Body, TerminatorKind},
+    ty::TyCtxt,
 };
 use rustc_session::{
     EarlyDiagCtxt,

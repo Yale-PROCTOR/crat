@@ -10,7 +10,7 @@ use rustc_middle::{
         Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
-    ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind},
+    ty::{AdtKind, Ty, TyKind, adjustment::PointerCoercion},
 };
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
@@ -869,11 +869,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         } else {
                             false
                         };
-                        if void {
-                            v
-                        } else {
-                            AbsValue::heap().join(&v)
-                        }
+                        if void { v } else { AbsValue::heap().join(&v) }
                     }
                     CastKind::FnPtrToPtr => v,
                     CastKind::Transmute => v,

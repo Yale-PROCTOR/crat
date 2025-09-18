@@ -1,4 +1,3 @@
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Deref,
@@ -8,7 +7,7 @@ use std::{
 use lazy_static::lazy_static;
 use rustc_abi::FieldIdx;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
@@ -477,11 +476,7 @@ impl AbsValue {
 
     #[inline]
     pub fn alpha_bool(b: bool) -> Self {
-        if b {
-            V_TRUE.clone()
-        } else {
-            V_FALSE.clone()
-        }
+        if b { V_TRUE.clone() } else { V_FALSE.clone() }
     }
 
     pub fn alpha_list(l: Vec<AbsValue>) -> Self {
@@ -2388,11 +2383,7 @@ impl AbsBool {
     }
 
     fn alpha(b: bool) -> Self {
-        if b {
-            Self::True
-        } else {
-            Self::False
-        }
+        if b { Self::True } else { Self::False }
     }
 
     pub fn gamma(self) -> Vec<bool> {
