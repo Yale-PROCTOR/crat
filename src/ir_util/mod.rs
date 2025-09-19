@@ -67,9 +67,11 @@ pub fn body_size(body: &Body<'_>) -> usize {
 
 pub mod ast_to_hir;
 pub mod hir_to_thir;
+pub mod thir_to_mir;
 
 pub use ast_to_hir::*;
 pub use hir_to_thir::*;
+pub use thir_to_mir::*;
 
 #[cfg(test)]
 mod tests;

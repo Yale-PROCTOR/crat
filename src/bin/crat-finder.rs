@@ -22,6 +22,7 @@ enum Finder {
     Example,
     Macro,
     Mapper,
+    Mir,
     Unsafe,
 }
 
@@ -36,7 +37,10 @@ fn main() {
             run_compiler_on_path(&file, finder::macro_finder::find_macros).unwrap();
         }
         Finder::Mapper => {
-            run_compiler_on_path(&file, |tcx| finder::mapper::run(&args.input, tcx)).unwrap();
+            run_compiler_on_path(&file, |tcx| finder::mapper::run(&args.input, true, tcx)).unwrap();
+        }
+        Finder::Mir => {
+            run_compiler_on_path(&file, finder::mir::run).unwrap();
         }
         Finder::Unsafe => {
             run_compiler_on_path(&file, finder::unsafe_finder::find_unsafe).unwrap();
