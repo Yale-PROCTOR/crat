@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 
 use etrace::some_or;
 use rustc_hash::FxHashMap;
-use rustc_hir::definitions::DefPathData;
+use rustc_hir::{def::DefKind, definitions::DefPathData};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{FileName, RealFileName};
 
 use crate::{ast_util, ir_util, rustc_ast::visit::Visitor};
 
-pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
+pub fn run(dir: &Path, verbose: bool, tcx: TyCtxt<'_>) {
     let borrowed = tcx.resolver_for_lowering().borrow();
     let mut expanded_crate = borrowed.1.as_ref().clone();
     drop(borrowed);
@@ -73,5 +73,13 @@ pub fn run(dir: &Path, tcx: TyCtxt<'_>) {
     let mut checker = ir_util::HirToThirChecker { tcx, hir_to_thir };
     tcx.hir_visit_all_item_likes_in_crate(&mut checker);
 
-    ir_util::map_thir_to_mir(tcx);
+    for def_id in tcx.hir_body_owners() {
+        if matches!(tcx.def_kind(def_id), DefKind::AnonConst) {
+            continue;
+        }
+        if ir_util::def_id_to_symbol(def_id, tcx).unwrap().as_str() == "main" {
+            continue;
+        }
+        ir_util::map_thir_to_mir(def_id, verbose, tcx);
+    }
 }
