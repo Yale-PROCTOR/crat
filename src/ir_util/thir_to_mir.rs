@@ -7,7 +7,7 @@ use rustc_middle::{
         Place, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
     thir::{
-        self, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
+        self, AdtExpr, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
         visit::Visitor as TVisitor,
     },
     ty::{Ty, TyCtxt, TyKind},
@@ -170,7 +170,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
 
             rhs_to_assigns: FxHashMap::default(),
             nested_logical_exprs: FxHashSet::default(),
-            promoted_fn_ptrs: FxHashMap::default(),
+            promoted_ptrs: FxHashMap::default(),
 
             thir_to_mir: ThirToMirBody::default(),
         };
@@ -178,36 +178,29 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
 
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
             match expr.kind {
-                ExprKind::Call { fun, ref args, .. } => {
-                    let fun = unwrap_expr(fun, &thir);
-                    // check whether this is `PartialEq::eq(arg1, arg2)`
-                    if let TyKind::FnDef(def_id, targs) = thir[fun].ty.kind()
-                        && let Some(assoc_item) = tcx.opt_associated_item(*def_id)
-                        && tcx.is_lang_item(assoc_item.container_id(tcx), LangItem::PartialEq)
-                        && let [targ1, targ2] = targs[..]
-                        && let ty1 = targ1.expect_ty()
-                        && let ty2 = targ2.expect_ty()
-                        && ty1 == ty2
-                        && let TyKind::Adt(adt_def, _) = ty1.kind()
-                        && tcx.is_lang_item(adt_def.did(), LangItem::Option)
-                        && let [arg1, arg2] = args[..]
-                    {
-                        // check whether `arg` is `&Some(..)`
-                        let mut handle_arg = |arg: ExprId| {
-                            let borrow_arg = unwrap_expr(arg, &thir);
-                            if let ExprKind::Borrow { arg, .. } = thir[borrow_arg].kind
-                                && let adt_arg = unwrap_expr(arg, &thir)
-                                && let ExprKind::Adt(adt) = &thir[adt_arg].kind
-                                && adt.adt_def.did() == adt_def.did()
-                                && let [field] = &adt.fields[..]
+                ExprKind::Borrow { arg, .. } => {
+                    let arg = unwrap_expr(arg, &thir);
+                    match &thir[arg].kind {
+                        // check for &[]
+                        ExprKind::Array { fields: box [] } => {
+                            ctx.promoted_ptrs.insert(arg, expr_id);
+                        }
+                        // check for &Some(f)
+                        ExprKind::Adt(box AdtExpr {
+                            adt_def,
+                            fields: box [field],
+                            ..
+                        }) if tcx.is_lang_item(adt_def.did(), LangItem::Option) => {
+                            let coercion = unwrap_expr(field.expr, &thir);
+                            let coercion_expr = &thir[coercion];
+                            if let ExprKind::PointerCoercion { .. } = coercion_expr.kind
+                                && coercion_expr.ty.is_fn_ptr()
                             {
-                                let arg = unwrap_expr(field.expr, &thir);
-                                ctx.promoted_fn_ptrs.insert(adt_arg, borrow_arg);
-                                ctx.promoted_fn_ptrs.insert(arg, borrow_arg);
+                                ctx.promoted_ptrs.insert(arg, expr_id);
+                                ctx.promoted_ptrs.insert(coercion, expr_id);
                             }
-                        };
-                        handle_arg(arg1);
-                        handle_arg(arg2);
+                        }
+                        _ => {}
                     }
                 }
                 ExprKind::Assign { lhs, rhs } => {
@@ -346,7 +339,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     ctx.handle_rvalue("Cast", expr_id, |rvalue| matches!(rvalue, Rvalue::Cast(..)));
                 }
                 ExprKind::PointerCoercion { .. } => {
-                    if !ctx.promoted_fn_ptrs.contains_key(&expr_id) {
+                    if !ctx.promoted_ptrs.contains_key(&expr_id) {
                         ctx.handle_rvalue("PointerCoercion", expr_id, |rvalue| {
                             matches!(
                                 rvalue,
@@ -375,9 +368,11 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     });
                 }
                 ExprKind::Array { .. } => {
-                    ctx.handle_rvalue("Array", expr_id, |rvalue| {
-                        matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Array(..), _))
-                    });
+                    if !ctx.promoted_ptrs.contains_key(&expr_id) {
+                        ctx.handle_rvalue("Array", expr_id, |rvalue| {
+                            matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Array(..), _))
+                        });
+                    }
                 }
                 ExprKind::Tuple { .. } => {
                     ctx.handle_rvalue("Tuple", expr_id, |rvalue| {
@@ -385,7 +380,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     });
                 }
                 ExprKind::Adt(_) => {
-                    if !ctx.promoted_fn_ptrs.contains_key(&expr_id) {
+                    if !ctx.promoted_ptrs.contains_key(&expr_id) {
                         ctx.handle_rvalue("Adt", expr_id, |rvalue| {
                             matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Adt(..), _))
                         });
@@ -543,12 +538,12 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
 
         for (expr_id, expr) in thir.exprs.iter_enumerated() {
             match expr.kind {
-                ExprKind::Adt(..) | ExprKind::PointerCoercion { .. } => {
-                    if let Some(arg) = ctx.promoted_fn_ptrs.get(&expr_id) {
+                ExprKind::Adt(..) | ExprKind::PointerCoercion { .. } | ExprKind::Array { .. } => {
+                    if let Some(arg) = ctx.promoted_ptrs.get(&expr_id) {
                         if let Some(locs) = ctx.thir_to_mir.expr_to_locs.get(arg) {
                             ctx.thir_to_mir.expr_to_locs.insert(expr_id, locs.clone());
                         } else {
-                            ctx.print_debug("Adt/PointerCoercion", expr.span.into());
+                            ctx.print_debug("Promoted", expr.span.into());
                         }
                     }
                 }
@@ -566,6 +561,18 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     }
                     if !bbs.is_empty() {
                         ctx.thir_to_mir.block_to_bbs.insert(block, bbs);
+                    } else if let block = &thir.blocks[block]
+                        && block.expr.is_none()
+                        && let [stmt] = &block.stmts[..]
+                        && let stmt = &thir[*stmt]
+                        && let StmtKind::Expr {
+                            expr: stmt_expr, ..
+                        } = stmt.kind
+                        && let stmt_expr = unwrap_expr(stmt_expr, &thir)
+                        && let stmt_expr = &thir[stmt_expr]
+                        && matches!(stmt_expr.kind, ExprKind::Continue { .. })
+                    {
+                        // we give up when the block is `{ continue; }`
                     } else {
                         ctx.print_debug("Block", expr.span.into());
                     }
@@ -756,10 +763,15 @@ struct Ctx<'a, 'tcx> {
     /// another And or Or. The result of such an expression is not stored to a Local.
     nested_logical_exprs: FxHashSet<ExprId>,
 
-    /// Where `f` is a function, `Some(f) == ..` becomes `PartialEq::eq(&Some(f), &..)` in THIR.
-    /// Then, in MIR, there is a statement for `&Some(f)` but not for `Some(f)` and `f`. Therefore,
-    /// we keep the mappings from `Some(f)` to `&Some(f)` and from `f` to `&Some(f)`.
-    promoted_fn_ptrs: FxHashMap<ExprId, ExprId>,
+    /// Expressions lowered to promoted pointers.
+    ///
+    /// Where `f` is a function, for `&Some(f)`, there is a statement for `&Some(f)` but not for
+    /// `Some(f)` and `f`. Therefore, we keep the mappings from `Some(f)` to `&Some(f)` and from
+    /// `f` to `&Some(f)`.
+    ///
+    /// For `&[]`, there is a statement for `&[]` but not for `[]`. Therefore, we keep the mapping
+    /// from `[]` to `&[]`.
+    promoted_ptrs: FxHashMap<ExprId, ExprId>,
 
     thir_to_mir: ThirToMirBody,
 }
