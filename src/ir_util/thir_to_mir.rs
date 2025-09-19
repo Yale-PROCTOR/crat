@@ -81,7 +81,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
         if super::def_id_to_symbol(def_id, tcx).unwrap().as_str() == "main" {
             continue;
         }
-        let overflow_check = matches!(
+        let is_const_or_static = matches!(
             tcx.hir_body_owner_kind(def_id),
             BodyOwnerKind::Const { .. } | BodyOwnerKind::Static(_)
         );
@@ -182,7 +182,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                     let arg = unwrap_expr(arg, &thir);
                     match &thir[arg].kind {
                         // check for &[]
-                        ExprKind::Array { fields: box [] } => {
+                        ExprKind::Array { fields } if is_const_or_static || fields.is_empty() => {
                             ctx.promoted_ptrs.insert(arg, expr_id);
                         }
                         // check for &Some(f)
@@ -362,9 +362,13 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                         matches!(rvalue, Rvalue::RawPtr(..))
                     });
                 }
-                ExprKind::Repeat { .. } => {
+                ExprKind::Repeat { count, .. } => {
                     ctx.handle_rvalue("Repeat", expr_id, |rvalue| {
-                        matches!(rvalue, Rvalue::Repeat(..))
+                        if Some(0) == count.try_to_target_usize(tcx) {
+                            matches!(rvalue, Rvalue::Aggregate(box AggregateKind::Array(..), _))
+                        } else {
+                            matches!(rvalue, Rvalue::Repeat(..))
+                        }
                     });
                 }
                 ExprKind::Array { .. } => {
@@ -388,7 +392,7 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 }
                 ExprKind::Binary { op, .. } => {
                     ctx.handle_rvalue("Binary", expr_id, |rvalue| {
-                        if overflow_check
+                        if is_const_or_static
                             && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                             && expr.ty.is_integral()
                         {
@@ -588,8 +592,20 @@ pub fn map_thir_to_mir(tcx: TyCtxt<'_>) {
                 }
                 ExprKind::If { then, else_opt, .. } => {
                     let then = unwrap_expr(then, &thir);
-                    let ExprKind::Block { block } = thir[then].kind else { panic!() };
-                    if let Some(bbs) = ctx.thir_to_mir.block_to_bbs.get(&block) {
+                    let bbs = if let ExprKind::Block { block } = thir[then].kind
+                        && let Some(bbs) = ctx.thir_to_mir.block_to_bbs.get(&block)
+                    {
+                        bbs.clone()
+                    } else {
+                        let mut visitor = ExprVisitor {
+                            tcx,
+                            thir: &thir,
+                            exprs: FxHashSet::default(),
+                        };
+                        visitor.visit_expr(&thir[then]);
+                        ctx.collect_basic_blocks(visitor.exprs.into_iter())
+                    };
+                    if !bbs.is_empty() {
                         let if_blocks = ctx.thir_to_mir.if_to_bbs.get_mut(&expr_id).unwrap();
                         if_blocks.true_blocks = bbs.clone();
                         if_blocks.true_blocks.insert(if_blocks.true_entry);
