@@ -43,6 +43,7 @@ pub mod formatter;
 pub mod graph_util;
 pub mod io_replacer;
 pub mod ir_util;
+pub mod libc_replacer;
 pub mod outparam_replacer;
 pub mod points_to;
 pub mod ty_shape;
