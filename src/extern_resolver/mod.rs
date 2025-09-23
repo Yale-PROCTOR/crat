@@ -29,6 +29,9 @@ use crate::{
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub choose_arbitrary: bool,
+
+    #[serde(default)]
     pub function_hints: Vec<LinkHint>,
     #[serde(default)]
     pub static_hints: Vec<LinkHint>,
@@ -90,6 +93,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
         &result.equiv_adts,
         &mut resolve_map,
         &config.type_hints,
+        config.choose_arbitrary,
         tcx,
     );
     link_failed |= link_externs(
@@ -98,6 +102,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
         &result.equiv_fns,
         &mut resolve_map,
         &config.function_hints,
+        config.choose_arbitrary,
         tcx,
     );
     link_failed |= link_externs(
@@ -106,6 +111,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
         &result.equiv_statics,
         &mut resolve_map,
         &config.static_hints,
+        config.choose_arbitrary,
         tcx,
     );
 
@@ -149,6 +155,7 @@ fn link_externs(
     equivs: &FxHashMap<Symbol, EquivClasses<LocalDefId>>,
     resolve_map: &mut FxHashMap<LocalDefId, LocalDefId>,
     hints: &[LinkHint],
+    choose_arbitrary: bool,
     tcx: TyCtxt<'_>,
 ) -> bool {
     let hints: FxHashMap<_, _> = hints
@@ -179,8 +186,10 @@ fn link_externs(
             link_candidates = &candidates;
         }
 
-        if let [id] = link_candidates[..] {
-            let class = &classes.0[id];
+        if let [id, others @ ..] = &link_candidates[..]
+            && (choose_arbitrary || others.is_empty())
+        {
+            let class = &classes.0[*id];
             let rep = find_representative_def_id(class, tcx);
             resolve_map.insert(*def_id, rep);
         } else {

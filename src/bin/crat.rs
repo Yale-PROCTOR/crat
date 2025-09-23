@@ -15,12 +15,14 @@ use serde::Deserialize;
 #[command(version)]
 struct Args {
     // Extern
+    #[arg(long, help = "Choose an arbitrary one when multiple candidates exist")]
+    extern_choose_arbitrary: bool,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern functions (example: `from::foo to::foo`)")]
-    resolve_function: Vec<String>,
+    extern_function_hints: Vec<String>,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern static variables (example: `from::foo to::foo`)")]
-    resolve_static: Vec<String>,
+    extern_static_hints: Vec<String>,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern types (example: `from::foo to::foo`)")]
-    resolve_type: Vec<String>,
+    extern_type_hints: Vec<String>,
 
     // Bin
     #[arg(
@@ -179,21 +181,22 @@ fn main() {
             .init();
     }
 
-    for args in args.resolve_function.chunks(2) {
+    config.r#extern.choose_arbitrary |= args.extern_choose_arbitrary;
+    for args in args.extern_function_hints.chunks(2) {
         let [from, to] = args else { panic!() };
         config
             .r#extern
             .function_hints
             .push(extern_resolver::LinkHint::new(from.clone(), to.clone()));
     }
-    for args in args.resolve_static.chunks(2) {
+    for args in args.extern_static_hints.chunks(2) {
         let [from, to] = args else { panic!() };
         config
             .r#extern
             .static_hints
             .push(extern_resolver::LinkHint::new(from.clone(), to.clone()));
     }
-    for args in args.resolve_type.chunks(2) {
+    for args in args.extern_type_hints.chunks(2) {
         let [from, to] = args else { panic!() };
         config
             .r#extern
