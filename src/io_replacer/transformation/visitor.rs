@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fmt::Write as _,
     ops::{Deref, DerefMut},
 };
@@ -25,8 +26,9 @@ use super::{
     hir_ctx::{HirCtx, HirLoc},
     likely_lit::LikelyLit,
     mir_loc::MirLoc,
-    printf, scanf,
+    printf,
     stream_ty::*,
+    transform::LibItem,
 };
 use crate::{
     bit_set::{BitSet8, BitSet16},
@@ -73,6 +75,8 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
     pub(super) bound_num: usize,
+    pub(super) lib_items: RefCell<Vec<LibItem>>,
+    pub(super) parsing_fns: RefCell<Vec<(String, String)>>,
     pub(super) guards: FxHashSet<Symbol>,
     pub(super) foreign_statics: FxHashSet<&'static str>,
     pub(super) unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
@@ -1698,173 +1702,6 @@ impl TransformVisitor<'_, '_, '_> {
         )
     }
 
-    fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
-        &self,
-        stream: &S,
-        fmt: &Expr,
-        args: &[E],
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::BufRead);
-        let handling = self.error_handling(ic);
-        let fmt = LikelyLit::from_expr(fmt);
-        match fmt {
-            LikelyLit::Lit(fmt) => {
-                // from rustc_ast/src/util/literal.rs
-                let s = fmt.as_str();
-                let mut buf = Vec::with_capacity(s.len());
-                rustc_literal_escaper::unescape_unicode(
-                    fmt.as_str(),
-                    rustc_literal_escaper::Mode::ByteStr,
-                    &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-                );
-                let specs = scanf::parse_specs(&buf);
-                scanf::make_parsing_function(&specs);
-                let mut i = 0;
-                let mut code = String::new();
-                for spec in specs {
-                    let arg = if spec.assign {
-                        i += 1;
-                        Some(pprust::expr_to_string(&args[i - 1]))
-                    } else {
-                        None
-                    };
-                    if spec.ty() == "char" {
-                        assert!(spec.width.is_none());
-                        let assign = if let Some(arg) = arg {
-                            format!(
-                                "
-                                *(({arg}) as *mut i8) = c as i8;
-                                count += 1;
-                            "
-                            )
-                        } else {
-                            String::new()
-                        };
-                        write!(
-                            code,
-                            "
-match stream.fill_buf() {{
-    Ok(buf) => {{
-        let c = buf[0];
-        stream.consume(1);
-        {assign}
-    }}
-    Err(e) => {{
-        {handling}
-    }}
-}}"
-                        )
-                        .unwrap();
-                        continue;
-                    }
-                    let check_width = if let Some(width) = spec.width {
-                        format!("if chars.len() == {width} {{ break; }}")
-                    } else {
-                        "".to_string()
-                    };
-                    let check_char = if let Some(scan_set) = spec.scan_set() {
-                        let mut cond = String::new();
-                        if scan_set.negative {
-                            cond.push('!');
-                        }
-                        cond.push('(');
-                        for (i, c) in scan_set.chars.iter().enumerate() {
-                            if i > 0 {
-                                cond.push_str(" || ");
-                            }
-                            if let Some(s) = scanf::escape(*c) {
-                                write!(cond, "c == b'{s}'").unwrap();
-                            } else {
-                                write!(cond, "c == b'{}'", *c as char).unwrap();
-                            }
-                        }
-                        cond.push(')');
-                        format!("if {cond} {{ chars.push(c); }} else {{ break; }}")
-                    } else {
-                        "
-if !c.is_ascii_whitespace() {
-    chars.push(c);
-} else if !chars.is_empty() {
-    break;
-}"
-                        .to_string()
-                    };
-                    let assign = if let Some(arg) = arg {
-                        let ty = spec.ty();
-                        match ty {
-                            "&str" => {
-                                format!(
-                                    "
-    let bytes = s.as_bytes();
-    let buf: &mut [u8] = std::slice::from_raw_parts_mut(({arg}) as _, bytes.len() + 1);
-    buf.copy_from_slice(bytes);
-    buf[bytes.len()] = 0;
-    count += 1;"
-                                )
-                            }
-                            "f128::f128" => {
-                                format!(
-                                    "
-    *(({arg}) as *mut {ty}) = <f128::f128 as num_traits::Num>::from_str_radix(&s, 10).unwrap();
-    count += 1;"
-                                )
-                            }
-                            _ => {
-                                format!(
-                                    "
-    *(({arg}) as *mut {ty}) = s.parse().unwrap();
-    count += 1;"
-                                )
-                            }
-                        }
-                    } else {
-                        "".to_string()
-                    };
-                    write!(
-                        code,
-                        "{{
-    let mut chars = vec![];
-    loop {{
-        {check_width}
-        let available = match stream.fill_buf() {{
-            Ok(buf) => buf,
-            Err(e) => {{
-                {handling}
-                break;
-            }}
-        }};
-        if available.is_empty() {{
-            break;
-        }}
-        let c = available[0];
-        {check_char}
-        stream.consume(1);
-    }}
-    let s = String::from_utf8(chars).unwrap();
-    {assign}
-}}"
-                    )
-                    .unwrap();
-                }
-                expr!(
-                    "{{
-    use std::io::BufRead;
-    let mut stream = {};
-    let mut count = 0i32;
-    {}
-    count
-}}",
-                    stream,
-                    code
-                )
-            }
-            LikelyLit::If(_, _, _) => todo!(),
-            LikelyLit::Path(_, _) => todo!(),
-            LikelyLit::Other(_) => todo!(),
-        }
-    }
-
     #[inline]
     fn transform_fgetc<S: StreamExpr>(&self, stream: &S, ic: IndicatorCheck<'_>) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Read);
@@ -2372,35 +2209,7 @@ if !c.is_ascii_whitespace() {
         (Some(expr!("{}", new_expr)), true)
     }
 
-    fn error_handling(&self, ic: IndicatorCheck<'_>) -> String {
-        match (ic.eof, ic.error) {
-            (true, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
-    ___v_{ind}_eof = 1;
-}} else {{
-    ___v_{ind}_error = 1;
-}}",
-                )
-            }
-            (true, false) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ ___v_{ind}_eof = 1; }}",
-                )
-            }
-            (false, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!(
-                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ ___v_{ind}_error = 1; }}",
-                )
-            }
-            (false, false) => "".to_string(),
-        }
-    }
-
-    fn update_error(&self, ic: IndicatorCheck<'_>, e: String) -> Expr {
+    pub(super) fn update_error(&self, ic: IndicatorCheck<'_>, e: String) -> Expr {
         match (ic.eof, ic.error) {
             (true, true) => {
                 let ind = self.tracked_loc_to_index[ic.name.unwrap()];
@@ -2597,7 +2406,7 @@ fn write_args<E: Deref<Target = Expr>>(
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct IndicatorCheck<'a> {
+pub(super) struct IndicatorCheck<'a> {
     name: Option<&'a ExprLoc>,
     eof: bool,
     error: bool,
