@@ -1719,6 +1719,7 @@ impl TransformVisitor<'_, '_, '_> {
                     &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
                 );
                 let specs = scanf::parse_specs(&buf);
+                scanf::make_parsing_function(&specs);
                 let mut i = 0;
                 let mut code = String::new();
                 for spec in specs {

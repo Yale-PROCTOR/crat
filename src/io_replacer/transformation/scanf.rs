@@ -1,3 +1,136 @@
+use std::fmt::Write as _;
+
+pub(super) fn make_parsing_function(specs: &[ConversionSpec]) {
+    let mut name = "parse".to_string();
+    let mut args = String::new();
+    write!(args, "mut stream: R").unwrap();
+    let mut body = String::new();
+    writeln!(body, "    let mut err = 0;").unwrap();
+    writeln!(body, "    let mut eof = 0;").unwrap();
+    let consume_whitespace = !matches!(
+        specs[0].conversion,
+        Conversion::Seq | Conversion::ScanSet(_)
+    );
+    writeln!(
+        body,
+        "    if is_eof(&mut stream, {consume_whitespace}) {{
+        return (-1, err, eof);
+    }}"
+    )
+    .unwrap();
+    writeln!(body, "    let mut count = 0;").unwrap();
+    let mut i = -1;
+    for spec in specs {
+        let ty = spec.ty();
+        if !spec.assign {
+            write!(name, "_no_assign").unwrap();
+        }
+        if let Some(width) = spec.width {
+            write!(name, "_w{width}").unwrap();
+        }
+        if let Some(length) = spec.length {
+            if length == LengthMod::LongDouble {
+                write!(name, "_big_l",).unwrap();
+            } else {
+                write!(name, "_{length}",).unwrap();
+            }
+        }
+        match &spec.conversion {
+            Conversion::ScanSet(scan_set) => {
+                write!(name, "_{}", !scan_set.negative).unwrap();
+                for c in &scan_set.chars {
+                    if c.is_ascii_digit() || c.is_ascii_lowercase() {
+                        write!(name, "_{}", *c as char).unwrap();
+                    } else {
+                        write!(name, "_{}", *c).unwrap();
+                    }
+                }
+            }
+            Conversion::C => write!(name, "_big_c").unwrap(),
+            Conversion::S => write!(name, "_big_s").unwrap(),
+            Conversion::Percent => write!(name, "_percent").unwrap(),
+            conv => write!(name, "_{conv}").unwrap(),
+        }
+
+        let assign = if !spec.assign {
+            "".to_string()
+        } else {
+            i += 1;
+            write!(args, ", v{i}: *mut {ty}").unwrap();
+            let mut assign = if ty == "String" {
+                format!(
+                    "        let bytes = _v.as_bytes();
+        let buf: &mut [u8] = std::slice::from_raw_parts_mut(v{i}, bytes.len() + 1);
+        buf.copy_from_slice(bytes);
+        buf[bytes.len()] = 0;
+"
+                )
+            } else if ty.starts_with("i") || ty.starts_with("u") {
+                format!("        *v{i} = _v as {ty};\n")
+            } else {
+                format!("        *v{i} = _v;\n")
+            };
+            write!(assign, "        count += 1;").unwrap();
+            assign
+        };
+
+        let mut call_args = String::new();
+        let f = match &spec.conversion {
+            Conversion::Int10 | Conversion::Unsigned => "parse_decimal",
+            Conversion::Int0 => "parse_integer_auto",
+            Conversion::Octal => "parse_octal",
+            Conversion::Hexadecimal => "parse_hexadecimal",
+            Conversion::Double => match spec.length {
+                None => "parse_f32",
+                Some(LengthMod::Long) => "parse_f64",
+                Some(LengthMod::LongDouble) => "parse_f128",
+                _ => panic!(),
+            },
+            Conversion::Str => "parse_string",
+            Conversion::ScanSet(scan_set) => {
+                write!(call_args, ", {}, b\"", !scan_set.negative).unwrap();
+                for c in &scan_set.chars {
+                    if let Some(s) = escape(*c) {
+                        write!(call_args, "{s}").unwrap();
+                    } else {
+                        write!(call_args, "{}", *c as char).unwrap();
+                    }
+                }
+                write!(call_args, "\"").unwrap();
+                "parse_scan_set"
+            }
+            Conversion::Seq => "parse_char",
+            Conversion::Pointer => todo!(),
+            Conversion::Num => todo!(),
+            Conversion::C => todo!(),
+            Conversion::S => todo!(),
+            Conversion::Percent => todo!(),
+        };
+        writeln!(
+            body,
+            "    let (_v, _err, _eof) = {f}(&mut stream, {:?}{call_args});",
+            spec.width
+        )
+        .unwrap();
+        writeln!(body, "    err |= _err;").unwrap();
+        writeln!(body, "    eof |= _eof;").unwrap();
+        writeln!(
+            body,
+            "    if let Some(_v) == _v {{
+{assign}
+    }} else {{
+        return (count, err, eof);
+    }}"
+        )
+        .unwrap();
+    }
+    let code = format!(
+        "pub(crate) unsafe fn {name}<R: std::io::BufRead>({args}) -> (i32, i32, i32) {{
+{body}}}"
+    );
+    println!("{code}");
+}
+
 pub(super) fn parse_specs(mut remaining: &[u8]) -> Vec<ConversionSpec> {
     let mut specs = vec![];
     loop {
@@ -317,9 +450,9 @@ impl Conversion {
                 Some(LongDouble) => "f128::f128",
                 _ => panic!(),
             },
-            Self::Str | Self::ScanSet { .. } => "&str",
+            Self::Str | Self::ScanSet { .. } => "String",
             Self::Seq => match length {
-                None => "char",
+                None => "i8",
                 Some(Long) => unimplemented!(),
                 _ => panic!(),
             },
