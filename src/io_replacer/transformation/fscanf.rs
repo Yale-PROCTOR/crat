@@ -944,12 +944,37 @@ fn parse_float<R: std::io::BufRead, F, E>(
         stream.consume(1);
     }
 
-    if v.iter().any(|c| c.is_ascii_digit()) {
-        let s = std::str::from_utf8(&v).unwrap();
-        parse(s).ok()
-    } else {
-        None
+    if !v.iter().any(|c| c.is_ascii_digit()) {
+        return None;
     }
+
+    if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) | 32 == b'e' {
+        v.push(b'e');
+        stream.consume(1);
+
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
+        if c == b'+' || c == b'-' {
+            v.push(c);
+            stream.consume(1);
+        }
+
+        loop {
+            let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
+            if c.is_ascii_digit() {
+                v.push(c);
+                stream.consume(1);
+            } else {
+                break;
+            }
+        }
+
+        while !v.last().unwrap().is_ascii_digit() {
+            v.pop();
+        }
+    }
+
+    let s = std::str::from_utf8(&v).unwrap();
+    parse(s).ok()
 }
 "#;
 
