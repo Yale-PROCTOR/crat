@@ -2209,6 +2209,24 @@ impl TransformVisitor<'_, '_, '_> {
         (Some(expr!("{}", new_expr)), true)
     }
 
+    pub(super) fn err_eof_args(&self, ic: IndicatorCheck<'_>) -> String {
+        match (ic.error, ic.eof) {
+            (true, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("Some(&mut ___v_{ind}_error), Some(&mut ___v_{ind}_eof)")
+            }
+            (true, false) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("Some(&mut ___v_{ind}_error), None")
+            }
+            (false, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("None, Some(&mut ___v_{ind}_eof)")
+            }
+            (false, false) => "None, None".to_string(),
+        }
+    }
+
     pub(super) fn update_error(&self, ic: IndicatorCheck<'_>, e: String) -> Expr {
         match (ic.eof, ic.error) {
             (true, true) => {

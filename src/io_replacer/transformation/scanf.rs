@@ -32,7 +32,11 @@ impl TransformVisitor<'_, '_, '_> {
                 );
                 let specs = parse_specs(&buf);
                 let parsing_fn = make_parsing_function(&specs);
-                let mut code = format!("crate::stdio::{}({}", parsing_fn.name, stream);
+                let err_eof_args = self.err_eof_args(ic);
+                let mut code = format!(
+                    "crate::stdio::{}({}, {}",
+                    parsing_fn.name, stream, err_eof_args
+                );
                 for arg in args.iter().take(parsing_fn.args_num) {
                     write!(code, ", ({}) as *mut _", pprust::expr_to_string(arg)).unwrap();
                 }
@@ -43,7 +47,7 @@ impl TransformVisitor<'_, '_, '_> {
                 self.parsing_fns
                     .borrow_mut()
                     .push((parsing_fn.name, parsing_fn.code));
-                self.update_error(ic, code)
+                expr!("{}", code)
             }
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(_, _) => todo!(),
@@ -63,18 +67,20 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     let mut lib_items = vec![];
     let mut name = "parse".to_string();
     let mut args = String::new();
-    write!(args, "mut stream: R").unwrap();
+    write!(
+        args,
+        "mut stream: R, mut err: Option<&mut i32>, mut eof: Option<&mut i32>"
+    )
+    .unwrap();
     let mut body = String::new();
-    writeln!(body, "    let mut err = 0;").unwrap();
-    writeln!(body, "    let mut eof = 0;").unwrap();
     let consume_whitespace = !matches!(
         specs[0].conversion,
         Conversion::Seq | Conversion::ScanSet(_)
     );
     writeln!(
         body,
-        "    if is_eof(&mut stream, &mut err, &mut eof, {consume_whitespace}) {{
-        return (-1, err, eof);
+        "    if is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), {consume_whitespace}) {{
+        return -1;
     }}"
     )
     .unwrap();
@@ -204,7 +210,7 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
         let width = spec.width;
         writeln!(
             body,
-            "    let _v = {f}(&mut stream, {width:?}, &mut err, &mut eof{call_args});",
+            "    let _v = {f}(&mut stream, {width:?}, err.as_deref_mut(), eof.as_deref_mut(){call_args});",
         )
         .unwrap();
         writeln!(
@@ -212,14 +218,14 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
             "    if let Some(_v) = _v {{
 {assign}
     }} else {{
-        return (count, err, eof);
+        return count;
     }}"
         )
         .unwrap();
     }
-    writeln!(body, "    (count, err, eof)").unwrap();
+    writeln!(body, "    count").unwrap();
     let code = format!(
-        "pub(crate) unsafe fn {name}<R: std::io::BufRead>({args}) -> (i32, i32, i32) {{
+        "pub(crate) unsafe fn {name}<R: std::io::BufRead>({args}) -> i32 {{
 {body}}}
 "
     );
@@ -690,30 +696,38 @@ fn test_scanf_parse() {
 }
 
 pub(super) static PEEK: &str = r#"
-fn peek<R: std::io::BufRead>(mut stream: R, err: &mut i32, eof: &mut i32) -> u8 {
+fn peek<R: std::io::BufRead>(mut stream: R, err: Option<&mut i32>, eof: Option<&mut i32>) -> u8 {
     match stream.fill_buf() {
         Ok([c, ..]) => return *c,
-        Ok([]) => *eof = 1,
-        Err(_) => *err = 1,
+        Ok([]) => {
+            if let Some(eof) = eof {
+                *eof = 1;
+            }
+        }
+        Err(_) => {
+            if let Some(err) = err {
+                *err = 1;
+            }
+        }
     }
     0xff
 }
 "#;
 
 pub(super) static IS_EOF: &str = r#"
-fn is_eof<R: std::io::BufRead>(mut stream: R, err: &mut i32, eof: &mut i32, consume_whitespace: bool) -> bool {
+fn is_eof<R: std::io::BufRead>(mut stream: R, mut err: Option<&mut i32>, mut eof: Option<&mut i32>, consume_whitespace: bool) -> bool {
     if consume_whitespace {
-        while peek(&mut stream, err, eof).is_ascii_whitespace() {
+        while peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()).is_ascii_whitespace() {
             stream.consume(1);
         }
     }
-    peek(&mut stream, err, eof) == 0xff
+    peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == 0xff
 }
 "#;
 
 pub(super) static PARSE_CHAR: &str = r#"
-fn parse_char<R: std::io::BufRead>(mut stream: R, _width: Option<usize>, err: &mut i32, eof: &mut i32) -> Option<i8> {
-    let c = peek(&mut stream, err, eof);
+fn parse_char<R: std::io::BufRead>(mut stream: R, _width: Option<usize>, mut err: Option<&mut i32>, mut eof: Option<&mut i32>) -> Option<i8> {
+    let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
     if c == 0xff {
         None
     } else {
@@ -727,14 +741,14 @@ pub(super) static PARSE_SCAN_SET: &str = r#"
 fn parse_scan_set<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
     pos: bool,
     set: &[u8],
 ) -> Option<Vec<u8>> {
     let mut v: Vec<u8> = vec![];
     while width.is_none_or(|lim| v.len() < lim) {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff || set.contains(&c) != pos {
             break;
         }
@@ -753,12 +767,12 @@ pub(super) static PARSE_STRING: &str = r#"
 fn parse_string<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<Vec<u8>> {
     let mut v: Vec<u8> = vec![];
     while width.is_none_or(|lim| v.len() < lim) {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff {
             break;
         } else if c.is_ascii_whitespace() {
@@ -779,30 +793,34 @@ fn parse_string<R: std::io::BufRead>(
 "#;
 
 pub(super) static PARSE_F32: &str = r#"
-fn parse_f32<R: std::io::BufRead>(stream: R, width: Option<usize>, err: &mut i32, eof: &mut i32) -> Option<f32> {
+fn parse_f32<R: std::io::BufRead>(stream: R, width: Option<usize>, mut err: Option<&mut i32>, mut eof: Option<&mut i32>) -> Option<f32> {
     parse_float(
         stream,
         width,
         err,
         eof,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::NAN,
+        FloatValues {
+            infinity_value: f32::INFINITY,
+            neg_infinity_value: f32::NEG_INFINITY,
+            nan_value: f32::NAN,
+        },
         str::parse,
     )
 }
 "#;
 
 pub(super) static PARSE_F64: &str = r#"
-fn parse_f64<R: std::io::BufRead>(stream: R, width: Option<usize>, err: &mut i32, eof: &mut i32) -> Option<f64> {
+fn parse_f64<R: std::io::BufRead>(stream: R, width: Option<usize>, mut err: Option<&mut i32>, mut eof: Option<&mut i32>) -> Option<f64> {
     parse_float(
         stream,
         width,
         err,
         eof,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NAN,
+        FloatValues {
+            infinity_value: f64::INFINITY,
+            neg_infinity_value: f64::NEG_INFINITY,
+            nan_value: f64::NAN,
+        },
         str::parse,
     )
 }
@@ -812,39 +830,45 @@ pub(super) static PARSE_F128: &str = r#"
 fn parse_f128<R: std::io::BufRead>(
     stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<f128::f128> {
     parse_float(
         stream,
         width,
         err,
         eof,
-        f128::f128::INFINITY,
-        f128::f128::NEG_INFINITY,
-        f128::f128::NAN,
+        FloatValues {
+            infinity_value: f128::f128::INFINITY,
+            neg_infinity_value: f128::f128::NEG_INFINITY,
+            nan_value: f128::f128::NAN,
+        },
         |s| <f128::f128 as num_traits::Num>::from_str_radix(s, 10),
     )
 }
 "#;
 
 pub(super) static PARSE_FLOAT: &str = r#"
+struct FloatValues<F> {
+    infinity_value: F,
+    neg_infinity_value: F,
+    nan_value: F,
+}
+
 #[inline]
 fn parse_float<R: std::io::BufRead, F, E>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
-    infinity_value: F,
-    neg_infinity_value: F,
-    nan_value: F,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
+    values: FloatValues<F>,
     parse: impl Fn(&str) -> Result<F, E>,
 ) -> Option<F> {
     let mut neg = false;
-    while peek(&mut stream, err, eof).is_ascii_whitespace() {
+    while peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()).is_ascii_whitespace() {
         stream.consume(1);
     }
-    let c = peek(&mut stream, err, eof);
+    let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
     if c == b'+' {
         stream.consume(1);
     } else if c == b'-' {
@@ -856,7 +880,7 @@ fn parse_float<R: std::io::BufRead, F, E>(
     let len = width.unwrap_or(8).min(8);
     let infinity = b"infinity";
     while i < len {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c | 32 == infinity[i] {
             stream.consume(1);
             i += 1;
@@ -865,11 +889,11 @@ fn parse_float<R: std::io::BufRead, F, E>(
         }
     }
     if i == 3 || i == 8 {
-        peek(&mut stream, err, eof);
+        peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         let v = if neg {
-            neg_infinity_value
+            values.neg_infinity_value
         } else {
-            infinity_value
+            values.infinity_value
         };
         return Some(v);
     } else if i > 0 {
@@ -880,7 +904,7 @@ fn parse_float<R: std::io::BufRead, F, E>(
     let len = width.unwrap_or(3).min(3);
     let nan = b"nan";
     while i < len {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c | 32 == nan[i] {
             stream.consume(1);
             i += 1;
@@ -889,15 +913,15 @@ fn parse_float<R: std::io::BufRead, F, E>(
         }
     }
     if i == 3 {
-        peek(&mut stream, err, eof);
-        return Some(nan_value);
+        peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
+        return Some(values.nan_value);
     } else if i > 0 {
         return None;
     }
 
-    if peek(&mut stream, err, eof) == b'0' {
+    if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == b'0' {
         stream.consume(1);
-        if peek(&mut stream, err, eof) | 32 == b'x' {
+        if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) | 32 == b'x' {
             stream.consume(1);
             todo!("hex float parsing");
         }
@@ -909,7 +933,7 @@ fn parse_float<R: std::io::BufRead, F, E>(
     }
     let mut dot_seen = false;
     loop {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c.is_ascii_digit() {
         } else if c == b'.' && !dot_seen {
             dot_seen = true;
@@ -933,10 +957,10 @@ pub(super) static PARSE_DECIMAL: &str = r#"
 fn parse_decimal<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<u64> {
-    parse_integer(&mut stream, width, err, eof, |c| c.is_ascii_digit(), 10)
+    parse_integer(&mut stream, width, err.as_deref_mut(), eof.as_deref_mut(), |c| c.is_ascii_digit(), 10)
 }
 "#;
 
@@ -944,10 +968,10 @@ pub(super) static PARSE_OCTAL: &str = r#"
 fn parse_octal<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<u64> {
-    parse_integer(&mut stream, width, err, eof, |c| matches!(c, b'0'..=b'7'), 8)
+    parse_integer(&mut stream, width, err.as_deref_mut(), eof.as_deref_mut(), |c| matches!(c, b'0'..=b'7'), 8)
 }
 "#;
 
@@ -956,8 +980,8 @@ pub(super) static PARSE_INTEGER: &str = r#"
 fn parse_integer<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
     is_digit: impl Fn(u8) -> bool,
     base: u64,
 ) -> Option<u64> {
@@ -967,7 +991,7 @@ fn parse_integer<R: std::io::BufRead>(
     let mut v = 0u64;
     let mut count = 0;
     while width.is_none_or(|lim| count < lim) {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if is_digit(c) {
             expect_digit = true;
             succ = true;
@@ -1014,8 +1038,8 @@ pub(super) static PARSE_HEXADECIMAL: &str = r#"
 fn parse_hexadecimal<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<u64> {
     let mut state = ParseIntState::Whitespace;
     let mut neg = false;
@@ -1023,7 +1047,7 @@ fn parse_hexadecimal<R: std::io::BufRead>(
     let mut v = 0u64;
     let mut count = 0;
     while width.is_none_or(|lim| count < lim) {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         match state {
             ParseIntState::Whitespace => {
                 if c == b'0' {
@@ -1103,8 +1127,8 @@ pub(super) static PARSE_INTEGER_AUTO: &str = r#"
 fn parse_integer_auto<R: std::io::BufRead>(
     mut stream: R,
     width: Option<usize>,
-    err: &mut i32,
-    eof: &mut i32,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
 ) -> Option<u64> {
     let mut state = ParseIntState::Whitespace;
     let mut neg = false;
@@ -1113,7 +1137,7 @@ fn parse_integer_auto<R: std::io::BufRead>(
     let mut v = 0u64;
     let mut count = 0;
     while width.is_none_or(|lim| count < lim) {
-        let c = peek(&mut stream, err, eof);
+        let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         match state {
             ParseIntState::Whitespace => {
                 if c == b'0' {
