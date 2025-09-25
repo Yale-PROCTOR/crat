@@ -662,21 +662,21 @@ pub(super) enum LibItem {
 }
 
 static LIB_ITEMS_ARRAY: [(LibItem, &str); 15] = [
-    (LibItem::Peek, super::scanf::PEEK),
-    (LibItem::IsEof, super::scanf::IS_EOF),
-    (LibItem::ParseChar, super::scanf::PARSE_CHAR),
-    (LibItem::ParseScanSet, super::scanf::PARSE_SCAN_SET),
-    (LibItem::ParseString, super::scanf::PARSE_STRING),
-    (LibItem::ParseF32, super::scanf::PARSE_F32),
-    (LibItem::ParseF64, super::scanf::PARSE_F64),
-    (LibItem::ParseF128, super::scanf::PARSE_F128),
-    (LibItem::ParseFloat, super::scanf::PARSE_FLOAT),
-    (LibItem::ParseDecimal, super::scanf::PARSE_DECIMAL),
-    (LibItem::ParseOctal, super::scanf::PARSE_OCTAL),
-    (LibItem::ParseInteger, super::scanf::PARSE_INTEGER),
-    (LibItem::ParseIntState, super::scanf::PARSE_INT_STATE),
-    (LibItem::ParseHexadecimal, super::scanf::PARSE_HEXADECIMAL),
-    (LibItem::ParseIntegerAuto, super::scanf::PARSE_INTEGER_AUTO),
+    (LibItem::Peek, super::fscanf::PEEK),
+    (LibItem::IsEof, super::fscanf::IS_EOF),
+    (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
+    (LibItem::ParseScanSet, super::fscanf::PARSE_SCAN_SET),
+    (LibItem::ParseString, super::fscanf::PARSE_STRING),
+    (LibItem::ParseF32, super::fscanf::PARSE_F32),
+    (LibItem::ParseF64, super::fscanf::PARSE_F64),
+    (LibItem::ParseF128, super::fscanf::PARSE_F128),
+    (LibItem::ParseFloat, super::fscanf::PARSE_FLOAT),
+    (LibItem::ParseDecimal, super::fscanf::PARSE_DECIMAL),
+    (LibItem::ParseOctal, super::fscanf::PARSE_OCTAL),
+    (LibItem::ParseInteger, super::fscanf::PARSE_INTEGER),
+    (LibItem::ParseIntState, super::fscanf::PARSE_INT_STATE),
+    (LibItem::ParseHexadecimal, super::fscanf::PARSE_HEXADECIMAL),
+    (LibItem::ParseIntegerAuto, super::fscanf::PARSE_INTEGER_AUTO),
 ];
 
 lazy_static! {

@@ -23,10 +23,10 @@ use super::{
     api_list::{self, Origin, Permission},
     error_analysis::{ErrorPropagation, ExprLoc, Indicator},
     file_analysis::{self, LocId, UnsupportedReason},
+    fprintf,
     hir_ctx::{HirCtx, HirLoc},
     likely_lit::LikelyLit,
     mir_loc::MirLoc,
-    printf,
     stream_ty::*,
     transform::LibItem,
 };
@@ -1834,7 +1834,7 @@ impl TransformVisitor<'_, '_, '_> {
             }
             buf = new_buf;
         }
-        let rsfmt = printf::to_rust_format(&buf);
+        let rsfmt = fprintf::to_rust_format(&buf);
         assert!(args.len() >= rsfmt.casts.len());
         let mut new_args = String::new();
         let mut width_args = String::new();
