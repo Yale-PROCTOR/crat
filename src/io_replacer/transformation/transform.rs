@@ -616,7 +616,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
     if lib_items.contains(&LibItem::Child) && lib_items.contains(&LibItem::AsRawFd) {
         lib_items.insert(LibItem::ChildAsRawFd);
     }
-    if lib_items.contains(&LibItem::Child) && lib_items.contains(&LibItem::Child) {
+    if lib_items.contains(&LibItem::Child) && lib_items.contains(&LibItem::Close) {
         lib_items.insert(LibItem::ChildClose);
     }
 
@@ -707,6 +707,8 @@ pub(super) enum LibItem {
     Fseek,
     Ftell,
     Rewind,
+    Rename,
+    Remove,
     Lock,
     Fopen,
     AsRawFd,
@@ -716,7 +718,7 @@ pub(super) enum LibItem {
     ChildClose,
 }
 
-static LIB_ITEMS_ARRAY: [(LibItem, &str); 46] = [
+static LIB_ITEMS_ARRAY: [(LibItem, &str); 48] = [
     (LibItem::Peek, super::fscanf::PEEK),
     (LibItem::IsEof, super::fscanf::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
@@ -756,6 +758,8 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 46] = [
     (LibItem::Fseek, super::fseek::FSEEK),
     (LibItem::Ftell, super::fseek::FTELL),
     (LibItem::Rewind, super::fseek::REWIND),
+    (LibItem::Rename, super::visitor::RENAME),
+    (LibItem::Remove, super::visitor::REMOVE),
     (LibItem::Lock, super::flockfile::LOCK),
     (LibItem::Fopen, super::fopen::FOPEN),
     (LibItem::AsRawFd, super::fileno::AS_RAW_FD),

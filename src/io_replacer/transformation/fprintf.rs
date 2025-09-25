@@ -11,6 +11,27 @@ use super::{
     visitor::{IndicatorCheck, TransformVisitor},
 };
 
+pub(super) const FPRINTF_ITEMS: [LibItem; 8] = [
+    LibItem::Fprintf,
+    LibItem::Vfprintf,
+    LibItem::Xu8,
+    LibItem::Xu16,
+    LibItem::Xu32,
+    LibItem::Xu64,
+    LibItem::Gf64,
+    LibItem::Af64,
+];
+
+pub(super) const VFPRINTF_ITEMS: [LibItem; 7] = [
+    LibItem::Vfprintf,
+    LibItem::Xu8,
+    LibItem::Xu16,
+    LibItem::Xu32,
+    LibItem::Xu64,
+    LibItem::Gf64,
+    LibItem::Af64,
+];
+
 impl TransformVisitor<'_, '_, '_> {
     pub(super) fn transform_fprintf<S: StreamExpr, E: Deref<Target = Expr>>(
         &self,
@@ -39,16 +60,7 @@ impl TransformVisitor<'_, '_, '_> {
             s.push_str(&arg);
         }
         s.push(')');
-        self.lib_items.borrow_mut().extend([
-            LibItem::Fprintf,
-            LibItem::Vfprintf,
-            LibItem::Xu8,
-            LibItem::Xu16,
-            LibItem::Xu32,
-            LibItem::Xu64,
-            LibItem::Gf64,
-            LibItem::Af64,
-        ]);
+        self.lib_items.borrow_mut().extend(FPRINTF_ITEMS);
         self.update_error_no_eof(ctx.ic, s, stream)
     }
 
@@ -197,15 +209,7 @@ impl TransformVisitor<'_, '_, '_> {
         let stream_str = stream.borrow_for(StreamTrait::Write);
         let fmt = pprust::expr_to_string(fmt);
         let args = pprust::expr_to_string(args);
-        self.lib_items.borrow_mut().extend([
-            LibItem::Vfprintf,
-            LibItem::Xu8,
-            LibItem::Xu16,
-            LibItem::Xu32,
-            LibItem::Xu64,
-            LibItem::Gf64,
-            LibItem::Af64,
-        ]);
+        self.lib_items.borrow_mut().extend(VFPRINTF_ITEMS);
         self.update_error_no_eof(
             ic,
             format!("crate::stdio::rs_vfprintf({stream_str}, {fmt}, {args})"),

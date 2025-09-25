@@ -917,6 +917,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
+                                self.lib_items.borrow_mut().extend(fprintf::FPRINTF_ITEMS);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fprintf",
                                     orig_name,
@@ -983,6 +984,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
+                                self.lib_items.borrow_mut().extend(fprintf::VFPRINTF_ITEMS);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_vfprintf",
                                     orig_name,
@@ -1017,6 +1019,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
+                                self.lib_items.borrow_mut().push(LibItem::Fputc);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputc",
                                     orig_name,
@@ -1051,6 +1054,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
+                                self.lib_items.borrow_mut().push(LibItem::Fputwc);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputwc",
                                     orig_name,
@@ -1074,6 +1078,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
+                                self.lib_items.borrow_mut().push(LibItem::Fputs);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputs",
                                     orig_name,
@@ -1116,6 +1121,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[3]);
+                                self.lib_items.borrow_mut().push(LibItem::Fwrite);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fwrite",
                                     orig_name,
@@ -1140,6 +1146,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
+                                self.lib_items.borrow_mut().push(LibItem::Fflush);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fflush",
                                     orig_name,
@@ -1251,10 +1258,12 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                         }
                         "rename" => {
                             let new_expr = expr!("crate::stdio::rs_rename");
+                            self.lib_items.borrow_mut().push(LibItem::Rename);
                             self.replace_expr(callee, new_expr);
                         }
                         "remove" => {
                             let new_expr = expr!("crate::stdio::rs_remove");
+                            self.lib_items.borrow_mut().push(LibItem::Remove);
                             self.replace_expr(callee, new_expr);
                         }
                         "setvbuf" | "setbuf" => {
@@ -1749,3 +1758,29 @@ pub(super) struct IndicatorCheck<'a> {
     eof: bool,
     error: bool,
 }
+
+pub(super) const RENAME: &str = r#"
+#[inline]
+pub(crate) unsafe fn rs_rename(old: *const i8, new: *const i8) -> i32 {
+    let old = std::ffi::CStr::from_ptr(old as _).to_str().unwrap();
+    let new = std::ffi::CStr::from_ptr(new as _).to_str().unwrap();
+    std::fs::rename(old, new).map_or(-1, |_| 0)
+}
+"#;
+
+pub(super) const REMOVE: &str = r#"
+#[inline]
+pub(crate) unsafe fn rs_remove(path: *const i8) -> i32 {
+    let path = std::ffi::CStr::from_ptr(path as _).to_str().unwrap();
+    match std::fs::remove_file(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::IsADirectory {
+                std::fs::remove_dir(path).map_or(-1, |_| 0)
+            } else {
+                -1
+            }
+        }
+    }
+}
+"#;
