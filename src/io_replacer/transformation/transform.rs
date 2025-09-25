@@ -44,10 +44,12 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
 
     let path = dir.join("c2rust-lib.rs");
     let mut contents = fs::read_to_string(&path).unwrap();
-    if !contents.contains("#![feature(c_variadic)]") {
+    if res.lib_items.contains(&LibItem::Fprintf) && !contents.contains("#![feature(c_variadic)]") {
         contents = format!("#![feature(c_variadic)]\n{contents}");
     }
-    if !contents.contains("#![feature(formatting_options)]") {
+    if res.lib_items.contains(&LibItem::Vfprintf)
+        && !contents.contains("#![feature(formatting_options)]")
+    {
         contents = format!("#![feature(formatting_options)]\n{contents}");
     }
     contents.push_str(&res.stdio_mod());
@@ -73,8 +75,14 @@ impl TransformationResult {
     pub fn stdio_mod(&self) -> String {
         let mut m = "mod stdio {".to_string();
         for bound in &self.bounds {
-            write!(m, " pub trait {} : {}", bound.trait_name(), bound,).unwrap();
+            if bound.count() <= 1 {
+                continue;
+            }
+            write!(m, " pub trait {} : {}", bound.trait_name(), bound).unwrap();
             for other in &self.bounds {
+                if other.count() <= 1 {
+                    continue;
+                }
                 if bound != other && bound.superset(other) {
                     write!(m, " + {}", other.trait_name()).unwrap();
                 }
@@ -596,6 +604,22 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
 
     let transformation_time = start.elapsed().as_millis();
 
+    if bounds
+        .iter()
+        .any(|bound| bound.contains(StreamTrait::AsRawFd))
+    {
+        lib_items.insert(LibItem::AsRawFd);
+    }
+    if bounds.iter().any(|bound| bound.contains(StreamTrait::Lock)) {
+        lib_items.insert(LibItem::Lock);
+    }
+    if lib_items.contains(&LibItem::Child) && lib_items.contains(&LibItem::AsRawFd) {
+        lib_items.insert(LibItem::ChildAsRawFd);
+    }
+    if lib_items.contains(&LibItem::Child) && lib_items.contains(&LibItem::Child) {
+        lib_items.insert(LibItem::ChildClose);
+    }
+
     TransformationResult {
         files: res.0,
         tmpfile,
@@ -659,9 +683,40 @@ pub(super) enum LibItem {
     ParseIntState,
     ParseHexadecimal,
     ParseIntegerAuto,
+    Fprintf,
+    Vfprintf,
+    Xu8,
+    Xu16,
+    Xu32,
+    Xu64,
+    Gf64,
+    Af64,
+    Fgetc,
+    Fgets,
+    Getdelim,
+    Getline,
+    Fread,
+    Fputc,
+    Fputwc,
+    Fputs,
+    Puts,
+    Perror,
+    Fwrite,
+    Fflush,
+    Seek,
+    Fseek,
+    Ftell,
+    Rewind,
+    Lock,
+    Fopen,
+    AsRawFd,
+    Close,
+    Child,
+    ChildAsRawFd,
+    ChildClose,
 }
 
-static LIB_ITEMS_ARRAY: [(LibItem, &str); 15] = [
+static LIB_ITEMS_ARRAY: [(LibItem, &str); 46] = [
     (LibItem::Peek, super::fscanf::PEEK),
     (LibItem::IsEof, super::fscanf::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
@@ -677,6 +732,37 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 15] = [
     (LibItem::ParseIntState, super::fscanf::PARSE_INT_STATE),
     (LibItem::ParseHexadecimal, super::fscanf::PARSE_HEXADECIMAL),
     (LibItem::ParseIntegerAuto, super::fscanf::PARSE_INTEGER_AUTO),
+    (LibItem::Fprintf, super::fprintf::FPRINTF),
+    (LibItem::Vfprintf, super::fprintf::VFPRINTF),
+    (LibItem::Xu8, super::fprintf::XU8),
+    (LibItem::Xu16, super::fprintf::XU16),
+    (LibItem::Xu32, super::fprintf::XU32),
+    (LibItem::Xu64, super::fprintf::XU64),
+    (LibItem::Gf64, super::fprintf::GF64),
+    (LibItem::Af64, super::fprintf::AF64),
+    (LibItem::Fgetc, super::fgetc::FGETC),
+    (LibItem::Fgets, super::fgets::FGETS),
+    (LibItem::Getdelim, super::getdelim::GETDELIM),
+    (LibItem::Getline, super::getdelim::GETLINE),
+    (LibItem::Fread, super::fread::FREAD),
+    (LibItem::Fputc, super::fputc::FPUTC),
+    (LibItem::Fputwc, super::fputc::FWPUTC),
+    (LibItem::Fputs, super::fputs::FPUTS),
+    (LibItem::Puts, super::fputs::PUTS),
+    (LibItem::Perror, super::fputs::PERROR),
+    (LibItem::Fwrite, super::fwrite::FWRITE),
+    (LibItem::Fflush, super::fflush::FFLUSH),
+    (LibItem::Seek, super::fseek::SEEK),
+    (LibItem::Fseek, super::fseek::FSEEK),
+    (LibItem::Ftell, super::fseek::FTELL),
+    (LibItem::Rewind, super::fseek::REWIND),
+    (LibItem::Lock, super::flockfile::LOCK),
+    (LibItem::Fopen, super::fopen::FOPEN),
+    (LibItem::AsRawFd, super::fileno::AS_RAW_FD),
+    (LibItem::Close, super::close::CLOSE),
+    (LibItem::Child, super::popen::CHILD),
+    (LibItem::ChildAsRawFd, super::popen::CHILD_AS_RAW_FD),
+    (LibItem::ChildClose, super::popen::CHILD_CLOSE),
 ];
 
 lazy_static! {

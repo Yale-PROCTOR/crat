@@ -25,7 +25,6 @@ use super::{
     file_analysis::{self, LocId, UnsupportedReason},
     fprintf,
     hir_ctx::{HirCtx, HirLoc},
-    likely_lit::LikelyLit,
     mir_loc::MirLoc,
     stream_ty::*,
     transform::LibItem,
@@ -98,13 +97,6 @@ impl Parameter {
 fn remove_cast(expr: &Expr) -> &Expr {
     let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
     remove_cast(expr)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FprintfCtx<'a> {
-    wide: bool,
-    retval_used: bool,
-    ic: IndicatorCheck<'a>,
 }
 
 impl<'a> TransformVisitor<'_, 'a, '_> {
@@ -234,9 +226,7 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
     fn replace_ty_with_pot(&mut self, old: &mut Ty, pot: Pot<'_>) {
         if let Some(bound) = pot.ty.get_dyn_bound() {
             self.bound_num += 1;
-            if bound.count() > 1 {
-                self.bounds.push(bound);
-            }
+            self.bounds.push(bound);
         }
         self.replace_ty(old, ty!("{}", pot.ty));
     }
@@ -686,9 +676,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
         } else {
             if let Some(bound) = pot.ty.get_dyn_bound() {
                 self.bound_num += 1;
-                if bound.count() > 1 {
-                    self.bounds.push(bound);
-                }
+                self.bounds.push(bound);
             }
             self.updated = true;
             local.ty = Some(P(ty!("{}", pot.ty)));
@@ -945,7 +933,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             let stream = TypedExpr::new(&args[0], ty);
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                             let ic = self.indicator_check(&args[0]);
-                            let ctx = FprintfCtx {
+                            let ctx = fprintf::FprintfCtx {
                                 wide: false,
                                 retval_used,
                                 ic,
@@ -963,7 +951,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             let stream = StdExpr::stdout();
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                             let ic = self.indicator_check_std("stdout");
-                            let ctx = FprintfCtx {
+                            let ctx = fprintf::FprintfCtx {
                                 wide: false,
                                 retval_used,
                                 ic,
@@ -981,7 +969,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             let stream = StdExpr::stdout();
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                             let ic = self.indicator_check_std("stdout");
-                            let ctx = FprintfCtx {
+                            let ctx = fprintf::FprintfCtx {
                                 wide: true,
                                 retval_used,
                                 ic,
@@ -1508,602 +1496,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenMode {
-    Read(bool),
-    Write(bool),
-    Append(bool),
-    Unknown,
-}
-
-impl OpenMode {
-    fn from_lit(mode: Symbol) -> Self {
-        let (prefix, suffix) = mode.as_str().split_at(1);
-        let plus = suffix.contains('+');
-        match prefix {
-            "r" => Self::Read(plus),
-            "w" => Self::Write(plus),
-            "a" => Self::Append(plus),
-            _ => panic!("{mode:?}"),
-        }
-    }
-
-    fn from_likely_lit(mode: &LikelyLit<'_>) -> Self {
-        match mode {
-            LikelyLit::Lit(mode) => Self::from_lit(*mode),
-            LikelyLit::If(_, t, f) => {
-                let t = Self::from_likely_lit(t);
-                let f = Self::from_likely_lit(f);
-                if t == f { t } else { Self::Unknown }
-            }
-            LikelyLit::Path(_, _) => Self::Unknown,
-            LikelyLit::Other(_) => todo!(),
-        }
-    }
-
-    fn make_expr(self, path: &Expr, mode: &Expr) -> Expr {
-        let path = pprust::expr_to_string(path);
-        let path_str = format!("std::ffi::CStr::from_ptr(({path}) as _).to_str().unwrap()");
-        match self {
-            Self::Read(plus) => {
-                if plus {
-                    expr!(
-                        "std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open({})
-                            .ok()",
-                        path_str,
-                    )
-                } else {
-                    expr!("std::fs::File::open({}).ok()", path_str)
-                }
-            }
-            Self::Write(plus) => {
-                if plus {
-                    expr!(
-                        "std::fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .read(true)
-                            .open({})
-                            .ok()",
-                        path_str,
-                    )
-                } else {
-                    expr!("std::fs::File::create({}).ok()", path_str)
-                }
-            }
-            Self::Append(plus) => {
-                if plus {
-                    expr!(
-                        "std::fs::OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .read(true)
-                            .open({})
-                            .ok()",
-                        path_str,
-                    )
-                } else {
-                    expr!(
-                        "std::fs::OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open({})
-                            .ok()",
-                        path_str,
-                    )
-                }
-            }
-            Self::Unknown => {
-                expr!(
-                    "crate::stdio::rs_fopen({}, {})",
-                    path,
-                    pprust::expr_to_string(mode),
-                )
-            }
-        }
-    }
-}
-
 impl TransformVisitor<'_, '_, '_> {
-    fn transform_fopen(&self, path: &Expr, mode_expr: &Expr) -> Expr {
-        let mode = LikelyLit::from_expr(mode_expr);
-        match mode {
-            LikelyLit::Lit(mode) => {
-                let mode = OpenMode::from_lit(mode);
-                mode.make_expr(path, mode_expr)
-            }
-            LikelyLit::If(c, t, f) => {
-                let t = OpenMode::from_likely_lit(&t);
-                let f = OpenMode::from_likely_lit(&f);
-                if t == f {
-                    t.make_expr(path, mode_expr)
-                } else {
-                    let t = t.make_expr(path, mode_expr);
-                    let f = f.make_expr(path, mode_expr);
-                    let c = pprust::expr_to_string(c);
-                    let t = pprust::expr_to_string(&t);
-                    let f = pprust::expr_to_string(&f);
-                    expr!("if {} {{ {} }} else {{ {} }}", c, t, f)
-                }
-            }
-            LikelyLit::Path(_, _) => OpenMode::Unknown.make_expr(path, mode_expr),
-            LikelyLit::Other(_) => todo!(),
-        }
-    }
-
-    #[inline]
-    fn transform_fdopen(&self, fd: &Expr) -> Expr {
-        let fd = pprust::expr_to_string(fd);
-        expr!("std::os::fd::FromRawFd::from_raw_fd({})", fd)
-    }
-
-    #[inline]
-    fn transform_tmpfile(&self) -> Expr {
-        expr!("tempfile::tempfile().ok()")
-    }
-
-    fn transform_popen(&self, command: &Expr, mode: &Expr) -> Expr {
-        let command = pprust::expr_to_string(command);
-        let command = format!("std::ffi::CStr::from_ptr(({command}) as _).to_str().unwrap()");
-        let mode = LikelyLit::from_expr(mode);
-        match is_popen_read(&mode) {
-            Some(read) => {
-                let field = if read { "stdout" } else { "stdin" };
-                expr!(
-                    r#"std::process::Command::new("sh")
-                .arg("-c")
-                .arg("--")
-                .arg({})
-                .{1}(std::process::Stdio::piped())
-                .spawn()
-                .ok()
-                .map(|c| crate::stdio::Child::new(c))"#,
-                    command,
-                    field
-                )
-            }
-            None => todo!("{:?}", mode),
-        }
-    }
-
-    fn transform_fclose(&self, stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
-        let stream = take_stream(stream, ty, is_non_local);
-        let v = if ty.can_flush() {
-            "std::io::Write::flush(&mut __x).map_or(-1, |_| 0)"
-        } else {
-            "0"
-        };
-        expr!(
-            "{{
-    let mut __x = {};
-    let __v = {};
-    drop(__x);
-    __v
-}}",
-            stream,
-            v,
-        )
-    }
-
-    fn transform_pclose(&self, stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
-        let stream = take_stream(stream, ty, is_non_local);
-        expr!(
-            "{{
-    let mut __x = {};
-    let __v = crate::stdio::Close::close(&mut __x);
-    drop(__x);
-    __v
-}}",
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fgetc<S: StreamExpr>(&self, stream: &S, ic: IndicatorCheck<'_>) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Read);
-        self.update_error(ic, format!("crate::stdio::rs_fgetc({stream_str})"))
-    }
-
-    #[inline]
-    fn transform_fgets<S: StreamExpr>(
-        &self,
-        stream: &S,
-        s: &Expr,
-        n: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::BufRead);
-        let s = pprust::expr_to_string(s);
-        let n = pprust::expr_to_string(n);
-        self.update_error(
-            ic,
-            format!("crate::stdio::rs_fgets({s}, {n}, {stream_str})"),
-        )
-    }
-
-    #[inline]
-    fn transform_getdelim<S: StreamExpr>(
-        &self,
-        stream: &S,
-        lineptr: &Expr,
-        n: &Expr,
-        delimiter: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::BufRead);
-        let lineptr = pprust::expr_to_string(lineptr);
-        let n = pprust::expr_to_string(n);
-        let delimiter = pprust::expr_to_string(delimiter);
-        self.update_error(
-            ic,
-            format!("crate::stdio::rs_getdelim({lineptr}, {n}, {delimiter}, {stream_str})"),
-        )
-    }
-
-    #[inline]
-    fn transform_getline<S: StreamExpr>(
-        &self,
-        stream: &S,
-        lineptr: &Expr,
-        n: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::BufRead);
-        let lineptr = pprust::expr_to_string(lineptr);
-        let n = pprust::expr_to_string(n);
-        self.update_error(
-            ic,
-            format!("crate::stdio::rs_getline({lineptr}, {n}, {stream_str})"),
-        )
-    }
-
-    #[inline]
-    fn transform_fread<S: StreamExpr>(
-        &self,
-        stream: &S,
-        ptr: &Expr,
-        size: &Expr,
-        nitems: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Read);
-        let ptr = pprust::expr_to_string(ptr);
-        let size = pprust::expr_to_string(size);
-        let nitems = pprust::expr_to_string(nitems);
-        self.update_error(
-            ic,
-            format!("crate::stdio::rs_fread({ptr}, {size}, {nitems}, {stream_str})"),
-        )
-    }
-
-    fn transform_fprintf<S: StreamExpr, E: Deref<Target = Expr>>(
-        &self,
-        stream: &S,
-        fmt: &Expr,
-        args: &[E],
-        ctx: FprintfCtx<'_>,
-    ) -> Expr {
-        match LikelyLit::from_expr(fmt) {
-            LikelyLit::Lit(fmt) => return self.transform_fprintf_lit(stream, fmt, args, ctx),
-            LikelyLit::Path(_, span) => {
-                let loc = self.hir.bound_span_to_loc[&span];
-                let static_span = self.hir.loc_to_binding_span[&loc];
-                if let Some(fmt) = self.analysis_res.static_span_to_lit.get(&static_span) {
-                    return self.transform_fprintf_lit(stream, *fmt, args, ctx);
-                }
-            }
-            _ => {}
-        }
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let fmt = pprust::expr_to_string(fmt);
-        let mut s = format!("crate::stdio::rs_fprintf({stream_str}, {fmt}");
-        for arg in args {
-            let arg = pprust::expr_to_string(arg);
-            s.push_str(", ");
-            s.push_str(&arg);
-        }
-        s.push(')');
-        self.update_error_no_eof(ctx.ic, s, stream)
-    }
-
-    fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
-        &self,
-        stream: &S,
-        fmt: Symbol,
-        args: &[E],
-        ctx: FprintfCtx<'_>,
-    ) -> Expr {
-        // from rustc_ast/src/util/literal.rs
-        let s = fmt.as_str();
-        let mut buf = Vec::with_capacity(s.len());
-        rustc_literal_escaper::unescape_unicode(
-            fmt.as_str(),
-            rustc_literal_escaper::Mode::ByteStr,
-            &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-        );
-
-        if ctx.wide {
-            let mut new_buf: Vec<u8> = vec![];
-            for c in buf.chunks_exact(4) {
-                let c = u32::from_le_bytes(c.try_into().unwrap());
-                new_buf.push(c.try_into().unwrap());
-            }
-            buf = new_buf;
-        }
-        let rsfmt = fprintf::to_rust_format(&buf);
-        assert!(args.len() >= rsfmt.casts.len());
-        let mut new_args = String::new();
-        let mut width_args = String::new();
-        for (i, (arg, cast)) in args.iter().zip(rsfmt.casts).enumerate() {
-            let width_arg_idx =
-                rsfmt
-                    .width_args
-                    .iter()
-                    .enumerate()
-                    .find_map(|(width_arg_idx, arg_idx)| {
-                        if *arg_idx == i {
-                            Some(width_arg_idx)
-                        } else {
-                            None
-                        }
-                    });
-            let args = if let Some(width_arg_idx) = width_arg_idx {
-                write!(width_args, "width{width_arg_idx} = ").unwrap();
-                &mut width_args
-            } else {
-                &mut new_args
-            };
-            let arg = pprust::expr_to_string(arg);
-            match cast {
-                "&str" => write!(
-                    args,
-                    "{{
-    let ___s = std::ffi::CStr::from_ptr(({arg}) as _);
-    if let Ok(___s) = ___s.to_str() {{
-        ___s.to_string()
-    }} else {{
-        ___s.to_bytes().iter().map(|&_b| _b as char).collect()
-    }}
-}}, "
-                )
-                .unwrap(),
-                "String" => write!(
-                    args,
-                    "{{
-    let mut p: *const u8 = {arg} as _;
-    let mut s: String = String::new();
-    loop {{
-        let slice = std::slice::from_raw_parts(p, 4);
-        let i = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-        if i == 0 {{
-            break s;
-        }}
-        s.push(std::char::from_u32(i).unwrap());
-        p = p.offset(4);
-    }}
-}}, "
-                )
-                .unwrap(),
-                "crate::stdio::Xu8" | "crate::stdio::Xu16" | "crate::stdio::Xu32"
-                | "crate::stdio::Xu64" | "crate::stdio::Gf64" | "crate::stdio::Af64" => {
-                    write!(args, "{cast}(({arg}) as _), ").unwrap()
-                }
-                _ => write!(args, "({arg}) as {cast}, ").unwrap(),
-            }
-        }
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        if ctx.retval_used {
-            expr!(
-                "{{
-    use std::io::Write;
-    let string_to_print = format!(\"{}\", {}{});
-    match write!({}, \"{{}}\", string_to_print) {{
-        Ok(_) => string_to_print.len() as i32,
-        Err(e) => {{
-            {}
-            -1
-        }}
-    }}
-}}",
-                rsfmt.format,
-                new_args,
-                width_args,
-                stream_str,
-                self.error_handling_no_eof(ctx.ic, stream),
-            )
-        } else {
-            expr!(
-                "{{
-    use std::io::Write;
-    match write!({}, \"{}\", {}{}) {{
-        Ok(_) => {{}}
-        Err(e) => {{
-            {}
-        }}
-    }}
-}}",
-                stream_str,
-                rsfmt.format,
-                new_args,
-                width_args,
-                self.error_handling_no_eof(ctx.ic, stream),
-            )
-        }
-    }
-
-    #[inline]
-    fn transform_vfprintf<S: StreamExpr>(
-        &self,
-        stream: &S,
-        fmt: &Expr,
-        args: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let fmt = pprust::expr_to_string(fmt);
-        let args = pprust::expr_to_string(args);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_vfprintf({stream_str}, {fmt}, {args})"),
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fputc<S: StreamExpr>(&self, stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let c = pprust::expr_to_string(c);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_fputc({c}, {stream_str})"),
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fputwc<S: StreamExpr>(
-        &self,
-        stream: &S,
-        c: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let c = pprust::expr_to_string(c);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_fputwc({c}, {stream_str})"),
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fputs<S: StreamExpr>(&self, stream: &S, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let s = pprust::expr_to_string(s);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_fputs({s}, {stream_str})"),
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fwrite<S: StreamExpr>(
-        &self,
-        stream: &S,
-        ptr: &Expr,
-        size: &Expr,
-        nitems: &Expr,
-        ic: IndicatorCheck<'_>,
-    ) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        let ptr = pprust::expr_to_string(ptr);
-        let size = pprust::expr_to_string(size);
-        let nitems = pprust::expr_to_string(nitems);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_fwrite({ptr}, {size}, {nitems}, {stream_str})"),
-            stream,
-        )
-    }
-
-    #[inline]
-    fn transform_fflush<S: StreamExpr>(&self, stream: &S, ic: IndicatorCheck<'_>) -> Expr {
-        let stream_str = stream.borrow_for(StreamTrait::Write);
-        self.update_error_no_eof(ic, format!("crate::stdio::rs_fflush({stream_str})"), stream)
-    }
-
-    #[inline]
-    fn transform_puts(&self, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
-        let s = pprust::expr_to_string(s);
-        self.update_error_no_eof(
-            ic,
-            format!("crate::stdio::rs_puts({s})"),
-            &StdExpr::stdout(),
-        )
-    }
-
-    #[inline]
-    fn transform_perror(&self, s: &Expr) -> Expr {
-        let s = pprust::expr_to_string(s);
-        expr!("crate::stdio::rs_perror({})", s)
-    }
-
-    #[inline]
-    fn transform_fseek<S: StreamExpr>(&self, stream: &S, off: &Expr, whence: &Expr) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::Seek);
-        let off = pprust::expr_to_string(off);
-        let whence = LikelyLit::from_expr(whence);
-        match whence {
-            LikelyLit::Lit(lit) => {
-                let v = match lit.as_str() {
-                    "0" => "Start",
-                    "1" => "Current",
-                    "2" => "End",
-                    lit => panic!("{}", lit),
-                };
-                expr!(
-                    "{{
-    use std::io::Seek;
-    ({}).seek(std::io::SeekFrom::{}(({}) as _)).map_or(-1, |_| 0)
-}}",
-                    stream,
-                    v,
-                    off
-                )
-            }
-            LikelyLit::If(_, _, _) => todo!(),
-            LikelyLit::Path(path, _) => {
-                expr!("crate::stdio::rs_fseek({}, {}, {})", stream, off, path)
-            }
-            LikelyLit::Other(_) => todo!(),
-        }
-    }
-
-    #[inline]
-    fn transform_ftell<S: StreamExpr>(&self, stream: &S) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::Seek);
-        expr!("crate::stdio::rs_ftell({})", stream)
-    }
-
-    #[inline]
-    fn transform_rewind<S: StreamExpr>(&self, stream: &S) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::Seek);
-        expr!("crate::stdio::rs_rewind({})", stream)
-    }
-
-    #[inline]
-    fn transform_fileno<S: StreamExpr>(&self, stream: &S) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::AsRawFd);
-        expr!("crate::stdio::AsRawFd::as_raw_fd({})", stream)
-    }
-
-    #[inline]
-    fn transform_flockfile<S: StreamExpr>(&self, stream: &S, name: Symbol) -> (Expr, bool) {
-        let (expr, is_file) = expr_to_lock(stream);
-        if is_file {
-            (expr!("{}.lock().unwrap()", expr), false)
-        } else if stream.ty().get_dyn_bound().is_some() {
-            (expr!("{}_guard = (&*{}).lock()", name, expr), true)
-        } else {
-            (expr!("{}_guard = {}.lock()", name, expr), true)
-        }
-    }
-
-    #[inline]
-    fn transform_funlockfile<S: StreamExpr>(&self, stream: &S, name: Symbol) -> Expr {
-        let (expr, is_file) = expr_to_lock(stream);
-        if is_file {
-            expr!("{}.unlock().unwrap()", expr)
-        } else {
-            expr!("drop({}_guard)", name)
-        }
-    }
-
     fn transform_unsupported<E: Deref<Target = Expr>>(
         &mut self,
         rs_name: &str,
@@ -2209,59 +1602,6 @@ impl TransformVisitor<'_, '_, '_> {
         (Some(expr!("{}", new_expr)), true)
     }
 
-    pub(super) fn err_eof_args(&self, ic: IndicatorCheck<'_>) -> String {
-        match (ic.error, ic.eof) {
-            (true, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!("Some(&mut ___v_{ind}_error), Some(&mut ___v_{ind}_eof)")
-            }
-            (true, false) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!("Some(&mut ___v_{ind}_error), None")
-            }
-            (false, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                format!("None, Some(&mut ___v_{ind}_eof)")
-            }
-            (false, false) => "None, None".to_string(),
-        }
-    }
-
-    pub(super) fn update_error(&self, ic: IndicatorCheck<'_>, e: String) -> Expr {
-        match (ic.eof, ic.error) {
-            (true, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                expr!(
-                    "{{
-    let (___v, ___error, ___eof) = {};
-    ___v_{1}_eof = ___eof;
-    ___v_{1}_error = ___error;
-    ___v
-}}",
-                    e,
-                    ind,
-                )
-            }
-            (true, false) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                expr!(
-                    "{{ let (___v, _, ___eof) = {}; ___v_{}_eof = ___eof; ___v }}",
-                    e,
-                    ind,
-                )
-            }
-            (false, true) => {
-                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
-                expr!(
-                    "{{ let (___v, ___error, _) = {}; ___v_{}_error = ___error; ___v }}",
-                    e,
-                    ind,
-                )
-            }
-            (false, false) => expr!("{}.0", e),
-        }
-    }
-
     fn clear(&self, ic: IndicatorCheck<'_>) -> String {
         match (ic.eof, ic.error) {
             (true, true) => {
@@ -2280,7 +1620,29 @@ impl TransformVisitor<'_, '_, '_> {
         }
     }
 
-    fn error_handling_no_eof<S: StreamExpr>(&self, ic: IndicatorCheck<'_>, stream: &S) -> String {
+    pub(super) fn err_eof_args(&self, ic: IndicatorCheck<'_>) -> String {
+        match (ic.error, ic.eof) {
+            (true, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("Some(&mut ___v_{ind}_error), Some(&mut ___v_{ind}_eof)")
+            }
+            (true, false) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("Some(&mut ___v_{ind}_error), None")
+            }
+            (false, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("None, Some(&mut ___v_{ind}_eof)")
+            }
+            (false, false) => "None, None".to_string(),
+        }
+    }
+
+    pub(super) fn error_handling_no_eof<S: StreamExpr>(
+        &self,
+        ic: IndicatorCheck<'_>,
+        stream: &S,
+    ) -> String {
         let mut update = String::new();
         let ty = stream.ty();
         if ty.must_stdout() {
@@ -2296,6 +1658,7 @@ impl TransformVisitor<'_, '_, '_> {
                 || self.analysis_res.unsupported_stderr_errors)
         {
             let stream = stream.borrow_for(StreamTrait::AsRawFd);
+            self.lib_items.borrow_mut().push(LibItem::AsRawFd);
             write!(
                 update,
                 "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"
@@ -2316,7 +1679,7 @@ impl TransformVisitor<'_, '_, '_> {
         update
     }
 
-    fn update_error_no_eof<S: StreamExpr>(
+    pub(super) fn update_error_no_eof<S: StreamExpr>(
         &self,
         ic: IndicatorCheck<'_>,
         e: String,
@@ -2337,6 +1700,7 @@ impl TransformVisitor<'_, '_, '_> {
                 || self.analysis_res.unsupported_stderr_errors)
         {
             let stream = stream.borrow_for(StreamTrait::AsRawFd);
+            self.lib_items.borrow_mut().push(LibItem::AsRawFd);
             write!(
                 update,
                 "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"
@@ -2362,50 +1726,6 @@ impl TransformVisitor<'_, '_, '_> {
     }
 }
 
-fn expr_to_lock<S: StreamExpr>(stream: &S) -> (String, bool) {
-    let ty = stream.ty();
-    let (ty, unwrap) = if let StreamType::Option(ty) = ty {
-        (*ty, ".as_ref().unwrap()")
-    } else {
-        (ty, "")
-    };
-    let (ty, get_ref) = if let StreamType::BufWriter(ty) | StreamType::BufReader(ty) = ty {
-        (*ty, ".get_ref()")
-    } else {
-        (ty, "")
-    };
-    let (ty, deref) = if let StreamType::Ptr(ty) = ty {
-        (*ty, "*")
-    } else {
-        (ty, "")
-    };
-    (
-        format!("({}({}){}{})", deref, stream.expr(), unwrap, get_ref),
-        ty == StreamType::File,
-    )
-}
-
-fn take_stream(stream_expr: &Expr, ty: StreamType<'_>, is_non_local: bool) -> String {
-    let stream = pprust::expr_to_string(stream_expr);
-    match ty {
-        StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
-        StreamType::Option(_) => {
-            if is_non_local || matches!(stream_expr.kind, ExprKind::Index(_, _, _)) {
-                format!("({stream}).take().unwrap()")
-            } else {
-                format!("({stream}).unwrap()")
-            }
-        }
-        StreamType::ManuallyDrop(StreamType::Option(_)) => {
-            format!("std::mem::ManuallyDrop::take(&mut ({stream})).take().unwrap()")
-        }
-        StreamType::ManuallyDrop(_) => {
-            format!("std::mem::ManuallyDrop::take(&mut ({stream}))")
-        }
-        _ => stream,
-    }
-}
-
 fn write_args<E: Deref<Target = Expr>>(
     new_expr: &mut String,
     before_args: &[E],
@@ -2428,20 +1748,4 @@ pub(super) struct IndicatorCheck<'a> {
     name: Option<&'a ExprLoc>,
     eof: bool,
     error: bool,
-}
-
-fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
-    match arg {
-        LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
-            "r" => Some(true),
-            "w" => Some(false),
-            _ => panic!("{lit:?}"),
-        },
-        LikelyLit::If(_, t, f) => {
-            let t = is_popen_read(t);
-            let f = is_popen_read(f);
-            if t == f { t } else { None }
-        }
-        LikelyLit::Path(_, _) | LikelyLit::Other(_) => None,
-    }
 }
