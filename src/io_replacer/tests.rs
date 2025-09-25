@@ -199,7 +199,7 @@ unsafe fn f() -> libc::c_int {
     scanf(b"%d\0" as *const u8 as *const libc::c_char, &mut x as *mut libc::c_int);
     return x;
 }"#,
-        &["stdin", "fill_buf", "available", "consume", "parse"],
+        &["stdin", "parse_d"],
         &["scanf"],
     );
 }
@@ -230,7 +230,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
         &mut h as *mut libc::c_double,
     );
 }"#,
-        &["BufRead", "fill_buf", "available", "consume", "parse", "TT"],
+        &["BufRead", "parse_d_h_d_l_d_u_h_u_l_u_g_l_g", "TT"],
         &["FILE", "fscanf"],
     );
 }
@@ -249,14 +249,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
         buf2.as_mut_ptr(),
     );
 }"#,
-        &[
-            "BufRead",
-            "fill_buf",
-            "available",
-            "consume",
-            "copy_from_slice",
-            "TT",
-        ],
+        &["BufRead", "parse_no_assign_s_s_w10_s", "TT"],
         &["FILE", "fscanf"],
     );
 }
@@ -268,7 +261,7 @@ fn test_fscanf_scan_set() {
 unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     return fscanf(stream, b"%*[^\n]\0" as *const u8 as *const libc::c_char);
 }"#,
-        &["BufRead", "fill_buf", "available", "consume", "TT"],
+        &["BufRead", "parse_no_assign_false_10", "TT"],
         &["FILE", "fscanf"],
     );
 }
@@ -286,7 +279,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_char {
     );
     return x;
 }"#,
-        &["BufRead", "fill_buf", "consume", "TT"],
+        &["BufRead", "parse_c", "TT"],
         &["FILE", "fscanf"],
     );
 }
@@ -2192,7 +2185,7 @@ unsafe fn f(mut x: libc::c_int) {
 }"#,
         &[
             "BufRead",
-            "consume",
+            "parse_d",
             "crate::stdio::rs_fputc",
             "crate::stdio::rs_fopen",
         ],
