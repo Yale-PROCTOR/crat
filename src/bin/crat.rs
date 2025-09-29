@@ -374,6 +374,17 @@ fn main() {
                         config.verbose,
                         tcx,
                     );
+                    let fns = res.len();
+                    let musts = res
+                        .values()
+                        .map(|res| res.1.output_params.iter().filter(|p| p.must).count())
+                        .sum::<usize>();
+                    let mays = res
+                        .values()
+                        .map(|res| res.1.output_params.iter().filter(|p| !p.must).count())
+                        .sum::<usize>();
+                    println!("{} {} {}", fns, musts, mays);
+
                     outparam_replacer::ai::analysis::write_analysis_result(&analysis_output, &res);
                 })
                 .unwrap();
