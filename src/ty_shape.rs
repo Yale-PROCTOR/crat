@@ -149,9 +149,9 @@ fn compute_ty_shapes<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
         let body = match item.kind {
-            ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => {
-                tcx.optimized_mir(def_id)
-            }
+            ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => &tcx
+                .mir_drops_elaborated_and_const_checked(local_def_id)
+                .borrow(),
             ItemKind::Static(_, _, _, _) => tcx.mir_for_ctfe(def_id),
             _ => continue,
         };

@@ -25,7 +25,9 @@ pub(super) fn find_alloc_funcs(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
         if !ty.is_c_void(tcx) {
             continue;
         }
-        let body = tcx.optimized_mir(local_def_id);
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(local_def_id)
+            .borrow();
         let mut analyzer = Analyzer::new(tcx);
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {

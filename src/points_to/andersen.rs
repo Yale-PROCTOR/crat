@@ -7,9 +7,8 @@ use rustc_hir::{ItemKind, QPath, def::Res};
 use rustc_index::{Idx, IndexVec, bit_set::ChunkedBitSet};
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BinOp, Body, Const, ConstValue, Local, LocalDecl, Location,
-        Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
-        UnOp,
+        AggregateKind, BasicBlock, BinOp, Const, ConstValue, Local, LocalDecl, Location, Operand,
+        Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
         interpret::{GlobalAlloc, Scalar},
         visit::Visitor,
     },
@@ -85,9 +84,9 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
 }
 
 #[derive(Debug)]
-pub struct BodyItem<'tcx> {
+pub struct BodyItem {
     local_def_id: LocalDefId,
-    body: &'tcx Body<'tcx>,
+    // body: &'tcx Body<'tcx>,
     is_fn: bool,
 }
 
@@ -160,7 +159,7 @@ impl<'tcx> IndexInfo<'tcx> {
 
 #[derive(Debug)]
 pub struct PreAnalysisData<'tcx> {
-    pub bodies: Vec<BodyItem<'tcx>>,
+    pub bodies: Vec<BodyItem>,
     pub alloc_fns: FxHashSet<LocalDefId>,
 
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
@@ -214,11 +213,12 @@ pub fn pre_analyze<'a, 'tcx>(
         match item.kind {
             ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => {
                 fn_def_ids.insert(local_def_id);
-                let body = tcx.optimized_mir(def_id);
-                visitor.visit_body(body);
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(local_def_id)
+                    .borrow();
+                visitor.visit_body(&body);
                 let body_item = BodyItem {
                     local_def_id,
-                    body,
                     is_fn: true,
                 };
                 bodies.push(body_item);
@@ -228,7 +228,6 @@ pub fn pre_analyze<'a, 'tcx>(
                 visitor.visit_body(body);
                 let body_item = BodyItem {
                     local_def_id,
-                    body,
                     is_fn: false,
                 };
                 bodies.push(body_item);
@@ -257,6 +256,12 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
+        let body = if item.is_fn {
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else {
+            tcx.mir_for_ctfe(item.local_def_id.to_def_id())
+        };
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
         let global_index = index_info.next_index();
         globals.insert(item.local_def_id, global_index);
@@ -265,10 +270,10 @@ pub fn pre_analyze<'a, 'tcx>(
             inv_fns.insert(global_index, item.local_def_id);
         }
 
-        let mut local_decls = item.body.local_decls.iter_enumerated();
+        let mut local_decls = body.local_decls.iter_enumerated();
         let ret = local_decls.next().unwrap();
         let mut params = vec![];
-        for _ in 0..item.body.arg_count {
+        for _ in 0..body.arg_count {
             params.push(local_decls.next().unwrap());
         }
         let local_decls = params
@@ -318,7 +323,7 @@ pub fn pre_analyze<'a, 'tcx>(
             non_fn_globals.extend(global_index..=(index_info.get_end(global_index)));
         }
 
-        for (bb, bbd) in item.body.basic_blocks.iter_enumerated() {
+        for (bb, bbd) in body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call {
                 func,
                 args,
@@ -341,7 +346,7 @@ pub fn pre_analyze<'a, 'tcx>(
                 _ => {
                     let def_id = some_or!(operand_to_fn(func), continue);
                     let local_def_id = some_or!(def_id.as_local(), continue);
-                    let ty = destination.ty(&item.body.local_decls, tcx).ty;
+                    let ty = destination.ty(&body.local_decls, tcx).ty;
                     if ty.is_raw_ptr()
                         && (is_c_fn(def_id, tcx) || alloc_fns.contains(&local_def_id))
                     {
@@ -424,13 +429,19 @@ pub fn analyze<'a, 'tcx>(
         graph: Graph::new(pre.index_info.len()),
     };
     for item in &pre.bodies {
-        for (block, bbd) in item.body.basic_blocks.iter_enumerated() {
+        let body = if item.is_fn {
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else {
+            tcx.mir_for_ctfe(item.local_def_id.to_def_id())
+        };
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
-                let ctx = Context::new(&item.body.local_decls, item.local_def_id);
+                let ctx = Context::new(&body.local_decls, item.local_def_id);
                 analyzer.transfer_stmt(stmt, ctx);
             }
             let terminator = bbd.terminator();
-            let ctx = Context::new(&item.body.local_decls, item.local_def_id);
+            let ctx = Context::new(&body.local_decls, item.local_def_id);
             analyzer.transfer_term(terminator, ctx, block);
         }
     }
@@ -595,6 +606,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                             Some(PrefixedLoc::new_ref(var))
                         }
                         TyKind::Array(_, _) => None,
+                        TyKind::Tuple(_) => None,
                         _ => unreachable!("{:?}", ty),
                     },
                     ConstValue::Slice { .. } => None,
@@ -774,8 +786,14 @@ pub fn post_analyze<'a, 'tcx>(
     for item in &pre.bodies {
         let writes = writes.entry(item.local_def_id).or_default();
         let bitfield_writes = bitfield_writes.entry(item.local_def_id).or_default();
-        let ctx = Context::new(&item.body.local_decls, item.local_def_id);
-        for (block, bbd) in item.body.basic_blocks.iter_enumerated() {
+        let body = if item.is_fn {
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else {
+            tcx.mir_for_ctfe(item.local_def_id.to_def_id())
+        };
+        let ctx = Context::new(&body.local_decls, item.local_def_id);
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for (statement_index, stmt) in bbd.statements.iter().enumerate() {
                 let StatementKind::Assign(box (l, _)) = stmt.kind else {
                     continue;
