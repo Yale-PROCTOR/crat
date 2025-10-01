@@ -374,7 +374,12 @@ fn main() {
                         config.verbose,
                         tcx,
                     );
-                    let fns = res.len();
+                    let fns = res
+                        .iter()
+                        .filter(|(_, (_, res))| {
+                            !res.output_params.is_empty()
+                        })
+                        .count();
                     let musts = res
                         .values()
                         .map(|res| res.1.output_params.iter().filter(|p| p.must).count())
