@@ -6,8 +6,35 @@ use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
 use rustc_parse::parser::{AttemptLocalParseRecovery, ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
-use rustc_span::{FileName, RealFileName};
+use rustc_span::{FileName, RealFileName, sym};
 use thin_vec::ThinVec;
+
+use crate::ir_util;
+
+/// Returns the expanded AST. The returned AST contains only dummay `NodeId`.
+///
+/// Note that the function will panic if called after the HIR is built.
+pub fn expanded_ast(tcx: TyCtxt<'_>) -> Crate {
+    tcx.resolver_for_lowering().borrow().1.as_ref().clone()
+}
+
+/// The first argument should be the `Crate` returned by `expanded_ast`.
+///
+/// Each AST node will get a unique `NodeId` while this function is running.
+pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir_util::AstToHir {
+    let mut mapper = ir_util::AstToHirMapper::new(tcx);
+    let module = tcx.hir_root_module();
+    mapper.map_crate_to_mod(krate, module, true);
+    krate.items.retain(|item| match item.kind {
+        ItemKind::ExternCrate(_, _) => false,
+        ItemKind::Use(_) => !item.attrs.iter().any(|attr| {
+            let AttrKind::Normal(attr) = &attr.kind else { return false };
+            attr.item.path.segments.last().unwrap().ident.name == sym::prelude_import
+        }),
+        _ => true,
+    });
+    mapper.ast_to_hir
+}
 
 #[derive(Debug)]
 pub struct TransformationResult(pub Vec<(PathBuf, String)>);

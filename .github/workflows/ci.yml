@@ -53,3 +53,10 @@ jobs:
         run: sudo -u ubuntu bash -lc "./tool.py build io --exclude axel,zmap"
       - name: Benchmark (Test) - io
         run: sudo -u ubuntu bash -lc "./tool.py test io --exclude axel,zmap,snoopy,streem,tar-1.34,the_silver_searcher,tulipindicators"
+
+      - name: Benchmark (Transformation) - expand
+        run: sudo -u ubuntu bash -lc "./tool.py transform expand-resolve"
+      - name: Benchmark (Build) - resolve
+        run: sudo -u ubuntu bash -lc "./tool.py build expand-resolve"
+      - name: Benchmark (Test) - resolve
+        run: sudo -u ubuntu bash -lc "./tool.py test expand-resolve --exclude tar-1.34"

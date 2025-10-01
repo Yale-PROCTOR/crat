@@ -96,6 +96,7 @@ struct Args {
 enum Pass {
     Expand,
     Extern,
+    ExternE,
     Unsafe,
     Preprocess,
     Bin,
@@ -257,7 +258,7 @@ fn main() {
                     eprintln!("{output:?} is not a directory");
                     std::process::exit(1);
                 }
-                clear_dir(&output, &["target"]);
+                clear_dir(&output);
             } else if fs::create_dir(&output).is_err() {
                 eprintln!("Cannot create {output:?}");
                 std::process::exit(1);
@@ -289,21 +290,22 @@ fn main() {
         }
         match pass {
             Pass::Expand => {
-                run_compiler_on_path(&file, |tcx| {
-                    let s = expander::expand(tcx);
-                    clear_dir(
-                        &dir,
-                        &["target", "build.rs", "Cargo.toml", "rust-toolchain"],
-                    );
-                    std::fs::write(&file, s).unwrap();
-                })
-                .unwrap();
+                let s = run_compiler_on_path(&file, expander::expand).unwrap();
+                remove_rs_files(&dir, true);
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Extern => {
                 run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern(&config.r#extern, tcx)
                 })
                 .unwrap();
+            }
+            Pass::ExternE => {
+                let s = run_compiler_on_path(&file, |tcx| {
+                    extern_resolver::resolve_extern_in_expanded_ast(&config.r#extern, tcx)
+                })
+                .unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Unsafe => {
                 run_compiler_on_path(&file, unsafe_resolver::resolve_unsafe).unwrap();
@@ -375,16 +377,33 @@ fn main() {
     }
 }
 
-fn clear_dir(path: &Path, excludes: &[&str]) {
+fn clear_dir(path: &Path) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry_path = entry.unwrap().path();
+        if entry_path.is_dir() {
+            let name = entry_path.file_name().unwrap();
+            if name != "target" {
+                fs::remove_dir_all(entry_path).unwrap();
+            }
+        } else {
+            fs::remove_file(entry_path).unwrap();
+        }
+    }
+}
+
+fn remove_rs_files(path: &Path, root: bool) {
     for entry in fs::read_dir(path).unwrap() {
         let entry_path = entry.unwrap().path();
         let name = entry_path.file_name().unwrap();
-        if excludes.iter().any(|e| name == *e) {
+        if root && (name == "target" || name == "build.rs") {
             continue;
         }
         if entry_path.is_dir() {
-            fs::remove_dir_all(entry_path).unwrap();
-        } else {
+            remove_rs_files(&entry_path, false);
+            if fs::read_dir(&entry_path).unwrap().next().is_none() {
+                fs::remove_dir(entry_path).unwrap();
+            }
+        } else if name.to_str().unwrap().ends_with(".rs") {
             fs::remove_file(entry_path).unwrap();
         }
     }
