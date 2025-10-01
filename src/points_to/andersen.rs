@@ -208,7 +208,7 @@ pub fn pre_analyze<'a, 'tcx>(
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> PreAnalysisData<'tcx> {
-    let alloc_fns = alloc_finder::find_alloc_funcs(tcx);
+    let alloc_fns = alloc_finder::find_alloc_funcs(config, tcx);
 
     let mut bodies = vec![];
     let mut fn_def_ids = FxHashSet::default();

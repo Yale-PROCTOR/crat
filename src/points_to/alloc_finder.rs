@@ -6,9 +6,13 @@ use rustc_middle::{
     ty::{TyCtxt, TyKind},
 };
 
+use super::andersen;
 use crate::graph_util;
 
-pub(super) fn find_alloc_funcs(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+pub(super) fn find_alloc_funcs(
+    config: &andersen::Config,
+    tcx: TyCtxt<'_>,
+) -> FxHashSet<LocalDefId> {
     let mut call_graph = FxHashMap::default();
     let mut assigns = FxHashMap::default();
     for item_id in tcx.hir_free_items() {
@@ -25,9 +29,12 @@ pub(super) fn find_alloc_funcs(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
         if !ty.is_c_void(tcx) {
             continue;
         }
-        let body = tcx
-            .mir_drops_elaborated_and_const_checked(local_def_id)
-            .borrow();
+        let body = if config.use_optimized_mir {
+            tcx.optimized_mir(local_def_id)
+        } else {
+            &tcx.mir_drops_elaborated_and_const_checked(local_def_id)
+                .borrow()
+        };
         let mut analyzer = Analyzer::new(tcx);
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
