@@ -18,6 +18,7 @@ use rustc_span::{
     def_id::{DefId, LocalDefId},
     source_map::Spanned,
 };
+use serde::Deserialize;
 use typed_arena::Arena;
 
 use super::alloc_finder;
@@ -26,11 +27,17 @@ use crate::{
     ty_shape::{self, TyShape, TyShapes},
 };
 
-pub fn run_analysis(tcx: TyCtxt<'_>) -> Solutions {
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub use_optimized_mir: bool,
+}
+
+pub fn run_analysis(config: &Config, tcx: TyCtxt<'_>) -> Solutions {
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = pre_analyze(&tss, tcx);
-    analyze(&pre, &tss, tcx)
+    let pre = pre_analyze(config, &tss, tcx);
+    analyze(config, &pre, &tss, tcx)
 }
 
 pub fn write_solutions<W: std::io::Write>(mut w: W, solutions: &Solutions) -> std::io::Result<()> {
@@ -197,6 +204,7 @@ pub struct AnalysisResult {
 }
 
 pub fn pre_analyze<'a, 'tcx>(
+    config: &Config,
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> PreAnalysisData<'tcx> {
@@ -212,10 +220,13 @@ pub fn pre_analyze<'a, 'tcx>(
         match item.kind {
             ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => {
                 fn_def_ids.insert(local_def_id);
-                let body = tcx
-                    .mir_drops_elaborated_and_const_checked(local_def_id)
-                    .borrow();
-                visitor.visit_body(&body);
+                let body = if config.use_optimized_mir {
+                    tcx.optimized_mir(def_id)
+                } else {
+                    &tcx.mir_drops_elaborated_and_const_checked(local_def_id)
+                        .borrow()
+                };
+                visitor.visit_body(body);
                 let body_item = BodyItem {
                     local_def_id,
                     is_fn: true,
@@ -256,8 +267,12 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
         let body = if item.is_fn {
-            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                .borrow()
+            if config.use_optimized_mir {
+                tcx.optimized_mir(item.local_def_id.to_def_id())
+            } else {
+                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                    .borrow()
+            }
         } else {
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };
@@ -417,6 +432,7 @@ fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id
 }
 
 pub fn analyze<'a, 'tcx>(
+    config: &Config,
     pre: &PreAnalysisData<'tcx>,
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -429,8 +445,12 @@ pub fn analyze<'a, 'tcx>(
     };
     for item in &pre.bodies {
         let body = if item.is_fn {
-            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                .borrow()
+            if config.use_optimized_mir {
+                tcx.optimized_mir(item.local_def_id.to_def_id())
+            } else {
+                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                    .borrow()
+            }
         } else {
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };
@@ -748,6 +768,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
 }
 
 pub fn post_analyze<'a, 'tcx>(
+    config: &Config,
     mut pre: PreAnalysisData<'tcx>,
     solutions: Solutions,
     tss: &'a TyShapes<'a, 'tcx>,
@@ -786,8 +807,12 @@ pub fn post_analyze<'a, 'tcx>(
         let writes = writes.entry(item.local_def_id).or_default();
         let bitfield_writes = bitfield_writes.entry(item.local_def_id).or_default();
         let body = if item.is_fn {
-            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                .borrow()
+            if config.use_optimized_mir {
+                tcx.optimized_mir(item.local_def_id.to_def_id())
+            } else {
+                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                    .borrow()
+            }
         } else {
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };

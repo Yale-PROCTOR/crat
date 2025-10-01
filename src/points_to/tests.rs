@@ -125,9 +125,12 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
     compile_util::run_compiler_on_str(&code, |tcx| {
         let arena = Arena::new();
         let tss = ty_shape::get_ty_shapes(&arena, tcx);
-        let pre = andersen::pre_analyze(&tss, tcx);
-        let solutions = andersen::analyze(&pre, &tss, tcx);
-        let res = andersen::post_analyze(pre, solutions, &tss, tcx);
+        let config = andersen::Config {
+            use_optimized_mir: true,
+        };
+        let pre = andersen::pre_analyze(&config, &tss, tcx);
+        let solutions = andersen::analyze(&config, &pre, &tss, tcx);
+        let res = andersen::post_analyze(&config, pre, solutions, &tss, tcx);
         f(res, tcx)
     })
     .unwrap();

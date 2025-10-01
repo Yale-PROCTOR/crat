@@ -265,12 +265,15 @@ pub fn analyze(
 
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = andersen::pre_analyze(&tss, tcx);
+    let pre_config = andersen::Config {
+        use_optimized_mir: false,
+    };
+    let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = if let Some(path) = &config.points_to_file {
         let arr = std::fs::read(path).unwrap();
         andersen::deserialize_solutions(&arr)
     } else {
-        andersen::analyze(&pre, &tss, tcx)
+        andersen::analyze(&pre_config, &pre, &tss, tcx)
     };
 
     let pre_data = pre_analysis::compute_alias(
