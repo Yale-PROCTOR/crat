@@ -86,7 +86,6 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
 #[derive(Debug)]
 pub struct BodyItem {
     local_def_id: LocalDefId,
-    // body: &'tcx Body<'tcx>,
     is_fn: bool,
 }
 

@@ -376,9 +376,7 @@ fn main() {
                     );
                     let fns = res
                         .iter()
-                        .filter(|(_, (_, res))| {
-                            !res.output_params.is_empty()
-                        })
+                        .filter(|(_, (_, res))| !res.output_params.is_empty())
                         .count();
                     let musts = res
                         .values()
@@ -388,7 +386,7 @@ fn main() {
                         .values()
                         .map(|res| res.1.output_params.iter().filter(|p| !p.must).count())
                         .sum::<usize>();
-                    println!("{} {} {}", fns, musts, mays);
+                    println!("{fns} {musts} {mays}");
 
                     outparam_replacer::ai::analysis::write_analysis_result(&analysis_output, &res);
                 })

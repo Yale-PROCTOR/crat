@@ -10,7 +10,7 @@ use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    Expr, ExprKind, FnRetTy, HirId, QPath,
+    BinOpKind, Expr, ExprKind, FnRetTy, HirId, Node, QPath,
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
 };
@@ -22,6 +22,7 @@ use rustc_middle::{
         Statement, StatementKind, Terminator, TerminatorKind,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
     },
+    thir,
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::Analysis as _;
@@ -40,7 +41,8 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    graph_util, ir_util,
+    graph_util,
+    ir_util::{self, hir_to_thir::HirToThir},
     points_to::andersen::{self, Loc},
     ty_shape,
 };
@@ -194,6 +196,7 @@ pub fn analyze(
     let mut call_graph = FxHashMap::default();
     let mut inputs_map = FxHashMap::default();
     let mut unit_funcs = FxHashSet::default();
+    let mut if_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
         if let Some(ident) = item.kind.ident()
@@ -211,9 +214,10 @@ pub fn analyze(
             continue;
         };
         inputs_map.insert(def_id, inputs);
-        let mut visitor = CallVisitor::new(tcx);
+        let mut visitor = ExprVisitor::new(tcx);
         visitor.visit_item(item);
         call_graph.insert(def_id, visitor.callees);
+        if_map.insert(def_id, visitor.ifs);
     }
 
     let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
@@ -277,6 +281,8 @@ pub fn analyze(
         config.check_global_alias,
         config.check_param_alias,
     );
+
+    let hir_to_thir = ir_util::hir_to_thir::map_hir_to_thir(tcx);
 
     let mut ptr_params_map = FxHashMap::default();
     let mut ptr_params_inv_map = FxHashMap::default();
@@ -372,12 +378,22 @@ pub fn analyze(
                     analyzer.get_nullable_candidates(&return_states)
                 };
 
+                let nonnull_null_locs = analyzer.compute_nonnull_null_locs(&states, &candidates);
+                let null_dependent_locs = analyzer.compute_null_dependent_locs(
+                    &body,
+                    &hir_to_thir,
+                    &if_map[def_id],
+                    &candidates,
+                );
+
                 let nullable_params = analyzer.find_nullable_params(
-                    &states,
                     &body,
                     &writes_map,
                     &call_info_map,
-                    candidates,
+                    nonnull_null_locs
+                        .into_iter()
+                        .chain(null_dependent_locs)
+                        .collect(),
                 );
 
                 let alias_params = if config.check_global_alias {
@@ -867,7 +883,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-        candidates: BTreeSet<Local>,
+        candidates: &BTreeSet<Local>,
     ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut locs = vec![];
 
@@ -879,7 +895,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
-                    if let Some(arg) = self.ptr_params_inv.get(&l) {
+                    if let Some(arg) = self.ptr_params_inv.get(l) {
                         match nulls.get(*arg) {
                             AbsNull::Null => {
                                 null_locs.insert(*loc);
@@ -903,9 +919,75 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .cloned()
                 .collect();
             let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
-            locs.push((l, nonnull_locs, null_locs));
+            locs.push((*l, nonnull_locs, null_locs));
         }
         locs
+    }
+
+    // Compute if-else locations where the condition has a logical op on is_null
+    fn compute_null_dependent_locs(
+        &self,
+        body: &Body<'tcx>,
+        hir_to_thir: &HirToThir,
+        if_set: &FxHashSet<HirId>,
+        candidates: &BTreeSet<Local>,
+    ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
+        let mut targets = vec![];
+        let thir_to_mir =
+            ir_util::thir_to_mir::map_thir_to_mir(self.pre_context.local_def_id, false, self.tcx);
+        let (thir, _) = self.tcx.thir_body(self.pre_context.local_def_id).unwrap();
+        let thir = &thir.borrow();
+
+        for if_id in if_set {
+            let Node::Expr(if_expr) = self.tcx.hir_node(*if_id) else {
+                continue;
+            };
+            let ExprKind::If(cond, _, _) = if_expr.kind else {
+                continue;
+            };
+
+            let mut cond_visitor = CondVisitor::new(self.tcx);
+            cond_visitor.visit_expr(cond);
+            let null_checks = cond_visitor.null_checks;
+
+            for check in null_checks {
+                let expr_id = hir_to_thir.exprs.get(&check).unwrap();
+                let thir::ExprKind::VarRef { id } = thir[*expr_id].kind else {
+                    continue;
+                };
+                if let Some(local) = thir_to_mir.binding_to_local.get(&id.0)
+                    && candidates.contains(local)
+                {
+                    let if_expr_id = hir_to_thir.exprs[if_id];
+                    let if_block = thir_to_mir.if_to_bbs.get(&if_expr_id).unwrap();
+                    let then_locs = if_block
+                        .true_blocks
+                        .iter()
+                        .flat_map(|b| {
+                            let bbd = &body.basic_blocks[*b];
+                            (0..=bbd.statements.len()).map(|i| Location {
+                                block: *b,
+                                statement_index: i,
+                            })
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let else_locs = if_block
+                        .false_blocks
+                        .iter()
+                        .flat_map(|b| {
+                            let bbd = &body.basic_blocks[*b];
+                            (0..=bbd.statements.len()).map(|i| Location {
+                                block: *b,
+                                statement_index: i,
+                            })
+                        })
+                        .collect::<BTreeSet<_>>();
+                    targets.push((*local, then_locs, else_locs));
+                }
+            }
+        }
+
+        targets
     }
 
     // We consider a parameter to be nullable if below sets are not the same:
@@ -913,74 +995,73 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     // 2. The set of locations that are reachable when x is null and have side-effects
     fn find_nullable_params(
         &self,
-        result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
-        candidates: BTreeSet<Local>,
+        locations: Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)>,
     ) -> BTreeSet<Local> {
-        self.compute_nonnull_null_locs(result, candidates)
-            .into_iter()
-            .filter_map(|(param, nonnull, null)| {
-                if null.is_empty() && nonnull.is_empty() {
-                    return None;
-                }
+        let mut nullable_params = BTreeSet::new();
+        for (param, nonnull, null) in locations {
+            if (null.is_empty() && nonnull.is_empty()) || nullable_params.contains(&param) {
+                continue;
+            }
 
-                let nonnull_diff = nonnull.iter().fold(
-                    BTreeMap::new(),
-                    |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(*loc);
-                        acc
-                    },
-                );
-                let null_diff = null.iter().fold(
-                    BTreeMap::new(),
-                    |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(*loc);
-                        acc
-                    },
-                );
+            let nonnull_diff = nonnull.iter().fold(
+                BTreeMap::new(),
+                |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
+                    acc.entry(loc.block).or_default().insert(*loc);
+                    acc
+                },
+            );
+            let null_diff = null.iter().fold(
+                BTreeMap::new(),
+                |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
+                    acc.entry(loc.block).or_default().insert(*loc);
+                    acc
+                },
+            );
 
-                let check = |block, locs: &BTreeSet<_>, diff_locs| {
-                    let mut local_writes = BTreeSet::new();
-                    locs.iter().all(|loc| {
-                        let writes = writes_map.get(loc).unwrap();
-                        let Location {
-                            block,
-                            statement_index,
-                        } = loc;
+            // check if the given block locations have side-effects
+            let check = |block, locs: &BTreeSet<_>, diff_locs| {
+                let mut local_writes = BTreeSet::new();
+                locs.iter().all(|loc| {
+                    let Some(writes) = writes_map.get(loc) else {
+                        return true;
+                    };
+                    let Location {
+                        block,
+                        statement_index,
+                    } = loc;
 
-                        if writes.iter().any(|p| p.base != param) {
-                            return false;
-                        }
+                    if writes.iter().any(|p| p.base != param) {
+                        return false;
+                    }
 
-                        let bbd = &body.basic_blocks[*block];
-                        if *statement_index < bbd.statements.len() {
-                            let stmt = &bbd.statements[*statement_index];
-                            self.check_assign_pure(&mut local_writes, param, &stmt.kind)
-                        } else {
-                            let term = bbd.terminator();
-                            self.check_terminator_pure(
-                                loc,
-                                &mut local_writes,
-                                param,
-                                call_info_map,
-                                term,
-                            )
-                        }
-                    }) && self.check_local_uses(body, block, diff_locs, &local_writes)
-                };
-                if nonnull_diff
-                    .iter()
-                    .all(|(b, locs)| check(b, locs, &nonnull))
-                    && null_diff.iter().all(|(b, locs)| check(b, locs, &null))
-                {
-                    None
-                } else {
-                    Some(param)
-                }
-            })
-            .collect::<BTreeSet<_>>()
+                    let bbd = &body.basic_blocks[*block];
+                    if *statement_index < bbd.statements.len() {
+                        let stmt = &bbd.statements[*statement_index];
+                        self.check_assign_pure(&mut local_writes, param, &stmt.kind)
+                    } else {
+                        let term = bbd.terminator();
+                        self.check_terminator_pure(
+                            loc,
+                            &mut local_writes,
+                            param,
+                            call_info_map,
+                            term,
+                        )
+                    }
+                }) && self.check_local_uses(body, block, diff_locs, &local_writes)
+            };
+            if nonnull_diff
+                .iter()
+                .any(|(b, locs)| !check(b, locs, &nonnull))
+                || null_diff.iter().any(|(b, locs)| !check(b, locs, &null))
+            {
+                nullable_params.insert(param);
+            }
+        }
+        nullable_params
     }
 
     // We consider a parameter p is implicitly non-null if every execution either:
@@ -1795,21 +1876,23 @@ fn get_dead_locals<'tcx>(
 }
 
 // MIR, HIR Visitors
-struct CallVisitor<'tcx> {
+struct ExprVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     callees: FxHashSet<DefId>,
+    ifs: FxHashSet<HirId>,
 }
 
-impl<'tcx> CallVisitor<'tcx> {
+impl<'tcx> ExprVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
             callees: FxHashSet::default(),
+            ifs: FxHashSet::default(),
         }
     }
 }
 
-impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
+impl<'tcx> HVisitor<'tcx> for ExprVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -1822,6 +1905,8 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
             && let Res::Def(DefKind::Fn, def_id) = path.res
         {
             self.callees.insert(def_id);
+        } else if let ExprKind::If(_, _, _) = expr.kind {
+            self.ifs.insert(expr.hir_id);
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
@@ -1865,6 +1950,55 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
             }
             _ => {}
         }
+        rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+struct CondVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    check_call: bool,
+    pub null_checks: FxHashSet<HirId>,
+}
+
+impl<'tcx> CondVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            check_call: false,
+            null_checks: FxHashSet::default(),
+        }
+    }
+}
+
+impl<'tcx> HVisitor<'tcx> for CondVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if let ExprKind::Binary(op, lhs, rhs) = expr.kind {
+            match &op.node {
+                BinOpKind::And | BinOpKind::Or => {
+                    let prev_check_call = self.check_call;
+                    self.check_call = true;
+                    self.visit_expr(lhs);
+                    self.visit_expr(rhs);
+                    self.check_call = prev_check_call;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.check_call
+            && let ExprKind::MethodCall(path, receiver, _, _) = expr.kind
+            && path.ident.to_string() == "is_null"
+        {
+            self.null_checks.insert(receiver.hir_id);
+        }
+
         rustc_hir::intravisit::walk_expr(self, expr);
     }
 }
