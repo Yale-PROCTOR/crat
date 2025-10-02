@@ -62,3 +62,12 @@ jobs:
         run: sudo -u ubuntu bash -lc "./tool.py transform expand"
       - name: Benchmark (Build) - expand
         run: sudo -u ubuntu bash -lc "./tool.py build expand"
+      - name: Benchmark (Clean) - expand
+        run: sudo -u ubuntu bash -lc "rm -rf benchmarks/rs-expanded/*/target"
+
+      - name: Benchmark (Transformation) - expand-resolve
+        run: sudo -u ubuntu bash -lc "./tool.py transform expand-resolve"
+      - name: Benchmark (Build) - expand-resolve
+        run: sudo -u ubuntu bash -lc "./tool.py build expand-resolve"
+      - name: Benchmark (Test) - expand-resolve
+        run: sudo -u ubuntu bash -lc "./tool.py test expand-resolve --exclude tar-1.34"

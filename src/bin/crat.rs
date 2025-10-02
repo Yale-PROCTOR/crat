@@ -99,6 +99,7 @@ enum Pass {
     ExternE,
     Unsafe,
     Preprocess,
+    PreprocessE,
     Bin,
     Check,
     Libc,
@@ -312,6 +313,10 @@ fn main() {
             }
             Pass::Preprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
+            }
+            Pass::PreprocessE => {
+                let s = run_compiler_on_path(&file, preprocessor::preprocess_expanded_ast).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Bin => {
                 run_compiler_on_path(&file, |tcx| {

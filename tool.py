@@ -81,7 +81,7 @@ TRANSFORM_ANALYSIS: Dict[str, Optional[Tuple[str, str]]] = {
 TRANSFORM_PASS: Dict[str, str] = {
     "resolve": "preprocess,extern,bin",
     "expand": "expand",
-    "expand-resolve": "externe,bin",
+    "expand-resolve": "preprocesse,externe,bin",
     "union": "union",
     "io": "io",
     "io-union": "union",
