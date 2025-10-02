@@ -26,6 +26,22 @@
 //! }
 //! 'c: {}
 //! ```
+//! Remove unreachable
+//!
+//! Some code may exist after non-returning expressions, like below:
+//!
+//! ```rust,ignore
+//! __assert_fail();
+//! 'c: {
+//!     __assert_fail();
+//! }
+//! ```
+//!
+//! We remove such unreachable code as follows:
+//!
+//! ```rust,ignore
+//! __assert_fail();
+//! ```
 //!
 //! # Remove dead code
 //!
@@ -211,6 +227,14 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_block(&mut self, b: &mut Block) {
+        if let Some((i, _)) = b.stmts.iter().enumerate().find(|(_, stmt)| {
+            let (StmtKind::Semi(e) | StmtKind::Expr(e)) = &stmt.kind else { return false };
+            self.hir.never_exprs.contains(&e.span)
+        }) {
+            self.updated = true;
+            b.stmts.truncate(i + 1);
+        }
+
         let mut assert = false;
         for stmt in &mut b.stmts {
             if assert {
@@ -516,6 +540,9 @@ struct HirCtx {
     used_vars: FxHashSet<HirId>,
     /// variable hir_id to bound occurrence spans
     bound_occurrences: FxHashMap<HirId, Vec<Span>>,
+
+    /// spans of never-type expressions
+    never_exprs: FxHashSet<Span>,
 }
 
 struct HirVisitor<'tcx> {
@@ -595,6 +622,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         match expr.kind {
             hir::ExprKind::Call(callee, args) => {
+                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+                if typeck.expr_ty(expr).is_never() {
+                    self.ctx.never_exprs.insert(expr.span);
+                }
+
                 if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
                     && let Res::Def(DefKind::Fn, def_id) = path.res
                     && io_replacer::api_list::is_def_id_api(def_id, self.tcx)
@@ -748,6 +780,48 @@ pub unsafe extern "C" fn f() {
             "#,
             &["g()", "'c_561: {}"],
             &[],
+        )
+    }
+
+    #[test]
+    fn test_unreachable() {
+        run_test(
+            r#"
+use ::libc;
+extern "C" {
+    fn __assert_fail(
+        __assertion: *const libc::c_char,
+        __file: *const libc::c_char,
+        __line: libc::c_uint,
+        __function: *const libc::c_char,
+    ) -> !;
+}
+pub unsafe extern "C" fn g() -> libc::c_int {
+    return 1 as libc::c_int;
+}
+pub unsafe extern "C" fn f() {
+    if g() != 0 {
+        __assert_fail(
+            b"0\0" as *const u8 as *const libc::c_char,
+            b"a.c\0" as *const u8 as *const libc::c_char,
+            15 as libc::c_int as libc::c_uint,
+            (*::std::mem::transmute::<&[u8; 9], &[libc::c_char; 9]>(b"void f()\0"))
+                .as_ptr(),
+        );
+        'c_3530: {
+            __assert_fail(
+                b"0\0" as *const u8 as *const libc::c_char,
+                b"a.c\0" as *const u8 as *const libc::c_char,
+                15 as libc::c_int as libc::c_uint,
+                (*::std::mem::transmute::<&[u8; 9], &[libc::c_char; 9]>(b"void f()\0"))
+                    .as_ptr(),
+            );
+        };
+    }
+}
+            "#,
+            &["g()", "__assert_fail"],
+            &["'c3530"],
         )
     }
 
