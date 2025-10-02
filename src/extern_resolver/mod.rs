@@ -59,6 +59,7 @@ pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> Strin
     let ast_to_hir = ast_util::make_ast_to_hir(&mut expanded_ast, tcx);
     let result = resolve(tcx);
     let resolve_map = make_resolve_map(&result, config, tcx);
+    ast_util::remove_unnecessary_items_from_ast(&mut expanded_ast);
     let mut visitor = ExpandedAstVisitor {
         tcx,
         ast_to_hir,

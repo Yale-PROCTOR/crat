@@ -25,6 +25,21 @@ pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir_util::AstToHir 
     let mut mapper = ir_util::AstToHirMapper::new(tcx);
     let module = tcx.hir_root_module();
     mapper.map_crate_to_mod(krate, module, true);
+    mapper.ast_to_hir
+}
+
+/// This function removes the following items, which make the program incompilable when
+/// pretty-printed back to source code, from the expanded AST:
+///
+/// ```rust,ignore
+/// #[prelude_import]
+/// use std::prelude::rust_2021::*;
+/// #[macro_use]
+/// extern crate std;
+/// ```
+///
+/// If mapping is needed, this function should be called after `make_ast_to_hir`.
+pub fn remove_unnecessary_items_from_ast(krate: &mut Crate) {
     krate.items.retain(|item| match item.kind {
         ItemKind::ExternCrate(_, _) => false,
         ItemKind::Use(_) => !item.attrs.iter().any(|attr| {
@@ -33,7 +48,6 @@ pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir_util::AstToHir 
         }),
         _ => true,
     });
-    mapper.ast_to_hir
 }
 
 #[derive(Debug)]
