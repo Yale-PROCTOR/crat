@@ -10,7 +10,7 @@ use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    BinOpKind, Expr, ExprKind, FnRetTy, HirId, Node, QPath,
+    BinOpKind, Expr, ExprKind, HirId, Node, QPath,
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
 };
@@ -195,7 +195,6 @@ pub fn analyze(
 ) -> AnalysisResult {
     let mut call_graph = FxHashMap::default();
     let mut inputs_map = FxHashMap::default();
-    let mut unit_funcs = FxHashSet::default();
     let mut if_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
@@ -206,9 +205,6 @@ pub fn analyze(
         }
         let def_id = item.item_id().owner_id.def_id.to_def_id();
         let inputs = if let rustc_hir::ItemKind::Fn { sig, .. } = &item.kind {
-            if let FnRetTy::DefaultReturn(_) = sig.decl.output {
-                unit_funcs.insert(def_id);
-            }
             sig.decl.inputs.len()
         } else {
             continue;
@@ -245,8 +241,8 @@ pub fn analyze(
             let loop_blocks = get_loop_blocks(&body, &pre_rpo_map);
             let rpo_map = compute_rpo_map(&body, &loop_blocks);
             let dead_locals = get_dead_locals(&body, tcx);
+            let is_unit = get_is_unit(def_id, tcx);
             let fn_ptr = visitor.fn_ptrs.contains(def_id);
-            let is_unit = unit_funcs.contains(def_id);
             global_visitor.visit_body(&body);
             let globals = std::mem::take(&mut global_visitor.globals);
             let info = FuncInfo {
@@ -299,7 +295,6 @@ pub fn analyze(
     let mut wbrs: FxHashMap<DefId, Vec<WriteBeforeReturn>> = FxHashMap::default();
     let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
         FxHashMap::default();
-    let mut is_units = FxHashMap::default();
     let mut time = 0;
 
     let mut rcfws = FxHashMap::default();
@@ -423,7 +418,9 @@ pub fn analyze(
 
                 let mut stack = vec![];
 
-                if let Some(ret_location) = ret_location {
+                if let Some(ret_location) = ret_location
+                    && !analyzer.info.is_unit
+                {
                     if let Some((ret_loc_assign0, ret_loc)) =
                         analyzer.exists_assign0(&body, ret_location.block)
                     {
@@ -471,7 +468,6 @@ pub fn analyze(
 
                 wbrs.insert(*def_id, wbr);
                 bb_musts.insert(*def_id, bb_must);
-                is_units.insert(*def_id, stack.is_empty());
 
                 // Handle unremovable parameters
                 for st in return_states.values_mut() {
@@ -548,7 +544,7 @@ pub fn analyze(
                     let bb_must = &bb_musts[def_id];
                     let mut rcfw: Rcfws = BTreeMap::new();
 
-                    if !is_units[def_id] {
+                    if !analyzer.info.is_unit {
                         for p in &output_params {
                             let OutputParam {
                                 index,
@@ -1876,6 +1872,11 @@ fn get_dead_locals<'tcx>(
             dead_locals
         })
         .collect()
+}
+
+fn get_is_unit<'tcx>(def_id: &DefId, tcx: TyCtxt<'tcx>) -> bool {
+    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+    sig.output().is_unit()
 }
 
 // MIR, HIR Visitors
