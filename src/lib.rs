@@ -49,5 +49,6 @@ pub mod outparam_replacer;
 pub mod points_to;
 pub mod ty_shape;
 pub mod type_checker;
+pub mod unexpander;
 pub mod union_replacer;
 pub mod unsafe_resolver;

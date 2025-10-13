@@ -6,9 +6,9 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{DUMMY_SP, Symbol, sym};
+use rustc_span::{Symbol, sym};
 
-use crate::ast_util;
+use crate::{ast_util, ir_util};
 
 pub fn expand(tcx: TyCtxt<'_>) -> String {
     let (_, mut krate) = tcx.resolver_for_lowering().steal();
@@ -16,41 +16,19 @@ pub fn expand(tcx: TyCtxt<'_>) -> String {
     ast_util::remove_unnecessary_items_from_ast(krate);
     krate.attrs.clear();
     krate.attrs.extend([
-        make_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
-        make_attribute(sym::feature, sym::c_variadic, tcx),
-        make_attribute(sym::feature, sym::extern_types, tcx),
-        make_attribute(sym::feature, sym::linkage, tcx),
-        make_attribute(sym::feature, sym::rustc_private, tcx),
-        make_attribute(sym::feature, sym::thread_local, tcx),
-        make_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
-        make_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
-        make_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
-        make_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
+        ir_util::make_inner_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
+        ir_util::make_inner_attribute(sym::feature, sym::c_variadic, tcx),
+        ir_util::make_inner_attribute(sym::feature, sym::extern_types, tcx),
+        ir_util::make_inner_attribute(sym::feature, sym::linkage, tcx),
+        ir_util::make_inner_attribute(sym::feature, sym::rustc_private, tcx),
+        ir_util::make_inner_attribute(sym::feature, sym::thread_local, tcx),
+        ir_util::make_inner_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
+        ir_util::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
+        ir_util::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
+        ir_util::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
     ]);
     AstVisitor.visit_crate(krate);
     pprust::crate_to_string_for_macros(krate)
-}
-
-fn make_attribute(outer: Symbol, inner: Symbol, tcx: TyCtxt<'_>) -> ast::Attribute {
-    let g = &tcx.sess.psess.attr_id_generator;
-    ast::attr::mk_attr_nested_word(
-        g,
-        ast::AttrStyle::Inner,
-        ast::Safety::Default,
-        outer,
-        inner,
-        DUMMY_SP,
-    )
-}
-
-#[allow(unused)]
-fn get_attr_arg(args: &ast::AttrArgs) -> Option<Symbol> {
-    let ast::AttrArgs::Delimited(args) = args else { return None };
-    let mut tokens = args.tokens.iter();
-    let first = tokens.next()?;
-    let ast::tokenstream::TokenTree::Token(token, _) = first else { return None };
-    let ast::token::TokenKind::Ident(sym, _) = token.kind else { return None };
-    Some(sym)
 }
 
 struct AstVisitor;

@@ -41,7 +41,7 @@ pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir_util::AstToHir 
 /// If mapping is needed, this function should be called after `make_ast_to_hir`.
 pub fn remove_unnecessary_items_from_ast(krate: &mut Crate) {
     krate.items.retain(|item| match item.kind {
-        ItemKind::ExternCrate(_, _) => false,
+        ItemKind::ExternCrate(_, ident) => ident.name != sym::std,
         ItemKind::Use(_) => !item.attrs.iter().any(|attr| {
             let AttrKind::Normal(attr) = &attr.kind else { return false };
             attr.item.path.segments.last().unwrap().ident.name == sym::prelude_import
@@ -271,5 +271,17 @@ pub fn parse_ty(ty: String) -> Ty {
 macro_rules! ty {
     ($($arg:tt)*) => {{
         $crate::ast_util::parse_ty(format!($($arg)*))
+    }};
+}
+
+pub fn parse_attr(attr: String) -> ThinVec<Attribute> {
+    let item = item!("{attr} mod a;");
+    item.attrs
+}
+
+#[macro_export]
+macro_rules! attr {
+    ($($arg:tt)*) => {{
+        $crate::ast_util::parse_attr(format!($($arg)*))
     }};
 }
