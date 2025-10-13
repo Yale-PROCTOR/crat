@@ -85,7 +85,7 @@ TRANSFORM_PASS: Dict[str, str] = {
     "resolve": "preprocess,extern,bin",
     "expand": "expand",
     "expand-resolve": "preprocesse,externe,bin",
-    "resolve-post": "unexpand",
+    "resolve-post": "unexpand,split",
     "union": "union",
     "io": "io",
     "io-union": "union",

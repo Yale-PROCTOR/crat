@@ -105,6 +105,7 @@ enum Pass {
     Preprocess,
     PreprocessE,
     Unexpand,
+    Split,
     Bin,
     Check,
     Libc,
@@ -330,6 +331,9 @@ fn main() {
             Pass::Unexpand => {
                 let s = run_compiler_on_path(&file, unexpander::unexpand).unwrap();
                 std::fs::write(&file, s).unwrap();
+            }
+            Pass::Split => {
+                run_compiler_on_path(&file, |_| splitter::split(&dir)).unwrap();
             }
             Pass::Bin => {
                 run_compiler_on_path(&file, |tcx| {
