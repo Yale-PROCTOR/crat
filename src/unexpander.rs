@@ -96,22 +96,45 @@ impl MutVisitor for AstVisitor<'_> {
         if let ast::ExprKind::Call(callee, args) = &expr.kind
             && let ast::ExprKind::Path(None, callee) = &callee.kind
             && let [.., md, func] = &callee.segments[..]
-            && md.ident.name == sym::panicking
         {
-            if func.ident.name.as_str() == "panic_explicit" {
-                *expr = expr!("panic!()");
-            } else if func.ident.name == sym::panic
-                && let [arg] = &args[..]
-            {
-                if let ast::ExprKind::Lit(lit) = &arg.kind
-                    && lit.symbol.as_str() == "internal error: entered unreachable code"
+            let md = md.ident.name;
+            let func = func.ident.name;
+            if md == sym::panicking {
+                if func.as_str() == "panic_explicit" {
+                    *expr = expr!("panic!()");
+                } else if func == sym::panic
+                    && let [arg] = &args[..]
                 {
-                    *expr = expr!("unreachable!()");
+                    if let ast::ExprKind::Lit(lit) = &arg.kind
+                        && lit.symbol.as_str() == "internal error: entered unreachable code"
+                    {
+                        *expr = expr!("unreachable!()");
+                    } else {
+                        panic!("{}", pprust::expr_to_string(arg))
+                    }
                 } else {
-                    panic!("{}", pprust::expr_to_string(arg))
+                    panic!("{func}");
                 }
-            } else {
-                panic!("{}", func.ident.name);
+            } else if md == sym::hint {
+                if func == sym::must_use {
+                    let [arg] = &args[..] else { panic!() };
+                    *expr = (**arg).clone();
+                } else {
+                    panic!("{func}");
+                }
+            } else if md == sym::fmt {
+                if func == sym::format {
+                    let [arg] = &args[..] else { panic!() };
+                    let arg = pprust::expr_to_string(arg);
+                    let arg = arg
+                        .strip_prefix("format_args!(")
+                        .unwrap()
+                        .strip_suffix(')')
+                        .unwrap();
+                    *expr = expr!("format!({arg})");
+                } else {
+                    panic!("{func}");
+                }
             }
         }
         mut_visit::walk_expr(self, expr);
