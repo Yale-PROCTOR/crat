@@ -1,14 +1,19 @@
 use std::cmp::Ordering;
 
 use rustc_ast::{node_id::NodeMap, visit::Visitor, *};
-use rustc_hir::{self as hir, HirId};
+use rustc_hash::FxHashMap;
+use rustc_hir::{self as hir, HirId, def::Res};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Ident, def_id::LocalDefId};
+use rustc_span::{Ident, Span, def_id::LocalDefId};
 
 #[derive(Debug, Default)]
 pub struct AstToHir {
     pub global_map: NodeMap<LocalDefId>,
     pub local_map: NodeMap<HirId>,
+
+    /// From the `Span` of AST `Path` to `Res` if the `Path` is mapped to `QPath::Resolved` in HIR.
+    /// We use `Span` because `Path` does not have `NodeId`.
+    pub path_span_to_res: FxHashMap<Span, Res>,
 }
 
 pub struct AstToHirMapper<'tcx> {
@@ -1105,6 +1110,9 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 for (seg, hseg) in path.segments.iter_mut().zip(hpath.segments) {
                     self.map_path_segment_to_path_segment(seg, hseg);
                 }
+                self.ast_to_hir
+                    .path_span_to_res
+                    .insert(path.span, hpath.res);
             }
             hir::QPath::TypeRelative(hty, hseg) => {
                 assert!(qself.is_none());

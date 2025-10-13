@@ -56,30 +56,40 @@ SCRIPT_TEST_DIR: Path = BENCH_ROOT / "script-tests"
 RS_ORIG: Path = BENCH_ROOT / "rs"
 TRANSFORM_DIRS: Dict[str, Path] = {
     "resolve": BENCH_ROOT / "rs-resolved",
+    "expand":  BENCH_ROOT / "rs-expanded",
+    "expand-resolve":  BENCH_ROOT / "rs-expand-resolve",
     "union": BENCH_ROOT / "rs-union",
     "io": BENCH_ROOT / "rs-io",
     "io-union": BENCH_ROOT / "rs-io-union",
 }
 TRANSFORM_ORDER: Dict[str, Optional[str]] = {
     "resolve": None,
+    "expand": None,
+    "expand-resolve": "expand",
     "union": "resolve",
     "io": "resolve",
     "io-union": "io",
 }
 TRANSFORM_ANALYSIS: Dict[str, Optional[Tuple[str, str]]] = {
     "resolve": None,
+    "expand": None,
+    "expand-resolve": None,
     "union": ("union", "points-to-file"),
     "io": None,
     "io-union": ("union", "points-to-file"),
 }
 TRANSFORM_PASS: Dict[str, str] = {
     "resolve": "preprocess,extern,bin",
+    "expand": "expand",
+    "expand-resolve": "preprocesse,externe,bin",
     "union": "union",
     "io": "io",
     "io-union": "union",
 }
 TRANSFORM_CONFIG: Dict[str, Path] = {
     "resolve": CONFIG_ROOT / "resolve",
+    "expand": CONFIG_ROOT / "expand",
+    "expand-resolve": CONFIG_ROOT / "resolve",
     "union": CONFIG_ROOT / "union",
     "io": CONFIG_ROOT / "io",
     "io-union": CONFIG_ROOT / "union",

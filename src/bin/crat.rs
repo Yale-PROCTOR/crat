@@ -94,9 +94,12 @@ struct Args {
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
+    Expand,
     Extern,
+    ExternE,
     Unsafe,
     Preprocess,
+    PreprocessE,
     Bin,
     Check,
     Libc,
@@ -287,17 +290,33 @@ fn main() {
             println!("{pass:?}");
         }
         match pass {
+            Pass::Expand => {
+                let s = run_compiler_on_path(&file, expander::expand).unwrap();
+                remove_rs_files(&dir, true);
+                std::fs::write(&file, s).unwrap();
+            }
             Pass::Extern => {
                 run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern(&config.r#extern, tcx)
                 })
                 .unwrap();
             }
+            Pass::ExternE => {
+                let s = run_compiler_on_path(&file, |tcx| {
+                    extern_resolver::resolve_extern_in_expanded_ast(&config.r#extern, tcx)
+                })
+                .unwrap();
+                std::fs::write(&file, s).unwrap();
+            }
             Pass::Unsafe => {
                 run_compiler_on_path(&file, unsafe_resolver::resolve_unsafe).unwrap();
             }
             Pass::Preprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
+            }
+            Pass::PreprocessE => {
+                let s = run_compiler_on_path(&file, preprocessor::preprocess_expanded_ast).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Bin => {
                 run_compiler_on_path(&file, |tcx| {
@@ -372,6 +391,24 @@ fn clear_dir(path: &Path) {
                 fs::remove_dir_all(entry_path).unwrap();
             }
         } else {
+            fs::remove_file(entry_path).unwrap();
+        }
+    }
+}
+
+fn remove_rs_files(path: &Path, root: bool) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry_path = entry.unwrap().path();
+        let name = entry_path.file_name().unwrap();
+        if root && (name == "target" || name == "build.rs") {
+            continue;
+        }
+        if entry_path.is_dir() {
+            remove_rs_files(&entry_path, false);
+            if fs::read_dir(&entry_path).unwrap().next().is_none() {
+                fs::remove_dir(entry_path).unwrap();
+            }
+        } else if name.to_str().unwrap().ends_with(".rs") {
             fs::remove_file(entry_path).unwrap();
         }
     }

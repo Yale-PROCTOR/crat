@@ -7,6 +7,7 @@ use rustc_ast::{
     self as ast,
     mut_visit::{self, MutVisitor as _},
 };
+use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, HirId, def::Res, definitions::DefPathData, intravisit};
 use rustc_middle::{
@@ -23,7 +24,8 @@ use crate::{
     ast_util,
     disjoint_set::DisjointSets,
     equiv_classes::{EquivClassId, EquivClasses},
-    graph_util, ir_util,
+    graph_util,
+    ir_util::{self, AstToHir},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,9 +54,62 @@ impl LinkHint {
     }
 }
 
+pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> String {
+    let mut expanded_ast = ast_util::expanded_ast(tcx);
+    let ast_to_hir = ast_util::make_ast_to_hir(&mut expanded_ast, tcx);
+    let result = resolve(tcx);
+    let resolve_map = make_resolve_map(&result, config, tcx);
+    ast_util::remove_unnecessary_items_from_ast(&mut expanded_ast);
+    let mut visitor = ExpandedAstVisitor {
+        tcx,
+        ast_to_hir,
+        resolve_map,
+        used_stack: vec![],
+        updated: false,
+    };
+    visitor.visit_crate(&mut expanded_ast);
+    pprust::crate_to_string_for_macros(&expanded_ast)
+}
+
 pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
     let result = resolve(tcx);
+    let resolve_map = make_resolve_map(&result, config, tcx);
+    let mut visitor = AstVisitor {
+        tcx,
+        span_to_def_id: result.span_to_def_id,
+        resolve_map,
+        used: FxHashSet::default(),
+        updated: false,
+    };
+    let res = ast_util::transform_ast(
+        |krate| {
+            visitor.updated = false;
+            visitor.visit_crate(krate);
+            let mut used: Vec<_> = visitor
+                .used
+                .drain()
+                .map(|def_id| tcx.def_path_str(def_id))
+                .collect();
+            used.sort();
+            used.dedup();
+            let mut items: ThinVec<_> = used
+                .into_iter()
+                .map(|s| P(item!("use crate::{};", s)))
+                .collect();
+            items.append(&mut krate.items);
+            krate.items = items;
+            visitor.updated
+        },
+        tcx,
+    );
+    res.apply();
+}
 
+fn make_resolve_map(
+    result: &ResolveResult,
+    config: &Config,
+    tcx: TyCtxt<'_>,
+) -> FxHashMap<LocalDefId, LocalDefId> {
     let mut resolve_map = FxHashMap::default();
     for classes in result
         .equiv_adts
@@ -117,35 +172,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
 
     assert!(!link_failed);
 
-    let mut visitor = AstVisitor {
-        tcx,
-        span_to_def_id: result.span_to_def_id,
-        resolve_map,
-        used: FxHashSet::default(),
-        updated: false,
-    };
-    let res = ast_util::transform_ast(
-        |krate| {
-            visitor.updated = false;
-            visitor.visit_crate(krate);
-            let mut used: Vec<_> = visitor
-                .used
-                .drain()
-                .map(|def_id| tcx.def_path_str(def_id))
-                .collect();
-            used.sort();
-            used.dedup();
-            let mut items: ThinVec<_> = used
-                .into_iter()
-                .map(|s| P(item!("use crate::{};", s)))
-                .collect();
-            items.append(&mut krate.items);
-            krate.items = items;
-            visitor.updated
-        },
-        tcx,
-    );
-    res.apply();
+    resolve_map
 }
 
 #[inline]
@@ -669,6 +696,116 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
 
 fn is_unnamed(name: &str) -> bool {
     name.starts_with("C2RustUnnamed")
+}
+
+struct ExpandedAstVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: AstToHir,
+    resolve_map: FxHashMap<LocalDefId, LocalDefId>,
+    used_stack: Vec<FxHashSet<LocalDefId>>,
+    updated: bool,
+}
+
+impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
+    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
+        let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();
+        if let ast::ItemKind::Fn(..)
+        | ast::ItemKind::Static(..)
+        | ast::ItemKind::Struct(..)
+        | ast::ItemKind::Union(..)
+        | ast::ItemKind::TyAlias(..) = &item.kind
+            && self.resolve_map.contains_key(&hir_item.owner_id.def_id)
+        {
+            self.updated = true;
+            SmallVec::new()
+        } else if let hir::ItemKind::Impl(imp) = &hir_item.kind
+            && let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = imp.self_ty.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+            && self.resolve_map.contains_key(&def_id)
+        {
+            self.updated = true;
+            SmallVec::new()
+        } else {
+            let mut items = mut_visit::walk_flat_map_item(self, item);
+            items.retain(|item| {
+                if let ast::ItemKind::ForeignMod(fm) = &item.kind {
+                    !fm.items.is_empty()
+                } else {
+                    true
+                }
+            });
+            items
+        }
+    }
+
+    fn visit_item(&mut self, item: &mut ast::Item) {
+        if matches!(
+            item.kind,
+            ast::ItemKind::Mod(_, _, ast::ModKind::Loaded(..))
+        ) {
+            self.used_stack.push(FxHashSet::default());
+        }
+
+        mut_visit::walk_item(self, item);
+
+        if let ast::ItemKind::Mod(_, _, ast::ModKind::Loaded(items, _, _, _)) = &mut item.kind {
+            let mut used: Vec<_> = self
+                .used_stack
+                .pop()
+                .unwrap()
+                .into_iter()
+                .map(|def_id| self.tcx.def_path_str(def_id))
+                .collect();
+            if !used.is_empty() {
+                used.sort();
+                used.dedup();
+                let mut new_items: ThinVec<_> = used
+                    .into_iter()
+                    .map(|s| P(item!("use crate::{};", s)))
+                    .collect();
+                new_items.append(items);
+                *items = new_items;
+                self.updated = true;
+            }
+        }
+    }
+
+    fn flat_map_foreign_item(
+        &mut self,
+        item: P<ast::ForeignItem>,
+    ) -> SmallVec<[P<ast::ForeignItem>; 1]> {
+        let hir_item = self.ast_to_hir.get_foreign_item(item.id, self.tcx).unwrap();
+        if let ast::ForeignItemKind::Fn(..)
+        | ast::ForeignItemKind::Static(..)
+        | ast::ForeignItemKind::TyAlias(..) = &item.kind
+            && self.resolve_map.contains_key(&hir_item.owner_id.def_id)
+        {
+            self.updated = true;
+            SmallVec::new()
+        } else {
+            mut_visit::walk_flat_map_foreign_item(self, item)
+        }
+    }
+
+    fn visit_path(&mut self, path: &mut ast::Path) {
+        if let Some(res) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Res::Def(_, def_id) = *res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(resolved) = self.resolve_map.get(&def_id)
+        {
+            self.updated = true;
+            let name = ir_util::def_id_to_symbol(*resolved, self.tcx).unwrap();
+            if is_unnamed(name.as_str()) {
+                *path = path!("crate::{}", self.tcx.def_path_str(*resolved));
+            } else {
+                path.segments.last_mut().unwrap().ident.name = name;
+                self.used_stack.last_mut().unwrap().insert(*resolved);
+            }
+        }
+
+        walk_path(self, path);
+    }
 }
 
 struct AstVisitor<'tcx> {
