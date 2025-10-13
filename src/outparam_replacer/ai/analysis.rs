@@ -1417,9 +1417,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let (new_next_states, next_locations, writes) =
                     if statement_index < bbd.statements.len() {
                         let stmt = &bbd.statements[statement_index];
-                        let (new_next_state, writes) = self
-                            .transfer_statement(stmt, state)
-                            .unwrap_or_else(|| (state.clone(), BTreeSet::new()));
+                        let (new_next_state, writes) = self.transfer_statement(stmt, state);
                         let next_location = Location {
                             block,
                             statement_index: statement_index + 1,
