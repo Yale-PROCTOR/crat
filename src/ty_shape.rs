@@ -39,6 +39,7 @@ impl BitField {
 pub fn get_ty_shapes<'a, 'tcx>(
     arena: &'a Arena<TyShape<'a, 'tcx>>,
     tcx: TyCtxt<'tcx>,
+    use_optimized_mir: bool,
 ) -> TyShapes<'a, 'tcx> {
     let mut tss = TyShapes {
         bitfields: FxHashMap::default(),
@@ -46,7 +47,7 @@ pub fn get_ty_shapes<'a, 'tcx>(
         arena,
     };
     compute_bitfields(&mut tss, tcx);
-    compute_ty_shapes(&mut tss, tcx);
+    compute_ty_shapes(&mut tss, tcx, use_optimized_mir);
     tss
 }
 
@@ -143,16 +144,32 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
         .collect();
 }
 
-fn compute_ty_shapes<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
+fn compute_ty_shapes<'tcx>(
+    tss: &mut TyShapes<'_, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+    use_optimized_mir: bool,
+) {
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
         let body = match item.kind {
-            ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => &tcx
-                .mir_drops_elaborated_and_const_checked(local_def_id)
-                .borrow(),
-            ItemKind::Static(_, _, _, _) => tcx.mir_for_ctfe(def_id),
+            ItemKind::Fn { ident, .. } if ident.name.as_str() != "main" => {
+                if use_optimized_mir {
+                    tcx.optimized_mir(local_def_id)
+                } else {
+                    &tcx.mir_drops_elaborated_and_const_checked(local_def_id)
+                        .borrow()
+                }
+            }
+            ItemKind::Static(_, _, _, _) => {
+                if use_optimized_mir {
+                    tcx.mir_for_ctfe(def_id)
+                } else {
+                    &tcx.mir_drops_elaborated_and_const_checked(local_def_id)
+                        .borrow()
+                }
+            }
             _ => continue,
         };
         for local_decl in body.local_decls.iter() {

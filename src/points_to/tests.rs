@@ -124,7 +124,7 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
     );
     compile_util::run_compiler_on_str(&code, |tcx| {
         let arena = Arena::new();
-        let tss = ty_shape::get_ty_shapes(&arena, tcx);
+        let tss = ty_shape::get_ty_shapes(&arena, tcx, true);
         let config = andersen::Config {
             use_optimized_mir: true,
         };

@@ -29,10 +29,10 @@ pub struct AnalysisResult {
 
 pub fn analyze(gc: bool, tcx: TyCtxt<'_>) -> AnalysisResult {
     let arena = Arena::new();
-    let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre_config = andersen::Config {
-        use_optimized_mir: true,
-    };
+    // always use optimized mir in union_replacer for now
+    let use_optimized_mir = true;
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
+    let pre_config = andersen::Config { use_optimized_mir };
     let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = andersen::analyze(&pre_config, &pre, &tss, tcx);
     let may_points_to = andersen::post_analyze(&pre_config, pre, solutions, &tss, tcx);

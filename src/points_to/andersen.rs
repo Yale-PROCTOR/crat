@@ -35,7 +35,7 @@ pub struct Config {
 
 pub fn run_analysis(config: &Config, tcx: TyCtxt<'_>) -> Solutions {
     let arena = Arena::new();
-    let tss = ty_shape::get_ty_shapes(&arena, tcx);
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, config.use_optimized_mir);
     let pre = pre_analyze(config, &tss, tcx);
     analyze(config, &pre, &tss, tcx)
 }
@@ -234,7 +234,12 @@ pub fn pre_analyze<'a, 'tcx>(
                 bodies.push(body_item);
             }
             ItemKind::Static(_, _, _, _) => {
-                let body = tcx.mir_for_ctfe(def_id);
+                let body = if config.use_optimized_mir {
+                    tcx.mir_for_ctfe(def_id)
+                } else {
+                    &tcx.mir_drops_elaborated_and_const_checked(local_def_id)
+                        .borrow()
+                };
                 visitor.visit_body(body);
                 let body_item = BodyItem {
                     local_def_id,
@@ -266,14 +271,15 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
-        let body = if item.is_fn {
-            if config.use_optimized_mir {
-                tcx.optimized_mir(item.local_def_id.to_def_id())
-            } else {
-                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                    .borrow()
-            }
+        let body = if !config.use_optimized_mir {
+            // use MIR before optimization
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else if item.is_fn {
+            // if item is a function, use optimized MIR
+            tcx.optimized_mir(item.local_def_id.to_def_id())
         } else {
+            // if item is a static, use MIR for CTFE
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
@@ -444,14 +450,15 @@ pub fn analyze<'a, 'tcx>(
         graph: Graph::new(pre.index_info.len()),
     };
     for item in &pre.bodies {
-        let body = if item.is_fn {
-            if config.use_optimized_mir {
-                tcx.optimized_mir(item.local_def_id.to_def_id())
-            } else {
-                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                    .borrow()
-            }
+        let body = if !config.use_optimized_mir {
+            // use MIR before optimization
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else if item.is_fn {
+            // if item is a function, use optimized MIR
+            tcx.optimized_mir(item.local_def_id.to_def_id())
         } else {
+            // if item is a static, use MIR for CTFE
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
@@ -806,14 +813,15 @@ pub fn post_analyze<'a, 'tcx>(
     for item in &pre.bodies {
         let writes = writes.entry(item.local_def_id).or_default();
         let bitfield_writes = bitfield_writes.entry(item.local_def_id).or_default();
-        let body = if item.is_fn {
-            if config.use_optimized_mir {
-                tcx.optimized_mir(item.local_def_id.to_def_id())
-            } else {
-                &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
-                    .borrow()
-            }
+        let body = if !config.use_optimized_mir {
+            // use MIR before optimization
+            &tcx.mir_drops_elaborated_and_const_checked(item.local_def_id)
+                .borrow()
+        } else if item.is_fn {
+            // if item is a function, use optimized MIR
+            tcx.optimized_mir(item.local_def_id.to_def_id())
         } else {
+            // if item is a static, use MIR for CTFE
             tcx.mir_for_ctfe(item.local_def_id.to_def_id())
         };
         let ctx = Context::new(&body.local_decls, item.local_def_id);
