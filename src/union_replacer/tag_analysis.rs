@@ -119,7 +119,9 @@ pub fn analyze(conf: &Config, verbose: bool, tcx: TyCtxt<'_>) -> Statistics {
     let visitor = ty_finder::TyVisitor::new(tcx);
     let (local_tys, foreign_tys) = visitor.find_foreign_tys(tcx);
     let arena = Arena::new();
-    let tss = ty_shape::get_ty_shapes(&arena, tcx);
+    // always use optimized mir in union_replacer for now
+    let use_optimized_mir = true;
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
 
     let mut non_tag_fields = FxHashMap::default();
     for item_id in tcx.hir_free_items() {
@@ -276,14 +278,15 @@ pub fn analyze(conf: &Config, verbose: bool, tcx: TyCtxt<'_>) -> Statistics {
     }
 
     let start = std::time::Instant::now();
-    let pre = andersen::pre_analyze(&tss, tcx);
+    let points_to_config = andersen::Config { use_optimized_mir };
+    let pre = andersen::pre_analyze(&points_to_config, &tss, tcx);
     let solutions = if let Some(file) = &conf.points_to_file {
         let arr = std::fs::read(file).unwrap();
         andersen::deserialize_solutions(&arr)
     } else {
-        andersen::analyze(&pre, &tss, tcx)
+        andersen::analyze(&points_to_config, &pre, &tss, tcx)
     };
-    let may_points_to = andersen::post_analyze(pre, solutions, &tss, tcx);
+    let may_points_to = andersen::post_analyze(&points_to_config, pre, solutions, &tss, tcx);
     stat.may_analysis = start.elapsed().as_millis() as usize;
 
     if verbose {

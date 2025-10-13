@@ -864,12 +864,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         }
                     }
                     CastKind::PtrToPtr => {
-                        let void = if let TyKind::RawPtr(ty, _) = ty.kind() {
-                            ty.is_c_void(self.tcx)
+                        let unchanged: bool = if let TyKind::RawPtr(inner_ty, _) = ty.kind() {
+                            inner_ty.is_c_void(self.tcx)
+                                || operand.ty(self.local_decl, self.tcx) == *ty
                         } else {
                             false
                         };
-                        if void { v } else { AbsValue::heap().join(&v) }
+                        if unchanged {
+                            v
+                        } else {
+                            AbsValue::heap().join(&v)
+                        }
                     }
                     CastKind::FnPtrToPtr => v,
                     CastKind::Transmute => v,
@@ -1091,13 +1096,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                 }
             },
-            ConstValue::ZeroSized => {
-                if let TyKind::FnDef(def_id, _) = ty.kind() {
-                    AbsValue::alpha_fn(*def_id)
-                } else {
-                    unreachable!("{:?}", v)
-                }
-            }
+            ConstValue::ZeroSized => match ty.kind() {
+                TyKind::Tuple(_) => AbsValue::alpha_list(vec![]),
+                TyKind::FnDef(def_id, _) => AbsValue::alpha_fn(*def_id),
+                _ => unreachable!("{:?}", ty),
+            },
             ConstValue::Slice { data, meta } => {
                 let size = Size::from_bytes(*meta);
                 let range = AllocRange {

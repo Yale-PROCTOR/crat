@@ -32,6 +32,10 @@ struct Args {
     )]
     bin_ignore: Vec<String>,
 
+    // Andersen
+    #[arg(long, help = "Use optimized MIR for points-to analysis")]
+    andersen_use_optimized_mir: bool,
+
     // Union
     #[arg(long, value_delimiter = ',', help = "Target unions to replace")]
     union_target: Vec<String>,
@@ -123,6 +127,8 @@ struct Config {
     #[serde(default)]
     r#extern: extern_resolver::Config,
     #[serde(default)]
+    andersen: points_to::andersen::Config,
+    #[serde(default)]
     bin: bin_file_adder::Config,
     #[serde(default)]
     r#union: union_replacer::tag_analysis::Config,
@@ -211,6 +217,8 @@ fn main() {
     for arg in args.bin_ignore {
         config.bin.ignores.push(arg);
     }
+
+    config.andersen.use_optimized_mir |= args.andersen_use_optimized_mir;
 
     for u in args.union_target {
         config.r#union.targets.insert(u);
@@ -360,7 +368,7 @@ fn main() {
         match analysis {
             Analysis::Andersen => {
                 run_compiler_on_path(&file, |tcx| {
-                    let solutions = points_to::andersen::run_analysis(tcx);
+                    let solutions = points_to::andersen::run_analysis(&config.andersen, tcx);
                     let file = std::fs::File::create(analysis_output).unwrap();
                     let file = std::io::BufWriter::new(file);
                     points_to::andersen::write_solutions(file, &solutions).unwrap();
@@ -374,6 +382,20 @@ fn main() {
                         config.verbose,
                         tcx,
                     );
+                    let fns = res
+                        .iter()
+                        .filter(|(_, (_, res))| !res.output_params.is_empty())
+                        .count();
+                    let musts = res
+                        .values()
+                        .map(|res| res.1.output_params.iter().filter(|p| p.must).count())
+                        .sum::<usize>();
+                    let mays = res
+                        .values()
+                        .map(|res| res.1.output_params.iter().filter(|p| !p.must).count())
+                        .sum::<usize>();
+                    println!("{fns} {musts} {mays}");
+
                     outparam_replacer::ai::analysis::write_analysis_result(&analysis_output, &res);
                 })
                 .unwrap();

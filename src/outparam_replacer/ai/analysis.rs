@@ -10,7 +10,7 @@ use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    Expr, ExprKind, HirId, QPath,
+    BinOpKind, Expr, ExprKind, HirId, Node, QPath,
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
 };
@@ -18,10 +18,11 @@ use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        BasicBlock, Body, Const, ConstOperand, ConstValue, Local, Location, Rvalue, Statement,
-        StatementKind, Terminator, TerminatorKind,
+        BasicBlock, Body, Const, ConstOperand, ConstValue, Local, LocalDecl, Location, Rvalue,
+        Statement, StatementKind, Terminator, TerminatorKind,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
     },
+    thir,
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::Analysis as _;
@@ -40,7 +41,8 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    graph_util, ir_util,
+    graph_util,
+    ir_util::{self, hir_to_thir::HirToThir},
     points_to::andersen::{self, Loc},
     ty_shape,
 };
@@ -193,6 +195,7 @@ pub fn analyze(
 ) -> AnalysisResult {
     let mut call_graph = FxHashMap::default();
     let mut inputs_map = FxHashMap::default();
+    let mut if_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
         if let Some(ident) = item.kind.ident()
@@ -200,16 +203,17 @@ pub fn analyze(
         {
             continue;
         }
+        let def_id = item.item_id().owner_id.def_id.to_def_id();
         let inputs = if let rustc_hir::ItemKind::Fn { sig, .. } = &item.kind {
             sig.decl.inputs.len()
         } else {
             continue;
         };
-        let def_id = item.item_id().owner_id.def_id.to_def_id();
         inputs_map.insert(def_id, inputs);
-        let mut visitor = CallVisitor::new(tcx);
+        let mut visitor = ExprVisitor::new(tcx);
         visitor.visit_item(item);
         call_graph.insert(def_id, visitor.callees);
+        if_map.insert(def_id, visitor.ifs);
     }
 
     let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
@@ -229,14 +233,17 @@ pub fn analyze(
         .iter()
         .map(|def_id| {
             let inputs = inputs_map[def_id];
-            let body = tcx.optimized_mir(def_id);
-            let param_tys = get_param_tys(body, inputs, tcx);
-            let pre_rpo_map = get_rpo_map(body);
-            let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
-            let rpo_map = compute_rpo_map(body, &loop_blocks);
-            let dead_locals = get_dead_locals(body, tcx);
+            let local_def_id = def_id.as_local().unwrap();
+            let steal = tcx.mir_drops_elaborated_and_const_checked(local_def_id);
+            let body = steal.borrow();
+            let param_tys = get_param_tys(&body, inputs, tcx);
+            let pre_rpo_map = get_rpo_map(&body);
+            let loop_blocks = get_loop_blocks(&body, &pre_rpo_map);
+            let rpo_map = compute_rpo_map(&body, &loop_blocks);
+            let dead_locals = get_dead_locals(&body, tcx);
+            let is_unit = get_is_unit(def_id, tcx);
             let fn_ptr = visitor.fn_ptrs.contains(def_id);
-            global_visitor.visit_body(body);
+            global_visitor.visit_body(&body);
             let globals = std::mem::take(&mut global_visitor.globals);
             let info = FuncInfo {
                 inputs,
@@ -246,19 +253,23 @@ pub fn analyze(
                 dead_locals,
                 fn_ptr,
                 globals,
+                is_unit,
             };
             (*def_id, info)
         })
         .collect();
 
     let arena = Arena::new();
-    let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = andersen::pre_analyze(&tss, tcx);
+    // to ensure further uses of mir are not stolen already, we use mir before optimization
+    let use_optimized_mir = false;
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
+    let pre_config = andersen::Config { use_optimized_mir };
+    let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = if let Some(path) = &config.points_to_file {
         let arr = std::fs::read(path).unwrap();
         andersen::deserialize_solutions(&arr)
     } else {
-        andersen::analyze(&pre, &tss, tcx)
+        andersen::analyze(&pre_config, &pre, &tss, tcx)
     };
 
     let pre_data = pre_analysis::compute_alias(
@@ -269,6 +280,8 @@ pub fn analyze(
         config.check_global_alias,
         config.check_param_alias,
     );
+
+    let hir_to_thir = ir_util::hir_to_thir::map_hir_to_thir(tcx);
 
     let mut ptr_params_map = FxHashMap::default();
     let mut ptr_params_inv_map = FxHashMap::default();
@@ -282,7 +295,7 @@ pub fn analyze(
     let mut wbrs: FxHashMap<DefId, Vec<WriteBeforeReturn>> = FxHashMap::default();
     let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
         FxHashMap::default();
-    let mut is_units = FxHashMap::default();
+    let mut time = 0;
 
     let mut rcfws = FxHashMap::default();
     for id in &po {
@@ -304,12 +317,12 @@ pub fn analyze(
             let mut need_rerun = false;
             for def_id in def_ids {
                 let start = std::time::Instant::now();
-
                 let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
 
-                let mut analyzer =
-                    Analyzer::new(tcx, &info_map[def_id], config, &summaries, pre_context);
-                let body = tcx.optimized_mir(*def_id);
+                let local_def_id = def_id.as_local().unwrap();
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(local_def_id)
+                    .borrow();
                 if verbose {
                     println!(
                         "{:?} {} {}",
@@ -319,22 +332,31 @@ pub fn analyze(
                     );
                 }
 
+                let mut analyzer = Analyzer::new(
+                    tcx,
+                    &info_map[def_id],
+                    config,
+                    &summaries,
+                    pre_context,
+                    &body.local_decls,
+                );
+
                 let AnalyzedBody {
                     states,
                     writes_map,
                     init_state,
                     call_info_map,
                     is_merged,
-                } = analyzer.analyze_body(body);
+                } = analyzer.analyze_body(&body);
                 if config.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",
                         def_id,
-                        analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
+                        analysis_result_to_string(&body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
 
-                let ret_location = return_location(body);
+                let ret_location = return_location(&body);
 
                 let mut return_states = ret_location
                     .and_then(|ret| states.get(&ret))
@@ -354,13 +376,19 @@ pub fn analyze(
                     analyzer.get_nullable_candidates(&return_states)
                 };
 
+                let nonnull_null_locs = analyzer.compute_nonnull_null_locs(&states, &candidates);
+                let null_dependent_locs = analyzer.compute_null_dependent_locs(
+                    &body,
+                    &hir_to_thir,
+                    &if_map[def_id],
+                    &candidates,
+                );
+
                 let nullable_params = analyzer.find_nullable_params(
-                    tcx,
-                    &states,
-                    body,
+                    &body,
                     &writes_map,
                     &call_info_map,
-                    candidates,
+                    nonnull_null_locs.into_iter().chain(null_dependent_locs),
                 );
 
                 let alias_params = if config.check_global_alias {
@@ -387,15 +415,17 @@ pub fn analyze(
 
                 let mut stack = vec![];
 
-                if let Some(ret_location) = ret_location {
+                if let Some(ret_location) = ret_location
+                    && !analyzer.info.is_unit
+                {
                     if let Some((ret_loc_assign0, ret_loc)) =
-                        exists_assign0(body, ret_location.block)
+                        analyzer.exists_assign0(&body, ret_location.block)
                     {
                         stack.push((ret_loc, ret_loc_assign0));
                     } else if let Some(v) = body.basic_blocks.predecessors().get(ret_location.block)
                     {
                         for i in v {
-                            if let Some((sp, ret_loc)) = exists_assign0(body, *i) {
+                            if let Some((sp, ret_loc)) = analyzer.exists_assign0(&body, *i) {
                                 stack.push((ret_loc, sp));
                             }
                         }
@@ -435,7 +465,6 @@ pub fn analyze(
 
                 wbrs.insert(*def_id, wbr);
                 bb_musts.insert(*def_id, bb_must);
-                is_units.insert(*def_id, stack.is_empty());
 
                 // Handle unremovable parameters
                 for st in return_states.values_mut() {
@@ -478,31 +507,41 @@ pub fn analyze(
                 need_rerun |= updated;
 
                 *analysis_times.entry(*def_id).or_default() += start.elapsed().as_millis();
+                time += start.elapsed().as_millis();
             }
 
             if !need_rerun {
                 for def_id in def_ids {
+                    let local_def_id = def_id.as_local().unwrap();
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(local_def_id)
+                        .borrow();
                     let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
-                    let mut analyzer =
-                        Analyzer::new(tcx, &info_map[def_id], config, &summaries, pre_context);
+                    let mut analyzer = Analyzer::new(
+                        tcx,
+                        &info_map[def_id],
+                        config,
+                        &summaries,
+                        pre_context,
+                        &body.local_decls,
+                    );
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
                     analyzer.ptr_params_inv = ptr_params_inv_map.remove(def_id).unwrap();
                     let summary = &summaries[def_id];
                     let return_ptrs = analyzer.get_return_ptrs(summary);
                     let mut output_params =
-                        analyzer.find_output_params(summary, &return_ptrs, *def_id);
+                        analyzer.find_output_params(summary, &return_ptrs, &body);
                     let writes_map = wm_map.remove(def_id).unwrap();
                     let call_args = call_args_map.remove(def_id).unwrap();
                     let result = results.remove(def_id).unwrap();
                     for p in &mut output_params {
-                        analyzer.find_complete_write(p, &result, &writes_map, &call_args, *def_id);
+                        analyzer.find_complete_write(p, &result, &writes_map, &call_args, &body);
                     }
 
-                    let body = tcx.optimized_mir(*def_id);
                     let bb_must = &bb_musts[def_id];
                     let mut rcfw: Rcfws = BTreeMap::new();
 
-                    if !is_units[def_id] {
+                    if !analyzer.info.is_unit {
                         for p in &output_params {
                             let OutputParam {
                                 index,
@@ -569,13 +608,17 @@ pub fn analyze(
         let mut analysis_times: Vec<_> = analysis_times.into_iter().collect();
         analysis_times.sort_by_key(|(_, t)| u128::MAX - *t);
         for (def_id, t) in analysis_times.iter().take(*n) {
+            let local_def_id = def_id.as_local().unwrap();
             let f = tcx.def_path(*def_id).to_string_no_crate_verbose();
-            let body = tcx.optimized_mir(*def_id);
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(local_def_id)
+                .borrow();
             let blocks = body.basic_blocks.len();
-            let stmts = ir_util::body_size(body);
+            let stmts = ir_util::body_size(&body);
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
     }
+    println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
 
     summaries
         .into_iter()
@@ -609,43 +652,6 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
     None
 }
 
-fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
-    for (i, stmt) in body.basic_blocks[bb].statements.iter().enumerate() {
-        if let StatementKind::Assign(rb) = &stmt.kind
-            && (**rb).0.local.as_u32() == 0u32
-        {
-            return Some((
-                stmt.source_info.span,
-                Location {
-                    block: bb,
-                    statement_index: i,
-                },
-            ));
-        }
-    }
-    let term = body.basic_blocks[bb].terminator();
-    if let TerminatorKind::Call {
-        func: _,
-        args: _,
-        destination,
-        target,
-        unwind: _,
-        call_source: _,
-        fn_span: _,
-    } = term.kind
-        && destination.local.as_u32() == 0u32
-    {
-        return Some((
-            term.source_info.span,
-            Location {
-                block: target.unwrap(),
-                statement_index: 0,
-            },
-        ));
-    }
-    None
-}
-
 pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
@@ -657,6 +663,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub pre_context: PreAnalysisContext<'a>,
     pub indirect_assigns: BTreeSet<Local>,
     pub is_merged: bool,
+    pub local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,
 }
 
 struct AnalyzedBody {
@@ -681,6 +688,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         config: &'a crate::outparam_replacer::Config,
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
         pre_context: PreAnalysisContext<'a>,
+        local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,
     ) -> Self {
         Self {
             tcx,
@@ -693,6 +701,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             pre_context,
             indirect_assigns: BTreeSet::new(),
             is_merged: false,
+            local_decl,
         }
     }
 
@@ -711,7 +720,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     // Check if any local is used in the following blocks
     fn check_local_uses(
         &self,
-        tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block: &BasicBlock,
         locs: &BTreeSet<Location>,
@@ -725,7 +733,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut work_list = VecDeque::new();
             work_list.extend(body.basic_blocks.successors(*block));
             let mut visited = BTreeSet::new();
-            let mut visitor = LocalVisitor::new(tcx, *local);
+            let mut visitor = LocalVisitor::new(self.tcx, *local);
 
             'outer: while let Some(bb) = work_list.pop_front() {
                 if visited.insert(bb) {
@@ -799,7 +807,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
                 let call_info = call_info_map.get(loc).unwrap();
-                if destination.local == Local::ZERO {
+                if destination.local == Local::ZERO && !self.info.is_unit {
                     return false;
                 }
 
@@ -853,7 +861,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         if let StatementKind::Assign(box (place, _)) = stmt {
             let local = place.local;
             if local == Local::ZERO {
-                return false;
+                return self.info.is_unit;
             }
             if place.is_indirect_first_projection() {
                 if local == param {
@@ -863,17 +871,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             }
 
             local_writes.insert(place.local);
-            true
-        } else {
-            unreachable!("{:?}", stmt)
         }
+        true
     }
 
     // Compute locations where the parameters are non-null or null
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-        candidates: BTreeSet<Local>,
+        candidates: &BTreeSet<Local>,
     ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut locs = vec![];
 
@@ -885,7 +891,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
-                    if let Some(arg) = self.ptr_params_inv.get(&l) {
+                    if let Some(arg) = self.ptr_params_inv.get(l) {
                         match nulls.get(*arg) {
                             AbsNull::Null => {
                                 null_locs.insert(*loc);
@@ -909,9 +915,75 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .cloned()
                 .collect();
             let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
-            locs.push((l, nonnull_locs, null_locs));
+            locs.push((*l, nonnull_locs, null_locs));
         }
         locs
+    }
+
+    // Compute if-else locations where the condition has a logical op on is_null
+    fn compute_null_dependent_locs(
+        &self,
+        body: &Body<'tcx>,
+        hir_to_thir: &HirToThir,
+        if_set: &FxHashSet<HirId>,
+        candidates: &BTreeSet<Local>,
+    ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
+        let mut targets = vec![];
+        let thir_to_mir =
+            ir_util::thir_to_mir::map_thir_to_mir(self.pre_context.local_def_id, false, self.tcx);
+        let (thir, _) = self.tcx.thir_body(self.pre_context.local_def_id).unwrap();
+        let thir = &thir.borrow();
+
+        for if_id in if_set {
+            let Node::Expr(if_expr) = self.tcx.hir_node(*if_id) else {
+                continue;
+            };
+            let ExprKind::If(cond, _, _) = if_expr.kind else {
+                continue;
+            };
+
+            let mut cond_visitor = CondVisitor::new(self.tcx);
+            cond_visitor.visit_expr(cond);
+            let null_checks = cond_visitor.null_checks;
+
+            for check in null_checks {
+                let expr_id = hir_to_thir.exprs.get(&check).unwrap();
+                let thir::ExprKind::VarRef { id } = thir[*expr_id].kind else {
+                    continue;
+                };
+                if let Some(local) = thir_to_mir.binding_to_local.get(&id.0)
+                    && candidates.contains(local)
+                {
+                    let if_expr_id = hir_to_thir.exprs[if_id];
+                    let if_block = thir_to_mir.if_to_bbs.get(&if_expr_id).unwrap();
+                    let then_locs = if_block
+                        .true_blocks
+                        .iter()
+                        .flat_map(|b| {
+                            let bbd = &body.basic_blocks[*b];
+                            (0..=bbd.statements.len()).map(|i| Location {
+                                block: *b,
+                                statement_index: i,
+                            })
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let else_locs = if_block
+                        .false_blocks
+                        .iter()
+                        .flat_map(|b| {
+                            let bbd = &body.basic_blocks[*b];
+                            (0..=bbd.statements.len()).map(|i| Location {
+                                block: *b,
+                                statement_index: i,
+                            })
+                        })
+                        .collect::<BTreeSet<_>>();
+                    targets.push((*local, then_locs, else_locs));
+                }
+            }
+        }
+
+        targets
     }
 
     // We consider a parameter to be nullable if below sets are not the same:
@@ -919,75 +991,73 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     // 2. The set of locations that are reachable when x is null and have side-effects
     fn find_nullable_params(
         &self,
-        tcx: TyCtxt<'tcx>,
-        result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
-        candidates: BTreeSet<Local>,
+        locations: impl Iterator<Item = (Local, BTreeSet<Location>, BTreeSet<Location>)>,
     ) -> BTreeSet<Local> {
-        self.compute_nonnull_null_locs(result, candidates)
-            .into_iter()
-            .filter_map(|(param, nonnull, null)| {
-                if null.is_empty() && nonnull.is_empty() {
-                    return None;
-                }
+        let mut nullable_params = BTreeSet::new();
+        for (param, nonnull, null) in locations {
+            if (null.is_empty() && nonnull.is_empty()) || nullable_params.contains(&param) {
+                continue;
+            }
 
-                let nonnull_diff = nonnull.iter().fold(
-                    BTreeMap::new(),
-                    |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(*loc);
-                        acc
-                    },
-                );
-                let null_diff = null.iter().fold(
-                    BTreeMap::new(),
-                    |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(*loc);
-                        acc
-                    },
-                );
+            let nonnull_diff = nonnull.iter().fold(
+                BTreeMap::new(),
+                |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
+                    acc.entry(loc.block).or_default().insert(*loc);
+                    acc
+                },
+            );
+            let null_diff = null.iter().fold(
+                BTreeMap::new(),
+                |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
+                    acc.entry(loc.block).or_default().insert(*loc);
+                    acc
+                },
+            );
 
-                let check = |block, locs: &BTreeSet<_>, diff_locs| {
-                    let mut local_writes = BTreeSet::new();
-                    locs.iter().all(|loc| {
-                        let writes = writes_map.get(loc).unwrap();
-                        let Location {
-                            block,
-                            statement_index,
-                        } = loc;
+            // check if the given block locations have side-effects
+            let check = |block, locs: &BTreeSet<_>, diff_locs| {
+                let mut local_writes = BTreeSet::new();
+                locs.iter().all(|loc| {
+                    let Some(writes) = writes_map.get(loc) else {
+                        return true;
+                    };
+                    let Location {
+                        block,
+                        statement_index,
+                    } = loc;
 
-                        if writes.iter().any(|p| p.base != param) {
-                            return false;
-                        }
+                    if writes.iter().any(|p| p.base != param) {
+                        return false;
+                    }
 
-                        let bbd = &body.basic_blocks[*block];
-                        if *statement_index < bbd.statements.len() {
-                            let stmt = &bbd.statements[*statement_index];
-                            self.check_assign_pure(&mut local_writes, param, &stmt.kind)
-                        } else {
-                            let term = bbd.terminator();
-                            self.check_terminator_pure(
-                                loc,
-                                &mut local_writes,
-                                param,
-                                call_info_map,
-                                term,
-                            )
-                        }
-                    }) && self.check_local_uses(tcx, body, block, diff_locs, &local_writes)
-                };
-                if nonnull_diff
-                    .iter()
-                    .all(|(b, locs)| check(b, locs, &nonnull))
-                    && null_diff.iter().all(|(b, locs)| check(b, locs, &null))
-                {
-                    None
-                } else {
-                    Some(param)
-                }
-            })
-            .collect::<BTreeSet<_>>()
+                    let bbd = &body.basic_blocks[*block];
+                    if *statement_index < bbd.statements.len() {
+                        let stmt = &bbd.statements[*statement_index];
+                        self.check_assign_pure(&mut local_writes, param, &stmt.kind)
+                    } else {
+                        let term = bbd.terminator();
+                        self.check_terminator_pure(
+                            loc,
+                            &mut local_writes,
+                            param,
+                            call_info_map,
+                            term,
+                        )
+                    }
+                }) && self.check_local_uses(body, block, diff_locs, &local_writes)
+            };
+            if nonnull_diff
+                .iter()
+                .any(|(b, locs)| !check(b, locs, &nonnull))
+                || null_diff.iter().any(|(b, locs)| !check(b, locs, &null))
+            {
+                nullable_params.insert(param);
+            }
+        }
+        nullable_params
     }
 
     // We consider a parameter p is implicitly non-null if every execution either:
@@ -1072,7 +1142,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         summary: &FunctionSummary,
         return_ptrs: &BTreeSet<Local>,
-        def_id: DefId,
+        body: &Body<'tcx>,
     ) -> Vec<OutputParam> {
         if self.info.fn_ptr || summary.return_states.values().any(|st| st.writes.is_bot()) {
             return vec![];
@@ -1097,7 +1167,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .map(|p| p.base)
             .collect();
 
-        let body = self.tcx.optimized_mir(def_id);
         let mut writes = vec![];
         for i in 1..=self.info.inputs {
             let i = Local::from_usize(i);
@@ -1201,7 +1270,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_args: &BTreeMap<Location, BTreeMap<usize, usize>>,
-        def_id: DefId,
+        body: &Body<'tcx>,
     ) {
         if param.must {
             return;
@@ -1209,7 +1278,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let paths = self.expands_path(&AbsPath::new(Local::from_usize(param.index + 1), vec![]));
 
-        let body = self.tcx.optimized_mir(def_id);
         let predecessors = body.basic_blocks.predecessors();
         for (location, sts) in result {
             let complete = sts.keys().any(|(w, _)| {
@@ -1474,6 +1542,46 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         self.info.expands_path(place)
     }
 
+    fn exists_assign0(&self, body: &Body<'tcx>, bb: BasicBlock) -> Option<(Span, Location)> {
+        if self.info.is_unit {
+            return None;
+        }
+        for (i, stmt) in body.basic_blocks[bb].statements.iter().enumerate() {
+            if let StatementKind::Assign(rb) = &stmt.kind
+                && (**rb).0.local.as_u32() == 0u32
+            {
+                return Some((
+                    stmt.source_info.span,
+                    Location {
+                        block: bb,
+                        statement_index: i,
+                    },
+                ));
+            }
+        }
+        let term = body.basic_blocks[bb].terminator();
+        if let TerminatorKind::Call {
+            func: _,
+            args: _,
+            destination,
+            target,
+            unwind: _,
+            call_source: _,
+            fn_span: _,
+        } = term.kind
+            && destination.local.as_u32() == 0u32
+        {
+            return Some((
+                term.source_info.span,
+                Location {
+                    block: target.unwrap(),
+                    statement_index: 0,
+                },
+            ));
+        }
+        None
+    }
+
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
@@ -1546,6 +1654,7 @@ struct FuncInfo {
     dead_locals: IndexVec<BasicBlock, DenseBitSet<Local>>,
     fn_ptr: bool,
     globals: FxHashSet<DefId>,
+    is_unit: bool,
 }
 
 impl FuncInfo {
@@ -1760,22 +1869,29 @@ fn get_dead_locals<'tcx>(
         .collect()
 }
 
-// MIR, HIR Visitors
-struct CallVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    callees: FxHashSet<DefId>,
+fn get_is_unit<'tcx>(def_id: &DefId, tcx: TyCtxt<'tcx>) -> bool {
+    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+    sig.output().is_unit()
 }
 
-impl<'tcx> CallVisitor<'tcx> {
+// MIR, HIR Visitors
+struct ExprVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    callees: FxHashSet<DefId>,
+    ifs: FxHashSet<HirId>,
+}
+
+impl<'tcx> ExprVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
             callees: FxHashSet::default(),
+            ifs: FxHashSet::default(),
         }
     }
 }
 
-impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
+impl<'tcx> HVisitor<'tcx> for ExprVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -1788,6 +1904,8 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
             && let Res::Def(DefKind::Fn, def_id) = path.res
         {
             self.callees.insert(def_id);
+        } else if let ExprKind::If(_, _, _) = expr.kind {
+            self.ifs.insert(expr.hir_id);
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
@@ -1831,6 +1949,55 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
             }
             _ => {}
         }
+        rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+struct CondVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    check_call: bool,
+    pub null_checks: FxHashSet<HirId>,
+}
+
+impl<'tcx> CondVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            check_call: false,
+            null_checks: FxHashSet::default(),
+        }
+    }
+}
+
+impl<'tcx> HVisitor<'tcx> for CondVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if let ExprKind::Binary(op, lhs, rhs) = expr.kind {
+            match &op.node {
+                BinOpKind::And | BinOpKind::Or => {
+                    let prev_check_call = self.check_call;
+                    self.check_call = true;
+                    self.visit_expr(lhs);
+                    self.visit_expr(rhs);
+                    self.check_call = prev_check_call;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.check_call
+            && let ExprKind::MethodCall(path, receiver, _, _) = expr.kind
+            && path.ident.to_string() == "is_null"
+        {
+            self.null_checks.insert(receiver.hir_id);
+        }
+
         rustc_hir::intravisit::walk_expr(self, expr);
     }
 }

@@ -141,8 +141,10 @@ pub fn compute_alias<'tcx>(
     );
 
     for (def_id, inputs) in inputs_map {
-        let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(local_def_id)
+            .borrow();
         let mut params = vec![];
         let mut locals = ChunkedBitSet::new_empty(pre.index_info.len());
         let mut index_local = FxHashMap::default();
