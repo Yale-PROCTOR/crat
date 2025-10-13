@@ -388,10 +388,7 @@ pub fn analyze(
                     &body,
                     &writes_map,
                     &call_info_map,
-                    nonnull_null_locs
-                        .into_iter()
-                        .chain(null_dependent_locs)
-                        .collect(),
+                    nonnull_null_locs.into_iter().chain(null_dependent_locs),
                 );
 
                 let alias_params = if config.check_global_alias {
@@ -997,7 +994,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
-        locations: Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)>,
+        locations: impl Iterator<Item = (Local, BTreeSet<Location>, BTreeSet<Location>)>,
     ) -> BTreeSet<Local> {
         let mut nullable_params = BTreeSet::new();
         for (param, nonnull, null) in locations {
