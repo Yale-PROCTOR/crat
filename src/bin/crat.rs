@@ -98,12 +98,12 @@ struct Args {
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
+    UExtern,
+    UPreprocess,
     Expand,
-    Extern,
-    ExternE,
-    Unsafe,
     Preprocess,
-    PreprocessE,
+    Extern,
+    Unsafe,
     Unexpand,
     Split,
     Bin,
@@ -305,13 +305,13 @@ fn main() {
                 remove_rs_files(&dir, true);
                 std::fs::write(&file, s).unwrap();
             }
-            Pass::Extern => {
+            Pass::UExtern => {
                 run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern(&config.r#extern, tcx)
                 })
                 .unwrap();
             }
-            Pass::ExternE => {
+            Pass::Extern => {
                 let s = run_compiler_on_path(&file, |tcx| {
                     extern_resolver::resolve_extern_in_expanded_ast(&config.r#extern, tcx)
                 })
@@ -321,10 +321,10 @@ fn main() {
             Pass::Unsafe => {
                 run_compiler_on_path(&file, unsafe_resolver::resolve_unsafe).unwrap();
             }
-            Pass::Preprocess => {
+            Pass::UPreprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
             }
-            Pass::PreprocessE => {
+            Pass::Preprocess => {
                 let s = run_compiler_on_path(&file, preprocessor::preprocess_expanded_ast).unwrap();
                 std::fs::write(&file, s).unwrap();
             }

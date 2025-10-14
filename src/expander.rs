@@ -6,7 +6,7 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, kw, sym};
 
 use crate::{ast_util, ir_util};
 
@@ -34,6 +34,15 @@ pub fn expand(tcx: TyCtxt<'_>) -> String {
 struct AstVisitor;
 
 impl MutVisitor for AstVisitor {
+    fn visit_item(&mut self, item: &mut ast::Item) {
+        if let ast::ItemKind::Mod(_, ident, _) = &mut item.kind
+            && ident.name == kw::Mod
+        {
+            ident.name = Symbol::intern("rmod");
+        }
+        mut_visit::walk_item(self, item);
+    }
+
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
         if let ast::ExprKind::Path(None, path) = &mut expr.kind
             && let [_, _, seg] = &path.segments[..]

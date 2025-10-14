@@ -12,6 +12,23 @@ from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
+class Transformation:
+    dir: Path
+    order: Optional[str]
+    analysis: Optional[Tuple[str, str]]  # (file, option)
+    pass_: str
+    config: Path
+
+
+@dataclass(frozen=True)
+class Analysis:
+    dir: Path
+    order: str
+    pass_: str
+    config: Path
+
+
+@dataclass(frozen=True)
 class Config:
     overwrite: bool
     debug: bool
@@ -54,67 +71,73 @@ ANALYSIS_CONFIG_ROOT: Path = BENCH_ROOT / "analysis-configs"
 BIN_TEST_DIR: Path = BENCH_ROOT / "bin-tests"
 SCRIPT_TEST_DIR: Path = BENCH_ROOT / "script-tests"
 RS_ORIG: Path = BENCH_ROOT / "rs"
-TRANSFORM_DIRS: Dict[str, Path] = {
-    "resolve": BENCH_ROOT / "rs-resolved",
-    "expand":  BENCH_ROOT / "rs-expanded",
-    "expand-resolve":  BENCH_ROOT / "rs-expand-resolve",
-    "resolve-post": BENCH_ROOT / "rs-resolve-post",
-    "union": BENCH_ROOT / "rs-union",
-    "io": BENCH_ROOT / "rs-io",
-    "io-union": BENCH_ROOT / "rs-io-union",
+
+TRANSFORMATIONS: Dict[str, Transformation] = {
+    "expand": Transformation(
+        dir=BENCH_ROOT / "rs-expand",
+        order=None,
+        analysis=None,
+        pass_="expand",
+        config=CONFIG_ROOT / "expand",
+    ),
+    "extern": Transformation(
+        dir=BENCH_ROOT / "rs-extern",
+        order="expand",
+        analysis=None,
+        pass_="preprocess,extern",
+        config=CONFIG_ROOT / "extern",
+    ),
+    "extern-post": Transformation(
+        dir=BENCH_ROOT / "rs-extern-post",
+        order="extern",
+        analysis=None,
+        pass_="unsafe,unexpand,split,bin",
+        config=CONFIG_ROOT / "post",
+    ),
+    "resolve": Transformation(
+        dir=BENCH_ROOT / "rs-resolve",
+        order=None,
+        analysis=None,
+        pass_="upreprocess,uextern,bin",
+        config=CONFIG_ROOT / "resolve",
+    ),
+    "io": Transformation(
+        dir=BENCH_ROOT / "rs-io",
+        order="resolve",
+        analysis=None,
+        pass_="io",
+        config=CONFIG_ROOT / "io",
+    ),
+    "union": Transformation(
+        dir=BENCH_ROOT / "rs-union",
+        order="resolve",
+        analysis=("union", "points-to-file"),
+        pass_="union",
+        config=CONFIG_ROOT / "union",
+    ),
+    "io-union": Transformation(
+        dir=BENCH_ROOT / "rs-io-union",
+        order="io",
+        analysis=("union", "points-to-file"),
+        pass_="union",
+        config=CONFIG_ROOT / "union",
+    ),
 }
-TRANSFORM_ORDER: Dict[str, Optional[str]] = {
-    "resolve": None,
-    "expand": None,
-    "expand-resolve": "expand",
-    "resolve-post": "expand-resolve",
-    "union": "resolve",
-    "io": "resolve",
-    "io-union": "io",
+ANALYSES: Dict[str, Analysis] = {
+    "union": Analysis(
+        dir=ANALYSIS_ROOT / "union",
+        order="resolve",
+        pass_="andersen",
+        config=ANALYSIS_CONFIG_ROOT / "union",
+    ),
+    "io-union": Analysis(
+        dir=ANALYSIS_ROOT / "io-union",
+        order="io",
+        pass_="andersen",
+        config=ANALYSIS_CONFIG_ROOT / "io-union",
+    ),
 }
-TRANSFORM_ANALYSIS: Dict[str, Optional[Tuple[str, str]]] = {
-    "resolve": None,
-    "expand": None,
-    "expand-resolve": None,
-    "resolve-post": None,
-    "union": ("union", "points-to-file"),
-    "io": None,
-    "io-union": ("union", "points-to-file"),
-}
-TRANSFORM_PASS: Dict[str, str] = {
-    "resolve": "preprocess,extern,bin",
-    "expand": "expand",
-    "expand-resolve": "preprocesse,externe,bin",
-    "resolve-post": "unexpand,split",
-    "union": "union",
-    "io": "io",
-    "io-union": "union",
-}
-TRANSFORM_CONFIG: Dict[str, Path] = {
-    "resolve": CONFIG_ROOT / "resolve",
-    "expand": CONFIG_ROOT / "expand",
-    "expand-resolve": CONFIG_ROOT / "resolve",
-    "resolve-post": CONFIG_ROOT / "post",
-    "union": CONFIG_ROOT / "union",
-    "io": CONFIG_ROOT / "io",
-    "io-union": CONFIG_ROOT / "union",
-}
-ANALYSIS_DIRS: Dict[str, Path] = {
-    "union": ANALYSIS_ROOT / "union",
-    "io-union": ANALYSIS_ROOT / "io-union",
-}
-ANALYSIS_ORDER: Dict[str, str] = {
-    "union": "resolve",
-    "io-union": "io",
-}
-ANALYSIS_PASS: Dict[str, str] = {
-    "union": "andersen",
-    "io-union": "andersen",
-}
-ANALYSIS_CONFIG: Dict[str, Path] = {
-    "union": ANALYSIS_CONFIG_ROOT / "union",
-    "io-union": ANALYSIS_CONFIG_ROOT / "io-union",
-}
+
 current_dst: Optional[Path] = None
 
 
@@ -139,21 +162,21 @@ def is_benchmark(bench: str) -> bool:
 
 
 def analyze_one(stage: str, bench: str, config: Config):
-    dst = ANALYSIS_DIRS[stage] / bench
+    analysis = ANALYSES[stage]
+    dst = analysis.dir / bench
     if dst.exists() and not config.overwrite:
         print(
             f"[Skip] {dst} already exists (use --overwrite to overwrite or --overwrite-depth to adjust depth)"
         )
         return
 
-    src_stage = ANALYSIS_ORDER[stage]
-    src = TRANSFORM_DIRS[src_stage] / bench
+    src_stage = analysis.order
+    src = TRANSFORMATIONS[src_stage].dir / bench
 
     if src_stage and (not src.exists() or config.overwrite):
         transform_one(src_stage, bench, config.decrease_depth())
 
-    config_dir = ANALYSIS_CONFIG[stage]
-    config_file = config_dir / f"{bench}.toml"
+    config_file = analysis.config / f"{bench}.toml"
     config_file = config_file if config_file.exists() else None
 
     if not dst.parent.exists():
@@ -162,7 +185,7 @@ def analyze_one(stage: str, bench: str, config: Config):
     cmd = ["cargo", "run", "--bin", "crat"]
     if not os.environ.get("DEBUG"):
         cmd.append("--release")
-    cmd += ["--", "--analysis-output", str(dst), "--analysis", ANALYSIS_PASS[stage]]
+    cmd += ["--", "--analysis-output", str(dst), "--analysis", analysis.pass_]
     if config_file:
         cmd.extend(["--config", str(config_file)])
     if config.log:
@@ -188,30 +211,34 @@ def analyze_one(stage: str, bench: str, config: Config):
 
 
 def transform_one(stage: str, bench: str, config: Config):
-    dst = TRANSFORM_DIRS[stage] / bench
+    transformation = TRANSFORMATIONS[stage]
+    dst = transformation.dir / bench
     if dst.exists() and not config.overwrite:
         print(
             f"[Skip] {dst} already exists (use --overwrite to overwrite or --overwrite-depth to adjust depth)"
         )
         return
 
-    src_stage = TRANSFORM_ORDER[stage]
-    src = RS_ORIG / bench if src_stage is None else TRANSFORM_DIRS[src_stage] / bench
+    src_stage = transformation.order
+    src = (
+        RS_ORIG / bench if src_stage is None else TRANSFORMATIONS[src_stage].dir / bench
+    )
 
     if src_stage and (not src.exists() or config.overwrite):
         transform_one(src_stage, bench, config.decrease_depth())
 
-    analysis_stage_opt = TRANSFORM_ANALYSIS[stage]
+    analysis_stage_opt = transformation.analysis
     analysis_file, analysis_opt = None, None
     if analysis_stage_opt:
         analysis_stage, analysis_opt = analysis_stage_opt
-        analysis_file = ANALYSIS_DIRS[analysis_stage] / bench
+        analysis_file = ANALYSES[analysis_stage].dir / bench
 
         if not analysis_file.exists() or config.overwrite:
-            analyze_one(analysis_stage, bench, config.decrease_depth().decrease_depth_to(1))
+            analyze_one(
+                analysis_stage, bench, config.decrease_depth().decrease_depth_to(1)
+            )
 
-    config_dir = TRANSFORM_CONFIG[stage]
-    config_file = config_dir / f"{bench}.toml"
+    config_file = transformation.config / f"{bench}.toml"
     config_file = config_file if config_file.exists() else None
 
     if not dst.parent.exists():
@@ -220,7 +247,7 @@ def transform_one(stage: str, bench: str, config: Config):
     cmd = ["cargo", "run", "--bin", "crat"]
     if not os.environ.get("DEBUG"):
         cmd.append("--release")
-    cmd += ["--", "-o", str(dst.parent), "--pass", TRANSFORM_PASS[stage]]
+    cmd += ["--", "-o", str(dst.parent), "--pass", transformation.pass_]
     if analysis_file and analysis_opt:
         cmd += [f"--{analysis_opt}", str(analysis_file)]
     if config_file:
@@ -248,7 +275,7 @@ def transform_one(stage: str, bench: str, config: Config):
 
 
 def build_one(stage: str, bench: str, config: Config):
-    bench_dir = TRANSFORM_DIRS[stage] / bench
+    bench_dir = TRANSFORMATIONS[stage].dir / bench
     if not bench_dir.exists() or config.overwrite:
         transform_one(stage, bench, config)
 
@@ -278,7 +305,7 @@ def test_one(stage: str, bench: str, config: Config):
     script_file = SCRIPT_TEST_DIR / f"{bench}.sh"
 
     if test_file.exists():
-        bench_dir = TRANSFORM_DIRS[stage] / bench
+        bench_dir = TRANSFORMATIONS[stage].dir / bench
         bin_subdir = "debug" if config.debug else "release"
         with open(test_file) as f:
             for line in f:
@@ -308,7 +335,7 @@ def test_one(stage: str, bench: str, config: Config):
         tmp_dir = BENCH_ROOT / "tmp"
         tmp_dir.mkdir(exist_ok=True)
 
-        cmd = [str(script_file), str(tmp_dir), str(TRANSFORM_DIRS[stage])]
+        cmd = [str(script_file), str(tmp_dir), str(TRANSFORMATIONS[stage].dir)]
         if not config.debug:
             cmd.append("--release")
 
@@ -328,8 +355,7 @@ def test_one(stage: str, bench: str, config: Config):
 
 
 def clean_one(stage: str, bench: str, _: Config):
-    path = TRANSFORM_DIRS[stage]
-    target = path / bench
+    target = TRANSFORMATIONS[stage].dir / bench
     if target.exists():
         print(f"[Remove] {target}")
         shutil.rmtree(target)
@@ -413,7 +439,7 @@ def main():
     )
     parser.add_argument(
         "stage",
-        help="Stage to operate on (e.g., resolve, union, io, etc.)",
+        help="Stage to operate on (e.g., extern, union, io, etc.)",
     )
     parser.add_argument(
         "benchmark",
@@ -448,11 +474,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == "analyze":
-        if args.stage not in ANALYSIS_ORDER:
+        if args.stage not in ANALYSES:
             print(f"Unknown analysis stage: {args.stage}")
             sys.exit(1)
     else:
-        if args.stage not in TRANSFORM_DIRS:
+        if args.stage not in TRANSFORMATIONS:
             print(f"Unknown stage: {args.stage}")
             sys.exit(1)
 

@@ -1,0 +1,4 @@
+[extern]
+function_hints = [
+  { from = "unzip::xalloc_die", to = "lib::xalloc_die::xalloc_die" },
+]

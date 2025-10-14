@@ -1,0 +1,6 @@
+[extern]
+function_hints = [
+  { from = "lib::paxnames::xalloc_die", to = "gnu::xalloc_die::xalloc_die" },
+  { from = "src::copyin::xalloc_die", to = "gnu::xalloc_die::xalloc_die" },
+  { from = "src::util::xalloc_die", to = "gnu::xalloc_die::xalloc_die" },
+]

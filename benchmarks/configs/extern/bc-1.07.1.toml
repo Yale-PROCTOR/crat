@@ -1,0 +1,4 @@
+[extern]
+function_hints = [
+  { from = "lib::number::out_of_memory", to = "bc::util::out_of_memory" },
+]
