@@ -1,0 +1,16 @@
+[extern]
+function_hints = [
+  { from = "BipsPl::bc_supp::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::flag_supp::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::foreign_supp::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::src_rdr_c::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::stream_supp::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::top_level_c::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "EnginePl::atom::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "EnginePl::if_no_fd::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "EnginePl::pred::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "EnginePl::stacks_sigsegv::Pl_Fatal_Error", to = "EnginePl::misc::Pl_Fatal_Error" },
+  { from = "BipsPl::consult_c::Pl_M_Spawn_Redirect", to = "EnginePl::machine1::Pl_M_Spawn_Redirect" },
+  { from = "BipsPl::os_interf_c::Pl_M_Spawn_Redirect", to = "EnginePl::machine1::Pl_M_Spawn_Redirect" },
+  { from = "TopComp::top_level_main::Pl_Fatal_Error", to = "TopComp::hexfilter::Pl_Fatal_Error" },
+]

@@ -1,12 +1,13 @@
 //! utils for working with HIR and MIR
 
+use rustc_ast as ast;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::{
     mir::{Body, TerminatorKind},
     query::IntoQueryParam,
     ty::TyCtxt,
 };
-use rustc_span::{Symbol, def_id::DefId};
+use rustc_span::{DUMMY_SP, Symbol, def_id::DefId};
 
 #[inline]
 pub fn def_id_to_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<Symbol> {
@@ -63,6 +64,47 @@ pub fn body_size(body: &Body<'_>) -> usize {
         .iter()
         .map(|bbd| bbd.statements.len() + 1)
         .sum()
+}
+
+pub fn make_inner_attribute(outer: Symbol, inner: Symbol, tcx: TyCtxt<'_>) -> ast::Attribute {
+    let g = &tcx.sess.psess.attr_id_generator;
+    ast::attr::mk_attr_nested_word(
+        g,
+        ast::AttrStyle::Inner,
+        ast::Safety::Default,
+        outer,
+        inner,
+        DUMMY_SP,
+    )
+}
+
+pub fn make_outer_attribute(outer: Symbol, inner: Symbol, tcx: TyCtxt<'_>) -> ast::Attribute {
+    let g = &tcx.sess.psess.attr_id_generator;
+    ast::attr::mk_attr_nested_word(
+        g,
+        ast::AttrStyle::Outer,
+        ast::Safety::Default,
+        outer,
+        inner,
+        DUMMY_SP,
+    )
+}
+
+pub fn is_automatically_derived(attrs: &[ast::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let ast::AttrKind::Normal(attr) = &attr.kind else { return false };
+        let path = attr.item.path.segments.last().unwrap().ident.name;
+        path == rustc_span::sym::automatically_derived
+    })
+}
+
+pub fn get_attr_arg(args: &ast::AttrArgs) -> Option<Symbol> {
+    let ast::AttrArgs::Delimited(args) = args else { return None };
+    let mut tokens = args.tokens.iter();
+    let first = tokens.next()?;
+    let ast::tokenstream::TokenTree::Token(token, _) = first else { return None };
+    let ast::token::TokenKind::Ident(sym, _) = token.kind else { return None };
+    Some(sym)
 }
 
 pub mod ast_to_hir;

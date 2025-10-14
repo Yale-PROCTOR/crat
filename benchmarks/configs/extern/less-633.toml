@@ -1,0 +1,11 @@
+[extern]
+function_hints = [
+  { from = "decode::homefile", to = "filename::homefile" },
+  { from = "mark::lstrtoi", to = "output::lstrtoi" },
+  { from = "option::lstrtoi", to = "output::lstrtoi" },
+  { from = "screen::lstrtoi", to = "output::lstrtoi" },
+  { from = "xbuf::out_of_memory", to = "main::out_of_memory" },
+  { from = "lesskey_parse::lesskey_parse_error", to = "lesskey::lesskey_parse_error" },
+  { from = "lesskey_parse::homefile", to = "lesskey::homefile" },
+  { from = "lesskey_parse::lstrtoi", to = "lesskey::lstrtoi" },
+]

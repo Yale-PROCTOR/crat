@@ -88,17 +88,17 @@ The stage specifies the directories being the source and the destination of the
 transformation and also the passes to be applied. The following stages are
 available:
 
-* `resolve`: From `rs` to `rs-resolved` by applying `preprocess,extern,bin`.
-* `io`: From `rs-resolved` to `rs-io` by applying `io`.
-* `union`: From `rs-resolved` to `rs-union` by applying `union`.
-* `union-io`: From `rs-union` to `rs-union-io` by applying `io`.
+* `expand`: From `rs` to `rs-expand` by applying `expand`.
+* `extern`: From `rs-expand` to `rs-extern` by applying `preprocess,extern`.
+* `extern-post`: From `rs-extern` to `rs-extern-post` by applying
+  `unsafe,unexpand,split,bin`.
 
 The benchmark is the name of the benchmark program to be processed, which is the
 name of the directory under `benchmarks/rs`. For example, the following command
 processes the `avl` benchmark:
 
 ```bash
-./tool.py transform resolve avl
+./tool.py transform expand avl
 ```
 
 If the given name does not match any of them, any benchmark whose name starts
@@ -106,7 +106,7 @@ with the given name will be processed. For example, the following command
 processes the `proxychains` and `proxychains-ng` benchmarks:
 
 ```bash
-./tool.py transform resolve proxy
+./tool.py transform expand proxy
 ```
 
 The benchmark name is an optional argument. If no benchmark is specified, all
@@ -114,7 +114,7 @@ benchmarks will be processed. For example, the following command processes all
 benchmarks:
 
 ```bash
-./tool.py transform resolve
+./tool.py transform expand
 ```
 
 You can use the `--exclude` option to exclude benchmarks whose names start with
@@ -123,7 +123,7 @@ benchmarks except for a few of them. For example, the following command
 processes all benchmarks except for `proxychains` and `proxychains-ng`:
 
 ```bash
-./tool.py transform resolve --exclude proxy
+./tool.py transform expand --exclude proxy
 ```
 
 You can exclude multiple benchmarks by specifying the `--exclude` option
@@ -132,11 +132,11 @@ following commands process all benchmarks except for `avl`, `proxychains`, and
 `proxychains-ng`:
 
 ```bash
-./tool.py transform resolve --exclude avl --exclude proxy
+./tool.py transform expand --exclude avl --exclude proxy
 ```
 
 ```bash
-./tool.py transform resolve --exclude avl,proxy
+./tool.py transform expand --exclude avl,proxy
 ```
 
 When processing multiple benchmarks, `tool.py` immediately aborts if any of them
@@ -144,7 +144,7 @@ fails to be processed. To continue processing the remaining benchmarks even upon
 failure, use the `--keep-going` option:
 
 ```bash
-./tool.py transform resolve --keep-going
+./tool.py transform expand --keep-going
 ```
 
 If there are failed benchmarks, `tool.py` will show the list of them at the end
@@ -152,24 +152,24 @@ of the output.
 
 ### Transform
 
-The following command transforms `avl` to the `resolve` stage:
+The following command transforms `avl` to the `expand` stage:
 
 ```bash
-./tool.py transform resolve avl
+./tool.py transform expand avl
 ```
 
-This will not transform the code if `benchmarks/rs-resolved/avl` already exists.
+This will not transform the code if `benchmarks/rs-expand/avl` already exists.
 To overwrite the existing code, use the `--overwrite` option:
 
 ```bash
-./tool.py transform resolve avl --overwrite
+./tool.py transform expand avl --overwrite
 ```
 
 `tool.py` runs Crat in the release mode by default. If you want to run it in the
 debug mode, you need to set the `DEBUG` environment variable:
 
 ```bash
-DEBUG=1 ./tool.py transform resolve avl
+DEBUG=1 ./tool.py transform expand avl
 ```
 
 This would be useful when inspecting the stack traces or frequently re-compiling
@@ -177,74 +177,74 @@ Crat during development.
 
 If the stage depends on another stage, the `tool.py` will automatically
 transform the required stage first if it has not been transformed yet. For
-example, the following command transforms `avl` to the `resolve` stage if
-necessary, and then transforms it to the `io` stage:
+example, the following command transforms `avl` to the `expand` stage if
+necessary, and then transforms it to the `extern` stage:
 
 ```bash
-./tool.py transform io avl
+./tool.py transform extern avl
 ```
 
 Note that the `--overwrite` option only applies to the last stage by default.
-Therefore, the following command never overwrites the `resolve` stage:
+Therefore, the following command never overwrites the `expand` stage:
 
 ```bash
-./tool.py transform io avl --overwrite
+./tool.py transform extern avl --overwrite
 ```
 
 To overwrite other stages, you can increase the depth by using the
 `--overwrite-depth` option:
 
 ```bash
-./tool.py transform io avl --overwrite --overwrite-depth 2
+./tool.py transform extern avl --overwrite --overwrite-depth 2
 ```
 
 The default depth is 1, and any positive integer is allowed. When `max` is
 given, all stages will be overwritten:
 
 ```bash
-./tool.py transform io avl --overwrite --overwrite-depth max
+./tool.py transform extern avl --overwrite --overwrite-depth max
 ```
 
 ### Build
 
-The following command builds the transformed `avl` in the `resolve` stage:
+The following command builds the transformed `avl` in the `expand` stage:
 
 ```bash
-./tool.py build resolve avl
+./tool.py build expand avl
 ```
 
-This will automatically transform `avl` to the `resolve` stage if it has not
+This will automatically transform `avl` to the `expand` stage if it has not
 been transformed yet. To overwrite the existing code, use the `--overwrite`
 option:
 
 ```bash
-./tool.py build resolve avl --overwrite
+./tool.py build expand avl --overwrite
 ```
 
 `tool.py` builds the transformed code in the release mode by default. If you
 want to build it in the debug mode, use the `--debug` option:
 
 ```bash
-./tool.py build resolve avl --debug
+./tool.py build expand avl --debug
 ```
 
 ### Test
 
 The following command runs the test suite of the transformed `avl` in the
-`resolve` stage:
+`extern-post` stage:
 
 ```bash
-./tool.py test resolve avl
+./tool.py test extern-post avl
 ```
 
 As in `build`, `--overwrite` and `--debug` options can be used.
 
 ### Clean
 
-The following command remove the transformed `avl` in the `resolve` stage:
+The following command remove the transformed `avl` in the `expand` stage:
 
 ```bash
-./tool.py clean resolve avl
+./tool.py clean expand avl
 ```
 
 When multiple benchmarks are to be cleaned at once, a confirmation prompt will
@@ -252,5 +252,5 @@ be displayed before removing them. To skip the confirmation, use the `--yes` or
 `-y` option:
 
 ```bash
-./tool.py clean resolve --yes
+./tool.py clean expand --yes
 ```

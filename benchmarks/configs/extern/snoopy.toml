@@ -1,0 +1,5 @@
+[extern]
+function_hints = [
+  { from = "tests::bin::action_stress_threadsexec::execv", to = "src::entrypoint::execve_wrapper_test_configfile_env::execv" },
+  { from = "tests::bin::spaceparent::execv", to = "src::entrypoint::execve_wrapper_test_configfile_env::execv" },
+]

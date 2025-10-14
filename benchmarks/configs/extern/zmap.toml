@@ -1,0 +1,13 @@
+[extern]
+function_hints = [
+  { from = "src::tests::test_harness::cmdline_parser_print_help", to = "src::ztopt_compat::cmdline_parser_print_help" },
+  { from = "src::tests::test_harness::cmdline_parser_print_version", to = "src::ztopt_compat::cmdline_parser_print_version" },
+  { from = "src::zblocklist::cmdline_parser_print_help", to = "src::zbopt_compat::cmdline_parser_print_help" },
+  { from = "src::zblocklist::cmdline_parser_print_version", to = "src::zbopt_compat::cmdline_parser_print_version" },
+  { from = "src::ziterate::cmdline_parser_print_help", to = "src::zitopt_compat::cmdline_parser_print_help" },
+  { from = "src::ziterate::cmdline_parser_print_version", to = "src::zitopt_compat::cmdline_parser_print_version" },
+  { from = "src::zmap::cmdline_parser_print_help", to = "src::zopt_compat::cmdline_parser_print_help" },
+  { from = "src::zmap::cmdline_parser_print_version", to = "src::zopt_compat::cmdline_parser_print_version" },
+  { from = "src::ztee::cmdline_parser_print_help", to = "src::topt_compat::cmdline_parser_print_help" },
+  { from = "src::ztee::cmdline_parser_print_version", to = "src::topt_compat::cmdline_parser_print_version" },
+]

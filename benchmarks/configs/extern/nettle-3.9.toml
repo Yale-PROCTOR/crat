@@ -1,0 +1,5 @@
+[extern]
+type_hints = [
+  { from = "ecdsa_verify::ecc_curve", to = "curve25519_eh_to_x::ecc_curve" },
+  { from = "gostdsa_verify::ecc_curve", to = "curve25519_eh_to_x::ecc_curve" },
+]

@@ -1,0 +1,7 @@
+[bin]
+ignores = [
+  "EnginePl",
+  "Ma2Asm",
+  "TopComp",
+  "Wam2Ma",
+]

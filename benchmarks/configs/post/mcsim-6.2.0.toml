@@ -1,0 +1,4 @@
+[bin]
+ignores = [
+  "sim",
+]
