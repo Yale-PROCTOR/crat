@@ -9,7 +9,7 @@ use rustc_index::IndexVec;
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
-use crate::graph_util;
+use crate::graph_utils;
 
 rustc_index::newtype_index! {
     #[orderable]
@@ -55,7 +55,7 @@ impl<'tcx> TyVisitor<'tcx> {
         let ftypes: FxHashSet<_> = self
             .foreign_types
             .into_iter()
-            .flat_map(|id| graph_util::reachable_vertices(&self.type_graph, id))
+            .flat_map(|id| graph_utils::reachable_vertices(&self.type_graph, id))
             .collect();
         let mut local_types = FxHashSet::default();
         let mut foreign_types = FxHashSet::default();

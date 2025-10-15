@@ -18,6 +18,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol, def_id::LocalDefId, symbol::Ident};
+use utils::{
+    bit_set::{BitSet8, BitSet16},
+    expr, item, param, stmt, ty, ty_param,
+};
 
 use super::{
     api_list::{self, Origin, Permission},
@@ -29,10 +33,7 @@ use super::{
     stream_ty::*,
     transform::LibItem,
 };
-use crate::{
-    bit_set::{BitSet8, BitSet16},
-    ir_util,
-};
+use crate::ir_utils;
 
 pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) tcx: TyCtxt<'tcx>,
@@ -267,7 +268,7 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
             let new_rhs = expr!("{}", new_rhs);
             self.replace_expr(rhs, new_rhs);
         } else if let Some(def_id) = self.hir.call_span_to_callee_id.get(&rhs_span) {
-            let name = ir_util::def_id_to_symbol(*def_id, self.tcx).unwrap();
+            let name = ir_utils::def_id_to_symbol(*def_id, self.tcx).unwrap();
             let name = api_list::normalize_api_name(name.as_str());
             let rhs_str = pprust::expr_to_string(rhs);
             let rhs_ty = match name {
@@ -702,7 +703,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
             if let ExprKind::Call(callee, _) = &expr.kind
                 && let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span)
             {
-                let name = ir_util::def_id_to_symbol(*def_id, self.tcx).unwrap();
+                let name = ir_utils::def_id_to_symbol(*def_id, self.tcx).unwrap();
                 let name = name.as_str();
                 let name = api_list::normalize_api_name(name);
                 if name == "fopen"
@@ -724,7 +725,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
         match &mut expr.kind {
             ExprKind::Call(callee, args) => {
                 if let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span) {
-                    let orig_name = ir_util::def_id_to_symbol(*def_id, self.tcx).unwrap();
+                    let orig_name = ir_utils::def_id_to_symbol(*def_id, self.tcx).unwrap();
                     let orig_name = orig_name.as_str();
                     let name = api_list::normalize_api_name(orig_name);
                     match name {

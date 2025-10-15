@@ -7,9 +7,9 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
+use utils::{compilation, ty_shape};
 
 use super::andersen::{self, AnalysisResult, Loc};
-use crate::{compile_util, ty_shape};
 
 // To inspect the MIR of test cases, you can:
 
@@ -122,7 +122,7 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
     ",
         types, name, params, code
     );
-    compile_util::run_compiler_on_str(&code, |tcx| {
+    compilation::run_compiler_on_str(&code, |tcx| {
         let arena = Arena::new();
         let tss = ty_shape::get_ty_shapes(&arena, tcx, true);
         let config = andersen::Config {

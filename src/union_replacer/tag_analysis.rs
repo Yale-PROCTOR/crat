@@ -28,6 +28,7 @@ use rustc_middle::{
 use rustc_span::{BytePos, Span, Symbol, def_id::LocalDefId, source_map::Spanned};
 use serde::Deserialize;
 use typed_arena::Arena;
+use utils::{expr, item, items, pat, stmt, ty_shape};
 
 use super::{
     must_analysis::{
@@ -37,7 +38,7 @@ use super::{
     ty_finder,
     util::suggestion::{AstEdit::*, AstSuggestions},
 };
-use crate::{ast_util, points_to::andersen, ty_shape};
+use crate::{ast_utils, points_to::andersen};
 
 #[derive(Default, Debug, Clone, Deserialize)]
 pub struct Config {
@@ -992,7 +993,7 @@ impl {} {{
     }
 
     let mut trans_visitor = suggestions.into_transform_visitor();
-    let res = ast_util::transform_ast(
+    let res = ast_utils::transform_ast(
         |krate| {
             trans_visitor.transform(krate);
             trans_visitor.updated

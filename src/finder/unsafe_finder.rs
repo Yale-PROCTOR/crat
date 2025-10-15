@@ -1,14 +1,12 @@
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
+use utils::unsafety::{self, UnsafeOpKind};
 
-use crate::{
-    check_unsafety::{self, UnsafeOpKind},
-    ir_util,
-};
+use crate::ir_utils;
 
 struct UnsafetyHandler;
 
-impl check_unsafety::UnsafetyHandler for UnsafetyHandler {
+impl unsafety::UnsafetyHandler for UnsafetyHandler {
     fn handle_unsafety(&mut self, kind: UnsafeOpKind, _: Span, tcx: TyCtxt<'_>) {
         if let UnsafeOpKind::CallToUnsafeFunction(Some(def_id)) = kind {
             if let Some(def_id) = def_id.as_local()
@@ -16,7 +14,7 @@ impl check_unsafety::UnsafetyHandler for UnsafetyHandler {
                 && matches!(item.kind, rustc_hir::ItemKind::Fn { .. })
             {
             } else {
-                println!("{}", ir_util::def_id_to_symbol(def_id, tcx).unwrap());
+                println!("{}", ir_utils::def_id_to_symbol(def_id, tcx).unwrap());
             }
         } else {
             println!("{kind:?}");
@@ -34,6 +32,6 @@ pub fn find_unsafe(tcx: TyCtxt<'_>) {
         ) {
             continue;
         }
-        check_unsafety::check_unsafety(def_id, &mut UnsafetyHandler, tcx);
+        unsafety::check_unsafety(def_id, &mut UnsafetyHandler, tcx);
     }
 }

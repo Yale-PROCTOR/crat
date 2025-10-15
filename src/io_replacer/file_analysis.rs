@@ -2,6 +2,7 @@ use std::ops::Deref as _;
 
 use etrace::some_or;
 use rustc_abi::{FIRST_VARIANT, FieldIdx};
+use rustc_ast::visit::Visitor as _;
 use rustc_data_structures::graph::{DirectedGraph, Successors, scc::Sccs};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -11,7 +12,10 @@ use rustc_hir::{
     definitions::DefPathData,
     intravisit,
 };
-use rustc_index::{Idx, IndexVec, bit_set::ChunkedBitSet};
+use rustc_index::{
+    Idx, IndexVec,
+    bit_set::{BitRelations, ChunkedBitSet},
+};
 use rustc_middle::{
     hir::nested_filter,
     mir::{
@@ -24,6 +28,10 @@ use rustc_middle::{
 };
 use rustc_span::{Span, Symbol, source_map::Spanned};
 use typed_arena::Arena;
+use utils::{
+    bit_set::{BitSet8, BitSet16},
+    disjoint_set::DisjointSet,
+};
 
 use super::{
     api_list::{ApiKind, Origin, Permission, def_id_api_kind, is_def_id_api},
@@ -32,13 +40,7 @@ use super::{
     mir_loc::MirLoc,
     util,
 };
-use crate::{
-    bit_set::{BitSet8, BitSet16},
-    disjoint_set::DisjointSet,
-    graph_util, ir_util,
-    rustc_ast::visit::Visitor as _,
-    rustc_index::bit_set::BitRelations,
-};
+use crate::{graph_utils, ir_utils};
 
 #[derive(Debug)]
 pub(super) struct AnalysisResult<'a> {
@@ -224,7 +226,7 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
             continue;
         }
         let mut new_origins: Option<BitSet8<Origin>> = None;
-        for reachable in graph_util::bitset_reachable_vertices(&origin_edges, loc_id).iter() {
+        for reachable in graph_utils::bitset_reachable_vertices(&origin_edges, loc_id).iter() {
             let origins = origins_clone[reachable];
             if origins.is_empty() {
                 continue;
@@ -650,7 +652,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Unsupported | ApiKind::NonPosix => {
-                            let name = ir_util::def_id_to_symbol(def_id, self.tcx).unwrap();
+                            let name = ir_utils::def_id_to_symbol(def_id, self.tcx).unwrap();
                             let reason = match name.as_str() {
                                 "setbuf" | "setvbuf" => UnsupportedReason::Setbuf,
                                 "ungetc" => UnsupportedReason::Ungetc,
@@ -674,7 +676,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);
                 } else {
-                    let name = ir_util::def_id_to_symbol(def_id, self.tcx).unwrap();
+                    let name = ir_utils::def_id_to_symbol(def_id, self.tcx).unwrap();
                     match name.as_str() {
                         "arg" => {
                             let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;

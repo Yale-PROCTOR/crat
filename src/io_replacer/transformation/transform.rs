@@ -14,6 +14,7 @@ use rustc_middle::{
 use rustc_span::{Span, def_id::LocalDefId};
 use toml_edit::DocumentMut;
 use typed_arena::Arena;
+use utils::bit_set::BitSet16;
 
 use super::{
     api_list::Permission,
@@ -24,7 +25,7 @@ use super::{
     util,
     visitor::{Parameter, TransformVisitor},
 };
-use crate::{ast_util, bit_set::BitSet16, graph_util, ir_util};
+use crate::{ast_utils, graph_utils, ir_utils};
 
 pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
     for (p, s) in &res.files {
@@ -236,7 +237,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
     for callees in hir_ctx.call_graph.values_mut() {
         callees.retain(|f| callers.contains(f));
     }
-    let sccs: graph_util::Sccs<_, true> = graph_util::sccs_copied(&hir_ctx.call_graph);
+    let sccs: graph_utils::Sccs<_, true> = graph_utils::sccs_copied(&hir_ctx.call_graph);
     let mut recursive_fns = FxHashSet::default();
     for fns in sccs.scc_elems.iter() {
         if fns.len() == 1 {
@@ -356,7 +357,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
             set.insert(*param);
         }
     }
-    let transitive_param_flow = graph_util::transitive_closure(&param_flow);
+    let transitive_param_flow = graph_utils::transitive_closure(&param_flow);
     let non_generic_params: FxHashSet<_> = non_generic_params
         .into_iter()
         .flat_map(|param| {
@@ -382,7 +383,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
                     match rhs {
                         HirLoc::Local(_) | HirLoc::Return(_) => return false,
                         HirLoc::Global(def_id) => {
-                            let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+                            let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
                             let name = name.as_str();
                             if name == "stdin" || name == "stdout" || name == "stderr" {
                                 return false;
@@ -459,7 +460,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
 
     for hir_loc in hir_ctx.loc_to_bound_spans.keys() {
         let HirLoc::Global(def_id) = hir_loc else { continue };
-        let name = some_or!(ir_util::def_id_to_symbol(*def_id, tcx), continue);
+        let name = some_or!(ir_utils::def_id_to_symbol(*def_id, tcx), continue);
         let (loc, ty) = match name.as_str() {
             "stdin" => (MirLoc::Stdin, &STDIN_TY),
             "stdout" => (MirLoc::Stdout, &STDOUT_TY),
@@ -551,7 +552,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
     let mut lib_items = FxHashSet::default();
     let mut parsing_fns = FxHashMap::default();
 
-    let res = ast_util::transform_ast(
+    let res = ast_utils::transform_ast(
         |krate| {
             let mut visitor = TransformVisitor {
                 tcx,

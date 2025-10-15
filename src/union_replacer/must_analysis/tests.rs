@@ -5,12 +5,12 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_span::def_id::LocalDefId;
+use utils::compilation;
 
 use super::{
     analysis::{AnalysisResult, analyze},
     domains::*,
 };
-use crate::compile_util;
 
 /// The indexing of locations in `must_analysis` is identical to the
 /// `may_analysis` (see `src/may_analysis/mod.rs`).
@@ -66,7 +66,7 @@ use crate::compile_util;
 /// imaginary value pointed to by field `0` of `_1`.
 
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
-    compile_util::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
 }
 
 fn find_fn(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {

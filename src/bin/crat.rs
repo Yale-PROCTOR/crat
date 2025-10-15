@@ -7,9 +7,9 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use compile_util::run_compiler_on_path;
 use crat::*;
 use serde::Deserialize;
+use utils::compilation::run_compiler_on_path;
 
 #[derive(Parser)]
 #[command(version)]

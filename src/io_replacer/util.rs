@@ -7,16 +7,16 @@ use rustc_middle::{
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{TypeSuperVisitable as _, TypeVisitable as _};
 
-use crate::ir_util;
+use crate::ir_utils;
 
 #[inline]
 pub fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    ir_util::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "_IO_FILE")
+    ir_utils::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "_IO_FILE")
 }
 
 #[inline]
 pub fn is_option_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    ir_util::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "Option")
+    ir_utils::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "Option")
 }
 
 #[inline]

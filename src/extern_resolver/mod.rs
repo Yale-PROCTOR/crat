@@ -19,13 +19,15 @@ use serde::Deserialize;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 use typed_arena::Arena;
-
-use crate::{
-    ast_util,
+use utils::{
     disjoint_set::DisjointSets,
     equiv_classes::{EquivClassId, EquivClasses},
-    graph_util,
-    ir_util::{self, AstToHir},
+    item, path,
+};
+
+use crate::{
+    ast_utils, graph_utils,
+    ir_utils::{self, AstToHir},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -55,11 +57,11 @@ impl LinkHint {
 }
 
 pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> String {
-    let mut expanded_ast = ast_util::expanded_ast(tcx);
-    let ast_to_hir = ast_util::make_ast_to_hir(&mut expanded_ast, tcx);
+    let mut expanded_ast = ast_utils::expanded_ast(tcx);
+    let ast_to_hir = ast_utils::make_ast_to_hir(&mut expanded_ast, tcx);
     let result = resolve(tcx);
     let resolve_map = make_resolve_map(&result, config, tcx);
-    ast_util::remove_unnecessary_items_from_ast(&mut expanded_ast);
+    ast_utils::remove_unnecessary_items_from_ast(&mut expanded_ast);
     let mut visitor = ExpandedAstVisitor {
         tcx,
         ast_to_hir,
@@ -81,7 +83,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
         used: FxHashSet::default(),
         updated: false,
     };
-    let res = ast_util::transform_ast(
+    let res = ast_utils::transform_ast(
         |krate| {
             visitor.updated = false;
             visitor.visit_crate(krate);
@@ -192,7 +194,7 @@ fn link_externs(
 
     let mut link_failed = false;
     for (def_id, link_candidates) in externs {
-        let name = ir_util::def_id_to_symbol(*def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(*def_id, tcx).unwrap();
         let classes = &equivs[&name];
 
         let mut link_candidates = link_candidates;
@@ -277,17 +279,17 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
             let ty = fd.ty(tcx, List::empty());
             visitor.visit_ty(ty);
         }
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         name_to_adts.entry(name).or_default().push(def_id);
         dependencies.entry(name).or_default().extend(
             visitor
                 .adts
                 .into_iter()
-                .map(|def_id| ir_util::def_id_to_symbol(def_id, tcx).unwrap()),
+                .map(|def_id| ir_utils::def_id_to_symbol(def_id, tcx).unwrap()),
         );
     }
 
-    let sccs: graph_util::Sccs<_, false> = graph_util::sccs_copied(&dependencies);
+    let sccs: graph_utils::Sccs<_, false> = graph_utils::sccs_copied(&dependencies);
     let arena = Arena::new();
     let mut cmp = TypeComparator {
         tcx,
@@ -322,7 +324,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
     let mut extern_adts = vec![];
     let mut opaque_foreign_tys: FxHashMap<_, Vec<_>> = FxHashMap::default();
     for def_id in hir_data.foreign_tys {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         if let Some(classes) = equiv_adts.get_mut(&name) {
             let mut link_candidates: Vec<_> = classes.0.indices().collect();
             filter_by_common_def_path(&mut link_candidates, def_id, classes, tcx);
@@ -334,7 +336,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
 
     let mut equiv_tys: FxHashMap<_, EquivClasses<LocalDefId>> = FxHashMap::default();
     for def_id in hir_data.tys {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         if is_unnamed(name.as_str()) {
             continue;
         }
@@ -346,7 +348,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
 
     let mut equiv_fns: FxHashMap<_, EquivClasses<LocalDefId>> = FxHashMap::default();
     for def_id in hir_data.fns {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         let name_str = name.as_str();
         if name_str == "main" {
             continue;
@@ -365,7 +367,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
     }
     let mut extern_fns = vec![];
     for def_id in hir_data.foreign_fns {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         let classes = some_or!(equiv_fns.get_mut(&name), continue);
         let mut link_candidates: Vec<_> = classes
             .0
@@ -384,7 +386,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
 
     let mut equiv_statics: FxHashMap<_, EquivClasses<LocalDefId>> = FxHashMap::default();
     for def_id in hir_data.statics {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         let classes = equiv_statics.entry(name).or_insert_with(EquivClasses::new);
         classes.insert(def_id, |id1, id2| {
             if !cmp.with_equiv_unnameds_update(|cmp| cmp.cmp_type_of(*id1, *id2)) {
@@ -397,7 +399,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
     }
     let mut extern_statics = vec![];
     for def_id in hir_data.foreign_statics {
-        let name = ir_util::def_id_to_symbol(def_id, tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
         let classes = some_or!(equiv_statics.get_mut(&name), continue);
         let mut link_candidates: Vec<_> = classes
             .0
@@ -504,7 +506,7 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
     }
 
     fn cmp_adts(&mut self, def_id1: LocalDefId, def_id2: LocalDefId) -> bool {
-        let name = ir_util::def_id_to_symbol(def_id1, self.tcx).unwrap();
+        let name = ir_utils::def_id_to_symbol(def_id1, self.tcx).unwrap();
         let unnamed = is_unnamed(name.as_str());
         if !unnamed {
             if self.compared_names.contains(&name) {
@@ -566,8 +568,8 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
             Adt(adt_def1, args1) => {
                 if let Foreign(def_id2) = ty2_kind {
                     let def_id1 = adt_def1.did();
-                    let name1 = ir_util::def_id_to_symbol(def_id1, self.tcx).unwrap();
-                    let name2 = ir_util::def_id_to_symbol(def_id2, self.tcx).unwrap();
+                    let name1 = ir_utils::def_id_to_symbol(def_id1, self.tcx).unwrap();
+                    let name2 = ir_utils::def_id_to_symbol(def_id2, self.tcx).unwrap();
                     return name1 == name2;
                 }
                 let Adt(adt_def2, args2) = ty2_kind else { return false };
@@ -577,9 +579,9 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
                 }
 
                 let def_id1 = adt_def1.did();
-                let name1 = ir_util::def_id_to_symbol(def_id1, self.tcx).unwrap();
+                let name1 = ir_utils::def_id_to_symbol(def_id1, self.tcx).unwrap();
                 let def_id2 = adt_def2.did();
-                let name2 = ir_util::def_id_to_symbol(def_id2, self.tcx).unwrap();
+                let name2 = ir_utils::def_id_to_symbol(def_id2, self.tcx).unwrap();
 
                 match (def_id1.as_local(), def_id2.as_local()) {
                     (Some(def_id1), Some(def_id2)) => {
@@ -622,8 +624,8 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
             Foreign(def_id1) => match ty2_kind {
                 Adt(_, _) => self.cmp_tys(ty2, ty1),
                 Foreign(def_id2) => {
-                    let name1 = ir_util::def_id_to_symbol(def_id1, self.tcx).unwrap();
-                    let name2 = ir_util::def_id_to_symbol(def_id2, self.tcx).unwrap();
+                    let name1 = ir_utils::def_id_to_symbol(def_id1, self.tcx).unwrap();
+                    let name2 = ir_utils::def_id_to_symbol(def_id2, self.tcx).unwrap();
                     name1 == name2
                 }
                 _ => false,
@@ -795,7 +797,7 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
             && let Some(resolved) = self.resolve_map.get(&def_id)
         {
             self.updated = true;
-            let name = ir_util::def_id_to_symbol(*resolved, self.tcx).unwrap();
+            let name = ir_utils::def_id_to_symbol(*resolved, self.tcx).unwrap();
             if is_unnamed(name.as_str()) {
                 *path = path!("crate::{}", self.tcx.def_path_str(*resolved));
             } else {
@@ -865,7 +867,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && let Some(resolved) = self.resolve_map.get(def_id)
         {
             self.updated = true;
-            let name = ir_util::def_id_to_symbol(*resolved, self.tcx).unwrap();
+            let name = ir_utils::def_id_to_symbol(*resolved, self.tcx).unwrap();
             if is_unnamed(name.as_str()) {
                 *path = path!("crate::{}", self.tcx.def_path_str(*resolved));
             } else {
