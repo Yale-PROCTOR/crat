@@ -2,6 +2,7 @@
 members = [
   "crates/utils",
 ]
+exclude = ["deps_crate"]
 
 [package]
 name = "crat"
