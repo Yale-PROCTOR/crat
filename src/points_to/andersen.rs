@@ -20,12 +20,10 @@ use rustc_span::{
 };
 use serde::Deserialize;
 use typed_arena::Arena;
+use utils::ty_shape::{self, TyShape, TyShapes};
 
 use super::alloc_finder;
-use crate::{
-    graph_util::{self, SccId},
-    ty_shape::{self, TyShape, TyShapes},
-};
+use crate::graph_utils::{self, SccId};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -195,7 +193,7 @@ pub struct AnalysisResult {
     pub solutions: Solutions,
 
     pub indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, Vec<LocalDefId>>>,
-    pub call_graph_sccs: graph_util::Sccs<LocalDefId, false>,
+    pub call_graph_sccs: graph_utils::Sccs<LocalDefId, false>,
     pub reachables: RefCell<FxHashMap<SccId, FxHashSet<SccId>>>,
 
     pub writes: FxHashMap<LocalDefId, FxHashMap<Location, ChunkedBitSet<Loc>>>,
@@ -917,7 +915,7 @@ pub fn post_analyze<'a, 'tcx>(
         let callees = pre.call_graph.get_mut(caller).unwrap();
         callees.extend(calls.values().flatten());
     }
-    let call_graph_sccs: graph_util::Sccs<_, false> = graph_util::sccs_copied(&pre.call_graph);
+    let call_graph_sccs: graph_utils::Sccs<_, false> = graph_utils::sccs_copied(&pre.call_graph);
 
     AnalysisResult {
         ends: pre.index_info.ends,
@@ -1373,8 +1371,8 @@ impl Graph {
         let mut id_to_rep: IndexVec<Loc, Loc> = solutions.indices().collect();
 
         while deltas.iter().any(|s| !s.is_empty()) {
-            let sccs: graph_util::Sccs<_, false> =
-                graph_util::sccs_from_vec_bit_set(&zero_weight_edges);
+            let sccs: graph_utils::Sccs<_, false> =
+                graph_utils::sccs_from_vec_bit_set(&zero_weight_edges);
 
             let mut scc_to_rep = IndexVec::new();
             let mut cycles = vec![];

@@ -6,12 +6,12 @@ use rustc_ast_pretty::pprust;
 use rustc_index::Idx;
 use rustc_middle::ty::TyCtxt;
 use typed_arena::Arena;
+use utils::bit_set::BitSet8;
 
 use super::{
     api_list::{Origin, Permission},
     util,
 };
-use crate::bit_set::BitSet8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Pot<'a> {

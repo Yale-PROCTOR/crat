@@ -14,13 +14,10 @@ use rustc_middle::{
 use rustc_mir_dataflow::Analysis as _;
 use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
+use utils::ty_shape::{self, TyShapes};
 
 use super::domains::*;
-use crate::{
-    graph_util,
-    points_to::andersen,
-    ty_shape::{self, TyShapes},
-};
+use crate::{graph_utils, points_to::andersen};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
@@ -299,11 +296,11 @@ fn get_loop_blocks(
             succs
         })
         .collect();
-    let mut inv_map = graph_util::bitset_inverse(&succ_map);
+    let mut inv_map = graph_utils::bitset_inverse(&succ_map);
     loop_heads
         .into_iter()
         .map(|head| {
-            let reachables = graph_util::bitset_reachable_vertices(&inv_map, head);
+            let reachables = graph_utils::bitset_reachable_vertices(&inv_map, head);
             for succs in &mut inv_map {
                 succs.remove(head);
             }

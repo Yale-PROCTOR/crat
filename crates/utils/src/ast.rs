@@ -6,10 +6,10 @@ use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
 use rustc_parse::parser::{AttemptLocalParseRecovery, ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
-use rustc_span::{FileName, RealFileName, sym};
+use rustc_span::{DUMMY_SP, FileName, RealFileName, Symbol, sym};
 use thin_vec::ThinVec;
 
-use crate::ir_util;
+use crate::ir;
 
 /// Returns the expanded AST. The returned AST contains only dummay `NodeId`.
 ///
@@ -21,8 +21,8 @@ pub fn expanded_ast(tcx: TyCtxt<'_>) -> Crate {
 /// The first argument should be the `Crate` returned by `expanded_ast`.
 ///
 /// Each AST node will get a unique `NodeId` while this function is running.
-pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir_util::AstToHir {
-    let mut mapper = ir_util::AstToHirMapper::new(tcx);
+pub fn make_ast_to_hir(krate: &mut Crate, tcx: TyCtxt<'_>) -> ir::AstToHir {
+    let mut mapper = ir::AstToHirMapper::new(tcx);
     let module = tcx.hir_root_module();
     mapper.map_crate_to_mod(krate, module, true);
     mapper.ast_to_hir
@@ -48,6 +48,33 @@ pub fn remove_unnecessary_items_from_ast(krate: &mut Crate) {
         }),
         _ => true,
     });
+}
+
+pub fn make_inner_attribute(outer: Symbol, inner: Symbol, tcx: TyCtxt<'_>) -> Attribute {
+    let g = &tcx.sess.psess.attr_id_generator;
+    attr::mk_attr_nested_word(g, AttrStyle::Inner, Safety::Default, outer, inner, DUMMY_SP)
+}
+
+pub fn make_outer_attribute(outer: Symbol, inner: Symbol, tcx: TyCtxt<'_>) -> Attribute {
+    let g = &tcx.sess.psess.attr_id_generator;
+    attr::mk_attr_nested_word(g, AttrStyle::Outer, Safety::Default, outer, inner, DUMMY_SP)
+}
+
+pub fn is_automatically_derived(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let AttrKind::Normal(attr) = &attr.kind else { return false };
+        let path = attr.item.path.segments.last().unwrap().ident.name;
+        path == rustc_span::sym::automatically_derived
+    })
+}
+
+pub fn get_attr_arg(args: &AttrArgs) -> Option<Symbol> {
+    let AttrArgs::Delimited(args) = args else { return None };
+    let mut tokens = args.tokens.iter();
+    let first = tokens.next()?;
+    let tokenstream::TokenTree::Token(token, _) = first else { return None };
+    let token::TokenKind::Ident(sym, _) = token.kind else { return None };
+    Some(sym)
 }
 
 #[derive(Debug)]
@@ -153,7 +180,7 @@ pub fn parse_item(item: String) -> Item {
 #[macro_export]
 macro_rules! item {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_item(format!($($arg)*))
+        $crate::ast::parse_item(format!($($arg)*))
     }};
 }
 
@@ -166,7 +193,7 @@ pub fn parse_items(items: String) -> ThinVec<P<Item>> {
 #[macro_export]
 macro_rules! items {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_items(format!($($arg)*))
+        $crate::ast::parse_items(format!($($arg)*))
     }};
 }
 
@@ -179,7 +206,7 @@ pub fn parse_ty_param(param: String) -> GenericParam {
 #[macro_export]
 macro_rules! ty_param {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_ty_param(format!($($arg)*))
+        $crate::ast::parse_ty_param(format!($($arg)*))
     }};
 }
 
@@ -192,7 +219,7 @@ pub fn parse_param(param: String) -> Param {
 #[macro_export]
 macro_rules! param {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_param(format!($($arg)*))
+        $crate::ast::parse_param(format!($($arg)*))
     }};
 }
 
@@ -209,7 +236,7 @@ pub fn parse_stmt(stmt: String) -> Stmt {
 #[macro_export]
 macro_rules! stmt {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_stmt(format!($($arg)*))
+        $crate::ast::parse_stmt(format!($($arg)*))
     }};
 }
 
@@ -223,7 +250,7 @@ pub fn parse_expr(expr: String) -> Expr {
 #[macro_export]
 macro_rules! expr {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_expr(format!($($arg)*))
+        $crate::ast::parse_expr(format!($($arg)*))
     }};
 }
 
@@ -235,7 +262,7 @@ pub fn parse_path(path: String) -> Path {
 #[macro_export]
 macro_rules! path {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_path(format!($($arg)*))
+        $crate::ast::parse_path(format!($($arg)*))
     }};
 }
 
@@ -256,7 +283,7 @@ pub fn parse_pat(pat: String) -> Pat {
 #[macro_export]
 macro_rules! pat {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_pat(format!($($arg)*))
+        $crate::ast::parse_pat(format!($($arg)*))
     }};
 }
 
@@ -270,7 +297,7 @@ pub fn parse_ty(ty: String) -> Ty {
 #[macro_export]
 macro_rules! ty {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_ty(format!($($arg)*))
+        $crate::ast::parse_ty(format!($($arg)*))
     }};
 }
 
@@ -282,6 +309,6 @@ pub fn parse_attr(attr: String) -> ThinVec<Attribute> {
 #[macro_export]
 macro_rules! attr {
     ($($arg:tt)*) => {{
-        $crate::ast_util::parse_attr(format!($($arg)*))
+        $crate::ast::parse_attr(format!($($arg)*))
     }};
 }

@@ -12,8 +12,9 @@ use rustc_middle::{
     mir::{HasLocalDecls, Local, Place, PlaceElem},
     ty::{Ty, TyCtxt, TyKind},
 };
+use utils::ty_shape::TyShape;
 
-use crate::{points_to::andersen, ty_shape::TyShape, union_replacer::tag_analysis};
+use crate::{points_to::andersen, union_replacer::tag_analysis};
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {

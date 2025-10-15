@@ -3,7 +3,7 @@ use rustc_hir::{self as hir, def_id::LocalModDefId};
 use rustc_span::FileName;
 
 use super::*;
-use crate::{ast_util, compile_util};
+use crate::{ast, compilation};
 
 fn run_test(code: &str) {
     let code = format!(
@@ -19,12 +19,12 @@ fn run_test(code: &str) {
         #![feature(unsafe_binders)]
         mod a {{ {code} }}"
     );
-    compile_util::run_compiler_on_str(&code, |tcx| {
+    compilation::run_compiler_on_str(&code, |tcx| {
         let borrowed = tcx.resolver_for_lowering().borrow();
         let mut expanded_crate = borrowed.1.as_ref().clone();
         drop(borrowed);
 
-        let parse_sess = ast_util::new_parse_sess();
+        let parse_sess = ast::new_parse_sess();
         let mut parser = rustc_parse::new_parser_from_source_str(
             &parse_sess,
             FileName::Custom("test.rs".to_string()),

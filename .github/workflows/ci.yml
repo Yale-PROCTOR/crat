@@ -33,12 +33,12 @@ jobs:
       - name: Build (Dev)
         run: sudo -u ubuntu bash -lc "cargo build"
       - name: Test (Dev)
-        run: sudo -u ubuntu bash -lc "cargo test"
+        run: sudo -u ubuntu bash -lc "cargo test --workspace"
 
       - name: Build (Release)
         run: sudo -u ubuntu bash -lc "cargo build --release"
       - name: Test (Release)
-        run: sudo -u ubuntu bash -lc "cargo test --release"
+        run: sudo -u ubuntu bash -lc "cargo test --workspace --release"
 
       - name: Benchmark (Transform) - expand
         run: sudo -u ubuntu bash -lc "./tool.py transform expand"

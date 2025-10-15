@@ -155,16 +155,17 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Span, Symbol};
+use utils::{expr, stmt, ty};
 
 use crate::{
-    ast_util, ast_util::TransformationResult, expr, io_replacer, ir_util::AstToHir,
-    rustc_ast::mut_visit::MutVisitor as _, stmt, ty,
+    ast_utils, ast_utils::TransformationResult, io_replacer, ir_utils::AstToHir,
+    rustc_ast::mut_visit::MutVisitor as _,
 };
 
 pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
-    let mut expanded_ast = ast_util::expanded_ast(tcx);
-    let ast_to_hir = ast_util::make_ast_to_hir(&mut expanded_ast, tcx);
-    ast_util::remove_unnecessary_items_from_ast(&mut expanded_ast);
+    let mut expanded_ast = ast_utils::expanded_ast(tcx);
+    let ast_to_hir = ast_utils::make_ast_to_hir(&mut expanded_ast, tcx);
+    ast_utils::remove_unnecessary_items_from_ast(&mut expanded_ast);
 
     let mut visitor = ExpandedHirVisitor {
         tcx,
@@ -407,7 +408,7 @@ fn transform(tcx: TyCtxt<'_>) -> TransformationResult {
         params_to_be_mut: &params_to_be_mut,
         updated: false,
     };
-    ast_util::transform_ast(
+    ast_utils::transform_ast(
         |krate| {
             visitor.updated = false;
             visitor.visit_crate(krate);
@@ -1095,8 +1096,8 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 mod tests {
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
         let s =
-            crate::compile_util::run_compiler_on_str(code, super::preprocess_expanded_ast).unwrap();
-        crate::compile_util::run_compiler_on_str(&s, crate::type_checker::type_check).expect(&s);
+            utils::compilation::run_compiler_on_str(code, super::preprocess_expanded_ast).unwrap();
+        utils::compilation::run_compiler_on_str(&s, crate::type_checker::type_check).expect(&s);
         for include in includes {
             assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
         }

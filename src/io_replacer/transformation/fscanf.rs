@@ -2,6 +2,7 @@ use std::{fmt::Write as _, ops::Deref};
 
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
+use utils::expr;
 
 use super::{
     likely_lit::LikelyLit,

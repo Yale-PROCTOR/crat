@@ -4,11 +4,12 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
+use utils::expr;
 
-use crate::ast_util;
+use crate::ast_utils;
 
 pub fn run(tcx: TyCtxt<'_>) {
-    ast_util::transform_ast(
+    ast_utils::transform_ast(
         |krate| {
             let mut visitor = TransformVisitor::default();
             visitor.visit_crate(krate);

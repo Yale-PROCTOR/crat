@@ -1,4 +1,5 @@
 use rustc_ast::*;
+use utils::expr;
 
 use super::{
     stream_ty::*,

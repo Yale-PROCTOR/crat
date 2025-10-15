@@ -32,8 +32,8 @@ use rustc_span::{
     source_map::SourceMap,
 };
 use serde::{Deserialize, Serialize};
-use serde_json;
 use typed_arena::Arena;
+use utils::ty_shape;
 
 use super::{
     domains::*,
@@ -41,10 +41,9 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    graph_util,
-    ir_util::{self, hir_to_thir::HirToThir},
+    graph_utils,
+    ir_utils::{self, hir_to_thir::HirToThir},
     points_to::andersen::{self, Loc},
-    ty_shape,
 };
 
 // TODO: Remove span translation
@@ -221,8 +220,8 @@ pub fn analyze(
         callees.retain(|callee| funcs.contains(callee));
     }
 
-    let sccs = graph_util::sccs_copied::<DefId, false>(&call_graph);
-    let transitive = graph_util::reflexive_transitive_closure(&call_graph);
+    let sccs = graph_utils::sccs_copied::<DefId, false>(&call_graph);
+    let transitive = graph_utils::reflexive_transitive_closure(&call_graph);
     let po: Vec<_> = sccs.post_order().collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
@@ -281,7 +280,7 @@ pub fn analyze(
         config.check_param_alias,
     );
 
-    let hir_to_thir = ir_util::hir_to_thir::map_hir_to_thir(tcx);
+    let hir_to_thir = ir_utils::hir_to_thir::map_hir_to_thir(tcx);
 
     let mut ptr_params_map = FxHashMap::default();
     let mut ptr_params_inv_map = FxHashMap::default();
@@ -614,7 +613,7 @@ pub fn analyze(
                 .mir_drops_elaborated_and_const_checked(local_def_id)
                 .borrow();
             let blocks = body.basic_blocks.len();
-            let stmts = ir_util::body_size(&body);
+            let stmts = ir_utils::body_size(&body);
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
     }
@@ -930,7 +929,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut targets = vec![];
         let thir_to_mir =
-            ir_util::thir_to_mir::map_thir_to_mir(self.pre_context.local_def_id, false, self.tcx);
+            ir_utils::thir_to_mir::map_thir_to_mir(self.pre_context.local_def_id, false, self.tcx);
         let (thir, _) = self.tcx.thir_body(self.pre_context.local_def_id).unwrap();
         let thir = &thir.borrow();
 
@@ -1789,11 +1788,11 @@ fn get_loop_blocks(
         .indices()
         .map(|bb| (bb, body.basic_blocks.successors(bb).collect()))
         .collect();
-    let mut inv_map = graph_util::inverse(&succ_map);
+    let mut inv_map = graph_utils::inverse(&succ_map);
     loop_heads
         .into_iter()
         .map(|head| {
-            let reachables = graph_util::reachable_vertices(&inv_map, head);
+            let reachables = graph_utils::reachable_vertices(&inv_map, head);
             for succs in inv_map.values_mut() {
                 succs.remove(&head);
             }

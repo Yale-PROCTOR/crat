@@ -8,9 +8,10 @@ use rustc_middle::{
     ty::{IntTy, Ty, TyKind, UintTy, adjustment::PointerCoercion},
 };
 use rustc_span::{def_id::LocalDefId, source_map::Spanned};
+use utils::ty_shape::TyShape;
 
 use super::{analysis::Analyzer, domains::*};
-use crate::{points_to::andersen, ty_shape::TyShape};
+use crate::points_to::andersen;
 
 impl<'tcx> Analyzer<'tcx, '_, '_> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, stmt_loc: Location, state: &mut AbsMem) {

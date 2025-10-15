@@ -9,8 +9,9 @@ use rustc_hir as hir;
 use rustc_index::bit_set::ChunkedBitSet;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, def_id::LocalDefId};
+use utils::unsafety;
 
-use crate::{ast_util, check_unsafety, graph_util};
+use crate::{ast_utils, graph_utils};
 
 pub fn resolve_unsafe(tcx: TyCtxt<'_>) {
     let unsafe_fns = find_unsafe_fns(tcx)
@@ -25,7 +26,7 @@ pub fn resolve_unsafe(tcx: TyCtxt<'_>) {
         unsafe_fns,
         updated: false,
     };
-    let res = ast_util::transform_ast(
+    let res = ast_utils::transform_ast(
         |krate| {
             visitor.updated = false;
             visitor.visit_crate(krate);
@@ -60,9 +61,9 @@ struct UnsafetyHandler {
     is_unsafe: bool,
 }
 
-impl check_unsafety::UnsafetyHandler for UnsafetyHandler {
-    fn handle_unsafety(&mut self, kind: check_unsafety::UnsafeOpKind, _: Span, tcx: TyCtxt<'_>) {
-        if let check_unsafety::UnsafeOpKind::CallToUnsafeFunction(Some(def_id)) = kind
+impl unsafety::UnsafetyHandler for UnsafetyHandler {
+    fn handle_unsafety(&mut self, kind: unsafety::UnsafeOpKind, _: Span, tcx: TyCtxt<'_>) {
+        if let unsafety::UnsafeOpKind::CallToUnsafeFunction(Some(def_id)) = kind
             && let Some(def_id) = def_id.as_local()
             && let hir::Node::Item(item) = tcx.hir_node_by_def_id(def_id)
             && matches!(item.kind, hir::ItemKind::Fn { .. })
@@ -82,14 +83,14 @@ fn find_unsafe_fns(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
         let item = tcx.hir_item(item_id);
         let rustc_hir::ItemKind::Fn { sig, .. } = item.kind else { continue };
         let mut handler = UnsafetyHandler::default();
-        check_unsafety::check_unsafety(def_id, &mut handler, tcx);
+        unsafety::check_unsafety(def_id, &mut handler, tcx);
         call_graph.insert(def_id, handler.callees);
         if handler.is_unsafe || sig.decl.c_variadic {
             self_unsafe_fns.insert(def_id);
         }
     }
 
-    let sccs: graph_util::Sccs<_, true> = graph_util::sccs_copied(&call_graph);
+    let sccs: graph_utils::Sccs<_, true> = graph_utils::sccs_copied(&call_graph);
 
     let mut is_scc_unsafe = ChunkedBitSet::new_empty(sccs.scc_elems.len());
     for scc_id in sccs.post_order() {

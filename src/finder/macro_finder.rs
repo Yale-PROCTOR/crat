@@ -2,11 +2,11 @@ use rustc_ast::visit::{self, Visitor};
 use rustc_hash::FxHashSet;
 use rustc_middle::ty::TyCtxt;
 
-use crate::ast_util;
+use crate::ast_utils;
 
 pub fn find_macros(tcx: TyCtxt<'_>) {
     let mut finder = MacroFinder::default();
-    ast_util::foreach_crate(
+    ast_utils::foreach_crate(
         |krate| {
             finder.visit_crate(&krate);
         },

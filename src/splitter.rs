@@ -3,12 +3,12 @@ use std::{fmt::Write as _, fs, path::Path};
 use rustc_ast as ast;
 use rustc_ast_pretty::pprust;
 
-use crate::ast_util;
+use crate::ast_utils;
 
 pub fn split(path: &Path) {
     let file = path.join("c2rust-lib.rs");
     let code = fs::read_to_string(&file).unwrap();
-    let krate = ast_util::parse_crate(code);
+    let krate = ast_utils::parse_crate(code);
     write_mod(path, None, &krate.attrs, &krate.items);
 }
 

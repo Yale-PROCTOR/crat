@@ -1,11 +1,12 @@
 use lazy_static::lazy_static;
+use utils::compilation;
 
-use crate::{compile_util, formatter, type_checker};
+use crate::{formatter, type_checker};
 
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let mut res = compile_util::run_compiler_on_str(&code, super::run).unwrap();
+    let mut res = compilation::run_compiler_on_str(&code, super::run).unwrap();
     let defs = res.stdio_mod();
     let [(_, s)] = &mut res.files[..] else { panic!() };
     let stripped = s
@@ -13,7 +14,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
         .unwrap()
         .to_string();
     s.push_str(&defs);
-    compile_util::run_compiler_on_str(&s, type_checker::type_check).expect(&stripped);
+    compilation::run_compiler_on_str(&s, type_checker::type_check).expect(&stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
     }
@@ -2931,5 +2932,5 @@ pub type wchar_t = libc::c_int;"#;
 
 lazy_static! {
     static ref FORMATTED_PREAMBLE: String =
-        compile_util::run_compiler_on_str(PREAMBLE, formatter::formatted).unwrap();
+        compilation::run_compiler_on_str(PREAMBLE, formatter::formatted).unwrap();
 }
