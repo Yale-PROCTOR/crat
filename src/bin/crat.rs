@@ -364,7 +364,9 @@ fn main() {
                     run_compiler_on_path(&file, |tcx| io_replacer::replace_io(&dir, tcx)).unwrap();
             }
             Pass::Pointer => {
-                todo!()
+                let s =
+                    run_compiler_on_path(&file, pointer_replacer::replace_local_borrows).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
         }
     }
