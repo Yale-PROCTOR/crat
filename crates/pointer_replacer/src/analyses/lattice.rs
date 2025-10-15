@@ -1,4 +1,4 @@
-use smallvec::{SmallVec, smallvec_inline};
+use small_vec::{SmallVec, smallvec_inline};
 
 pub trait Lattice: Eq + HasBottom + HasTop {
     fn join(&mut self, other: &Self) -> bool;
