@@ -231,6 +231,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
         steensgaard
     }
 
+    #[allow(unused)]
     pub fn print_results(&self) {
         for (&did, _) in self.fn_locals.0.did_idx.iter() {
             println!("results for {did:?}:");
@@ -275,6 +276,7 @@ impl<F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrategy> Steens
         self.pts_targets.equiv(self.pts[p], self.pts[q])
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn pts_rep(&self, p: AbstractLocation) -> AbstractLocation {
         self.pts_targets.find(self.pts[p])

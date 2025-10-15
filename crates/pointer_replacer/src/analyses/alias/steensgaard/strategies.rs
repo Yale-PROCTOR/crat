@@ -230,6 +230,7 @@ pub enum InterProcedural {}
 
 impl InterProceduralStrategy for InterProcedural {}
 
+#[allow(unused)]
 pub enum IntraProcedural {}
 impl InterProceduralStrategy for IntraProcedural {
     fn handle_extern_call<'cg, 'tcx, F: FieldStrategy, D: DeallocArgStrategy>(

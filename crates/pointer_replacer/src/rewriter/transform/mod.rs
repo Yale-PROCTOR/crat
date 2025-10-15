@@ -15,7 +15,7 @@ use rustc_hir::{
 use rustc_middle::ty::{Ty as MirTy, TyCtxt};
 use rustc_span::symbol::Ident;
 use smallvec::SmallVec;
-use utils::ir::{AstToHir, HirToThir};
+use utils::ir::AstToHir;
 
 use super::{
     Analysis,
@@ -52,7 +52,6 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_diffs: FxHashMap<HirId, PtrKindDiff>,
     ast_to_hir: AstToHir,
-    hir_to_thir: HirToThir,
     pub stats: RewriteStats,
 }
 
@@ -316,7 +315,6 @@ impl<'tcx> TransformVisitor<'tcx> {
         rust_program: &RustProgram<'tcx>,
         analysis: &Analysis,
         ast_to_hir: AstToHir,
-        hir_to_thir: HirToThir,
     ) -> TransformVisitor<'tcx> {
         let sig_decs = SigDecisions::new(rust_program, analysis); // TODO: Move outside
         let ptr_diffs = collect_diffs(rust_program, analysis); // TODO: Move outside
@@ -325,11 +323,11 @@ impl<'tcx> TransformVisitor<'tcx> {
             sig_decs,
             ptr_diffs,
             ast_to_hir,
-            hir_to_thir,
             stats: RewriteStats::default(),
         }
     }
 
+    #[allow(unused)]
     pub fn updated(&self) -> bool {
         self.stats.usages + self.stats.writes + self.stats.defs + self.stats.params > 0
     }
@@ -339,6 +337,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         parent_node
     }
 
+    #[allow(unused)]
     fn is_function_arg(&self, hir_id: HirId) -> bool {
         if let Some(outer_expr) = self.get_outer_expr(hir_id)
             && let HirNode::Expr(parent_expr) = self.expect_parent_node(outer_expr.hir_id)
@@ -351,7 +350,8 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
-    // Get the outermost expression that contains casting and dereferencing
+    /// Get the outermost expression that contains casting and dereferencing
+    #[allow(unused)]
     fn get_outer_expr(&self, hir_id: HirId) -> Option<&HirExpr<'tcx>> {
         let mut out_expr = None;
         for (_, parent_node) in self.tcx.hir_parent_iter(hir_id) {

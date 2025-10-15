@@ -27,7 +27,7 @@ where
     let mut did_idx = FxHashMap::default();
     did_idx.reserve(structs.len());
 
-    let mut vars = VecVec::new();
+    let mut vars = VecVec::builder();
 
     let mut next: Idx = initial;
 
@@ -69,7 +69,7 @@ where
     let mut did_idx = FxHashMap::default();
     did_idx.reserve(fns.len());
 
-    let mut vars = VecVec::new();
+    let mut vars = VecVec::builder();
 
     let mut next: Idx = initial;
 
@@ -123,6 +123,7 @@ impl<Idx: Copy> StructFields<Idx> {
         self.0.contents_iter(did)
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn field(&self, did: &DefId, f: usize) -> Range<Idx> {
         self.0.content(did, f)
@@ -136,6 +137,7 @@ impl<Idx: Copy> FnLocals<Idx> {
         self.0.contents_iter(did)
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn local(&self, did: &DefId, local: usize) -> Range<Idx> {
         self.0.content(did, local)

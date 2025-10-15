@@ -84,9 +84,7 @@ impl Eq for CxDefId<'_> {}
 
 impl PartialOrd for CxDefId<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.tcx
-            .item_name(self.did)
-            .partial_cmp(&other.tcx.item_name(other.did))
+        Some(self.cmp(other))
     }
 }
 

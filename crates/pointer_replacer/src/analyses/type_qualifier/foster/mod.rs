@@ -90,6 +90,7 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         self.fn_locals.locals(did).map(|vars| &self.model[vars])
     }
 
+    #[allow(unused)]
     pub fn struct_facts(&self, did: &DefId) -> impl Iterator<Item = &[Qualifier]> {
         self.struct_fields.fields(did).map(|vars| &self.model[vars])
     }

@@ -39,8 +39,6 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
-    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
-
     let mut functions = vec![];
     let mut structs = vec![];
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
@@ -70,7 +68,7 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
         .postprocess_promoted_mut_refs(analyses::borrow::mutable_references_no_guarantee(&input));
     let analysis_results = Analysis::new(output_params, promoted_mut_refs);
 
-    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir, hir_to_thir);
+    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
 
     let mut visitor = transform::post::UnnecessaryRawMutRemover;

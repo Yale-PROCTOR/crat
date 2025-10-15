@@ -11,6 +11,7 @@ use crate::analyses::type_qualifier::foster::{
     constraint_system::{BooleanSystem, ConstraintSystem},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn library_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
@@ -94,10 +95,7 @@ pub fn library_call<'tcx>(
     if def_path
         .data
         .first()
-        .map(|d| match d.data {
-            rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr" => true,
-            _ => false,
-        })
+        .map(|d| matches!(d.data, rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr"))
         .is_some()
     {
         // if it is core::ptr::<..>::..

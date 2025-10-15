@@ -28,7 +28,7 @@ impl<I, A: Allocator> std::ops::IndexMut<usize> for VecVec<I, A> {
 }
 
 impl<I> VecVec<I> {
-    pub fn new() -> VecVecBuilder<I> {
+    pub fn builder() -> VecVecBuilder<I> {
         Self::with_capacity(0, 0)
     }
 
@@ -56,9 +56,9 @@ impl<I> VecVec<I> {
         }
     }
 
+    #[allow(unused)]
     pub fn with_data_capacity(size: usize) -> VecVecBuilder<I> {
-        let mut indices = Vec::new();
-        indices.push(0);
+        let mut indices = vec![0];
         let data = Vec::with_capacity(size);
         let vec_array = VecVec { indices, data };
         VecVecBuilder {
@@ -68,6 +68,7 @@ impl<I> VecVec<I> {
         }
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn repack<U, F>(self, f: F) -> VecVec<U>
     where F: Fn(I) -> U {
@@ -78,6 +79,7 @@ impl<I> VecVec<I> {
 }
 
 impl<I, A: Allocator + Copy> VecVec<I, A> {
+    #[allow(unused)]
     pub fn new_in(len: usize, alloc: A) -> VecVecBuilder<I, A> {
         let mut indices = Vec::with_capacity_in(len + 1, alloc);
         indices.push(0);
@@ -90,16 +92,19 @@ impl<I, A: Allocator + Copy> VecVec<I, A> {
         }
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn everything(&self) -> &[I] {
         &self.data
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn everything_mut(&mut self) -> &mut [I] {
         &mut self.data
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn len(&self) -> usize {
         self.indices.len() - 1
@@ -147,6 +152,7 @@ impl<I, A: Allocator> VecVecBuilder<I, A> {
         self.vec_vec
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn get(&self, index: usize) -> &[I] {
         if index + 1 >= self.vec_vec.indices.len() {

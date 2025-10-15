@@ -1,5 +1,7 @@
 pub type Constraint<Loc> = GenericConstraint<ConstraintKind, Loc>;
+#[allow(unused)]
 pub type BasicConstraint<Loc> = GenericConstraint<BasicConstraintKind, Loc>;
+#[allow(unused)]
 pub type ComplexConstraint<Loc> = GenericConstraint<ComplexConstraintKind, Loc>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -16,6 +18,7 @@ impl<K, Loc> GenericConstraint<K, Loc> {
 }
 
 impl<Loc> Constraint<Loc> {
+    #[allow(unused)]
     pub fn addr(lhs: Loc, rhs: Loc) -> Self {
         Self::new(ConstraintKind::Basic(BasicConstraintKind::Addr), lhs, rhs)
     }
@@ -24,6 +27,7 @@ impl<Loc> Constraint<Loc> {
         Self::new(ConstraintKind::Basic(BasicConstraintKind::Assign), lhs, rhs)
     }
 
+    #[allow(unused)]
     pub fn store(lhs: Loc, rhs: Loc) -> Self {
         Self::new(
             ConstraintKind::Complex(ComplexConstraintKind::Store),
@@ -32,6 +36,7 @@ impl<Loc> Constraint<Loc> {
         )
     }
 
+    #[allow(unused)]
     pub fn load(lhs: Loc, rhs: Loc) -> Self {
         Self::new(
             ConstraintKind::Complex(ComplexConstraintKind::Load),

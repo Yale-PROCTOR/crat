@@ -1,6 +1,7 @@
 use rustc_hir::LangItem;
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 
+#[allow(unused)]
 pub trait TyExt {
     fn is_non_unit_tuple(&self) -> bool;
 
@@ -8,7 +9,7 @@ pub trait TyExt {
     fn is_c2rust_fn_ptr(&self, tcx: TyCtxt) -> bool;
 
     /// Bruh...
-    fn from_libtree(&self) -> bool;
+    fn is_from_libtree(&self) -> bool;
 }
 
 impl TyExt for Ty<'_> {
@@ -26,11 +27,12 @@ impl TyExt for Ty<'_> {
         }
     }
 
-    fn from_libtree(&self) -> bool {
+    fn is_from_libtree(&self) -> bool {
         format!("{self}").starts_with("src::libtree::")
     }
 }
 
+#[allow(unused)]
 pub trait TyGate {
     fn gated(&self, tcx: TyCtxt);
 }
@@ -41,7 +43,7 @@ impl TyGate for Ty<'_> {
         let ty = self;
         if ty.is_non_unit_tuple()
             || (ty.is_enum() && !ty.is_c_void(tcx) && !ty.is_c2rust_fn_ptr(tcx))
-            || ty.is_union() && !ty.from_libtree()
+            || ty.is_union() && !ty.is_from_libtree()
         {
             unimplemented!("only user-defined structs are allowed, found {self}")
         }

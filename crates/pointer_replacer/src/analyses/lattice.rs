@@ -1,7 +1,9 @@
 use small_vec::{SmallVec, smallvec_inline};
 
 pub trait Lattice: Eq + HasBottom + HasTop {
+    #[allow(unused)]
     fn join(&mut self, other: &Self) -> bool;
+    #[allow(unused)]
     fn meet(&mut self, other: &Self) -> bool;
 }
 
@@ -14,6 +16,7 @@ pub trait HasTop {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(unused)]
 pub enum FlatSet<T> {
     Bottom,
     Elem(T),

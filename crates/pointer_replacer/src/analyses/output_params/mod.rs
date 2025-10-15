@@ -19,6 +19,7 @@ mod eliminable_temporaries;
 
 pub type OutputParams = FxHashMap<DefId, MixedBitSet<Local>>;
 
+#[allow(unused)]
 pub fn show_output_params(program: &RustProgram, mutability_result: &MutabilityResult) {
     let output_params = compute_output_params(program, mutability_result);
 

@@ -204,6 +204,7 @@ impl DefUse {
 /// This is basically written for dead store elimination and nothing else.
 ///
 /// All of the caveats of `MaybeLiveLocals` apply.
+#[allow(unused)]
 pub struct MaybeTransitiveLiveLocals<'a> {
     always_live: &'a DenseBitSet<Local>,
 }
@@ -213,6 +214,7 @@ impl<'a> MaybeTransitiveLiveLocals<'a> {
     /// considered live.
     ///
     /// This should include at least all locals that are ever borrowed.
+    #[allow(unused)]
     pub fn new(always_live: &'a DenseBitSet<Local>) -> Self {
         MaybeTransitiveLiveLocals { always_live }
     }

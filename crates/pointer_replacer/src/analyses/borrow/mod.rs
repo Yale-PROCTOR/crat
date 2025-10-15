@@ -168,6 +168,7 @@ pub struct BorrowData<'tcx> {
 #[derive(Clone, Copy, Debug)]
 pub enum Borrower<'tcx> {
     AssignStmt(Place<'tcx>),
+    #[allow(unused)]
     CallArg(DefId, usize),
 }
 
@@ -420,6 +421,7 @@ impl ProvenanceConstraintGraph {
     }
 }
 
+#[allow(unused)]
 pub struct BorrowInferenceResults<'tcx> {
     // pub provenance_set: ProvenanceSet,
     pub borrow_set: BorrowSet<'tcx>,
@@ -439,14 +441,11 @@ pub fn borrow_inference<'tcx>(
     def_id: DefId,
     global_borrow_ctxt: &GBorrowInferCtxt,
 ) -> BorrowInferenceResults<'tcx> {
-    let tcx = tcx;
-    let f = def_id;
-
     let body = &*tcx
-        .mir_drops_elaborated_and_const_checked(f.expect_local())
+        .mir_drops_elaborated_and_const_checked(def_id.expect_local())
         .borrow();
 
-    let provenance_set = global_borrow_ctxt.provenances.get(&f).unwrap();
+    let provenance_set = global_borrow_ctxt.provenances.get(&def_id).unwrap();
     let borrow_set = body.borrow_set(tcx, provenance_set, global_borrow_ctxt);
     let location_map = DenseLocationMap::new(body);
     let provenance_liveness = compute_provenance_liveness(&location_map, tcx, body, provenance_set);
@@ -481,6 +480,7 @@ pub fn borrow_inference<'tcx>(
     }
 }
 
+#[allow(unused)]
 pub fn dump_borrow_inference_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -576,6 +576,7 @@ pub fn dump_borrow_inference_mir<'tcx>(
     Ok(())
 }
 
+#[allow(unused)]
 pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &GBorrowInferCtxt) {
     let tcx = program.tcx;
 
