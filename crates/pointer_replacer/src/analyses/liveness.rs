@@ -257,14 +257,13 @@ impl<'a, 'tcx> Analysis<'tcx> for MaybeTransitiveLiveLocals<'a> {
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::Nop => None,
         };
-        if let Some(destination) = destination {
-            if !destination.is_indirect()
-                && !state.contains(destination.local)
-                && !self.always_live.contains(destination.local)
-            {
-                // This store is dead
-                return;
-            }
+        if let Some(destination) = destination
+            && !destination.is_indirect()
+            && !state.contains(destination.local)
+            && !self.always_live.contains(destination.local)
+        {
+            // This store is dead
+            return;
         }
         TransferFunction(state).visit_statement(statement, location);
     }

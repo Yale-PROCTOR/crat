@@ -25,7 +25,7 @@ pub fn show_output_params(program: &RustProgram, mutability_result: &MutabilityR
     for (did, noalias_params) in output_params {
         let noalias_params_str = noalias_params
             .iter()
-            .map(|param| format!("{:?}", param))
+            .map(|param| format!("{param:?}"))
             .join(", ");
         println!("@{}: {noalias_params_str}", program.tcx.def_path_str(did));
     }

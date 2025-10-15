@@ -36,7 +36,7 @@ where T: Clone + Copy + Eq
             (Self::Bottom, _) | (_, Self::Top) => return false,
             (Self::Elem(a), Self::Elem(b)) if a == b => return false,
 
-            (Self::Top, Self::Elem(x)) => Self::Elem(x.clone()),
+            (Self::Top, Self::Elem(x)) => Self::Elem(*x),
 
             _ => Self::Bottom,
         };
@@ -50,7 +50,7 @@ where T: Clone + Copy + Eq
             (Self::Top, _) | (_, Self::Bottom) => return false,
             (Self::Elem(a), Self::Elem(b)) if a == b => return false,
 
-            (Self::Bottom, Self::Elem(x)) => Self::Elem(x.clone()),
+            (Self::Bottom, Self::Elem(x)) => Self::Elem(*x),
 
             _ => Self::Top,
         };

@@ -13,7 +13,7 @@ pub trait TyExt {
 
 impl TyExt for Ty<'_> {
     fn is_non_unit_tuple(&self) -> bool {
-        matches!(self.kind(), TyKind::Tuple(list) if list.len() > 0)
+        matches!(self.kind(), TyKind::Tuple(list) if !list.is_empty())
     }
 
     fn is_c2rust_fn_ptr(&self, tcx: TyCtxt) -> bool {

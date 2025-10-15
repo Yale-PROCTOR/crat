@@ -58,19 +58,19 @@ impl CallKind {
 
             if let Some(local_did) = callee.as_local() {
                 match tcx.hir_node_by_def_id(local_did) {
-                    rustc_hir::Node::Item(_) => return CallKind::FreeStanding(callee),
+                    rustc_hir::Node::Item(_) => CallKind::FreeStanding(callee),
                     rustc_hir::Node::ForeignItem(foreign_item) => {
-                        return CallKind::LibC(foreign_item.ident);
+                        CallKind::LibC(foreign_item.ident)
                     }
-                    rustc_hir::Node::ImplItem(_) => return CallKind::Impl(callee),
-                    rustc_hir::Node::TraitItem(_) => return CallKind::Dynamic,
+                    rustc_hir::Node::ImplItem(_) => CallKind::Impl(callee),
+                    rustc_hir::Node::TraitItem(_) => CallKind::Dynamic,
                     _ => unreachable!(),
                 }
             } else {
-                return CallKind::RustLib(callee);
+                CallKind::RustLib(callee)
             }
         } else {
-            return CallKind::Closure;
+            CallKind::Closure
         }
     }
 

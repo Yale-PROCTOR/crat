@@ -58,7 +58,7 @@ pub fn collect_diffs<'tcx>(
         {
             let mutability = decl.ty.is_mutable_ptr();
             let ptr_kind = if output_params.contains(local) {
-                assert!(mutability == true); // output parameters are always &mut T
+                assert!(mutability); // output parameters are always &mut T
                 PtrKind::OptRef(true)
             } else if promoted_mut_refs.contains(local) {
                 PtrKind::OptRef(mutability)
@@ -70,9 +70,7 @@ pub fn collect_diffs<'tcx>(
                 // Ensure output parameters and promoted mutable references are raw pointers
                 assert!(
                     ty.is_raw_ptr(),
-                    "Expected raw pointer type, got {:?} in {:?}",
-                    ty,
-                    decl
+                    "Expected raw pointer type, got {ty:?} in {decl:?}"
                 );
                 ptr_kind_diffs.insert(
                     *hir_id,

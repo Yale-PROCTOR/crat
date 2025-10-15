@@ -28,11 +28,11 @@ pub fn library_call<'tcx>(
         .iter()
         .map(|data| data.data)
         .collect::<smallvec::SmallVec<[_; 4]>>()[..]
+        && cmp.as_str() == "cmp"
+        && eq.as_str() == "eq"
     {
-        if cmp.as_str() == "cmp" && eq.as_str() == "eq" {
-            // unconstrained call
-            return;
-        }
+        // unconstrained call
+        return;
     }
 
     if let [
@@ -45,13 +45,12 @@ pub fn library_call<'tcx>(
         .iter()
         .map(|data| data.data)
         .collect::<smallvec::SmallVec<[_; 4]>>()[..]
+        && option.as_str() == "option"
     {
-        if option.as_str() == "option" {
-            // unconstrained call
-            match func.as_str() {
-                "is_some" | "expect" | "is_none" => return,
-                _ => {} // fall
-            }
+        // unconstrained call
+        match func.as_str() {
+            "is_some" | "expect" | "is_none" => return,
+            _ => {} // fall
         }
     }
 
@@ -65,17 +64,17 @@ pub fn library_call<'tcx>(
         .iter()
         .map(|data| data.data)
         .collect::<smallvec::SmallVec<[_; 4]>>()[..]
+        && slice.as_str() == "slice"
+        && as_mut_ptr.as_str() == "as_mut_ptr"
     {
-        if slice.as_str() == "slice" && as_mut_ptr.as_str() == "as_mut_ptr" {
-            return call_as_mut_ptr(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
+        return call_as_mut_ptr(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        );
     }
 
     let def_path_str = tcx.def_path_str(callee);
@@ -94,7 +93,7 @@ pub fn library_call<'tcx>(
     // if it is a library call in core::ptr
     if def_path
         .data
-        .get(0)
+        .first()
         .map(|d| match d.data {
             rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr" => true,
             _ => false,
@@ -102,45 +101,45 @@ pub fn library_call<'tcx>(
         .is_some()
     {
         // if it is core::ptr::<..>::..
-        if let Some(d) = def_path.data.get(3) {
-            if let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data {
-                match s.as_str() {
-                    "is_null" => {
-                        return call_is_null(
-                            destination,
-                            args,
-                            local_decls,
-                            locals,
-                            struct_fields,
-                            database,
-                        );
-                    }
-                    "offset" => {
-                        return call_offset(
-                            destination,
-                            args,
-                            local_decls,
-                            locals,
-                            struct_fields,
-                            database,
-                        );
-                    }
-                    "offset_from" => {
-                        return call_offset_from(
-                            destination,
-                            args,
-                            local_decls,
-                            locals,
-                            struct_fields,
-                            database,
-                        );
-                    }
-                    "addr" => {
-                        // no constraint
-                        return;
-                    }
-                    _ => {}
+        if let Some(d) = def_path.data.get(3)
+            && let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data
+        {
+            match s.as_str() {
+                "is_null" => {
+                    return call_is_null(
+                        destination,
+                        args,
+                        local_decls,
+                        locals,
+                        struct_fields,
+                        database,
+                    );
                 }
+                "offset" => {
+                    return call_offset(
+                        destination,
+                        args,
+                        local_decls,
+                        locals,
+                        struct_fields,
+                        database,
+                    );
+                }
+                "offset_from" => {
+                    return call_offset_from(
+                        destination,
+                        args,
+                        local_decls,
+                        locals,
+                        struct_fields,
+                        database,
+                    );
+                }
+                "addr" => {
+                    // no constraint
+                    return;
+                }
+                _ => {}
             }
         }
 

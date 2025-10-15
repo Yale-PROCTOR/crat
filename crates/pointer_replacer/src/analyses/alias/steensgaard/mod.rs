@@ -132,7 +132,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
 
     pub fn print_results(&self) {
         for (&did, _) in self.struct_fields.0.did_idx.iter() {
-            println!("results for {:?}:", did);
+            println!("results for {did:?}:");
             let fields_result = self
                 .struct_fields
                 .memory_locations(&did)
@@ -144,12 +144,12 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
                 .map(|loc| self.pts_targets.find(self.pts[loc]));
             // .collect::<Vec<_>>();
             for (idx, tgt) in fields_result.enumerate() {
-                println!("{:?}.{idx} -> {:?}", did, tgt);
+                println!("{did:?}.{idx} -> {tgt:?}");
             }
         }
 
         for (&did, _) in self.fn_locals.0.did_idx.iter() {
-            println!("results for {:?}:", did);
+            println!("results for {did:?}:");
             let locals_result = self
                 .fn_locals
                 .memory_locations(&did)
@@ -157,7 +157,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
                 .copied()
                 .map(|loc| self.pts_targets.find(self.pts[loc]));
             for (idx, tgt) in locals_result.enumerate() {
-                println!("{:?}.{idx} -> {:?}", did, tgt);
+                println!("{did:?}.{idx} -> {tgt:?}");
             }
         }
     }
@@ -233,7 +233,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
 
     pub fn print_results(&self) {
         for (&did, _) in self.fn_locals.0.did_idx.iter() {
-            println!("results for {:?}:", did);
+            println!("results for {did:?}:");
             let locals_result = self
                 .fn_locals
                 .memory_locations(&did)
@@ -241,7 +241,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
                 .copied()
                 .map(|loc| self.pts_targets.find(self.pts[loc]));
             for (idx, tgt) in locals_result.enumerate() {
-                println!("{:?}.{idx} -> {:?}", did, tgt);
+                println!("{did:?}.{idx} -> {tgt:?}");
             }
         }
     }
@@ -254,7 +254,7 @@ impl<F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrategy> Steens
     }
 
     pub fn local_locations(&self, body_id: &DefId) -> &[AbstractLocation] {
-        &self.fn_locals.memory_locations(&body_id)
+        self.fn_locals.memory_locations(body_id)
     }
 
     pub(crate) fn join(&mut self, p: AbstractLocation, q: AbstractLocation) {

@@ -24,7 +24,7 @@ impl MutVisitor for UnnecessaryRawMutRemover {
         {
             *ex = utils::expr!(
                 "&raw mut ({}) as *mut *mut _",
-                pprust::expr_to_string(&inner)
+                pprust::expr_to_string(inner)
             );
         }
 

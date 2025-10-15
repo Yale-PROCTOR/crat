@@ -127,7 +127,7 @@ impl GBorrowInferCtxt {
                 .mir_drops_elaborated_and_const_checked(f.expect_local())
                 .borrow();
             let is_candidate = is_candidate(f);
-            provenances.insert(f, body.provenance_set(|local| is_candidate(local)));
+            provenances.insert(f, body.provenance_set(is_candidate));
         }
 
         GBorrowInferCtxt { provenances }
@@ -271,7 +271,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         }
                     }
                 };
-                return self.super_terminator(terminator, location);
+                self.super_terminator(terminator, location)
             }
         }
 
@@ -447,15 +447,14 @@ pub fn borrow_inference<'tcx>(
         .borrow();
 
     let provenance_set = global_borrow_ctxt.provenances.get(&f).unwrap();
-    let borrow_set = body.borrow_set(tcx, &provenance_set, global_borrow_ctxt);
+    let borrow_set = body.borrow_set(tcx, provenance_set, global_borrow_ctxt);
     let location_map = DenseLocationMap::new(body);
-    let provenance_liveness =
-        compute_provenance_liveness(&location_map, tcx, body, &provenance_set);
+    let provenance_liveness = compute_provenance_liveness(&location_map, tcx, body, provenance_set);
     let killed = compute_killed(body, tcx, &location_map, &borrow_set);
     let constraint_graph =
         ProvenanceConstraintGraph::new(tcx, body, &borrow_set, provenance_set, global_borrow_ctxt);
     let subset_closure = compute_subset_closure(provenance_set, &constraint_graph);
-    let requires = compute_requires(&borrow_set, &provenance_set, &constraint_graph);
+    let requires = compute_requires(&borrow_set, provenance_set, &constraint_graph);
     let loan_liveness = compute_loan_liveness(
         tcx,
         body,
@@ -563,7 +562,7 @@ pub fn dump_borrow_inference_mir<'tcx>(
             .map(|loan| format!("{:?}", &borrow_set.loans[loan]))
             .join(", ");
 
-        if illegal_accesses == "" {
+        if illegal_accesses.is_empty() {
             continue;
         }
 
@@ -593,7 +592,7 @@ pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &G
         };
         println!("{} inferred bounds:", program.tcx.def_path_str(f));
         let BorrowInferenceResults { subset_closure, .. } =
-            borrow_inference(tcx, *f, &global_borrow_ctxt);
+            borrow_inference(tcx, *f, global_borrow_ctxt);
 
         for arg in body.args_iter() {
             if let Some(arg_provenance) = provenance_set.local_data[arg]
@@ -628,7 +627,7 @@ pub fn demote_pointers(
 
         let BorrowInferenceResults {
             borrow_set, errors, ..
-        } = borrow_inference(tcx, *f, &global_borrow_ctxt);
+        } = borrow_inference(tcx, *f, global_borrow_ctxt);
 
         let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
         for row in errors.rows() {

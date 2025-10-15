@@ -73,7 +73,7 @@ impl<Value: BooleanLattice> BooleanSystem<Value> {
         for &var in bottom_valued_vars {
             model[var] = false.into()
         }
-        assert_eq!(Into::into(model[Self::BOTTOM]), false);
+        assert!(!Into::into(model[Self::BOTTOM]));
     }
 }
 

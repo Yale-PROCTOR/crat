@@ -277,15 +277,14 @@ impl<'me, 'tcx, F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrat
             .did_idx
             .contains_key(&callee_did)
         {
-            if let Some(local_did) = callee_did.as_local() {
-                if let rustc_hir::Node::ForeignItem(foreign_item) =
+            if let Some(local_did) = callee_did.as_local()
+                && let rustc_hir::Node::ForeignItem(foreign_item) =
                     self.tcx.hir_node_by_def_id(local_did)
-                {
-                    // special-casing free function
-                    if foreign_item.ident.as_str() == "free" {
-                        D::handle_dealloc_arg(self, &args.first().unwrap().node);
-                        return;
-                    }
+            {
+                // special-casing free function
+                if foreign_item.ident.as_str() == "free" {
+                    D::handle_dealloc_arg(self, &args.first().unwrap().node);
+                    return;
                 }
             }
 

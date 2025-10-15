@@ -71,11 +71,11 @@ fn group_locals_by_source_variable<'tcx>(
     let mut local_to_src_local: FxHashMap<Local, Local> = FxHashMap::default();
 
     for debug_info in &body.var_debug_info {
-        if let VarDebugInfoContents::Place(place) = &debug_info.value {
-            if let Some(local) = place.as_local() {
-                src_local_to_locals.entry(local).or_default().push(local);
-                local_to_src_local.insert(local, local);
-            }
+        if let VarDebugInfoContents::Place(place) = &debug_info.value
+            && let Some(local) = place.as_local()
+        {
+            src_local_to_locals.entry(local).or_default().push(local);
+            local_to_src_local.insert(local, local);
         }
     }
 
@@ -85,14 +85,11 @@ fn group_locals_by_source_variable<'tcx>(
     // Propagate source variable names to temporaries
     // Caveat: the order of copy_relationships should be chronological
     for (dest, src) in copy_relationships {
-        if let Some(src_local) = local_to_src_local.get(&src).cloned() {
-            if !local_to_src_local.contains_key(&dest) {
-                src_local_to_locals
-                    .entry(src_local.clone())
-                    .or_default()
-                    .push(dest);
-                local_to_src_local.insert(dest, src_local);
-            }
+        if let Some(src_local) = local_to_src_local.get(&src).cloned()
+            && !local_to_src_local.contains_key(&dest)
+        {
+            src_local_to_locals.entry(src_local).or_default().push(dest);
+            local_to_src_local.insert(dest, src_local);
         }
     }
 
@@ -112,15 +109,11 @@ fn find_copy_relationships(body: &Body<'_>) -> Vec<(Local, Local)> {
             rvalue: &Rvalue<'tcx>,
             _location: Location,
         ) {
-            if let Some(dest_local) = place.as_local() {
-                match rvalue {
-                    Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) => {
-                        if let Some(src_local) = src_place.as_local() {
-                            self.copies.push((dest_local, src_local));
-                        }
-                    }
-                    _ => {}
-                }
+            if let Some(dest_local) = place.as_local()
+                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue
+                && let Some(src_local) = src_place.as_local()
+            {
+                self.copies.push((dest_local, src_local));
             }
         }
     }

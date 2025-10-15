@@ -145,22 +145,18 @@ impl MutVisitor for TransformVisitor<'_> {
                     && let QPath::Resolved(_, path) = qpath
                     && let Res::Local(local_id) = path.res
                     && let Some(ptr_diff) = self.ptr_diffs.get(&local_id)
+                    && let PtrKindDiff {
+                        before: PtrKind::Raw(mutability),
+                        after: PtrKind::OptRef(_mutability),
+                    } = ptr_diff
                 {
-                    match ptr_diff {
-                        PtrKindDiff {
-                            before: PtrKind::Raw(mutability),
-                            after: PtrKind::OptRef(_mutability),
-                        } => {
-                            assert!(mutability == _mutability);
-                            *rhs = utils::expr!(
-                                "Some(&{}*({}))",
-                                if *mutability { "mut " } else { "" },
-                                pprust::expr_to_string(&*rhs)
-                            );
-                            self.stats.writes += 1;
-                        }
-                        _ => (),
-                    }
+                    assert!(mutability == _mutability);
+                    *rhs = utils::expr!(
+                        "Some(&{}*({}))",
+                        if *mutability { "mut " } else { "" },
+                        pprust::expr_to_string(&*rhs)
+                    );
+                    self.stats.writes += 1;
                 }
             }
             ExprKind::Path(..) => {
@@ -186,11 +182,10 @@ impl MutVisitor for TransformVisitor<'_> {
                                 if let HirNode::Expr(grandparent_expr) = grandparent_node
                                     && let HirExprKind::Assign(lhs, _, _) = grandparent_expr.kind
                                     && let HirExprKind::Unary(UnOp::Deref, lhs_deref) = &lhs.kind
+                                    && lhs_deref.hir_id == hir_expr.hir_id
                                 {
-                                    if lhs_deref.hir_id == hir_expr.hir_id {
-                                        // assignment to dereferenced pointer, handled in ExprKind::Assign above
-                                        return;
-                                    }
+                                    // assignment to dereferenced pointer, handled in ExprKind::Assign above
+                                    return;
                                 }
                             }
                         }
@@ -238,39 +233,36 @@ impl MutVisitor for TransformVisitor<'_> {
                     {
                         // Note: the arguments have been visited and rewritten to *mut T
                         // Hir arguments stays the same, so may not match the AST arguments
-                        match &sig_dec.input_decs.get(i).unwrap_or_else(|| {
+                        if let Some(PtrKind::OptRef(mutability)) = &sig_dec.input_decs.get(i).unwrap_or_else(|| {
                                 panic!(
                                     "Function call argument index out of bounds: {} in {:?}, function: {:?}",
                                     i, expr.span, self.tcx.def_path_str(func_did)
                                 )
                             }) {
-                                Some(PtrKind::OptRef(mutability)) => {
-                                    if let ExprKind::AddrOf(BorrowKind::Raw, Mutability::Mut, box inner) = &arg.kind {
-                                        // `Some(&mut inner)` when arg is `&raw mut inner`
-                                        **arg = utils::expr!(
-                                            "Some(&mut ({}))",
-                                            pprust::expr_to_string(&*inner)
-                                        );
-                                    } else if let ExprKind::AddrOf(BorrowKind::Ref, _, box inner) = &arg.kind
-                                           && let ExprKind::Unary(UnOp::Deref, _) = &inner.kind {
-                                        // `Some(arg)` when arg is `&mut inner` or `&inner`
-                                        // (c2rust is using automatic casting for &mut T to *mut T)
-                                        **arg = utils::expr!(
-                                            "Some({})",
-                                            pprust::expr_to_string(&*arg)
-                                        );
-                                    } else {
-                                        // arg.as_mut()
-                                        **arg = utils::expr!(
-                                            "({}).as_{}()",
-                                            pprust::expr_to_string(&*arg),
-                                            if *mutability { "mut" } else { "ref" }
-                                        );
-                                    }
-                                    self.stats.usages += 1;
-                                }
-                                _ => (),
+                            if let ExprKind::AddrOf(BorrowKind::Raw, Mutability::Mut, box inner) = &arg.kind {
+                                // `Some(&mut inner)` when arg is `&raw mut inner`
+                                **arg = utils::expr!(
+                                    "Some(&mut ({}))",
+                                    pprust::expr_to_string(inner)
+                                );
+                            } else if let ExprKind::AddrOf(BorrowKind::Ref, _, box inner) = &arg.kind
+                                   && let ExprKind::Unary(UnOp::Deref, _) = &inner.kind {
+                                // `Some(arg)` when arg is `&mut inner` or `&inner`
+                                // (c2rust is using automatic casting for &mut T to *mut T)
+                                **arg = utils::expr!(
+                                    "Some({})",
+                                    pprust::expr_to_string(&*arg)
+                                );
+                            } else {
+                                // arg.as_mut()
+                                **arg = utils::expr!(
+                                    "({}).as_{}()",
+                                    pprust::expr_to_string(&*arg),
+                                    if *mutability { "mut" } else { "ref" }
+                                );
                             }
+                            self.stats.usages += 1;
+                        }
                     }
                 }
             }
@@ -278,49 +270,41 @@ impl MutVisitor for TransformVisitor<'_> {
         }
     }
 
-    fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+    fn flat_map_stmt(&mut self, stmt: Stmt) -> SmallVec<[Stmt; 1]> {
         let mut stmts = mut_visit::walk_flat_map_stmt(self, stmt);
         for stmt in &mut stmts {
-            let hir_stmt_opt = self.get_hir_stmt(&stmt);
-            match &mut stmt.kind {
-                StmtKind::Let(box local) => {
-                    if let HirStmtKind::Let(hir_let) = hir_stmt_opt.unwrap().kind
-                        && let HirPatKind::Binding(_, binding_hir_id, _, _) = hir_let.pat.kind
-                        && let Some(ptr_diff) = self.ptr_diffs.get(&binding_hir_id)
-                    {
-                        match ptr_diff {
-                            PtrKindDiff {
-                                before: PtrKind::Raw(mutability),
-                                after: PtrKind::OptRef(_mutability),
-                            } => {
-                                assert!(mutability == _mutability);
-                                let mutability = *mutability;
-                                if let Some(ty) = &mut local.ty {
-                                    let hir_ty = hir_let.ty.unwrap();
-                                    let typeck = self.tcx.typeck(hir_ty.hir_id.owner);
-                                    let hir_ty_res = typeck.node_type(hir_ty.hir_id);
-                                    let ty_res = mir_ty_to_ty(&hir_ty_res);
-                                    self.rewrite_ty(ty, ty_res, &Some(PtrKind::OptRef(mutability)));
-                                }
-                                match &mut local.kind {
-                                    LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) => {
-                                        *rhs = utils::expr!(
-                                            "({}).as_{}()",
-                                            pprust::expr_to_string(&*rhs),
-                                            if mutability { "mut" } else { "ref" }
-                                        );
-                                        self.stats.defs += 1;
-                                    }
-                                    LocalKind::Decl => {
-                                        // No initializer, do nothing
-                                    }
-                                }
-                            }
-                            _ => (),
-                        }
+            let hir_stmt_opt = self.get_hir_stmt(stmt);
+            if let StmtKind::Let(box local) = &mut stmt.kind
+                && let HirStmtKind::Let(hir_let) = hir_stmt_opt.unwrap().kind
+                && let HirPatKind::Binding(_, binding_hir_id, _, _) = hir_let.pat.kind
+                && let Some(ptr_diff) = self.ptr_diffs.get(&binding_hir_id)
+                && let PtrKindDiff {
+                    before: PtrKind::Raw(mutability),
+                    after: PtrKind::OptRef(_mutability),
+                } = ptr_diff
+            {
+                assert!(mutability == _mutability);
+                let mutability = *mutability;
+                if let Some(ty) = &mut local.ty {
+                    let hir_ty = hir_let.ty.unwrap();
+                    let typeck = self.tcx.typeck(hir_ty.hir_id.owner);
+                    let hir_ty_res = typeck.node_type(hir_ty.hir_id);
+                    let ty_res = mir_ty_to_ty(&hir_ty_res);
+                    self.rewrite_ty(ty, ty_res, &Some(PtrKind::OptRef(mutability)));
+                }
+                match &mut local.kind {
+                    LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) => {
+                        *rhs = utils::expr!(
+                            "({}).as_{}()",
+                            pprust::expr_to_string(&*rhs),
+                            if mutability { "mut" } else { "ref" }
+                        );
+                        self.stats.defs += 1;
+                    }
+                    LocalKind::Decl => {
+                        // No initializer, do nothing
                     }
                 }
-                _ => (),
             }
         }
         stmts
@@ -407,8 +391,8 @@ impl<'tcx> TransformVisitor<'tcx> {
             .unwrap_or_else(|| panic!("Failed to find HIR expr for Expr {:?}", expr.span));
         let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
         let mir_ty = typeck.expr_ty(&hir_expr);
-        let ty_res = mir_ty_to_ty(&mir_ty);
-        ty_res
+
+        mir_ty_to_ty(&mir_ty)
     }
 
     // Get the inner type if the expr is a pointer
@@ -416,49 +400,46 @@ impl<'tcx> TransformVisitor<'tcx> {
         let ty = self.expr_ty(expr);
         match &ty.kind {
             TyKind::Ptr(mut_ty) => (*mut_ty.ty).clone(),
-            _ => panic!("Expected pointer type for type {:#?}", ty),
+            _ => panic!("Expected pointer type for type {ty:#?}"),
         }
     }
 
     fn rewrite_ty(&mut self, ty: &mut Ty, ty_res: Ty, dec: &Option<PtrKind>) {
-        match dec {
-            Some(PtrKind::OptRef(mutability)) => {
-                // Create Option<&T> or Option<&mut T>
-                let ptr_mut_ty = expect_ptr(ty, ty_res);
-                assert!(
-                    ptr_mut_ty.mutbl
-                        == if *mutability {
-                            rustc_ast::Mutability::Mut
-                        } else {
-                            rustc_ast::Mutability::Not
-                        }
-                );
+        if let Some(PtrKind::OptRef(mutability)) = dec {
+            // Create Option<&T> or Option<&mut T>
+            let ptr_mut_ty = expect_ptr(ty, ty_res);
+            assert!(
+                ptr_mut_ty.mutbl
+                    == if *mutability {
+                        rustc_ast::Mutability::Mut
+                    } else {
+                        rustc_ast::Mutability::Not
+                    }
+            );
 
-                let inner_ref = P(Ty {
+            let inner_ref = P(Ty {
+                id: rustc_ast::DUMMY_NODE_ID,
+                kind: TyKind::Ref(None, ptr_mut_ty),
+                span: rustc_span::DUMMY_SP,
+                tokens: None,
+            });
+
+            // Create the Option path
+            let option_path = Path {
+                span: rustc_span::DUMMY_SP,
+                segments: vec![PathSegment {
+                    ident: Ident::from_str("Option"),
                     id: rustc_ast::DUMMY_NODE_ID,
-                    kind: TyKind::Ref(None, ptr_mut_ty),
-                    span: rustc_span::DUMMY_SP,
-                    tokens: None,
-                });
+                    args: Some(P(GenericArgs::AngleBracketed(AngleBracketedArgs {
+                        span: rustc_span::DUMMY_SP,
+                        args: [AngleBracketedArg::Arg(GenericArg::Type(inner_ref))].into(),
+                    }))),
+                }]
+                .into(),
+                tokens: None,
+            };
 
-                // Create the Option path
-                let option_path = Path {
-                    span: rustc_span::DUMMY_SP,
-                    segments: vec![PathSegment {
-                        ident: Ident::from_str("Option"),
-                        id: rustc_ast::DUMMY_NODE_ID,
-                        args: Some(P(GenericArgs::AngleBracketed(AngleBracketedArgs {
-                            span: rustc_span::DUMMY_SP,
-                            args: [AngleBracketedArg::Arg(GenericArg::Type(inner_ref))].into(),
-                        }))),
-                    }]
-                    .into(),
-                    tokens: None,
-                };
-
-                ty.kind = TyKind::Path(None, option_path);
-            }
-            _ => {}
+            ty.kind = TyKind::Path(None, option_path);
         }
     }
 }
@@ -468,7 +449,7 @@ fn expect_ptr(ty: &mut Ty, ty_res: Ty) -> MutTy {
         TyKind::Ptr(ptr) => ptr,
         _ => match ty_res.kind {
             TyKind::Ptr(ptr) => ptr,
-            _ => panic!("Expected pointer type for type {:#?}", ty),
+            _ => panic!("Expected pointer type for type {ty:#?}"),
         },
     }
 }

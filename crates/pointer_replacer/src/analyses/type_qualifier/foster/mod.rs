@@ -58,12 +58,12 @@ where Domain: BooleanLattice
 
         let (struct_fields, next) = encode_structs(next, structs, tcx, |field_ty| {
             let num_ptrs = count_ptr(field_ty);
-            model.extend(std::iter::repeat(Domain::BOTTOM).take(num_ptrs));
+            model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });
         let (fn_locals, _) = encode_fns(next, fns, tcx, |local_ty| {
             let num_ptrs = count_ptr(local_ty);
-            model.extend(std::iter::repeat(Domain::BOTTOM).take(num_ptrs));
+            model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });
 

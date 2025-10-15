@@ -83,9 +83,9 @@ impl FieldStrategy for FieldBased {
         assert!(place.local_or_deref_local().is_some());
         let loc = fn_locals.memory_location(&body.source.def_id(), place.local.as_usize());
         if place.as_local().is_some() {
-            return Some(PlaceLocation::Plain(loc));
+            Some(PlaceLocation::Plain(loc))
         } else {
-            return Some(PlaceLocation::Deref(loc));
+            Some(PlaceLocation::Deref(loc))
         }
     }
 }

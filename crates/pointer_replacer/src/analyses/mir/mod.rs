@@ -15,7 +15,6 @@ pub mod terminator;
 pub mod ty;
 
 pub use terminator::*;
-pub use ty::*;
 
 pub struct CallGraphPostOrder(pub VecVec<DefId>);
 
@@ -33,7 +32,7 @@ impl CallGraphPostOrder {
                 graph: &mut graph,
             }
             .visit_body(
-                &*program
+                &program
                     .tcx
                     .mir_drops_elaborated_and_const_checked(did.expect_local())
                     .borrow(),

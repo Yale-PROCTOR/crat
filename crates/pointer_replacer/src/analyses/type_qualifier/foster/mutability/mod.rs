@@ -109,23 +109,17 @@ impl HasTop for Mutability {
 
 impl Lattice for Mutability {
     fn join(&mut self, other: &Self) -> bool {
-        match (*self, *other) {
-            (Self::Mut, Self::Imm) => {
-                *self = Self::Imm;
-                return true;
-            }
-            _ => {}
+        if let (Self::Mut, Self::Imm) = (*self, *other) {
+            *self = Self::Imm;
+            return true;
         }
         false
     }
 
     fn meet(&mut self, other: &Self) -> bool {
-        match (*self, *other) {
-            (Self::Imm, Self::Mut) => {
-                *self = Self::Mut;
-                return true;
-            }
-            _ => {}
+        if let (Self::Imm, Self::Mut) = (*self, *other) {
+            *self = Self::Mut;
+            return true;
         }
         true
     }
@@ -428,7 +422,7 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
         match projection_elem {
             ProjectionElem::Deref => {
                 Ctxt::on_deref(place_vars.start, deref_store);
-                place_vars.start = place_vars.start + 1;
+                place_vars.start += 1;
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(field, ty) => {
