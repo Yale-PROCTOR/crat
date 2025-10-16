@@ -238,11 +238,16 @@ impl MutVisitor for TransformVisitor<'_> {
                                     i, expr.span, self.tcx.def_path_str(func_did)
                                 )
                             }) {
-                            if let ExprKind::AddrOf(BorrowKind::Raw, Mutability::Mut, box inner) = &arg.kind {
-                                // `Some(&mut inner)` when arg is `&raw mut inner`
+                            if let ExprKind::AddrOf(_, _mutability, box inner) = &arg.kind {
+                                // `Some(&mut inner)` when arg is `&raw mut inner` or `&mut inner`
+                                let _mutability = match _mutability {
+                                    Mutability::Mut => true,
+                                    Mutability::Not => false,
+                                };
                                 **arg = utils::expr!(
-                                    "Some(&mut ({}))",
-                                    pprust::expr_to_string(inner)
+                                    "Some(&{}({}))",
+                                    if *mutability { "mut " } else { "" },
+                                    pprust::expr_to_string(&*inner)
                                 );
                             } else if let ExprKind::AddrOf(BorrowKind::Ref, _, box inner) = &arg.kind
                                    && let ExprKind::Unary(UnOp::Deref, _) = &inner.kind {
