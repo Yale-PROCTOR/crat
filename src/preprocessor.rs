@@ -281,38 +281,35 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                 }
             } else {
                 assert = is_assert_stmt(stmt);
-                if let StmtKind::Let(local) = &stmt.kind
-                    && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-                {
-                    if self.lets_to_remove.contains(&hir_stmt.hir_id) {
-                        self.updated = true;
-                        *stmt = stmt!("0;");
-                    } else if let hir::PatKind::Binding(
-                        hir::BindingMode(hir::ByRef::Yes(_), _),
-                        id,
-                        _,
-                        _,
-                    ) = hir_stmt.pat.kind
-                    {
-                        let LocalKind::Init(box e) = &local.kind else { panic!() };
-                        self.let_ref_exprs.insert(id, e.clone());
-                        *stmt = stmt!("0;");
-                    }
-                }
             }
         }
 
         mut_visit::walk_block(self, b);
 
         b.stmts.retain(|stmt| {
-            if let StmtKind::Semi(e) = &stmt.kind
-                && matches!(e.kind, ExprKind::Lit(_))
+            if let StmtKind::Let(local) = &stmt.kind
+                && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+                && self.lets_to_remove.contains(&hir_stmt.hir_id)
             {
                 false
             } else {
                 true
             }
         });
+    }
+
+    fn visit_local(&mut self, local: &mut Local) {
+        mut_visit::walk_local(self, local);
+
+        if let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(_), _), id, _, _) =
+                hir_stmt.pat.kind
+            && let LocalKind::Init(box e) = &local.kind
+            && matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
+        {
+            self.let_ref_exprs.insert(id, e.clone());
+            self.lets_to_remove.insert(hir_stmt.hir_id);
+        }
     }
 
     fn visit_param(&mut self, param: &mut Param) {

@@ -121,7 +121,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                 unreachable!("Expected deref expression on LHS: {:?}", expr.span);
                             };
                             **lhs_deref = utils::expr!(
-                                "{}.as_deref_mut().unwrap_or_else(|| panic!(\"attempted to deref a null pointer\"))",
+                                "{}.as_deref_mut().unwrap()",
                                 pprust::expr_to_string(&*lhs_deref),
                             );
                             self.stats.writes += 1;
