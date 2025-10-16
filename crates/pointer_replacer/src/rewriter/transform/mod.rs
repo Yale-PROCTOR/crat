@@ -243,7 +243,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                 **arg = utils::expr!(
                                     "Some(&{}({}))",
                                     if *mutability { "mut " } else { "" },
-                                    pprust::expr_to_string(&*inner)
+                                    pprust::expr_to_string(inner)
                                 );
                             } else if let ExprKind::AddrOf(BorrowKind::Ref, _, box inner) = &arg.kind
                                    && let ExprKind::Unary(UnOp::Deref, _) = &inner.kind {
@@ -298,7 +298,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             *rhs = utils::expr!(
                                 "Some(&{}({}))",
                                 if mutability { "mut " } else { "" },
-                                pprust::expr_to_string(&*inner)
+                                pprust::expr_to_string(inner)
                             )
                         } else {
                             *rhs = utils::expr!(
@@ -465,7 +465,7 @@ fn expect_ptr(ty: &mut Ty, ty_res: Ty) -> MutTy {
 
 fn mir_ty_to_ty(mir_ty: &MirTy) -> Ty {
     let mut ty_str = mir_ty.to_string();
-    let re = Regex::new(r"(?P<prefix>(^|<|\s|,\s))(src|bin)::").unwrap();
+    let re = Regex::new(r"(?P<prefix>(^|<|\s|,\s))([A-Za-z_][A-Za-z0-9_]*)::").unwrap();
     ty_str = re
         .replace_all(&ty_str, "${prefix}crate::${3}::")
         .to_string();
