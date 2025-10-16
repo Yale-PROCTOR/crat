@@ -238,12 +238,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                     i, expr.span, self.tcx.def_path_str(func_did)
                                 )
                             }) {
-                            if let ExprKind::AddrOf(_, _mutability, box inner) = &arg.kind {
+                            if let ExprKind::AddrOf(_, _, box inner) = &arg.kind {
                                 // `Some(&mut inner)` when arg is `&raw mut inner` or `&mut inner`
-                                let _mutability = match _mutability {
-                                    Mutability::Mut => true,
-                                    Mutability::Not => false,
-                                };
                                 **arg = utils::expr!(
                                     "Some(&{}({}))",
                                     if *mutability { "mut " } else { "" },
@@ -298,12 +294,20 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
                 match &mut local.kind {
                     LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) => {
-                        *rhs = utils::expr!(
-                            "({}).as_{}()",
-                            pprust::expr_to_string(&*rhs),
-                            if mutability { "mut" } else { "ref" }
-                        );
-                        self.stats.defs += 1;
+                        if let ExprKind::AddrOf(_, _, box inner) = &rhs.kind {
+                            *rhs = utils::expr!(
+                                "Some(&{}({}))",
+                                if mutability { "mut " } else { "" },
+                                pprust::expr_to_string(&*inner)
+                            )
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_{}()",
+                                pprust::expr_to_string(&*rhs),
+                                if mutability { "mut" } else { "ref" }
+                            );
+                            self.stats.defs += 1;
+                        }
                     }
                     LocalKind::Decl => {
                         // No initializer, do nothing
