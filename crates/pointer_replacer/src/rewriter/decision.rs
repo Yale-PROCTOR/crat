@@ -6,14 +6,18 @@ use crate::utils::rustc::RustProgram;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
-    OptRef(bool), // reference: &mut T for Ref(true), or &T for Ref(false)
-    Raw(bool),    // raw pointer: *mut T for Raw(true), or *const T for Raw(false)
+    /// reference: &mut T for Ref(true), or &T for Ref(false)
+    OptRef(bool),
+    /// raw pointer: *mut T for Raw(true), or *const T for Raw(false)
+    Raw(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PtrKindDiff {
-    pub before: PtrKind, // ptrkind before change (required by surrounding context)
-    pub after: PtrKind,  // ptrkind after change (should be adjusted to satisfy `before`)
+    /// ptrkind before change (required by surrounding context)
+    pub before: PtrKind,
+    /// ptrkind after change (should be adjusted to satisfy `before`)
+    pub after: PtrKind,
 }
 
 impl Default for PtrKindDiff {
@@ -27,7 +31,8 @@ impl Default for PtrKindDiff {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SigDecision {
-    pub input_decs: Vec<Option<PtrKind>>, // None means no change
+    /// None means no change
+    pub input_decs: Vec<Option<PtrKind>>,
     pub output_dec: Option<PtrKind>,
 }
 
