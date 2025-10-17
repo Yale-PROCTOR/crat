@@ -31,6 +31,11 @@ struct Args {
         help = "Main function to ignore when adding bin files"
     )]
     bin_ignore: Vec<String>,
+    #[arg(
+        long,
+        help = "Name of the binary. Works only when there is a single main function."
+    )]
+    bin_name: Option<String>,
 
     // Andersen
     #[arg(long, help = "Use optimized MIR for points-to analysis")]
@@ -218,6 +223,9 @@ fn main() {
 
     for arg in args.bin_ignore {
         config.bin.ignores.push(arg);
+    }
+    if args.bin_name.is_some() {
+        config.bin.name = args.bin_name;
     }
 
     config.andersen.use_optimized_mir |= args.andersen_use_optimized_mir;

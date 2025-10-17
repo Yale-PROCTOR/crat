@@ -15,9 +15,10 @@ use toml_edit::{DocumentMut, Table};
 pub struct Config {
     #[serde(default)]
     pub ignores: Vec<String>,
+    pub name: Option<String>,
 }
 
-pub fn add_bin_files(dir: &Path, ignores: &Config, tcx: TyCtxt<'_>) {
+pub fn add_bin_files(dir: &Path, config: &Config, tcx: TyCtxt<'_>) {
     let mut visitor = HirVisitor {
         tcx,
         data: HirData::default(),
@@ -34,9 +35,10 @@ pub fn add_bin_files(dir: &Path, ignores: &Config, tcx: TyCtxt<'_>) {
         .as_array_of_tables_mut()
         .unwrap();
 
+    let mut names = vec![];
     for def_id in visitor.data.mains {
         let def_path_str = tcx.def_path_str(def_id);
-        if ignores.ignores.iter().any(|s| def_path_str.starts_with(s)) {
+        if config.ignores.iter().any(|s| def_path_str.starts_with(s)) {
             continue;
         }
 
@@ -46,7 +48,18 @@ pub fn add_bin_files(dir: &Path, ignores: &Config, tcx: TyCtxt<'_>) {
         let mut file = File::create_new(path).unwrap();
         write!(file, "fn main() {{ {crate_name}::{def_path_str}(); }}").unwrap();
 
+        names.push((bin_name, filename));
+    }
+
+    for (bin_name, filename) in &names {
         let mut t = Table::new();
+        let bin_name = if let Some(name) = &config.name
+            && names.len() == 1
+        {
+            name
+        } else {
+            bin_name
+        };
         t["name"] = toml_edit::value(bin_name);
         t["path"] = toml_edit::value(filename);
         bins.push(t);
