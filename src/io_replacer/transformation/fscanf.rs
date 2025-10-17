@@ -920,18 +920,20 @@ fn parse_float<R: std::io::BufRead, F, E>(
         return None;
     }
 
+    let mut v = Vec::new();
+    if neg {
+        v.push(b'-');
+    }
+
     if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == b'0' {
         stream.consume(1);
+        v.push(b'0');
         if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) | 32 == b'x' {
             stream.consume(1);
             panic!();
         }
     }
 
-    let mut v = Vec::new();
-    if neg {
-        v.push(b'-');
-    }
     let mut dot_seen = false;
     loop {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
