@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{ast_utils, graph_utils, ir_utils};
 
-pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
+pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path, lib_name: &str) {
     for (p, s) in &res.files {
         fs::write(p, s).unwrap();
     }
@@ -43,7 +43,7 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
         }
     }
 
-    let path = dir.join("c2rust-lib.rs");
+    let path = dir.join(lib_name);
     let mut contents = fs::read_to_string(&path).unwrap();
     if res.lib_items.contains(&LibItem::Fprintf) && !contents.contains("#![feature(c_variadic)]") {
         contents = format!("#![feature(c_variadic)]\n{contents}");
@@ -113,10 +113,10 @@ impl TransformationResult {
     }
 }
 
-pub fn replace_io(dir: &std::path::Path, tcx: TyCtxt<'_>) -> TransformationResult {
+pub fn replace_io(dir: &std::path::Path, lib_name: &str, tcx: TyCtxt<'_>) -> TransformationResult {
     let mut res = run(tcx);
     let start = std::time::Instant::now();
-    write_to_files(&res, dir);
+    write_to_files(&res, dir, lib_name);
     res.transformation_time += start.elapsed().as_millis();
     res
 }

@@ -90,7 +90,7 @@ struct Args {
     analysis_output: Option<PathBuf>,
     #[arg(short, long, help = "Path to the log file")]
     log_file: Option<PathBuf>,
-    #[arg(help = "Path to the input directory containing c2rust-lib.rs")]
+    #[arg(help = "Path to the input directory containing Cargo.toml")]
     input: PathBuf,
 }
 
@@ -293,7 +293,12 @@ fn main() {
         }
         args.input
     };
-    let file = dir.join("c2rust-lib.rs");
+
+    let lib_path = crat::find_lib_path(&dir).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let file = dir.join(&lib_path);
 
     for pass in config.passes {
         if config.verbose {
@@ -333,7 +338,7 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Split => {
-                run_compiler_on_path(&file, |_| splitter::split(&dir)).unwrap();
+                run_compiler_on_path(&file, |_| splitter::split(&dir, &lib_path)).unwrap();
             }
             Pass::Bin => {
                 run_compiler_on_path(&file, |tcx| {
@@ -360,8 +365,10 @@ fn main() {
                 .unwrap();
             }
             Pass::Io => {
-                let _res =
-                    run_compiler_on_path(&file, |tcx| io_replacer::replace_io(&dir, tcx)).unwrap();
+                let _res = run_compiler_on_path(&file, |tcx| {
+                    io_replacer::replace_io(&dir, &lib_path, tcx)
+                })
+                .unwrap();
             }
             Pass::Pointer => {
                 let s =
