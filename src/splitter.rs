@@ -5,21 +5,25 @@ use rustc_ast_pretty::pprust;
 
 use crate::ast_utils;
 
-pub fn split(path: &Path) {
-    let file = path.join("c2rust-lib.rs");
+pub fn split(dir: &Path, lib_name: &str) {
+    let file = dir.join(lib_name);
     let code = fs::read_to_string(&file).unwrap();
     let krate = ast_utils::parse_crate(code);
-    write_mod(path, None, &krate.attrs, &krate.items);
+    write_mod(dir, Name::Root(lib_name), &krate.attrs, &krate.items);
 }
 
-/// If `name` is `None`, this is the root module and we write `c2rust-lib.rs`
+enum Name<'a> {
+    Root(&'a str),
+    Mod(&'a str),
+}
+
 fn write_mod<I: AsRef<ast::Item>>(
     path: &Path,
-    name: Option<&str>,
+    name: Name<'_>,
     attrs: &[ast::Attribute],
     items: &[I],
 ) {
-    let dir = if let Some(name) = name {
+    let dir = if let Name::Mod(name) = name {
         path.join(name)
     } else {
         path.to_path_buf()
@@ -48,19 +52,20 @@ fn write_mod<I: AsRef<ast::Item>>(
             }
             let raw = if ident.is_raw_guess() { "r#" } else { "" };
             writeln!(code, "pub mod {raw}{name};").unwrap();
-            write_mod(&dir, Some(name), &item.attrs, items);
+            write_mod(&dir, Name::Mod(name), &item.attrs, items);
         } else {
             writeln!(code, "{}", pprust::item_to_string(item)).unwrap();
         }
     }
-    let file = if let Some(name) = name {
-        if has_submodules {
-            dir.join("mod.rs")
-        } else {
-            path.join(format!("{name}.rs"))
+    let file = match name {
+        Name::Mod(name) => {
+            if has_submodules {
+                dir.join("mod.rs")
+            } else {
+                path.join(format!("{name}.rs"))
+            }
         }
-    } else {
-        dir.join("c2rust-lib.rs")
+        Name::Root(name) => dir.join(name),
     };
     fs::write(file, code).unwrap();
 }

@@ -139,6 +139,21 @@
 //! ```rust,ignore
 //! fn foo(x: Option::<fn(*mut FILE)>) {}
 //! ```
+//!
+//! # Remove `let ref`
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! let ref mut fresh0 = *p.offset(0 as libc::c_int as isize);
+//! *fresh0 += 1;
+//! ```
+//!
+//! We replace such code with the following code:
+//!
+//! ```rust,ignore
+//! *p.offset(0 as libc::c_int as isize) += 1;
+//! ```
 
 use std::fmt::Write as _;
 
@@ -198,6 +213,7 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
         params_to_be_mut,
         call_to_if_args: visitor.ctx.call_to_if_args,
         call_to_nested_args: visitor.ctx.call_to_nested_args,
+        let_ref_exprs: FxHashMap::default(),
         updated: false,
     };
 
@@ -213,6 +229,7 @@ struct ExpandedAstVisitor<'tcx> {
     vars_to_replace: FxHashMap<HirId, Symbol>,
     call_to_if_args: FxHashMap<HirId, Vec<ArgIdx>>,
     call_to_nested_args: FxHashMap<HirId, Vec<ArgIdx>>,
+    let_ref_exprs: FxHashMap<HirId, Expr>,
     updated: bool,
 }
 
@@ -264,16 +281,35 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                 }
             } else {
                 assert = is_assert_stmt(stmt);
-                if let StmtKind::Let(local) = &stmt.kind
-                    && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-                    && self.lets_to_remove.contains(&hir_stmt.hir_id)
-                {
-                    self.updated = true;
-                    *stmt = stmt!("{{}}");
-                }
             }
         }
+
         mut_visit::walk_block(self, b);
+
+        b.stmts.retain(|stmt| {
+            if let StmtKind::Let(local) = &stmt.kind
+                && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+                && self.lets_to_remove.contains(&hir_stmt.hir_id)
+            {
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn visit_local(&mut self, local: &mut Local) {
+        mut_visit::walk_local(self, local);
+
+        if let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(_), _), id, _, _) =
+                hir_stmt.pat.kind
+            && let LocalKind::Init(box e) = &local.kind
+            && matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
+        {
+            self.let_ref_exprs.insert(id, e.clone());
+            self.lets_to_remove.insert(hir_stmt.hir_id);
+        }
     }
 
     fn visit_param(&mut self, param: &mut Param) {
@@ -367,6 +403,16 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                 self.updated = true;
                 let arg = pprust::expr_to_string(arg);
                 *expr = expr!("{arg}");
+            }
+            ExprKind::Unary(UnOp::Deref, e) => {
+                if !matches!(e.kind, ExprKind::Path(_, _)) {
+                    return;
+                }
+                let hir_expr = some_or!(self.ast_to_hir.get_expr(e.id, self.tcx), return);
+                let hir::ExprKind::Path(QPath::Resolved(_, path)) = hir_expr.kind else { panic!() };
+                let Res::Local(hir_id) = path.res else { return };
+                let v = some_or!(self.let_ref_exprs.get(&hir_id), return);
+                *expr = v.clone();
             }
             _ => {}
         }
@@ -1386,6 +1432,36 @@ pub unsafe extern "C" fn f() -> libc::c_int {
             "#,
             &["h: Option"],
             &["h: int_func"],
+        );
+    }
+
+    #[test]
+    fn test_let_ref_1() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut p: *mut libc::c_int) {
+    let ref mut fresh0 = *p.offset(0 as libc::c_int as isize);
+    *fresh0 += 1;
+    *fresh0;
+}
+            "#,
+            &["*p.offset(0 as libc::c_int as isize)"],
+            &["fresh0"],
+        );
+    }
+
+    #[test]
+    fn test_let_ref_2() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
+    let ref mut fresh0 = *p.offset(0 as libc::c_int as isize);
+    *fresh0 = (*fresh0).wrapping_add(1);
+    *fresh0;
+}
+            "#,
+            &["*p.offset(0 as libc::c_int as isize)"],
+            &["fresh0"],
         );
     }
 }

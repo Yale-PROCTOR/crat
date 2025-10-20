@@ -31,6 +31,11 @@ struct Args {
         help = "Main function to ignore when adding bin files"
     )]
     bin_ignore: Vec<String>,
+    #[arg(
+        long,
+        help = "Name of the binary. Works only when there is a single main function."
+    )]
+    bin_name: Option<String>,
 
     // Andersen
     #[arg(long, help = "Use optimized MIR for points-to analysis")]
@@ -90,7 +95,7 @@ struct Args {
     analysis_output: Option<PathBuf>,
     #[arg(short, long, help = "Path to the log file")]
     log_file: Option<PathBuf>,
-    #[arg(help = "Path to the input directory containing c2rust-lib.rs")]
+    #[arg(help = "Path to the input directory containing Cargo.toml")]
     input: PathBuf,
 }
 
@@ -219,6 +224,9 @@ fn main() {
     for arg in args.bin_ignore {
         config.bin.ignores.push(arg);
     }
+    if args.bin_name.is_some() {
+        config.bin.name = args.bin_name;
+    }
 
     config.andersen.use_optimized_mir |= args.andersen_use_optimized_mir;
 
@@ -293,7 +301,12 @@ fn main() {
         }
         args.input
     };
-    let file = dir.join("c2rust-lib.rs");
+
+    let lib_path = crat::find_lib_path(&dir).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let file = dir.join(&lib_path);
 
     for pass in config.passes {
         if config.verbose {
@@ -333,7 +346,7 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Split => {
-                run_compiler_on_path(&file, |_| splitter::split(&dir)).unwrap();
+                run_compiler_on_path(&file, |_| splitter::split(&dir, &lib_path)).unwrap();
             }
             Pass::Bin => {
                 run_compiler_on_path(&file, |tcx| {
@@ -360,11 +373,15 @@ fn main() {
                 .unwrap();
             }
             Pass::Io => {
-                let _res =
-                    run_compiler_on_path(&file, |tcx| io_replacer::replace_io(&dir, tcx)).unwrap();
+                let _res = run_compiler_on_path(&file, |tcx| {
+                    io_replacer::replace_io(&dir, &lib_path, tcx)
+                })
+                .unwrap();
             }
             Pass::Pointer => {
-                todo!()
+                let s =
+                    run_compiler_on_path(&file, pointer_replacer::replace_local_borrows).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
         }
     }

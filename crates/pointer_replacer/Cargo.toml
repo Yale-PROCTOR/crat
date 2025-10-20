@@ -1,0 +1,15 @@
+[package]
+name = "pointer_replacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+itertools = "0.14.0"
+small_vec = { package = "smallvec", version = "1.15.1", features = ["const_new"] }
+petgraph = "0.8.2"
+regex = "1.12.2"
+tracing.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

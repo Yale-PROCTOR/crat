@@ -8,7 +8,7 @@ use rustc_ast::{
     visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, QPath, def::Res, def_id::LocalDefId, intravisit, intravisit::Visitor as _,
 };
@@ -24,18 +24,6 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     let ast_to_hir = ast_utils::make_ast_to_hir(&mut krate, tcx);
     ast_utils::remove_unnecessary_items_from_ast(&mut krate);
 
-    krate.attrs.retain(|attr| {
-        if let ast::AttrKind::Normal(attr) = &attr.kind
-            && attr.item.path.segments.last().unwrap().ident.name == sym::feature
-            && let Some(arg) = ast_utils::get_attr_arg(&attr.item.args)
-            && let arg = arg.as_str()
-            && (arg == "derive_clone_copy" || arg == "hint_must_use" || arg == "panic_internals")
-        {
-            return false;
-        }
-        true
-    });
-
     let mut pre_visitor = Previsitor {
         tcx,
         ast_to_hir,
@@ -49,6 +37,26 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
         ctx: pre_visitor.ctx,
     };
     visitor.visit_crate(&mut krate);
+
+    let mut unnecessary_attributes: FxHashSet<_> =
+        ["derive_clone_copy", "hint_must_use", "panic_internals"]
+            .into_iter()
+            .collect();
+    if !visitor.ctx.use_intrinsics {
+        unnecessary_attributes.insert("core_intrinsics");
+    }
+
+    krate.attrs.retain(|attr| {
+        if let ast::AttrKind::Normal(attr) = &attr.kind
+            && attr.item.path.segments.last().unwrap().ident.name == sym::feature
+            && let Some(arg) = ast_utils::get_attr_arg(&attr.item.args)
+            && let arg = arg.as_str()
+            && unnecessary_attributes.contains(arg)
+        {
+            return false;
+        }
+        true
+    });
 
     pprust::crate_to_string_for_macros(&krate)
 }
@@ -146,6 +154,7 @@ impl MutVisitor for AstVisitor<'_> {
 struct Ctx {
     derived_traits: FxHashMap<LocalDefId, Vec<Symbol>>,
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
+    use_intrinsics: bool,
 }
 
 struct BitField {
@@ -213,6 +222,15 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
             }
         }
         visit::walk_item(self, item);
+    }
+
+    fn visit_path(&mut self, path: &'ast ast::Path) {
+        if let [pre @ .., _] = &path.segments[..]
+            && pre.iter().any(|s| s.ident.name == sym::intrinsics)
+        {
+            self.ctx.use_intrinsics = true;
+        }
+        visit::walk_path(self, path);
     }
 }
 

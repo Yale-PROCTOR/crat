@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2025 PLRG@KAIST
+Copyright (c) The Crat Project Contributors
+Copyright (c) The Crown Project Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +20,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Copyright Information
+
+The code in `crates/pointer_replacer` is under the MIT License from multiple
+contributors:
+
+* Original portions Copyright (c) The Crown Project Contributors (Source:
+  https://github.com/KomaEc/crown)
+* Modifications Copyright (c) The Crat Project Contributors
+
+The other code in this repository is under the MIT License from The Crat Project
+Contributors.

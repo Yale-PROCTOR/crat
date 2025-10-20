@@ -747,7 +747,7 @@ fn parse_scan_set<R: std::io::BufRead>(
     pos: bool,
     set: &[u8],
 ) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = vec![];
+    let mut v: Vec<u8> = Vec::new();
     while width.is_none_or(|lim| v.len() < lim) {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff || set.contains(&c) != pos {
@@ -771,7 +771,7 @@ fn parse_string<R: std::io::BufRead>(
     mut err: Option<&mut i32>,
     mut eof: Option<&mut i32>,
 ) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = vec![];
+    let mut v: Vec<u8> = Vec::new();
     while width.is_none_or(|lim| v.len() < lim) {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff {
@@ -920,18 +920,20 @@ fn parse_float<R: std::io::BufRead, F, E>(
         return None;
     }
 
-    if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == b'0' {
-        stream.consume(1);
-        if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) | 32 == b'x' {
-            stream.consume(1);
-            todo!("hex float parsing");
-        }
-    }
-
-    let mut v = vec![];
+    let mut v = Vec::new();
     if neg {
         v.push(b'-');
     }
+
+    if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == b'0' {
+        stream.consume(1);
+        v.push(b'0');
+        if peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) | 32 == b'x' {
+            stream.consume(1);
+            panic!();
+        }
+    }
+
     let mut dot_seen = false;
     loop {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());

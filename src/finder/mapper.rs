@@ -8,7 +8,7 @@ use rustc_span::{FileName, RealFileName};
 
 use crate::{ast_utils, ir_utils, rustc_ast::visit::Visitor};
 
-pub fn run(dir: &Path, verbose: bool, tcx: TyCtxt<'_>) {
+pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
     let borrowed = tcx.resolver_for_lowering().borrow();
     let mut expanded_crate = borrowed.1.as_ref().clone();
     drop(borrowed);
@@ -35,7 +35,7 @@ pub fn run(dir: &Path, verbose: bool, tcx: TyCtxt<'_>) {
             _ => continue,
         };
         let src = some_or!(file.src.as_ref(), continue);
-        if p.file_name().unwrap().to_str().unwrap() == "c2rust-lib.rs" {
+        if p.file_name().unwrap().to_str().unwrap() == lib_name {
             continue;
         }
         let mut parser = rustc_parse::new_parser_from_source_str(

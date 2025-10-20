@@ -1721,10 +1721,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
         tref: &mut PolyTraitRef,
         htref: &hir::PolyTraitRef<'tcx>,
     ) {
-        assert_eq!(
-            tref.bound_generic_params.len(),
-            htref.bound_generic_params.len()
-        );
+        assert!(tref.bound_generic_params.len() <= htref.bound_generic_params.len());
         for (param, hparam) in tref
             .bound_generic_params
             .iter_mut()

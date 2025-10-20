@@ -767,7 +767,7 @@ pub(crate) unsafe fn rs_vfprintf<W: std::io::Write>(
 ) -> (i32, i32) {
     let fmt = std::ffi::CStr::from_ptr(fmt as _);
     let mut state = PrintfState::Percent;
-    let mut flags = vec![];
+    let mut flags = Vec::new();
     let mut width = None;
     let mut precision = None;
     let mut length = None;
@@ -1414,7 +1414,7 @@ impl std::fmt::Display for Gf64 {
         };
         let s = if x >= -4 && x < p as i32 {
             let frac_prec = (p as i32 - (x + 1)).max(0) as usize;
-            let mut s = format!("{abs:.frac_prec$}");
+            let mut s = std::fmt::format(format_args!("{abs:.frac_prec$}"));
             if !f.alternate() && s.contains('.') {
                 while s.ends_with('0') {
                     s.pop();
@@ -1426,7 +1426,7 @@ impl std::fmt::Display for Gf64 {
             s
         } else {
             let exp_prec = p.saturating_sub(1);
-            let s_full = format!("{abs:.exp_prec$e}");
+            let s_full = std::fmt::format(format_args!("{abs:.exp_prec$e}"));
             let idx = s_full.find('e').unwrap();
             let mut mant = s_full[..idx].to_string();
             let exp = &s_full[idx + 1..];
@@ -1451,11 +1451,11 @@ impl std::fmt::Display for Gf64 {
                 )
             };
             let digits = if digits.len() < 2 {
-                format!("0{digits}")
+                std::fmt::format(format_args!("0{digits}"))
             } else {
                 digits.to_string()
             };
-            format!("{mant}e{sign_e}{digits}")
+            std::fmt::format(format_args!("{mant}e{sign_e}{digits}"))
         };
         f.write_str(sign)?;
         f.write_str(&s)
