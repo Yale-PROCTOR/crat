@@ -1,19 +1,26 @@
 //! Remove unnecessary `unsafe`.
 
 use rustc_ast::{
-    self as ast,
+    self as ast, DUMMY_NODE_ID,
     mut_visit::{self, MutVisitor as _},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_index::bit_set::ChunkedBitSet;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Span, def_id::LocalDefId};
-use utils::unsafety;
+use rustc_span::{Span, def_id::LocalDefId, symbol::sym};
+use serde::Deserialize;
+use utils::{path, unsafety};
 
 use crate::{ast_utils, graph_utils};
 
-pub fn resolve_unsafe(tcx: TyCtxt<'_>) {
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    pub remove_no_mangle: bool,
+    pub replace_pub: bool,
+}
+
+pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) {
     let unsafe_fns = find_unsafe_fns(tcx)
         .into_iter()
         .map(|def_id| {
@@ -24,6 +31,8 @@ pub fn resolve_unsafe(tcx: TyCtxt<'_>) {
         .collect();
     let mut visitor = AstVisitor {
         unsafe_fns,
+        remove_no_mangle: config.remove_no_mangle,
+        replace_pub: config.replace_pub,
         updated: false,
     };
     let res = ast_utils::transform_ast(
@@ -39,11 +48,37 @@ pub fn resolve_unsafe(tcx: TyCtxt<'_>) {
 
 struct AstVisitor {
     unsafe_fns: FxHashSet<Span>,
+    remove_no_mangle: bool,
+    replace_pub: bool,
     updated: bool,
 }
 
 impl mut_visit::MutVisitor for AstVisitor {
     fn visit_item(&mut self, item: &mut ast::Item) {
+        let path = path!("crate");
+        if self.replace_pub && item.vis.kind.is_pub() {
+            if let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind
+                && ident.name == sym::main
+            {
+            } else {
+                item.vis.kind = ast::VisibilityKind::Restricted {
+                    path: ast::ptr::P::new(path),
+                    id: DUMMY_NODE_ID,
+                    shorthand: true,
+                };
+                self.updated = true;
+            }
+        }
+
+        if self.remove_no_mangle {
+            item.attrs.retain(|attr| {
+                let ast::AttrKind::Normal(normal) = &attr.kind else { return true };
+                let b = normal.item.path.segments.last().unwrap().ident.name != sym::no_mangle;
+                self.updated |= !b;
+                b
+            });
+        }
+
         if let ast::ItemKind::Fn(box ast::Fn { ident, sig, .. }) = &mut item.kind
             && !self.unsafe_fns.contains(&ident.span)
             && matches!(sig.header.safety, ast::Safety::Unsafe(_))
@@ -51,6 +86,7 @@ impl mut_visit::MutVisitor for AstVisitor {
             sig.header.safety = ast::Safety::Default;
             self.updated = true;
         }
+
         mut_visit::walk_item(self, item);
     }
 }

@@ -66,29 +66,30 @@ impl LinkHint {
 pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = ast_utils::expanded_ast(tcx);
 
-    let top_level_mods = expanded_ast
-        .items
-        .iter()
-        .find_map(|item| {
-            if let ast::ItemKind::Mod(_, ident, ast::ModKind::Loaded(items, _, _, _)) = &item.kind
-                && ident.name.as_str() == "src"
-            {
-                Some(items)
-            } else {
-                None
-            }
-        })
-        .unwrap()
-        .iter()
-        .filter_map(|item| {
-            if let ast::ItemKind::Mod(_, ident, _) = &item.kind {
-                Some(ident.name.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
     let priorities = config.cmake_reply_index_file.as_ref().map(|index_file| {
+        let top_level_mods = expanded_ast
+            .items
+            .iter()
+            .find_map(|item| {
+                if let ast::ItemKind::Mod(_, ident, ast::ModKind::Loaded(items, _, _, _)) =
+                    &item.kind
+                    && ident.name.as_str() == "src"
+                {
+                    Some(items)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+            .iter()
+            .filter_map(|item| {
+                if let ast::ItemKind::Mod(_, ident, _) = &item.kind {
+                    Some(ident.name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let build_dir = config.build_dir.as_deref().unwrap();
         let source_dir = config.source_dir.as_deref().unwrap();
         cmake_reply::parse_index_file(index_file, build_dir, source_dir, &top_level_mods)

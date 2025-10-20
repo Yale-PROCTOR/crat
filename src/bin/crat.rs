@@ -30,6 +30,12 @@ struct Args {
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern types (example: `from::foo to::foo`)")]
     extern_type_hints: Vec<String>,
 
+    // Unsafe
+    #[arg(long, help = "Remove no_mangle attributes")]
+    unsafe_remove_no_mangle: bool,
+    #[arg(long, help = "Replace `pub` with `pub(crate)`")]
+    unsafe_replace_pub: bool,
+
     // Bin
     #[arg(
         long,
@@ -140,13 +146,15 @@ struct Config {
     #[serde(default)]
     r#extern: extern_resolver::Config,
     #[serde(default)]
-    andersen: points_to::andersen::Config,
+    r#unsafe: unsafe_resolver::Config,
     #[serde(default)]
     bin: bin_file_adder::Config,
     #[serde(default)]
     r#union: union_replacer::tag_analysis::Config,
     #[serde(default)]
     outparam: outparam_replacer::Config,
+    #[serde(default)]
+    andersen: points_to::andersen::Config,
 
     #[serde(default)]
     verbose: bool,
@@ -235,6 +243,9 @@ fn main() {
             .type_hints
             .push(extern_resolver::LinkHint::new(from.clone(), to.clone()));
     }
+
+    config.r#unsafe.remove_no_mangle |= args.unsafe_remove_no_mangle;
+    config.r#unsafe.replace_pub |= args.unsafe_replace_pub;
 
     for arg in args.bin_ignore {
         config.bin.ignores.push(arg);
@@ -347,7 +358,10 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Unsafe => {
-                run_compiler_on_path(&file, unsafe_resolver::resolve_unsafe).unwrap();
+                run_compiler_on_path(&file, |tcx| {
+                    unsafe_resolver::resolve_unsafe(&config.r#unsafe, tcx)
+                })
+                .unwrap();
             }
             Pass::UPreprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
