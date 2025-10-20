@@ -1,5 +1,7 @@
 //! Replaces extern items with `use`.
 
+use std::path::PathBuf;
+
 use ast::ptr::P;
 use etrace::some_or;
 use rustc_abi::VariantIdx;
@@ -30,8 +32,13 @@ use crate::{
     ir_utils::{self, AstToHir},
 };
 
+mod cmake_reply;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
+    pub cmake_reply_index_file: Option<PathBuf>,
+    pub build_dir: Option<PathBuf>,
+    pub source_dir: Option<PathBuf>,
     #[serde(default)]
     pub choose_arbitrary: bool,
 
@@ -58,9 +65,38 @@ impl LinkHint {
 
 pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = ast_utils::expanded_ast(tcx);
+
+    let top_level_mods = expanded_ast
+        .items
+        .iter()
+        .find_map(|item| {
+            if let ast::ItemKind::Mod(_, ident, ast::ModKind::Loaded(items, _, _, _)) = &item.kind
+                && ident.name.as_str() == "src"
+            {
+                Some(items)
+            } else {
+                None
+            }
+        })
+        .unwrap()
+        .iter()
+        .filter_map(|item| {
+            if let ast::ItemKind::Mod(_, ident, _) = &item.kind {
+                Some(ident.name.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let priorities = config.cmake_reply_index_file.as_ref().map(|index_file| {
+        let build_dir = config.build_dir.as_deref().unwrap();
+        let source_dir = config.source_dir.as_deref().unwrap();
+        cmake_reply::parse_index_file(index_file, build_dir, source_dir, &top_level_mods)
+    });
+
     let ast_to_hir = ast_utils::make_ast_to_hir(&mut expanded_ast, tcx);
     let result = resolve(tcx);
-    let resolve_map = make_resolve_map(&result, config, tcx);
+    let resolve_map = make_resolve_map(&result, &priorities, config, tcx);
     ast_utils::remove_unnecessary_items_from_ast(&mut expanded_ast);
     let mut visitor = ExpandedAstVisitor {
         tcx,
@@ -75,7 +111,7 @@ pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> Strin
 
 pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
     let result = resolve(tcx);
-    let resolve_map = make_resolve_map(&result, config, tcx);
+    let resolve_map = make_resolve_map(&result, &None, config, tcx);
     let mut visitor = AstVisitor {
         tcx,
         span_to_def_id: result.span_to_def_id,
@@ -109,6 +145,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
 
 fn make_resolve_map(
     result: &ResolveResult,
+    priorities: &Option<FxHashMap<String, usize>>,
     config: &Config,
     tcx: TyCtxt<'_>,
 ) -> FxHashMap<LocalDefId, LocalDefId> {
@@ -150,6 +187,7 @@ fn make_resolve_map(
         &result.equiv_adts,
         &mut resolve_map,
         &config.type_hints,
+        priorities,
         config.choose_arbitrary,
         tcx,
     );
@@ -159,6 +197,7 @@ fn make_resolve_map(
         &result.equiv_fns,
         &mut resolve_map,
         &config.function_hints,
+        priorities,
         config.choose_arbitrary,
         tcx,
     );
@@ -168,6 +207,7 @@ fn make_resolve_map(
         &result.equiv_statics,
         &mut resolve_map,
         &config.static_hints,
+        priorities,
         config.choose_arbitrary,
         tcx,
     );
@@ -177,6 +217,7 @@ fn make_resolve_map(
     resolve_map
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn link_externs(
     kind: &str,
@@ -184,6 +225,7 @@ fn link_externs(
     equivs: &FxHashMap<Symbol, EquivClasses<LocalDefId>>,
     resolve_map: &mut FxHashMap<LocalDefId, LocalDefId>,
     hints: &[LinkHint],
+    priorities: &Option<FxHashMap<String, usize>>,
     choose_arbitrary: bool,
     tcx: TyCtxt<'_>,
 ) -> bool {
@@ -218,6 +260,27 @@ fn link_externs(
         if let [id, others @ ..] = &link_candidates[..]
             && (choose_arbitrary || others.is_empty())
         {
+            let class = &classes.0[*id];
+            let rep = find_representative_def_id(class, tcx);
+            resolve_map.insert(*def_id, rep);
+        } else if let Some(priorities) = priorities {
+            let (id, _) = link_candidates
+                .iter()
+                .flat_map(|cand| {
+                    let class = &classes.0[*cand];
+                    let priority = class
+                        .iter()
+                        .flat_map(|def_id| {
+                            let s = tcx.def_path_str(*def_id);
+                            let i = s.rfind("::").unwrap();
+                            priorities.get(&s[..i]).copied()
+                        })
+                        .min();
+                    priority.map(|p| (cand, p))
+                })
+                .min_by_key(|(_, p)| *p)
+                .unwrap();
+
             let class = &classes.0[*id];
             let rep = find_representative_def_id(class, tcx);
             resolve_map.insert(*def_id, rep);

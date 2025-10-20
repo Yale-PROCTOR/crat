@@ -15,6 +15,12 @@ use utils::compilation::run_compiler_on_path;
 #[command(version)]
 struct Args {
     // Extern
+    #[arg(long, help = "Path to the CMake reply index file")]
+    extern_cmake_reply_index_file: Option<PathBuf>,
+    #[arg(long, help = "Path to the top-level build directory for CMake")]
+    extern_build_dir: Option<PathBuf>,
+    #[arg(long, help = "Path to the top-level source directory for CMake")]
+    extern_source_dir: Option<PathBuf>,
     #[arg(long, help = "Choose an arbitrary one when multiple candidates exist")]
     extern_choose_arbitrary: bool,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern functions (example: `from::foo to::foo`)")]
@@ -198,6 +204,15 @@ fn main() {
             .init();
     }
 
+    if args.extern_cmake_reply_index_file.is_some() {
+        config.r#extern.cmake_reply_index_file = args.extern_cmake_reply_index_file;
+    }
+    if args.extern_build_dir.is_some() {
+        config.r#extern.build_dir = args.extern_build_dir;
+    }
+    if args.extern_source_dir.is_some() {
+        config.r#extern.source_dir = args.extern_source_dir;
+    }
     config.r#extern.choose_arbitrary |= args.extern_choose_arbitrary;
     for args in args.extern_function_hints.chunks(2) {
         let [from, to] = args else { panic!() };
@@ -262,7 +277,7 @@ fn main() {
         config.outparam.analysis_file = args.outparam_analysis_file;
     }
     if args.points_to_file.is_some() {
-        config.outparam.points_to_file = args.points_to_file.clone();
+        config.outparam.points_to_file = args.points_to_file;
     }
 
     let dir = if !config.passes.is_empty() {
