@@ -401,7 +401,10 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::OutParam => {
-                todo!()
+                run_compiler_on_path(&file, |tcx| {
+                    outparam_replacer::transform::transform(tcx, &dir, &lib_path, &config.outparam)
+                })
+                .unwrap();
             }
             Pass::Lock => {
                 todo!()
@@ -451,18 +454,19 @@ fn main() {
                         &config.outparam,
                         config.verbose,
                         tcx,
-                    );
+                    )
+                    .0;
                     let fns = res
                         .iter()
-                        .filter(|(_, (_, res))| !res.output_params.is_empty())
+                        .filter(|(_, res)| !res.output_params.is_empty())
                         .count();
                     let musts = res
                         .values()
-                        .map(|res| res.1.output_params.iter().filter(|p| p.must).count())
+                        .map(|res| res.output_params.iter().filter(|p| p.must).count())
                         .sum::<usize>();
                     let mays = res
                         .values()
-                        .map(|res| res.1.output_params.iter().filter(|p| !p.must).count())
+                        .map(|res| res.output_params.iter().filter(|p| !p.must).count())
                         .sum::<usize>();
                     println!("{fns} {musts} {mays}");
 

@@ -68,7 +68,8 @@ impl LoHi {
 }
 
 // The result of the output parameter analysis
-pub type AnalysisResult = FxHashMap<String, (FunctionSummary, FnAnalysisRes)>;
+pub type AnalysisResult = FxHashMap<String, FnAnalysisRes>;
+pub type FunctionSummaries = FxHashMap<String, FunctionSummary>;
 
 #[derive(Clone, Debug)]
 pub struct FunctionSummary {
@@ -176,7 +177,7 @@ pub fn write_analysis_result(path: &Path, result: &AnalysisResult) {
     let file = std::fs::File::create(path).unwrap();
     let writes = result
         .iter()
-        .filter_map(|(def_id, (_summary, res))| {
+        .filter_map(|(def_id, res)| {
             if res.output_params.is_empty() {
                 None
             } else {
@@ -191,7 +192,7 @@ pub fn analyze(
     config: &crate::outparam_replacer::Config,
     verbose: bool,
     tcx: TyCtxt<'_>,
-) -> AnalysisResult {
+) -> (AnalysisResult, FunctionSummaries) {
     let mut call_graph = FxHashMap::default();
     let mut inputs_map = FxHashMap::default();
     let mut if_map = FxHashMap::default();
@@ -630,7 +631,8 @@ pub fn analyze(
                 wbrs,
                 rcfws,
             };
-            (tcx.def_path_str(def_id), (summary, res))
+            let path_str = tcx.def_path_str(def_id);
+            ((path_str.clone(), res), (path_str, summary))
         })
         .collect()
 }
@@ -1401,6 +1403,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
             self.call_args.clear();
             while let Some(label) = work_list.pop() {
+                // println!("Analyzing location: {:?}", label.location);
                 let state = states
                     .get(&label.location)
                     .and_then(|states| states.get(&(label.writes.clone(), label.nulls.clone())))
