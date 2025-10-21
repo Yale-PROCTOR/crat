@@ -31,6 +31,8 @@ struct Args {
     extern_type_hints: Vec<String>,
 
     // Unsafe
+    #[arg(long, help = "Remove unused items")]
+    unsafe_remove_unused: bool,
     #[arg(long, help = "Remove no_mangle attributes")]
     unsafe_remove_no_mangle: bool,
     #[arg(long, help = "Replace `pub` with `pub(crate)`")]
@@ -244,6 +246,7 @@ fn main() {
             .push(extern_resolver::LinkHint::new(from.clone(), to.clone()));
     }
 
+    config.r#unsafe.remove_unused |= args.unsafe_remove_unused;
     config.r#unsafe.remove_no_mangle |= args.unsafe_remove_no_mangle;
     config.r#unsafe.replace_pub |= args.unsafe_replace_pub;
 
@@ -358,10 +361,11 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Unsafe => {
-                run_compiler_on_path(&file, |tcx| {
+                let s = run_compiler_on_path(&file, |tcx| {
                     unsafe_resolver::resolve_unsafe(&config.r#unsafe, tcx)
                 })
                 .unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::UPreprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
