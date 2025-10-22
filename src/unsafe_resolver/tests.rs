@@ -12,10 +12,10 @@ fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], e
         super::resolve_unsafe(&config, tcx)
     })
     .unwrap();
-    utils::compilation::run_compiler_on_str(&code, |tcx| {
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
         crate::type_checker::type_check(tcx);
     })
-    .unwrap();
+    .expect(&transformed);
     for include in includes {
         assert!(
             transformed.contains(include),
@@ -96,6 +96,30 @@ mod b {
         true,
         &["fn main()", "fn g()"],
         &["fn f()", "use crate::a::g;"],
+    );
+}
+
+#[test]
+fn test_transformation_unused_method() {
+    let code = r#"
+trait A {
+    fn f();
+    fn g();
+}
+struct S {}
+impl A for S {
+    fn f() {}
+    fn g() {}
+}
+fn main() {
+    S::g();
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["fn main()", "fn g()", "trait A", "struct S", "impl A for S"],
+        &["fn f()"],
     );
 }
 

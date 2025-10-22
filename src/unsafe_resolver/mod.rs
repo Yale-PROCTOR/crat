@@ -14,7 +14,7 @@ use rustc_hir::{
     intravisit::{self, VisitorExt},
 };
 use rustc_index::bit_set::ChunkedBitSet;
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{hir::nested_filter, thir, ty::TyCtxt};
 use rustc_span::{Span, def_id::LocalDefId, symbol::sym};
 use serde::Deserialize;
 use smallvec::smallvec;
@@ -37,27 +37,47 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut visitor = HirVisitor {
         tcx,
         mains: vec![],
+        fns: vec![],
         uses: vec![],
         used: FxHashMap::default(),
         item_mods: FxHashMap::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+    let mut used = visitor.used;
 
-    let used_items: FxHashSet<_> = visitor
-        .mains
+    // trait method calls are not resolved in HIR, so we visit THIR
+    for def_id in tcx.hir_body_owners() {
+        let (thir, expr_id) = tcx.thir_body(def_id).unwrap();
+        let thir = thir.borrow();
+        let mut visitor = ThirVisitor {
+            thir: &thir,
+            callees: vec![],
+        };
+        use thir::visit::Visitor as _;
+        visitor.visit_expr(&thir[expr_id]);
+        used.entry(def_id).or_default().extend(visitor.callees);
+    }
+
+    let entries = if visitor.mains.is_empty() {
+        // when no main, consider all functions as entry points
+        &visitor.fns
+    } else {
+        &visitor.mains
+    };
+    let used_items: FxHashSet<_> = entries
         .iter()
-        .flat_map(|def_id| graph_utils::reachable_vertices(&visitor.used, *def_id))
+        .flat_map(|def_id| graph_utils::reachable_vertices(&used, *def_id))
         .collect();
 
     let mut def_ids = vec![];
-    for ids in visitor.used.values() {
+    for ids in used.values() {
         def_ids.extend(ids.iter().copied());
     }
     for def_id in def_ids {
-        visitor.used.entry(def_id).or_default();
+        used.entry(def_id).or_default();
     }
 
-    let used_inv = graph_utils::inverse(&visitor.used);
+    let used_inv = graph_utils::inverse(&used);
     let removable_uses: FxHashSet<_> = visitor
         .uses
         .iter()
@@ -114,6 +134,20 @@ impl mut_visit::MutVisitor for AstVisitor {
             return smallvec![];
         }
         mut_visit::walk_flat_map_foreign_item(self, item)
+    }
+
+    fn flat_map_assoc_item(
+        &mut self,
+        item: P<ast::AssocItem>,
+        ctxt: ast::visit::AssocCtxt,
+    ) -> smallvec::SmallVec<[P<ast::AssocItem>; 1]> {
+        if self.config.remove_unused
+            && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
+            && !self.used_items.contains(def_id)
+        {
+            return smallvec![];
+        }
+        mut_visit::walk_flat_map_assoc_item(self, item, ctxt)
     }
 
     fn flat_map_item(&mut self, item: P<ast::Item>) -> smallvec::SmallVec<[P<ast::Item>; 1]> {
@@ -189,6 +223,7 @@ impl mut_visit::MutVisitor for AstVisitor {
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     mains: Vec<LocalDefId>,
+    fns: Vec<LocalDefId>,
     uses: Vec<(LocalDefId, Vec<DefId>)>,
     used: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     item_mods: FxHashMap<LocalDefId, LocalDefId>,
@@ -226,6 +261,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         self.add_item_mod(item.owner_id.def_id);
         match item.kind {
             hir::ItemKind::Fn { ident, .. } => {
+                self.fns.push(item.owner_id.def_id);
                 if ident.name == sym::main {
                     self.mains.push(item.owner_id.def_id);
                 }
@@ -233,13 +269,20 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             hir::ItemKind::Impl(imp) => {
                 if let Some(of_trait) = imp.of_trait
                     && let Some(def_id) = of_trait.trait_def_id()
-                    && let Some(def_id) = def_id.as_local()
                 {
-                    // if a trait is used, then the impl is considered used
-                    self.used
-                        .entry(def_id)
-                        .or_default()
-                        .insert(item.owner_id.def_id);
+                    if let Some(def_id) = def_id.as_local() {
+                        // if a trait is used, then the impl is considered used
+                        self.used
+                            .entry(def_id)
+                            .or_default()
+                            .insert(item.owner_id.def_id);
+                    } else {
+                        // if a trait is not local, all the associated items are considered used
+                        self.used
+                            .entry(item.owner_id.def_id)
+                            .or_default()
+                            .extend(imp.items.iter().map(|id| id.id.owner_id.def_id));
+                    }
                 }
 
                 let mut visitor = HirTyVisitor {
@@ -266,20 +309,23 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         && let Some(trait_item_def_id) = trait_item_def_id.as_local()
                     {
                         // if an associated item is used, then the corresponding trait item is
-                        // considered used
+                        // considered used, and vice versa
                         self.used
                             .entry(assoc_item.owner_id.def_id)
                             .or_default()
                             .insert(trait_item_def_id);
+                        self.used
+                            .entry(trait_item_def_id)
+                            .or_default()
+                            .insert(assoc_item.owner_id.def_id);
                     }
                 }
             }
             hir::ItemKind::Trait(_, _, _, _, _, items) => {
                 for item_ref in items {
-                    let trait_item = self.tcx.hir_trait_item(item_ref.id);
                     // if an associated item is used, then the trait is considered used
                     self.used
-                        .entry(trait_item.owner_id.def_id)
+                        .entry(item_ref.id.owner_id.def_id)
                         .or_default()
                         .insert(item.owner_id.def_id);
                 }
@@ -345,6 +391,26 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirTyVisitor<'tcx> {
             self.def_ids.push(def_id);
         }
         intravisit::walk_path(self, path)
+    }
+}
+
+struct ThirVisitor<'thir, 'tcx> {
+    thir: &'thir thir::Thir<'tcx>,
+    callees: Vec<LocalDefId>,
+}
+
+impl<'thir, 'tcx> thir::visit::Visitor<'thir, 'tcx> for ThirVisitor<'thir, 'tcx> {
+    fn thir(&self) -> &'thir thir::Thir<'tcx> {
+        self.thir
+    }
+
+    fn visit_expr(&mut self, expr: &'thir thir::Expr<'tcx>) {
+        if let rustc_middle::ty::TyKind::FnDef(def_id, _) = expr.ty.kind()
+            && let Some(def_id) = def_id.as_local()
+        {
+            self.callees.push(def_id);
+        }
+        thir::visit::walk_expr(self, expr);
     }
 }
 
