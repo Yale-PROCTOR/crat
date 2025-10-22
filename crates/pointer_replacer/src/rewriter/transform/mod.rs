@@ -103,43 +103,9 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::walk_expr(self, expr);
         let hir_expr_opt = self.get_hir_expr(expr);
         match &mut expr.kind {
-            ExprKind::Assign(box lhs, box rhs, _) => {
-                // assignment to dereferenced pointer
-                if let HirExprKind::Assign(hir_lhs, _, _) = hir_expr_opt.unwrap().kind
-                    && let HirExprKind::Unary(UnOp::Deref, hir_lhs_deref) = hir_lhs.kind
-                    && let HirExprKind::Path(qpath) = &hir_lhs_deref.kind  // TODO: support multiple deref
-                    && let QPath::Resolved(_, path) = qpath
-                    && let Res::Local(local_id) = path.res
-                    && let Some(ptr_diff) = self.ptr_diffs.get(&local_id)
-                {
-                    match ptr_diff {
-                        PtrKindDiff {
-                            before: PtrKind::Raw(_),
-                            after: PtrKind::OptRef(true), // Option<&mut T>
-                        } => {
-                            let ExprKind::Unary(UnOp::Deref, lhs_deref) = &mut lhs.kind else {
-                                unreachable!("Expected deref expression on LHS: {:?}", expr.span);
-                            };
-                            **lhs_deref = utils::expr!(
-                                "{}.as_deref_mut().unwrap()",
-                                pprust::expr_to_string(&*lhs_deref),
-                            );
-                            self.stats.writes += 1;
-                        }
-                        PtrKindDiff {
-                            before: PtrKind::Raw(_),
-                            after: PtrKind::OptRef(false), // Option<&T>
-                        } => {
-                            unreachable!(
-                                "Immutable references cannot be assigned to: {:?}",
-                                expr.span
-                            );
-                        }
-                        _ => (),
-                    }
-                }
+            ExprKind::Assign(_, box rhs, _) => {
                 // direct assignment
-                else if let HirExprKind::Assign(hir_lhs, _rhs, _) = hir_expr_opt.unwrap().kind
+                if let HirExprKind::Assign(hir_lhs, _rhs, _) = hir_expr_opt.unwrap().kind
                     && let HirExprKind::Path(qpath) = &hir_lhs.kind
                     && let QPath::Resolved(_, path) = qpath
                     && let Res::Local(local_id) = path.res
@@ -156,6 +122,22 @@ impl MutVisitor for TransformVisitor<'_> {
                         pprust::expr_to_string(&*rhs)
                     );
                     self.stats.writes += 1;
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, e) => {
+                if let HirExprKind::Unary(_, hir_deref) = hir_expr_opt.unwrap().kind
+                    && let HirExprKind::Path(qpath) = &hir_deref.kind  // TODO: support multiple deref
+                    && let QPath::Resolved(_, path) = qpath
+                    && let Res::Local(local_id) = path.res
+                    && let Some(ptr_diff) = self.ptr_diffs.get(&local_id)
+                    && let PtrKindDiff {
+                        before: PtrKind::Raw(_),
+                        after: PtrKind::OptRef(b),
+                    } = ptr_diff
+                {
+                    let m = if *b { "_mut" } else { "" };
+                    **e = utils::expr!("{}.as_deref{}().unwrap()", pprust::expr_to_string(e), m);
+                    self.stats.usages += 1;
                 }
             }
             ExprKind::Path(..) => {
@@ -175,6 +157,10 @@ impl MutVisitor for TransformVisitor<'_> {
                                     // assignment to this variable, handled in ExprKind::Assign above
                                     return;
                                 }
+                            }
+                            HirExprKind::Unary(UnOp::Deref, _) => {
+                                // handled in ExprKind::Unary above
+                                return;
                             }
                             _ => {
                                 let grandparent_node = self.expect_parent_node(parent_expr.hir_id);
