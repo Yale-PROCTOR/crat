@@ -391,7 +391,8 @@ fn main() {
                 run_compiler_on_path(&file, type_checker::type_check).unwrap();
             }
             Pass::Libc => {
-                run_compiler_on_path(&file, libc_replacer::run).unwrap();
+                let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::OutParam => {
                 todo!()
