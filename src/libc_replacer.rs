@@ -165,7 +165,7 @@ impl MutVisitor for TransformVisitor {
                 "_ISspace" => {
                     self.replace_expr(
                         expr,
-                        expr!("(({arg} as u8 as char).is_ascii_whitespace() as i32)"),
+                        expr!("(({arg} as u8 as char).is_whitespace() as i32)"),
                     );
                 }
                 "_ISblank" => {
