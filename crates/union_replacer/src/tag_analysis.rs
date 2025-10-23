@@ -39,7 +39,6 @@ use super::{
     ty_finder,
     util::suggestion::{AstEdit::*, AstSuggestions},
 };
-use crate::ast_utils;
 
 #[derive(Default, Debug, Clone, Deserialize)]
 pub struct Config {
@@ -994,7 +993,7 @@ impl {} {{
     }
 
     let mut trans_visitor = suggestions.into_transform_visitor();
-    let res = ast_utils::transform_ast(
+    let res = utils::ast::transform_ast(
         |krate| {
             trans_visitor.transform(krate);
             trans_visitor.updated

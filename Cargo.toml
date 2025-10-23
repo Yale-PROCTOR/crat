@@ -4,6 +4,7 @@ members = [
   "crates/io_replacer",
   "crates/pointer_replacer",
   "crates/points_to",
+  "crates/union_replacer",
   "crates/utils",
 ]
 exclude = ["deps_crate"]
@@ -28,6 +29,7 @@ finders = { path = "crates/finders" }
 io_replacer = { path = "crates/io_replacer" }
 pointer_replacer = { path = "crates/pointer_replacer" }
 points_to = { path = "crates/points_to" }
+union_replacer = { path = "crates/union_replacer" }
 utils = { path = "crates/utils" }
 clap = { version = "4.5.40", features = ["derive"] }
 tracing-subscriber = "0.3.19"

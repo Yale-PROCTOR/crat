@@ -18,13 +18,14 @@ use typed_arena::Arena;
 use utils::ty_shape::{self, TyShapes};
 
 use super::domains::*;
-use crate::graph_utils;
 
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
     pub functions: FxHashMap<LocalDefId, FxHashMap<Location, AbsMem>>,
 }
 
+#[allow(unused)]
 pub fn analyze(gc: bool, tcx: TyCtxt<'_>) -> AnalysisResult {
     let arena = Arena::new();
     // always use optimized mir in union_replacer for now
@@ -217,6 +218,7 @@ impl Analyzer<'_, '_, '_> {
         if w.is_empty() { None } else { Some(w) }
     }
 
+    #[allow(unused)]
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
@@ -297,11 +299,11 @@ fn get_loop_blocks(
             succs
         })
         .collect();
-    let mut inv_map = graph_utils::bitset_inverse(&succ_map);
+    let mut inv_map = utils::graph::bitset_inverse(&succ_map);
     loop_heads
         .into_iter()
         .map(|head| {
-            let reachables = graph_utils::bitset_reachable_vertices(&inv_map, head);
+            let reachables = utils::graph::bitset_reachable_vertices(&inv_map, head);
             for succs in &mut inv_map {
                 succs.remove(head);
             }

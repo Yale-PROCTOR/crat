@@ -15,7 +15,7 @@ use rustc_middle::{
 };
 use utils::ty_shape::TyShape;
 
-use crate::union_replacer::tag_analysis;
+use crate::tag_analysis;
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -73,6 +73,7 @@ impl AbsMem {
         }
     }
 
+    #[allow(unused)]
     pub fn size(&self) -> (usize, usize) {
         match self {
             Self::Bot => (0, 0),
@@ -320,11 +321,13 @@ impl AbsLoc {
         }
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn root(&self) -> NodeId {
         self.root
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn projection(&self) -> &[AccElem] {
         &self.projection
@@ -660,22 +663,26 @@ impl Obj {
         }
     }
 
+    #[allow(unused)]
     pub fn as_ptr(&self) -> &AbsLoc {
         let Obj::Ptr(loc) = self else { panic!() };
         loc
     }
 
+    #[allow(unused)]
     pub fn field(&self, i: u32) -> &Obj {
         let Obj::Struct(fs, _) = self else { panic!() };
         fs.get(&FieldIdx::from_u32(i)).unwrap()
     }
 
+    #[allow(unused)]
     #[allow(clippy::should_implement_trait)]
     pub fn index(&self, i: i128) -> &Obj {
         let Obj::Array(vs) = self else { panic!() };
         vs.get(&Index::Num(i)).unwrap()
     }
 
+    #[allow(unused)]
     pub fn symbolic(&self, index: &[Local]) -> Option<&Obj> {
         let Obj::Array(vs) = self else { panic!() };
         let index = index.iter().copied().collect();
@@ -1051,6 +1058,7 @@ impl Graph {
         }
     }
 
+    #[allow(unused)]
     pub fn x_eq_offset_int(&mut self, x: &AccPath, y: &AccPath, idx: i128) {
         let (id, _) = self.get_local_node_mut(y.local);
         let mut loc = self.get_pointed_loc_mut(id, &[], false);
@@ -1199,6 +1207,7 @@ impl Graph {
         }
     }
 
+    #[allow(unused)]
     pub fn deref_local_id(&self, local: Local) -> Option<NodeId> {
         let id = self.locals.get(&local)?;
         let loc = self.get_pointed_loc(*id, &[])?;
@@ -1217,10 +1226,12 @@ impl Graph {
         self.nodes[loc.root].project_mut(&loc.projection, write)
     }
 
+    #[allow(unused)]
     pub fn get_local_id(&self, local: Local) -> NodeId {
         *self.locals.get(&local).unwrap()
     }
 
+    #[allow(unused)]
     pub fn get_local_node(&self, local: Local) -> &Node {
         &self.nodes[self.get_local_id(local)]
     }

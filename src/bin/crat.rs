@@ -153,7 +153,7 @@ struct Config {
     #[serde(default)]
     bin: bin_file_adder::Config,
     #[serde(default)]
-    r#union: union_replacer::tag_analysis::Config,
+    r#union: union_replacer::Config,
     #[serde(default)]
     outparam: outparam_replacer::Config,
     #[serde(default)]
