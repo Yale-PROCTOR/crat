@@ -170,14 +170,12 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Span, Symbol};
-use utils::{expr, stmt, ty};
-
-use crate::{ast_utils, ast_utils::TransformationResult, ir_utils::AstToHir};
+use utils::{ast::TransformationResult, expr, ir::AstToHir, stmt, ty};
 
 pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
-    let mut expanded_ast = ast_utils::expanded_ast(tcx);
-    let ast_to_hir = ast_utils::make_ast_to_hir(&mut expanded_ast, tcx);
-    ast_utils::remove_unnecessary_items_from_ast(&mut expanded_ast);
+    let mut expanded_ast = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
 
     let mut visitor = ExpandedHirVisitor {
         tcx,
@@ -458,7 +456,7 @@ fn transform(tcx: TyCtxt<'_>) -> TransformationResult {
         params_to_be_mut: &params_to_be_mut,
         updated: false,
     };
-    ast_utils::transform_ast(
+    utils::ast::transform_ast(
         |krate| {
             visitor.updated = false;
             visitor.visit_crate(krate);

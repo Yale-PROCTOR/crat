@@ -9,24 +9,22 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::{Symbol, kw, sym};
 use utils::expr;
 
-use crate::ast_utils;
-
 pub fn expand(tcx: TyCtxt<'_>) -> String {
     let (_, mut krate) = tcx.resolver_for_lowering().steal();
     let krate = Arc::get_mut(&mut krate).unwrap();
-    ast_utils::remove_unnecessary_items_from_ast(krate);
+    utils::ast::remove_unnecessary_items_from_ast(krate);
     krate.attrs.clear();
     krate.attrs.extend([
-        ast_utils::make_inner_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
-        ast_utils::make_inner_attribute(sym::feature, sym::c_variadic, tcx),
-        ast_utils::make_inner_attribute(sym::feature, sym::extern_types, tcx),
-        ast_utils::make_inner_attribute(sym::feature, sym::linkage, tcx),
-        ast_utils::make_inner_attribute(sym::feature, sym::rustc_private, tcx),
-        ast_utils::make_inner_attribute(sym::feature, sym::thread_local, tcx),
-        ast_utils::make_inner_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
-        ast_utils::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
-        ast_utils::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
-        ast_utils::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
+        utils::ast::make_inner_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::c_variadic, tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::extern_types, tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::linkage, tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::rustc_private, tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::thread_local, tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
     ]);
     AstVisitor.visit_crate(krate);
     pprust::crate_to_string_for_macros(krate)

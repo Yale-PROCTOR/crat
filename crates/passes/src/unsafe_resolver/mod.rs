@@ -20,8 +20,6 @@ use serde::Deserialize;
 use smallvec::smallvec;
 use utils::{path, unsafety};
 
-use crate::{ast_utils, graph_utils, ir_utils};
-
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct Config {
     pub remove_unused: bool,
@@ -30,9 +28,9 @@ pub struct Config {
 }
 
 pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
-    let mut krate = ast_utils::expanded_ast(tcx);
-    let ast_to_hir = ast_utils::make_ast_to_hir(&mut krate, tcx);
-    ast_utils::remove_unnecessary_items_from_ast(&mut krate);
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let mut visitor = HirVisitor {
         tcx,
@@ -66,7 +64,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
     };
     let used_items: FxHashSet<_> = entries
         .iter()
-        .flat_map(|def_id| graph_utils::reachable_vertices(&used, *def_id))
+        .flat_map(|def_id| utils::graph::reachable_vertices(&used, *def_id))
         .collect();
 
     let mut def_ids = vec![];
@@ -77,7 +75,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used.entry(def_id).or_default();
     }
 
-    let used_inv = graph_utils::inverse(&used);
+    let used_inv = utils::graph::inverse(&used);
     let removable_uses: FxHashSet<_> = visitor
         .uses
         .iter()
@@ -115,7 +113,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
 }
 
 struct AstVisitor {
-    ast_to_hir: ir_utils::AstToHir,
+    ast_to_hir: utils::ir::AstToHir,
     unsafe_fns: FxHashSet<LocalDefId>,
     used_items: FxHashSet<LocalDefId>,
     removable_uses: FxHashSet<LocalDefId>,
@@ -449,7 +447,7 @@ fn find_unsafe_fns(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
         }
     }
 
-    let sccs: graph_utils::Sccs<_, true> = graph_utils::sccs_copied(&call_graph);
+    let sccs: utils::graph::Sccs<_, true> = utils::graph::sccs_copied(&call_graph);
 
     let mut is_scc_unsafe = ChunkedBitSet::new_empty(sccs.scc_elems.len());
     for scc_id in sccs.post_order() {

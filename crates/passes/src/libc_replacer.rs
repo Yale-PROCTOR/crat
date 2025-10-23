@@ -6,11 +6,9 @@ use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
 use utils::expr;
 
-use crate::ast_utils;
-
 pub fn replace_libc(tcx: TyCtxt<'_>) -> String {
-    let mut krate = ast_utils::expanded_ast(tcx);
-    ast_utils::remove_unnecessary_items_from_ast(&mut krate);
+    let mut krate = utils::ast::expanded_ast(tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
     TransformVisitor.visit_crate(&mut krate);
     pprust::crate_to_string_for_macros(&krate)
 }

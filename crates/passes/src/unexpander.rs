@@ -17,12 +17,10 @@ use rustc_span::{Symbol, kw, sym};
 use smallvec::{SmallVec, smallvec};
 use utils::{attr, expr};
 
-use crate::{ast_utils, ir_utils};
-
 pub fn unexpand(tcx: TyCtxt<'_>) -> String {
-    let mut krate = ast_utils::expanded_ast(tcx);
-    let ast_to_hir = ast_utils::make_ast_to_hir(&mut krate, tcx);
-    ast_utils::remove_unnecessary_items_from_ast(&mut krate);
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let mut pre_visitor = Previsitor {
         tcx,
@@ -49,7 +47,7 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     krate.attrs.retain(|attr| {
         if let ast::AttrKind::Normal(attr) = &attr.kind
             && attr.item.path.segments.last().unwrap().ident.name == sym::feature
-            && let Some(arg) = ast_utils::get_attr_arg(&attr.item.args)
+            && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
             && let arg = arg.as_str()
             && unnecessary_attributes.contains(arg)
         {
@@ -63,13 +61,13 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
 
 struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    ast_to_hir: ir_utils::AstToHir,
+    ast_to_hir: utils::ir::AstToHir,
     ctx: Ctx,
 }
 
 impl MutVisitor for AstVisitor<'_> {
     fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
-        if ast_utils::is_automatically_derived(&item.attrs) {
+        if utils::ast::is_automatically_derived(&item.attrs) {
             return smallvec![];
         }
         mut_visit::walk_flat_map_item(self, item)
@@ -80,7 +78,7 @@ impl MutVisitor for AstVisitor<'_> {
             let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
             if let Some(traits) = self.ctx.derived_traits.get(local_def_id) {
                 for t in traits {
-                    let attr = ast_utils::make_outer_attribute(sym::derive, *t, self.tcx);
+                    let attr = utils::ast::make_outer_attribute(sym::derive, *t, self.tcx);
                     item.attrs.push(attr);
                 }
             }
@@ -166,13 +164,13 @@ struct BitField {
 
 struct Previsitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    ast_to_hir: ir_utils::AstToHir,
+    ast_to_hir: utils::ir::AstToHir,
     ctx: Ctx,
 }
 
 impl<'ast> Visitor<'ast> for Previsitor<'_> {
     fn visit_item(&mut self, item: &'ast ast::Item) {
-        if ast_utils::is_automatically_derived(&item.attrs)
+        if utils::ast::is_automatically_derived(&item.attrs)
             && matches!(item.kind, ast::ItemKind::Impl(_))
         {
             let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();

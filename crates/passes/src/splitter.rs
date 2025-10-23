@@ -3,12 +3,10 @@ use std::{fmt::Write as _, fs, path::Path};
 use rustc_ast as ast;
 use rustc_ast_pretty::pprust;
 
-use crate::ast_utils;
-
 pub fn split(dir: &Path, lib_name: &str) {
     let file = dir.join(lib_name);
     let code = fs::read_to_string(&file).unwrap();
-    let krate = ast_utils::parse_crate(code);
+    let krate = utils::ast::parse_crate(code);
     write_mod(dir, Name::Root(lib_name), &krate.attrs, &krate.items);
 }
 

@@ -1,7 +1,5 @@
 use rustc_hash::FxHashSet;
 
-use crate::ir_utils;
-
 fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], excludes: &[&str]) {
     let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
         let config = super::Config {
@@ -127,7 +125,7 @@ fn run_test(code: &str, unsafe_fns: &[&str]) {
     utils::compilation::run_compiler_on_str(&code, |tcx| {
         let res: Vec<_> = super::find_unsafe_fns(tcx)
             .into_iter()
-            .map(|def_id| ir_utils::def_id_to_symbol(def_id, tcx).unwrap())
+            .map(|def_id| utils::ir::def_id_to_symbol(def_id, tcx).unwrap())
             .collect();
         let res: FxHashSet<_> = res.iter().map(|s| s.as_str()).collect();
         let expected: FxHashSet<_> = unsafe_fns.iter().cloned().collect();

@@ -7,7 +7,8 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use crat::*;
+use crat::outparam_replacer;
+use passes::*;
 use serde::Deserialize;
 use utils::compilation::run_compiler_on_path;
 

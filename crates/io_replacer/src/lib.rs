@@ -1,8 +1,5 @@
 #![feature(rustc_private)]
 #![feature(box_patterns)]
-#![feature(if_let_guard)]
-#![feature(iter_intersperse)]
-#![feature(map_try_insert)]
 #![warn(unused_extern_crates)]
 
 extern crate rustc_abi;
