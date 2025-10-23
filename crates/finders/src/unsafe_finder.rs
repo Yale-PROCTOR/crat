@@ -2,8 +2,6 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 use utils::unsafety::{self, UnsafeOpKind};
 
-use crate::ir_utils;
-
 struct UnsafetyHandler;
 
 impl unsafety::UnsafetyHandler for UnsafetyHandler {
@@ -14,7 +12,7 @@ impl unsafety::UnsafetyHandler for UnsafetyHandler {
                 && matches!(item.kind, rustc_hir::ItemKind::Fn { .. })
             {
             } else {
-                println!("{}", ir_utils::def_id_to_symbol(def_id, tcx).unwrap());
+                println!("{}", utils::ir::def_id_to_symbol(def_id, tcx).unwrap());
             }
         } else {
             println!("{kind:?}");

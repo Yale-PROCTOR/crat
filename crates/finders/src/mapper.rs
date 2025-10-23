@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use etrace::some_or;
+use rustc_ast::visit::Visitor;
 use rustc_hash::FxHashMap;
 use rustc_hir::{def::DefKind, definitions::DefPathData};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{FileName, RealFileName};
-
-use crate::{ast_utils, ir_utils, rustc_ast::visit::Visitor};
 
 pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
     let borrowed = tcx.resolver_for_lowering().borrow();
@@ -26,7 +25,7 @@ pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
     });
 
     let source_map = tcx.sess.source_map();
-    let parse_sess = ast_utils::new_parse_sess();
+    let parse_sess = utils::ast::new_parse_sess();
 
     for file in source_map.files().iter() {
         let p = match &file.name {
@@ -47,9 +46,9 @@ pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
         let mut krate = parser.parse_crate_mod().unwrap();
         let mod_id = path_to_mod_id[&p];
         let (module, _, _) = tcx.hir_get_module(mod_id);
-        let mut mapper = ir_utils::AstToHirMapper::new(tcx);
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
         mapper.map_crate_to_mod(&mut krate, module, false);
-        let mut checker = ir_utils::AstToHirChecker {
+        let mut checker = utils::ir::AstToHirChecker {
             tcx,
             ast_to_hir: mapper.ast_to_hir,
         };
@@ -58,10 +57,10 @@ pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
         }
     }
 
-    let mut mapper = ir_utils::AstToHirMapper::new(tcx);
+    let mut mapper = utils::ir::AstToHirMapper::new(tcx);
     let module = tcx.hir_root_module();
     mapper.map_crate_to_mod(&mut expanded_crate, module, true);
-    let mut checker = ir_utils::AstToHirChecker {
+    let mut checker = utils::ir::AstToHirChecker {
         tcx,
         ast_to_hir: mapper.ast_to_hir,
     };
@@ -69,17 +68,17 @@ pub fn run(dir: &Path, lib_name: &str, verbose: bool, tcx: TyCtxt<'_>) {
         checker.visit_item(item);
     }
 
-    let hir_to_thir = ir_utils::map_hir_to_thir(tcx);
-    let mut checker = ir_utils::HirToThirChecker { tcx, hir_to_thir };
+    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
+    let mut checker = utils::ir::HirToThirChecker { tcx, hir_to_thir };
     tcx.hir_visit_all_item_likes_in_crate(&mut checker);
 
     for def_id in tcx.hir_body_owners() {
         if matches!(tcx.def_kind(def_id), DefKind::AnonConst) {
             continue;
         }
-        if ir_utils::def_id_to_symbol(def_id, tcx).unwrap().as_str() == "main" {
+        if utils::ir::def_id_to_symbol(def_id, tcx).unwrap().as_str() == "main" {
             continue;
         }
-        ir_utils::map_thir_to_mir(def_id, verbose, tcx);
+        utils::ir::map_thir_to_mir(def_id, verbose, tcx);
     }
 }

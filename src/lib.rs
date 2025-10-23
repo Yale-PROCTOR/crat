@@ -16,7 +16,6 @@ extern crate rustc_index;
 extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
-extern crate rustc_parse;
 extern crate rustc_span;
 extern crate rustc_type_ir;
 extern crate smallvec;
@@ -27,7 +26,6 @@ use utils::{ast as ast_utils, graph as graph_utils, ir as ir_utils};
 pub mod bin_file_adder;
 pub mod expander;
 pub mod extern_resolver;
-pub mod finder;
 pub mod formatter;
 pub mod io_replacer;
 pub mod libc_replacer;
@@ -39,19 +37,3 @@ pub mod type_checker;
 pub mod unexpander;
 pub mod union_replacer;
 pub mod unsafe_resolver;
-
-pub fn find_lib_path(dir: &std::path::Path) -> Result<String, String> {
-    let cargo_file = dir.join("Cargo.toml");
-    if !cargo_file.exists() {
-        return Err(format!("{cargo_file:?} does not exist"));
-    }
-    let content = std::fs::read_to_string(&cargo_file).unwrap();
-    let table = content.parse::<toml::Table>().unwrap();
-    let Some(toml::Value::Table(lib)) = table.get(&"lib".to_string()) else {
-        return Err(format!("No [lib] section in {cargo_file:?}"));
-    };
-    let Some(toml::Value::String(path)) = lib.get(&"path".to_string()) else {
-        return Err(format!("No path in [lib] section in {cargo_file:?}"));
-    };
-    Ok(path.clone())
-}

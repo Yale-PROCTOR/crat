@@ -119,6 +119,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "etrace",
+ "finders",
  "lazy_static",
  "pointer_replacer",
  "serde",
@@ -148,6 +149,14 @@ name = "etrace"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17311e68ea07046ee809b8513f6c259518bc10173681d98c21f8c3926f56f40"
+
+[[package]]
+name = "finders"
+version = "0.1.0"
+dependencies = [
+ "etrace",
+ "utils",
+]
 
 [[package]]
 name = "fixedbitset"
@@ -532,6 +541,7 @@ name = "utils"
 version = "0.1.0"
 dependencies = [
  "etrace",
+ "toml",
  "typed-arena",
 ]
 

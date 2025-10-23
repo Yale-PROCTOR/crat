@@ -331,7 +331,7 @@ fn main() {
         args.input
     };
 
-    let lib_path = crat::find_lib_path(&dir).unwrap_or_else(|e| {
+    let lib_path = utils::find_lib_path(&dir).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });

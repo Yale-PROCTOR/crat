@@ -177,7 +177,6 @@ mod tests {
     use utils::compilation;
 
     use super::*;
-    use crate::ir_utils;
 
     #[test]
     fn test_collect_functions() {
@@ -194,7 +193,7 @@ fn h(x: i32) -> i32 { x + x }
                 let nullary = functions.get(&0).unwrap();
                 assert_eq!(nullary.len(), 1);
                 assert_eq!(
-                    ir_utils::def_id_to_symbol(nullary[0], tcx)
+                    utils::ir::def_id_to_symbol(nullary[0], tcx)
                         .unwrap()
                         .as_str(),
                     "f"
@@ -203,11 +202,11 @@ fn h(x: i32) -> i32 { x + x }
                 let unary = functions.get(&1).unwrap();
                 assert_eq!(unary.len(), 2);
                 assert_eq!(
-                    ir_utils::def_id_to_symbol(unary[0], tcx).unwrap().as_str(),
+                    utils::ir::def_id_to_symbol(unary[0], tcx).unwrap().as_str(),
                     "g"
                 );
                 assert_eq!(
-                    ir_utils::def_id_to_symbol(unary[1], tcx).unwrap().as_str(),
+                    utils::ir::def_id_to_symbol(unary[1], tcx).unwrap().as_str(),
                     "h"
                 );
             },
@@ -282,7 +281,7 @@ fn h() { g(); g(); }
                 let f = calls
                     .iter()
                     .find_map(|(def_id, count)| {
-                        if ir_utils::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "f" {
+                        if utils::ir::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "f" {
                             Some(*count)
                         } else {
                             None
@@ -294,7 +293,7 @@ fn h() { g(); g(); }
                 let g = calls
                     .iter()
                     .find_map(|(def_id, count)| {
-                        if ir_utils::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "g" {
+                        if utils::ir::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "g" {
                             Some(*count)
                         } else {
                             None
@@ -325,7 +324,7 @@ fn g(x: i32, y: i32, f: f32) -> f32 {
                 let f = adds
                     .iter()
                     .find_map(|(def_id, count)| {
-                        if ir_utils::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "f" {
+                        if utils::ir::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "f" {
                             Some(*count)
                         } else {
                             None
@@ -337,7 +336,7 @@ fn g(x: i32, y: i32, f: f32) -> f32 {
                 let g = adds
                     .iter()
                     .find_map(|(def_id, count)| {
-                        if ir_utils::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "g" {
+                        if utils::ir::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == "g" {
                             Some(*count)
                         } else {
                             None
