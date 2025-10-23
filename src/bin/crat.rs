@@ -15,6 +15,12 @@ use utils::compilation::run_compiler_on_path;
 #[command(version)]
 struct Args {
     // Extern
+    #[arg(long, help = "Path to the CMake reply index file")]
+    extern_cmake_reply_index_file: Option<PathBuf>,
+    #[arg(long, help = "Path to the top-level build directory for CMake")]
+    extern_build_dir: Option<PathBuf>,
+    #[arg(long, help = "Path to the top-level source directory for CMake")]
+    extern_source_dir: Option<PathBuf>,
     #[arg(long, help = "Choose an arbitrary one when multiple candidates exist")]
     extern_choose_arbitrary: bool,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern functions (example: `from::foo to::foo`)")]
@@ -23,6 +29,14 @@ struct Args {
     extern_static_hints: Vec<String>,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern types (example: `from::foo to::foo`)")]
     extern_type_hints: Vec<String>,
+
+    // Unsafe
+    #[arg(long, help = "Remove unused items")]
+    unsafe_remove_unused: bool,
+    #[arg(long, help = "Remove no_mangle attributes")]
+    unsafe_remove_no_mangle: bool,
+    #[arg(long, help = "Replace `pub` with `pub(crate)`")]
+    unsafe_replace_pub: bool,
 
     // Bin
     #[arg(
@@ -134,13 +148,15 @@ struct Config {
     #[serde(default)]
     r#extern: extern_resolver::Config,
     #[serde(default)]
-    andersen: points_to::andersen::Config,
+    r#unsafe: unsafe_resolver::Config,
     #[serde(default)]
     bin: bin_file_adder::Config,
     #[serde(default)]
     r#union: union_replacer::tag_analysis::Config,
     #[serde(default)]
     outparam: outparam_replacer::Config,
+    #[serde(default)]
+    andersen: points_to::andersen::Config,
 
     #[serde(default)]
     verbose: bool,
@@ -198,6 +214,15 @@ fn main() {
             .init();
     }
 
+    if args.extern_cmake_reply_index_file.is_some() {
+        config.r#extern.cmake_reply_index_file = args.extern_cmake_reply_index_file;
+    }
+    if args.extern_build_dir.is_some() {
+        config.r#extern.build_dir = args.extern_build_dir;
+    }
+    if args.extern_source_dir.is_some() {
+        config.r#extern.source_dir = args.extern_source_dir;
+    }
     config.r#extern.choose_arbitrary |= args.extern_choose_arbitrary;
     for args in args.extern_function_hints.chunks(2) {
         let [from, to] = args else { panic!() };
@@ -220,6 +245,10 @@ fn main() {
             .type_hints
             .push(extern_resolver::LinkHint::new(from.clone(), to.clone()));
     }
+
+    config.r#unsafe.remove_unused |= args.unsafe_remove_unused;
+    config.r#unsafe.remove_no_mangle |= args.unsafe_remove_no_mangle;
+    config.r#unsafe.replace_pub |= args.unsafe_replace_pub;
 
     for arg in args.bin_ignore {
         config.bin.ignores.push(arg);
@@ -262,7 +291,7 @@ fn main() {
         config.outparam.analysis_file = args.outparam_analysis_file;
     }
     if args.points_to_file.is_some() {
-        config.outparam.points_to_file = args.points_to_file.clone();
+        config.outparam.points_to_file = args.points_to_file;
     }
 
     let dir = if !config.passes.is_empty() {
@@ -332,7 +361,11 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Unsafe => {
-                run_compiler_on_path(&file, unsafe_resolver::resolve_unsafe).unwrap();
+                let s = run_compiler_on_path(&file, |tcx| {
+                    unsafe_resolver::resolve_unsafe(&config.r#unsafe, tcx)
+                })
+                .unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::UPreprocess => {
                 run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
@@ -358,7 +391,8 @@ fn main() {
                 run_compiler_on_path(&file, type_checker::type_check).unwrap();
             }
             Pass::Libc => {
-                run_compiler_on_path(&file, libc_replacer::run).unwrap();
+                let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::OutParam => {
                 todo!()

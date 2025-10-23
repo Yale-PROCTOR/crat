@@ -8,22 +8,15 @@ use utils::expr;
 
 use crate::ast_utils;
 
-pub fn run(tcx: TyCtxt<'_>) {
-    ast_utils::transform_ast(
-        |krate| {
-            let mut visitor = TransformVisitor::default();
-            visitor.visit_crate(krate);
-            visitor.updated
-        },
-        tcx,
-    )
-    .apply();
+pub fn replace_libc(tcx: TyCtxt<'_>) -> String {
+    let mut krate = ast_utils::expanded_ast(tcx);
+    ast_utils::remove_unnecessary_items_from_ast(&mut krate);
+    TransformVisitor.visit_crate(&mut krate);
+    pprust::crate_to_string_for_macros(&krate)
 }
 
 #[derive(Default)]
-struct TransformVisitor {
-    updated: bool,
-}
+struct TransformVisitor;
 
 impl MutVisitor for TransformVisitor {
     fn visit_expr(&mut self, expr: &mut Expr) {
@@ -172,7 +165,7 @@ impl MutVisitor for TransformVisitor {
                 "_ISspace" => {
                     self.replace_expr(
                         expr,
-                        expr!("(({arg} as u8 as char).is_ascii_whitespace() as i32)"),
+                        expr!("(({arg} as u8 as char).is_whitespace() as i32)"),
                     );
                 }
                 "_ISblank" => {
@@ -202,7 +195,6 @@ impl MutVisitor for TransformVisitor {
 impl TransformVisitor {
     fn replace_expr(&mut self, expr: &mut Expr, new: Expr) {
         *expr = new;
-        self.updated = true;
     }
 
     fn expr_to_string(&self, expr: &Expr) -> String {

@@ -196,12 +196,19 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
             continue;
         }
         let name = some_or!(visitor.ctx.params.get(rhs), continue);
-        let (lhs, let_span) = lhs[0];
-        lets_to_remove.insert(let_span);
+        let (lhs, let_id) = lhs[0];
+        let is_in_loop = tcx.hir_parent_iter(let_id).any(|(_, node)| {
+            let hir::Node::Expr(expr) = node else { return false };
+            matches!(expr.kind, hir::ExprKind::Loop(..))
+        });
+        if is_in_loop {
+            continue;
+        }
+        lets_to_remove.insert(let_id);
         params_to_be_mut.insert(*rhs);
         let bounds = some_or!(visitor.ctx.bound_occurrences.get(&lhs), continue);
-        for span in bounds {
-            vars_to_replace.insert(*span, *name);
+        for hir_id in bounds {
+            vars_to_replace.insert(*hir_id, *name);
         }
     }
 

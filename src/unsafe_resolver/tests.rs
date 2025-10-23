@@ -2,6 +2,127 @@ use rustc_hash::FxHashSet;
 
 use crate::ir_utils;
 
+fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], excludes: &[&str]) {
+    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let config = super::Config {
+            remove_unused,
+            remove_no_mangle: false,
+            replace_pub: false,
+        };
+        super::resolve_unsafe(&config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+        crate::type_checker::type_check(tcx);
+    })
+    .expect(&transformed);
+    for include in includes {
+        assert!(
+            transformed.contains(include),
+            "{transformed}\ndoes not contain \"{include}\"",
+        );
+    }
+    for exclude in excludes {
+        assert!(
+            !transformed.contains(exclude),
+            "{transformed}\ncontains \"{exclude}\"",
+        );
+    }
+}
+
+#[test]
+fn test_transformation_unsafe() {
+    let code = r#"
+unsafe fn f() -> i32 {
+    0
+}
+unsafe fn g() -> i32 {
+    h()
+}
+unsafe fn h() -> i32 {
+    let x = 0;
+    let p: *const i32 = &x;
+    *p
+}
+"#;
+    run_transformation_test(
+        code,
+        false,
+        &["fn f()", "unsafe fn g()", "unsafe fn h()"],
+        &["unsafe fn f()"],
+    );
+}
+
+#[test]
+fn test_transformation_unused() {
+    let code = r#"
+mod a {
+    fn main() {}
+    pub fn g() {}
+}
+mod b {
+    use crate::a::g;
+    pub fn f() {
+        g();
+    }
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["fn main()"],
+        &["fn f()", "fn g()", "use crate::a::g;"],
+    );
+}
+
+#[test]
+fn test_transformation_unused_uses() {
+    let code = r#"
+mod a {
+    fn main() {
+        g();
+    }
+    pub fn g() {}
+}
+mod b {
+    use crate::a::g;
+    pub fn f() {
+        g();
+    }
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["fn main()", "fn g()"],
+        &["fn f()", "use crate::a::g;"],
+    );
+}
+
+#[test]
+fn test_transformation_unused_method() {
+    let code = r#"
+trait A {
+    fn f();
+    fn g();
+}
+struct S {}
+impl A for S {
+    fn f() {}
+    fn g() {}
+}
+fn main() {
+    S::g();
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["fn main()", "fn g()", "trait A", "struct S", "impl A for S"],
+        &["fn f()"],
+    );
+}
+
 fn run_test(code: &str, unsafe_fns: &[&str]) {
     utils::compilation::run_compiler_on_str(&code, |tcx| {
         let res: Vec<_> = super::find_unsafe_fns(tcx)
