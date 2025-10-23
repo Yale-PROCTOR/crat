@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use points_to::andersen;
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, def_id::DefId};
@@ -17,7 +18,7 @@ use typed_arena::Arena;
 use utils::ty_shape::{self, TyShapes};
 
 use super::domains::*;
-use crate::{graph_utils, points_to::andersen};
+use crate::graph_utils;
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {

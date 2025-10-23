@@ -5,6 +5,7 @@ use std::{
 };
 
 use etrace::some_or;
+use points_to::andersen::{self, Loc};
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
@@ -43,7 +44,6 @@ use super::{
 use crate::{
     graph_utils,
     ir_utils::{self, hir_to_thir::HirToThir},
-    points_to::andersen::{self, Loc},
 };
 
 // TODO: Remove span translation

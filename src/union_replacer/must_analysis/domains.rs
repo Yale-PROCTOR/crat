@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
+use points_to::andersen;
 use rustc_abi::FieldIdx;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LocalDefId;
@@ -14,7 +15,7 @@ use rustc_middle::{
 };
 use utils::ty_shape::TyShape;
 
-use crate::{points_to::andersen, union_replacer::tag_analysis};
+use crate::union_replacer::tag_analysis;
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {

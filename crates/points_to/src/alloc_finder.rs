@@ -7,7 +7,6 @@ use rustc_middle::{
 };
 
 use super::andersen;
-use crate::graph_utils;
 
 pub(super) fn find_alloc_funcs(
     config: &andersen::Config,
@@ -50,7 +49,7 @@ pub(super) fn find_alloc_funcs(
     for callees in call_graph.values_mut() {
         callees.retain(|callee| fns.contains(callee));
     }
-    let sccs: graph_utils::Sccs<_, false> = graph_utils::sccs_copied(&call_graph);
+    let sccs: utils::graph::Sccs<_, false> = utils::graph::sccs_copied(&call_graph);
     let mut alloc_fns = FxHashSet::default();
     for scc_id in sccs.post_order() {
         let scc = &sccs.scc_elems[scc_id];

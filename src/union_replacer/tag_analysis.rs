@@ -5,6 +5,7 @@ use std::{
 };
 
 use etrace::{ok_or, some_or};
+use points_to::andersen;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_ast::{BindingMode, LitKind, Mutability};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -38,7 +39,7 @@ use super::{
     ty_finder,
     util::suggestion::{AstEdit::*, AstSuggestions},
 };
-use crate::{ast_utils, points_to::andersen};
+use crate::ast_utils;
 
 #[derive(Default, Debug, Clone, Deserialize)]
 pub struct Config {

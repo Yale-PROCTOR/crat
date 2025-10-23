@@ -2,6 +2,7 @@
 members = [
   "crates/finders",
   "crates/pointer_replacer",
+  "crates/points_to",
   "crates/utils",
 ]
 exclude = ["deps_crate"]
@@ -24,6 +25,7 @@ tracing = "0.1.41"
 [dependencies]
 finders = { path = "crates/finders" }
 pointer_replacer = { path = "crates/pointer_replacer" }
+points_to = { path = "crates/points_to" }
 utils = { path = "crates/utils" }
 clap = { version = "4.5.40", features = ["derive"] }
 tracing-subscriber = "0.3.19"

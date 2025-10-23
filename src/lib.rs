@@ -30,7 +30,6 @@ pub mod formatter;
 pub mod io_replacer;
 pub mod libc_replacer;
 pub mod outparam_replacer;
-pub mod points_to;
 pub mod preprocessor;
 pub mod splitter;
 pub mod type_checker;
