@@ -1147,7 +1147,7 @@ mod tests {
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
         let s =
             utils::compilation::run_compiler_on_str(code, super::preprocess_expanded_ast).unwrap();
-        utils::compilation::run_compiler_on_str(&s, crate::type_checker::type_check).expect(&s);
+        utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
         for include in includes {
             assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
         }

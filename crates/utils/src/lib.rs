@@ -49,3 +49,16 @@ pub fn find_lib_path(dir: &std::path::Path) -> Result<String, String> {
     };
     Ok(path.clone())
 }
+
+pub fn type_check(tcx: rustc_middle::ty::TyCtxt<'_>) {
+    let () = tcx.analysis(());
+}
+
+pub fn format(code: &str) -> String {
+    compilation::run_compiler_on_str(code, |tcx| {
+        let r = tcx.crate_for_resolver(()).borrow();
+        let (ref krate, _) = *r;
+        rustc_ast_pretty::pprust::crate_to_string_for_macros(krate)
+    })
+    .unwrap()
+}

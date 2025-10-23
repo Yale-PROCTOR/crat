@@ -39,7 +39,6 @@ use super::{
     likely_lit::LikelyLit,
     mir_loc::MirLoc,
 };
-use crate::{graph_utils, ir_utils};
 
 #[derive(Debug)]
 pub(super) struct AnalysisResult<'a> {
@@ -225,7 +224,7 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
             continue;
         }
         let mut new_origins: Option<BitSet8<Origin>> = None;
-        for reachable in graph_utils::bitset_reachable_vertices(&origin_edges, loc_id).iter() {
+        for reachable in utils::graph::bitset_reachable_vertices(&origin_edges, loc_id).iter() {
             let origins = origins_clone[reachable];
             if origins.is_empty() {
                 continue;
@@ -474,7 +473,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
-                if ir_utils::is_option(def_id, self.tcx) {
+                if utils::ir::is_option(def_id, self.tcx) {
                     if !fields.is_empty()
                         && let Some(variance) = variance
                     {
@@ -651,7 +650,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Unsupported | ApiKind::NonPosix => {
-                            let name = ir_utils::def_id_to_symbol(def_id, self.tcx).unwrap();
+                            let name = utils::ir::def_id_to_symbol(def_id, self.tcx).unwrap();
                             let reason = match name.as_str() {
                                 "setbuf" | "setvbuf" => UnsupportedReason::Setbuf,
                                 "ungetc" => UnsupportedReason::Ungetc,
@@ -675,7 +674,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);
                 } else {
-                    let name = ir_utils::def_id_to_symbol(def_id, self.tcx).unwrap();
+                    let name = utils::ir::def_id_to_symbol(def_id, self.tcx).unwrap();
                     match name.as_str() {
                         "arg" => {
                             let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
@@ -821,7 +820,7 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
         }
         TyKind::Array(ty, _) | TyKind::Slice(ty) => file_type_variance(*ty, tcx),
         TyKind::Adt(adt_def, targs) => {
-            if ir_utils::is_option(adt_def.did(), tcx) {
+            if utils::ir::is_option(adt_def.did(), tcx) {
                 let targs = targs.into_type_list(tcx);
                 file_type_variance(targs[0], tcx)
             } else {

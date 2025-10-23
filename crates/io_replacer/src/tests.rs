@@ -1,8 +1,6 @@
 use lazy_static::lazy_static;
 use utils::compilation;
 
-use crate::{formatter, type_checker};
-
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
@@ -14,7 +12,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
         .unwrap()
         .to_string();
     s.push_str(&defs);
-    compilation::run_compiler_on_str(&s, type_checker::type_check).expect(&stripped);
+    compilation::run_compiler_on_str(&s, utils::type_check).expect(&stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
     }
@@ -2931,6 +2929,5 @@ pub type fpos_t = __fpos_t;
 pub type wchar_t = libc::c_int;"#;
 
 lazy_static! {
-    static ref FORMATTED_PREAMBLE: String =
-        compilation::run_compiler_on_str(PREAMBLE, formatter::formatted).unwrap();
+    static ref FORMATTED_PREAMBLE: String = utils::format(PREAMBLE);
 }

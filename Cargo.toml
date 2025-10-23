@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/finders",
+  "crates/io_replacer",
   "crates/pointer_replacer",
   "crates/points_to",
   "crates/utils",
@@ -24,6 +25,7 @@ tracing = "0.1.41"
 
 [dependencies]
 finders = { path = "crates/finders" }
+io_replacer = { path = "crates/io_replacer" }
 pointer_replacer = { path = "crates/pointer_replacer" }
 points_to = { path = "crates/points_to" }
 utils = { path = "crates/utils" }

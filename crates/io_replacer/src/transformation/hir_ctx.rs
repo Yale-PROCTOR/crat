@@ -13,8 +13,6 @@ use rustc_middle::{
 use rustc_span::{Span, Symbol, def_id::LocalDefId};
 use utils::file::api_list;
 
-use crate::ir_utils;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum HirLoc {
     Global(LocalDefId),
@@ -331,7 +329,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         Res::Local(hir_id) => Some(hir_id),
                         Res::Def(DefKind::Static { .. }, def_id) => {
                             if let Some(def_id) = def_id.as_local() {
-                                let name = ir_utils::def_id_to_symbol(def_id, self.tcx).unwrap();
+                                let name = utils::ir::def_id_to_symbol(def_id, self.tcx).unwrap();
                                 let name = name.as_str();
                                 if name != "stdin" && name != "stdout" && name != "stderr" {
                                     self.ctx

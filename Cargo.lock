@@ -120,6 +120,7 @@ dependencies = [
  "clap",
  "etrace",
  "finders",
+ "io_replacer",
  "lazy_static",
  "pointer_replacer",
  "points_to",
@@ -194,6 +195,18 @@ checksum = "fe4cd85333e22411419a0bcae1297d25e58c9443848b11dc6a86fefe8c78a661"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "io_replacer"
+version = "0.1.0"
+dependencies = [
+ "etrace",
+ "lazy_static",
+ "toml_edit",
+ "tracing",
+ "typed-arena",
+ "utils",
 ]
 
 [[package]]

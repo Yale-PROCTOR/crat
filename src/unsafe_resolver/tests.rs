@@ -13,7 +13,7 @@ fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], e
     })
     .unwrap();
     utils::compilation::run_compiler_on_str(&transformed, |tcx| {
-        crate::type_checker::type_check(tcx);
+        utils::type_check(tcx);
     })
     .expect(&transformed);
     for include in includes {

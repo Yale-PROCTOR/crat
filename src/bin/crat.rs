@@ -127,6 +127,7 @@ enum Pass {
     Split,
     Bin,
     Check,
+    Format,
     Libc,
     OutParam,
     Lock,
@@ -388,7 +389,10 @@ fn main() {
                 .unwrap();
             }
             Pass::Check => {
-                run_compiler_on_path(&file, type_checker::type_check).unwrap();
+                run_compiler_on_path(&file, utils::type_check).unwrap();
+            }
+            Pass::Format => {
+                run_compiler_on_path(&file, formatter::format).unwrap();
             }
             Pass::Libc => {
                 let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();

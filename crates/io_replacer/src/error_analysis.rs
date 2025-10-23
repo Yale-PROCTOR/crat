@@ -20,7 +20,6 @@ use typed_arena::Arena;
 use utils::file::api_list;
 
 use super::mir_loc::MirLoc;
-use crate::{graph_utils, ir_utils};
 
 pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
     let mut result = AnalysisResult::default();
@@ -79,9 +78,9 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
             for node in nodes {
                 assert!(call_graph.insert(node, FxHashSet::default()).is_none());
             }
-            let transitive_call_graph = graph_utils::transitive_closure(&call_graph);
-            let inv_call_graph = graph_utils::inverse(&call_graph);
-            let transitive_inv_call_graph = graph_utils::transitive_closure(&inv_call_graph);
+            let transitive_call_graph = utils::graph::transitive_closure(&call_graph);
+            let inv_call_graph = utils::graph::inverse(&call_graph);
+            let transitive_inv_call_graph = utils::graph::transitive_closure(&inv_call_graph);
 
             if inv_call_graph[&label.func_loc].is_empty() {
                 let source_reachables: FxHashSet<_> = sink_result
@@ -410,7 +409,7 @@ fn handling_api_indicator(
     def_id: impl IntoQueryParam<DefId>,
     tcx: TyCtxt<'_>,
 ) -> Option<Indicator> {
-    let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
+    let name = utils::ir::def_id_to_symbol(def_id, tcx).unwrap();
     let name = api_list::normalize_api_name(name.as_str());
     match name {
         "ferror" => Some(Indicator::Error),
@@ -512,9 +511,9 @@ impl std::fmt::Debug for ExprBase {
             ExprBase::Stdin => write!(f, "stdin"),
             ExprBase::Stdout => write!(f, "stdout"),
             ExprBase::Stderr => write!(f, "stderr"),
-            ExprBase::Global(def_id) => ir_utils::fmt_def_id(f, *def_id),
+            ExprBase::Global(def_id) => utils::ir::fmt_def_id(f, *def_id),
             ExprBase::Local(hir_id) => {
-                ir_utils::fmt_def_id(f, hir_id.owner)?;
+                utils::ir::fmt_def_id(f, hir_id.owner)?;
                 write!(f, ":{:?}", hir_id.local_id)
             }
         }
@@ -527,11 +526,11 @@ impl std::fmt::Display for ExprBase {
             ExprBase::Stdin => write!(f, "stdin"),
             ExprBase::Stdout => write!(f, "stdout"),
             ExprBase::Stderr => write!(f, "stderr"),
-            ExprBase::Global(def_id) => ir_utils::with_tcx(|tcx| {
-                let name = ir_utils::def_id_to_symbol(*def_id, tcx).unwrap();
+            ExprBase::Global(def_id) => utils::ir::with_tcx(|tcx| {
+                let name = utils::ir::def_id_to_symbol(*def_id, tcx).unwrap();
                 write!(f, "{name}")
             }),
-            ExprBase::Local(hir_id) => ir_utils::with_tcx(|tcx| {
+            ExprBase::Local(hir_id) => utils::ir::with_tcx(|tcx| {
                 let node = tcx.hir_node(*hir_id);
                 let Node::Pat(pat) = node else { panic!() };
                 let PatKind::Binding(_, _, name, _) = pat.kind else { panic!() };
@@ -599,7 +598,7 @@ pub(super) fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprL
                 let base = match path.res {
                     Res::Def(DefKind::Static { .. }, def_id) => {
                         let def_id = def_id.as_local()?;
-                        let name = ir_utils::def_id_to_symbol(def_id, tcx).unwrap();
+                        let name = utils::ir::def_id_to_symbol(def_id, tcx).unwrap();
                         match name.as_str() {
                             "stdin" => ExprBase::Stdin,
                             "stdout" => ExprBase::Stdout,
