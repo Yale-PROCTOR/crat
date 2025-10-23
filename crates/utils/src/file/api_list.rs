@@ -8,8 +8,6 @@ use rustc_index::Idx;
 use rustc_middle::{query::IntoQueryParam, ty::TyCtxt};
 use rustc_span::{Symbol, def_id::DefId};
 
-use crate::ir_utils;
-
 #[inline]
 pub fn symbol_api_kind(name: Symbol) -> Option<ApiKind> {
     API_MAP
@@ -20,7 +18,7 @@ pub fn symbol_api_kind(name: Symbol) -> Option<ApiKind> {
 
 #[inline]
 pub fn def_id_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<ApiKind> {
-    symbol_api_kind(ir_utils::def_id_to_symbol(id, tcx)?)
+    symbol_api_kind(crate::ir::def_id_to_symbol(id, tcx)?)
 }
 
 #[inline]
@@ -30,7 +28,7 @@ pub fn is_symbol_api(name: Symbol) -> bool {
 
 #[inline]
 pub fn is_def_id_api(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    is_symbol_api(some_or!(ir_utils::def_id_to_symbol(id, tcx), return false))
+    is_symbol_api(some_or!(crate::ir::def_id_to_symbol(id, tcx), return false))
 }
 
 #[inline]

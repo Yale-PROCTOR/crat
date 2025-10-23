@@ -1,10 +1,8 @@
-pub mod api_list;
 mod error_analysis;
-pub mod file_analysis;
+mod file_analysis;
 mod likely_lit;
 mod mir_loc;
-pub mod transformation;
-pub mod util;
+mod transformation;
 
 pub use transformation::transform::{replace_io, run};
 

@@ -11,8 +11,8 @@ use rustc_middle::{
     ty::{AdtDef, TyCtxt, TyKind},
 };
 use rustc_span::{Span, Symbol, def_id::LocalDefId};
+use utils::file::api_list;
 
-use super::api_list;
 use crate::ir_utils;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

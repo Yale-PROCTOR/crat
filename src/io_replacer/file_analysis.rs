@@ -31,14 +31,13 @@ use typed_arena::Arena;
 use utils::{
     bit_set::{BitSet8, BitSet16},
     disjoint_set::DisjointSet,
+    file::api_list::{ApiKind, Origin, Permission, def_id_api_kind, is_def_id_api},
 };
 
 use super::{
-    api_list::{ApiKind, Origin, Permission, def_id_api_kind, is_def_id_api},
     error_analysis::{self, ErrorPropagation, ExprLoc, Indicator},
     likely_lit::LikelyLit,
     mir_loc::MirLoc,
-    util,
 };
 use crate::{graph_utils, ir_utils};
 
@@ -115,7 +114,7 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
                 let adt_def = tcx.adt_def(item.owner_id);
                 for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
                     let ty = fd.ty(tcx, List::empty());
-                    if util::contains_file_ty(ty, tcx) {
+                    if utils::file::contains_file_ty(ty, tcx) {
                         locs.push(MirLoc::Field(local_def_id, i));
                     }
                 }
@@ -124,7 +123,7 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
             _ => continue,
         };
         for (i, local_decl) in body.local_decls.iter_enumerated() {
-            if util::contains_file_ty(local_decl.ty, tcx) {
+            if utils::file::contains_file_ty(local_decl.ty, tcx) {
                 let loc = MirLoc::Var(local_def_id, i);
                 locs.push(loc);
             }
@@ -392,7 +391,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         match r {
             Rvalue::Cast(CastKind::PtrToPtr | CastKind::Transmute, op, _) => {
                 let rty = op.ty(ctx.local_decls, self.tcx);
-                match (variance, util::contains_file_ty(rty, self.tcx)) {
+                match (variance, utils::file::contains_file_ty(rty, self.tcx)) {
                     (Some(variance), true) => {
                         let l = self.transfer_place(*l, ctx);
                         let r = self.transfer_operand(op, ctx);
@@ -427,7 +426,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::Cast(CastKind::PointerExposeProvenance, op, _) => {
                 let rty = op.ty(ctx.local_decls, self.tcx);
-                if util::contains_file_ty(rty, self.tcx) {
+                if utils::file::contains_file_ty(rty, self.tcx) {
                     let r = self.transfer_operand(op, ctx);
                     self.unsupported.add(r, UnsupportedReason::Cast);
                 }
@@ -441,7 +440,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                     let l = self.transfer_place(*l, ctx);
                     for (i, ty) in sig.inputs().iter().enumerate() {
-                        if util::contains_file_ty(*ty, self.tcx) {
+                        if utils::file::contains_file_ty(*ty, self.tcx) {
                             let node = self.tcx.hir_node_by_def_id(def_id);
                             if matches!(node, Node::ForeignItem(_)) {
                                 self.unsupported.add(l, UnsupportedReason::ApiFnPtr);
@@ -459,7 +458,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 assert!(variance.is_none(), "{:?} {:?}", kind, stmt.source_info.span);
                 let rty = op.ty(ctx.local_decls, self.tcx);
                 assert!(
-                    !util::contains_file_ty(rty, self.tcx),
+                    !utils::file::contains_file_ty(rty, self.tcx),
                     "{:?} {:?}",
                     kind,
                     stmt.source_info.span
@@ -467,7 +466,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::BinaryOp(_, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
-                if util::contains_file_ty(ty, self.tcx) {
+                if utils::file::contains_file_ty(ty, self.tcx) {
                     let op1 = self.transfer_operand(op1, ctx);
                     self.unsupported.add(op1, UnsupportedReason::Cmp);
                     let op2 = self.transfer_operand(op2, ctx);
@@ -475,7 +474,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
-                if util::is_option_ty(def_id, self.tcx) {
+                if ir_utils::is_option(def_id, self.tcx) {
                     if !fields.is_empty()
                         && let Some(variance) = variance
                     {
@@ -621,7 +620,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let r = self.transfer_operand(&arg.node, ctx);
                             self.assign(l, r, variance);
                         }
-                    } else if util::contains_file_ty(ty, self.tcx) {
+                    } else if utils::file::contains_file_ty(ty, self.tcx) {
                         let arg = self.transfer_operand(&arg.node, ctx);
                         self.unsupported.add(arg, UnsupportedReason::Variadic);
                     }
@@ -644,7 +643,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         ApiKind::Operation(Some(permission)) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
-                                if util::contains_file_ty(*t, self.tcx) {
+                                if utils::file::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     self.add_permission(x, permission);
                                     break;
@@ -661,7 +660,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             };
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
-                                if util::contains_file_ty(*t, self.tcx) {
+                                if utils::file::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     self.unsupported.add(x, reason);
                                 }
@@ -680,7 +679,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     match name.as_str() {
                         "arg" => {
                             let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
-                            if util::contains_file_ty(ty, self.tcx) {
+                            if utils::file::contains_file_ty(ty, self.tcx) {
                                 let x = self.transfer_place(*destination, ctx);
                                 self.unsupported.add(x, UnsupportedReason::Variadic);
                             }
@@ -721,7 +720,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     let r = self.transfer_operand(&arg.node, ctx);
                     self.assign(*l, r, variance);
                 }
-            } else if util::contains_file_ty(ty, self.tcx) {
+            } else if utils::file::contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg, UnsupportedReason::Variadic);
             }
@@ -809,7 +808,7 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
     let v = match ty.kind() {
         TyKind::RawPtr(ty, mutbl) | TyKind::Ref(_, ty, mutbl) => {
             if let TyKind::Adt(adt_def, _) = ty.kind()
-                && util::is_file_ty(adt_def.did(), tcx)
+                && utils::file::is_file_ty(adt_def.did(), tcx)
             {
                 return Some(Variance::Covariant);
             }
@@ -822,7 +821,7 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
         }
         TyKind::Array(ty, _) | TyKind::Slice(ty) => file_type_variance(*ty, tcx),
         TyKind::Adt(adt_def, targs) => {
-            if util::is_option_ty(adt_def.did(), tcx) {
+            if ir_utils::is_option(adt_def.did(), tcx) {
                 let targs = targs.into_type_list(tcx);
                 file_type_variance(targs[0], tcx)
             } else {
@@ -839,7 +838,11 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
             .find_map(|ty| file_type_variance(*ty, tcx).map(|_| Variance::Invariant)),
         _ => None,
     };
-    assert_eq!(v.is_some(), util::contains_file_ty(ty, tcx), "{ty:?}");
+    assert_eq!(
+        v.is_some(),
+        utils::file::contains_file_ty(ty, tcx),
+        "{ty:?}"
+    );
     v
 }
 

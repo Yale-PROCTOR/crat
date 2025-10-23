@@ -6,11 +6,9 @@ use rustc_ast_pretty::pprust;
 use rustc_index::Idx;
 use rustc_middle::ty::TyCtxt;
 use typed_arena::Arena;
-use utils::bit_set::BitSet8;
-
-use super::{
-    api_list::{Origin, Permission},
-    util,
+use utils::{
+    bit_set::BitSet8,
+    file::api_list::{Origin, Permission},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +194,7 @@ impl<'a> TypeArena<'a> {
             };
             self.option(ty)
         };
-        let ty = if util::is_file_ptr_ptr(ctx.ty, tcx) {
+        let ty = if utils::file::is_file_ptr_ptr(ctx.ty, tcx) {
             self.ptr(ty)
         } else {
             ty

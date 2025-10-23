@@ -14,15 +14,13 @@ use rustc_middle::{
 use rustc_span::{Span, def_id::LocalDefId};
 use toml_edit::DocumentMut;
 use typed_arena::Arena;
-use utils::bit_set::BitSet16;
+use utils::{bit_set::BitSet16, file::api_list::Permission};
 
 use super::{
-    api_list::Permission,
     file_analysis::{self, UnsupportedReason},
     hir_ctx::{HirCtx, HirLoc, HirVisitor},
     mir_loc::MirLoc,
     stream_ty::*,
-    util,
     visitor::{Parameter, TransformVisitor},
 };
 use crate::{ast_utils, graph_utils, ir_utils};
@@ -293,8 +291,8 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
                             if analysis_res.fn_ptrs.contains(def_id)
                                 || fn_ptr_args.contains(&loc)
                                 || analysis_res.permissions[loc_id].contains(Permission::Lock)
-                                || util::is_file_ptr_ptr(ty, tcx)
-                                || util::file_param_index(ty, tcx).is_some()
+                                || utils::file::is_file_ptr_ptr(ty, tcx)
+                                || utils::file::file_param_index(ty, tcx).is_some()
                                 || hir_ctx.is_loc_used_in_assign(loc)
                             {
                                 non_generic_params.insert(param);
@@ -434,7 +432,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
                 ctx.is_generic = true;
             }
 
-            if util::file_param_index(ctx.ty, tcx).is_some() {
+            if utils::file::file_param_index(ctx.ty, tcx).is_some() {
                 ctx.is_param_without_assign = true;
             }
 
@@ -449,7 +447,7 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
                 permissions,
                 origins,
                 ty,
-                file_param_index: util::file_param_index(ctx.ty, tcx),
+                file_param_index: utils::file::file_param_index(ctx.ty, tcx),
             };
             let old = hir_loc_to_pot.insert(hir_loc, pot);
             if let Some(old) = old {

@@ -20,11 +20,12 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol, def_id::LocalDefId, symbol::Ident};
 use utils::{
     bit_set::{BitSet8, BitSet16},
-    expr, item, param, stmt, ty, ty_param,
+    expr,
+    file::api_list::{self, Origin, Permission},
+    item, param, stmt, ty, ty_param,
 };
 
 use super::{
-    api_list::{self, Origin, Permission},
     error_analysis::{ErrorPropagation, ExprLoc, Indicator},
     file_analysis::{self, LocId, UnsupportedReason},
     fprintf,

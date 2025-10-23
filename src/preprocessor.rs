@@ -158,7 +158,7 @@
 use std::fmt::Write as _;
 
 use etrace::some_or;
-use rustc_ast::*;
+use rustc_ast::{mut_visit::MutVisitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
@@ -172,10 +172,7 @@ use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Span, Symbol};
 use utils::{expr, stmt, ty};
 
-use crate::{
-    ast_utils, ast_utils::TransformationResult, io_replacer, ir_utils::AstToHir,
-    rustc_ast::mut_visit::MutVisitor as _,
-};
+use crate::{ast_utils, ast_utils::TransformationResult, ir_utils::AstToHir};
 
 pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = ast_utils::expanded_ast(tcx);
@@ -249,7 +246,7 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
             && let Res::Def(DefKind::TyAlias, def_id) = path.res
             && let Some(def_id) = def_id.as_local()
             && let mir_ty = self.tcx.type_of(def_id).skip_binder()
-            && io_replacer::util::file_param_index(mir_ty, self.tcx).is_some()
+            && utils::file::file_param_index(mir_ty, self.tcx).is_some()
         {
             let item = self.tcx.hir_expect_item(def_id);
             let hir::ItemKind::TyAlias(_, _, hir_ty) = item.kind else { panic!() };
@@ -859,7 +856,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
             hir::ExprKind::Call(callee, args) => {
                 if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
                     && let Res::Def(DefKind::Fn, def_id) = path.res
-                    && io_replacer::api_list::is_def_id_api(def_id, self.tcx)
+                    && utils::file::api_list::is_def_id_api(def_id, self.tcx)
                 {
                     let mut if_args = vec![];
                     for (i, arg) in args.iter().enumerate() {
@@ -868,7 +865,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                         }
                         let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
                         let ty = typeck.expr_ty(arg);
-                        if io_replacer::util::contains_file_ty(ty, self.tcx) {
+                        if utils::file::contains_file_ty(ty, self.tcx) {
                             if_args.push(ArgIdx(i));
                         }
                     }
@@ -1015,7 +1012,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         let Res::Def(DefKind::TyAlias, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
         let mir_ty = self.tcx.type_of(def_id).skip_binder();
-        if io_replacer::util::file_param_index(mir_ty, self.tcx).is_some() {
+        if utils::file::file_param_index(mir_ty, self.tcx).is_some() {
             self.ctx.bound_file_ty_aliases.insert(ty.span, def_id);
         }
     }
@@ -1055,7 +1052,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
                 if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
                     && let Res::Def(DefKind::Fn, def_id) = path.res
-                    && io_replacer::api_list::is_def_id_api(def_id, self.tcx)
+                    && utils::file::api_list::is_def_id_api(def_id, self.tcx)
                 {
                     let mut if_args = vec![];
                     for (i, arg) in args.iter().enumerate() {
@@ -1064,7 +1061,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         }
                         let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
                         let ty = typeck.expr_ty(arg);
-                        if io_replacer::util::contains_file_ty(ty, self.tcx) {
+                        if utils::file::contains_file_ty(ty, self.tcx) {
                             if_args.push(ArgIdx(i));
                         }
                     }

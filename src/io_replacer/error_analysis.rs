@@ -17,8 +17,9 @@ use rustc_middle::{
 };
 use rustc_span::{Span, Symbol};
 use typed_arena::Arena;
+use utils::file::api_list;
 
-use super::{api_list, mir_loc::MirLoc};
+use super::mir_loc::MirLoc;
 use crate::{graph_utils, ir_utils};
 
 pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {

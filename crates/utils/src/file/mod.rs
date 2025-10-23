@@ -7,16 +7,9 @@ use rustc_middle::{
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{TypeSuperVisitable as _, TypeVisitable as _};
 
-use crate::ir_utils;
-
 #[inline]
 pub fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    ir_utils::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "_IO_FILE")
-}
-
-#[inline]
-pub fn is_option_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    ir_utils::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "Option")
+    crate::ir::def_id_to_symbol(id, tcx).is_some_and(|name| name.as_str() == "_IO_FILE")
 }
 
 #[inline]
@@ -55,10 +48,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
     }
 }
 
-pub fn file_param_index<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> {
+pub fn file_param_index<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> {
     match ty.kind() {
         TyKind::Adt(adt_def, targs) => {
-            if is_option_ty(adt_def.did(), tcx) {
+            if crate::ir::is_option(adt_def.did(), tcx) {
                 let targs = targs.into_type_list(tcx);
                 file_param_index(targs[0], tcx)
             } else {
@@ -75,3 +68,5 @@ pub fn file_param_index<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>)
         _ => None,
     }
 }
+
+pub mod api_list;

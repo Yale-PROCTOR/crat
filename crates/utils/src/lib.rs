@@ -19,6 +19,7 @@ extern crate rustc_middle;
 extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_type_ir;
 extern crate smallvec;
 extern crate thin_vec;
 
@@ -27,6 +28,7 @@ pub mod bit_set;
 pub mod compilation;
 pub mod disjoint_set;
 pub mod equiv_classes;
+pub mod file;
 pub mod graph;
 pub mod ir;
 pub mod ty_shape;
