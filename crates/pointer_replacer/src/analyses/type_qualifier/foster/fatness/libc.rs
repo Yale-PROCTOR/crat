@@ -1,5 +1,5 @@
 use rustc_middle::mir::{HasLocalDecls, Operand, Place};
-use rustc_span::{source_map::Spanned, symbol::Ident};
+use rustc_span::{Symbol, source_map::Spanned};
 
 use super::{Fatness, place_vars};
 use crate::analyses::type_qualifier::foster::{
@@ -10,7 +10,7 @@ use crate::analyses::type_qualifier::foster::{
 pub fn libc_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
-    callee: Ident,
+    callee: Symbol,
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,

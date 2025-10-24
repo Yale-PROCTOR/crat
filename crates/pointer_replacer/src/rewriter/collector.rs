@@ -3,10 +3,10 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{
     ExprKind, HirId, QPath, TyKind,
     def::{DefKind, Res},
-    def_id::DefId,
     intravisit::{Visitor, walk_expr},
 };
 use rustc_middle::mir::Local;
+use rustc_span::def_id::LocalDefId;
 
 use super::{
     Analysis,
@@ -29,7 +29,7 @@ pub fn collect_diffs<'tcx>(
         let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
 
         // Assume every mir local has one or less corresponding hir id
-        let hir_to_mir = utils::ir::map_thir_to_mir(did.expect_local(), false, rust_program.tcx);
+        let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
         let local_to_binding: FxHashMap<Local, HirId> = hir_to_mir
             .binding_to_local
             .into_iter()
@@ -38,7 +38,7 @@ pub fn collect_diffs<'tcx>(
 
         let body = &*rust_program
             .tcx
-            .mir_drops_elaborated_and_const_checked(did.expect_local())
+            .mir_drops_elaborated_and_const_checked(did)
             .borrow();
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
@@ -86,9 +86,9 @@ pub fn collect_diffs<'tcx>(
     ptr_kind_diffs
 }
 
-pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<DefId> {
+pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
     struct FnPtrCollector {
-        pub fn_ptrs: FxHashSet<DefId>,
+        pub fn_ptrs: FxHashSet<LocalDefId>,
     }
 
     impl<'tcx> Visitor<'tcx> for FnPtrCollector {
@@ -98,6 +98,7 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<DefId> {
                 && let ExprKind::Path(ref qpath) = inner.kind
                 && let QPath::Resolved(_, path) = qpath
                 && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
+                && let Some(def_id) = def_id.as_local()
             {
                 self.fn_ptrs.insert(def_id);
             }
@@ -110,8 +111,7 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<DefId> {
     };
 
     for def_id in rust_program.functions.iter() {
-        let local_def_id = def_id.expect_local();
-        let body = rust_program.tcx.hir_body_owned_by(local_def_id);
+        let body = rust_program.tcx.hir_body_owned_by(*def_id);
         collector.visit_body(body);
     }
 

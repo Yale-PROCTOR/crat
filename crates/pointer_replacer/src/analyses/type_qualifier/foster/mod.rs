@@ -1,9 +1,9 @@
 //! Foster style flow-insensitive type qualifier inference algorithm
 
 use constraint_system::{BooleanLattice, Var};
-use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_span::def_id::LocalDefId;
 
 use crate::{
     analyses::{
@@ -77,22 +77,24 @@ where Domain: BooleanLattice
 }
 
 impl<Qualifier> TypeQualifiers<Qualifier> {
-    pub fn function_facts(&self, did: &DefId, tcx: TyCtxt) -> impl Iterator<Item = &[Qualifier]> {
-        let body = &*tcx
-            .mir_drops_elaborated_and_const_checked(did.expect_local())
-            .borrow();
+    pub fn function_facts(
+        &self,
+        did: LocalDefId,
+        tcx: TyCtxt,
+    ) -> impl Iterator<Item = &[Qualifier]> {
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
         self.fn_locals
             .locals(did)
             .take(body.arg_count + 1)
             .map(|vars| &self.model[vars])
     }
 
-    pub fn function_body_facts(&self, did: &DefId) -> impl Iterator<Item = &[Qualifier]> {
+    pub fn function_body_facts(&self, did: LocalDefId) -> impl Iterator<Item = &[Qualifier]> {
         self.fn_locals.locals(did).map(|vars| &self.model[vars])
     }
 
     #[allow(unused)]
-    pub fn struct_facts(&self, did: &DefId) -> impl Iterator<Item = &[Qualifier]> {
+    pub fn struct_facts(&self, did: LocalDefId) -> impl Iterator<Item = &[Qualifier]> {
         self.struct_fields.fields(did).map(|vars| &self.model[vars])
     }
 }

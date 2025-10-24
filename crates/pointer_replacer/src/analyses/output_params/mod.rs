@@ -1,12 +1,12 @@
 use eliminable_temporaries::eliminable_temporaries;
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::MixedBitSet;
 use rustc_middle::{
     mir::{Body, Local},
     ty::TyCtxt,
 };
+use rustc_span::def_id::LocalDefId;
 
 use super::{
     alias::{AliasResult, alias_results},
@@ -17,7 +17,7 @@ use crate::utils::rustc::RustProgram;
 
 mod eliminable_temporaries;
 
-pub type OutputParams = FxHashMap<DefId, MixedBitSet<Local>>;
+pub type OutputParams = FxHashMap<LocalDefId, MixedBitSet<Local>>;
 
 #[allow(unused)]
 pub fn show_output_params(program: &RustProgram, mutability_result: &MutabilityResult) {
@@ -46,7 +46,7 @@ pub fn compute_output_params(
     for &did in program.functions.iter() {
         let body = &*program
             .tcx
-            .mir_drops_elaborated_and_const_checked(did.expect_local())
+            .mir_drops_elaborated_and_const_checked(did)
             .borrow();
         output_params.insert(
             did,
@@ -60,9 +60,7 @@ pub fn compute_output_params(
         loop {
             let mut changed = false;
             for &def_id in scc {
-                let body = &*tcx
-                    .mir_drops_elaborated_and_const_checked(def_id.expect_local())
-                    .borrow();
+                let body = &*tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
                 changed = changed
                     || iterate(
                         body,
@@ -88,9 +86,9 @@ fn conservative<'tcx>(
     alias_result: &AliasResult,
     mutability_result: &MutabilityResult,
 ) -> MixedBitSet<Local> {
-    let location_of = alias_result.local_locations(&body.source.def_id());
-    let body_did = body.source.def_id();
-    let function_facts = mutability_result.function_facts(&body_did, tcx);
+    let body_did = body.source.def_id().expect_local();
+    let location_of = alias_result.local_locations(body_did);
+    let function_facts = mutability_result.function_facts(body_did, tcx);
 
     let mut output_params = MixedBitSet::new_empty(body.local_decls.len());
     for (local, _) in
@@ -137,12 +135,12 @@ fn iterate<'tcx>(
     known_facts: &mut OutputParams,
     tcx: TyCtxt<'tcx>,
 ) -> bool {
-    let location_of = alias_result.local_locations(&body.source.def_id());
-    let body_did = body.source.def_id();
-    let function_facts = mutability_result.function_facts(&body_did, tcx);
+    let body_did = body.source.def_id().expect_local();
+    let location_of = alias_result.local_locations(body_did);
+    let function_facts = mutability_result.function_facts(body_did, tcx);
     let transitive_output_position_temporaries =
         transitive_output_position_temporaries(known_facts, copies, body, tcx);
-    let output_params = known_facts.get_mut(&body.source.def_id()).unwrap();
+    let output_params = known_facts.get_mut(&body_did).unwrap();
 
     let mut changed = false;
     for (arg, _) in

@@ -270,31 +270,26 @@ impl<'me, 'tcx, F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrat
             return;
         };
 
-        if !self
-            .steensgaard
-            .fn_locals
-            .0
-            .did_idx
-            .contains_key(&callee_did)
-        {
-            if let Some(local_did) = callee_did.as_local()
-                && let rustc_hir::Node::ForeignItem(foreign_item) =
-                    self.tcx.hir_node_by_def_id(local_did)
+        if let Some(callee_did) = callee_did.as_local() {
+            if !self
+                .steensgaard
+                .fn_locals
+                .0
+                .did_idx
+                .contains_key(&callee_did)
+            {
+                I::handle_boundary(self, callee_did, destination, args);
+            } else if let rustc_hir::Node::ForeignItem(foreign_item) =
+                self.tcx.hir_node_by_def_id(callee_did)
+                && foreign_item.ident.as_str() == "free"
             {
                 // special-casing free function
-                if foreign_item.ident.as_str() == "free" {
-                    D::handle_dealloc_arg(self, &args.first().unwrap().node);
-                    return;
-                }
+                D::handle_dealloc_arg(self, &args.first().unwrap().node);
+            } else {
+                I::handle_extern_call(self, destination, args);
             }
-
-            // handle unknown calls
-            // self.handle_unknown_call(destination, args);
+        } else {
             I::handle_extern_call(self, destination, args);
-
-            return;
         }
-
-        I::handle_boundary(self, callee_did, destination, args);
     }
 }

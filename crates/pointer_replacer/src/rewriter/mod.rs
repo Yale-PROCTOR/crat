@@ -49,8 +49,8 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
             continue;
         };
         match item.kind {
-            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id.to_def_id()),
-            ItemKind::Struct(..) => structs.push(item.owner_id.def_id.to_def_id()),
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
             _ => {}
         };
     }

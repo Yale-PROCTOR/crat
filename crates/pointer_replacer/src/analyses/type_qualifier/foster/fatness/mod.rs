@@ -28,10 +28,10 @@ pub fn fatness_analysis(rust_program: &RustProgram) -> FatnessResult {
     for r#fn in &rust_program.functions {
         let body = &*rust_program
             .tcx
-            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+            .mir_drops_elaborated_and_const_checked(r#fn)
             .borrow();
         let locals = {
-            let idx = result.fn_locals.0.did_idx[&body.source.def_id()];
+            let idx = result.fn_locals.0.did_idx[r#fn];
             &result.fn_locals.0.contents[idx]
         };
         let ctxt = InferCtxt {
@@ -213,12 +213,10 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
         {
             match func {
                 CallKind::FreeStanding(callee) => {
-                    let callee_body = &*tcx
-                        .mir_drops_elaborated_and_const_checked(callee.expect_local())
-                        .borrow();
+                    let callee_body = &*tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
                     let mut callee_vars = fn_locals
                         .0
-                        .contents_iter(&callee)
+                        .contents_iter(callee)
                         .take(callee_body.arg_count + 1);
 
                     let dest = place_vars(destination, local_decls, locals, struct_fields);
@@ -309,7 +307,7 @@ fn place_vars<'tcx>(
                             return place_vars;
                         }
                         let field_vars = struct_fields
-                            .fields(&adt_def.did())
+                            .fields(adt_def.did().expect_local())
                             .nth(field.index())
                             .unwrap();
 

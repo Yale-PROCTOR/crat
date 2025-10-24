@@ -1,9 +1,8 @@
-use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{Body, Operand, Place, ProjectionElem},
     ty::{TyCtxt, TyKind},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::{def_id::LocalDefId, source_map::Spanned};
 
 use super::{
     ConstraintGeneration, FnLocals, StructFields,
@@ -35,7 +34,8 @@ impl FieldStrategy for FieldInsensitive {
         fn_locals: &FnLocals,
         _: TyCtxt<'tcx>,
     ) -> Option<PlaceLocation> {
-        let loc = fn_locals.memory_location(&body.source.def_id(), place.local.as_usize());
+        let loc =
+            fn_locals.memory_location(body.source.def_id().expect_local(), place.local.as_usize());
         if !place.is_indirect() {
             Some(PlaceLocation::Plain(loc))
         } else {
@@ -73,15 +73,17 @@ impl FieldStrategy for FieldBased {
         if let Some((struct_place, ProjectionElem::Field(field, _))) = place.last_projection() {
             let struct_ty = struct_place.ty(body, tcx).ty;
             let TyKind::Adt(adt_def, _) = struct_ty.kind() else { unreachable!() };
-            if !struct_fields.0.did_idx.contains_key(&adt_def.did()) {
+            let did = adt_def.did().as_local()?;
+            if !struct_fields.0.did_idx.contains_key(&did) {
                 return None;
             }
-            let loc = struct_fields.memory_location(&adt_def.did(), field.index());
+            let loc = struct_fields.memory_location(did, field.index());
             return Some(PlaceLocation::Plain(loc));
         }
 
         assert!(place.local_or_deref_local().is_some());
-        let loc = fn_locals.memory_location(&body.source.def_id(), place.local.as_usize());
+        let loc =
+            fn_locals.memory_location(body.source.def_id().expect_local(), place.local.as_usize());
         if place.as_local().is_some() {
             Some(PlaceLocation::Plain(loc))
         } else {
@@ -176,7 +178,7 @@ pub trait InterProceduralStrategy: Sized {
 
     fn handle_boundary<'cg, 'tcx, F: FieldStrategy, D: DeallocArgStrategy>(
         cg: &mut ConstraintGeneration<'cg, 'tcx, F, D, Self>,
-        callee_did: DefId,
+        callee_did: LocalDefId,
         destination: &Place<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
     ) {
@@ -196,7 +198,7 @@ pub trait InterProceduralStrategy: Sized {
             let param_loc = cg
                 .steensgaard
                 .fn_locals
-                .memory_location(&callee_did, idx + 1);
+                .memory_location(callee_did, idx + 1);
 
             let PlaceLocation::Plain(arg_loc) = arg_loc else {
                 unreachable!("argument operand contains derefs")
@@ -219,7 +221,7 @@ pub trait InterProceduralStrategy: Sized {
         };
         // let ret_loc =
         //     cg.steensgaard.fn_locals.locations[cg.steensgaard.fn_locals.did_idx[&callee_did]][0];
-        let ret_loc = cg.steensgaard.fn_locals.memory_location(&callee_did, 0);
+        let ret_loc = cg.steensgaard.fn_locals.memory_location(callee_did, 0);
         let constraint_idx = cg.constraints.len();
         cg.constraints.push(Constraint::assign(dest_loc, ret_loc));
         cg.resolve_assign(dest_loc, ret_loc, constraint_idx);
@@ -242,7 +244,7 @@ impl InterProceduralStrategy for IntraProcedural {
 
     fn handle_boundary<'cg, 'tcx, F: FieldStrategy, D: DeallocArgStrategy>(
         _: &mut ConstraintGeneration<'cg, 'tcx, F, D, Self>,
-        _: DefId,
+        _: LocalDefId,
         _: &Place<'tcx>,
         _: &[Spanned<Operand<'tcx>>],
     ) {

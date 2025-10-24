@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::DefId;
+use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, collector::collect_fn_ptrs};
 use crate::utils::rustc::RustProgram;
@@ -38,16 +38,16 @@ pub struct SigDecision {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SigDecisions {
-    data: FxHashMap<DefId, SigDecision>,
+    data: FxHashMap<LocalDefId, SigDecision>,
 }
 
 impl SigDecisions {
-    pub fn expect(&self, did: &DefId) -> SigDecision {
-        self.data.get(did).unwrap().clone()
+    pub fn expect(&self, did: LocalDefId) -> &SigDecision {
+        self.data.get(&did).unwrap()
     }
 
-    pub fn get(&self, did: &DefId) -> Option<SigDecision> {
-        self.data.get(did).cloned()
+    pub fn get(&self, did: LocalDefId) -> Option<&SigDecision> {
+        self.data.get(&did)
     }
 
     pub fn new(rust_program: &RustProgram, analysis: &Analysis) -> Self {
@@ -82,7 +82,7 @@ impl SigDecisions {
 
             let body = &*rust_program
                 .tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .mir_drops_elaborated_and_const_checked(did)
                 .borrow();
 
             let sig = rust_program.tcx.fn_sig(*did).skip_binder();
