@@ -7,7 +7,8 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use crat::*;
+use crat::outparam_replacer;
+use passes::*;
 use serde::Deserialize;
 use utils::compilation::run_compiler_on_path;
 
@@ -127,6 +128,7 @@ enum Pass {
     Split,
     Bin,
     Check,
+    Format,
     Libc,
     OutParam,
     Lock,
@@ -152,7 +154,7 @@ struct Config {
     #[serde(default)]
     bin: bin_file_adder::Config,
     #[serde(default)]
-    r#union: union_replacer::tag_analysis::Config,
+    r#union: union_replacer::Config,
     #[serde(default)]
     outparam: outparam_replacer::Config,
     #[serde(default)]
@@ -331,7 +333,7 @@ fn main() {
         args.input
     };
 
-    let lib_path = crat::find_lib_path(&dir).unwrap_or_else(|e| {
+    let lib_path = utils::find_lib_path(&dir).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -388,7 +390,10 @@ fn main() {
                 .unwrap();
             }
             Pass::Check => {
-                run_compiler_on_path(&file, type_checker::type_check).unwrap();
+                run_compiler_on_path(&file, utils::type_check).unwrap();
+            }
+            Pass::Format => {
+                run_compiler_on_path(&file, formatter::format).unwrap();
             }
             Pass::Libc => {
                 let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();

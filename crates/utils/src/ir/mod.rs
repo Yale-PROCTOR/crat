@@ -6,7 +6,7 @@ use rustc_middle::{
     query::IntoQueryParam,
     ty::TyCtxt,
 };
-use rustc_span::{Symbol, def_id::DefId};
+use rustc_span::{Symbol, def_id::DefId, sym};
 
 #[inline]
 pub fn def_id_to_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<Symbol> {
@@ -16,6 +16,11 @@ pub fn def_id_to_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Opti
         return None;
     };
     Some(name)
+}
+
+#[inline]
+pub fn is_option(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
+    def_id_to_symbol(id, tcx).is_some_and(|name| name == sym::Option)
 }
 
 #[inline]

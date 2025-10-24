@@ -1,13 +1,13 @@
 [package]
-name = "utils"
+name = "points_to"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+utils = { path = "../utils" }
 etrace.workspace = true
+serde.workspace = true
 typed-arena.workspace = true
-toml.workspace = true
-lazy_static.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

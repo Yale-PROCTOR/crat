@@ -143,8 +143,22 @@ impl Emitter for ErrorEmitter {
 fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];
 
-    let dir = std::env::var("DIR").unwrap_or_else(|_| ".".to_string());
-    let dep = format!("{dir}/deps_crate/target/debug/deps");
+    let dep = std::env::var("DIR")
+        .ok()
+        .and_then(|dir| {
+            let dep = format!("{dir}/deps_crate/target/debug/deps");
+            Path::new(&dep).exists().then_some(dep)
+        })
+        .or_else(|| {
+            let dep = "deps_crate/target/debug/deps";
+            Path::new(dep).exists().then(|| dep.to_string())
+        })
+        .or_else(|| {
+            let dep = "../../deps_crate/target/debug/deps";
+            Path::new(dep).exists().then(|| dep.to_string())
+        })
+        .expect("deps_crate not found");
+
     if let Ok(dir) = std::fs::read_dir(&dep) {
         args.push("-L".to_string());
         args.push(format!("dependency={dep}"));

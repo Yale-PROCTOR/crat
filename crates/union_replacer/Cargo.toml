@@ -1,0 +1,15 @@
+[package]
+name = "union_replacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+points_to = { path = "../points_to" }
+typed-arena.workspace = true
+etrace.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true

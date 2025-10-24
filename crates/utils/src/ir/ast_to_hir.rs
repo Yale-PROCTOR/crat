@@ -1376,7 +1376,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
             }
             ExprKind::IncludedBytes(_) => todo!(),
             ExprKind::Path(_, _) => todo!(),
-            ExprKind::Unary(UnOp::Neg, expr) if let ExprKind::Lit(_) = &expr.kind => {
+            ExprKind::Unary(UnOp::Neg, expr) if matches!(expr.kind, ExprKind::Lit(_)) => {
                 let hir::PatExprKind::Lit { negated: true, .. } = hpat_expr.kind else { panic!() };
                 self.add_local(&mut expr.id, hpat_expr.hir_id);
             }
