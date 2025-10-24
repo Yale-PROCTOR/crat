@@ -12,23 +12,6 @@ pub enum PtrKind {
     Raw(bool),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PtrKindDiff {
-    /// ptrkind before change (required by surrounding context)
-    pub before: PtrKind,
-    /// ptrkind after change (should be adjusted to satisfy `before`)
-    pub after: PtrKind,
-}
-
-impl Default for PtrKindDiff {
-    fn default() -> Self {
-        PtrKindDiff {
-            before: PtrKind::Raw(true),
-            after: PtrKind::Raw(true),
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SigDecision {
     /// None means no change
@@ -38,18 +21,10 @@ pub struct SigDecision {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SigDecisions {
-    data: FxHashMap<LocalDefId, SigDecision>,
+    pub data: FxHashMap<LocalDefId, SigDecision>,
 }
 
 impl SigDecisions {
-    pub fn expect(&self, did: LocalDefId) -> &SigDecision {
-        self.data.get(&did).unwrap()
-    }
-
-    pub fn get(&self, did: LocalDefId) -> Option<&SigDecision> {
-        self.data.get(&did)
-    }
-
     pub fn new(rust_program: &RustProgram, analysis: &Analysis) -> Self {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());

@@ -10,6 +10,7 @@ small_vec = { package = "smallvec", version = "1.15.1", features = ["const_new"]
 petgraph = "0.8.2"
 regex = "1.12.2"
 tracing.workspace = true
+etrace.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

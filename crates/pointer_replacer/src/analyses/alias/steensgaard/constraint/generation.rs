@@ -271,7 +271,7 @@ impl<'me, 'tcx, F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrat
         };
 
         if let Some(callee_did) = callee_did.as_local() {
-            if !self
+            if self
                 .steensgaard
                 .fn_locals
                 .0

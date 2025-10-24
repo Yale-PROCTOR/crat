@@ -8,18 +8,14 @@ use rustc_hir::{
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
-use super::{
-    Analysis,
-    decision::{PtrKind, PtrKindDiff},
-};
+use super::{Analysis, decision::PtrKind};
 use crate::utils::rustc::RustProgram;
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
-) -> FxHashMap<HirId, PtrKindDiff> {
-    // Res::Local(id) -> (PtrKind before rewrite, PtrKind after rewrite)
-    let mut ptr_kind_diffs: FxHashMap<HirId, PtrKindDiff> = FxHashMap::default();
+) -> FxHashMap<HirId, PtrKind> {
+    let mut ptr_kinds = FxHashMap::default();
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
 
@@ -62,6 +58,8 @@ pub fn collect_diffs<'tcx>(
                 PtrKind::OptRef(true)
             } else if promoted_mut_refs.contains(local) {
                 PtrKind::OptRef(mutability)
+            } else if decl.ty.is_raw_ptr() {
+                PtrKind::Raw(mutability)
             } else {
                 continue;
             };
@@ -72,18 +70,12 @@ pub fn collect_diffs<'tcx>(
                     ty.is_raw_ptr(),
                     "Expected raw pointer type, got {ty:?} in {decl:?}"
                 );
-                ptr_kind_diffs.insert(
-                    *hir_id,
-                    PtrKindDiff {
-                        before: PtrKind::Raw(mutability),
-                        after: ptr_kind,
-                    },
-                );
+                ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }
     }
 
-    ptr_kind_diffs
+    ptr_kinds
 }
 
 pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
