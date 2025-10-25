@@ -19,8 +19,6 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
-pub mod post;
-
 pub(crate) struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     sig_decs: SigDecisions,
@@ -51,7 +49,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
                     let Some(PtrKind::OptRef(m)) = input_dec else { continue };
-                    let inner_ty = unwrap_raw_ptr_from_mir_ty(local_decl.ty);
+                    let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty).unwrap();
                     *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
                     if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
                         binding_mode.1 = Mutability::Mut;
@@ -71,44 +69,42 @@ impl MutVisitor for TransformVisitor<'_> {
             && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
             && let Some(lhs_kind) = self.ptr_kinds.get(&hir_id).copied()
         {
+            let typeck = self.tcx.typeck(hir_id.owner);
+            let lhs_ty = typeck.node_type(hir_id);
+            let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+
             if let PtrKind::OptRef(m) = lhs_kind {
-                let typeck = self.tcx.typeck(hir_id.owner);
-                let ty = typeck.node_type(hir_id);
-                let inner_ty = unwrap_raw_ptr_from_mir_ty(ty);
-                local.ty = Some(P(mk_opt_ref_ty(inner_ty, m, self.tcx)));
+                local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
             }
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
-                self.transform_rhs(rhs, lhs_kind);
+                self.transform_rhs(rhs, let_stmt.init.unwrap(), lhs_kind);
             }
         }
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        // lhs may be transformed, so we record its type before visiting children
-        let lhs_ty = if let ExprKind::Assign(lhs, _, _) = &expr.kind {
-            let hir_lhs = self.ast_to_hir.get_expr(lhs.id, self.tcx).unwrap();
-            let typeck = self.tcx.typeck(hir_lhs.hir_id.owner);
-            Some(typeck.expr_ty(hir_lhs))
-        } else {
-            None
-        };
-
         mut_visit::walk_expr(self, expr);
 
         match &mut expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
-                let ty::TyKind::RawPtr(_, m) = lhs_ty.unwrap().kind() else { return };
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let hir::ExprKind::Assign(hir_lhs, hir_rhs, _) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
+                let lhs_ty = typeck.expr_ty(hir_lhs);
+                let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
                 let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind {
                     let hir_id = self.hir_id_of_path(lhs.id).unwrap();
                     self.ptr_kinds[&hir_id]
                 } else {
                     PtrKind::Raw(m.is_mut())
                 };
-                self.transform_rhs(rhs, lhs_kind);
+                self.transform_rhs(rhs, hir_rhs, lhs_kind);
             }
-            ExprKind::Unary(UnOp::Deref, e) => match e.kind {
-                ExprKind::Path(None, _) => {
+            ExprKind::Unary(UnOp::Deref, e) => {
+                if matches!(e.kind, ExprKind::Path(_, _)) {
                     let hir_id = self.hir_id_of_path(e.id).unwrap();
                     let ptr_kind = self.ptr_kinds[&hir_id];
                     if let PtrKind::OptRef(m) = ptr_kind {
@@ -117,8 +113,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             utils::expr!("{}.as_deref{}().unwrap()", pprust::expr_to_string(e), m);
                     }
                 }
-                _ => {}
-            },
+            }
             ExprKind::Call(_, args) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
@@ -135,16 +130,19 @@ impl MutVisitor for TransformVisitor<'_> {
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                 for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
                     let ty = typeck.expr_ty_adjusted(harg);
-                    let ty::TyKind::RawPtr(_, m) = ty.kind() else { continue };
+                    let (_, m) = some_or!(unwrap_ptr_from_mir_ty(ty), continue);
                     let param_kind = sig_dec
                         .and_then(|sig| sig.input_decs.get(i).copied())
                         .flatten()
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
-                    self.transform_rhs(arg, param_kind);
+                    self.transform_rhs(arg, harg, param_kind);
                 }
             }
             ExprKind::Ret(Some(ret)) => {
-                let hir_ret = self.ast_to_hir.get_expr(ret.id, self.tcx).unwrap();
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let hir::ExprKind::Ret(Some(hir_ret)) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
                 let sig = self
                     .tcx
                     .fn_sig(hir_ret.hir_id.owner)
@@ -152,7 +150,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     .skip_binder();
                 if let ty::TyKind::RawPtr(_, m) = sig.output().kind() {
                     let kind = PtrKind::Raw(m.is_mut());
-                    self.transform_rhs(ret, kind);
+                    self.transform_rhs(ret, hir_ret, kind);
                 }
             }
             _ => {}
@@ -170,7 +168,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let mut ptr_kinds = collect_diffs(rust_program, analysis); // TODO: Move outside
 
         // HACK: if `p.offset(..)` is used, `p` remains a raw pointer
-        // used until fatness analysis is integrated
+        // TODO: use fatness analysis instead
         let mut visitor = OffsetVisitor {
             tcx: rust_program.tcx,
             params: FxHashMap::default(),
@@ -216,71 +214,159 @@ impl<'tcx> TransformVisitor<'tcx> {
         Some(hir_id)
     }
 
-    fn transform_rhs(&self, rhs: &mut Expr, lhs_kind: PtrKind) {
+    fn transform_rhs(&self, rhs: &mut Expr, hir_rhs: &hir::Expr, lhs_kind: PtrKind) {
         let e = unwrap_expr(rhs);
+        if let ExprKind::Lit(token::Lit {
+            kind: token::LitKind::Integer,
+            symbol,
+            ..
+        }) = e.kind
+            && symbol.as_str() == "0"
+        {
+            // rhs_ty will be `usize`, not a pointer, so we early return here
+            if matches!(lhs_kind, PtrKind::OptRef(_)) {
+                *rhs = utils::expr!("None");
+            }
+            return;
+        }
+
+        let typeck = self.tcx.typeck(hir_rhs.hir_id.owner);
+        let lhs_ty = typeck.expr_ty_adjusted(hir_rhs);
+        let rhs_ty = typeck.expr_ty(unwrap_hir_expr(hir_rhs));
+        let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+        let (rhs_inner_ty, _) = unwrap_ptr_from_mir_ty(rhs_ty).unwrap();
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
         match &e.kind {
             ExprKind::Path(_, _) => {
                 let hir_id = some_or!(self.hir_id_of_path(e.id), return);
                 let rhs_kind = self.ptr_kinds[&hir_id];
                 match (lhs_kind, rhs_kind) {
                     (PtrKind::OptRef(m), PtrKind::OptRef(_)) => {
-                        *rhs = utils::expr!(
-                            "({}).as_deref{}()",
-                            pprust::expr_to_string(e),
-                            if m { "_mut" } else { "" },
-                        );
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "({}).as_deref{}().map(|x| &{}*(x as *{3} _ as *{3} {4}))",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_deref{}()",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                            );
+                        }
                     }
                     (PtrKind::Raw(m), PtrKind::OptRef(_)) => {
-                        *rhs = utils::expr!(
-                            "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x as *{2} _ as *{2} _)",
-                            pprust::expr_to_string(e),
-                            if m { "_mut" } else { "" },
-                            if m { "mut" } else { "const" }
-                        );
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x as *{2} _ as *{2} {3})",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                            );
+                        }
                     }
                     (PtrKind::OptRef(m), PtrKind::Raw(_)) => {
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "(({}) as *{} {}).as_{}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                                if m { "mut" } else { "ref" },
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_{}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "ref" },
+                            );
+                        }
+                    }
+                    (PtrKind::Raw(_), PtrKind::Raw(_)) => {}
+                }
+            }
+            ExprKind::AddrOf(_, _, e) => {
+                // if rhs is `&mut x` and `x`'s type has been updated to `Option<&(mut) T>`,
+                // we need a cast
+                let ty_updated = if matches!(e.kind, ExprKind::Path(_, _))
+                    && let Some(hir_e) = self.ast_to_hir.get_expr(e.id, self.tcx)
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_e.kind
+                    && let Res::Local(hir_id) = path.res
+                {
+                    matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::OptRef(_)))
+                } else {
+                    false
+                };
+                match lhs_kind {
+                    PtrKind::OptRef(m) => {
+                        if need_cast || ty_updated {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "Some(&{}*(&raw {1} ({2}) as *{1} {3}))",
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "Some(&{}({}))",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(e)
+                            );
+                        }
+                    }
+                    PtrKind::Raw(m) => {
+                        if need_cast || ty_updated {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "&raw {0} ({1}) as *{0} {2}",
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "&raw {0} ({1})",
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => match lhs_kind {
+                PtrKind::OptRef(m) => {
+                    if need_cast {
+                        let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        *rhs = utils::expr!(
+                            "(({}) as *{} {}).as_{}()",
+                            pprust::expr_to_string(e),
+                            if m { "mut" } else { "const" },
+                            lhs_inner_ty,
+                            if m { "mut" } else { "ref" },
+                        );
+                    } else {
                         *rhs = utils::expr!(
                             "({}).as_{}()",
                             pprust::expr_to_string(e),
                             if m { "mut" } else { "ref" },
                         );
                     }
-                    (PtrKind::Raw(_), PtrKind::Raw(_)) => {}
-                }
-            }
-            ExprKind::AddrOf(_, _, e) => match lhs_kind {
-                PtrKind::OptRef(m) => {
-                    *rhs = utils::expr!(
-                        "Some(&{}({}))",
-                        if m { "mut " } else { "" },
-                        pprust::expr_to_string(e)
-                    );
-                }
-                PtrKind::Raw(m) => {
-                    *rhs = utils::expr!(
-                        "&raw {} ({}) as *mut _",
-                        if m { "mut" } else { "const" },
-                        pprust::expr_to_string(e)
-                    );
-                }
-            },
-            ExprKind::Lit(token::Lit {
-                kind: token::LitKind::Integer,
-                symbol,
-                ..
-            }) if symbol.as_str() == "0" => match lhs_kind {
-                PtrKind::OptRef(_) => {
-                    *rhs = utils::expr!("None");
-                }
-                PtrKind::Raw(_) => {}
-            },
-            _ => match lhs_kind {
-                PtrKind::OptRef(m) => {
-                    *rhs = utils::expr!(
-                        "({}).as_{}()",
-                        pprust::expr_to_string(e),
-                        if m { "mut" } else { "ref" },
-                    );
                 }
                 PtrKind::Raw(_) => {}
             },
@@ -296,19 +382,22 @@ fn unwrap_expr(expr: &Expr) -> &Expr {
     }
 }
 
-fn unwrap_raw_ptr_from_mir_ty(ty: ty::Ty<'_>) -> ty::Ty<'_> {
+#[inline]
+fn unwrap_ptr_from_mir_ty(ty: ty::Ty<'_>) -> Option<(ty::Ty<'_>, ty::Mutability)> {
     match ty.kind() {
-        ty::TyKind::RawPtr(ty, _) => *ty,
-        _ => panic!("{ty:?}"),
+        ty::TyKind::RawPtr(ty, m) | ty::TyKind::Ref(_, ty, m) => Some((*ty, *m)),
+        _ => None,
     }
 }
 
+#[inline]
 fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
     let ty = mir_ty_to_string(ty, tcx);
     let m = if mutability { "mut " } else { "" };
     utils::ty!("Option<&{m}{ty}>")
 }
 
+#[inline]
 fn mir_ty_to_string<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
     let mut buf = String::new();
     format_mir_ty(&mut buf, ty, tcx).unwrap();
