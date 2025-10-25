@@ -14,6 +14,7 @@ use crate::{
 };
 
 mod constraint_system;
+pub mod fatness;
 pub mod mutability;
 
 pub type StructFields = encoding::StructFields<Var>;
