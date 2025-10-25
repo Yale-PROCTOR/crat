@@ -51,7 +51,7 @@ jobs:
       - name: Benchmark (Test) - extern-post
         run: sudo -u ubuntu bash -lc "./tool.py test extern-post --exclude tar-1.34"
       - name: Benchmark (Clean) - extern-post
-        run: sudo -u ubuntu bash -lc "rm -rf benchmarks/rs-extern-post/*/target"
+        run: sudo -u ubuntu bash -lc "./tool.py clean expand -y && ./tool.py clean extern -y && ./tool.py clean extern-post -y"
 
       - name: Benchmark (Transform) - resolve
         run: sudo -u ubuntu bash -lc "./tool.py transform resolve"
@@ -68,5 +68,3 @@ jobs:
         run: sudo -u ubuntu bash -lc "./tool.py build io --exclude axel,zmap"
       - name: Benchmark (Test) - io
         run: sudo -u ubuntu bash -lc "./tool.py test io --exclude axel,zmap,snoopy,streem,tar-1.34,the_silver_searcher,tulipindicators"
-      - name: Benchmark (Clean) - io
-        run: sudo -u ubuntu bash -lc "rm -rf benchmarks/rs-io/*/target"
