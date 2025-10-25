@@ -21,76 +21,62 @@ pub fn libc_call<'tcx>(
         // "malloc" => {},
         // free is skipped
         // "free" => {},
-        "strlen" => {
-            return call_strlen(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "strstr" => {
-            return call_strstr(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "strcmp" => {
-            return call_strcmp(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "strncat" => {
-            return call_strncat(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "memcpy" => {
-            return call_memcpy(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "memmove" => {
-            return call_memmove(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
-        "memset" => {
-            return call_memset(
-                destination,
-                args,
-                local_decls,
-                locals,
-                struct_fields,
-                database,
-            );
-        }
+        "strlen" => call_strlen(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "strstr" => call_strstr(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "strcmp" => call_strcmp(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "strncat" => call_strncat(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "memcpy" => call_memcpy(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "memmove" => call_memmove(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
+        "memset" => call_memset(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            database,
+        ),
         "calloc" => call_calloc(
             destination,
             args,
