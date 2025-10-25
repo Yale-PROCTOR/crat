@@ -104,23 +104,17 @@ impl HasTop for Fatness {
 
 impl Lattice for Fatness {
     fn join(&mut self, other: &Self) -> bool {
-        match (*self, *other) {
-            (Self::Arr, Self::Ptr) => {
-                *self = Self::Ptr;
-                return true;
-            }
-            _ => {}
+        if let (Self::Arr, Self::Ptr) = (*self, *other) {
+            *self = Self::Ptr;
+            return true;
         }
         false
     }
 
     fn meet(&mut self, other: &Self) -> bool {
-        match (*self, *other) {
-            (Self::Ptr, Self::Arr) => {
-                *self = Self::Arr;
-                return true;
-            }
-            _ => {}
+        if let (Self::Ptr, Self::Arr) = (*self, *other) {
+            *self = Self::Arr;
+            return true;
         }
         true
     }
@@ -138,9 +132,9 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
         let lhs = place;
         let rhs = rvalue;
 
-        let local_decls = &*self.ctxt.local_decls;
-        let locals = &*self.ctxt.locals;
-        let struct_fields = &*self.ctxt.struct_fields;
+        let local_decls = self.ctxt.local_decls;
+        let locals = self.ctxt.locals;
+        let struct_fields = self.ctxt.struct_fields;
 
         let database = &mut *self.database;
 
@@ -302,7 +296,7 @@ fn place_vars<'tcx>(
     for projection_elem in place.projection {
         match projection_elem {
             ProjectionElem::Deref => {
-                place_vars.start = place_vars.start + 1;
+                place_vars.start += 1;
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(field, ty) => {

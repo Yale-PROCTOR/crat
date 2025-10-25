@@ -11,6 +11,7 @@ use crate::analyses::type_qualifier::foster::{
     constraint_system::{BooleanSystem, ConstraintSystem},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn library_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
@@ -24,46 +25,40 @@ pub fn library_call<'tcx>(
     let def_path = tcx.def_path(callee);
     // if it is a library call in core::ptr
     if def_path
-        .data
-        .get(0)
-        .map(|d| match d.data {
-            rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr" => true,
-            _ => false,
-        })
+        .data.first()
+        .map(|d| matches!(d.data, rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr"))
         .is_some()
     {
         // if it is core::ptr::<..>::..
-        if let Some(d) = def_path.data.get(3) {
-            if let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data {
+        if let Some(d) = def_path.data.get(3)
+            && let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data {
                 match s.as_str() {
                     "offset" => {
-                        return call_offset(
+                        call_offset(
                             destination,
                             args,
                             local_decls,
                             locals,
                             struct_fields,
                             database,
-                        );
+                        )
                     }
                     "offset_from" => {
-                        return call_offset_from(
+                        call_offset_from(
                             destination,
                             args,
                             local_decls,
                             locals,
                             struct_fields,
                             database,
-                        );
+                        )
                     }
                     "addr" => {
                         // no constraint
-                        return;
                     }
                     _ => {}
                 }
             }
-        }
     }
 }
 
