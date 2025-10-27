@@ -13,6 +13,8 @@ extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
 extern crate rustc_span;
 extern crate rustc_type_ir;
+extern crate rustc_ast;
+extern crate rustc_ast_pretty;
 
 use utils::{graph as graph_utils, ir as ir_utils};
 
