@@ -5,9 +5,7 @@ use std::{
 };
 
 use etrace::some_or;
-use regex::Regex;
 use rustc_ast::{
-    HasNodeId,
     ast::*,
     mut_visit::{self, MutVisitor},
     ptr::P,
@@ -15,18 +13,16 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    intravisit, Expr as HirExpr, ExprKind as HirExprKind, ItemKind as HirItemKind, MutTy, PatKind, QPath,
-    TyKind as HirTyKind, def::Res, definitions::DefPathData, Item as HirItem,
+    HirId, Item as HirItem, ItemKind as HirItemKind, MutTy, PatKind, Path as HirPath, QPath,
+    TyKind as HirTyKind, def::Res, definitions::DefPathData, intravisit,
 };
 use rustc_index::IndexVec;
 use rustc_middle::{
+    hir::nested_filter,
     mir::{BasicBlock, TerminatorKind},
-    ty::{Ty as MirTy, TyCtxt},
+    ty::TyCtxt,
 };
-use rustc_span::{
-    FileName, RealFileName, Span,
-    def_id::{DefId, LocalDefId},
-};
+use rustc_span::{FileName, RealFileName, Span, def_id::LocalDefId};
 use utils::{
     ast::transform_ast,
     expr,
@@ -46,6 +42,7 @@ struct Param {
     must: bool,
     /// string representation of the type of the parameter
     ty_str: String,
+    /// return value indicating success for may output parameter
     succ_value: Option<SuccValue>,
 }
 
@@ -74,11 +71,11 @@ rustc_index::newtype_index! {
 }
 
 struct Func {
-    _is_unit: bool,
-    _input_len: usize,
     index_map: BTreeMap<ParamIdx, Param>,
     /// target return type after transformation
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
+    /// spans where the parameter is fully written. empty for must parameters
+    write_spans: FxHashMap<ParamIdx, Vec<Span>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,18 +141,6 @@ enum ReturnTyItem {
     Option(Param), // rewrite may parameter to option type
 }
 
-#[derive(Default, Clone, Copy)]
-struct Counter {
-    removed_value_defs: usize,
-    removed_pointer_defs: usize,
-    removed_pointer_uses: usize,
-    direct_returns: usize,
-    success_returns: usize,
-    failure_returns: usize,
-    removed_flag_sets: usize,
-    removed_flag_defs: usize,
-}
-
 pub fn transform(
     tcx: TyCtxt<'_>,
     dir: &Path,
@@ -183,7 +168,6 @@ pub fn transform(
     });
 
     let source_map = tcx.sess.source_map();
-
     let mut def_id_ty_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
@@ -198,6 +182,9 @@ pub fn transform(
         def_id_ty_map.insert(def_id, ty);
     }
 
+    let mut hir_visitor = HirVisitor::new(tcx);
+    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
+
     let mut funcs = FxHashMap::default();
     let mut write_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
 
@@ -208,15 +195,17 @@ pub fn transform(
         };
 
         let def_id = id.owner_id.to_def_id();
+        let local_def_id = def_id.as_local().unwrap();
         let name = tcx.def_path_str(def_id);
         let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let hir_body = tcx.hir_body(body);
         let mir_body = tcx
-            .mir_drops_elaborated_and_const_checked(def_id.as_local().unwrap())
+            .mir_drops_elaborated_and_const_checked(local_def_id)
             .borrow();
 
         let mut succ_param = None;
         let mut index_map: BTreeMap<_, _> = BTreeMap::new();
+        let mut write_spans: FxHashMap<_, Vec<_>> = FxHashMap::default();
 
         for p in &fn_analysis_result.output_params {
             let OutputParam {
@@ -226,6 +215,7 @@ pub fn transform(
                 ..
             } = p;
             let param = &hir_body.params[*index];
+            let param_index = ParamIdx::from_usize(*index);
             let PatKind::Binding(_, _hir_id, ident, _) = param.pat.kind else { unreachable!() };
             let name = ident.name.to_string();
 
@@ -253,7 +243,7 @@ pub fn transform(
                 let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*block)];
                 if *statement_index == bbd.statements.len() {
                     let t = bbd.terminator();
-                    assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{:?}", t);
+                    assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{t:?}");
                     let span = t.source_info.span;
                     if let Some(arg) = write_arg {
                         write_args
@@ -261,13 +251,15 @@ pub fn transform(
                             .or_default()
                             .insert(ParamIdx::from_usize(*arg), name.clone());
                     }
+                } else {
+                    let write_span = bbd.statements[*statement_index].source_info.span;
+                    write_spans.entry(param_index).or_default().push(write_span);
                 }
             });
 
-            let param_index = ParamIdx::from_usize(*index);
             let succ_value = if succ_param.is_none() {
                 // find the first may parameter which has a value indicating success
-                SuccValue::from(&p)
+                SuccValue::from(p)
             } else {
                 None
             };
@@ -301,18 +293,17 @@ pub fn transform(
             return_tys.push(ReturnTyItem::Result(param));
             return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
         } else if !is_unit {
-            // keep the original return type if not unit
+            // if not, keep the original return type
             return_tys.push(ReturnTyItem::Orig);
             return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
         }
 
         let func = Func {
-            _is_unit: is_unit,
-            _input_len: sig.inputs().len(),
             index_map,
             return_tys,
+            write_spans,
         };
-        funcs.insert(def_id, func);
+        funcs.insert(local_def_id, func);
     }
 
     let res = transform_ast(
@@ -326,11 +317,8 @@ pub fn transform(
             };
 
             if p.file_name().unwrap().to_str().unwrap() == lib_name {
-                println!("Skipping library file {:?}", p);
                 return false;
             }
-
-            println!("Transforming AST at {:?}", p);
 
             let mod_id = path_to_mod_id[&p];
             let (module, _, _) = tcx.hir_get_module(mod_id);
@@ -343,6 +331,7 @@ pub fn transform(
                 funcs: &funcs,
                 current_fns: vec![],
                 write_args: &write_args,
+                bounds: &hir_visitor.bounds,
                 updated: false,
             };
             visitor.visit_crate(krate);
@@ -356,10 +345,13 @@ pub fn transform(
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
-    funcs: &'a FxHashMap<DefId, Func>,
+    funcs: &'a FxHashMap<LocalDefId, Func>,
     current_fns: Vec<LocalDefId>,
-    /// param is used as 'usize'th call argument at span
+    /// at span, caller param named string is used 'ParamIdx'th argument of call
     write_args: &'a FxHashMap<Span, FxHashMap<ParamIdx, String>>,
+    /// bound occurrence (ident) span to def_id
+    bounds: &'a FxHashMap<Span, LocalDefId>,
+    /// is this file updated
     updated: bool,
 }
 
@@ -377,64 +369,42 @@ impl TransformVisitor<'_, '_> {
         old.span = span;
     }
 
-    fn expr_to_path<'a, 'tcx>(&self, expr: &'a HirExpr<'tcx>) -> Option<&'a rustc_hir::Path<'tcx>> {
-        if let HirExprKind::Path(QPath::Resolved(_, path)) = expr.kind {
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    fn expr_ty(&self, expr: &Expr) -> Ty {
-        let node_id = expr.node_id();
-        let hir_expr = self
-            .ast_to_hir
-            .get_expr(node_id, self.tcx)
-            .cloned()
-            .unwrap_or_else(|| panic!("Failed to find HIR expr to node {:?}", node_id));
-        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
-        let mir_ty = typeck.expr_ty(&hir_expr);
-
-        mir_ty_to_ty(&mir_ty)
-    }
-
-    fn get_set_flag(&self, i: ParamIdx, write_args: &FxHashMap<ParamIdx, String>) -> String {
-        if let Some(name) = write_args.get(&i) {
-            format!("{}___s = true", name)
-        } else {
-            String::new()
-        }
-    }
-
     fn get_assign(
         &self,
         expr: &Expr,
         must: bool,
         rhs: String,
-        aidx: ParamIdx,
-        write_args: &FxHashMap<ParamIdx, String>,
+        index: ParamIdx,
+        span: Span,
     ) -> String {
-        let ty = self.expr_ty(expr);
         let arg = pprust::expr_to_string(expr);
-        let set_flag = self.get_set_flag(aidx, write_args);
-        match &ty.kind {
-            TyKind::Ptr(_) => {
+        let write_args = self.write_args.get(&span);
+        let set_flag = if let Some(arg_to_param) = write_args
+            && let Some(caller_param) = arg_to_param.get(&index)
+        {
+            format!(" {caller_param}___s = true")
+        } else {
+            String::new()
+        };
+
+        match &expr.kind {
+            ExprKind::AddrOf(BorrowKind::Raw, _, _) | ExprKind::Path(_, _) => {
                 if must {
-                    format!("if !{arg}.is_null() {{ *({arg}) = {rhs}; {set_flag} }}")
+                    format!("if !{arg}.is_null() {{ *({arg}) = {rhs};{set_flag} }}")
                 } else {
                     format!(
-                        "if !({arg}).is_null() {{ if let Some(v___) = {rhs} {{ *({arg}) = v___; {set_flag} }} }}"
+                        "if !({arg}).is_null() {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
                     )
                 }
             }
-            TyKind::Ref(_, _) => {
+            ExprKind::AddrOf(BorrowKind::Ref, _, _) => {
                 if must {
-                    format!("*({arg}) = {rhs}; {set_flag}")
+                    format!("*({arg}) = {rhs};{set_flag}")
                 } else {
-                    format!("if let Some(v___) = {rhs} {{ *({arg}) = v___; {set_flag} }}")
+                    format!("if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }}")
                 }
             }
-            _ => panic!("expected pointer or reference type, found {:?}", ty),
+            kind => panic!("expected pointer or reference kind, found {kind:?}"),
         }
     }
 }
@@ -445,22 +415,27 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_item(&mut self, item: &mut Item) {
-        let node_id = item.id;
-        let ItemKind::Fn(box fn_item) = &mut item.kind else {
+        if !matches!(item.kind, ItemKind::Fn(_)) {
             mut_visit::walk_item(self, item);
             return;
         };
+
+        let node_id = item.id;
         let hir_item = self
             .ast_to_hir
             .get_item(node_id, self.tcx)
             .unwrap_or_else(|| panic!("Failed to find HIR item to node {node_id:?}"));
         let local_def_id = hir_item.owner_id.def_id;
-        let def_id = local_def_id.to_def_id();
+        println!("Visiting function item {local_def_id:?}");
 
-        println!("Visiting function item {def_id:?}");
         self.current_fns.push(local_def_id);
 
-        if let Some(func) = self.funcs.get(&def_id) {
+        mut_visit::walk_item(self, item);
+
+        if let ItemKind::Fn(box fn_item) = &mut item.kind
+            && let Some(func) = self.funcs.get(&local_def_id)
+            && !func.index_map.is_empty()
+        {
             // remove output parameters from input types
             fn_item.sig.decl.inputs = fn_item
                 .sig
@@ -525,25 +500,55 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
                 stmts.insert(0, ref_decl);
                 stmts.insert(0, value_decl);
-                stmts.insert(0, flag_decl);
+                if !param.must {
+                    stmts.insert(0, flag_decl);
+                }
             }
             self.updated = true;
         }
-        mut_visit::walk_item(self, item);
         self.current_fns.pop();
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        let node_id = expr.node_id();
         mut_visit::walk_expr(self, expr);
+
         match &mut expr.kind {
+            ExprKind::Assign(box _lhs, box _rhs, _) => {
+                // Add flag updates for writes
+                let expr_span = expr.span;
+                let curr_fn = self.current_fn();
+
+                if let Some(func) = self.funcs.get(&curr_fn)
+                    && !func.index_map.is_empty()
+                {
+                    let mut flag_updates = vec![];
+                    for (p, spans) in &func.write_spans {
+                        let param = &func.index_map[p];
+                        if !param.must && spans.contains(&expr_span) {
+                            let update = format!("{}___s = true", param.name);
+                            flag_updates.push(update);
+                        }
+                    }
+
+                    if !flag_updates.is_empty() {
+                        let new_expr = expr!(
+                            "{{ {}; {} }}",
+                            flag_updates.join("; "),
+                            pprust::expr_to_string(expr),
+                        );
+                        self.replace_expr(expr, new_expr);
+                        self.updated = true;
+                    }
+                }
+            }
             ExprKind::Ret(opt_expr) => {
                 // Rewrite return values of functions
                 let curr_fn = self.current_fn();
-                let def_id = curr_fn.to_def_id();
 
                 let mut ret_vals = vec![];
-                if let Some(func) = self.funcs.get(&def_id) {
+                if let Some(func) = self.funcs.get(&curr_fn)
+                    && !func.index_map.is_empty()
+                {
                     for ret_ty in &func.return_tys {
                         let ret_val = match ret_ty {
                             ReturnTyItem::Orig => {
@@ -569,39 +574,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         expr!("return ({})", ret_vals.join(", "))
                     };
                     self.replace_expr(expr, new_return);
+                    self.updated = true;
                 }
             }
             ExprKind::Call(callee, args) => {
-                let hir_expr = self
-                    .ast_to_hir
-                    .get_expr(node_id, self.tcx)
-                    .unwrap_or_else(|| panic!("Failed to find HIR expr to expr"));
-
-                let HirExprKind::Call(hir_callee, _) = hir_expr.kind else {
-                    return;
-                };
-
-                let path = some_or!(self.expr_to_path(hir_callee), return);
-                let Res::Def(_, def_id) = path.res else {
-                    return;
-                };
-                if !def_id.is_local() {
-                    return;
-                }
-
-                if let Some(func) = self.funcs.get(&def_id) {
+                if let Some(def_id) = self.bounds.get(&callee.span)
+                    && let Some(func) = self.funcs.get(def_id)
+                    && !func.index_map.is_empty()
+                {
                     let ret_tys = &func.return_tys;
-                    // bind return values
-                    // e.g. let (rv___, rv___1) = call(...)
+                    // binds return values of a call to rv___, rv___1, ...
                     let mut bindings = vec![];
                     // assign output parameter values to arguments
                     let mut assigns = vec![];
-
-                    let write_args = self
-                        .write_args
-                        .get(&expr.span)
-                        .cloned() // TODO: avoid clone
-                        .unwrap_or(FxHashMap::default());
                     let mut mtch_assign = None;
 
                     for (ridx, ret_ty) in ret_tys.iter_enumerated() {
@@ -610,37 +595,36 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 bindings.push(String::from("rv___"));
                             }
                             ReturnTyItem::Type(param) => {
-                                let aidx = param.index;
-                                let arg = args[aidx.index()].as_ref();
+                                let index = param.index;
+                                let arg = args[index.index()].as_ref();
                                 let rhs = format!("rv___{}", ridx.index());
                                 let assign =
-                                    self.get_assign(arg, true, rhs.clone(), aidx, &write_args);
+                                    self.get_assign(arg, true, rhs.clone(), index, expr.span);
                                 assigns.push(assign);
                                 bindings.push(rhs);
                             }
                             ReturnTyItem::Option(param) => {
-                                let aidx = param.index;
-                                let arg = args[aidx.index()].as_ref();
+                                let index = param.index;
+                                let arg = args[index.index()].as_ref();
                                 let rhs = format!("rv___{}", ridx.index());
                                 let assign =
-                                    self.get_assign(arg, false, rhs.clone(), aidx, &write_args);
+                                    self.get_assign(arg, false, rhs.clone(), index, expr.span);
                                 assigns.push(assign);
                                 bindings.push(rhs);
                             }
                             ReturnTyItem::Result(param) => {
-                                let aidx = param.index;
-                                let arg = args[aidx.index()].as_ref();
+                                let index = param.index;
+                                let arg = args[index.index()].as_ref();
                                 mtch_assign = Some(self.get_assign(
                                     arg,
                                     true,
                                     "v___".to_string(),
-                                    aidx,
-                                    &write_args,
+                                    index,
+                                    expr.span,
                                 ));
                             }
                         }
                     }
-
                     // remove output parameters from arguments
                     *args = args
                         .iter()
@@ -685,6 +669,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         _ => unreachable!(),
                     };
                     self.replace_expr(expr, new_expr);
+                    self.updated = true;
                 }
             }
             _ => {}
@@ -710,26 +695,27 @@ impl<'tcx> HirVisitor<'tcx> {
     }
 }
 
-impl<'tcx> intravisit::Visitor <'tcx> for HirVisitor<'tcx> {
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
     fn visit_item(&mut self, item: &'tcx HirItem<'tcx>) {
         intravisit::walk_item(self, item);
 
-        match item.kind {
-            HirItemKind::Static(_, ident, _, body_id) => {
-                self.add_bound(ident.span, item.owner_id.def_id);
-            }
-            _ => {}
+        if let HirItemKind::Static(_, ident, _, _body_id) = item.kind {
+            self.add_bound(ident.span, item.owner_id.def_id);
         }
     }
 
-    fn visit_path()
-}
-
-fn mir_ty_to_ty(mir_ty: &MirTy) -> Ty {
-    let mut ty_str = mir_ty.to_string();
-    let re = Regex::new(r"(?P<prefix>(^|<|\s|,\s))([A-Za-z_][A-Za-z0-9_]*)::").unwrap();
-    ty_str = re
-        .replace_all(&ty_str, "${prefix}crate::${3}::")
-        .to_string();
-    ty!("{}", ty_str)
+    fn visit_path(&mut self, path: &HirPath<'tcx>, _: HirId) {
+        intravisit::walk_path(self, path);
+        if let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            self.add_bound(path.span, def_id);
+        }
+    }
 }
