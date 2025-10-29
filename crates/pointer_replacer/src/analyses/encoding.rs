@@ -1,8 +1,8 @@
 use std::ops::{Add, Range};
 
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
+use rustc_span::def_id::LocalDefId;
 
 use crate::utils::dsa::fixed_shape::VecVec;
 
@@ -10,13 +10,13 @@ use crate::utils::dsa::fixed_shape::VecVec;
 /// to a set of constraint variables
 /// [`DefId`] -> entity -> [`std::ops::Range<Idx>`]
 pub struct Encoding<Idx> {
-    pub did_idx: FxHashMap<DefId, usize>,
+    pub did_idx: FxHashMap<LocalDefId, usize>,
     pub contents: VecVec<Idx>,
 }
 
 pub fn encode_structs<Idx, F>(
     initial: Idx,
-    structs: &[DefId],
+    structs: &[LocalDefId],
     tcx: TyCtxt,
     mut count_vars: F,
 ) -> (StructFields<Idx>, Idx)
@@ -58,7 +58,7 @@ where
 
 pub fn encode_fns<Idx, F>(
     initial: Idx,
-    fns: &[DefId],
+    fns: &[LocalDefId],
     tcx: TyCtxt,
     mut count_vars: F,
 ) -> (FnLocals<Idx>, Idx)
@@ -75,9 +75,7 @@ where
 
     for (idx, r#fn) in fns.iter().enumerate() {
         did_idx.insert(*r#fn, idx);
-        let body = &*tcx
-            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
-            .borrow();
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(r#fn).borrow();
         for local_decl in &body.local_decls {
             let ptr_count = count_vars(local_decl.ty);
             vars.push_element(next.clone());
@@ -99,16 +97,16 @@ where
 
 impl<Idx: Copy> Encoding<Idx> {
     #[inline]
-    pub fn contents_iter(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
-        let idx = self.did_idx[did];
+    pub fn contents_iter(&self, did: LocalDefId) -> impl Iterator<Item = Range<Idx>> + '_ {
+        let idx = self.did_idx[&did];
         self.contents[idx]
             .array_windows()
             .map(|&[start, end]| start..end)
     }
 
     #[inline]
-    pub fn content(&self, did: &DefId, idx: usize) -> Range<Idx> {
-        let outer_idx = self.did_idx[did];
+    pub fn content(&self, did: LocalDefId, idx: usize) -> Range<Idx> {
+        let outer_idx = self.did_idx[&did];
         self.contents[outer_idx][idx]..self.contents[outer_idx][idx + 1]
     }
 }
@@ -119,13 +117,13 @@ pub struct FnLocals<Idx>(pub Encoding<Idx>);
 impl<Idx: Copy> StructFields<Idx> {
     /// [`fields()`] returns a slice of [`Range<T>`] that is in lock-step with [`all_fields()`]
     #[inline]
-    pub fn fields(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
+    pub fn fields(&self, did: LocalDefId) -> impl Iterator<Item = Range<Idx>> + '_ {
         self.0.contents_iter(did)
     }
 
     #[allow(unused)]
     #[inline]
-    pub fn field(&self, did: &DefId, f: usize) -> Range<Idx> {
+    pub fn field(&self, did: LocalDefId, f: usize) -> Range<Idx> {
         self.0.content(did, f)
     }
 }
@@ -133,13 +131,13 @@ impl<Idx: Copy> StructFields<Idx> {
 impl<Idx: Copy> FnLocals<Idx> {
     /// [`locals()`] returns a slice of [`Range<Var>`] that is in lock-step with [`local_decls`]
     /// #[inline]
-    pub fn locals(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
+    pub fn locals(&self, did: LocalDefId) -> impl Iterator<Item = Range<Idx>> + '_ {
         self.0.contents_iter(did)
     }
 
     #[allow(unused)]
     #[inline]
-    pub fn local(&self, did: &DefId, local: usize) -> Range<Idx> {
+    pub fn local(&self, did: LocalDefId, local: usize) -> Range<Idx> {
         self.0.content(did, local)
     }
 }

@@ -1,321 +1,160 @@
-use itertools::izip;
-use regex::Regex;
+use etrace::some_or;
 use rustc_ast::{
-    HasNodeId, ItemKind,
-    ast::*,
     mut_visit::{self, MutVisitor},
     ptr::P,
+    *,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
-use rustc_hir::{
-    Expr as HirExpr, ExprKind as HirExprKind, HirId, Node as HirNode, PatKind as HirPatKind, QPath,
-    StmtKind as HirStmtKind, def::Res, def_id::DefId,
-};
-use rustc_middle::ty::{Ty as MirTy, TyCtxt};
-use rustc_span::symbol::Ident;
-use smallvec::SmallVec;
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir as hir;
+use rustc_hir::{HirId, def::Res};
+use rustc_middle::{ty, ty::TyCtxt};
+use rustc_span::def_id::LocalDefId;
 use utils::ir::AstToHir;
 
 use super::{
     Analysis,
     collector::collect_diffs,
-    decision::{PtrKind, PtrKindDiff, SigDecisions},
+    decision::{PtrKind, SigDecisions},
 };
 use crate::utils::rustc::RustProgram;
-
-pub mod post;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RewriteStats {
-    pub params: usize, // number of function parameters changed
-    pub defs: usize,   // number of variable definitions changed
-    pub writes: usize, // number of variable writes changed
-    pub usages: usize, // number of variable usages changed
-}
-
-impl std::ops::Add for RewriteStats {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        RewriteStats {
-            params: self.params + other.params,
-            defs: self.defs + other.defs,
-            writes: self.writes + other.writes,
-            usages: self.usages + other.usages,
-        }
-    }
-}
 
 pub(crate) struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     sig_decs: SigDecisions,
-    ptr_diffs: FxHashMap<HirId, PtrKindDiff>,
+    ptr_kinds: FxHashMap<HirId, PtrKind>,
     ast_to_hir: AstToHir,
-    pub stats: RewriteStats,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
     fn visit_item(&mut self, item: &mut Item) {
-        let node_id = item.node_id();
-        let ItemKind::Fn(box fn_item) = &mut item.kind else {
-            return mut_visit::walk_item(self, item);
-        };
-        let hir_item = self
-            .ast_to_hir
-            .get_item(node_id, self.tcx)
-            .unwrap_or_else(|| panic!("Failed to find HIR item for Item {:?}", item.span));
-        let local_def_id = hir_item.owner_id.def_id;
-        let def_id = local_def_id.to_def_id();
-        let mir_body = self
-            .tcx
-            .mir_drops_elaborated_and_const_checked(local_def_id)
-            .borrow();
+        let node_id = item.id;
+        match &mut item.kind {
+            ItemKind::Impl(_) => return,
+            ItemKind::Fn(box fn_item) => {
+                let def_id = self.ast_to_hir.global_map[&node_id];
+                let mir_body = self
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(def_id)
+                    .borrow();
+                let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
-        // Rewrite function signature
-        let local_input_decls = mir_body
-            .args_iter()
-            .map(|local| mir_body.local_decls[local].clone())
-            .collect::<Vec<_>>();
-
-        let input_len = self.sig_input_len(def_id); // exclude variadic arguments
-        let sig_dec = self.sig_decs.expect(&def_id);
-
-        // Currently intra-procedural borrow inference: skip return type, only consider parameters
-        for (idx, (local_decl, param)) in
-            izip!(local_input_decls, fn_item.sig.decl.inputs.iter_mut())
-                .take(input_len)
-                .enumerate()
-        {
-            let ty_res = mir_ty_to_ty(&local_decl.ty); // resolved type (no type alias)
-            self.rewrite_ty(&mut param.ty, ty_res, &sig_dec.input_decs[idx]);
-            self.stats.params += 1;
-            if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
-                *binding_mode = BindingMode::MUT;
+                // Currently intra-procedural borrow inference:
+                // skip return type; only consider parameters
+                for ((local_decl, input_dec), param) in mir_body
+                    .local_decls
+                    .iter()
+                    .skip(1)
+                    .zip(&sig_dec.input_decs)
+                    .zip(&mut fn_item.sig.decl.inputs)
+                {
+                    let Some(PtrKind::OptRef(m)) = input_dec else { continue };
+                    let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty).unwrap();
+                    *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
+                    if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
+                        binding_mode.1 = Mutability::Mut;
+                    }
+                }
             }
+            _ => {}
         }
+
         mut_visit::walk_item(self, item);
     }
 
-    fn visit_expr(&mut self, expr: &mut Expr) -> Self::Result {
-        let _expr = expr.clone();
-        // visit children first; we can assume that the function arguments have been rewritten
-        mut_visit::walk_expr(self, expr);
-        let hir_expr_opt = self.get_hir_expr(expr);
-        match &mut expr.kind {
-            ExprKind::Assign(box lhs, box rhs, _) => {
-                // assignment to dereferenced pointer
-                if let HirExprKind::Assign(hir_lhs, _, _) = hir_expr_opt.unwrap().kind
-                    && let HirExprKind::Unary(UnOp::Deref, hir_lhs_deref) = hir_lhs.kind
-                    && let HirExprKind::Path(qpath) = &hir_lhs_deref.kind  // TODO: support multiple deref
-                    && let QPath::Resolved(_, path) = qpath
-                    && let Res::Local(local_id) = path.res
-                    && let Some(ptr_diff) = self.ptr_diffs.get(&local_id)
-                {
-                    match ptr_diff {
-                        PtrKindDiff {
-                            before: PtrKind::Raw(_),
-                            after: PtrKind::OptRef(true), // Option<&mut T>
-                        } => {
-                            let ExprKind::Unary(UnOp::Deref, lhs_deref) = &mut lhs.kind else {
-                                unreachable!("Expected deref expression on LHS: {:?}", expr.span);
-                            };
-                            **lhs_deref = utils::expr!(
-                                "{}.as_deref_mut().unwrap()",
-                                pprust::expr_to_string(&*lhs_deref),
-                            );
-                            self.stats.writes += 1;
-                        }
-                        PtrKindDiff {
-                            before: PtrKind::Raw(_),
-                            after: PtrKind::OptRef(false), // Option<&T>
-                        } => {
-                            unreachable!(
-                                "Immutable references cannot be assigned to: {:?}",
-                                expr.span
-                            );
-                        }
-                        _ => (),
-                    }
-                }
-                // direct assignment
-                else if let HirExprKind::Assign(hir_lhs, _rhs, _) = hir_expr_opt.unwrap().kind
-                    && let HirExprKind::Path(qpath) = &hir_lhs.kind
-                    && let QPath::Resolved(_, path) = qpath
-                    && let Res::Local(local_id) = path.res
-                    && let Some(ptr_diff) = self.ptr_diffs.get(&local_id)
-                    && let PtrKindDiff {
-                        before: PtrKind::Raw(mutability),
-                        after: PtrKind::OptRef(_mutability),
-                    } = ptr_diff
-                {
-                    assert!(mutability == _mutability);
-                    *rhs = utils::expr!(
-                        "Some(&{}*({}))",
-                        if *mutability { "mut " } else { "" },
-                        pprust::expr_to_string(&*rhs)
-                    );
-                    self.stats.writes += 1;
-                }
+    fn visit_local(&mut self, local: &mut Local) {
+        mut_visit::walk_local(self, local);
+
+        if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+            && let Some(lhs_kind) = self.ptr_kinds.get(&hir_id).copied()
+        {
+            let typeck = self.tcx.typeck(hir_id.owner);
+            let lhs_ty = typeck.node_type(hir_id);
+            let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+
+            if let PtrKind::OptRef(m) = lhs_kind {
+                local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
             }
-            ExprKind::Path(..) => {
-                // usage site
-                let hir_expr = hir_expr_opt.unwrap();
-                if let HirExprKind::Path(qpath) = &hir_expr.kind
-                    && let QPath::Resolved(_, path) = qpath
-                    && let Res::Local(local_id) = path.res
-                    && let Some(ptr_diff) = self.ptr_diffs.get(&local_id).cloned()
-                {
-                    let parent_node = self.expect_parent_node(hir_expr.hir_id);
-                    if let HirNode::Expr(parent_expr) = parent_node {
-                        match parent_expr.kind {
-                            // HirExprKind::Call(..) => return, // handled in ExprKind::Call below
-                            HirExprKind::Assign(lhs, _, _) => {
-                                if lhs.hir_id == hir_expr.hir_id {
-                                    // assignment to this variable, handled in ExprKind::Assign above
-                                    return;
-                                }
-                            }
-                            _ => {
-                                let grandparent_node = self.expect_parent_node(parent_expr.hir_id);
-                                if let HirNode::Expr(grandparent_expr) = grandparent_node
-                                    && let HirExprKind::Assign(lhs, _, _) = grandparent_expr.kind
-                                    && let HirExprKind::Unary(UnOp::Deref, lhs_deref) = &lhs.kind
-                                    && lhs_deref.hir_id == hir_expr.hir_id
-                                {
-                                    // assignment to dereferenced pointer, handled in ExprKind::Assign above
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    match ptr_diff {
-                        PtrKindDiff {
-                            before: PtrKind::Raw(mutability),
-                            after: PtrKind::OptRef(_mutability),
-                        } => {
-                            let ptr_ty = self.expr_ptr_ty(&*expr);
-                            *expr = utils::expr!(
-                                "({}).as_deref{}().map(|__r| __r as *{} _).unwrap_or(std::ptr::null{}::<{}>())",
-                                pprust::expr_to_string(&*expr),
-                                if mutability { "_mut" } else { "" },
-                                if mutability { "mut" } else { "const" },
-                                if mutability { "_mut" } else { "" },
-                                pprust::ty_to_string(&ptr_ty)
-                            );
-                            self.stats.usages += 1;
-                        }
-                        PtrKindDiff {
-                            before: PtrKind::OptRef(_),
-                            after: PtrKind::Raw(_),
-                        } => {
-                            unreachable!("Raw pointers adapting to references: {:?}", expr.span);
-                        }
-                        _ => (),
-                    }
-                }
+
+            if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
+                self.transform_rhs(rhs, let_stmt.init.unwrap(), lhs_kind);
             }
-            ExprKind::Call(box _func_expr, args) => {
-                // function call
-                let hir_expr = hir_expr_opt.unwrap();
-                let typeck_res = self.tcx.typeck(hir_expr.hir_id.owner); // ensure typeck is available
-                if let HirExprKind::Call(hir_func_expr, hir_args) = hir_expr.kind
-                    && let HirExprKind::Path(func_qpath) = &hir_func_expr.kind
-                    && let Res::Def(_, func_did) =
-                        typeck_res.qpath_res(func_qpath, hir_func_expr.hir_id)
-                    && let Some(sig_dec) = self.sig_decs.get(&func_did)
-                {
-                    let input_len = self.sig_input_len(func_did); // exclude variadic arguments
-                    for (i, (arg, _hir_arg)) in izip!(args.iter_mut(), hir_args.iter())
-                        .take(input_len)
-                        .enumerate()
-                    {
-                        // Note: the arguments have been visited and rewritten to *mut T
-                        // Hir arguments stays the same, so may not match the AST arguments
-                        if let Some(PtrKind::OptRef(mutability)) = &sig_dec.input_decs.get(i).unwrap_or_else(|| {
-                                panic!(
-                                    "Function call argument index out of bounds: {} in {:?}, function: {:?}",
-                                    i, expr.span, self.tcx.def_path_str(func_did)
-                                )
-                            }) {
-                            if let ExprKind::AddrOf(_, _, box inner) = &arg.kind {
-                                // `Some(&mut inner)` when arg is `&raw mut inner` or `&mut inner`
-                                **arg = utils::expr!(
-                                    "Some(&{}({}))",
-                                    if *mutability { "mut " } else { "" },
-                                    pprust::expr_to_string(inner)
-                                );
-                            } else if let ExprKind::AddrOf(BorrowKind::Ref, _, box inner) = &arg.kind
-                                   && let ExprKind::Unary(UnOp::Deref, _) = &inner.kind {
-                                // `Some(arg)` when arg is `&mut inner` or `&inner`
-                                // (c2rust is using automatic casting for &mut T to *mut T)
-                                **arg = utils::expr!(
-                                    "Some({})",
-                                    pprust::expr_to_string(&*arg)
-                                );
-                            } else {
-                                // arg.as_mut()
-                                **arg = utils::expr!(
-                                    "({}).as_{}()",
-                                    pprust::expr_to_string(&*arg),
-                                    if *mutability { "mut" } else { "ref" }
-                                );
-                            }
-                            self.stats.usages += 1;
-                        }
-                    }
-                }
-            }
-            _ => (),
         }
     }
 
-    fn flat_map_stmt(&mut self, stmt: Stmt) -> SmallVec<[Stmt; 1]> {
-        let mut stmts = mut_visit::walk_flat_map_stmt(self, stmt);
-        for stmt in &mut stmts {
-            let hir_stmt_opt = self.get_hir_stmt(stmt);
-            if let StmtKind::Let(box local) = &mut stmt.kind
-                && let HirStmtKind::Let(hir_let) = hir_stmt_opt.unwrap().kind
-                && let HirPatKind::Binding(_, binding_hir_id, _, _) = hir_let.pat.kind
-                && let Some(ptr_diff) = self.ptr_diffs.get(&binding_hir_id)
-                && let PtrKindDiff {
-                    before: PtrKind::Raw(mutability),
-                    after: PtrKind::OptRef(_mutability),
-                } = ptr_diff
-            {
-                assert!(mutability == _mutability);
-                let mutability = *mutability;
-                if let Some(ty) = &mut local.ty {
-                    let hir_ty = hir_let.ty.unwrap();
-                    let typeck = self.tcx.typeck(hir_ty.hir_id.owner);
-                    let hir_ty_res = typeck.node_type(hir_ty.hir_id);
-                    let ty_res = mir_ty_to_ty(&hir_ty_res);
-                    self.rewrite_ty(ty, ty_res, &Some(PtrKind::OptRef(mutability)));
-                }
-                match &mut local.kind {
-                    LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) => {
-                        if let ExprKind::AddrOf(_, _, box inner) = &rhs.kind {
-                            *rhs = utils::expr!(
-                                "Some(&{}({}))",
-                                if mutability { "mut " } else { "" },
-                                pprust::expr_to_string(inner)
-                            )
-                        } else {
-                            *rhs = utils::expr!(
-                                "({}).as_{}()",
-                                pprust::expr_to_string(&*rhs),
-                                if mutability { "mut" } else { "ref" }
-                            );
-                            self.stats.defs += 1;
-                        }
-                    }
-                    LocalKind::Decl => {
-                        // No initializer, do nothing
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        mut_visit::walk_expr(self, expr);
+
+        match &mut expr.kind {
+            ExprKind::Assign(lhs, rhs, _) => {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let hir::ExprKind::Assign(hir_lhs, hir_rhs, _) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
+                let lhs_ty = typeck.expr_ty(hir_lhs);
+                let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
+                let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind {
+                    let hir_id = self.hir_id_of_path(lhs.id).unwrap();
+                    self.ptr_kinds[&hir_id]
+                } else {
+                    PtrKind::Raw(m.is_mut())
+                };
+                self.transform_rhs(rhs, hir_rhs, lhs_kind);
+            }
+            ExprKind::Unary(UnOp::Deref, e) => {
+                if matches!(e.kind, ExprKind::Path(_, _)) {
+                    let hir_id = self.hir_id_of_path(e.id).unwrap();
+                    let ptr_kind = self.ptr_kinds[&hir_id];
+                    if let PtrKind::OptRef(m) = ptr_kind {
+                        let m = if m { "_mut" } else { "" };
+                        **e =
+                            utils::expr!("{}.as_deref{}().unwrap()", pprust::expr_to_string(e), m);
                     }
                 }
             }
+            ExprKind::Call(_, args) => {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
+                let sig_dec = if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+                    && let Res::Def(_, def_id) = path.res
+                    && let Some(def_id) = def_id.as_local()
+                {
+                    self.sig_decs.data.get(&def_id)
+                } else {
+                    None
+                };
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
+                    let ty = typeck.expr_ty_adjusted(harg);
+                    let (_, m) = some_or!(unwrap_ptr_from_mir_ty(ty), continue);
+                    let param_kind = sig_dec
+                        .and_then(|sig| sig.input_decs.get(i).copied())
+                        .flatten()
+                        .unwrap_or(PtrKind::Raw(m.is_mut()));
+                    self.transform_rhs(arg, harg, param_kind);
+                }
+            }
+            ExprKind::Ret(Some(ret)) => {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let hir::ExprKind::Ret(Some(hir_ret)) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
+                let sig = self
+                    .tcx
+                    .fn_sig(hir_ret.hir_id.owner)
+                    .skip_binder()
+                    .skip_binder();
+                if let ty::TyKind::RawPtr(_, m) = sig.output().kind() {
+                    let kind = PtrKind::Raw(m.is_mut());
+                    self.transform_rhs(ret, hir_ret, kind);
+                }
+            }
+            _ => {}
         }
-        stmts
     }
 }
 
@@ -325,149 +164,395 @@ impl<'tcx> TransformVisitor<'tcx> {
         analysis: &Analysis,
         ast_to_hir: AstToHir,
     ) -> TransformVisitor<'tcx> {
-        let sig_decs = SigDecisions::new(rust_program, analysis); // TODO: Move outside
-        let ptr_diffs = collect_diffs(rust_program, analysis); // TODO: Move outside
+        let mut sig_decs = SigDecisions::new(rust_program, analysis); // TODO: Move outside
+        let mut ptr_kinds = collect_diffs(rust_program, analysis); // TODO: Move outside
+
+        // HACK: if `p.offset(..)` is used, `p` remains a raw pointer
+        // TODO: use fatness analysis instead
+        let mut visitor = OffsetVisitor {
+            tcx: rust_program.tcx,
+            params: FxHashMap::default(),
+            offsets: FxHashSet::default(),
+        };
+        rust_program
+            .tcx
+            .hir_visit_all_item_likes_in_crate(&mut visitor);
+        for (def_id, dec) in &mut sig_decs.data {
+            let params = &visitor.params[def_id];
+            for (dec, hir_id) in dec.input_decs.iter_mut().zip(params) {
+                if let Some(kind) = dec
+                    && visitor.offsets.contains(hir_id)
+                {
+                    let typeck = rust_program.tcx.typeck(hir_id.owner);
+                    let ty = typeck.node_type(*hir_id);
+                    let ty::TyKind::RawPtr(_, m) = ty.kind() else { panic!() };
+                    *kind = PtrKind::Raw(m.is_mut());
+                }
+            }
+        }
+        for (hir_id, kind) in &mut ptr_kinds {
+            if visitor.offsets.contains(hir_id) {
+                let typeck = rust_program.tcx.typeck(hir_id.owner);
+                let ty = typeck.node_type(*hir_id);
+                let ty::TyKind::RawPtr(_, m) = ty.kind() else { panic!() };
+                *kind = PtrKind::Raw(m.is_mut());
+            }
+        }
+
         TransformVisitor {
             tcx: rust_program.tcx,
             sig_decs,
-            ptr_diffs,
+            ptr_kinds,
             ast_to_hir,
-            stats: RewriteStats::default(),
         }
     }
 
-    #[allow(unused)]
-    pub fn updated(&self) -> bool {
-        self.stats.usages + self.stats.writes + self.stats.defs + self.stats.params > 0
+    fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
+        let hir_rhs = self.ast_to_hir.get_expr(id, self.tcx)?;
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_rhs.kind else { return None };
+        let Res::Local(hir_id) = path.res else { return None };
+        Some(hir_id)
     }
 
-    fn expect_parent_node(&self, hir_id: HirId) -> HirNode<'tcx> {
-        let (_, parent_node) = self.tcx.hir_parent_iter(hir_id).next().unwrap();
-        parent_node
-    }
-
-    #[allow(unused)]
-    fn is_function_arg(&self, hir_id: HirId) -> bool {
-        if let Some(outer_expr) = self.get_outer_expr(hir_id)
-            && let HirNode::Expr(parent_expr) = self.expect_parent_node(outer_expr.hir_id)
-            && let HirExprKind::Call(_func, args) = parent_expr.kind
-            && let Some(_) = args.iter().position(|arg| arg.hir_id == outer_expr.hir_id)
+    fn transform_rhs(&self, rhs: &mut Expr, hir_rhs: &hir::Expr, lhs_kind: PtrKind) {
+        let e = unwrap_expr(rhs);
+        if let ExprKind::Lit(token::Lit {
+            kind: token::LitKind::Integer,
+            symbol,
+            ..
+        }) = e.kind
+            && symbol.as_str() == "0"
         {
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the outermost expression that contains casting and dereferencing
-    #[allow(unused)]
-    fn get_outer_expr(&self, hir_id: HirId) -> Option<&HirExpr<'tcx>> {
-        let mut out_expr = None;
-        for (_, parent_node) in self.tcx.hir_parent_iter(hir_id) {
-            match parent_node {
-                HirNode::Expr(parent_expr) => match parent_expr.kind {
-                    HirExprKind::Cast(..)
-                    | HirExprKind::AddrOf(..)
-                    | HirExprKind::Unary(UnOp::Deref, _) => out_expr = Some(parent_expr),
-                    _ => break,
-                },
-                _ => break,
+            // rhs_ty will be `usize`, not a pointer, so we early return here
+            if matches!(lhs_kind, PtrKind::OptRef(_)) {
+                *rhs = utils::expr!("None");
             }
+            return;
         }
-        out_expr
-    }
 
-    fn sig_input_len(&self, def_id: DefId) -> usize {
-        self.tcx
-            .fn_sig(def_id)
-            .skip_binder()
-            .inputs()
-            .skip_binder()
-            .len()
-    }
-
-    fn get_hir_expr(&self, expr: &Expr) -> Option<rustc_hir::Expr<'tcx>> {
-        self.ast_to_hir.get_expr(expr.node_id(), self.tcx).cloned()
-    }
-
-    fn get_hir_stmt(&self, stmt: &Stmt) -> Option<&rustc_hir::Stmt<'tcx>> {
-        self.ast_to_hir.get_stmt(stmt.node_id(), self.tcx)
-    }
-
-    fn expr_ty(&self, expr: &Expr) -> Ty {
-        let hir_expr = self
-            .get_hir_expr(expr)
-            .unwrap_or_else(|| panic!("Failed to find HIR expr for Expr {:?}", expr.span));
-        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
-        let mir_ty = typeck.expr_ty(&hir_expr);
-
-        mir_ty_to_ty(&mir_ty)
-    }
-
-    // Get the inner type if the expr is a pointer
-    fn expr_ptr_ty(&self, expr: &Expr) -> Ty {
-        let ty = self.expr_ty(expr);
-        match &ty.kind {
-            TyKind::Ptr(mut_ty) => (*mut_ty.ty).clone(),
-            _ => panic!("Expected pointer type for type {ty:#?}"),
-        }
-    }
-
-    fn rewrite_ty(&mut self, ty: &mut Ty, ty_res: Ty, dec: &Option<PtrKind>) {
-        if let Some(PtrKind::OptRef(mutability)) = dec {
-            // Create Option<&T> or Option<&mut T>
-            let ptr_mut_ty = expect_ptr(ty, ty_res);
-            assert!(
-                ptr_mut_ty.mutbl
-                    == if *mutability {
-                        rustc_ast::Mutability::Mut
-                    } else {
-                        rustc_ast::Mutability::Not
+        let typeck = self.tcx.typeck(hir_rhs.hir_id.owner);
+        let lhs_ty = typeck.expr_ty_adjusted(hir_rhs);
+        let rhs_ty = typeck.expr_ty(unwrap_hir_expr(hir_rhs));
+        let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+        let (rhs_inner_ty, _) = unwrap_ptr_from_mir_ty(rhs_ty).unwrap();
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        match &e.kind {
+            ExprKind::Path(_, _) => {
+                let hir_id = some_or!(self.hir_id_of_path(e.id), return);
+                let rhs_kind = self.ptr_kinds[&hir_id];
+                match (lhs_kind, rhs_kind) {
+                    (PtrKind::OptRef(m), PtrKind::OptRef(_)) => {
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "({}).as_deref{}().map(|x| &{}*(x as *{3} _ as *{3} {4}))",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_deref{}()",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                            );
+                        }
                     }
-            );
-
-            let inner_ref = P(Ty {
-                id: rustc_ast::DUMMY_NODE_ID,
-                kind: TyKind::Ref(None, ptr_mut_ty),
-                span: rustc_span::DUMMY_SP,
-                tokens: None,
-            });
-
-            // Create the Option path
-            let option_path = Path {
-                span: rustc_span::DUMMY_SP,
-                segments: vec![PathSegment {
-                    ident: Ident::from_str("Option"),
-                    id: rustc_ast::DUMMY_NODE_ID,
-                    args: Some(P(GenericArgs::AngleBracketed(AngleBracketedArgs {
-                        span: rustc_span::DUMMY_SP,
-                        args: [AngleBracketedArg::Arg(GenericArg::Type(inner_ref))].into(),
-                    }))),
-                }]
-                .into(),
-                tokens: None,
-            };
-
-            ty.kind = TyKind::Path(None, option_path);
+                    (PtrKind::Raw(m), PtrKind::OptRef(_)) => {
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x as *{2} _ as *{2} {3})",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                            );
+                        }
+                    }
+                    (PtrKind::OptRef(m), PtrKind::Raw(_)) => {
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "(({}) as *{} {}).as_{}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                                if m { "mut" } else { "ref" },
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "({}).as_{}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "ref" },
+                            );
+                        }
+                    }
+                    (PtrKind::Raw(_), PtrKind::Raw(_)) => {}
+                }
+            }
+            ExprKind::AddrOf(_, _, e) => {
+                // if rhs is `&mut x` and `x`'s type has been updated to `Option<&(mut) T>`,
+                // we need a cast
+                let ty_updated = if matches!(e.kind, ExprKind::Path(_, _))
+                    && let Some(hir_e) = self.ast_to_hir.get_expr(e.id, self.tcx)
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_e.kind
+                    && let Res::Local(hir_id) = path.res
+                {
+                    matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::OptRef(_)))
+                } else {
+                    false
+                };
+                match lhs_kind {
+                    PtrKind::OptRef(m) => {
+                        if need_cast || ty_updated {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "Some(&{}*(&raw {1} ({2}) as *{1} {3}))",
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "Some(&{}({}))",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(e)
+                            );
+                        }
+                    }
+                    PtrKind::Raw(m) => {
+                        if need_cast || ty_updated {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "&raw {0} ({1}) as *{0} {2}",
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "&raw {0} ({1})",
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(e),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => match lhs_kind {
+                PtrKind::OptRef(m) => {
+                    if need_cast {
+                        let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        *rhs = utils::expr!(
+                            "(({}) as *{} {}).as_{}()",
+                            pprust::expr_to_string(e),
+                            if m { "mut" } else { "const" },
+                            lhs_inner_ty,
+                            if m { "mut" } else { "ref" },
+                        );
+                    } else {
+                        *rhs = utils::expr!(
+                            "({}).as_{}()",
+                            pprust::expr_to_string(e),
+                            if m { "mut" } else { "ref" },
+                        );
+                    }
+                }
+                PtrKind::Raw(_) => {}
+            },
         }
     }
 }
 
-fn expect_ptr(ty: &mut Ty, ty_res: Ty) -> MutTy {
-    match std::mem::replace(&mut ty.kind, TyKind::Infer) {
-        TyKind::Ptr(ptr) => ptr,
-        _ => match ty_res.kind {
-            TyKind::Ptr(ptr) => ptr,
-            _ => panic!("Expected pointer type for type {ty:#?}"),
-        },
+fn unwrap_expr(expr: &Expr) -> &Expr {
+    if let ExprKind::Cast(expr, _) | ExprKind::Paren(expr) = &expr.kind {
+        unwrap_expr(expr)
+    } else {
+        expr
     }
 }
 
-fn mir_ty_to_ty(mir_ty: &MirTy) -> Ty {
-    let mut ty_str = mir_ty.to_string();
-    let re = Regex::new(r"(?P<prefix>(^|<|\s|,\s))([A-Za-z_][A-Za-z0-9_]*)::").unwrap();
-    ty_str = re
-        .replace_all(&ty_str, "${prefix}crate::${3}::")
-        .to_string();
-    utils::ty!("{}", ty_str)
+#[inline]
+fn unwrap_ptr_from_mir_ty(ty: ty::Ty<'_>) -> Option<(ty::Ty<'_>, ty::Mutability)> {
+    match ty.kind() {
+        ty::TyKind::RawPtr(ty, m) | ty::TyKind::Ref(_, ty, m) => Some((*ty, *m)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    let m = if mutability { "mut " } else { "" };
+    utils::ty!("Option<&{m}{ty}>")
+}
+
+#[inline]
+fn mir_ty_to_string<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
+    let mut buf = String::new();
+    format_mir_ty(&mut buf, ty, tcx).unwrap();
+    buf
+}
+
+fn format_mir_ty<'tcx, W: std::fmt::Write>(
+    out: &mut W,
+    ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> std::fmt::Result {
+    use ty::*;
+    match ty.kind() {
+        TyKind::Bool => write!(out, "bool"),
+        TyKind::Char => write!(out, "char"),
+        TyKind::Int(IntTy::Isize) => write!(out, "isize"),
+        TyKind::Int(IntTy::I8) => write!(out, "i8"),
+        TyKind::Int(IntTy::I16) => write!(out, "i16"),
+        TyKind::Int(IntTy::I32) => write!(out, "i32"),
+        TyKind::Int(IntTy::I64) => write!(out, "i64"),
+        TyKind::Int(IntTy::I128) => write!(out, "i128"),
+        TyKind::Uint(UintTy::Usize) => write!(out, "usize"),
+        TyKind::Uint(UintTy::U8) => write!(out, "u8"),
+        TyKind::Uint(UintTy::U16) => write!(out, "u16"),
+        TyKind::Uint(UintTy::U32) => write!(out, "u32"),
+        TyKind::Uint(UintTy::U64) => write!(out, "u64"),
+        TyKind::Uint(UintTy::U128) => write!(out, "u128"),
+        TyKind::Float(FloatTy::F16) => write!(out, "f16"),
+        TyKind::Float(FloatTy::F32) => write!(out, "f32"),
+        TyKind::Float(FloatTy::F64) => write!(out, "f64"),
+        TyKind::Float(FloatTy::F128) => write!(out, "f128"),
+        TyKind::Adt(adt_def, args) => {
+            write!(out, "crate::{}", tcx.def_path_str(adt_def.did()))?;
+            if !args.is_empty() {
+                write!(out, "<")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(out, ", ")?;
+                    }
+                    match arg.kind() {
+                        GenericArgKind::Type(ty) => format_mir_ty(out, ty, tcx)?,
+                        GenericArgKind::Const(cnst) => write!(out, "{cnst}")?,
+                        GenericArgKind::Lifetime(_) => write!(out, "'_")?,
+                    }
+                }
+                write!(out, ">")?;
+            }
+            Ok(())
+        }
+        TyKind::Foreign(def_id) => write!(out, "crate::{}", tcx.def_path_str(*def_id)),
+        TyKind::Str => write!(out, "str"),
+        TyKind::Array(ty, cnst) => {
+            write!(out, "[")?;
+            format_mir_ty(out, *ty, tcx)?;
+            write!(out, "; {cnst}]")
+        }
+        TyKind::Pat(..) => todo!(),
+        TyKind::Slice(ty) => {
+            write!(out, "[")?;
+            format_mir_ty(out, *ty, tcx)?;
+            write!(out, "]")
+        }
+        TyKind::RawPtr(ty, mutability) => {
+            let m = match mutability {
+                Mutability::Mut => "mut",
+                Mutability::Not => "const",
+            };
+            write!(out, "*{m} ")?;
+            format_mir_ty(out, *ty, tcx)
+        }
+        TyKind::Ref(_, ty, mutability) => {
+            write!(out, "&")?;
+            if *mutability == Mutability::Mut {
+                write!(out, "mut ")?;
+            }
+            format_mir_ty(out, *ty, tcx)
+        }
+        TyKind::FnDef(..) => todo!(),
+        TyKind::FnPtr(..) => todo!(),
+        TyKind::UnsafeBinder(..) => todo!(),
+        TyKind::Dynamic(..) => todo!(),
+        TyKind::Closure(..) => todo!(),
+        TyKind::CoroutineClosure(..) => todo!(),
+        TyKind::Coroutine(..) => todo!(),
+        TyKind::CoroutineWitness(..) => todo!(),
+        TyKind::Never => todo!(),
+        TyKind::Tuple(tys) => {
+            write!(out, "(")?;
+            for (i, ty) in tys.iter().enumerate() {
+                if i > 0 {
+                    write!(out, ", ")?;
+                }
+                format_mir_ty(out, ty, tcx)?;
+            }
+            write!(out, ")")
+        }
+        TyKind::Alias(..) => todo!(),
+        TyKind::Param(..) => todo!(),
+        TyKind::Bound(..) => todo!(),
+        TyKind::Placeholder(..) => todo!(),
+        TyKind::Infer(..) => todo!(),
+        TyKind::Error(..) => panic!(),
+    }
+}
+
+struct OffsetVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    params: FxHashMap<LocalDefId, Vec<HirId>>,
+    offsets: FxHashSet<HirId>,
+}
+
+impl<'tcx> hir::intravisit::Visitor<'tcx> for OffsetVisitor<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_fn(
+        &mut self,
+        kind: hir::intravisit::FnKind<'tcx>,
+        decl: &'tcx hir::FnDecl<'tcx>,
+        body_id: hir::BodyId,
+        _: rustc_span::Span,
+        def_id: LocalDefId,
+    ) {
+        let body = self.tcx.hir_body(body_id);
+        let params = body
+            .params
+            .iter()
+            .map(|param| {
+                let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else { panic!() };
+                hir_id
+            })
+            .collect();
+        self.params.insert(def_id, params);
+        hir::intravisit::walk_fn(self, kind, decl, body_id, def_id);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::MethodCall(seg, e, _, _) = expr.kind
+            && seg.ident.name == rustc_span::sym::offset
+            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = unwrap_hir_expr(e).kind
+            && let Res::Local(hir_id) = path.res
+        {
+            self.offsets.insert(hir_id);
+        }
+        hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+    if let hir::ExprKind::Cast(expr, _) | hir::ExprKind::DropTemps(expr) = &expr.kind {
+        unwrap_hir_expr(expr)
+    } else {
+        expr
+    }
 }

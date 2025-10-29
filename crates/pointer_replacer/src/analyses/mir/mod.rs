@@ -3,11 +3,11 @@
 use std::hash::Hash;
 
 use petgraph::{algo::TarjanScc, prelude::DiGraphMap};
-use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::{Terminator, visit::Visitor},
     ty::TyCtxt,
 };
+use rustc_span::def_id::LocalDefId;
 
 use crate::utils::{dsa::fixed_shape::VecVec, rustc::RustProgram};
 
@@ -16,7 +16,7 @@ pub mod ty;
 
 pub use terminator::*;
 
-pub struct CallGraphPostOrder(pub VecVec<DefId>);
+pub struct CallGraphPostOrder(pub VecVec<LocalDefId>);
 
 impl CallGraphPostOrder {
     pub fn new(program: &RustProgram) -> Self {
@@ -34,7 +34,7 @@ impl CallGraphPostOrder {
             .visit_body(
                 &program
                     .tcx
-                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .mir_drops_elaborated_and_const_checked(did)
                     .borrow(),
             );
         }
@@ -49,7 +49,7 @@ impl CallGraphPostOrder {
         CallGraphPostOrder(post_order)
     }
 
-    pub fn sccs(&self) -> impl Iterator<Item = &[DefId]> {
+    pub fn sccs(&self) -> impl Iterator<Item = &[LocalDefId]> {
         self.0.iter()
     }
 }
@@ -59,11 +59,11 @@ impl CallGraphPostOrder {
 #[derive(Clone, Copy)]
 pub(crate) struct CxDefId<'tcx> {
     tcx: TyCtxt<'tcx>,
-    pub(crate) did: DefId,
+    pub(crate) did: LocalDefId,
 }
 
 impl<'tcx> CxDefId<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, did: DefId) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, did: LocalDefId) -> Self {
         CxDefId { tcx, did }
     }
 }
@@ -91,14 +91,14 @@ impl PartialOrd for CxDefId<'_> {
 impl<'tcx> Ord for CxDefId<'tcx> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.tcx
-            .item_name(self.did)
-            .cmp(&other.tcx.item_name(other.did))
+            .item_name(self.did.to_def_id())
+            .cmp(&other.tcx.item_name(other.did.to_def_id()))
     }
 }
 
 struct StaticCallGraphBuilder<'me, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    caller: DefId,
+    caller: LocalDefId,
     /// We use the `def_path_str` of [`DefId`] as keys
     graph: &'me mut DiGraphMap<CxDefId<'tcx>, ()>,
 }
@@ -109,12 +109,9 @@ impl<'me, 'tcx> Visitor<'tcx> for StaticCallGraphBuilder<'me, 'tcx> {
         terminator: &Terminator<'tcx>,
         _location: rustc_middle::mir::Location,
     ) {
-        let Some(MirFunctionCall { func, .. }) = terminator.as_call(self.tcx) else {
-            return;
-        };
-        let Some(callee) = func.did() else {
-            return;
-        };
+        let Some(MirFunctionCall { func, .. }) = terminator.as_call(self.tcx) else { return };
+        let Some(callee) = func.did() else { return };
+        let Some(callee) = callee.as_local() else { return };
         if !self.graph.contains_node(CxDefId::new(self.tcx, callee)) {
             return;
         }

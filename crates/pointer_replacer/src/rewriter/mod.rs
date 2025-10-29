@@ -49,8 +49,8 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
             continue;
         };
         match item.kind {
-            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id.to_def_id()),
-            ItemKind::Struct(..) => structs.push(item.owner_id.def_id.to_def_id()),
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
             _ => {}
         };
     }
@@ -69,9 +69,6 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
     let analysis_results = Analysis::new(output_params, promoted_mut_refs);
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
-    visitor.visit_crate(&mut krate);
-
-    let mut visitor = transform::post::UnnecessaryRawMutRemover;
     visitor.visit_crate(&mut krate);
 
     pprust::crate_to_string_for_macros(&krate)

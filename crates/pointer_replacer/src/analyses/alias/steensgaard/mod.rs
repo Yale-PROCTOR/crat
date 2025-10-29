@@ -6,9 +6,9 @@ mod strategies;
 use constraint::{generation::*, watcher::WatcherLists};
 use location::AbstractLocation;
 use petgraph::unionfind::UnionFind;
-use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::visit::Visitor;
+use rustc_span::def_id::LocalDefId;
 pub use strategies::*;
 
 use crate::{
@@ -22,12 +22,12 @@ use crate::{
 pub struct MemoryLocations(encoding::Encoding<AbstractLocation>);
 
 impl MemoryLocations {
-    pub(crate) fn memory_location(&self, did: &DefId, index: usize) -> AbstractLocation {
+    pub(crate) fn memory_location(&self, did: LocalDefId, index: usize) -> AbstractLocation {
         self.0.content(did, index).start
     }
 
-    pub(crate) fn memory_locations(&self, did: &DefId) -> &[AbstractLocation] {
-        let locations = &self.0.contents[self.0.did_idx[did]];
+    pub(crate) fn memory_locations(&self, did: LocalDefId) -> &[AbstractLocation] {
+        let locations = &self.0.contents[self.0.did_idx[&did]];
         &locations[..locations.len() - 1]
         // &self.0.contents[self.0.did_idx[did]]
     }
@@ -111,10 +111,10 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
         let mut watchers = WatcherLists::new(steensgaard.node_count());
         let mut buffer = Vec::with_capacity(steensgaard.node_count());
 
-        for &did in &rust_program.functions {
+        for did in &rust_program.functions {
             let body = &*rust_program
                 .tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .mir_drops_elaborated_and_const_checked(did)
                 .borrow();
             let mut cg = ConstraintGeneration {
                 steensgaard: &mut steensgaard,
@@ -135,7 +135,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
             println!("results for {did:?}:");
             let fields_result = self
                 .struct_fields
-                .memory_locations(&did)
+                .memory_locations(did)
                 .split_last()
                 .unwrap()
                 .1
@@ -152,7 +152,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldBased, MergeDeallocArg, I> {
             println!("results for {did:?}:");
             let locals_result = self
                 .fn_locals
-                .memory_locations(&did)
+                .memory_locations(did)
                 .iter()
                 .copied()
                 .map(|loc| self.pts_targets.find(self.pts[loc]));
@@ -168,7 +168,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
         let n_fn_locals = rust_program.functions.iter().fold(0usize, |acc, did| {
             acc + rust_program
                 .tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .mir_drops_elaborated_and_const_checked(did)
                 .borrow()
                 .local_decls
                 .len()
@@ -215,7 +215,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
         for &did in &rust_program.functions {
             let body = &*rust_program
                 .tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .mir_drops_elaborated_and_const_checked(did)
                 .borrow();
             let mut cg = ConstraintGeneration {
                 steensgaard: &mut steensgaard,
@@ -237,7 +237,7 @@ impl<I: InterProceduralStrategy> Steensgaard<FieldInsensitive, NopDeallocArg, I>
             println!("results for {did:?}:");
             let locals_result = self
                 .fn_locals
-                .memory_locations(&did)
+                .memory_locations(did)
                 .iter()
                 .copied()
                 .map(|loc| self.pts_targets.find(self.pts[loc]));
@@ -254,7 +254,7 @@ impl<F: FieldStrategy, D: DeallocArgStrategy, I: InterProceduralStrategy> Steens
         self.pts.len()
     }
 
-    pub fn local_locations(&self, body_id: &DefId) -> &[AbstractLocation] {
+    pub fn local_locations(&self, body_id: LocalDefId) -> &[AbstractLocation] {
         self.fn_locals.memory_locations(body_id)
     }
 

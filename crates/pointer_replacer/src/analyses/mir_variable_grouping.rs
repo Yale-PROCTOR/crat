@@ -4,19 +4,19 @@
 //! including temporaries that don't have debug info but are copies of source variables.
 
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     mir::{Body, Local, Location, Operand, Place, Rvalue, VarDebugInfoContents, visit::Visitor},
     ty::TyCtxt,
 };
+use rustc_span::def_id::LocalDefId;
 
 use crate::utils::rustc::RustProgram;
 
 /// Group MIR locals by their corresponding source variable names.
 /// This includes both locals with debug info and temporaries that are copies.
 pub struct SourceVarGroups {
-    inner: FxHashMap<DefId, FxHashMap<Local, Vec<Local>>>,
+    inner: FxHashMap<LocalDefId, FxHashMap<Local, Vec<Local>>>,
 }
 
 impl SourceVarGroups {
@@ -25,7 +25,7 @@ impl SourceVarGroups {
         for f in rust_program.functions.iter().copied() {
             let body = &*rust_program
                 .tcx
-                .mir_drops_elaborated_and_const_checked(f.expect_local())
+                .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
             let groups = group_locals_by_source_variable(body, rust_program.tcx);
             // Store groups for function f
@@ -36,8 +36,8 @@ impl SourceVarGroups {
 
     pub fn postprocess_promoted_mut_refs(
         &self,
-        promoted_mut_refs: FxHashMap<DefId, DenseBitSet<Local>>,
-    ) -> FxHashMap<DefId, DenseBitSet<Local>> {
+        promoted_mut_refs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
         // a Local is promoted if all locals in its source variable group are promoted
         // otherwise its promotion is removed
         let mut result = FxHashMap::default();
