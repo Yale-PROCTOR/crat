@@ -71,6 +71,7 @@ rustc_index::newtype_index! {
 }
 
 struct Func {
+    is_unit: bool,
     index_map: BTreeMap<ParamIdx, Param>,
     /// target return type after transformation
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
@@ -134,6 +135,7 @@ impl SuccValue {
     }
 }
 
+#[derive(Debug, Clone)]
 enum ReturnTyItem {
     Orig,          // original return type
     Type(Param),   // must output parameter
@@ -284,21 +286,22 @@ pub fn transform(
         let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
         let is_unit = sig.output().is_unit();
 
-        let mut return_tys = IndexVec::new();
+        let mut return_tys: IndexVec<RetIdx, ReturnTyItem> = IndexVec::new();
 
         if let Some(index) = succ_param {
             // if there is a may parameter which has a value indicating success,
             // rewrite it to result type
             let param = index_map[&index].clone();
             return_tys.push(ReturnTyItem::Result(param));
-            return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
         } else if !is_unit {
             // if not, keep the original return type
             return_tys.push(ReturnTyItem::Orig);
-            return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
         }
 
+        return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
+
         let func = Func {
+            is_unit,
             index_map,
             return_tys,
             write_spans,
@@ -320,14 +323,15 @@ pub fn transform(
                 return false;
             }
 
-            let mod_id = path_to_mod_id[&p];
+            let mod_id: rustc_hir::def_id::LocalModDefId = path_to_mod_id[&p];
             let (module, _, _) = tcx.hir_get_module(mod_id);
             let mut mapper = AstToHirMapper::new(tcx);
             mapper.map_crate_to_mod(krate, module, false);
 
+
             let mut visitor = TransformVisitor {
                 tcx,
-                ast_to_hir: &mapper.ast_to_hir,
+                ast_to_hir: mapper.ast_to_hir,
                 funcs: &funcs,
                 current_fns: vec![],
                 write_args: &write_args,
@@ -344,7 +348,7 @@ pub fn transform(
 
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
-    ast_to_hir: &'a AstToHir,
+    ast_to_hir: AstToHir,
     funcs: &'a FxHashMap<LocalDefId, Func>,
     current_fns: Vec<LocalDefId>,
     /// at span, caller param named string is used 'ParamIdx'th argument of call
@@ -387,24 +391,54 @@ impl TransformVisitor<'_, '_> {
             String::new()
         };
 
-        match &expr.kind {
-            ExprKind::AddrOf(BorrowKind::Raw, _, _) | ExprKind::Path(_, _) => {
-                if must {
-                    format!("if !{arg}.is_null() {{ *({arg}) = {rhs};{set_flag} }}")
-                } else {
-                    format!(
-                        "if !({arg}).is_null() {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
-                    )
-                }
+        // TODO: enable more robust detection
+        if arg.contains("&mut ") {
+            if must {
+                format!("*({arg}) = {rhs};{set_flag}")
+            } else {
+                format!("if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }}")
             }
-            ExprKind::AddrOf(BorrowKind::Ref, _, _) => {
-                if must {
-                    format!("*({arg}) = {rhs};{set_flag}")
-                } else {
-                    format!("if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }}")
-                }
+        } else {
+            if must {
+                format!("if !({arg}.is_null()) {{ *({arg}) = {rhs};{set_flag} }}")
+            } else {
+                format!(
+                    "if !(({arg}).is_null()) {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
+                )
             }
-            kind => panic!("expected pointer or reference kind, found {kind:?}"),
+        }
+
+    }
+
+    fn get_return_value(
+        &self,
+        func: &Func,
+        orig_ret: Option<String>,
+    ) -> String {
+        let mut ret_vals = vec![];
+        for ret_ty in &func.return_tys {
+            let ret_val = match ret_ty {
+                ReturnTyItem::Orig => {
+                    orig_ret.as_ref().unwrap().clone()
+                }
+                ReturnTyItem::Type(param) => format!("{}___v", param.name),
+                ReturnTyItem::Result(param) => format!(
+                    "if {}___s {{ Ok({}___v) }} else {{ Err({}) }}",
+                    param.name,
+                    param.name,
+                    orig_ret.as_ref().unwrap()
+                ),
+                ReturnTyItem::Option(param) => format!(
+                    "if {}___s {{ Some({}___v) }} else {{ None }}",
+                    param.name, param.name
+                ),
+            };
+            ret_vals.push(ret_val);
+        }
+        if ret_vals.len() == 1 {
+            ret_vals.pop().unwrap()
+        } else {
+            format!("({})", ret_vals.join(", "))
         }
     }
 }
@@ -426,10 +460,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .get_item(node_id, self.tcx)
             .unwrap_or_else(|| panic!("Failed to find HIR item to node {node_id:?}"));
         let local_def_id = hir_item.owner_id.def_id;
-        println!("Visiting function item {local_def_id:?}");
 
         self.current_fns.push(local_def_id);
-
+        println!("Visiting function item {local_def_id:?}");
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(box fn_item) = &mut item.kind
@@ -504,6 +537,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     stmts.insert(0, flag_decl);
                 }
             }
+
+            // for unit function without return statement, add a return
+            if func.is_unit {
+                let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
+                let ret = self.get_return_value(func, None);
+                let ret_stmt = stmt!("return {};", ret);
+                stmts.push(ret_stmt);
+            }
+
             self.updated = true;
         }
         self.current_fns.pop();
@@ -537,7 +579,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             pprust::expr_to_string(expr),
                         );
                         self.replace_expr(expr, new_expr);
-                        self.updated = true;
                     }
                 }
             }
@@ -545,36 +586,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 // Rewrite return values of functions
                 let curr_fn = self.current_fn();
 
-                let mut ret_vals = vec![];
                 if let Some(func) = self.funcs.get(&curr_fn)
                     && !func.index_map.is_empty()
                 {
-                    for ret_ty in &func.return_tys {
-                        let ret_val = match ret_ty {
-                            ReturnTyItem::Orig => {
-                                pprust::expr_to_string(opt_expr.as_ref().unwrap())
-                            }
-                            ReturnTyItem::Type(param) => format!("{}___v", param.name),
-                            ReturnTyItem::Result(param) => format!(
-                                "if {}___s {{ Ok({}___v) }} else {{ Err({}) }}",
-                                param.name,
-                                param.name,
-                                pprust::expr_to_string(opt_expr.as_ref().unwrap())
-                            ),
-                            ReturnTyItem::Option(param) => format!(
-                                "if {}___s {{ Some({}___v) }} else {{ None }}",
-                                param.name, param.name
-                            ),
-                        };
-                        ret_vals.push(ret_val);
-                    }
-                    let new_return = if ret_vals.len() == 1 {
-                        expr!("return {}", ret_vals[0])
+                    let orig_ret = if let Some(e) = opt_expr {
+                        Some(pprust::expr_to_string(e))
                     } else {
-                        expr!("return ({})", ret_vals.join(", "))
+                        None
                     };
+                    let new_return = expr!("return {}", self.get_return_value(func, orig_ret));
                     self.replace_expr(expr, new_return);
-                    self.updated = true;
                 }
             }
             ExprKind::Call(callee, args) => {
@@ -582,39 +603,43 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     && let Some(func) = self.funcs.get(def_id)
                     && !func.index_map.is_empty()
                 {
+                    println!("Transforming call to function {def_id:?}");
                     let ret_tys = &func.return_tys;
                     // binds return values of a call to rv___, rv___1, ...
                     let mut bindings = vec![];
                     // assign output parameter values to arguments
-                    let mut assigns = vec![];
+                    let mut assign_ret = vec![];
                     let mut mtch_assign = None;
 
                     for (ridx, ret_ty) in ret_tys.iter_enumerated() {
                         match ret_ty {
                             ReturnTyItem::Orig => {
+                                assert!(ridx.index() == 0);
                                 bindings.push(String::from("rv___"));
                             }
                             ReturnTyItem::Type(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = format!("rv___{}", ridx.index());
+                                let rhs = if ridx.index() == 0 { String::from("rv___") } else { format!("rv___{}", ridx.index()) };
                                 let assign =
                                     self.get_assign(arg, true, rhs.clone(), index, expr.span);
-                                assigns.push(assign);
+                                assign_ret.push(assign);
                                 bindings.push(rhs);
                             }
                             ReturnTyItem::Option(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = format!("rv___{}", ridx.index());
+                                let rhs = if ridx.index() == 0 { String::from("rv___") } else { format!("rv___{}", ridx.index()) };
                                 let assign =
                                     self.get_assign(arg, false, rhs.clone(), index, expr.span);
-                                assigns.push(assign);
+                                assign_ret.push(assign);
                                 bindings.push(rhs);
                             }
                             ReturnTyItem::Result(param) => {
+                                assert!(ridx.index() == 0);
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
+                                bindings.push(String::from("rv___"));
                                 mtch_assign = Some(self.get_assign(
                                     arg,
                                     true,
@@ -639,6 +664,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         })
                         .collect();
 
+
                     let binding = if bindings.len() == 1 {
                         format!("let {} = {}", bindings[0], pprust::expr_to_string(expr))
                     } else {
@@ -648,11 +674,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             pprust::expr_to_string(expr)
                         )
                     };
-                    let assign = assigns.join("; ");
+
+                    assign_ret.push(String::from("rv___"));
 
                     let new_expr = match &ret_tys[RetIdx::from_usize(0)] {
-                        ReturnTyItem::Orig => {
-                            expr!("{{ {binding}; {assign}; rv___ }}")
+                        ReturnTyItem::Orig | ReturnTyItem::Type(_) | ReturnTyItem::Option(_) => {
+                            let assign_ret = assign_ret.join("; ");
+                            expr!("{{ {binding}; {assign_ret}}}")
                         }
                         ReturnTyItem::Result(param) => {
                             let mtch_assign = mtch_assign.unwrap();
@@ -662,14 +690,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 SuccValue::Uint(v) => v.to_string(),
                                 SuccValue::Bool(v) => v.to_string(),
                             };
+                            let assign_ret = assign_ret.join("; ");
                             expr!(
-                                "(match ({{ {binding}; {assign}; rv___ }}) {{ Ok(v___) => {{ {mtch_assign}; {v} }} Err(v___) => v___ }})"
+                                "(match ({{ {binding}; {assign_ret} }}) {{ Ok(v___) => {{ {mtch_assign}; {v} }} Err(v___) => v___ }})",
                             )
                         }
-                        _ => unreachable!(),
                     };
                     self.replace_expr(expr, new_expr);
-                    self.updated = true;
                 }
             }
             _ => {}
