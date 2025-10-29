@@ -1,4 +1,6 @@
 use rustc_hash::FxHashMap;
+use rustc_index::{IndexVec, bit_set::MixedBitSet};
+use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, collector::collect_fn_ptrs};
@@ -52,6 +54,16 @@ impl SigDecisions {
                 );
                 continue;
             }
+            let promoted_shared_refs = analysis
+                .mutability_result
+                .function_facts(*did, rust_program.tcx) // output + inputs
+                .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable())) // No mutables behind shared refs
+                .collect::<IndexVec<Local, _>>();
+            let _array_pointers = analysis
+                .fatness_result
+                .function_facts(*did, rust_program.tcx) // output + inputs
+                .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
+                .collect::<IndexVec<Local, _>>();
             let output_params = analysis.output_param_result.get(did).unwrap();
             let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
 
@@ -64,14 +76,23 @@ impl SigDecisions {
             let input_len = sig.inputs().skip_binder().len();
 
             let input_decs = body
-                .args_iter()
+                .local_decls.iter().collect::<IndexVec<Local, _>>()
+                .iter_enumerated().skip(1)
                 .take(input_len) // exclude variadic arguments
-                .map(|param| {
-                    let mutability = body.local_decls[param].ty.is_mutable_ptr();
-                    if output_params.contains(param) {
+                .map(|(param, param_decl)| {
+                    if !param_decl.ty.is_any_ptr() {
+                        None
+                    }
+                    // TODO: More precise filtering of array pointers
+                    // else if array_pointers[param] {
+                    //     None
+                    // }
+                    else if promoted_shared_refs[param] {
+                        Some(PtrKind::OptRef(false))
+                    } else if output_params.contains(param) {
                         Some(PtrKind::OptRef(true))
                     } else if promoted_mut_refs.contains(param) {
-                        Some(PtrKind::OptRef(mutability))
+                        Some(PtrKind::OptRef(body.local_decls[param].ty.is_mutable_ptr()))
                     } else {
                         None
                     }

@@ -5,6 +5,7 @@ use rustc_hir::{
     def::{DefKind, Res},
     intravisit::{Visitor, walk_expr},
 };
+use rustc_index::IndexVec;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
@@ -21,6 +22,16 @@ pub fn collect_diffs<'tcx>(
 
     // collect each HIR variable's before/after pointer kinds
     for did in rust_program.functions.iter() {
+        let promoted_shared_refs = analysis
+            .mutability_result
+            .function_body_facts(*did) // output + inputs
+            .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable())) // No mutables behind shared refs
+            .collect::<IndexVec<Local, _>>();
+        let _array_pointers = analysis
+            .fatness_result
+            .function_body_facts(*did) // output + inputs
+            .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
+            .collect::<IndexVec<Local, _>>();
         let output_params = analysis.output_param_result.get(did).unwrap();
         let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
 
@@ -52,8 +63,18 @@ pub fn collect_diffs<'tcx>(
             .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
         // skip inputs if used as fn ptr
         {
+            if !decl.ty.is_any_ptr() {
+                continue;
+            }
             let mutability = decl.ty.is_mutable_ptr();
-            let ptr_kind = if output_params.contains(local) {
+            let ptr_kind =
+            // TODO: More precise filtering of array pointers
+            // if array_pointers[local] {
+            //     PtrKind::Raw(mutability) // TODO: handle array pointers properly
+            // } else
+            if promoted_shared_refs[local] {
+                PtrKind::OptRef(false)
+            } else if output_params.contains(local) {
                 assert!(mutability); // output parameters are always &mut T
                 PtrKind::OptRef(true)
             } else if promoted_mut_refs.contains(local) {
@@ -64,12 +85,6 @@ pub fn collect_diffs<'tcx>(
                 continue;
             };
             if let Some(hir_id) = local_to_binding.get(&local) {
-                let ty = decl.ty;
-                // Ensure output parameters and promoted mutable references are raw pointers
-                assert!(
-                    ty.is_raw_ptr(),
-                    "Expected raw pointer type, got {ty:?} in {decl:?}"
-                );
                 ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }

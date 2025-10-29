@@ -3,6 +3,7 @@ use std::ops::Range;
 use rustc_middle::mir::{
     HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Terminator, visit::Visitor,
 };
+use rustc_span::source_map::Spanned;
 use rustc_type_ir::TyKind;
 
 use crate::{
@@ -271,9 +272,14 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                         tcx,
                     );
                 }
-                CallKind::Impl(_) => todo!(),
-                CallKind::Closure => todo!(),
-                CallKind::Dynamic => todo!(),
+                CallKind::Impl(_) | CallKind::Closure | CallKind::Dynamic => conservative_call(
+                    destination,
+                    args,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    database,
+                ),
             }
         }
     }
@@ -336,4 +342,29 @@ fn place_vars<'tcx>(
     }
 
     place_vars
+}
+
+pub(crate) fn conservative_call<'tcx>(
+    destination: &Place<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    database: &mut BooleanSystem<Fatness>,
+) {
+    let dest_var = place_vars(destination, local_decls, locals, struct_fields);
+
+    for var in dest_var {
+        database.bottom(var);
+    }
+
+    for arg in args {
+        let Some(arg) = arg.node.place() else {
+            continue;
+        };
+        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields);
+        for var in arg_vars {
+            database.bottom(var);
+        }
+    }
 }
