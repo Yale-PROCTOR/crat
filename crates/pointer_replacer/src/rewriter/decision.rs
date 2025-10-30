@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use rustc_index::{IndexVec, bit_set::MixedBitSet};
+use rustc_index::IndexVec;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
