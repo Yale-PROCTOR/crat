@@ -110,14 +110,33 @@ impl MutVisitor for TransformVisitor<'_> {
                 self.transform_rhs(rhs, hir_rhs, lhs_kind);
             }
             ExprKind::Unary(UnOp::Deref, e) => {
-                if matches!(e.kind, ExprKind::Path(_, _)) {
-                    let hir_id = self.hir_id_of_path(e.id).unwrap();
-                    let ptr_kind = self.ptr_kinds[&hir_id];
-                    if let PtrKind::OptRef(m) = ptr_kind {
-                        let m = if m { "_mut" } else { "" };
-                        **e =
-                            utils::expr!("{}.as_deref{}().unwrap()", pprust::expr_to_string(e), m);
+                let e = unwrap_paren_mut(e);
+                match &e.kind {
+                    ExprKind::Path(_, _) => {
+                        let hir_id = self.hir_id_of_path(e.id).unwrap();
+                        let ptr_kind = self.ptr_kinds[&hir_id];
+                        if let PtrKind::OptRef(m) = ptr_kind {
+                            let m = if m { "_mut" } else { "" };
+                            *e = utils::expr!(
+                                "{}.as_deref{}().unwrap()",
+                                pprust::expr_to_string(e),
+                                m
+                            );
+                        }
                     }
+                    ExprKind::Cast(_, box cast_ty) => {
+                        let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
+                        let unwrapped_e = unwrap_expr(e);
+                        let unwrapped_hir_id = self.hir_id_of_path(unwrapped_e.id).unwrap();
+                        let unwrapped_ptr_kind = self.ptr_kinds[&unwrapped_hir_id];
+                        if let hir::TyKind::Ptr(_) = cast_ty.kind
+                            && let PtrKind::OptRef(m) = unwrapped_ptr_kind
+                        {
+                            let hir_expr = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
+                            self.transform_rhs(e, hir_expr, PtrKind::Raw(m));
+                        }
+                    }
+                    _ => {}
                 }
             }
             ExprKind::Call(_, args) => {
@@ -414,6 +433,15 @@ impl<'tcx> TransformVisitor<'tcx> {
 fn unwrap_expr(expr: &Expr) -> &Expr {
     if let ExprKind::Cast(expr, _) | ExprKind::Paren(expr) = &expr.kind {
         unwrap_expr(expr)
+    } else {
+        expr
+    }
+}
+
+fn unwrap_paren_mut(expr: &mut Expr) -> &mut Expr {
+    if matches!(&expr.kind, ExprKind::Paren(_)) {
+        let ExprKind::Paren(e) = &mut expr.kind else { unreachable!() };
+        unwrap_paren_mut(e)
     } else {
         expr
     }
