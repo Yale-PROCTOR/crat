@@ -127,10 +127,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     ExprKind::Cast(_, box cast_ty) => {
                         let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
                         let unwrapped_e = unwrap_expr(e);
-                        let unwrapped_hir_id = self.hir_id_of_path(unwrapped_e.id).unwrap();
-                        let unwrapped_ptr_kind = self.ptr_kinds[&unwrapped_hir_id];
-                        if let hir::TyKind::Ptr(_) = cast_ty.kind
-                            && let PtrKind::OptRef(m) = unwrapped_ptr_kind
+                        if let Some(unwrapped_hir_id) = self.hir_id_of_path(unwrapped_e.id)
+                            && let hir::TyKind::Ptr(_) = cast_ty.kind
+                            && let PtrKind::OptRef(m) = self.ptr_kinds[&unwrapped_hir_id]
                         {
                             let hir_expr = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
                             self.transform_rhs(e, hir_expr, PtrKind::Raw(m));
