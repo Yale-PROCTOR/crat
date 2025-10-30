@@ -144,6 +144,17 @@ impl MutVisitor for TransformVisitor<'_> {
                     self.transform_rhs(arg, harg, param_kind);
                 }
             }
+            ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
+                if seg.ident.name.as_str() == "is_null" =>
+            {
+                if matches!(receiver.kind, ExprKind::Path(_, _)) {
+                    let hir_id = self.hir_id_of_path(receiver.id).unwrap();
+                    let ptr_kind = self.ptr_kinds[&hir_id];
+                    if let PtrKind::OptRef(_) = ptr_kind {
+                        *expr = utils::expr!("{}.is_none()", pprust::expr_to_string(receiver));
+                    }
+                }
+            }
             ExprKind::Ret(Some(ret)) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let hir::ExprKind::Ret(Some(hir_ret)) = hir_expr.kind else {
