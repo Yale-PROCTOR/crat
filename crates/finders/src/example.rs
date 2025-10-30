@@ -8,7 +8,10 @@ use rustc_hir::{
 };
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BinOp, Const, LocalDecls, Location, Rvalue, TerminatorKind, visit::Visitor as MVisitor},
+    mir::{
+        BinOp, Body, Const, LocalDecls, Location, Rvalue, TerminatorKind,
+        visit::Visitor as MVisitor,
+    },
     ty::{TyCtxt, TyKind},
 };
 use rustc_span::Symbol;
@@ -115,12 +118,8 @@ impl<'tcx> HVisitor<'tcx> for BindingCollector<'tcx> {
 fn collect_calls(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, usize> {
     let mut calls: FxHashMap<_, usize> = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
-        let dk = tcx.def_kind(def_id);
-        let body = if dk.is_fn_like() {
-            tcx.optimized_mir(def_id)
-        } else {
-            tcx.mir_for_ctfe(def_id)
-        };
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let body: &Body<'_> = &body.borrow();
         for bbd in body.basic_blocks.iter() {
             let terminator = bbd.terminator();
             let TerminatorKind::Call { func, .. } = &terminator.kind else { continue };
@@ -137,12 +136,8 @@ fn collect_calls(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, usize> {
 fn collect_int_adds(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, usize> {
     let mut adds: FxHashMap<_, usize> = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
-        let dk = tcx.def_kind(def_id);
-        let body = if dk.is_fn_like() {
-            tcx.optimized_mir(def_id)
-        } else {
-            tcx.mir_for_ctfe(def_id)
-        };
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let body: &Body<'_> = &body.borrow();
         let mut visitor = AddCollector {
             tcx,
             local_decls: &body.local_decls,
@@ -154,13 +149,13 @@ fn collect_int_adds(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, usize> {
     adds
 }
 
-struct AddCollector<'tcx> {
+struct AddCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    local_decls: &'tcx LocalDecls<'tcx>,
+    local_decls: &'a LocalDecls<'tcx>,
     count: usize,
 }
 
-impl<'tcx> MVisitor<'tcx> for AddCollector<'tcx> {
+impl<'tcx> MVisitor<'tcx> for AddCollector<'_, 'tcx> {
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         if let Rvalue::BinaryOp(BinOp::Add, box (l, _)) = rvalue {
             let ty = l.ty(self.local_decls, self.tcx);
