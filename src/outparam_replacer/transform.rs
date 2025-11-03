@@ -13,8 +13,9 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    HirId, Item as HirItem, ItemKind as HirItemKind, MutTy, PatKind, Path as HirPath, QPath,
-    TyKind as HirTyKind, def::Res, definitions::DefPathData, intravisit,
+    Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
+    MutTy, Node as HirNode, PatKind, Path as HirPath, QPath, TyKind as HirTyKind, def::Res,
+    definitions::DefPathData, intravisit,
 };
 use rustc_index::IndexVec;
 use rustc_middle::{
@@ -328,7 +329,6 @@ pub fn transform(
             let mut mapper = AstToHirMapper::new(tcx);
             mapper.map_crate_to_mod(krate, module, false);
 
-
             let mut visitor = TransformVisitor {
                 tcx,
                 ast_to_hir: mapper.ast_to_hir,
@@ -336,6 +336,7 @@ pub fn transform(
                 current_fns: vec![],
                 write_args: &write_args,
                 bounds: &hir_visitor.bounds,
+                call_in_ret: &hir_visitor.call_in_ret,
                 updated: false,
             };
             visitor.visit_crate(krate);
@@ -355,6 +356,8 @@ struct TransformVisitor<'tcx, 'a> {
     write_args: &'a FxHashMap<Span, FxHashMap<ParamIdx, String>>,
     /// bound occurrence (ident) span to def_id
     bounds: &'a FxHashMap<Span, LocalDefId>,
+    // maps spans of returns to calls inside them
+    call_in_ret: &'a FxHashMap<Span, LocalDefId>,
     /// is this file updated
     updated: bool,
 }
@@ -398,29 +401,20 @@ impl TransformVisitor<'_, '_> {
             } else {
                 format!("if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }}")
             }
+        } else if must {
+            format!("if !({arg}.is_null()) {{ *({arg}) = {rhs};{set_flag} }}")
         } else {
-            if must {
-                format!("if !({arg}.is_null()) {{ *({arg}) = {rhs};{set_flag} }}")
-            } else {
-                format!(
-                    "if !(({arg}).is_null()) {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
-                )
-            }
+            format!(
+                "if !(({arg}).is_null()) {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
+            )
         }
-
     }
 
-    fn get_return_value(
-        &self,
-        func: &Func,
-        orig_ret: Option<String>,
-    ) -> String {
+    fn get_return_value(&self, func: &Func, orig_ret: Option<String>) -> String {
         let mut ret_vals = vec![];
         for ret_ty in &func.return_tys {
             let ret_val = match ret_ty {
-                ReturnTyItem::Orig => {
-                    orig_ret.as_ref().unwrap().clone()
-                }
+                ReturnTyItem::Orig => orig_ret.as_ref().unwrap().clone(),
                 ReturnTyItem::Type(param) => format!("{}___v", param.name),
                 ReturnTyItem::Result(param) => format!(
                     "if {}___s {{ Ok({}___v) }} else {{ Err({}) }}",
@@ -583,19 +577,30 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ExprKind::Ret(opt_expr) => {
-                // Rewrite return values of functions
+                // rewrite return values of functions
                 let curr_fn = self.current_fn();
 
                 if let Some(func) = self.funcs.get(&curr_fn)
                     && !func.index_map.is_empty()
                 {
-                    let orig_ret = if let Some(e) = opt_expr {
-                        Some(pprust::expr_to_string(e))
+                    let orig_ret = opt_expr.as_ref().map(|e| pprust::expr_to_string(e));
+
+                    if let Some(callee) = self.call_in_ret.get(&expr.span)
+                        && let Some(callee) = self.funcs.get(callee)
+                        && !callee.index_map.is_empty()
+                    {
+                        // if return contains a call to function being transformed
+                        let ret_val = self.get_return_value(func, Some("rv___".to_string()));
+                        let new_return = expr!(
+                            "{{ let rv___ = {}; return {} }}",
+                            orig_ret.unwrap(),
+                            ret_val
+                        );
+                        self.replace_expr(expr, new_return);
                     } else {
-                        None
-                    };
-                    let new_return = expr!("return {}", self.get_return_value(func, orig_ret));
-                    self.replace_expr(expr, new_return);
+                        let new_return = expr!("return {}", self.get_return_value(func, orig_ret));
+                        self.replace_expr(expr, new_return);
+                    }
                 }
             }
             ExprKind::Call(callee, args) => {
@@ -620,7 +625,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             ReturnTyItem::Type(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = if ridx.index() == 0 { String::from("rv___") } else { format!("rv___{}", ridx.index()) };
+                                let rhs = if ridx.index() == 0 {
+                                    String::from("rv___")
+                                } else {
+                                    format!("rv___{}", ridx.index())
+                                };
                                 let assign =
                                     self.get_assign(arg, true, rhs.clone(), index, expr.span);
                                 assign_ret.push(assign);
@@ -629,7 +638,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             ReturnTyItem::Option(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = if ridx.index() == 0 { String::from("rv___") } else { format!("rv___{}", ridx.index()) };
+                                let rhs = if ridx.index() == 0 {
+                                    String::from("rv___")
+                                } else {
+                                    format!("rv___{}", ridx.index())
+                                };
                                 let assign =
                                     self.get_assign(arg, false, rhs.clone(), index, expr.span);
                                 assign_ret.push(assign);
@@ -664,7 +677,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         })
                         .collect();
 
-
                     let binding = if bindings.len() == 1 {
                         format!("let {} = {}", bindings[0], pprust::expr_to_string(expr))
                     } else {
@@ -692,7 +704,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             };
                             let assign_ret = assign_ret.join("; ");
                             expr!(
-                                "(match ({{ {binding}; {assign_ret} }}) {{ Ok(v___) => {{ {mtch_assign}; {v} }} Err(v___) => v___ }})",
+                                "(match ({{ {binding}; {assign_ret} }}) {{ Ok(v___) => {{ {mtch_assign} {v} }} Err(v___) => v___ }})",
                             )
                         }
                     };
@@ -707,6 +719,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     bounds: FxHashMap<Span, LocalDefId>,
+    call_in_ret: FxHashMap<Span, LocalDefId>,
 }
 
 impl<'tcx> HirVisitor<'tcx> {
@@ -714,11 +727,31 @@ impl<'tcx> HirVisitor<'tcx> {
         Self {
             tcx,
             bounds: FxHashMap::default(),
+            call_in_ret: FxHashMap::default(),
         }
     }
 
     fn add_bound(&mut self, span: Span, def_id: LocalDefId) {
         self.bounds.insert(span, def_id);
+    }
+
+    fn get_parent(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
+        let HirNode::Expr(e) = self.tcx.parent_hir_node(hir_id) else {
+            return None;
+        };
+        match e.kind {
+            HirExprKind::DropTemps(_) | HirExprKind::Cast(_, _) => self.get_parent(e.hir_id),
+            _ => Some(e),
+        }
+    }
+
+    fn get_parent_return(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
+        let parent = self.get_parent(hir_id)?;
+        if let HirExprKind::Ret(_) = parent.kind {
+            Some(parent)
+        } else {
+            self.get_parent_return(parent.hir_id)
+        }
     }
 }
 
@@ -744,5 +777,17 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         {
             self.add_bound(path.span, def_id);
         }
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx HirExpr<'tcx>) {
+        if let HirExprKind::Call(callee, _) = expr.kind
+            && let HirExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(parent) = self.get_parent_return(expr.hir_id)
+        {
+            self.call_in_ret.insert(parent.span, def_id);
+        }
+        intravisit::walk_expr(self, expr);
     }
 }
