@@ -1403,7 +1403,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
             self.call_args.clear();
             while let Some(label) = work_list.pop() {
-                // println!("Analyzing location: {:?}", label.location);
                 let state = states
                     .get(&label.location)
                     .and_then(|states| states.get(&(label.writes.clone(), label.nulls.clone())))

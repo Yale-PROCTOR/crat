@@ -48,7 +48,8 @@ struct Param {
 }
 
 impl Param {
-    fn to_ret_ty(&self) -> Option<ReturnTyItem> {
+    // convert param to return type item which does not use origin return type
+    fn to_non_orig_ret_ty(&self) -> Option<ReturnTyItem> {
         if self.must {
             Some(ReturnTyItem::Type(self.clone()))
         } else if self.succ_value.is_none() {
@@ -138,10 +139,14 @@ impl SuccValue {
 
 #[derive(Debug, Clone)]
 enum ReturnTyItem {
-    Orig,          // original return type
-    Type(Param),   // must output parameter
-    Result(Param), // rewrite may parameter with original return to result type
-    Option(Param), // rewrite may parameter to option type
+    /// original return type
+    Orig,
+    /// must output parameter
+    Type(Param),
+    /// rewrite may parameter with original return to result type
+    Result(Param),
+    /// rewrite may parameter to option type
+    Option(Param),
 }
 
 pub fn transform(
@@ -154,8 +159,7 @@ pub fn transform(
         let file = File::open(file).unwrap();
         serde_json::from_reader(file).unwrap()
     } else {
-        // TODO: run analysis here?
-        panic!("no analysis result");
+        analyze(config, false, tcx).0
     };
 
     let mut path_to_mod_id = FxHashMap::default();
@@ -299,7 +303,7 @@ pub fn transform(
             return_tys.push(ReturnTyItem::Orig);
         }
 
-        return_tys.extend(index_map.values().filter_map(|p| p.to_ret_ty()));
+        return_tys.extend(index_map.values().filter_map(|p| p.to_non_orig_ret_ty()));
 
         let func = Func {
             is_unit,
@@ -352,7 +356,7 @@ struct TransformVisitor<'tcx, 'a> {
     ast_to_hir: AstToHir,
     funcs: &'a FxHashMap<LocalDefId, Func>,
     current_fns: Vec<LocalDefId>,
-    /// at span, caller param named string is used 'ParamIdx'th argument of call
+    /// at span, caller param named 'String' is used 'ParamIdx'th argument of call
     write_args: &'a FxHashMap<Span, FxHashMap<ParamIdx, String>>,
     /// bound occurrence (ident) span to def_id
     bounds: &'a FxHashMap<Span, LocalDefId>,
