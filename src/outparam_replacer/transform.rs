@@ -696,7 +696,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let new_expr = match &ret_tys[RetIdx::from_usize(0)] {
                         ReturnTyItem::Orig | ReturnTyItem::Type(_) | ReturnTyItem::Option(_) => {
                             let assign_ret = assign_ret.join("; ");
-                            expr!("{{ {binding}; {assign_ret}}}")
+                            expr!("{{ {binding}; {assign_ret} }}")
                         }
                         ReturnTyItem::Result(param) => {
                             let mtch_assign = mtch_assign.unwrap();
