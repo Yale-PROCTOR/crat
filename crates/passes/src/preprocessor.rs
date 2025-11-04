@@ -154,6 +154,23 @@
 //! ```rust,ignore
 //! *p.offset(0 as libc::c_int as isize) += 1;
 //! ```
+//!
+//! # Remove `transmute`
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! *::std::mem::transmute::<
+//!     &[u8; 2],
+//!     &mut [libc::c_char; 2],
+//! >(b"a\0");
+//! ```
+//!
+//! We replace such code with the following code:
+//!
+//! ```rust,ignore
+//! [b'a' as i8, b'\0' as i8];
+//! ```
 
 use std::fmt::Write as _;
 
@@ -168,8 +185,8 @@ use rustc_hir::{
     def_id::LocalDefId,
     intravisit,
 };
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
-use rustc_span::{Span, Symbol};
+use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
+use rustc_span::{Span, Symbol, sym};
 use utils::{ast::TransformationResult, expr, ir::AstToHir, stmt, ty};
 
 pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
@@ -353,6 +370,46 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                     } else {
                         *expr = expr!("{{}}");
                     }
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, e) => {
+                if let ExprKind::Call(callee, args) = &e.kind
+                    && let ExprKind::Path(_, path) = &callee.kind
+                    && let [.., seg] = &path.segments[..]
+                    && seg.ident.name == sym::transmute
+                    && let [arg] = &args[..]
+                    && let ExprKind::Lit(lit) = &arg.kind
+                    && matches!(lit.kind, token::LitKind::ByteStr)
+                    && let Some(hir_e) = self.ast_to_hir.get_expr(e.id, self.tcx)
+                    && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+                    && let e_ty = typeck.expr_ty(hir_e)
+                    && let ty::TyKind::Ref(_, inner_ty, _) = e_ty.kind()
+                    && let ty::TyKind::Array(elem_ty, _) = inner_ty.kind()
+                    && let ty::TyKind::Int(ty::IntTy::I8) = elem_ty.kind()
+                {
+                    let s = lit.symbol.as_str();
+                    let mut buf = Vec::with_capacity(s.len());
+                    rustc_literal_escaper::unescape_unicode(
+                        s,
+                        rustc_literal_escaper::Mode::ByteStr,
+                        &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+                    );
+                    let mut array = "[".to_string();
+                    for c in buf {
+                        write!(array, "b'").unwrap();
+                        match c {
+                            b'\0' => write!(array, "\\0").unwrap(),
+                            b'\'' => write!(array, "\\'").unwrap(),
+                            b'\\' => write!(array, "\\\\").unwrap(),
+                            b'\n' => write!(array, "\\n").unwrap(),
+                            b'\r' => write!(array, "\\r").unwrap(),
+                            b'\t' => write!(array, "\\t").unwrap(),
+                            _ => write!(array, "{}", c as char).unwrap(),
+                        }
+                        write!(array, "' as i8, ").unwrap();
+                    }
+                    write!(array, "]").unwrap();
+                    *expr = expr!("{array}");
                 }
             }
             _ => {}
@@ -1464,6 +1521,23 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
             "#,
             &["*p.offset(0 as libc::c_int as isize)"],
             &["fresh0"],
+        );
+    }
+
+    #[test]
+    fn test_transmute() {
+        run_test(
+            r#"
+#![allow(mutable_transmutes)]
+pub unsafe extern "C" fn foo() {
+    let mut a: [libc::c_char; 2] = *::std::mem::transmute::<
+        &[u8; 2],
+        &mut [libc::c_char; 2],
+    >(b"a\0");
+}
+            "#,
+            &["b'a'", "b'\\0'"],
+            &["::transmute"],
         );
     }
 }

@@ -10,6 +10,7 @@ extern crate rustc_ast_pretty;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
+extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_span;
 extern crate rustc_type_ir;
