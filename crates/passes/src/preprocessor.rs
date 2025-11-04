@@ -171,6 +171,24 @@
 //! ```rust,ignore
 //! [b'a' as i8, b'\0' as i8];
 //! ```
+//!
+//! # Remove `fresh`
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! let fresh0 = p;
+//! p = p.offset(1);
+//! *fresh0;
+//! ```
+//!
+//! We replace such code with the following code:
+//!
+//! ```rust,ignore
+//! let fresh0 = *p;
+//! p = p.offset(1);
+//! fresh0;
+//! ```
 
 use std::fmt::Write as _;
 
@@ -208,19 +226,33 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
             continue;
         }
         let name = some_or!(visitor.ctx.params.get(rhs), continue);
-        let (lhs, let_id) = lhs[0];
-        let is_in_loop = tcx.hir_parent_iter(let_id).any(|(_, node)| {
+        let lhs = lhs[0];
+        let is_in_loop = tcx.hir_parent_iter(lhs.let_stmt).any(|(_, node)| {
             let hir::Node::Expr(expr) = node else { return false };
             matches!(expr.kind, hir::ExprKind::Loop(..))
         });
         if is_in_loop {
             continue;
         }
-        lets_to_remove.insert(let_id);
+        lets_to_remove.insert(lhs.let_stmt);
         params_to_be_mut.insert(*rhs);
-        let bounds = some_or!(visitor.ctx.bound_occurrences.get(&lhs), continue);
+        let bounds = some_or!(visitor.ctx.bound_occurrences.get(&lhs.variable), continue);
         for hir_id in bounds {
             vars_to_replace.insert(*hir_id, *name);
+        }
+    }
+
+    let mut fresh_pointers = FxHashSet::default();
+    for lhs in visitor.ctx.rhs_to_lhs.values() {
+        for lhs in lhs {
+            if lhs.is_mutable {
+                continue;
+            }
+            let pointer_uses = some_or!(visitor.ctx.pointer_uses.get(&lhs.variable), continue);
+            if !pointer_uses.iter().all(|u| *u == PointerUse::RvalueDeref) {
+                continue;
+            }
+            fresh_pointers.insert(lhs.variable);
         }
     }
 
@@ -233,6 +265,7 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
         call_to_if_args: visitor.ctx.call_to_if_args,
         call_to_nested_args: visitor.ctx.call_to_nested_args,
         let_ref_exprs: FxHashMap::default(),
+        fresh_pointers,
         updated: false,
     };
 
@@ -249,6 +282,7 @@ struct ExpandedAstVisitor<'tcx> {
     call_to_if_args: FxHashMap<HirId, Vec<ArgIdx>>,
     call_to_nested_args: FxHashMap<HirId, Vec<ArgIdx>>,
     let_ref_exprs: FxHashMap<HirId, Expr>,
+    fresh_pointers: FxHashSet<HirId>,
     updated: bool,
 }
 
@@ -321,13 +355,17 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
         mut_visit::walk_local(self, local);
 
         if let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-            && let hir::PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(_), _), id, _, _) =
-                hir_stmt.pat.kind
-            && let LocalKind::Init(box e) = &local.kind
-            && matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
+            && let hir::PatKind::Binding(mode, id, _, _) = hir_stmt.pat.kind
+            && let LocalKind::Init(box e) = &mut local.kind
         {
-            self.let_ref_exprs.insert(id, e.clone());
-            self.lets_to_remove.insert(hir_stmt.hir_id);
+            if matches!(mode, hir::BindingMode(hir::ByRef::Yes(_), _))
+                && matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
+            {
+                self.let_ref_exprs.insert(id, e.clone());
+                self.lets_to_remove.insert(hir_stmt.hir_id);
+            } else if self.fresh_pointers.contains(&id) {
+                *e = expr!("*{}", pprust::expr_to_string(e));
+            }
         }
     }
 
@@ -373,7 +411,13 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                 }
             }
             ExprKind::Unary(UnOp::Deref, e) => {
-                if let ExprKind::Call(callee, args) = &e.kind
+                if let Some(hir_e) = self.ast_to_hir.get_expr(e.id, self.tcx)
+                    && let hir::ExprKind::Path(QPath::Resolved(_, path)) = hir_e.kind
+                    && let Res::Local(hir_id) = path.res
+                    && self.fresh_pointers.contains(&hir_id)
+                {
+                    *expr = (**e).clone();
+                } else if let ExprKind::Call(callee, args) = &e.kind
                     && let ExprKind::Path(_, path) = &callee.kind
                     && let [.., seg] = &path.segments[..]
                     && seg.ident.name == sym::transmute
@@ -840,6 +884,21 @@ struct BoundOccurrence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ArgIdx(usize);
 
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerUse {
+    LvalueDeref,
+    RvalueDeref,
+    NonDeref,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Lhs {
+    variable: HirId,
+    let_stmt: HirId,
+    is_mutable: bool,
+}
+
 #[derive(Default)]
 struct ExpandedHirCtx {
     call_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
@@ -848,12 +907,14 @@ struct ExpandedHirCtx {
 
     /// function param hir_id to ident symbol
     params: FxHashMap<HirId, Symbol>,
-    /// let stmt rhs variable hir_id to lhs variable hir_id and let stmt hir_id
-    rhs_to_lhs: FxHashMap<HirId, Vec<(HirId, HirId)>>,
+    /// let stmt rhs variable hir_id to lhs
+    rhs_to_lhs: FxHashMap<HirId, Vec<Lhs>>,
     /// hir_ids of variables used, excluding let stmt rhs
     used_vars: FxHashSet<HirId>,
     /// variable hir_id to bound occurrence hir_ids
     bound_occurrences: FxHashMap<HirId, Vec<HirId>>,
+    /// integer-pointer-type variable to uses
+    pointer_uses: FxHashMap<HirId, Vec<PointerUse>>,
 }
 
 struct ExpandedHirVisitor<'tcx> {
@@ -888,15 +949,16 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
     fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) {
         intravisit::walk_local(self, let_stmt);
 
-        let hir::PatKind::Binding(_, lhs_id, _, _) = let_stmt.pat.kind else { return };
+        let hir::PatKind::Binding(mode, lhs_id, _, _) = let_stmt.pat.kind else { return };
         let init = some_or!(let_stmt.init, return);
         let hir::ExprKind::Path(QPath::Resolved(_, path)) = init.kind else { return };
         let Res::Local(rhs_id) = path.res else { return };
-        self.ctx
-            .rhs_to_lhs
-            .entry(rhs_id)
-            .or_default()
-            .push((lhs_id, let_stmt.hir_id));
+        let lhs = Lhs {
+            variable: lhs_id,
+            let_stmt: let_stmt.hir_id,
+            is_mutable: mode.1.is_mut(),
+        };
+        self.ctx.rhs_to_lhs.entry(rhs_id).or_default().push(lhs);
     }
 
     fn visit_param(&mut self, param: &'tcx hir::Param<'tcx>) {
@@ -958,6 +1020,32 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                     let (_, parent) = self.tcx.hir_parent_iter(expr.hir_id).next().unwrap();
                     if !matches!(parent, hir::Node::LetStmt(_)) {
                         self.ctx.used_vars.insert(hir_id);
+                    }
+
+                    if let ty::TyKind::RawPtr(inner_ty, _) = ty.kind()
+                        && matches!(inner_ty.kind(), ty::TyKind::Int(_) | ty::TyKind::Uint(_))
+                    {
+                        let pointer_use = if let hir::Node::Expr(parent) = parent
+                            && let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind
+                        {
+                            let (_, pparent) =
+                                self.tcx.hir_parent_iter(parent.hir_id).next().unwrap();
+                            if let hir::Node::Expr(pparent) = pparent
+                                && let hir::ExprKind::Assign(l, _, _) = pparent.kind
+                                && l.hir_id == parent.hir_id
+                            {
+                                PointerUse::LvalueDeref
+                            } else {
+                                PointerUse::RvalueDeref
+                            }
+                        } else {
+                            PointerUse::NonDeref
+                        };
+                        self.ctx
+                            .pointer_uses
+                            .entry(hir_id)
+                            .or_default()
+                            .push(pointer_use);
                     }
                 }
             }
@@ -1538,6 +1626,21 @@ pub unsafe extern "C" fn foo() {
             "#,
             &["b'a'", "b'\\0'"],
             &["::transmute"],
+        );
+    }
+
+    #[test]
+    fn test_fresh_1() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn foo(mut p: *mut libc::c_int) -> libc::c_int {
+    let fresh0 = p;
+    p = p.offset(1);
+    return *fresh0;
+}
+            "#,
+            &["fresh0 = *p", "return fresh0"],
+            &["fresh0 = p", "return *fresh0"],
         );
     }
 }
