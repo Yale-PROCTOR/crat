@@ -480,7 +480,15 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                             b'\n' => write!(array, "\\n").unwrap(),
                             b'\r' => write!(array, "\\r").unwrap(),
                             b'\t' => write!(array, "\\t").unwrap(),
-                            _ => write!(array, "{}", c as char).unwrap(),
+                            _ => {
+                                if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == b' ' {
+                                    write!(array, "{}", c as char).unwrap();
+                                } else if c < 0x10 {
+                                    write!(array, "\\x0{c:x}").unwrap();
+                                } else {
+                                    write!(array, "\\x{c:x}").unwrap();
+                                }
+                            }
                         }
                         write!(array, "' as i8, ").unwrap();
                     }
@@ -1709,13 +1717,16 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
             r#"
 #![allow(mutable_transmutes)]
 pub unsafe extern "C" fn f() {
-    let mut a: [libc::c_char; 2] = *::std::mem::transmute::<
-        &[u8; 2],
-        &mut [libc::c_char; 2],
-    >(b"a\0");
+    let mut buf: [libc::c_char; 9] = *::std::mem::transmute::<
+        &[u8; 9],
+        &mut [libc::c_char; 9],
+    >(b"a\"'\n\r\t\x02\xC2\0");
 }
             "#,
-            &["b'a'", "b'\\0'"],
+            &[
+                "b'a'", "b'\"'", "b'\\\''", "b'\\n'", "b'\\r'", "b'\\t'", "b'\\x02'", "b'\\xc2'",
+                "b'\\0'",
+            ],
             &["::transmute"],
         );
     }
