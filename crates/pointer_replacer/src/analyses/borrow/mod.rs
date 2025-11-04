@@ -23,7 +23,7 @@ use rustc_mir_dataflow::{fmt::DebugWithContext, points::DenseLocationMap};
 use rustc_span::def_id::LocalDefId;
 use subset_closure::{SubSetClosure, compute_subset_closure};
 
-use super::{mir::TerminatorExt, type_qualifier::foster::mutability::mutability_analysis};
+use super::mir::TerminatorExt;
 use crate::utils::rustc::RustProgram;
 
 macro_rules! disallow_interprocedural {
@@ -134,19 +134,7 @@ impl GBorrowInferCtxt {
     }
 
     pub fn mutable_pointers_only(program: &RustProgram) -> Self {
-        let mutability_results = mutability_analysis(program);
-
-        GBorrowInferCtxt::new(program, |f| {
-            let mutability_results = mutability_results
-                .function_body_facts(f)
-                .collect::<IndexVec<Local, _>>();
-
-            move |local| {
-                mutability_results[local]
-                    .first()
-                    .is_some_and(|mutability| mutability.is_mutable())
-            }
-        })
+        GBorrowInferCtxt::new(program, |_| |_| true)
     }
 }
 

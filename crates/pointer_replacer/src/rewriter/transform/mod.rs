@@ -109,6 +109,21 @@ impl MutVisitor for TransformVisitor<'_> {
                 };
                 self.transform_rhs(rhs, hir_rhs, lhs_kind);
             }
+            ExprKind::Binary(bin_op, l, r)
+                if matches!(bin_op.node, BinOpKind::Eq | BinOpKind::Ne) =>
+            {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let hir::ExprKind::Binary(_, hir_l, hir_r) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
+                let ty = typeck.expr_ty_adjusted(hir_l);
+                if let Some((_, m)) = unwrap_ptr_from_mir_ty(ty) {
+                    let kind = PtrKind::Raw(m.is_mut());
+                    self.transform_rhs(l, hir_l, kind);
+                    self.transform_rhs(r, hir_r, kind);
+                }
+            }
             ExprKind::Unary(UnOp::Deref, e) => {
                 let e = unwrap_paren_mut(e);
                 match &e.kind {
@@ -271,6 +286,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
         let (rhs_inner_ty, _) = unwrap_ptr_from_mir_ty(rhs_ty).unwrap();
         let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let extern_ty = matches!(rhs_inner_ty.kind(), ty::TyKind::Foreign(_));
         match &e.kind {
             ExprKind::Path(_, _) => {
                 let hir_id = some_or!(self.hir_id_of_path(e.id), return);
@@ -305,6 +321,20 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 if m { "mut" } else { "const" },
                                 lhs_inner_ty,
                             );
+                        } else if extern_ty {
+                            *rhs = utils::expr!(
+                                "
+    match &{}({}) {{
+        Some(x) => *x as *{} {},
+        None => std::ptr::null{}(),
+    }}
+",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                                mir_ty_to_string(rhs_inner_ty, self.tcx),
+                                if m { "_mut" } else { "" },
+                            );
                         } else {
                             *rhs = utils::expr!(
                                 "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x)",
@@ -313,7 +343,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    (PtrKind::OptRef(m), PtrKind::Raw(_)) => {
+                    (PtrKind::OptRef(m), PtrKind::Raw(m1)) => {
                         if need_cast {
                             if *lhs_inner_ty.kind() == ty::TyKind::Int(ty::IntTy::I8) {
                                 // special handling for libc::c_char TODO: better solution for char arrays
@@ -333,6 +363,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                                     if m { "mut" } else { "ref" },
                                 );
                             }
+                        } else if m && !m1 {
+                            *rhs = utils::expr!(
+                                "({}).cast_mut().as_mut()",
+                                pprust::expr_to_string(e),
+                            );
                         } else {
                             *rhs = utils::expr!(
                                 "({}).as_{}()",
@@ -602,12 +637,34 @@ impl<'tcx> hir::intravisit::Visitor<'tcx> for OffsetVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-        if let hir::ExprKind::MethodCall(seg, e, _, _) = expr.kind
-            && seg.ident.name == rustc_span::sym::offset
-            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = unwrap_hir_expr(e).kind
-            && let Res::Local(hir_id) = path.res
-        {
-            self.offsets.insert(hir_id);
+        match expr.kind {
+            hir::ExprKind::MethodCall(seg, e, _, _) => {
+                if seg.ident.name == rustc_span::sym::offset
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                        unwrap_hir_expr(e).kind
+                    && let Res::Local(hir_id) = path.res
+                {
+                    self.offsets.insert(hir_id);
+                }
+            }
+            hir::ExprKind::Call(callee, args) => {
+                if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind
+                    && let Res::Def(_, def_id) = path.res
+                    && matches!(
+                        self.tcx.hir_get_if_local(def_id),
+                        Some(hir::Node::ForeignItem(_))
+                    )
+                    && let Some(name) = utils::ir::def_id_to_symbol(def_id, self.tcx)
+                    && name.as_str() == "strtol"
+                    && let [arg, ..] = args
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
+                        unwrap_hir_expr(arg).kind
+                    && let Res::Local(hir_id) = path.res
+                {
+                    self.offsets.insert(hir_id);
+                }
+            }
+            _ => {}
         }
         hir::intravisit::walk_expr(self, expr);
     }
