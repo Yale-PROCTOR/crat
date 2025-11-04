@@ -55,67 +55,6 @@ impl<I> VecVec<I> {
             num_cur_items: 0,
         }
     }
-
-    #[allow(unused)]
-    pub fn with_data_capacity(size: usize) -> VecVecBuilder<I> {
-        let mut indices = vec![0];
-        let data = Vec::with_capacity(size);
-        let vec_array = VecVec { indices, data };
-        VecVecBuilder {
-            vec_vec: vec_array,
-            start_index: 0,
-            num_cur_items: 0,
-        }
-    }
-
-    #[allow(unused)]
-    #[inline]
-    pub fn repack<U, F>(self, f: F) -> VecVec<U>
-    where F: Fn(I) -> U {
-        let indices = self.indices;
-        let data = self.data.into_iter().map(f).collect();
-        VecVec { indices, data }
-    }
-}
-
-impl<I, A: Allocator + Copy> VecVec<I, A> {
-    #[allow(unused)]
-    pub fn new_in(len: usize, alloc: A) -> VecVecBuilder<I, A> {
-        let mut indices = Vec::with_capacity_in(len + 1, alloc);
-        indices.push(0);
-        let data = Vec::new_in(alloc);
-        let vec_array = VecVec { indices, data };
-        VecVecBuilder {
-            vec_vec: vec_array,
-            start_index: 0,
-            num_cur_items: 0,
-        }
-    }
-
-    #[allow(unused)]
-    #[inline]
-    pub fn everything(&self) -> &[I] {
-        &self.data
-    }
-
-    #[allow(unused)]
-    #[inline]
-    pub fn everything_mut(&mut self) -> &mut [I] {
-        &mut self.data
-    }
-
-    #[allow(unused)]
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.indices.len() - 1
-    }
-
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &[I]> {
-        self.indices
-            .array_windows()
-            .map(|&[start, end]| &self.data[start..end])
-    }
 }
 
 #[derive(Debug)]

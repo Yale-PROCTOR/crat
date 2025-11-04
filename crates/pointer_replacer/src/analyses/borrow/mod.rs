@@ -133,7 +133,7 @@ impl GBorrowInferCtxt {
         GBorrowInferCtxt { provenances }
     }
 
-    pub fn mutable_pointers_only(program: &RustProgram) -> Self {
+    pub fn all_pointers(program: &RustProgram) -> Self {
         GBorrowInferCtxt::new(program, |_| |_| true)
     }
 }
@@ -650,9 +650,9 @@ pub fn demote_pointers(
 pub fn mutable_references_no_guarantee(
     program: &RustProgram,
 ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
-    let mut mutabla_references = FxHashMap::default();
+    let mut mutable_references = FxHashMap::default();
 
-    let global_borrow_ctxt = GBorrowInferCtxt::mutable_pointers_only(program);
+    let global_borrow_ctxt = GBorrowInferCtxt::all_pointers(program);
     let demoted = demote_pointers(program, &global_borrow_ctxt);
 
     for (&f, demoted) in demoted.iter() {
@@ -665,10 +665,10 @@ pub fn mutable_references_no_guarantee(
         }
         promoted.subtract(demoted);
 
-        mutabla_references.insert(f, promoted);
+        mutable_references.insert(f, promoted);
     }
 
-    mutabla_references
+    mutable_references
 }
 
 // #[cfg(test)]

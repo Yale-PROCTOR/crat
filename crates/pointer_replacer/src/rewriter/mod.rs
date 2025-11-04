@@ -8,7 +8,6 @@ use crate::{
     analyses::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
-        output_params::OutputParams as OutputParamResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -20,7 +19,6 @@ mod transform;
 
 pub struct Analysis {
     mutability_result: MutabilityResult,
-    output_param_result: OutputParamResult,
     promoted_mut_ref_result: PromotedMutRefResult,
     fatness_result: FatnessResult,
 }
@@ -28,13 +26,11 @@ pub struct Analysis {
 impl Analysis {
     pub fn new(
         mutability_result: MutabilityResult,
-        output_param_result: OutputParamResult,
         promoted_mut_ref_result: PromotedMutRefResult,
         fatness_result: FatnessResult,
     ) -> Self {
         Analysis {
             mutability_result,
-            output_param_result,
             promoted_mut_ref_result,
             fatness_result,
         }
@@ -69,19 +65,12 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
-    let output_param_result =
-        analyses::output_params::compute_output_params(&input, &mutability_result);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
-    // TODO: promoted_mut_ref does mutability analysis again internally
     let promoted_mut_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(analyses::borrow::mutable_references_no_guarantee(&input));
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
-    let analysis_results = Analysis::new(
-        mutability_result,
-        output_param_result,
-        promoted_mut_ref_result,
-        fatness_result,
-    );
+    let analysis_results =
+        Analysis::new(mutability_result, promoted_mut_ref_result, fatness_result);
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);

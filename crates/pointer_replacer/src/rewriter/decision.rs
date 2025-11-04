@@ -64,7 +64,6 @@ impl SigDecisions {
                 .function_facts(*did, rust_program.tcx) // output + inputs
                 .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
                 .collect::<IndexVec<Local, _>>();
-            let output_params = analysis.output_param_result.get(did).unwrap();
             let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
 
             let body = &*rust_program
@@ -89,8 +88,6 @@ impl SigDecisions {
                     // }
                     else if promoted_shared_refs[param] {
                         Some(PtrKind::OptRef(false))
-                    } else if output_params.contains(param) {
-                        Some(PtrKind::OptRef(true))
                     } else if promoted_mut_refs.contains(param) {
                         Some(PtrKind::OptRef(body.local_decls[param].ty.is_mutable_ptr()))
                     } else {

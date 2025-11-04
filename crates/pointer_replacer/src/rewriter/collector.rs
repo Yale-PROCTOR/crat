@@ -32,7 +32,6 @@ pub fn collect_diffs<'tcx>(
             .function_body_facts(*did) // output + inputs
             .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
             .collect::<IndexVec<Local, _>>();
-        let output_params = analysis.output_param_result.get(did).unwrap();
         let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
 
         // Assume every mir local has one or less corresponding hir id
@@ -74,9 +73,6 @@ pub fn collect_diffs<'tcx>(
             // } else
             if promoted_shared_refs[local] {
                 PtrKind::OptRef(false)
-            } else if output_params.contains(local) {
-                assert!(mutability); // output parameters are always &mut T
-                PtrKind::OptRef(true)
             } else if promoted_mut_refs.contains(local) {
                 PtrKind::OptRef(mutability)
             } else if decl.ty.is_raw_ptr() {
