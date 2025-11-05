@@ -34,6 +34,8 @@ jobs:
         run: sudo -u ubuntu bash -lc "cargo build"
       - name: Test (Dev)
         run: sudo -u ubuntu bash -lc "cargo test --workspace"
+      - name: Clean (Dev)
+        run: sudo -u ubuntu bash -lc "rm -rf target/debug"
 
       - name: Build (Release)
         run: sudo -u ubuntu bash -lc "cargo build --release"
