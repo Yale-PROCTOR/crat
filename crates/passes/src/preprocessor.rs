@@ -196,13 +196,16 @@
 //! let fresh0 = p;
 //! p = p.offset(1);
 //! *fresh0 = 0;
+//! *fresh0;
 //! ```
 //!
 //! We replace such code with the following code:
 //!
 //! ```rust,ignore
 //! *p = 0;
+//! let fresh0 = *p;
 //! p = p.offset(1);
+//! fresh0;
 //! ```
 
 use std::fmt::Write as _;
@@ -251,13 +254,11 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
         }
         lets_to_remove.insert(lhs.let_stmt);
         params_to_be_mut.insert(*rhs);
-        let bounds = some_or!(visitor.ctx.bound_occurrences.get(&lhs.variable), continue);
-        for hir_id in bounds {
-            vars_to_replace.insert(*hir_id, *name);
-        }
+        vars_to_replace.insert(lhs.variable, *name);
     }
 
     let mut fresh_pointers = FxHashSet::default();
+    let mut fresh_pointer_renames = FxHashMap::default();
     let mut stmt_swaps: FxHashMap<_, Vec<_>> = FxHashMap::default();
     for lhs in visitor.ctx.rhs_to_lhs.values() {
         for lhs in lhs {
@@ -267,15 +268,21 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
             let pointer_uses = some_or!(visitor.ctx.pointer_uses.get(&lhs.variable), continue);
             if pointer_uses.iter().all(|u| *u == PointerUse::RvalueDeref) {
                 fresh_pointers.insert(lhs.variable);
-            } else if matches!(pointer_uses[..], [PointerUse::LvalueDeref])
-                && let Some(lhs_fresh) = visitor.ctx.lhs_freshes.get(&lhs.variable)
+            } else if let [PointerUse::LvalueDeref, rems @ ..] = &pointer_uses[..]
+                && rems.iter().all(|u| *u == PointerUse::RvalueDeref)
+                && let Some(fresh_let) = visitor.ctx.fresh_lets.get(&lhs.variable)
             {
-                lets_to_remove.insert(lhs_fresh.let_stmt);
-                vars_to_replace.insert(lhs_fresh.lhs_expr, lhs_fresh.rhs_symbol);
+                fresh_pointers.insert(lhs.variable);
                 stmt_swaps
-                    .entry(lhs_fresh.block)
+                    .entry(fresh_let.block)
                     .or_default()
-                    .push(lhs_fresh.stmt_idx);
+                    .push(fresh_let.stmt_idx);
+                let symbol = if let Some(symbol) = vars_to_replace.get(&fresh_let.rhs) {
+                    *symbol
+                } else {
+                    tcx.hir_name(fresh_let.rhs)
+                };
+                fresh_pointer_renames.insert(lhs.variable, symbol);
             }
         }
     }
@@ -290,6 +297,7 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
         call_to_nested_args: visitor.ctx.call_to_nested_args,
         let_ref_exprs: FxHashMap::default(),
         fresh_pointers,
+        fresh_pointer_renames,
         stmt_swaps,
     };
 
@@ -307,6 +315,7 @@ struct ExpandedAstVisitor<'tcx> {
     call_to_nested_args: FxHashMap<HirId, Vec<ArgIdx>>,
     let_ref_exprs: FxHashMap<HirId, Expr>,
     fresh_pointers: FxHashSet<HirId>,
+    fresh_pointer_renames: FxHashMap<HirId, Symbol>,
     stmt_swaps: FxHashMap<HirId, Vec<usize>>,
 }
 
@@ -364,12 +373,8 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
             && let Some(indices) = self.stmt_swaps.get(&hir_block.hir_id)
         {
             for i in indices {
-                let (left, right) = b.stmts.split_at_mut(*i + 1);
-                if let [.., s0] = left
-                    && let [s1, ..] = right
-                {
-                    std::mem::swap(s0, s1);
-                }
+                b.stmts.swap(*i + 1, *i + 2);
+                b.stmts.swap(*i, *i + 1);
             }
         }
 
@@ -419,7 +424,9 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
         match &mut expr.kind {
             ExprKind::Path(_, _) => {
                 if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
-                    && let Some(name) = self.vars_to_replace.get(&hir_expr.hir_id)
+                    && let hir::ExprKind::Path(QPath::Resolved(_, path)) = hir_expr.kind
+                    && let Res::Local(hir_id) = path.res
+                    && let Some(name) = self.vars_to_replace.get(&hir_id)
                 {
                     *expr = expr!("{name}");
                 }
@@ -448,7 +455,14 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                     && let Res::Local(hir_id) = path.res
                     && self.fresh_pointers.contains(&hir_id)
                 {
-                    *expr = (**e).clone();
+                    if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                        && is_lhs(hir_expr, self.tcx)
+                    {
+                        let sym = self.fresh_pointer_renames[&hir_id];
+                        **e = expr!("{sym}");
+                    } else {
+                        *expr = (**e).clone();
+                    }
                 } else if let ExprKind::Call(callee, args) = &e.kind
                     && let ExprKind::Path(_, path) = &callee.kind
                     && let [.., seg] = &path.segments[..]
@@ -937,11 +951,19 @@ struct Lhs {
     is_mutable: bool,
 }
 
+/// ```rust,ignore
+/// ...
+/// let lhs = rhs;
+/// rhs = rhs.offset(n);
+/// *lhs = ...;
+/// ```
+///
+/// `rhs`: HirId of the rhs variable
+/// `block`: HirId of the block containing the statements
+/// `stmt_idx`: index of `let lhs = rhs;` in the block
 #[derive(Debug, Clone, Copy)]
-struct LhsFresh {
-    lhs_expr: HirId,
-    rhs_symbol: Symbol,
-    let_stmt: HirId,
+struct LhsFreshLet {
+    rhs: HirId,
     block: HirId,
     stmt_idx: usize,
 }
@@ -963,7 +985,7 @@ struct ExpandedHirCtx {
     /// integer-pointer-type variable to uses
     pointer_uses: FxHashMap<HirId, Vec<PointerUse>>,
     /// integer-pointer-type fresh variable used for deref in lhs
-    lhs_freshes: FxHashMap<HirId, LhsFresh>,
+    fresh_lets: FxHashMap<HirId, LhsFreshLet>,
 }
 
 struct ExpandedHirVisitor<'tcx> {
@@ -1013,7 +1035,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                 ) = let0.pat.kind
                 && let Some(init) = let0.init
                 && let hir::ExprKind::Path(QPath::Resolved(_, path)) = init.kind
-                && let symbol = path.segments.last().unwrap().ident.name
                 && let Res::Local(rhs_id) = path.res
                 && let hir::StmtKind::Semi(expr1) = stmt1.kind
                 && let hir::ExprKind::Assign(l, r, _) = expr1.kind
@@ -1027,20 +1048,19 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                 && id == rhs_id
                 && matches!(arg.kind, hir::ExprKind::Lit(_))
                 && let hir::StmtKind::Semi(expr2) = stmt2.kind
-                && let hir::ExprKind::Assign(l, _, _) = expr2.kind
+                && let hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _) =
+                    expr2.kind
                 && let hir::ExprKind::Unary(UnOp::Deref, inner) = l.kind
                 && let hir::ExprKind::Path(QPath::Resolved(_, path)) = inner.kind
                 && let Res::Local(id) = path.res
                 && id == lhs_id
             {
-                let lhs_fresh = LhsFresh {
-                    lhs_expr: inner.hir_id,
-                    rhs_symbol: symbol,
-                    let_stmt: let0.hir_id,
+                let fresh_let = LhsFreshLet {
+                    rhs: rhs_id,
                     block: block.hir_id,
-                    stmt_idx: i + 1,
+                    stmt_idx: i,
                 };
-                self.ctx.lhs_freshes.insert(lhs_id, lhs_fresh);
+                self.ctx.fresh_lets.insert(lhs_id, fresh_let);
             }
         }
     }
@@ -1121,18 +1141,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                         self.ctx.used_vars.insert(hir_id);
                     }
 
-                    if let ty::TyKind::RawPtr(inner_ty, _) = ty.kind()
-                        && matches!(inner_ty.kind(), ty::TyKind::Int(_) | ty::TyKind::Uint(_))
-                    {
+                    if ty.is_raw_ptr() {
                         let pointer_use = if let hir::Node::Expr(parent) = parent
                             && let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind
                         {
-                            let (_, pparent) =
-                                self.tcx.hir_parent_iter(parent.hir_id).next().unwrap();
-                            if let hir::Node::Expr(pparent) = pparent
-                                && let hir::ExprKind::Assign(l, _, _) = pparent.kind
-                                && l.hir_id == parent.hir_id
-                            {
+                            if is_lhs(parent, self.tcx) {
                                 PointerUse::LvalueDeref
                             } else {
                                 PointerUse::RvalueDeref
@@ -1185,6 +1198,18 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                     .insert(expr.hir_id, nested_args);
             }
         }
+    }
+}
+
+fn is_lhs<'tcx>(expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let (_, parent) = tcx.hir_parent_iter(expr.hir_id).next().unwrap();
+    if let hir::Node::Expr(parent) = parent
+        && let hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _) = parent.kind
+        && l.hir_id == expr.hir_id
+    {
+        true
+    } else {
+        false
     }
 }
 
@@ -1750,14 +1775,15 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_int) -> libc::c_int {
     fn test_fresh_2() {
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut p: *mut libc::c_int) {
+pub unsafe extern "C" fn f(mut p: *mut libc::c_int) -> libc::c_int {
     let fresh0 = p;
     p = p.offset(1);
     *fresh0 = 0 as libc::c_int;
+    return *fresh0;
 }
             "#,
-            &["*p = 0"],
-            &["fresh0 = p", "*fresh0 = 0"],
+            &["fresh0 = *p", "*p = 0", "return fresh0"],
+            &["fresh0 = p", "*fresh0 = 0", "return *fresh0"],
         );
     }
 
@@ -1765,16 +1791,136 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_int) {
     fn test_fresh_3() {
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut p: *mut libc::c_int, mut q: *mut libc::c_int) {
-    let fresh1 = q;
+pub unsafe extern "C" fn f(
+    mut p: *mut libc::c_int,
+    mut q: *mut libc::c_int,
+) -> libc::c_int {
+    let fresh0 = q;
     q = q.offset(1);
-    let fresh2 = p;
+    let fresh1 = p;
     p = p.offset(1);
-    *fresh2 = *fresh1;
+    *fresh1 = *fresh0;
+    return *fresh1;
 }
             "#,
-            &["fresh1 = *q", "*p = fresh1"],
-            &["fresh1 = q", "fresh2 = p", "*fresh2 = *fresh1"],
+            &["fresh0 = *q", "fresh1 = *p", "*p = fresh0", "return fresh1"],
+            &[
+                "fresh0 = q",
+                "fresh1 = p",
+                "*fresh1 = *fresh0",
+                "return *fresh1",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_fresh_4() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut p: *mut libc::c_int) -> libc::c_int {
+    let fresh0 = p;
+    p = p.offset(1);
+    *fresh0 += 1 as libc::c_int;
+    return *fresh0;
+}
+            "#,
+            &["fresh0 = *p", "*p += 1", "return fresh0"],
+            &["fresh0 = p", "*fresh0 += 1", "return *fresh0"],
+        );
+    }
+
+    #[test]
+    fn test_fresh_5() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(
+    mut p: *mut libc::c_int,
+    mut q: *mut libc::c_int,
+) -> libc::c_int {
+    let fresh0 = q;
+    q = q.offset(1);
+    let fresh1 = p;
+    p = p.offset(1);
+    *fresh1 += *fresh0;
+    return *fresh1;
+}
+            "#,
+            &[
+                "fresh0 = *q",
+                "fresh1 = *p",
+                "*p += fresh0",
+                "return fresh1",
+            ],
+            &[
+                "fresh0 = q",
+                "fresh1 = p",
+                "*fresh1 += *fresh0",
+                "return *fresh1",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_fresh_6() {
+        run_test(
+            r#"
+#[no_mangle]
+pub unsafe extern "C" fn f(
+    mut a: *mut libc::c_int,
+    mut b: *mut libc::c_int,
+) -> libc::c_int {
+    let mut p: *mut libc::c_int = a;
+    let mut q: *mut libc::c_int = b;
+    let fresh0 = q;
+    q = q.offset(1);
+    let fresh1 = p;
+    p = p.offset(1);
+    *fresh1 += *fresh0;
+    return *fresh1;
+}
+            "#,
+            &[
+                "fresh0 = *b",
+                "fresh1 = *a",
+                "*a += fresh0",
+                "return fresh1",
+            ],
+            &[
+                "fresh0 = q",
+                "fresh1 = p",
+                "*fresh1 += *fresh0",
+                "return *fresh1",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_fresh_7() {
+        run_test(
+            r#"
+#![feature(derive_clone_copy)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct s {
+    pub x: libc::c_int,
+}
+#[no_mangle]
+pub unsafe extern "C" fn f(mut p: *mut s, mut q: *mut s) -> s {
+    let fresh0 = q;
+    q = q.offset(1);
+    let fresh1 = p;
+    p = p.offset(1);
+    *fresh1 = *fresh0;
+    return *fresh1;
+}
+            "#,
+            &["fresh0 = *q", "fresh1 = *p", "*p = fresh0", "return fresh1"],
+            &[
+                "fresh0 = q",
+                "fresh1 = p",
+                "*fresh1 = *fresh0",
+                "return *fresh1",
+            ],
         );
     }
 }
