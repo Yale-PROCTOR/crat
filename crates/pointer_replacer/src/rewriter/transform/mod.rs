@@ -49,7 +49,13 @@ impl MutVisitor for TransformVisitor<'_> {
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
                     let Some(PtrKind::OptRef(m)) = input_dec else { continue };
-                    let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty).unwrap();
+                    let (inner_ty, _) =
+                        unwrap_ptr_from_mir_ty(local_decl.ty).unwrap_or_else(|| {
+                            panic!(
+                                "Expected pointer type, got {ty:?} in {local_decl:?}",
+                                ty = local_decl.ty
+                            )
+                        });
                     *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
                     if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
                         binding_mode.1 = Mutability::Mut;
@@ -104,14 +110,32 @@ impl MutVisitor for TransformVisitor<'_> {
                 self.transform_rhs(rhs, hir_rhs, lhs_kind);
             }
             ExprKind::Unary(UnOp::Deref, e) => {
-                if matches!(e.kind, ExprKind::Path(_, _)) {
-                    let hir_id = self.hir_id_of_path(e.id).unwrap();
-                    let ptr_kind = self.ptr_kinds[&hir_id];
-                    if let PtrKind::OptRef(m) = ptr_kind {
-                        let m = if m { "_mut" } else { "" };
-                        **e =
-                            utils::expr!("{}.as_deref{}().unwrap()", pprust::expr_to_string(e), m);
+                let e = unwrap_paren_mut(e);
+                match &e.kind {
+                    ExprKind::Path(_, _) => {
+                        let hir_id = self.hir_id_of_path(e.id).unwrap();
+                        let ptr_kind = self.ptr_kinds[&hir_id];
+                        if let PtrKind::OptRef(m) = ptr_kind {
+                            let m = if m { "_mut" } else { "" };
+                            *e = utils::expr!(
+                                "{}.as_deref{}().unwrap()",
+                                pprust::expr_to_string(e),
+                                m
+                            );
+                        }
                     }
+                    ExprKind::Cast(_, box cast_ty) => {
+                        let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
+                        let unwrapped_e = unwrap_expr(e);
+                        if let Some(unwrapped_hir_id) = self.hir_id_of_path(unwrapped_e.id)
+                            && let hir::TyKind::Ptr(_) = cast_ty.kind
+                            && let PtrKind::OptRef(m) = self.ptr_kinds[&unwrapped_hir_id]
+                        {
+                            let hir_expr = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
+                            self.transform_rhs(e, hir_expr, PtrKind::Raw(m));
+                        }
+                    }
+                    _ => {}
                 }
             }
             ExprKind::Call(_, args) => {
@@ -136,6 +160,17 @@ impl MutVisitor for TransformVisitor<'_> {
                         .flatten()
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_rhs(arg, harg, param_kind);
+                }
+            }
+            ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
+                if seg.ident.name.as_str() == "is_null" =>
+            {
+                if matches!(receiver.kind, ExprKind::Path(_, _)) {
+                    let hir_id = self.hir_id_of_path(receiver.id).unwrap();
+                    let ptr_kind = self.ptr_kinds[&hir_id];
+                    if let PtrKind::OptRef(_) = ptr_kind {
+                        *expr = utils::expr!("{}.is_none()", pprust::expr_to_string(receiver));
+                    }
                 }
             }
             ExprKind::Ret(Some(ret)) => {
@@ -280,14 +315,24 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                     (PtrKind::OptRef(m), PtrKind::Raw(_)) => {
                         if need_cast {
-                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                            *rhs = utils::expr!(
-                                "(({}) as *{} {}).as_{}()",
-                                pprust::expr_to_string(e),
-                                if m { "mut" } else { "const" },
-                                lhs_inner_ty,
-                                if m { "mut" } else { "ref" },
-                            );
+                            if *lhs_inner_ty.kind() == ty::TyKind::Int(ty::IntTy::I8) {
+                                // special handling for libc::c_char TODO: better solution for char arrays
+                                *rhs = utils::expr!(
+                                    "(({0}) as *{1} u8 as *{1} libc::c_char).as_{2}()",
+                                    pprust::expr_to_string(e),
+                                    if m { "mut" } else { "const" },
+                                    if m { "mut" } else { "ref" },
+                                );
+                            } else {
+                                let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                                *rhs = utils::expr!(
+                                    "(({}) as *{} {}).as_{}()",
+                                    pprust::expr_to_string(e),
+                                    if m { "mut" } else { "const" },
+                                    lhs_inner_ty,
+                                    if m { "mut" } else { "ref" },
+                                );
+                            }
                         } else {
                             *rhs = utils::expr!(
                                 "({}).as_{}()",
@@ -352,14 +397,24 @@ impl<'tcx> TransformVisitor<'tcx> {
             _ => match lhs_kind {
                 PtrKind::OptRef(m) => {
                     if need_cast {
-                        let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                        *rhs = utils::expr!(
-                            "(({}) as *{} {}).as_{}()",
-                            pprust::expr_to_string(e),
-                            if m { "mut" } else { "const" },
-                            lhs_inner_ty,
-                            if m { "mut" } else { "ref" },
-                        );
+                        if *lhs_inner_ty.kind() == ty::TyKind::Int(ty::IntTy::I8) {
+                            // special handling for libc::c_char TODO: better solution for char arrays
+                            *rhs = utils::expr!(
+                                "(({0}) as *{1} u8 as *{1} libc::c_char).as_{2}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                                if m { "mut" } else { "ref" },
+                            );
+                        } else {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            *rhs = utils::expr!(
+                                "(({}) as *{} {}).as_{}()",
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                                if m { "mut" } else { "ref" },
+                            );
+                        }
                     } else {
                         *rhs = utils::expr!(
                             "({}).as_{}()",
@@ -377,6 +432,15 @@ impl<'tcx> TransformVisitor<'tcx> {
 fn unwrap_expr(expr: &Expr) -> &Expr {
     if let ExprKind::Cast(expr, _) | ExprKind::Paren(expr) = &expr.kind {
         unwrap_expr(expr)
+    } else {
+        expr
+    }
+}
+
+fn unwrap_paren_mut(expr: &mut Expr) -> &mut Expr {
+    if matches!(&expr.kind, ExprKind::Paren(_)) {
+        let ExprKind::Paren(e) = &mut expr.kind else { unreachable!() };
+        unwrap_paren_mut(e)
     } else {
         expr
     }
