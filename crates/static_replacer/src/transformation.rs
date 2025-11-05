@@ -56,6 +56,11 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
                 Symbol::intern("thread_local_internals"),
                 tcx,
             ),
+            utils::ast::make_inner_attribute(
+                sym::feature,
+                Symbol::intern("as_array_of_cells"),
+                tcx,
+            ),
         ]);
     }
 
@@ -91,10 +96,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 let ty = pprust::ty_to_string(&static_item.ty);
                 let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
                 *item = item!(
-                    "
-    thread_local! {{
-        static {name}: std::cell::Cell<{ty}> = const {{ std::cell::Cell::new({init}) }};
-    }}"
+                    "thread_local! {{
+                        static {name}: std::cell::Cell<{ty}> =
+                            const {{ std::cell::Cell::new({init}) }};
+                    }}"
                 );
             }
         }
@@ -114,7 +119,20 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     *expr = expr!("{x}.get()");
                 }
             }
-            ExprKind::Assign(_, rhs, _) => {
+            ExprKind::Index(_, idx, _) => {
+                let hir::ExprKind::Index(hir_base, _, _) = &hir_expr.kind else {
+                    panic!("{hir_expr:?}");
+                };
+                if let Some(def_id) = get_static_from_hir_expr(hir_base)
+                    && self.cells.contains(&def_id)
+                    && !find_context(hir_expr, self.tcx).1
+                {
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let idx = pprust::expr_to_string(idx);
+                    *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].get())");
+                }
+            }
+            ExprKind::Assign(lhs, rhs, _) => {
                 let hir::ExprKind::Assign(hir_lhs, _, _) = &hir_expr.kind else {
                     panic!("{hir_expr:?}");
                 };
@@ -124,30 +142,53 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     let x = self.tcx.item_name(def_id.to_def_id());
                     let rhs = pprust::expr_to_string(rhs);
                     *expr = expr!("{x}.set({rhs})");
+                } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
+                    && let Some(def_id) = get_static_from_hir_expr(hir_base)
+                    && self.cells.contains(&def_id)
+                {
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let rhs = pprust::expr_to_string(rhs);
+                    let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
+                    let idx = pprust::expr_to_string(idx);
+                    *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].set({rhs}))");
                 }
             }
-            ExprKind::AssignOp(op, _, rhs) => {
+            ExprKind::AssignOp(op, lhs, rhs) => {
                 let hir::ExprKind::AssignOp(_, hir_lhs, _) = &hir_expr.kind else {
                     panic!("{hir_expr:?}");
+                };
+                let op = match op.node {
+                    AssignOpKind::AddAssign => "+",
+                    AssignOpKind::SubAssign => "-",
+                    AssignOpKind::MulAssign => "*",
+                    AssignOpKind::DivAssign => "/",
+                    AssignOpKind::RemAssign => "%",
+                    AssignOpKind::BitXorAssign => "^",
+                    AssignOpKind::BitAndAssign => "&",
+                    AssignOpKind::BitOrAssign => "|",
+                    AssignOpKind::ShlAssign => "<<",
+                    AssignOpKind::ShrAssign => ">>",
                 };
                 if let Some(def_id) = get_static_from_hir_expr(hir_lhs)
                     && self.cells.contains(&def_id)
                 {
                     let x = self.tcx.item_name(def_id.to_def_id());
                     let rhs = pprust::expr_to_string(rhs);
-                    let op = match op.node {
-                        AssignOpKind::AddAssign => "+",
-                        AssignOpKind::SubAssign => "-",
-                        AssignOpKind::MulAssign => "*",
-                        AssignOpKind::DivAssign => "/",
-                        AssignOpKind::RemAssign => "%",
-                        AssignOpKind::BitXorAssign => "^",
-                        AssignOpKind::BitAndAssign => "&",
-                        AssignOpKind::BitOrAssign => "|",
-                        AssignOpKind::ShlAssign => "<<",
-                        AssignOpKind::ShrAssign => ">>",
-                    };
                     *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
+                } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
+                    && let Some(def_id) = get_static_from_hir_expr(hir_base)
+                    && self.cells.contains(&def_id)
+                {
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    let rhs = pprust::expr_to_string(rhs);
+                    let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
+                    let idx = pprust::expr_to_string(idx);
+                    *expr = expr!(
+                        "{x}.with(|__v| {{
+                            let __v = &__v.as_array_of_cells()[{idx}];
+                            __v.set(__v.get() {op} ({rhs}));
+                        }})"
+                    );
                 }
             }
             _ => {}
