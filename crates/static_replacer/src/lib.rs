@@ -7,6 +7,7 @@ extern crate rustc_ast_pretty;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_middle;
+extern crate rustc_span;
 
 mod transformation;
 

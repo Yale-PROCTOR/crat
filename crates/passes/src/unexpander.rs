@@ -15,7 +15,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Symbol, kw, sym};
 use smallvec::{SmallVec, smallvec};
-use utils::{attr, expr};
+use utils::{attr, expr, item};
 
 pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
@@ -36,10 +36,15 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     };
     visitor.visit_crate(&mut krate);
 
-    let mut unnecessary_attributes: FxHashSet<_> =
-        ["derive_clone_copy", "hint_must_use", "panic_internals"]
-            .into_iter()
-            .collect();
+    let mut unnecessary_attributes: FxHashSet<_> = [
+        "derive_clone_copy",
+        "hint_must_use",
+        "never_type",
+        "panic_internals",
+        "thread_local_internals",
+    ]
+    .into_iter()
+    .collect();
     if !visitor.ctx.use_intrinsics {
         unnecessary_attributes.insert("core_intrinsics");
     }
@@ -89,21 +94,48 @@ impl MutVisitor for AstVisitor<'_> {
                 }
             }
         }
-        if let ast::ItemKind::Struct(_, _, vd) = &mut item.kind {
-            let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
-            if let Some(bitfields) = self.ctx.bitfields.get(local_def_id) {
-                let ast::VariantData::Struct { fields, .. } = vd else { panic!() };
-                for field in fields {
-                    let bitfields = some_or!(bitfields.get(&field.ident.unwrap().name), continue);
-                    for bitfield in bitfields {
-                        let BitField { name, ty, l, r } = bitfield;
-                        let attrs = attr!(
-                            "#[bitfield(name = \"{name}\", ty = \"{ty}\", bits = \"{l}..={r}\")]"
-                        );
-                        field.attrs.extend(attrs);
+        match &mut item.kind {
+            ast::ItemKind::Struct(_, _, vd) => {
+                let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
+                if let Some(bitfields) = self.ctx.bitfields.get(local_def_id) {
+                    let ast::VariantData::Struct { fields, .. } = vd else { panic!() };
+                    for field in fields {
+                        let bitfields =
+                            some_or!(bitfields.get(&field.ident.unwrap().name), continue);
+                        for bitfield in bitfields {
+                            let BitField { name, ty, l, r } = bitfield;
+                            let attrs = attr!(
+                                "#[bitfield(name = \"{name}\", ty = \"{ty}\", bits = \"{l}..={r}\")]"
+                            );
+                            field.attrs.extend(attrs);
+                        }
                     }
                 }
             }
+            ast::ItemKind::Const(const_item) => {
+                if let ast::TyKind::Path(_, path) = &const_item.ty.kind
+                    && let Some(seg) = path.segments.last()
+                    && seg.ident.name == sym::LocalKey
+                    && let Some(box ast::GenericArgs::AngleBracketed(args)) = &seg.args
+                    && let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(ty))] = &args.args[..]
+                    && let Some(init) = &const_item.expr
+                    && let ast::ExprKind::Block(block, _) = &init.kind
+                    && let [stmt, ..] = &block.stmts[..]
+                    && let ast::StmtKind::Item(stmt_item) = &stmt.kind
+                    && let ast::ItemKind::Const(inner_item) = &stmt_item.kind
+                    && inner_item.ident.name.as_str() == "__INIT"
+                    && let Some(init) = &inner_item.expr
+                    && let ast::ExprKind::Block(block, _) = &init.kind
+                    && let [stmt] = &block.stmts[..]
+                    && let ast::StmtKind::Expr(init) = &stmt.kind
+                {
+                    let name = const_item.ident.name;
+                    let ty = pprust::ty_to_string(ty);
+                    let init = pprust::expr_to_string(init);
+                    *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
+                }
+            }
+            _ => {}
         }
         mut_visit::walk_item(self, item);
     }

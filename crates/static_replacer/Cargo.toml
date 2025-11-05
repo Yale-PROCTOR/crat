@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 utils = { path = "../utils" }
+etrace.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true
