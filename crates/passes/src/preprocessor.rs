@@ -475,8 +475,10 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                     && let e_ty = typeck.expr_ty(hir_e)
                     && let ty::TyKind::Ref(_, inner_ty, _) = e_ty.kind()
                     && let ty::TyKind::Array(elem_ty, _) = inner_ty.kind()
-                    && let ty::TyKind::Int(ty::IntTy::I8) = elem_ty.kind()
+                    && let ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8) =
+                        elem_ty.kind()
                 {
+                    let is_signed = elem_ty.is_signed();
                     let s = lit.symbol.as_str();
                     let mut buf = Vec::with_capacity(s.len());
                     rustc_literal_escaper::unescape_unicode(
@@ -504,7 +506,11 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
                                 }
                             }
                         }
-                        write!(array, "' as i8, ").unwrap();
+                        if is_signed {
+                            write!(array, "' as i8, ").unwrap();
+                        } else {
+                            write!(array, "', ").unwrap();
+                        }
                     }
                     write!(array, "]").unwrap();
                     *expr = expr!("{array}");
@@ -1737,7 +1743,7 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
     }
 
     #[test]
-    fn test_transmute() {
+    fn test_transmute_1() {
         run_test(
             r#"
 #![allow(mutable_transmutes)]
@@ -1745,6 +1751,26 @@ pub unsafe extern "C" fn f() {
     let mut buf: [libc::c_char; 9] = *::std::mem::transmute::<
         &[u8; 9],
         &mut [libc::c_char; 9],
+    >(b"a\"'\n\r\t\x02\xC2\0");
+}
+            "#,
+            &[
+                "b'a'", "b'\"'", "b'\\\''", "b'\\n'", "b'\\r'", "b'\\t'", "b'\\x02'", "b'\\xc2'",
+                "b'\\0'",
+            ],
+            &["::transmute"],
+        );
+    }
+
+    #[test]
+    fn test_transmute_2() {
+        run_test(
+            r#"
+#![allow(mutable_transmutes)]
+pub unsafe extern "C" fn f() {
+    let mut buf: [libc::c_uchar; 9] = *::std::mem::transmute::<
+        &[u8; 9],
+        &mut [libc::c_uchar; 9],
     >(b"a\"'\n\r\t\x02\xC2\0");
 }
             "#,
