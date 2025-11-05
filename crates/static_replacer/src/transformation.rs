@@ -266,8 +266,6 @@ struct HirVisitor<'tcx> {
     statics: FxHashMap<LocalDefId, Vec<(&'tcx hir::Expr<'tcx>, bool)>>,
 }
 
-impl<'tcx> HirVisitor<'tcx> {}
-
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
@@ -282,5 +280,83 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         }
 
         intravisit::walk_expr(self, expr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
+        let s = utils::compilation::run_compiler_on_str(code, super::replace_static).unwrap();
+        utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
+        for include in includes {
+            assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+        }
+        for exclude in excludes {
+            assert!(
+                !s.contains(exclude),
+                "Expected not to find `{exclude}` in:\n{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_immutable() {
+        let code = r#"
+static mut X: u32 = 0;
+unsafe fn f() -> u32 { X }
+"#;
+        run_test(code, &["static X"], &["static mut"]);
+    }
+
+    #[test]
+    fn test_cell_assign() {
+        let code = r#"
+static mut X: u32 = 0;
+unsafe fn f(x: u32) { X = X + x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_cell_assign_op() {
+        let code = r#"
+static mut X: u32 = 0;
+unsafe fn f(x: u32) { X += x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_cell_array_assign() {
+        let code = r#"
+static mut X: [u32; 1] = [0; 1];
+unsafe fn f(i: usize, x: u32) { X[i] = X[i] + x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_cell_array_assign_op() {
+        let code = r#"
+static mut X: [u32; 1] = [0; 1];
+unsafe fn f(i: usize, x: u32) { X[i] += x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
     }
 }
