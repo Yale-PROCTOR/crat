@@ -1056,7 +1056,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
                 && let hir::StmtKind::Semi(expr2) = stmt2.kind
                 && let hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _) =
                     expr2.kind
-                && let hir::ExprKind::Unary(UnOp::Deref, inner) = l.kind
+                && let hir::ExprKind::Unary(UnOp::Deref, inner) = lhs_base(l).kind
                 && let hir::ExprKind::Path(QPath::Resolved(_, path)) = inner.kind
                 && let Res::Local(id) = path.res
                 && id == lhs_id
@@ -1207,16 +1207,30 @@ impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
     }
 }
 
-fn is_lhs<'tcx>(expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
-    let (_, parent) = tcx.hir_parent_iter(expr.hir_id).next().unwrap();
-    if let hir::Node::Expr(parent) = parent
-        && let hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _) = parent.kind
-        && l.hir_id == expr.hir_id
-    {
-        true
+fn lhs_base<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
+    if let hir::ExprKind::Field(l, _) | hir::ExprKind::Index(l, _, _) = expr.kind {
+        lhs_base(l)
     } else {
-        false
+        expr
     }
+}
+
+fn is_lhs<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    for (_, parent) in tcx.hir_parent_iter(expr.hir_id) {
+        let hir::Node::Expr(parent) = parent else { return false };
+        match parent.kind {
+            hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _)
+                if l.hir_id == expr.hir_id =>
+            {
+                return true;
+            }
+            hir::ExprKind::Field(_, _) => {}
+            hir::ExprKind::Index(l, _, _) if l.hir_id == expr.hir_id => {}
+            _ => return false,
+        }
+        expr = parent;
+    }
+    panic!()
 }
 
 #[derive(Default)]
@@ -1947,6 +1961,29 @@ pub unsafe extern "C" fn f(mut p: *mut s, mut q: *mut s) -> s {
                 "*fresh1 = *fresh0",
                 "return *fresh1",
             ],
+        );
+    }
+
+    #[test]
+    fn test_fresh_8() {
+        run_test(
+            r#"
+#![feature(derive_clone_copy)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct s {
+    pub x: libc::c_int,
+}
+#[no_mangle]
+pub unsafe extern "C" fn f(mut p: *mut s) -> libc::c_int {
+    let fresh0 = p;
+    p = p.offset(1);
+    (*fresh0).x = 1 as libc::c_int;
+    return (*fresh0).x;
+}
+            "#,
+            &["fresh0 = *p", "(*p).x = 1", "return (fresh0).x"],
+            &["fresh0 = p", "(*fresh0).x = 1", "return (*fresh0).x"],
         );
     }
 }
