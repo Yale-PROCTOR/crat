@@ -12,6 +12,7 @@ extern crate rustc_index;
 extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_span;
+extern crate smallvec;
 
 mod error_analysis;
 mod file_analysis;

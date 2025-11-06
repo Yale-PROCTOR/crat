@@ -37,11 +37,12 @@ pub struct TransformationResult {
 
 pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
-    // let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let arena = Arena::new();
     let analysis_res = file_analysis::analyze(&arena, tcx);
+
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let start = std::time::Instant::now();
     let error_returning_fns: FxHashMap<_, Vec<_>> = analysis_res
@@ -426,11 +427,7 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         }
         let node = tcx.hir_node_by_def_id(def_id);
         let hir::Node::Item(item) = node else { panic!() };
-        let (hir::ItemKind::Struct(ident, _, _) | hir::ItemKind::Union(ident, _, _)) = item.kind
-        else {
-            panic!();
-        };
-        uncopiable.entry(ident.span).or_default().push(field);
+        uncopiable.entry(def_id).or_default().push(field);
         if matches!(item.kind, hir::ItemKind::Union(_, _, _)) {
             uncopiable_union_fields.push((def_id, field));
         }
@@ -465,6 +462,7 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
 
     let mut visitor = TransformVisitor {
         tcx,
+        ast_to_hir,
         type_arena: &type_arena,
         analysis_res: &analysis_res,
         hir: &hir_ctx,

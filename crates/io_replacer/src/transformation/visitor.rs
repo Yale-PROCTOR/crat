@@ -10,18 +10,21 @@ use rustc_ast::{
     ast::*,
     mut_visit::{self, MutVisitor},
     ptr::P,
-    token::TokenKind,
-    tokenstream::{TokenStream, TokenTree},
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir};
+use rustc_hir::{
+    def::Res,
+    {self as hir},
+};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Span, Symbol, def_id::LocalDefId, symbol::Ident};
+use rustc_span::{Span, Symbol, def_id::LocalDefId, sym, symbol::Ident};
+use smallvec::smallvec;
 use utils::{
     bit_set::{BitSet8, BitSet16},
     expr,
     file::api_list::{self, Origin, Permission},
+    ir::AstToHir,
     item, param, stmt, ty, ty_param,
 };
 
@@ -37,6 +40,7 @@ use super::{
 
 pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) tcx: TyCtxt<'tcx>,
+    pub(super) ast_to_hir: AstToHir,
     pub(super) type_arena: &'a TypeArena<'a>,
     pub(super) analysis_res: &'a file_analysis::AnalysisResult<'a>,
     pub(super) hir: &'a HirCtx,
@@ -53,8 +57,8 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
     pub(super) api_ident_spans: &'a FxHashSet<Span>,
-    /// uncopiable struct ident span to field indices
-    pub(super) uncopiable: &'a FxHashMap<Span, Vec<FieldIdx>>,
+    /// uncopiable struct to field indices
+    pub(super) uncopiable: &'a FxHashMap<LocalDefId, Vec<FieldIdx>>,
     /// spans of projections of manually dropped fields
     pub(super) manually_drop_projections: &'a FxHashSet<Span>,
 
@@ -427,6 +431,23 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
         }
     }
 
+    fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+        if let Some(hir_item) = self.ast_to_hir.get_item(item.id, self.tcx)
+            && let hir::ItemKind::Impl(imp) = hir_item.kind
+            && utils::ast::is_automatically_derived(&item.attrs)
+            && let hir::TyKind::Path(hir::QPath::Resolved(_, self_ty)) = imp.self_ty.kind
+            && let Res::Def(_, def_id) = self_ty.res
+            && let Some(def_id) = def_id.as_local()
+            && self.uncopiable.contains_key(&def_id)
+            && let Some(of_trait) = imp.of_trait
+            && let of_trait = of_trait.path.segments.last().unwrap().ident.name
+            && (of_trait == sym::Copy || of_trait == sym::Clone)
+        {
+            return smallvec![];
+        }
+        mut_visit::walk_flat_map_item(self, item)
+    }
+
     fn visit_item(&mut self, item: &mut Item) {
         if let ItemKind::Fn(box Fn { ident, .. }) = item.kind
             && self.api_ident_spans.contains(&ident.span)
@@ -576,47 +597,18 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                     stmts.insert(0, stmt);
                 }
             }
-            ItemKind::Struct(ident, _, _) | ItemKind::Union(ident, _, _) => {
-                if let Some(field_indices) = self.uncopiable.get(&ident.span) {
-                    for attr in &mut item.attrs {
-                        let AttrKind::Normal(attr) = &mut attr.kind else { continue };
-                        let AttrArgs::Delimited(args) = &mut attr.item.args else { continue };
-                        let mut tokens = vec![];
-                        let mut remove_comma = false;
-                        for tree in args.tokens.iter() {
-                            if let TokenTree::Token(token, _) = tree {
-                                match token.kind {
-                                    TokenKind::Ident(symbol, _) => {
-                                        let name = symbol.as_str();
-                                        if name == "Copy" || name == "Clone" {
-                                            remove_comma = true;
-                                            continue;
-                                        }
-                                    }
-                                    TokenKind::Comma => {
-                                        if remove_comma {
-                                            remove_comma = false;
-                                            continue;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            tokens.push(tree.clone());
+            ItemKind::Union(_, _, vd) => {
+                let def_id = self.ast_to_hir.global_map[&item.id];
+                if let Some(field_indices) = self.uncopiable.get(&def_id) {
+                    let VariantData::Struct { fields, .. } = vd else { panic!() };
+                    for i in field_indices {
+                        let field = &mut fields[i.as_usize()];
+                        if self.binding_pot(field.span).is_some() {
+                            continue;
                         }
-                        args.tokens = TokenStream::new(tokens);
-                    }
-                    if let ItemKind::Union(_, _, vd) = &mut item.kind {
-                        let VariantData::Struct { fields, .. } = vd else { panic!() };
-                        for i in field_indices {
-                            let field = &mut fields[i.as_usize()];
-                            if self.binding_pot(field.span).is_some() {
-                                continue;
-                            }
-                            let ty = pprust::ty_to_string(&field.ty);
-                            let new_ty = ty!("std::mem::ManuallyDrop<{}>", ty);
-                            self.replace_ty(&mut field.ty, new_ty);
-                        }
+                        let ty = pprust::ty_to_string(&field.ty);
+                        let new_ty = ty!("std::mem::ManuallyDrop<{}>", ty);
+                        self.replace_ty(&mut field.ty, new_ty);
                     }
                 }
             }
@@ -640,6 +632,17 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                 self.replace_ty_with_pot(&mut f.ty, pot);
             }
         }
+    }
+
+    fn flat_map_stmt(&mut self, stmt: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        if let StmtKind::Let(local) = &stmt.kind
+            && let Some(ty) = &local.ty
+            && let TyKind::Path(_, path) = &ty.kind
+            && path.segments.last().unwrap().ident.name == sym::AssertParamIsClone
+        {
+            return smallvec![];
+        }
+        mut_visit::walk_flat_map_stmt(self, stmt)
     }
 
     fn visit_local(&mut self, local: &mut Local) {

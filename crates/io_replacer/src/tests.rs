@@ -10,7 +10,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
         .strip_prefix(FORMATTED_PREAMBLE.as_str())
         .unwrap()
         .to_string();
-    compilation::run_compiler_on_str(&s, utils::type_check).expect(&stripped);
+    compilation::run_compiler_on_str(&res.code, utils::type_check).expect(&stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
     }
@@ -1988,14 +1988,28 @@ unsafe fn f(mut x: libc::c_int) {
 fn test_bitfield() {
     run_test(
         r#"
-#[derive(Copy, Clone, BitfieldStruct)]
+#[derive(Copy, Clone)]
 #[repr(C)]
 struct s {
-    #[bitfield(name = "x", ty = "libc::c_int", bits = "0..=0")]
     x: [u8; 1],
-    #[bitfield(padding)]
     c2rust_padding: [u8; 7],
     stream: *mut FILE,
+}
+#[automatically_derived]
+impl s {
+    pub fn set_x(&mut self, int: libc::c_int) {
+        use c2rust_bitfields::FieldType;
+        let field = &mut self.x;
+        let (lhs_bit, rhs_bit) = (0usize, 0usize);
+        int.set_field(field, (lhs_bit, rhs_bit));
+    }
+    pub fn x(&self) -> libc::c_int {
+        use c2rust_bitfields::FieldType;
+        type IntType = libc::c_int;
+        let field = &self.x;
+        let (lhs_bit, rhs_bit) = (0usize, 0usize);
+        <IntType as FieldType>::get_field(field, (lhs_bit, rhs_bit))
+    }
 }
 unsafe fn f(mut x: libc::c_int) {
     let mut stream: *mut FILE = fopen(
@@ -2012,7 +2026,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(s.stream);
     fclose(s.stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "BitfieldStruct"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE", "Copy", "Clone"],
     );
 }
@@ -2699,6 +2713,7 @@ const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
 #![feature(formatting_options)]
+#![feature(derive_clone_copy)]
 #[macro_use]
 extern crate c2rust_bitfields;
 use ::libc;
@@ -2857,7 +2872,12 @@ extern "C" {
     fn funlockfile(__stream: *mut FILE);
     fn wprintf(__format: *const wchar_t, _: ...) -> libc::c_int;
 }
-#[derive(Copy, Clone)]
+#[automatically_derived]
+impl ::core::clone::Clone for __va_list_tag {
+    #[inline] fn clone(&self) -> Self { *self }
+}
+#[automatically_derived]
+impl ::core::marker::Copy for __va_list_tag { }
 #[repr(C)]
 pub struct __va_list_tag {
     pub gp_offset: libc::c_uint,
@@ -2869,26 +2889,46 @@ pub type size_t = libc::c_ulong;
 pub type __off_t = libc::c_long;
 pub type __off64_t = libc::c_long;
 pub type __ssize_t = libc::c_long;
-#[derive(Copy, Clone)]
+#[automatically_derived]
+impl ::core::clone::Clone for __mbstate_t {
+    #[inline] fn clone(&self) -> Self { *self }
+}
+#[automatically_derived]
+impl ::core::marker::Copy for __mbstate_t { }
 #[repr(C)]
 pub struct __mbstate_t {
     pub __count: libc::c_int,
     pub __value: C2RustUnnamed,
 }
-#[derive(Copy, Clone)]
+#[automatically_derived]
+impl ::core::clone::Clone for C2RustUnnamed {
+    #[inline] fn clone(&self) -> Self { *self }
+}
+#[automatically_derived]
+impl ::core::marker::Copy for C2RustUnnamed { }
 #[repr(C)]
 pub union C2RustUnnamed {
     pub __wch: libc::c_uint,
     pub __wchb: [libc::c_char; 4],
 }
-#[derive(Copy, Clone)]
+#[automatically_derived]
+impl ::core::clone::Clone for _G_fpos_t {
+    #[inline] fn clone(&self) -> Self { *self }
+}
+#[automatically_derived]
+impl ::core::marker::Copy for _G_fpos_t { }
 #[repr(C)]
 pub struct _G_fpos_t {
     pub __pos: __off_t,
     pub __state: __mbstate_t,
 }
 pub type __fpos_t = _G_fpos_t;
-#[derive(Copy, Clone)]
+#[automatically_derived]
+impl ::core::clone::Clone for _IO_FILE {
+    #[inline] fn clone(&self) -> Self { *self }
+}
+#[automatically_derived]
+impl ::core::marker::Copy for _IO_FILE { }
 #[repr(C)]
 pub struct _IO_FILE {
     pub _flags: libc::c_int,
@@ -2927,5 +2967,11 @@ pub type fpos_t = __fpos_t;
 pub type wchar_t = libc::c_int;"#;
 
 lazy_static! {
-    static ref FORMATTED_PREAMBLE: String = utils::format(PREAMBLE);
+    static ref FORMATTED_PREAMBLE: String =
+        utils::compilation::run_compiler_on_str(PREAMBLE, |tcx| {
+            let mut krate = utils::ast::expanded_ast(tcx);
+            utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+            rustc_ast_pretty::pprust::crate_to_string_for_macros(&krate)
+        })
+        .unwrap();
 }
