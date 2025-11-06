@@ -74,14 +74,23 @@ impl MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_item(&mut self, item: &mut ast::Item) {
-        if let ast::ItemKind::Struct(_, _, vd) | ast::ItemKind::Union(_, _, vd) = &mut item.kind {
+        if matches!(
+            item.kind,
+            ast::ItemKind::Struct(..) | ast::ItemKind::Union(..) | ast::ItemKind::Enum(..)
+        ) {
             let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
             if let Some(traits) = self.ctx.derived_traits.get(local_def_id) {
                 for t in traits {
+                    if *t == sym::StructuralPartialEq {
+                        continue;
+                    }
                     let attr = utils::ast::make_outer_attribute(sym::derive, *t, self.tcx);
                     item.attrs.push(attr);
                 }
             }
+        }
+        if let ast::ItemKind::Struct(_, _, vd) = &mut item.kind {
+            let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
             if let Some(bitfields) = self.ctx.bitfields.get(local_def_id) {
                 let ast::VariantData::Struct { fields, .. } = vd else { panic!() };
                 for field in fields {

@@ -1191,7 +1191,7 @@ pub(crate) unsafe fn rs_vfprintf<W: std::io::Write>(
     (count, 0)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrintfState {
     Percent,
     Flag,
@@ -1203,7 +1203,7 @@ pub(super) enum PrintfState {
     L,
     Conversion,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrintfFlagChar {
     Apostrophe,
     Minus,
@@ -1226,12 +1226,12 @@ impl PrintfFlagChar {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrintfWidth {
     Asterisk,
     Decimal(usize),
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrintfLengthMod {
     Char,
     Short,
@@ -1256,7 +1256,7 @@ impl PrintfLengthMod {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrintfConversion {
     Int,
     Octal,
