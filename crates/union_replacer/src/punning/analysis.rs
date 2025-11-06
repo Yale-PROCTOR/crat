@@ -1,23 +1,31 @@
+use std::collections::{HashMap, HashSet};
+
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, Body, Local, ProjectionElem, Rvalue, Statement, StatementKind,
+        AggregateKind, BasicBlock, BasicBlocks, Body, Local, ProjectionElem, Rvalue, StatementKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
+use rustc_span::def_id::LocalDefId;
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum UnionUseKind<'a> {
     InitUnion(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
     WriteField(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
     ReadField(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+/// All useinfo related operations are considered only within the same function(def id) for now.
 struct UnionUseInfo<'a> {
     kind: UnionUseKind<'a>,
     basic_block: BasicBlock,
-    statement: Statement<'a>,
+    stmt_idx: usize,
+    // statement: Statement<'a>,
 }
 
 impl<'a> std::fmt::Debug for UnionUseKind<'a> {
@@ -32,105 +40,188 @@ impl<'a> std::fmt::Debug for UnionUseKind<'a> {
 
 impl<'a> std::fmt::Debug for UnionUseInfo<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // write!(
+        //     f,
+        //     "UnionUseInfo: kind: {:?}, location: {:?}-{:?}, statement: {:?}",
+        //     self.kind, self.basic_block, self.stmt_idx, self.statement
+        // )
         write!(
             f,
-            "UnionUseInfo: kind: {:?}, basic_block: {:?}, statement: {:?}",
-            self.kind, self.basic_block, self.statement
+            "{:?} at {:?}-{:?}",
+            self.kind, self.basic_block, self.stmt_idx
         )
     }
 }
 
-fn collect_union_uses<'a>(
-    mut union_related: Vec<UnionUseInfo<'a>>,
-    tcx: TyCtxt<'a>,
-) -> Vec<UnionUseInfo<'a>> {
+fn collect_union_uses_map<'a>(tcx: TyCtxt<'a>) -> HashMap<LocalDefId, HashSet<UnionUseInfo<'a>>> {
+    let mut union_uses_map: HashMap<LocalDefId, HashSet<UnionUseInfo<'a>>> = HashMap::new();
     for def_id in tcx.hir_body_owners() {
-        if tcx.def_kind(def_id) != DefKind::Fn {
-            continue;
+        if let Some(uses) = collect_union_uses(def_id, tcx) {
+            union_uses_map.insert(def_id, uses);
         }
-        // println!("DEF: {def_id:?}");
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body: &Body<'_> = &body.borrow();
-        for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-            // println!("BB: {bb:?}");
-            for stmt in &bbd.statements {
-                if let StatementKind::Assign(box (place, value)) = &stmt.kind {
-                    // println!("STMT: {:?}", stmt);
-                    // Initialize a Union Field
-                    if place.ty(body, tcx).ty.is_union() {
-                        if let Rvalue::Aggregate(
-                            box AggregateKind::Adt(_, _, _, _, Some(field_idx)),
-                            index_vec,
-                        ) = value
-                        {
-                            let op_type = index_vec.iter().next().unwrap().ty(body, tcx);
-                            let project_elem = ProjectionElem::Field(*field_idx, op_type);
-                            // Safe to unwrap as index_vec must have only one element
-                            assert_eq!(
-                                op_type,
-                                place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
-                            );
+    }
+    union_uses_map
+}
 
-                            union_related.push(UnionUseInfo {
-                                kind: UnionUseKind::InitUnion(
-                                    *place.ty(body, tcx).ty.kind(),
+fn collect_union_uses<'a>(
+    def_id: LocalDefId,
+    tcx: TyCtxt<'a>,
+) -> Option<HashSet<UnionUseInfo<'a>>> {
+    let mut union_uses = HashSet::new();
+    if tcx.def_kind(def_id) != DefKind::Fn {
+        return None;
+    }
+    println!("DEF: {def_id:?}");
+    let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+    let body: &Body<'_> = &body.borrow();
+    for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+        println!("\tBB: {bb:?}");
+        for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
+            if let StatementKind::Assign(box (place, value)) = &stmt.kind {
+                println!("\t\tSTMT: {stmt:?}");
+                // Initialize a Union Field
+                if place.ty(body, tcx).ty.is_union() {
+                    if let Rvalue::Aggregate(
+                        box AggregateKind::Adt(_, _, _, _, Some(field_idx)),
+                        index_vec,
+                    ) = value
+                    {
+                        let op_type = index_vec.iter().next().unwrap().ty(body, tcx);
+                        let project_elem = ProjectionElem::Field(*field_idx, op_type);
+                        // Safe to unwrap as index_vec must have only one element
+                        assert_eq!(
+                            op_type,
+                            place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
+                        );
+
+                        union_uses.insert(UnionUseInfo {
+                            kind: UnionUseKind::InitUnion(
+                                *place.ty(body, tcx).ty.kind(),
+                                project_elem,
+                            ),
+                            basic_block: bb,
+                            stmt_idx,
+                            // statement: stmt.clone(),
+                        });
+                    }
+                } else {
+                    // ### Ignore nested union accesses for both reads and writes for now
+                    // Write to a Union Field (Some projection iteration of Lvalue is a Union)
+                    for (place_ref, project_elem) in place.iter_projections() {
+                        if place_ref.ty(body, tcx).ty.is_union() {
+                            union_uses.insert(UnionUseInfo {
+                                kind: UnionUseKind::WriteField(
+                                    *place_ref.ty(body, tcx).ty.kind(),
                                     project_elem,
                                 ),
                                 basic_block: bb,
-                                statement: stmt.clone(),
+                                stmt_idx,
+                                // statement: stmt.clone(),
                             });
                         }
-                    } else {
-                        // ### Ignore nested union accesses for both reads and writes for now
-                        // Write to a Union Field (Some projection iteration of Lvalue is a Union)
-                        for (place_ref, project_elem) in place.iter_projections() {
-                            if place_ref.ty(body, tcx).ty.is_union() {
-                                union_related.push(UnionUseInfo {
-                                    kind: UnionUseKind::WriteField(
-                                        *place_ref.ty(body, tcx).ty.kind(),
+                    }
+                    // Read from a Union Field (Rvalue is a Rvalue::Use of an union field)
+                    if let Rvalue::Use(operand) = value
+                        && let Some(rplace) = operand.place()
+                    {
+                        for (rplace_ref, project_elem) in rplace.iter_projections() {
+                            if rplace_ref.ty(body, tcx).ty.is_union() {
+                                union_uses.insert(UnionUseInfo {
+                                    kind: UnionUseKind::ReadField(
+                                        *rplace_ref.ty(body, tcx).ty.kind(),
                                         project_elem,
                                     ),
                                     basic_block: bb,
-                                    statement: stmt.clone(),
+                                    stmt_idx,
+                                    // statement: stmt.clone(),
                                 });
-                            }
-                        }
-                        // Read from a Union Field (Rvalue is a Rvalue::Use of an union field)
-                        if let Rvalue::Use(operand) = value
-                            && let Some(rplace) = operand.place()
-                        {
-                            for (rplace_ref, project_elem) in rplace.iter_projections() {
-                                if rplace_ref.ty(body, tcx).ty.is_union() {
-                                    union_related.push(UnionUseInfo {
-                                        kind: UnionUseKind::ReadField(
-                                            *rplace_ref.ty(body, tcx).ty.kind(),
-                                            project_elem,
-                                        ),
-                                        basic_block: bb,
-                                        statement: stmt.clone(),
-                                    });
-                                }
                             }
                         }
                     }
                 }
             }
-            // println!("TERM: {:?}", bbd.terminator().kind);
         }
+        println!("\t\tTERM: {:?}", bbd.terminator().kind);
     }
-    union_related
+    if union_uses.is_empty() {
+        None
+    } else {
+        Some(union_uses)
+    }
 }
 
-fn print_union_uses<'a>(union_related: &Vec<UnionUseInfo<'a>>) {
-    for use_info in union_related {
-        println!("UNION USE: {use_info:?}");
+fn print_union_uses_map<'a>(union_uses: &HashMap<LocalDefId, HashSet<UnionUseInfo<'a>>>) {
+    for (def_id, uses) in union_uses {
+        println!("Union Uses for {def_id:?}:");
+        for use_info in uses {
+            println!("\t{use_info:?}");
+        }
+    }
+}
+
+impl<'a> UnionUseInfo<'a> {
+    /// Return if Use1 dominates Use2
+    /// - Ignore unreachable basic blocks for now
+    fn dominates(use1: &UnionUseInfo, use2: &UnionUseInfo, basic_blocks: &BasicBlocks) -> bool {
+        if use1.basic_block == use2.basic_block {
+            use1.stmt_idx <= use2.stmt_idx
+        } else {
+            basic_blocks
+                .dominators()
+                .dominates(use1.basic_block, use2.basic_block)
+        }
+    }
+
+    /// Find dominatees of self (except self)
+    fn extract_dominated(
+        &self,
+        union_uses: &HashSet<UnionUseInfo<'a>>,
+        basic_blocks: &BasicBlocks,
+    ) -> HashSet<UnionUseInfo<'a>> {
+        union_uses
+            .clone()
+            .into_iter()
+            .filter(|u| *u != *self && UnionUseInfo::dominates(self, u, basic_blocks))
+            .collect()
+    }
+
+    fn extract_relations(
+        union_uses: &HashSet<UnionUseInfo<'a>>,
+        basic_blocks: &BasicBlocks,
+    ) -> HashSet<(UnionUseInfo<'a>, UnionUseInfo<'a>)> {
+        let mut relations = HashSet::new();
+        for use1 in union_uses {
+            let dominated = use1.extract_dominated(union_uses, basic_blocks);
+            for use2 in dominated {
+                relations.insert((use1.clone(), use2));
+            }
+        }
+        relations
+    }
+}
+
+fn print_dominance_relations<'a>(
+    union_uses: &HashSet<UnionUseInfo<'a>>,
+    def_id: LocalDefId,
+    tcx: TyCtxt<'a>,
+) {
+    let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+    let basic_blocks = &body.borrow().basic_blocks;
+    let relations = UnionUseInfo::extract_relations(union_uses, basic_blocks);
+    for (use1, use2) in relations {
+        println!("\t{use1:?}\n\t--> {use2:?}\n");
     }
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
-    let mut union_related = Vec::new();
-    union_related = collect_union_uses(union_related, tcx);
+    let union_uses_map = collect_union_uses_map(tcx);
+    println!("");
+    print_union_uses_map(&union_uses_map);
+    println!("");
 
-    print_union_uses(&union_related);
+    for (def_id, union_uses) in &union_uses_map {
+        println!("Dominance Relations for {def_id:?}");
+        print_dominance_relations(union_uses, *def_id, tcx);
+    }
     AnalysisResult {}
 }
