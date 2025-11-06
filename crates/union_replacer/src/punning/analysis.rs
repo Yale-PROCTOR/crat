@@ -34,7 +34,7 @@ impl<'a> std::fmt::Debug for UnionUseInfo<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "UnionUseInfo {{ kind: {:?}, basic_block: {:?}, statement: {:?} }}",
+            "UnionUseInfo: kind: {:?}, basic_block: {:?}, statement: {:?}",
             self.kind, self.basic_block, self.statement
         )
     }
@@ -81,6 +81,7 @@ fn collect_union_uses<'a>(
                             });
                         }
                     } else {
+                        // ### Ignore nested union accesses for both reads and writes for now
                         // Write to a Union Field (Some projection iteration of Lvalue is a Union)
                         for (place_ref, project_elem) in place.iter_projections() {
                             if place_ref.ty(body, tcx).ty.is_union() {
