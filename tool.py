@@ -94,48 +94,48 @@ TRANSFORMATIONS: Dict[str, Transformation] = {
         pass_="unsafe,unexpand,split,bin",
         config=CONFIG_ROOT / "post",
     ),
-    "resolve": Transformation(
-        dir=BENCH_ROOT / "rs-resolve",
-        order=None,
-        analysis=None,
-        pass_="upreprocess,uextern,bin",
-        config=CONFIG_ROOT / "resolve",
-    ),
     "io": Transformation(
         dir=BENCH_ROOT / "rs-io",
-        order="resolve",
+        order="extern",
         analysis=None,
         pass_="io",
         config=CONFIG_ROOT / "io",
     ),
-    "union": Transformation(
-        dir=BENCH_ROOT / "rs-union",
-        order="resolve",
-        analysis=("union", "points-to-file"),
-        pass_="union",
-        config=CONFIG_ROOT / "union",
-    ),
-    "io-union": Transformation(
-        dir=BENCH_ROOT / "rs-io-union",
+    "io-post": Transformation(
+        dir=BENCH_ROOT / "rs-io",
         order="io",
-        analysis=("union", "points-to-file"),
-        pass_="union",
-        config=CONFIG_ROOT / "union",
+        analysis=None,
+        pass_="unsafe,unexpand,split,bin",
+        config=CONFIG_ROOT / "post",
     ),
+    # "union": Transformation(
+    #     dir=BENCH_ROOT / "rs-union",
+    #     order="resolve",
+    #     analysis=("union", "points-to-file"),
+    #     pass_="union",
+    #     config=CONFIG_ROOT / "union",
+    # ),
+    # "io-union": Transformation(
+    #     dir=BENCH_ROOT / "rs-io-union",
+    #     order="io",
+    #     analysis=("union", "points-to-file"),
+    #     pass_="union",
+    #     config=CONFIG_ROOT / "union",
+    # ),
 }
 ANALYSES: Dict[str, Analysis] = {
-    "union": Analysis(
-        dir=ANALYSIS_ROOT / "union",
-        order="resolve",
-        pass_="andersen",
-        config=ANALYSIS_CONFIG_ROOT / "union",
-    ),
-    "io-union": Analysis(
-        dir=ANALYSIS_ROOT / "io-union",
-        order="io",
-        pass_="andersen",
-        config=ANALYSIS_CONFIG_ROOT / "io-union",
-    ),
+    # "union": Analysis(
+    #     dir=ANALYSIS_ROOT / "union",
+    #     order="resolve",
+    #     pass_="andersen",
+    #     config=ANALYSIS_CONFIG_ROOT / "union",
+    # ),
+    # "io-union": Analysis(
+    #     dir=ANALYSIS_ROOT / "io-union",
+    #     order="io",
+    #     pass_="andersen",
+    #     config=ANALYSIS_CONFIG_ROOT / "io-union",
+    # ),
 }
 
 current_dst: Optional[Path] = None

@@ -11,12 +11,12 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir, HirId, def::Res, definitions::DefPathData, intravisit};
+use rustc_hir::{self as hir, def::Res, definitions::DefPathData, intravisit};
 use rustc_middle::{
     hir::nested_filter,
     ty::{self, List, TyCtxt, TypeSuperVisitable, TypeVisitor},
 };
-use rustc_span::{Span, Symbol, def_id::LocalDefId};
+use rustc_span::{Symbol, def_id::LocalDefId};
 use serde::Deserialize;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
@@ -59,7 +59,7 @@ impl LinkHint {
     }
 }
 
-pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> String {
+pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
 
     let priorities = config.cmake_reply_index_file.as_ref().map(|index_file| {
@@ -95,7 +95,7 @@ pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> Strin
     let result = resolve(tcx);
     let resolve_map = make_resolve_map(&result, &priorities, config, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
-    let mut visitor = ExpandedAstVisitor {
+    let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
         resolve_map,
@@ -104,40 +104,6 @@ pub fn resolve_extern_in_expanded_ast(config: &Config, tcx: TyCtxt<'_>) -> Strin
     };
     visitor.visit_crate(&mut expanded_ast);
     pprust::crate_to_string_for_macros(&expanded_ast)
-}
-
-pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) {
-    let result = resolve(tcx);
-    let resolve_map = make_resolve_map(&result, &None, config, tcx);
-    let mut visitor = AstVisitor {
-        tcx,
-        span_to_def_id: result.span_to_def_id,
-        resolve_map,
-        used: FxHashSet::default(),
-        updated: false,
-    };
-    let res = utils::ast::transform_ast(
-        |krate| {
-            visitor.updated = false;
-            visitor.visit_crate(krate);
-            let mut used: Vec<_> = visitor
-                .used
-                .drain()
-                .map(|def_id| tcx.def_path_str(def_id))
-                .collect();
-            used.sort();
-            used.dedup();
-            let mut items: ThinVec<_> = used
-                .into_iter()
-                .map(|s| P(item!("use crate::{};", s)))
-                .collect();
-            items.append(&mut krate.items);
-            krate.items = items;
-            visitor.updated
-        },
-        tcx,
-    );
-    res.apply();
 }
 
 fn make_resolve_map(
@@ -308,8 +274,6 @@ fn find_representative_def_id(def_ids: &[LocalDefId], tcx: TyCtxt<'_>) -> LocalD
 }
 
 struct ResolveResult {
-    span_to_def_id: FxHashMap<Span, LocalDefId>,
-
     equiv_adts: FxHashMap<Symbol, EquivClasses<LocalDefId>>,
     equiv_unnameds: EquivClasses<LocalDefId>,
     extern_adts: Vec<(LocalDefId, Vec<EquivClassId>)>,
@@ -479,7 +443,6 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
     let equiv_unnameds = cmp.equiv_unnameds.to_equiv_classes();
 
     ResolveResult {
-        span_to_def_id: hir_data.span_to_def_id,
         equiv_adts,
         equiv_unnameds,
         extern_adts,
@@ -760,7 +723,7 @@ fn is_unnamed(name: &str) -> bool {
     name.starts_with("C2RustUnnamed")
 }
 
-struct ExpandedAstVisitor<'tcx> {
+struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
     resolve_map: FxHashMap<LocalDefId, LocalDefId>,
@@ -768,7 +731,7 @@ struct ExpandedAstVisitor<'tcx> {
     updated: bool,
 }
 
-impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
+impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
         let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();
         if let ast::ItemKind::Fn(..)
@@ -870,76 +833,6 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
     }
 }
 
-struct AstVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    span_to_def_id: FxHashMap<Span, LocalDefId>,
-    resolve_map: FxHashMap<LocalDefId, LocalDefId>,
-    used: FxHashSet<LocalDefId>,
-    updated: bool,
-}
-
-impl mut_visit::MutVisitor for AstVisitor<'_> {
-    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
-        if let ast::ItemKind::Fn(box ast::Fn { ident, .. })
-        | ast::ItemKind::Static(box ast::StaticItem { ident, .. })
-        | ast::ItemKind::Struct(ident, _, _)
-        | ast::ItemKind::Union(ident, _, _)
-        | ast::ItemKind::TyAlias(box ast::TyAlias { ident, .. }) = &item.kind
-            && self
-                .resolve_map
-                .contains_key(&self.span_to_def_id[&ident.span])
-        {
-            self.updated = true;
-            SmallVec::new()
-        } else {
-            let mut items = mut_visit::walk_flat_map_item(self, item);
-            items.retain(|item| {
-                if let ast::ItemKind::ForeignMod(fm) = &item.kind {
-                    !fm.items.is_empty()
-                } else {
-                    true
-                }
-            });
-            items
-        }
-    }
-
-    fn flat_map_foreign_item(
-        &mut self,
-        item: P<ast::ForeignItem>,
-    ) -> SmallVec<[P<ast::ForeignItem>; 1]> {
-        if let ast::ForeignItemKind::Fn(box ast::Fn { ident, .. })
-        | ast::ForeignItemKind::Static(box ast::StaticItem { ident, .. })
-        | ast::ForeignItemKind::TyAlias(box ast::TyAlias { ident, .. }) = &item.kind
-            && self
-                .resolve_map
-                .contains_key(&self.span_to_def_id[&ident.span])
-        {
-            self.updated = true;
-            SmallVec::new()
-        } else {
-            mut_visit::walk_flat_map_foreign_item(self, item)
-        }
-    }
-
-    fn visit_path(&mut self, path: &mut ast::Path) {
-        if let Some(def_id) = self.span_to_def_id.get(&path.span)
-            && let Some(resolved) = self.resolve_map.get(def_id)
-        {
-            self.updated = true;
-            let name = utils::ir::def_id_to_symbol(*resolved, self.tcx).unwrap();
-            if is_unnamed(name.as_str()) {
-                *path = path!("crate::{}", self.tcx.def_path_str(*resolved));
-            } else {
-                path.segments.last_mut().unwrap().ident.name = name;
-                self.used.insert(*resolved);
-            }
-        }
-
-        walk_path(self, path);
-    }
-}
-
 fn walk_path<T: mut_visit::MutVisitor>(
     vis: &mut T,
     ast::Path {
@@ -978,8 +871,6 @@ struct HirData {
     foreign_fns: Vec<LocalDefId>,
     foreign_statics: Vec<LocalDefId>,
     foreign_tys: Vec<LocalDefId>,
-
-    span_to_def_id: FxHashMap<Span, LocalDefId>,
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
@@ -990,21 +881,18 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) -> Self::Result {
-        let ident_and_vec = match item.kind {
-            hir::ItemKind::Fn { ident, .. } => Some((ident, &mut self.data.fns)),
-            hir::ItemKind::Static(_, ident, _, _) => Some((ident, &mut self.data.statics)),
-            hir::ItemKind::Struct(ident, _, _) | hir::ItemKind::Union(ident, _, _) => {
-                Some((ident, &mut self.data.adts))
-            }
-            hir::ItemKind::TyAlias(ident, _, _) => Some((ident, &mut self.data.tys)),
+        let vec = match item.kind {
+            hir::ItemKind::Fn { .. } => Some(&mut self.data.fns),
+            hir::ItemKind::Static(..) => Some(&mut self.data.statics),
+            hir::ItemKind::Struct(..) | hir::ItemKind::Union(..) => Some(&mut self.data.adts),
+            hir::ItemKind::TyAlias(..) => Some(&mut self.data.tys),
             _ => None,
         };
         let def_id = item.owner_id.def_id;
-        if let Some((ident, vec)) = ident_and_vec {
-            if self.tcx.visibility(def_id).is_public() {
-                vec.push(def_id);
-            }
-            self.data.span_to_def_id.insert(ident.span, def_id);
+        if let Some(vec) = vec
+            && self.tcx.visibility(def_id).is_public()
+        {
+            vec.push(def_id);
         }
 
         intravisit::walk_item(self, item)
@@ -1023,19 +911,8 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 self.data.foreign_tys.push(def_id);
             }
         }
-        self.data.span_to_def_id.insert(item.ident.span, def_id);
 
         intravisit::walk_foreign_item(self, item)
-    }
-
-    fn visit_path(&mut self, path: &hir::Path<'tcx>, _hir_id: HirId) -> Self::Result {
-        if let Res::Def(_, def_id) = path.res
-            && let Some(def_id) = def_id.as_local()
-        {
-            self.data.span_to_def_id.insert(path.span, def_id);
-        }
-
-        intravisit::walk_path(self, path)
     }
 }
 

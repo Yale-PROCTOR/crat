@@ -118,8 +118,6 @@ struct Args {
 #[clap(rename_all = "lower")]
 #[serde(rename_all = "lowercase")]
 enum Pass {
-    UExtern,
-    UPreprocess,
     Expand,
     Preprocess,
     Extern,
@@ -350,15 +348,9 @@ fn main() {
                 remove_rs_files(&dir, true);
                 std::fs::write(&file, s).unwrap();
             }
-            Pass::UExtern => {
-                run_compiler_on_path(&file, |tcx| {
-                    extern_resolver::resolve_extern(&config.r#extern, tcx)
-                })
-                .unwrap();
-            }
             Pass::Extern => {
                 let s = run_compiler_on_path(&file, |tcx| {
-                    extern_resolver::resolve_extern_in_expanded_ast(&config.r#extern, tcx)
+                    extern_resolver::resolve_extern(&config.r#extern, tcx)
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -370,11 +362,8 @@ fn main() {
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
             }
-            Pass::UPreprocess => {
-                run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
-            }
             Pass::Preprocess => {
-                let s = run_compiler_on_path(&file, preprocessor::preprocess_expanded_ast).unwrap();
+                let s = run_compiler_on_path(&file, preprocessor::preprocess).unwrap();
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Unexpand => {

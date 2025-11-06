@@ -218,21 +218,20 @@ use rustc_hir as hir;
 use rustc_hir::{
     HirId, QPath,
     def::{DefKind, Res},
-    def_id::LocalDefId,
     intravisit,
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
-use utils::{ast::TransformationResult, expr, ir::AstToHir, stmt, ty};
+use utils::{expr, ir::AstToHir, ty};
 
-pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
+pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
 
-    let mut visitor = ExpandedHirVisitor {
+    let mut visitor = HirVisitor {
         tcx,
-        ctx: ExpandedHirCtx::default(),
+        ctx: HirCtx::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
@@ -287,7 +286,7 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
         }
     }
 
-    let mut visitor = ExpandedAstVisitor {
+    let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
         lets_to_remove,
@@ -305,7 +304,7 @@ pub fn preprocess_expanded_ast(tcx: TyCtxt<'_>) -> String {
     pprust::crate_to_string_for_macros(&expanded_ast)
 }
 
-struct ExpandedAstVisitor<'tcx> {
+struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
     lets_to_remove: FxHashSet<HirId>,
@@ -319,7 +318,7 @@ struct ExpandedAstVisitor<'tcx> {
     stmt_swaps: FxHashMap<HirId, Vec<usize>>,
 }
 
-impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
+impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn visit_ty(&mut self, ty: &mut Ty) {
         mut_visit::walk_ty(self, ty);
 
@@ -580,195 +579,6 @@ impl mut_visit::MutVisitor for ExpandedAstVisitor<'_> {
     }
 }
 
-pub fn preprocess(tcx: TyCtxt<'_>) {
-    transform(tcx).apply();
-}
-
-fn transform(tcx: TyCtxt<'_>) -> TransformationResult {
-    let mut visitor = HirVisitor {
-        tcx,
-        ctx: HirCtx::default(),
-    };
-    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-
-    let mut lets_to_remove = FxHashSet::default();
-    let mut vars_to_replace = FxHashMap::default();
-    let mut params_to_be_mut = FxHashSet::default();
-    for (rhs, lhs) in &visitor.ctx.rhs_to_lhs {
-        if lhs.len() > 1 || visitor.ctx.used_vars.contains(rhs) {
-            continue;
-        }
-        let (name, param_span) = some_or!(visitor.ctx.params.get(rhs), continue);
-        let (lhs, let_span) = lhs[0];
-        lets_to_remove.insert(let_span);
-        params_to_be_mut.insert(*param_span);
-        let bounds = some_or!(visitor.ctx.bound_occurrences.get(&lhs), continue);
-        for span in bounds {
-            vars_to_replace.insert(*span, *name);
-        }
-    }
-
-    let mut visitor = AstVisitor {
-        hir: &visitor.ctx,
-        lets_to_remove: &lets_to_remove,
-        vars_to_replace: &vars_to_replace,
-        params_to_be_mut: &params_to_be_mut,
-        updated: false,
-    };
-    utils::ast::transform_ast(
-        |krate| {
-            visitor.updated = false;
-            visitor.visit_crate(krate);
-            visitor.updated
-        },
-        tcx,
-    )
-}
-
-struct AstVisitor<'a> {
-    hir: &'a HirCtx,
-
-    lets_to_remove: &'a FxHashSet<Span>,
-    vars_to_replace: &'a FxHashMap<Span, Symbol>,
-    params_to_be_mut: &'a FxHashSet<Span>,
-
-    updated: bool,
-}
-
-impl mut_visit::MutVisitor for AstVisitor<'_> {
-    fn visit_ty(&mut self, ty: &mut Ty) {
-        mut_visit::walk_ty(self, ty);
-
-        if let Some(def_id) = self.hir.bound_file_ty_aliases.get(&ty.span) {
-            self.updated = true;
-            *ty = ty!("{}", self.hir.ty_aliases[def_id]);
-        }
-    }
-
-    fn visit_block(&mut self, b: &mut Block) {
-        if let Some((i, _)) = b.stmts.iter().enumerate().find(|(_, stmt)| {
-            let (StmtKind::Semi(e) | StmtKind::Expr(e)) = &stmt.kind else { return false };
-            self.hir.never_exprs.contains(&e.span)
-        }) {
-            self.updated = true;
-            b.stmts.truncate(i + 1);
-        }
-
-        let mut assert = false;
-        for stmt in &mut b.stmts {
-            if assert {
-                assert = false;
-                let StmtKind::Semi(e) = &mut stmt.kind else { continue };
-                let ExprKind::Block(b, Some(_)) = &mut e.kind else { continue };
-                let [stmt] = &b.stmts[..] else { continue };
-                if is_assert_stmt(stmt) {
-                    self.updated = true;
-                    b.stmts.clear();
-                }
-            } else {
-                assert = is_assert_stmt(stmt);
-                if self.lets_to_remove.contains(&stmt.span) {
-                    self.updated = true;
-                    *stmt = stmt!("{{}}");
-                }
-            }
-        }
-        mut_visit::walk_block(self, b);
-    }
-
-    fn visit_param(&mut self, param: &mut Param) {
-        if let PatKind::Ident(mode, ident, _) = &mut param.pat.kind
-            && self.params_to_be_mut.contains(&ident.span)
-        {
-            mode.1 = Mutability::Mut;
-        }
-
-        mut_visit::walk_param(self, param);
-    }
-
-    fn visit_expr(&mut self, expr: &mut Expr) {
-        match &mut expr.kind {
-            ExprKind::Path(_, _) => {
-                if let Some(name) = self.vars_to_replace.get(&expr.span) {
-                    self.updated = true;
-                    *expr = expr!("{name}");
-                }
-            }
-            ExprKind::If(c, t, f) => {
-                if let Some(Value::Bool(b)) = eval_expr(c) {
-                    self.updated = true;
-                    if b {
-                        let e = Expr {
-                            id: DUMMY_NODE_ID,
-                            kind: ExprKind::Block(t.clone(), None),
-                            span: expr.span,
-                            attrs: expr.attrs.clone(),
-                            tokens: expr.tokens.clone(),
-                        };
-                        *expr = e;
-                    } else if let Some(f) = f {
-                        *expr = *f.clone();
-                    } else {
-                        *expr = expr!("{{}}");
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        mut_visit::walk_expr(self, expr);
-
-        let expr_span = expr.span;
-        match &mut expr.kind {
-            ExprKind::Call(_, args) => {
-                let mut indices: Vec<ArgIdx> = vec![];
-                if let Some(if_args) = self.hir.call_span_to_if_args.get(&expr_span) {
-                    indices.extend(if_args);
-                }
-                if let Some(nested_args) = self.hir.call_span_to_nested_args.get(&expr_span) {
-                    indices.extend(nested_args);
-                }
-                if !indices.is_empty() {
-                    self.updated = true;
-                    indices.sort();
-                    indices.dedup();
-                    let mut new_expr = "{".to_string();
-                    for i in indices {
-                        let i = i.0;
-                        ref_to_ptr_in_if(&mut args[i]);
-                        let a = pprust::expr_to_string(&args[i]);
-                        write!(new_expr, "let __arg_{i} = {a};").unwrap();
-                        *args[i] = expr!("__arg_{i}");
-                    }
-                    new_expr.push_str(&pprust::expr_to_string(expr));
-                    new_expr.push('}');
-                    *expr = expr!("{new_expr}");
-                }
-            }
-            ExprKind::MethodCall(box call) => {
-                if call.seg.ident.name.as_str() != "unwrap" {
-                    return;
-                }
-                let ExprKind::Paren(e) = &call.receiver.kind else { return };
-                let ExprKind::Call(callee, e) = &e.kind else { return };
-                let ExprKind::Path(_, path) = &callee.kind else { return };
-                if path.segments.last().unwrap().ident.name.as_str() != "Some" {
-                    return;
-                }
-                let [arg] = &e[..] else { return };
-                let ExprKind::MethodCall(box call) = &arg.kind else { return };
-                if call.seg.ident.name.as_str() != "unwrap" {
-                    return;
-                }
-                self.updated = true;
-                let arg = pprust::expr_to_string(arg);
-                *expr = expr!("{arg}");
-            }
-            _ => {}
-        }
-    }
-}
-
 fn is_assert_stmt(stmt: &Stmt) -> bool {
     let StmtKind::Expr(e) = &stmt.kind else { return false };
     let ExprKind::If(_, t, f) = &e.kind else { return false };
@@ -975,7 +785,7 @@ struct LhsFreshLet {
 }
 
 #[derive(Default)]
-struct ExpandedHirCtx {
+struct HirCtx {
     call_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
     call_to_nested_args: FxHashMap<HirId, Vec<ArgIdx>>,
     call_to_if_args: FxHashMap<HirId, Vec<ArgIdx>>,
@@ -994,12 +804,12 @@ struct ExpandedHirCtx {
     fresh_lets: FxHashMap<HirId, LhsFreshLet>,
 }
 
-struct ExpandedHirVisitor<'tcx> {
+struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    ctx: ExpandedHirCtx,
+    ctx: HirCtx,
 }
 
-impl ExpandedHirVisitor<'_> {
+impl HirVisitor<'_> {
     fn find_call_parent(&self, hir_id: HirId) -> HirId {
         for (hir_id, node) in self.tcx.hir_parent_iter(hir_id) {
             if matches!(
@@ -1016,7 +826,7 @@ impl ExpandedHirVisitor<'_> {
     }
 }
 
-impl<'tcx> intravisit::Visitor<'tcx> for ExpandedHirVisitor<'tcx> {
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -1233,207 +1043,10 @@ fn is_lhs<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     panic!()
 }
 
-#[derive(Default)]
-struct HirCtx {
-    call_id_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
-    call_span_to_nested_args: FxHashMap<Span, Vec<ArgIdx>>,
-    call_span_to_if_args: FxHashMap<Span, Vec<ArgIdx>>,
-
-    ty_aliases: FxHashMap<LocalDefId, String>,
-    bound_file_ty_aliases: FxHashMap<Span, LocalDefId>,
-
-    /// function param hir_id to ident symbol and span
-    params: FxHashMap<HirId, (Symbol, Span)>,
-    /// let stmt rhs variable hir_id to lhs variable hir_id and let stmt span
-    rhs_to_lhs: FxHashMap<HirId, Vec<(HirId, Span)>>,
-    /// hir_ids of variables used, excluding let stmt rhs
-    used_vars: FxHashSet<HirId>,
-    /// variable hir_id to bound occurrence spans
-    bound_occurrences: FxHashMap<HirId, Vec<Span>>,
-
-    /// spans of never-type expressions
-    never_exprs: FxHashSet<Span>,
-}
-
-struct HirVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    ctx: HirCtx,
-}
-
-impl HirVisitor<'_> {
-    fn find_call_parent(&self, hir_id: HirId) -> HirId {
-        for (hir_id, node) in self.tcx.hir_parent_iter(hir_id) {
-            if matches!(
-                node,
-                hir::Node::Expr(hir::Expr {
-                    kind: hir::ExprKind::Call(_, _),
-                    ..
-                })
-            ) {
-                return hir_id;
-            }
-        }
-        panic!()
-    }
-}
-
-impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-        self.tcx
-    }
-
-    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
-        intravisit::walk_item(self, item);
-
-        let hir::ItemKind::TyAlias(_, _, ty) = item.kind else { return };
-        let ty = self.tcx.sess.source_map().span_to_snippet(ty.span).unwrap();
-        self.ctx.ty_aliases.insert(item.owner_id.def_id, ty);
-    }
-
-    fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, hir::AmbigArg>) {
-        intravisit::walk_ty(self, ty);
-
-        let hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind else { return };
-        let Res::Def(DefKind::TyAlias, def_id) = path.res else { return };
-        let def_id = some_or!(def_id.as_local(), return);
-        let mir_ty = self.tcx.type_of(def_id).skip_binder();
-        if utils::file::file_param_index(mir_ty, self.tcx).is_some() {
-            self.ctx.bound_file_ty_aliases.insert(ty.span, def_id);
-        }
-    }
-
-    fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) {
-        intravisit::walk_local(self, let_stmt);
-
-        if let_stmt.ty.is_none() {
-            // ignore C2Rust-introduced variables, which may be used in `asm!` macro calls
-            return;
-        }
-        let hir::PatKind::Binding(_, lhs_id, _, _) = let_stmt.pat.kind else { return };
-        let init = some_or!(let_stmt.init, return);
-        let hir::ExprKind::Path(QPath::Resolved(_, path)) = init.kind else { return };
-        let Res::Local(rhs_id) = path.res else { return };
-        self.ctx
-            .rhs_to_lhs
-            .entry(rhs_id)
-            .or_default()
-            .push((lhs_id, let_stmt.span));
-    }
-
-    fn visit_param(&mut self, param: &'tcx hir::Param<'tcx>) {
-        intravisit::walk_param(self, param);
-
-        let hir::PatKind::Binding(_, id, ident, _) = param.pat.kind else { return };
-        self.ctx.params.insert(id, (ident.name, ident.span));
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-        match expr.kind {
-            hir::ExprKind::Call(callee, args) => {
-                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                if typeck.expr_ty(expr).is_never() {
-                    self.ctx.never_exprs.insert(expr.span);
-                }
-
-                if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
-                    && let Res::Def(DefKind::Fn, def_id) = path.res
-                    && utils::file::api_list::is_def_id_api(def_id, self.tcx)
-                {
-                    let mut if_args = vec![];
-                    for (i, arg) in args.iter().enumerate() {
-                        if !matches!(arg.kind, hir::ExprKind::If(_, _, _)) {
-                            continue;
-                        }
-                        let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                        let ty = typeck.expr_ty(arg);
-                        if utils::file::contains_file_ty(ty, self.tcx) {
-                            if_args.push(ArgIdx(i));
-                        }
-                    }
-                    if !if_args.is_empty() {
-                        self.ctx.call_span_to_if_args.insert(expr.span, if_args);
-                    }
-                }
-
-                let args = args.iter().map(|arg| (arg.span, vec![])).collect();
-                self.ctx.call_id_to_args.insert(expr.hir_id, args);
-            }
-            hir::ExprKind::Path(QPath::Resolved(_, path)) => {
-                if let Res::Local(hir_id) = path.res {
-                    let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                    let ty = typeck.expr_ty(expr);
-                    if ty.is_raw_ptr() {
-                        for v in self.ctx.call_id_to_args.values_mut() {
-                            for (span, v) in v {
-                                if span.contains(expr.span) {
-                                    v.push(BoundOccurrence {
-                                        var_id: hir_id,
-                                        expr_id: expr.hir_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    self.ctx
-                        .bound_occurrences
-                        .entry(hir_id)
-                        .or_default()
-                        .push(expr.span);
-
-                    let (_, parent) = self.tcx.hir_parent_iter(expr.hir_id).next().unwrap();
-                    if !matches!(parent, hir::Node::LetStmt(_)) {
-                        self.ctx.used_vars.insert(hir_id);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        intravisit::walk_expr(self, expr);
-
-        if let hir::ExprKind::Call(_, args) = expr.kind {
-            let arg_bound_ids = self.ctx.call_id_to_args.remove(&expr.hir_id).unwrap();
-            let nested_args: Vec<_> = arg_bound_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (_, ids))| {
-                    for boi in ids {
-                        if self.find_call_parent(boi.expr_id) == expr.hir_id {
-                            continue;
-                        }
-                        for ((_, ids), arg) in arg_bound_ids.iter().zip(args) {
-                            if !matches!(arg.kind, hir::ExprKind::Path(QPath::Resolved(_, _))) {
-                                continue;
-                            }
-                            if ids.is_empty() {
-                                continue;
-                            }
-                            let [boj] = &ids[..] else { panic!() };
-                            if boi.var_id == boj.var_id {
-                                return Some(ArgIdx(i));
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-            if !nested_args.is_empty() {
-                self.ctx
-                    .call_span_to_nested_args
-                    .insert(expr.span, nested_args);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
-        let s =
-            utils::compilation::run_compiler_on_str(code, super::preprocess_expanded_ast).unwrap();
+        let s = utils::compilation::run_compiler_on_str(code, super::preprocess).unwrap();
         utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
         for include in includes {
             assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
