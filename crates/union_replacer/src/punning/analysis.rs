@@ -23,9 +23,9 @@ struct UnionUseInfo<'a> {
 impl<'a> std::fmt::Debug for UnionUseKind<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnionUseKind::InitUnion(ty, proj) => write!(f, "InitUnion({:?}, {:?})", ty, proj),
-            UnionUseKind::WriteField(ty, proj) => write!(f, "WriteField({:?}, {:?})", ty, proj),
-            UnionUseKind::ReadField(ty, proj) => write!(f, "ReadField({:?}, {:?})", ty, proj),
+            UnionUseKind::InitUnion(ty, proj) => write!(f, "InitUnion({ty:?}, {proj:?})"),
+            UnionUseKind::WriteField(ty, proj) => write!(f, "WriteField({ty:?}, {proj:?})"),
+            UnionUseKind::ReadField(ty, proj) => write!(f, "ReadField({ty:?}, {proj:?})"),
         }
     }
 }
@@ -58,26 +58,27 @@ fn collect_union_uses<'a>(
                     // println!("STMT: {:?}", stmt);
                     // Initialize a Union Field
                     if place.ty(body, tcx).ty.is_union() {
-                        if let Rvalue::Aggregate(box aggregate_kind, index_vec) = value {
-                            if let AggregateKind::Adt(_, _, _, _, Some(field_idx)) = aggregate_kind
-                            {
-                                let op_type = index_vec.iter().next().unwrap().ty(body, tcx);
-                                let project_elem = ProjectionElem::Field(*field_idx, op_type);
-                                // Safe to unwrap as index_vec must have only one element
-                                assert_eq!(
-                                    op_type,
-                                    place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
-                                );
+                        if let Rvalue::Aggregate(
+                            box AggregateKind::Adt(_, _, _, _, Some(field_idx)),
+                            index_vec,
+                        ) = value
+                        {
+                            let op_type = index_vec.iter().next().unwrap().ty(body, tcx);
+                            let project_elem = ProjectionElem::Field(*field_idx, op_type);
+                            // Safe to unwrap as index_vec must have only one element
+                            assert_eq!(
+                                op_type,
+                                place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
+                            );
 
-                                union_related.push(UnionUseInfo {
-                                    kind: UnionUseKind::InitUnion(
-                                        place.ty(body, tcx).ty.kind().clone(),
-                                        project_elem,
-                                    ),
-                                    basic_block: bb,
-                                    statement: stmt.clone(),
-                                });
-                            }
+                            union_related.push(UnionUseInfo {
+                                kind: UnionUseKind::InitUnion(
+                                    *place.ty(body, tcx).ty.kind(),
+                                    project_elem,
+                                ),
+                                basic_block: bb,
+                                statement: stmt.clone(),
+                            });
                         }
                     } else {
                         // Write to a Union Field (Some projection iteration of Lvalue is a Union)
@@ -85,8 +86,8 @@ fn collect_union_uses<'a>(
                             if place_ref.ty(body, tcx).ty.is_union() {
                                 union_related.push(UnionUseInfo {
                                     kind: UnionUseKind::WriteField(
-                                        place_ref.ty(body, tcx).ty.kind().clone(),
-                                        project_elem.clone(),
+                                        *place_ref.ty(body, tcx).ty.kind(),
+                                        project_elem,
                                     ),
                                     basic_block: bb,
                                     statement: stmt.clone(),
@@ -94,19 +95,19 @@ fn collect_union_uses<'a>(
                             }
                         }
                         // Read from a Union Field (Rvalue is a Rvalue::Use of an union field)
-                        if let Rvalue::Use(operand) = value {
-                            if let Some(rplace) = operand.place() {
-                                for (rplace_ref, project_elem) in rplace.iter_projections() {
-                                    if rplace_ref.ty(body, tcx).ty.is_union() {
-                                        union_related.push(UnionUseInfo {
-                                            kind: UnionUseKind::ReadField(
-                                                rplace_ref.ty(body, tcx).ty.kind().clone(),
-                                                project_elem.clone(),
-                                            ),
-                                            basic_block: bb,
-                                            statement: stmt.clone(),
-                                        });
-                                    }
+                        if let Rvalue::Use(operand) = value
+                            && let Some(rplace) = operand.place()
+                        {
+                            for (rplace_ref, project_elem) in rplace.iter_projections() {
+                                if rplace_ref.ty(body, tcx).ty.is_union() {
+                                    union_related.push(UnionUseInfo {
+                                        kind: UnionUseKind::ReadField(
+                                            *rplace_ref.ty(body, tcx).ty.kind(),
+                                            project_elem,
+                                        ),
+                                        basic_block: bb,
+                                        statement: stmt.clone(),
+                                    });
                                 }
                             }
                         }
@@ -121,7 +122,7 @@ fn collect_union_uses<'a>(
 
 fn print_union_uses<'a>(union_related: &Vec<UnionUseInfo<'a>>) {
     for use_info in union_related {
-        println!("UNION USE: {:?}", use_info);
+        println!("UNION USE: {use_info:?}");
     }
 }
 
