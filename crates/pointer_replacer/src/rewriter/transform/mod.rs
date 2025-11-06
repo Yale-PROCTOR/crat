@@ -348,6 +348,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                         // TODO: handle c char arrays properly
                         if need_cast {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            // HACK: assume length 1024
                             *rhs = utils::expr!(
                                 "std::slice::from_raw_parts{1}(({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x as *{2} _ as *{2} {3}), 1024)",
                                 pprust::expr_to_string(e),
@@ -356,6 +357,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 lhs_inner_ty,
                             );
                         } else {
+                            // HACK: assume length 1024
                             *rhs = utils::expr!(
                                 "std::slice::from_raw_parts{1}(({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x), 1024)",
                                 pprust::expr_to_string(e),
@@ -476,9 +478,26 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    (PtrKind::Slice(_), PtrKind::Raw(_)) => {
-                        println!("slice from raw: {:?}", rhs);
-                        unimplemented!()
+                    (PtrKind::Slice(m), PtrKind::Raw(_)) => {
+                        if need_cast {
+                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                            // HACK: assume length 1024
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{1}({0} as *{2} _ as *{2} {3}, 1024)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                                lhs_inner_ty,
+                            );
+                        } else {
+                            // HACK: assume length 1024
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{1}({0} as *{2} _, 1024)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                            );
+                        }
                     }
                     (PtrKind::Raw(_), PtrKind::Raw(_)) => {}
                 }
@@ -623,11 +642,6 @@ impl<'tcx> TransformVisitor<'tcx> {
                     PtrKind::Raw(_) => {
                         // skipping cases like
                         // memset(((*ctx).ctr).as_mut_ptr().offset(12 as libc::c_int as isize)
-                    }
-                    _ => {
-                        println!("offset from non-slice: {:?}", rhs);
-                        println!("{:?}", lhs_kind);
-                        unimplemented!()
                     }
                 }
             }

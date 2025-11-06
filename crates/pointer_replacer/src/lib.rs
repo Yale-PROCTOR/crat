@@ -7,7 +7,6 @@
 
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
-extern crate rustc_data_structures;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
