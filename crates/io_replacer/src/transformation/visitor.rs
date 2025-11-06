@@ -73,10 +73,10 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) updated: bool,
     pub(super) tmpfile: bool,
     pub(super) current_fns: Vec<LocalDefId>,
-    pub(super) bounds: Vec<TraitBound>,
+    pub(super) bounds: FxHashSet<TraitBound>,
     pub(super) bound_num: usize,
-    pub(super) lib_items: RefCell<Vec<LibItem>>,
-    pub(super) parsing_fns: RefCell<Vec<(String, String)>>,
+    pub(super) lib_items: RefCell<FxHashSet<LibItem>>,
+    pub(super) parsing_fns: RefCell<FxHashMap<String, String>>,
     pub(super) guards: FxHashSet<Symbol>,
     pub(super) foreign_statics: FxHashSet<&'static str>,
     pub(super) unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
@@ -227,7 +227,7 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
     fn replace_ty_with_pot(&mut self, old: &mut Ty, pot: Pot<'_>) {
         if let Some(bound) = pot.ty.get_dyn_bound() {
             self.bound_num += 1;
-            self.bounds.push(bound);
+            self.bounds.insert(bound);
         }
         self.replace_ty(old, ty!("{}", pot.ty));
     }
@@ -677,7 +677,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
         } else {
             if let Some(bound) = pot.ty.get_dyn_bound() {
                 self.bound_num += 1;
-                self.bounds.push(bound);
+                self.bounds.insert(bound);
             }
             self.updated = true;
             local.ty = Some(P(ty!("{}", pot.ty)));
@@ -1020,7 +1020,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
-                                self.lib_items.borrow_mut().push(LibItem::Fputc);
+                                self.lib_items.borrow_mut().insert(LibItem::Fputc);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputc",
                                     orig_name,
@@ -1055,7 +1055,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
-                                self.lib_items.borrow_mut().push(LibItem::Fputwc);
+                                self.lib_items.borrow_mut().insert(LibItem::Fputwc);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputwc",
                                     orig_name,
@@ -1079,7 +1079,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
-                                self.lib_items.borrow_mut().push(LibItem::Fputs);
+                                self.lib_items.borrow_mut().insert(LibItem::Fputs);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputs",
                                     orig_name,
@@ -1122,7 +1122,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[3]);
-                                self.lib_items.borrow_mut().push(LibItem::Fwrite);
+                                self.lib_items.borrow_mut().insert(LibItem::Fwrite);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fwrite",
                                     orig_name,
@@ -1147,7 +1147,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let reasons = self.get_unsupported_reasons(loc);
                                 self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
-                                self.lib_items.borrow_mut().push(LibItem::Fflush);
+                                self.lib_items.borrow_mut().insert(LibItem::Fflush);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fflush",
                                     orig_name,
@@ -1259,12 +1259,12 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                         }
                         "rename" => {
                             let new_expr = expr!("crate::stdio::rs_rename");
-                            self.lib_items.borrow_mut().push(LibItem::Rename);
+                            self.lib_items.borrow_mut().insert(LibItem::Rename);
                             self.replace_expr(callee, new_expr);
                         }
                         "remove" => {
                             let new_expr = expr!("crate::stdio::rs_remove");
-                            self.lib_items.borrow_mut().push(LibItem::Remove);
+                            self.lib_items.borrow_mut().insert(LibItem::Remove);
                             self.replace_expr(callee, new_expr);
                         }
                         "setvbuf" | "setbuf" => {
@@ -1668,7 +1668,7 @@ impl TransformVisitor<'_, '_, '_> {
                 || self.analysis_res.unsupported_stderr_errors)
         {
             let stream = stream.borrow_for(StreamTrait::AsRawFd);
-            self.lib_items.borrow_mut().push(LibItem::AsRawFd);
+            self.lib_items.borrow_mut().insert(LibItem::AsRawFd);
             write!(
                 update,
                 "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"
@@ -1710,7 +1710,7 @@ impl TransformVisitor<'_, '_, '_> {
                 || self.analysis_res.unsupported_stderr_errors)
         {
             let stream = stream.borrow_for(StreamTrait::AsRawFd);
-            self.lib_items.borrow_mut().push(LibItem::AsRawFd);
+            self.lib_items.borrow_mut().insert(LibItem::AsRawFd);
             write!(
                 update,
                 "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"

@@ -18,7 +18,7 @@ impl TransformVisitor<'_, '_, '_> {
     ) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Write);
         let s = pprust::expr_to_string(s);
-        self.lib_items.borrow_mut().push(LibItem::Fputs);
+        self.lib_items.borrow_mut().insert(LibItem::Fputs);
         self.update_error_no_eof(
             ic,
             format!("crate::stdio::rs_fputs({s}, {stream_str})"),
@@ -29,7 +29,7 @@ impl TransformVisitor<'_, '_, '_> {
     #[inline]
     pub(super) fn transform_puts(&self, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
         let s = pprust::expr_to_string(s);
-        self.lib_items.borrow_mut().push(LibItem::Puts);
+        self.lib_items.borrow_mut().insert(LibItem::Puts);
         self.update_error_no_eof(
             ic,
             format!("crate::stdio::rs_puts({s})"),
@@ -40,7 +40,7 @@ impl TransformVisitor<'_, '_, '_> {
     #[inline]
     pub(super) fn transform_perror(&self, s: &Expr) -> Expr {
         let s = pprust::expr_to_string(s);
-        self.lib_items.borrow_mut().push(LibItem::Perror);
+        self.lib_items.borrow_mut().insert(LibItem::Perror);
         expr!("crate::stdio::rs_perror({})", s)
     }
 }

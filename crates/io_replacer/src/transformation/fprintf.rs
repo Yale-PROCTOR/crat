@@ -146,14 +146,14 @@ impl TransformVisitor<'_, '_, '_> {
                 "crate::stdio::Xu8" | "crate::stdio::Xu16" | "crate::stdio::Xu32"
                 | "crate::stdio::Xu64" | "crate::stdio::Gf64" | "crate::stdio::Af64" => {
                     match cast {
-                        "crate::stdio::Xu8" => self.lib_items.borrow_mut().push(LibItem::Xu8),
-                        "crate::stdio::Xu16" => self.lib_items.borrow_mut().push(LibItem::Xu16),
-                        "crate::stdio::Xu32" => self.lib_items.borrow_mut().push(LibItem::Xu32),
-                        "crate::stdio::Xu64" => self.lib_items.borrow_mut().push(LibItem::Xu64),
-                        "crate::stdio::Gf64" => self.lib_items.borrow_mut().push(LibItem::Gf64),
-                        "crate::stdio::Af64" => self.lib_items.borrow_mut().push(LibItem::Af64),
+                        "crate::stdio::Xu8" => self.lib_items.borrow_mut().insert(LibItem::Xu8),
+                        "crate::stdio::Xu16" => self.lib_items.borrow_mut().insert(LibItem::Xu16),
+                        "crate::stdio::Xu32" => self.lib_items.borrow_mut().insert(LibItem::Xu32),
+                        "crate::stdio::Xu64" => self.lib_items.borrow_mut().insert(LibItem::Xu64),
+                        "crate::stdio::Gf64" => self.lib_items.borrow_mut().insert(LibItem::Gf64),
+                        "crate::stdio::Af64" => self.lib_items.borrow_mut().insert(LibItem::Af64),
                         _ => panic!(),
-                    }
+                    };
                     write!(args, "{cast}(({arg}) as _), ").unwrap()
                 }
                 _ => write!(args, "({arg}) as {cast}, ").unwrap(),

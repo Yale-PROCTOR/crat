@@ -416,10 +416,11 @@ fn main() {
                 .unwrap();
             }
             Pass::Io => {
-                let _res = run_compiler_on_path(&file, |tcx| {
-                    io_replacer::replace_io(&dir, &lib_path, tcx)
-                })
-                .unwrap();
+                let res = run_compiler_on_path(&file, io_replacer::replace_io).unwrap();
+                std::fs::write(&file, res.code).unwrap();
+                if res.tmpfile {
+                    io_replacer::add_tempfile(&dir);
+                }
             }
             Pass::Pointer => {
                 let s =

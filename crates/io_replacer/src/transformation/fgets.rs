@@ -21,7 +21,7 @@ impl TransformVisitor<'_, '_, '_> {
         let s = pprust::expr_to_string(s);
         let n = pprust::expr_to_string(n);
         let err_eof_args = self.err_eof_args(ic);
-        self.lib_items.borrow_mut().push(LibItem::Fgets);
+        self.lib_items.borrow_mut().insert(LibItem::Fgets);
         expr!("crate::stdio::rs_fgets({s}, {n}, {stream_str}, {err_eof_args})")
     }
 }

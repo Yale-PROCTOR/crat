@@ -38,7 +38,7 @@ impl TransformVisitor<'_, '_, '_> {
         is_non_local: bool,
     ) -> Expr {
         let stream = take_stream(stream, ty, is_non_local);
-        self.lib_items.borrow_mut().push(LibItem::Close);
+        self.lib_items.borrow_mut().insert(LibItem::Close);
         expr!(
             "{{
     let mut __x = {};

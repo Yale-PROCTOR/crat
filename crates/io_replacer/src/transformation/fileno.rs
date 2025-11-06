@@ -7,7 +7,7 @@ impl TransformVisitor<'_, '_, '_> {
     #[inline]
     pub(super) fn transform_fileno<S: StreamExpr>(&self, stream: &S) -> Expr {
         let stream = stream.borrow_for(StreamTrait::AsRawFd);
-        self.lib_items.borrow_mut().push(LibItem::AsRawFd);
+        self.lib_items.borrow_mut().insert(LibItem::AsRawFd);
         expr!("crate::stdio::AsRawFd::as_raw_fd({})", stream)
     }
 }

@@ -4,14 +4,12 @@ use utils::compilation;
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let mut res = compilation::run_compiler_on_str(&code, super::run).unwrap();
-    let defs = res.stdio_mod();
-    let [(_, s)] = &mut res.files[..] else { panic!() };
-    let stripped = s
+    let res = compilation::run_compiler_on_str(&code, super::replace_io).unwrap();
+    let stripped = res
+        .code
         .strip_prefix(FORMATTED_PREAMBLE.as_str())
         .unwrap()
         .to_string();
-    s.push_str(&defs);
     compilation::run_compiler_on_str(&s, utils::type_check).expect(&stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);

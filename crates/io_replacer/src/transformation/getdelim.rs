@@ -23,7 +23,7 @@ impl TransformVisitor<'_, '_, '_> {
         let n = pprust::expr_to_string(n);
         let delimiter = pprust::expr_to_string(delimiter);
         let err_eof_args = self.err_eof_args(ic);
-        self.lib_items.borrow_mut().push(LibItem::Getdelim);
+        self.lib_items.borrow_mut().insert(LibItem::Getdelim);
         expr!(
             "crate::stdio::rs_getdelim({lineptr}, {n}, {delimiter}, {stream_str}, {err_eof_args})"
         )
@@ -41,8 +41,8 @@ impl TransformVisitor<'_, '_, '_> {
         let lineptr = pprust::expr_to_string(lineptr);
         let n = pprust::expr_to_string(n);
         let err_eof_args = self.err_eof_args(ic);
-        self.lib_items.borrow_mut().push(LibItem::Getdelim);
-        self.lib_items.borrow_mut().push(LibItem::Getline);
+        self.lib_items.borrow_mut().insert(LibItem::Getdelim);
+        self.lib_items.borrow_mut().insert(LibItem::Getline);
         expr!("crate::stdio::rs_getline({lineptr}, {n}, {stream_str}, {err_eof_args})")
     }
 }

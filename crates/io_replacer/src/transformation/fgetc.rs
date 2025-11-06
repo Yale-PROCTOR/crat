@@ -16,7 +16,7 @@ impl TransformVisitor<'_, '_, '_> {
     ) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Read);
         let err_eof_args = self.err_eof_args(ic);
-        self.lib_items.borrow_mut().push(LibItem::Fgetc);
+        self.lib_items.borrow_mut().insert(LibItem::Fgetc);
         expr!("crate::stdio::rs_fgetc({stream_str}, {err_eof_args})")
     }
 }

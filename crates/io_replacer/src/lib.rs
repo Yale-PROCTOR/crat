@@ -19,7 +19,7 @@ mod likely_lit;
 mod mir_loc;
 mod transformation;
 
-pub use transformation::transform::{replace_io, run};
+pub use transformation::transform::{add_tempfile, replace_io};
 
 #[cfg(test)]
 mod tests;

@@ -100,7 +100,7 @@ impl TransformVisitor<'_, '_, '_> {
                 }
             }
             OpenMode::Unknown => {
-                self.lib_items.borrow_mut().push(LibItem::Fopen);
+                self.lib_items.borrow_mut().insert(LibItem::Fopen);
                 expr!(
                     "crate::stdio::rs_fopen({}, {})",
                     path,

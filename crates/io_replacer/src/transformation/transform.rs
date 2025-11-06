@@ -1,9 +1,10 @@
-use std::{cell::RefCell, fmt::Write as _, fs, path::PathBuf};
+use std::{cell::RefCell, fmt::Write as _, fs};
 
 use etrace::some_or;
 use lazy_static::lazy_static;
 use rustc_abi::FIRST_VARIANT;
 use rustc_ast::mut_visit::MutVisitor;
+use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, HirId};
 use rustc_index::IndexVec;
@@ -11,7 +12,7 @@ use rustc_middle::{
     mir,
     ty::{List, TyCtxt},
 };
-use rustc_span::{Span, def_id::LocalDefId};
+use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
 use toml_edit::DocumentMut;
 use typed_arena::Arena;
 use utils::{bit_set::BitSet16, file::api_list::Permission};
@@ -24,101 +25,21 @@ use super::{
     visitor::{Parameter, TransformVisitor},
 };
 
-pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path, lib_name: &str) {
-    for (p, s) in &res.files {
-        fs::write(p, s).unwrap();
-    }
-
-    if res.tmpfile {
-        let path = dir.join("Cargo.toml");
-        let content = fs::read_to_string(&path).unwrap();
-        let mut doc = content.parse::<DocumentMut>().unwrap();
-        let dependencies = doc["dependencies"].as_table_mut().unwrap();
-        if !dependencies.contains_key("tempfile") {
-            dependencies["tempfile"] = toml_edit::value("3.19.1");
-            fs::write(path, doc.to_string()).unwrap();
-        }
-    }
-
-    let path = dir.join(lib_name);
-    let mut contents = fs::read_to_string(&path).unwrap();
-    if res.lib_items.contains(&LibItem::Fprintf) && !contents.contains("#![feature(c_variadic)]") {
-        contents = format!("#![feature(c_variadic)]\n{contents}");
-    }
-    if res.lib_items.contains(&LibItem::Vfprintf)
-        && !contents.contains("#![feature(formatting_options)]")
-    {
-        contents = format!("#![feature(formatting_options)]\n{contents}");
-    }
-    contents.push_str(&res.stdio_mod());
-    fs::write(path, contents).unwrap();
-}
-
 #[derive(Debug)]
 pub struct TransformationResult {
-    pub files: Vec<(PathBuf, String)>,
-    tmpfile: bool,
-    stdout_error: bool,
-    stderr_error: bool,
-    bounds: FxHashSet<TraitBound>,
-    lib_items: FxHashSet<LibItem>,
-    parsing_fns: FxHashMap<String, String>,
+    pub code: String,
+    pub tmpfile: bool,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
     pub bound_num: usize,
     pub transformation_time: u128,
     pub analysis_stat: file_analysis::Statistics,
 }
 
-impl TransformationResult {
-    pub fn stdio_mod(&self) -> String {
-        let mut m = "mod stdio {".to_string();
-        for bound in &self.bounds {
-            if bound.count() <= 1 {
-                continue;
-            }
-            write!(m, " pub trait {} : {}", bound.trait_name(), bound).unwrap();
-            for other in &self.bounds {
-                if other.count() <= 1 {
-                    continue;
-                }
-                if bound != other && bound.superset(other) {
-                    write!(m, " + {}", other.trait_name()).unwrap();
-                }
-            }
-            write!(
-                m,
-                " {{}} impl<T: {}> {} for T {{}}",
-                bound,
-                bound.trait_name(),
-            )
-            .unwrap();
-        }
-        if self.stdout_error {
-            m.push_str(" pub static mut STDOUT_ERROR: i32 = 0;");
-        }
-        if self.stderr_error {
-            m.push_str(" pub static mut STDERR_ERROR: i32 = 0;");
-        }
-        for lib_item in &self.lib_items {
-            m.push_str(LIB_ITEMS[lib_item]);
-        }
-        for s in self.parsing_fns.values() {
-            m.push_str(s);
-        }
-        m.push('}');
-        m
-    }
-}
+pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    // let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
-pub fn replace_io(dir: &std::path::Path, lib_name: &str, tcx: TyCtxt<'_>) -> TransformationResult {
-    let mut res = run(tcx);
-    let start = std::time::Instant::now();
-    write_to_files(&res, dir, lib_name);
-    res.transformation_time += start.elapsed().as_millis();
-    res
-}
-
-pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
     let arena = Arena::new();
     let analysis_res = file_analysis::analyze(&arena, tcx);
 
@@ -542,65 +463,56 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
         }
     }
 
-    let mut tmpfile = false;
-    let mut bounds = FxHashSet::default();
-    let mut bound_num = 0;
-    let mut unsupported_reasons = vec![];
-    let mut lib_items = FxHashSet::default();
-    let mut parsing_fns = FxHashMap::default();
-
-    let res = utils::ast::transform_ast(
-        |krate| {
-            let mut visitor = TransformVisitor {
-                tcx,
-                type_arena: &type_arena,
-                analysis_res: &analysis_res,
-                hir: &hir_ctx,
-
-                error_returning_fns: &error_returning_fns,
-                error_taking_fns: &error_taking_fns,
-                tracked_loc_to_index: &tracked_loc_to_index,
-
-                hir_loc_to_loc_id: &hir_loc_to_loc_id,
-
-                param_to_loc: &param_to_hir_loc,
-                loc_to_pot: &hir_loc_to_pot,
-                api_ident_spans: &api_ident_spans,
-                uncopiable: &uncopiable,
-                manually_drop_projections: &manually_drop_projections,
-
-                unsupported: &mut unsupported,
-                unsupported_returns: &unsupported_returns,
-                is_stdin_unsupported,
-                is_stdout_unsupported,
-                is_stderr_unsupported,
-
-                updated: false,
-                tmpfile: false,
-                current_fns: vec![],
-                bounds: vec![],
-                bound_num: 0,
-                lib_items: RefCell::new(vec![]),
-                parsing_fns: RefCell::new(vec![]),
-                guards: FxHashSet::default(),
-                foreign_statics: FxHashSet::default(),
-                unsupported_reasons: vec![],
-            };
-            visitor.visit_crate(krate);
-
-            tmpfile |= visitor.tmpfile;
-            bounds.extend(visitor.bounds);
-            bound_num += visitor.bound_num;
-            lib_items.extend(visitor.lib_items.into_inner());
-            parsing_fns.extend(visitor.parsing_fns.into_inner());
-            unsupported_reasons.extend(visitor.unsupported_reasons);
-
-            visitor.updated
-        },
+    let mut visitor = TransformVisitor {
         tcx,
-    );
+        type_arena: &type_arena,
+        analysis_res: &analysis_res,
+        hir: &hir_ctx,
+
+        error_returning_fns: &error_returning_fns,
+        error_taking_fns: &error_taking_fns,
+        tracked_loc_to_index: &tracked_loc_to_index,
+
+        hir_loc_to_loc_id: &hir_loc_to_loc_id,
+
+        param_to_loc: &param_to_hir_loc,
+        loc_to_pot: &hir_loc_to_pot,
+        api_ident_spans: &api_ident_spans,
+        uncopiable: &uncopiable,
+        manually_drop_projections: &manually_drop_projections,
+
+        unsupported: &mut unsupported,
+        unsupported_returns: &unsupported_returns,
+        is_stdin_unsupported,
+        is_stdout_unsupported,
+        is_stderr_unsupported,
+
+        updated: false,
+        tmpfile: false,
+        current_fns: vec![],
+        bounds: FxHashSet::default(),
+        bound_num: 0,
+        lib_items: RefCell::new(FxHashSet::default()),
+        parsing_fns: RefCell::new(FxHashMap::default()),
+        guards: FxHashSet::default(),
+        foreign_statics: FxHashSet::default(),
+        unsupported_reasons: vec![],
+    };
+    visitor.visit_crate(&mut krate);
 
     let transformation_time = start.elapsed().as_millis();
+
+    let TransformVisitor {
+        tmpfile,
+        bounds,
+        bound_num,
+        unsupported_reasons,
+        parsing_fns,
+        lib_items,
+        ..
+    } = visitor;
+    let parsing_fns = parsing_fns.into_inner();
+    let mut lib_items = lib_items.into_inner();
 
     if bounds
         .iter()
@@ -618,18 +530,95 @@ pub fn run(tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items.insert(LibItem::ChildClose);
     }
 
+    krate.items.push(rustc_ast::ptr::P(stdio_mod(
+        &bounds,
+        &lib_items,
+        &parsing_fns,
+        analysis_res.unsupported_stdout_errors,
+        analysis_res.unsupported_stderr_errors,
+    )));
+    if !krate.attrs.iter().any(|attr| {
+        if let rustc_ast::AttrKind::Normal(attr) = &attr.kind
+            && attr.item.path.segments.last().unwrap().ident.name == sym::feature
+            && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
+            && arg.as_str() == "formatting_options"
+        {
+            true
+        } else {
+            false
+        }
+    }) {
+        krate.attrs.push(utils::ast::make_inner_attribute(
+            sym::warn,
+            Symbol::intern("mutable_transmutes"),
+            tcx,
+        ));
+    }
+
+    let code = pprust::crate_to_string_for_macros(&krate);
     TransformationResult {
-        files: res.0,
+        code,
         tmpfile,
-        bounds,
-        stdout_error: analysis_res.unsupported_stdout_errors,
-        stderr_error: analysis_res.unsupported_stderr_errors,
-        lib_items,
-        parsing_fns,
         unsupported_reasons,
         bound_num,
         transformation_time,
         analysis_stat: analysis_res.stat,
+    }
+}
+
+fn stdio_mod(
+    bounds: &FxHashSet<TraitBound>,
+    lib_items: &FxHashSet<LibItem>,
+    parsing_fns: &FxHashMap<String, String>,
+    stdout_error: bool,
+    stderr_error: bool,
+) -> rustc_ast::Item {
+    let mut m = "mod stdio {".to_string();
+    for bound in bounds {
+        if bound.count() <= 1 {
+            continue;
+        }
+        write!(m, " pub trait {} : {}", bound.trait_name(), bound).unwrap();
+        for other in bounds {
+            if other.count() <= 1 {
+                continue;
+            }
+            if bound != other && bound.superset(other) {
+                write!(m, " + {}", other.trait_name()).unwrap();
+            }
+        }
+        write!(
+            m,
+            " {{}} impl<T: {}> {} for T {{}}",
+            bound,
+            bound.trait_name(),
+        )
+        .unwrap();
+    }
+    for lib_item in lib_items {
+        m.push_str(LIB_ITEMS[lib_item]);
+    }
+    for s in parsing_fns.values() {
+        m.push_str(s);
+    }
+    if stdout_error {
+        m.push_str(" pub static mut STDOUT_ERROR: i32 = 0;");
+    }
+    if stderr_error {
+        m.push_str(" pub static mut STDERR_ERROR: i32 = 0;");
+    }
+    m.push('}');
+    utils::item!("{m}")
+}
+
+pub fn add_tempfile(dir: &std::path::Path) {
+    let path = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&path).unwrap();
+    let mut doc = content.parse::<DocumentMut>().unwrap();
+    let dependencies = doc["dependencies"].as_table_mut().unwrap();
+    if !dependencies.contains_key("tempfile") {
+        dependencies["tempfile"] = toml_edit::value("3.19.1");
+        fs::write(path, doc.to_string()).unwrap();
     }
 }
 

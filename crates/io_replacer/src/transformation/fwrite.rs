@@ -21,7 +21,7 @@ impl TransformVisitor<'_, '_, '_> {
         let ptr = pprust::expr_to_string(ptr);
         let size = pprust::expr_to_string(size);
         let nitems = pprust::expr_to_string(nitems);
-        self.lib_items.borrow_mut().push(LibItem::Fwrite);
+        self.lib_items.borrow_mut().insert(LibItem::Fwrite);
         self.update_error_no_eof(
             ic,
             format!("crate::stdio::rs_fwrite({ptr}, {size}, {nitems}, {stream_str})"),

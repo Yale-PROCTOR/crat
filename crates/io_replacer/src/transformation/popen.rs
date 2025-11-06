@@ -9,7 +9,7 @@ impl TransformVisitor<'_, '_, '_> {
         let command = pprust::expr_to_string(command);
         let command = format!("std::ffi::CStr::from_ptr(({command}) as _).to_str().unwrap()");
         let mode = LikelyLit::from_expr(mode);
-        self.lib_items.borrow_mut().push(LibItem::Child);
+        self.lib_items.borrow_mut().insert(LibItem::Child);
         match is_popen_read(&mode) {
             Some(read) => {
                 let field = if read { "stdout" } else { "stdin" };

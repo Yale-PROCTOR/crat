@@ -43,11 +43,11 @@ impl TransformVisitor<'_, '_, '_> {
                 }
                 code.push(')');
                 self.lib_items.borrow_mut().extend(parsing_fn.lib_items);
-                self.lib_items.borrow_mut().push(LibItem::Peek);
-                self.lib_items.borrow_mut().push(LibItem::IsEof);
+                self.lib_items.borrow_mut().insert(LibItem::Peek);
+                self.lib_items.borrow_mut().insert(LibItem::IsEof);
                 self.parsing_fns
                     .borrow_mut()
-                    .push((parsing_fn.name, parsing_fn.code));
+                    .insert(parsing_fn.name, parsing_fn.code);
                 expr!("{}", code)
             }
             LikelyLit::If(_, _, _) => todo!(),
