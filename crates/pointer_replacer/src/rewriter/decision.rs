@@ -12,6 +12,8 @@ pub enum PtrKind {
     OptRef(bool),
     /// raw pointer: *mut T for Raw(true), or *const T for Raw(false)
     Raw(bool),
+    /// slice: &mut [T] for Slice(true), or &[T] for Slice(false)
+    Slice(bool),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -59,7 +61,7 @@ impl SigDecisions {
                 .function_facts(*did, rust_program.tcx) // output + inputs
                 .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable())) // No mutables behind shared refs
                 .collect::<IndexVec<Local, _>>();
-            let _array_pointers = analysis
+            let array_pointers = analysis
                 .fatness_result
                 .function_facts(*did, rust_program.tcx) // output + inputs
                 .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
@@ -83,9 +85,9 @@ impl SigDecisions {
                         None
                     }
                     // TODO: More precise filtering of array pointers
-                    // else if array_pointers[param] {
-                    //     None
-                    // }
+                    else if array_pointers[param] {
+                        Some(PtrKind::Slice(param_decl.ty.is_mutable_ptr()))
+                    }
                     else if promoted_shared_refs[param] {
                         Some(PtrKind::OptRef(false))
                     } else if promoted_mut_refs.contains(param) {
