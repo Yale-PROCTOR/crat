@@ -492,7 +492,6 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items: RefCell::new(FxHashSet::default()),
         parsing_fns: RefCell::new(FxHashMap::default()),
         guards: FxHashSet::default(),
-        foreign_statics: FxHashSet::default(),
         unsupported_reasons: vec![],
     };
     visitor.visit_crate(&mut krate);
@@ -531,9 +530,8 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         &bounds,
         &lib_items,
         &parsing_fns,
-        analysis_res.unsupported_stdout_errors,
-        analysis_res.unsupported_stderr_errors,
     )));
+
     if !krate.attrs.iter().any(|attr| {
         if let rustc_ast::AttrKind::Normal(attr) = &attr.kind
             && attr.item.path.segments.last().unwrap().ident.name == sym::feature
@@ -546,8 +544,25 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         }
     }) {
         krate.attrs.push(utils::ast::make_inner_attribute(
-            sym::warn,
-            Symbol::intern("mutable_transmutes"),
+            sym::feature,
+            Symbol::intern("formatting_options"),
+            tcx,
+        ));
+    }
+    if !krate.attrs.iter().any(|attr| {
+        if let rustc_ast::AttrKind::Normal(attr) = &attr.kind
+            && attr.item.path.segments.last().unwrap().ident.name == sym::feature
+            && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
+            && arg == sym::coverage_attribute
+        {
+            true
+        } else {
+            false
+        }
+    }) {
+        krate.attrs.push(utils::ast::make_inner_attribute(
+            sym::feature,
+            sym::coverage_attribute,
             tcx,
         ));
     }
@@ -567,15 +582,25 @@ fn stdio_mod(
     bounds: &FxHashSet<TraitBound>,
     lib_items: &FxHashSet<LibItem>,
     parsing_fns: &FxHashMap<String, String>,
-    stdout_error: bool,
-    stderr_error: bool,
 ) -> rustc_ast::Item {
     let mut m = "mod stdio {".to_string();
+    m.push_str(
+        r#"
+        pub static mut STDOUT_ERROR: i32 = 0;
+        pub static mut STDERR_ERROR: i32 = 0;
+        unsafe extern "C" {
+            #[link_name = "stdout"]
+            pub static mut STDOUT: *mut libc::c_void;
+            #[link_name = "stderr"]
+            pub static mut STDERR: *mut libc::c_void;
+        }
+        "#,
+    );
     for bound in bounds {
         if bound.count() <= 1 {
             continue;
         }
-        write!(m, " pub trait {} : {}", bound.trait_name(), bound).unwrap();
+        write!(m, "pub trait {} : {}", bound.trait_name(), bound).unwrap();
         for other in bounds {
             if other.count() <= 1 {
                 continue;
@@ -586,7 +611,7 @@ fn stdio_mod(
         }
         write!(
             m,
-            " {{}} impl<T: {}> {} for T {{}}",
+            "{{}} impl<T: {}> {} for T {{}}",
             bound,
             bound.trait_name(),
         )
@@ -597,12 +622,6 @@ fn stdio_mod(
     }
     for s in parsing_fns.values() {
         m.push_str(s);
-    }
-    if stdout_error {
-        m.push_str(" pub static mut STDOUT_ERROR: i32 = 0;");
-    }
-    if stderr_error {
-        m.push_str(" pub static mut STDERR_ERROR: i32 = 0;");
     }
     m.push('}');
     utils::item!("{m}")

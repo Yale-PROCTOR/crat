@@ -25,7 +25,7 @@ use utils::{
     expr,
     file::api_list::{self, Origin, Permission},
     ir::AstToHir,
-    item, param, stmt, ty, ty_param,
+    param, stmt, ty, ty_param,
 };
 
 use super::{
@@ -80,7 +80,6 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) lib_items: RefCell<FxHashSet<LibItem>>,
     pub(super) parsing_fns: RefCell<FxHashMap<String, String>>,
     pub(super) guards: FxHashSet<Symbol>,
-    pub(super) foreign_statics: FxHashSet<&'static str>,
     pub(super) unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
 }
 
@@ -392,45 +391,6 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_, '_> {
-    fn visit_crate(&mut self, c: &mut Crate) {
-        mut_visit::walk_crate(self, c);
-
-        if !self.foreign_statics.is_empty() {
-            let foreign_mod = c
-                .items
-                .iter_mut()
-                .find_map(|item| {
-                    if let ItemKind::ForeignMod(foreign_mod) = &mut item.kind {
-                        Some(foreign_mod)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap();
-            for name in self.foreign_statics.drain() {
-                if foreign_mod.items.iter().any(|item| {
-                    let ForeignItemKind::Static(box StaticItem { ident, .. }) = item.kind else {
-                        return false;
-                    };
-                    ident.as_str() == name
-                }) {
-                    continue;
-                }
-                let item = item!("static mut {}: *mut FILE;", name);
-                let ItemKind::Static(static_item) = item.kind else { panic!() };
-                let foreign_item = ForeignItem {
-                    attrs: item.attrs,
-                    id: item.id,
-                    span: item.span,
-                    vis: item.vis,
-                    kind: ForeignItemKind::Static(static_item),
-                    tokens: item.tokens,
-                };
-                foreign_mod.items.push(P(foreign_item));
-            }
-        }
-    }
-
     fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         if let Some(hir_item) = self.ast_to_hir.get_item(item.id, self.tcx)
             && let hir::ItemKind::Impl(imp) = hir_item.kind
@@ -1520,11 +1480,10 @@ impl TransformVisitor<'_, '_, '_> {
         let stream = pprust::expr_to_string(stream);
         let mut new_expr = String::new();
         if stdout {
-            self.foreign_statics.insert("stdout");
             if self.analysis_res.unsupported_stdout_errors {
                 write!(
                     new_expr,
-                    "if {stream} == stdout {{ let (___v, ___error) = crate::stdio::{rs_name}("
+                    "if {stream} == crate::stdio::STDOUT as _ {{ let (___v, ___error) = crate::stdio::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
@@ -1532,7 +1491,7 @@ impl TransformVisitor<'_, '_, '_> {
             } else {
                 write!(
                     new_expr,
-                    "if {stream} == stdout {{ crate::stdio::{rs_name}("
+                    "if {stream} == crate::stdio::STDOUT as _ {{ crate::stdio::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
@@ -1540,11 +1499,10 @@ impl TransformVisitor<'_, '_, '_> {
             }
         }
         if stderr {
-            self.foreign_statics.insert("stderr");
             if self.analysis_res.unsupported_stderr_errors {
                 write!(
                     new_expr,
-                    "if {stream} == stderr {{ let (___v, ___error) = crate::stdio::{rs_name}("
+                    "if {stream} == crate::stdio::STDERR as _ {{ let (___v, ___error) = crate::stdio::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
@@ -1552,7 +1510,7 @@ impl TransformVisitor<'_, '_, '_> {
             } else {
                 write!(
                     new_expr,
-                    "if {stream} == stderr {{ crate::stdio::{rs_name}("
+                    "if {stream} == crate::stdio::STDERR as _ {{ crate::stdio::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
@@ -1587,18 +1545,16 @@ impl TransformVisitor<'_, '_, '_> {
         }
         let mut new_expr = String::new();
         if stdout {
-            self.foreign_statics.insert("stdout");
             write!(
                 new_expr,
-                "if {stream} == stdout {{ crate::stdio::STDOUT_ERROR }} else ",
+                "if {stream} == crate::stdio::STDOUT as _ {{ crate::stdio::STDOUT_ERROR }} else ",
             )
             .unwrap();
         }
         if stderr {
-            self.foreign_statics.insert("stderr");
             write!(
                 new_expr,
-                "if {stream} == stderr {{ crate::stdio::STDERR_ERROR }} else ",
+                "if {stream} == crate::stdio::STDERR as _ {{ crate::stdio::STDERR_ERROR }} else ",
             )
             .unwrap();
         }

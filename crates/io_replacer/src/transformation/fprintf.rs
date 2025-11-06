@@ -164,7 +164,7 @@ impl TransformVisitor<'_, '_, '_> {
             expr!(
                 "{{
     use std::io::Write;
-    let string_to_print = format!(\"{}\", {}{});
+    let string_to_print = std::fmt::format(format_args!(\"{}\", {}{}));
     match write!({}, \"{{}}\", string_to_print) {{
         Ok(_) => string_to_print.len() as i32,
         Err(_) => {{

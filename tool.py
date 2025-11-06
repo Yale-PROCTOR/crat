@@ -102,7 +102,7 @@ TRANSFORMATIONS: Dict[str, Transformation] = {
         config=CONFIG_ROOT / "io",
     ),
     "io-post": Transformation(
-        dir=BENCH_ROOT / "rs-io",
+        dir=BENCH_ROOT / "rs-io-post",
         order="io",
         analysis=None,
         pass_="unsafe,unexpand,split,bin",
