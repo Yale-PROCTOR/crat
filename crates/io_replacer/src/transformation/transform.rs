@@ -487,7 +487,6 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         is_stdout_unsupported,
         is_stderr_unsupported,
 
-        updated: false,
         tmpfile: false,
         current_fns: vec![],
         bounds: FxHashSet::default(),

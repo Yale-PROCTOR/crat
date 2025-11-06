@@ -69,8 +69,6 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     /// is stderr unsupported
     pub(super) is_stderr_unsupported: bool,
 
-    /// is this file updated
-    pub(super) updated: bool,
     pub(super) tmpfile: bool,
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: FxHashSet<TraitBound>,
@@ -217,7 +215,6 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
 
     #[inline]
     fn replace_expr(&mut self, old: &mut Expr, new: Expr) {
-        self.updated = true;
         let span = old.span;
         *old = new;
         old.span = span;
@@ -234,7 +231,6 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
 
     #[inline]
     fn replace_ty(&mut self, old: &mut Ty, new: Ty) {
-        self.updated = true;
         let span = old.span;
         *old = new;
         old.span = span;
@@ -242,7 +238,6 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
 
     #[inline]
     fn replace_ident(&mut self, old: &mut Ident, new: Ident) {
-        self.updated = true;
         let span = old.span;
         *old = new;
         old.span = span;
@@ -545,7 +540,6 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             let stmt = stmt!("return {};", rv);
                             let stmts = &mut item.body.as_mut().unwrap().stmts;
                             stmts.push(stmt);
-                            self.updated = true;
                         }
                     }
                 }
@@ -554,7 +548,6 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                         let ind = self.tracked_loc_to_index[loc];
                         let param = param!("mut ___v_{}_{}: i32", ind, indicator);
                         item.sig.decl.inputs.push(param);
-                        self.updated = true;
                     }
                 }
                 if let Some(pot) = self.return_pot(def_id) {
@@ -679,7 +672,6 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                 self.bound_num += 1;
                 self.bounds.insert(bound);
             }
-            self.updated = true;
             local.ty = Some(P(ty!("{}", pot.ty)));
         }
 
@@ -1340,7 +1332,6 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                     let ind = self.tracked_loc_to_index[loc];
                                     let arg = expr!("___v_{}_{}", ind, indicator);
                                     args.push(P(arg));
-                                    self.updated = true;
                                 }
                             }
                             if let Some(returns) = self.error_returning_fns.get(def_id) {
