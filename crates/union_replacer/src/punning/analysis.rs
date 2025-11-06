@@ -215,9 +215,9 @@ fn print_dominance_relations<'a>(
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
-    println!("");
+    println!();
     print_union_uses_map(&union_uses_map);
-    println!("");
+    println!();
 
     for (def_id, union_uses) in &union_uses_map {
         println!("Dominance Relations for {def_id:?}");
