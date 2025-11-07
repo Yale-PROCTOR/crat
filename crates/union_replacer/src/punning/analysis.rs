@@ -4,6 +4,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlock, BasicBlocks, Body, Local, ProjectionElem, Rvalue, StatementKind,
+        traversal::Preorder,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -184,34 +185,60 @@ impl<'a> UnionUseInfo<'a> {
             .filter(|u| *u != *self && UnionUseInfo::dominates(self, u, basic_blocks))
             .collect()
     }
-
-    fn extract_relations(
-        union_uses: &HashSet<UnionUseInfo<'a>>,
-        basic_blocks: &BasicBlocks,
-    ) -> HashSet<(UnionUseInfo<'a>, UnionUseInfo<'a>)> {
-        let mut relations = HashSet::new();
-        for use1 in union_uses {
-            let dominated = use1.extract_dominated(union_uses, basic_blocks);
-            for use2 in dominated {
-                relations.insert((use1.clone(), use2));
-            }
-        }
-        relations
-    }
 }
 
-fn print_dominance_relations<'a>(
+fn collect_relations<'a>(
     union_uses: &HashSet<UnionUseInfo<'a>>,
-    def_id: LocalDefId,
-    tcx: TyCtxt<'a>,
-) {
-    let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-    let basic_blocks = &body.borrow().basic_blocks;
-    let relations = UnionUseInfo::extract_relations(union_uses, basic_blocks);
-    for (use1, use2) in relations {
-        println!("\t{use1:?}\n\t--> {use2:?}\n");
+    basic_blocks: &BasicBlocks,
+) -> HashSet<(UnionUseInfo<'a>, UnionUseInfo<'a>)> {
+    let mut relations = HashSet::new();
+    for use1 in union_uses {
+        let dominated = use1.extract_dominated(union_uses, basic_blocks);
+        for use2 in dominated {
+            relations.insert((use1.clone(), use2));
+        }
+    }
+    relations
+}
+
+impl<'a> UnionUseInfo<'a> {
+    /// Return if Use2 is reachable from Use1
+    fn reachable(use1: &UnionUseInfo, use2: &UnionUseInfo, body: &Body<'a>) -> bool {
+        if use1.basic_block == use2.basic_block {
+            use1.stmt_idx <= use2.stmt_idx
+        } else {
+            let preorder = Preorder::new(body, use1.basic_block);
+            preorder.into_iter().any(|(bb, _)| bb == use2.basic_block)
+        }
+    }
+
+    fn is_between_dominance(
+        &self,
+        dominator: &UnionUseInfo,
+        dominatee: &UnionUseInfo,
+        body: &Body<'a>,
+    ) -> Option<bool> {
+        if !UnionUseInfo::dominates(dominator, dominatee, &body.basic_blocks) {
+            None
+        } else {
+            Some(
+                UnionUseInfo::reachable(dominator, self, body)
+                    && UnionUseInfo::reachable(self, dominatee, body),
+            )
+        }
     }
 }
+
+// fn print_dominance_relations<'a>(
+//     union_uses: &HashSet<UnionUseInfo<'a>>,
+//     body: &Body<'a>,
+// ) {
+//     let basic_blocks = &body.basic_blocks;
+//     let relations = collect_relations(union_uses, basic_blocks);
+//     for (use1, use2) in relations {
+//         println!("\t{use1:?}\n\t--> {use2:?}\n");
+//     }
+// }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
@@ -221,7 +248,26 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
 
     for (def_id, union_uses) in &union_uses_map {
         println!("Dominance Relations for {def_id:?}");
-        print_dominance_relations(union_uses, *def_id, tcx);
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let body: &Body<'_> = &body.borrow();
+
+        let relations = collect_relations(union_uses, &body.basic_blocks);
+        for (use1, use2) in relations {
+            let between_uses: HashSet<_> = union_uses
+                .iter()
+                .filter(|u| {
+                    **u != use1
+                        && **u != use2
+                        && u.is_between_dominance(&use1, &use2, body).unwrap()
+                })
+                .collect();
+            println!("\t{use1:?}");
+            for between_use in between_uses {
+                println!("\t|-- {between_use:?}");
+            }
+            println!("\t|-> {use2:?}");
+            println!();
+        }
     }
     AnalysisResult {}
 }
