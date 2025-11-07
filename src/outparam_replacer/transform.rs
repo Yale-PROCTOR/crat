@@ -14,20 +14,20 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
-    MutTy, Node as HirNode, PatKind, Path as HirPath, QPath, TyKind as HirTyKind, def::Res,
-    definitions::DefPathData, intravisit,
+    Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, definitions::DefPathData,
+    intravisit,
 };
 use rustc_index::IndexVec;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, TerminatorKind},
-    ty::TyCtxt,
+    mir::{BasicBlock, Local, Location, TerminatorKind},
+    ty::{TyCtxt, TyKind as MirTyKind},
 };
 use rustc_span::{FileName, RealFileName, Span, def_id::LocalDefId};
 use utils::{
     ast::transform_ast,
     expr,
-    ir::{AstToHir, AstToHirMapper},
+    ir::{AstToHir, AstToHirMapper, HirToThir, ThirToMir, mir_ty_to_string},
     stmt, ty,
 };
 
@@ -78,7 +78,7 @@ struct Func {
     /// target return type after transformation
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
     /// spans where the parameter is fully written. empty for must parameters
-    write_spans: FxHashMap<ParamIdx, Vec<Span>>,
+    write_locs: FxHashMap<ParamIdx, Vec<Location>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,35 +174,25 @@ pub fn transform(
         path_to_mod_id.insert(path, mod_id);
     });
 
-    let source_map = tcx.sess.source_map();
-    let mut def_id_ty_map = FxHashMap::default();
-    for id in tcx.hir_free_items() {
-        let item = tcx.hir_item(id);
-        let HirItemKind::TyAlias(_, _, ty) = item.kind else {
-            continue;
-        };
-        let HirTyKind::Ptr(MutTy { ty, .. }) = ty.kind else {
-            continue;
-        };
-        let def_id = item.owner_id.to_def_id();
-        let ty = source_map.span_to_snippet(ty.span).unwrap();
-        def_id_ty_map.insert(def_id, ty);
-    }
-
     let mut hir_visitor = HirVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
+
+    let mut thir_to_mir = FxHashMap::default();
+    for def_id in tcx.hir_body_owners() {
+        thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
+    }
 
     let mut funcs = FxHashMap::default();
     let mut write_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
 
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        let HirItemKind::Fn { sig, body, .. } = item.kind else {
+        let HirItemKind::Fn { body, .. } = item.kind else {
             continue;
         };
 
-        let def_id = id.owner_id.to_def_id();
-        let local_def_id = def_id.as_local().unwrap();
+        let local_def_id = id.owner_id.def_id;
+        let def_id = local_def_id.to_def_id();
         let name = tcx.def_path_str(def_id);
         let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let hir_body = tcx.hir_body(body);
@@ -212,7 +202,7 @@ pub fn transform(
 
         let mut succ_param = None;
         let mut index_map: BTreeMap<_, _> = BTreeMap::new();
-        let mut write_spans: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut write_locs: FxHashMap<_, Vec<_>> = FxHashMap::default();
 
         for p in &fn_analysis_result.output_params {
             let OutputParam {
@@ -223,22 +213,14 @@ pub fn transform(
             } = p;
             let param = &hir_body.params[*index];
             let param_index = ParamIdx::from_usize(*index);
+            let mir_local = Local::from_usize(*index + 1);
             let PatKind::Binding(_, _hir_id, ident, _) = param.pat.kind else { unreachable!() };
             let name = ident.name.to_string();
 
-            let ty = &sig.decl.inputs[*index];
-            let ty_str = match ty.kind {
-                HirTyKind::Ptr(MutTy { ty, .. }) => source_map.span_to_snippet(ty.span).unwrap(),
-                HirTyKind::Path(QPath::Resolved(_, path)) => {
-                    let Res::Def(_, def_id) = path.res else {
-                        unreachable!("{:?}", ty);
-                    };
-                    def_id_ty_map
-                        .get(&def_id)
-                        .unwrap_or_else(|| panic!("{ty:?}"))
-                        .clone()
-                }
-                _ => unreachable!("{:?}", ty),
+            let mir_ty = mir_body.local_decls[mir_local].ty;
+            let ty_str = match mir_ty.kind() {
+                MirTyKind::RawPtr(ty, ..) => mir_ty_to_string(*ty, tcx),
+                _ => unreachable!("{mir_ty:?}"),
             };
 
             complete_writes.iter().for_each(|cw| {
@@ -247,20 +229,24 @@ pub fn transform(
                     statement_index,
                     write_arg,
                 } = cw;
-                let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*block)];
+                let block = BasicBlock::from_usize(*block);
+                let bbd = &mir_body.basic_blocks[block];
+                let loc = Location {
+                    block,
+                    statement_index: *statement_index,
+                };
                 if *statement_index == bbd.statements.len() {
                     let t = bbd.terminator();
                     assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{t:?}");
-                    let span = t.source_info.span;
+
                     if let Some(arg) = write_arg {
                         write_args
-                            .entry(span)
+                            .entry((local_def_id, loc))
                             .or_default()
                             .insert(ParamIdx::from_usize(*arg), name.clone());
                     }
                 } else {
-                    let write_span = bbd.statements[*statement_index].source_info.span;
-                    write_spans.entry(param_index).or_default().push(write_span);
+                    write_locs.entry(param_index).or_default().push(loc);
                 }
             });
 
@@ -309,11 +295,12 @@ pub fn transform(
             is_unit,
             index_map,
             return_tys,
-            write_spans,
+            write_locs,
         };
         funcs.insert(local_def_id, func);
     }
 
+    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let res = transform_ast(
         |krate| {
             let source_map = tcx.sess.source_map();
@@ -336,6 +323,8 @@ pub fn transform(
             let mut visitor = TransformVisitor {
                 tcx,
                 ast_to_hir: mapper.ast_to_hir,
+                hir_to_thir: &hir_to_thir,
+                thir_to_mir: &thir_to_mir,
                 funcs: &funcs,
                 current_fns: vec![],
                 write_args: &write_args,
@@ -354,10 +343,12 @@ pub fn transform(
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
+    hir_to_thir: &'a HirToThir,
+    thir_to_mir: &'a FxHashMap<LocalDefId, ThirToMir>,
     funcs: &'a FxHashMap<LocalDefId, Func>,
     current_fns: Vec<LocalDefId>,
-    /// at span, caller param named 'String' is used 'ParamIdx'th argument of call
-    write_args: &'a FxHashMap<Span, FxHashMap<ParamIdx, String>>,
+    /// at location, caller param named 'String' is used 'ParamIdx'th argument of call
+    write_args: &'a FxHashMap<(LocalDefId, Location), FxHashMap<ParamIdx, String>>,
     /// bound occurrence (ident) span to def_id
     bounds: &'a FxHashMap<Span, LocalDefId>,
     // maps spans of returns to calls inside them
@@ -386,10 +377,10 @@ impl TransformVisitor<'_, '_> {
         must: bool,
         rhs: String,
         index: ParamIdx,
-        span: Span,
+        loc: Location,
     ) -> String {
         let arg = pprust::expr_to_string(expr);
-        let write_args = self.write_args.get(&span);
+        let write_args = self.write_args.get(&(self.current_fn(), loc));
         let set_flag = if let Some(arg_to_param) = write_args
             && let Some(caller_param) = arg_to_param.get(&index)
         {
@@ -439,13 +430,29 @@ impl TransformVisitor<'_, '_> {
             format!("({})", ret_vals.join(", "))
         }
     }
+
+    fn get_mir_loc_for_expr(&self, expr_id: NodeId) -> Option<Location> {
+        let hir_expr = self.ast_to_hir.get_expr(expr_id, self.tcx)?;
+
+        let hir_id = hir_expr.hir_id;
+        let owner_id = hir_id.owner.def_id;
+
+        let thir_to_mir = self.thir_to_mir.get(&owner_id)?;
+
+        let thir_expr_id = self.hir_to_thir.exprs.get(&hir_expr.hir_id)?;
+
+        let mir_locs = thir_to_mir.expr_to_locs.get(thir_expr_id)?;
+
+        if mir_locs.len() == 1 {
+            Some(mir_locs[0])
+        } else {
+            // we expect only one mir location for expr (e.g., assignment, call)
+            None
+        }
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
-    fn visit_crate(&mut self, c: &mut Crate) {
-        mut_visit::walk_crate(self, c);
-    }
-
     fn visit_item(&mut self, item: &mut Item) {
         if !matches!(item.kind, ItemKind::Fn(_)) {
             mut_visit::walk_item(self, item);
@@ -458,9 +465,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .get_item(node_id, self.tcx)
             .unwrap_or_else(|| panic!("Failed to find HIR item to node {node_id:?}"));
         let local_def_id = hir_item.owner_id.def_id;
-
         self.current_fns.push(local_def_id);
-        println!("Visiting function item {local_def_id:?}");
+
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(box fn_item) = &mut item.kind
@@ -555,16 +561,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         match &mut expr.kind {
             ExprKind::Assign(box _lhs, box _rhs, _) => {
                 // Add flag updates for writes
-                let expr_span = expr.span;
                 let curr_fn = self.current_fn();
 
                 if let Some(func) = self.funcs.get(&curr_fn)
                     && !func.index_map.is_empty()
                 {
+                    let loc = self
+                        .get_mir_loc_for_expr(expr.id)
+                        .unwrap_or_else(|| panic!("Failed to find MIR location for assign expr"));
+
                     let mut flag_updates = vec![];
-                    for (p, spans) in &func.write_spans {
+                    for (p, locs) in &func.write_locs {
                         let param = &func.index_map[p];
-                        if !param.must && spans.contains(&expr_span) {
+                        if !param.must && locs.contains(&loc) {
                             let update = format!("{}___s = true", param.name);
                             flag_updates.push(update);
                         }
@@ -612,7 +621,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     && let Some(func) = self.funcs.get(def_id)
                     && !func.index_map.is_empty()
                 {
-                    println!("Transforming call to function {def_id:?}");
+                    let loc = self
+                        .get_mir_loc_for_expr(expr.id)
+                        .unwrap_or_else(|| panic!("Failed to find MIR location for call expr"));
+
                     let ret_tys = &func.return_tys;
                     // binds return values of a call to rv___, rv___1, ...
                     let mut bindings = vec![];
@@ -634,8 +646,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 } else {
                                     format!("rv___{}", ridx.index())
                                 };
-                                let assign =
-                                    self.get_assign(arg, true, rhs.clone(), index, expr.span);
+                                let assign = self.get_assign(arg, true, rhs.clone(), index, loc);
                                 assign_ret.push(assign);
                                 bindings.push(rhs);
                             }
@@ -647,8 +658,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 } else {
                                     format!("rv___{}", ridx.index())
                                 };
-                                let assign =
-                                    self.get_assign(arg, false, rhs.clone(), index, expr.span);
+                                let assign = self.get_assign(arg, false, rhs.clone(), index, loc);
                                 assign_ret.push(assign);
                                 bindings.push(rhs);
                             }
@@ -662,7 +672,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                     true,
                                     "v___".to_string(),
                                     index,
-                                    expr.span,
+                                    loc,
                                 ));
                             }
                         }
@@ -739,23 +749,17 @@ impl<'tcx> HirVisitor<'tcx> {
         self.bounds.insert(span, def_id);
     }
 
-    fn get_parent(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
-        let HirNode::Expr(e) = self.tcx.parent_hir_node(hir_id) else {
-            return None;
-        };
-        match e.kind {
-            HirExprKind::DropTemps(_) | HirExprKind::Cast(_, _) => self.get_parent(e.hir_id),
-            _ => Some(e),
-        }
-    }
-
     fn get_parent_return(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
-        let parent = self.get_parent(hir_id)?;
-        if let HirExprKind::Ret(_) = parent.kind {
-            Some(parent)
-        } else {
-            self.get_parent_return(parent.hir_id)
+        for (_, parent) in self.tcx.hir_parent_iter(hir_id) {
+            let HirNode::Expr(e) = parent else {
+                return None;
+            };
+
+            if matches!(e.kind, HirExprKind::Ret(_)) {
+                return Some(e);
+            }
         }
+        None
     }
 }
 

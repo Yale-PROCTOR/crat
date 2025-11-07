@@ -4,6 +4,7 @@ use rustc_hir::definitions::DefPathData;
 use rustc_middle::{
     mir::{Body, TerminatorKind},
     query::IntoQueryParam,
+    ty,
     ty::TyCtxt,
 };
 use rustc_span::{Symbol, def_id::DefId, sym};
@@ -26,6 +27,136 @@ pub fn is_option(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
 #[inline]
 pub fn with_tcx<R, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> R>(f: F) -> R {
     rustc_middle::ty::tls::with_opt(|tcx| f(tcx.unwrap()))
+}
+
+#[inline]
+pub fn mir_ty_to_string<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
+    let mut buf = String::new();
+    format_mir_ty(&mut buf, ty, tcx).unwrap();
+    buf
+}
+
+pub fn format_mir_ty<'tcx, W: std::fmt::Write>(
+    out: &mut W,
+    ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> std::fmt::Result {
+    use ty::*;
+    match ty.kind() {
+        TyKind::Bool => write!(out, "bool"),
+        TyKind::Char => write!(out, "char"),
+        TyKind::Int(IntTy::Isize) => write!(out, "isize"),
+        TyKind::Int(IntTy::I8) => write!(out, "i8"),
+        TyKind::Int(IntTy::I16) => write!(out, "i16"),
+        TyKind::Int(IntTy::I32) => write!(out, "i32"),
+        TyKind::Int(IntTy::I64) => write!(out, "i64"),
+        TyKind::Int(IntTy::I128) => write!(out, "i128"),
+        TyKind::Uint(UintTy::Usize) => write!(out, "usize"),
+        TyKind::Uint(UintTy::U8) => write!(out, "u8"),
+        TyKind::Uint(UintTy::U16) => write!(out, "u16"),
+        TyKind::Uint(UintTy::U32) => write!(out, "u32"),
+        TyKind::Uint(UintTy::U64) => write!(out, "u64"),
+        TyKind::Uint(UintTy::U128) => write!(out, "u128"),
+        TyKind::Float(FloatTy::F16) => write!(out, "f16"),
+        TyKind::Float(FloatTy::F32) => write!(out, "f32"),
+        TyKind::Float(FloatTy::F64) => write!(out, "f64"),
+        TyKind::Float(FloatTy::F128) => write!(out, "f128"),
+        TyKind::Adt(adt_def, args) => {
+            let path_str = tcx.def_path_str(adt_def.did());
+            if path_str.starts_with("std") {
+                write!(out, "{path_str}",)?;
+            } else {
+                write!(out, "crate::{}", tcx.def_path_str(adt_def.did()))?;
+            }
+            if !args.is_empty() {
+                write!(out, "<")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(out, ", ")?;
+                    }
+                    match arg.kind() {
+                        GenericArgKind::Type(ty) => format_mir_ty(out, ty, tcx)?,
+                        GenericArgKind::Const(cnst) => write!(out, "{cnst}")?,
+                        GenericArgKind::Lifetime(_) => write!(out, "'_")?,
+                    }
+                }
+                write!(out, ">")?;
+            }
+            Ok(())
+        }
+        TyKind::Foreign(def_id) => write!(out, "crate::{}", tcx.def_path_str(*def_id)),
+        TyKind::Str => write!(out, "str"),
+        TyKind::Array(ty, cnst) => {
+            write!(out, "[")?;
+            format_mir_ty(out, *ty, tcx)?;
+            write!(out, "; {cnst}]")
+        }
+        TyKind::Pat(..) => todo!(),
+        TyKind::Slice(ty) => {
+            write!(out, "[")?;
+            format_mir_ty(out, *ty, tcx)?;
+            write!(out, "]")
+        }
+        TyKind::RawPtr(ty, mutability) => {
+            let m = match mutability {
+                Mutability::Mut => "mut",
+                Mutability::Not => "const",
+            };
+            write!(out, "*{m} ")?;
+            format_mir_ty(out, *ty, tcx)
+        }
+        TyKind::Ref(_, ty, mutability) => {
+            write!(out, "&")?;
+            if *mutability == Mutability::Mut {
+                write!(out, "mut ")?;
+            }
+            format_mir_ty(out, *ty, tcx)
+        }
+        TyKind::FnDef(..) => todo!(),
+        TyKind::FnPtr(ty_binder, header) => {
+            if header.safety.is_unsafe() {
+                write!(out, "unsafe ")?;
+            }
+            if !header.abi.is_rustic_abi() {
+                write!(out, "extern \"{}\" ", header.abi.name())?;
+            }
+
+            write!(out, "fn")?;
+            let ty = ty_binder.skip_binder();
+            write!(out, "(")?;
+            for (i, arg_ty) in ty.inputs().iter().enumerate() {
+                if i > 0 {
+                    write!(out, ", ")?;
+                }
+                format_mir_ty(out, *arg_ty, tcx)?;
+            }
+            write!(out, ") -> ")?;
+            format_mir_ty(out, ty.output(), tcx)
+        }
+        TyKind::UnsafeBinder(..) => todo!(),
+        TyKind::Dynamic(..) => todo!(),
+        TyKind::Closure(..) => todo!(),
+        TyKind::CoroutineClosure(..) => todo!(),
+        TyKind::Coroutine(..) => todo!(),
+        TyKind::CoroutineWitness(..) => todo!(),
+        TyKind::Never => todo!(),
+        TyKind::Tuple(tys) => {
+            write!(out, "(")?;
+            for (i, ty) in tys.iter().enumerate() {
+                if i > 0 {
+                    write!(out, ", ")?;
+                }
+                format_mir_ty(out, ty, tcx)?;
+            }
+            write!(out, ")")
+        }
+        TyKind::Alias(..) => todo!(),
+        TyKind::Param(..) => todo!(),
+        TyKind::Bound(..) => todo!(),
+        TyKind::Placeholder(..) => todo!(),
+        TyKind::Infer(..) => todo!(),
+        TyKind::Error(..) => panic!(),
+    }
 }
 
 #[inline]
