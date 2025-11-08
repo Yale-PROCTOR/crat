@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BasicBlocks, Body, Local, ProjectionElem, Rvalue, StatementKind,
-        traversal::Preorder,
+        AggregateKind, BasicBlock, BasicBlocks, Body, Local, Place, ProjectionElem, Rvalue,
+        StatementKind, traversal::Preorder,
     },
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TypingEnv},
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -14,10 +14,12 @@ use rustc_span::def_id::LocalDefId;
 pub struct AnalysisResult {}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
+/// Union Place, Union Type, Field Projection
+// ### TODO: Remove Ty from this enum (as it is only for debug logging)
 enum UnionUseKind<'a> {
-    InitUnion(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
-    WriteField(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
-    ReadField(TyKind<'a>, ProjectionElem<Local, Ty<'a>>),
+    InitUnion(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
+    WriteField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
+    ReadField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -32,9 +34,15 @@ struct UnionUseInfo<'a> {
 impl<'a> std::fmt::Debug for UnionUseKind<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnionUseKind::InitUnion(ty, proj) => write!(f, "InitUnion({ty:?}, {proj:?})"),
-            UnionUseKind::WriteField(ty, proj) => write!(f, "WriteField({ty:?}, {proj:?})"),
-            UnionUseKind::ReadField(ty, proj) => write!(f, "ReadField({ty:?}, {proj:?})"),
+            UnionUseKind::InitUnion(place, ty, proj) => {
+                write!(f, "InitUnion({place:?}, {ty:?}, {proj:?})")
+            }
+            UnionUseKind::WriteField(place, ty, proj) => {
+                write!(f, "WriteField({place:?}, {ty:?}, {proj:?})")
+            }
+            UnionUseKind::ReadField(place, ty, proj) => {
+                write!(f, "ReadField({place:?}, {ty:?}, {proj:?})")
+            }
         }
     }
 }
@@ -94,12 +102,10 @@ fn collect_union_uses<'a>(
                             op_type,
                             place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
                         );
-
+                        let ty = place.ty(body, tcx).ty;
                         union_uses.insert(UnionUseInfo {
-                            kind: UnionUseKind::InitUnion(
-                                *place.ty(body, tcx).ty.kind(),
-                                project_elem,
-                            ),
+                            // kind: UnionUseKind::InitUnion(place.ty(body, tcx).ty, project_elem),
+                            kind: UnionUseKind::InitUnion(*place, ty, project_elem),
                             basic_block: bb,
                             stmt_idx,
                             // statement: stmt.clone(),
@@ -112,7 +118,9 @@ fn collect_union_uses<'a>(
                         if place_ref.ty(body, tcx).ty.is_union() {
                             union_uses.insert(UnionUseInfo {
                                 kind: UnionUseKind::WriteField(
-                                    *place_ref.ty(body, tcx).ty.kind(),
+                                    // place_ref.ty(body, tcx).ty,
+                                    place_ref.to_place(tcx),
+                                    place_ref.ty(body, tcx).ty,
                                     project_elem,
                                 ),
                                 basic_block: bb,
@@ -129,7 +137,9 @@ fn collect_union_uses<'a>(
                             if rplace_ref.ty(body, tcx).ty.is_union() {
                                 union_uses.insert(UnionUseInfo {
                                     kind: UnionUseKind::ReadField(
-                                        *rplace_ref.ty(body, tcx).ty.kind(),
+                                        // rplace_ref.ty(body, tcx).ty,
+                                        rplace_ref.to_place(tcx),
+                                        rplace_ref.ty(body, tcx).ty,
                                         project_elem,
                                     ),
                                     basic_block: bb,
@@ -240,6 +250,50 @@ impl<'a> UnionUseInfo<'a> {
 //     }
 // }
 
+impl<'a> UnionUseKind<'a> {
+    fn is_punning(
+        write_use: &UnionUseKind<'a>,
+        read_use: &UnionUseKind<'a>,
+        def_id: LocalDefId,
+        tcx: TyCtxt<'a>,
+    ) -> (bool, u64) {
+        match read_use {
+            UnionUseKind::ReadField(u1, tu, proj1) => match write_use {
+                UnionUseKind::WriteField(u2, _, proj2) | UnionUseKind::InitUnion(u2, _, proj2) => {
+                    if u1 != u2 || proj1 == proj2 {
+                        (false, 0)
+                    } else {
+                        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+                        let body: &Body<'_> = &body.borrow();
+                        let typing_env = TypingEnv::post_analysis(tcx, def_id);
+                        let t1 = u1.project_deeper(&[*proj1], tcx).ty(body, tcx).ty;
+                        let t2 = u2.project_deeper(&[*proj2], tcx).ty(body, tcx).ty;
+
+                        let is_sized1 = t1.is_sized(tcx, typing_env);
+                        let is_sized2 = t2.is_sized(tcx, typing_env);
+                        let is_sized_u = tu.is_sized(tcx, typing_env);
+                        if !is_sized1 || !is_sized2 || !is_sized_u {
+                            return (false, 0);
+                        }
+
+                        let layout1 = tcx.layout_of(typing_env.as_query_input(t1)).unwrap();
+                        let layout2 = tcx.layout_of(typing_env.as_query_input(t2)).unwrap();
+                        let layout_u = tcx.layout_of(typing_env.as_query_input(*tu)).unwrap();
+
+                        (
+                            layout1.size.bytes() == layout2.size.bytes()
+                                && layout1.size.bytes() == layout_u.size.bytes(),
+                            layout1.size.bytes(),
+                        )
+                    }
+                }
+                _ => (false, 0),
+            },
+            _ => (false, 0),
+        }
+    }
+}
+
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
     println!();
@@ -266,6 +320,13 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
                 println!("\t|-- {between_use:?}");
             }
             println!("\t|-> {use2:?}");
+            let (is_punning, size) = UnionUseKind::is_punning(&use1.kind, &use2.kind, *def_id, tcx);
+            let s = if is_punning {
+                format!("Punning of {size} bytes")
+            } else {
+                "No Punning".to_string()
+            };
+            println!("\t{s}");
             println!();
         }
     }
