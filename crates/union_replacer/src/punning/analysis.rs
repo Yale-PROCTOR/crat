@@ -170,6 +170,7 @@ fn print_union_uses_map<'a>(union_uses: &HashMap<LocalDefId, HashSet<UnionUseInf
     }
 }
 
+// ### TODO: Dominance and Reachability only for the same Place
 impl<'a> UnionUseInfo<'a> {
     /// Return if Use1 dominates Use2
     /// - Ignore unreachable basic blocks for now
@@ -212,6 +213,7 @@ fn collect_relations<'a>(
 }
 
 impl<'a> UnionUseInfo<'a> {
+    // ### TODO: Reachablility for the same Place
     /// Return if Use2 is reachable from Use1
     fn reachable(use1: &UnionUseInfo, use2: &UnionUseInfo, body: &Body<'a>) -> bool {
         if use1.basic_block == use2.basic_block {
@@ -251,16 +253,32 @@ impl<'a> UnionUseInfo<'a> {
 // }
 
 impl<'a> UnionUseKind<'a> {
+    // ### TODO: Improve Logic
+    //     InitUnion(_16, src::lib::C2RustUnnamed, Field(0, f64)) at bb1-14
+    //     |-- WriteField(_16, src::lib::C2RustUnnamed, Field(1, u64)) at bb29-5
+    //     |-- WriteField(_16, src::lib::C2RustUnnamed, Field(1, u64)) at bb30-1
+    //     |-> ReadField(_16, src::lib::C2RustUnnamed, Field(0, f64)) at bb30-6
+    //     No Punning
+    // Take care of above case --> Between set should also be considered
+
     fn is_punning(
         write_use: &UnionUseKind<'a>,
         read_use: &UnionUseKind<'a>,
+        between_set: &HashSet<&UnionUseInfo<'a>>,
         def_id: LocalDefId,
         tcx: TyCtxt<'a>,
     ) -> (bool, u64) {
         match read_use {
             UnionUseKind::ReadField(u1, tu, proj1) => match write_use {
                 UnionUseKind::WriteField(u2, _, proj2) | UnionUseKind::InitUnion(u2, _, proj2) => {
-                    if u1 != u2 || proj1 == proj2 {
+                    if u1 != u2
+                        || (proj1 == proj2
+                            && between_set.iter().all(|u| match u.kind {
+                                UnionUseKind::InitUnion(_, _, p)
+                                | UnionUseKind::WriteField(_, _, p)
+                                | UnionUseKind::ReadField(_, _, p) => p == *proj2,
+                            }))
+                    {
                         (false, 0)
                     } else {
                         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
@@ -306,29 +324,78 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
         let body: &Body<'_> = &body.borrow();
 
         let relations = collect_relations(union_uses, &body.basic_blocks);
-        for (use1, use2) in relations {
-            let between_uses: HashSet<_> = union_uses
-                .iter()
-                .filter(|u| {
-                    **u != use1
-                        && **u != use2
-                        && u.is_between_dominance(&use1, &use2, body).unwrap()
-                })
-                .collect();
-            println!("\t{use1:?}");
-            for between_use in between_uses {
-                println!("\t|-- {between_use:?}");
-            }
-            println!("\t|-> {use2:?}");
-            let (is_punning, size) = UnionUseKind::is_punning(&use1.kind, &use2.kind, *def_id, tcx);
-            let s = if is_punning {
-                format!("Punning of {size} bytes")
-            } else {
-                "No Punning".to_string()
-            };
-            println!("\t{s}");
-            println!();
-        }
+        let punning_relations = relations
+            .clone()
+            .into_iter()
+            .filter_map(|(dominator, dominatee)| {
+                let between_set: HashSet<_> = union_uses
+                    .iter()
+                    .filter(|u| {
+                        **u != dominator
+                            && **u != dominatee
+                            && u.is_between_dominance(&dominator, &dominatee, body)
+                                .unwrap()
+                    })
+                    .collect();
+                let (is_punning, _) = UnionUseKind::is_punning(
+                    &dominator.kind,
+                    &dominatee.kind,
+                    &between_set,
+                    *def_id,
+                    tcx,
+                );
+                if !is_punning {
+                    None
+                } else {
+                    Some((dominatee, (dominator, between_set)))
+                }
+            })
+            .fold(HashMap::new(), |mut acc, (r, (w, between_set))| {
+                if let UnionUseKind::InitUnion(_, _, _) = w.kind {
+                    if between_set == union_uses.iter().filter(|u| **u != r && **u != w).collect() {
+                        acc.insert(r, (w, between_set));
+                        acc
+                    } else {
+                        acc
+                    }
+                } else {
+                    let (max_w, max_between_set) =
+                        acc.entry(r).or_insert((w.clone(), between_set.clone()));
+                    if *max_w == w || max_between_set.contains(&w) {
+                        acc
+                    } else if between_set.contains(max_w) {
+                        *max_w = w;
+                        *max_between_set = between_set;
+                        acc
+                    } else {
+                        todo!("Merge failed!")
+                    }
+                }
+            });
+        println!("\tPunning Relations {punning_relations:?}");
+        //     for (use1, use2) in relations {
+        //         let between_uses: HashSet<_> = union_uses
+        //             .iter()
+        //             .filter(|u| {
+        //                 **u != use1
+        //                     && **u != use2
+        //                     && u.is_between_dominance(&use1, &use2, body).unwrap()
+        //             })
+        //             .collect();
+        //         println!("\t{use1:?}");
+        //         for between_use in between_uses {
+        //             println!("\t|-- {between_use:?}");
+        //         }
+        //         println!("\t|-> {use2:?}");
+        //         let (is_punning, size) = UnionUseKind::is_punning(&use1.kind, &use2.kind, *def_id, tcx);
+        //         let s = if is_punning {
+        //             format!("Punning of {size} bytes")
+        //         } else {
+        //             "No Punning".to_string()
+        //         };
+        //         println!("\t{s}");
+        //         println!();
+        //     }
     }
     AnalysisResult {}
 }
