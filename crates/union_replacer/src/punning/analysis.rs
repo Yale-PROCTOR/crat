@@ -10,16 +10,61 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 
-#[derive(Debug, Clone)]
-pub struct AnalysisResult {}
+pub struct AnalysisResult<'a> {
+    pub punning_map: HashMap<LocalDefId, HashMap<Place<'a>, PunningInfo<'a>>>,
+}
+
+impl<'a> std::fmt::Debug for AnalysisResult<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (def_id, punning_infos) in &self.punning_map {
+            writeln!(f, "At Function {def_id:?}:")?;
+            for (place, info) in punning_infos {
+                writeln!(f, "For Place {place:?}, {info:?}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PunningInfo<'a> {
+    size: u64,
+    replacable_uses: HashSet<UnionUseInfo<'a>>,
+}
+
+impl<'a> std::fmt::Debug for PunningInfo<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let use_str = self
+            .replacable_uses
+            .iter()
+            .map(|u| format!("\t{u:?}\n"))
+            .collect::<Vec<String>>()
+            .join("");
+
+        write!(
+            f,
+            "Punning of {} bytes, Replacable uses:\n{}",
+            self.size, use_str
+        )
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 /// Union Place, Union Type, Field Projection
-// ### TODO: Remove Ty from this enum (as it is only for debug logging)
 enum UnionUseKind<'a> {
     InitUnion(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
     WriteField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
     ReadField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
+}
+
+impl<'a> UnionUseKind<'a> {
+    fn place(&self) -> &Place<'a> {
+        match self {
+            UnionUseKind::InitUnion(place, _, _) => place,
+            UnionUseKind::WriteField(place, _, _) => place,
+            UnionUseKind::ReadField(place, _, _) => place,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -112,7 +157,7 @@ fn collect_union_uses<'a>(
                         });
                     }
                 } else {
-                    // ### Ignore nested union accesses for both reads and writes for now
+                    // Ignore nested union accesses for both reads and writes for now
                     // Write to a Union Field (Some projection iteration of Lvalue is a Union)
                     for (place_ref, project_elem) in place.iter_projections() {
                         if place_ref.ty(body, tcx).ty.is_union() {
@@ -170,7 +215,6 @@ fn print_union_uses_map<'a>(union_uses: &HashMap<LocalDefId, HashSet<UnionUseInf
     }
 }
 
-// ### TODO: Dominance and Reachability only for the same Place
 impl<'a> UnionUseInfo<'a> {
     /// Return if Use1 dominates Use2
     /// - Ignore unreachable basic blocks for now
@@ -206,14 +250,15 @@ fn collect_relations<'a>(
     for use1 in union_uses {
         let dominated = use1.extract_dominated(union_uses, basic_blocks);
         for use2 in dominated {
-            relations.insert((use1.clone(), use2));
+            if use1.kind.place() == use2.kind.place() {
+                relations.insert((use1.clone(), use2));
+            }
         }
     }
     relations
 }
 
 impl<'a> UnionUseInfo<'a> {
-    // ### TODO: Reachablility for the same Place
     /// Return if Use2 is reachable from Use1
     fn reachable(use1: &UnionUseInfo, use2: &UnionUseInfo, body: &Body<'a>) -> bool {
         if use1.basic_block == use2.basic_block {
@@ -241,26 +286,7 @@ impl<'a> UnionUseInfo<'a> {
     }
 }
 
-// fn print_dominance_relations<'a>(
-//     union_uses: &HashSet<UnionUseInfo<'a>>,
-//     body: &Body<'a>,
-// ) {
-//     let basic_blocks = &body.basic_blocks;
-//     let relations = collect_relations(union_uses, basic_blocks);
-//     for (use1, use2) in relations {
-//         println!("\t{use1:?}\n\t--> {use2:?}\n");
-//     }
-// }
-
 impl<'a> UnionUseKind<'a> {
-    // ### TODO: Improve Logic
-    //     InitUnion(_16, src::lib::C2RustUnnamed, Field(0, f64)) at bb1-14
-    //     |-- WriteField(_16, src::lib::C2RustUnnamed, Field(1, u64)) at bb29-5
-    //     |-- WriteField(_16, src::lib::C2RustUnnamed, Field(1, u64)) at bb30-1
-    //     |-> ReadField(_16, src::lib::C2RustUnnamed, Field(0, f64)) at bb30-6
-    //     No Punning
-    // Take care of above case --> Between set should also be considered
-
     fn is_punning(
         write_use: &UnionUseKind<'a>,
         read_use: &UnionUseKind<'a>,
@@ -312,14 +338,14 @@ impl<'a> UnionUseKind<'a> {
     }
 }
 
-pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
+pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
     println!();
     print_union_uses_map(&union_uses_map);
     println!();
+    let mut result_map = HashMap::new();
 
     for (def_id, union_uses) in &union_uses_map {
-        println!("Dominance Relations for {def_id:?}");
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
         let body: &Body<'_> = &body.borrow();
 
@@ -331,13 +357,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
                 let between_set: HashSet<_> = union_uses
                     .iter()
                     .filter(|u| {
-                        **u != dominator
+                        u.kind.place() == dominator.kind.place()
+                            && **u != dominator
                             && **u != dominatee
                             && u.is_between_dominance(&dominator, &dominatee, body)
                                 .unwrap()
                     })
                     .collect();
-                let (is_punning, _) = UnionUseKind::is_punning(
+                let (is_punning, psize) = UnionUseKind::is_punning(
                     &dominator.kind,
                     &dominatee.kind,
                     &between_set,
@@ -347,20 +374,21 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
                 if !is_punning {
                     None
                 } else {
-                    Some((dominatee, (dominator, between_set)))
+                    Some((dominatee, psize, (dominator, between_set)))
                 }
             })
-            .fold(HashMap::new(), |mut acc, (r, (w, between_set))| {
+            .fold(HashMap::new(), |mut acc, (r, psize, (w, between_set))| {
                 if let UnionUseKind::InitUnion(_, _, _) = w.kind {
                     if between_set == union_uses.iter().filter(|u| **u != r && **u != w).collect() {
-                        acc.insert(r, (w, between_set));
+                        acc.insert(r, (psize, w, between_set));
                         acc
                     } else {
                         acc
                     }
                 } else {
-                    let (max_w, max_between_set) =
-                        acc.entry(r).or_insert((w.clone(), between_set.clone()));
+                    let (_, max_w, max_between_set) =
+                        acc.entry(r)
+                            .or_insert((psize, w.clone(), between_set.clone()));
                     if *max_w == w || max_between_set.contains(&w) {
                         acc
                     } else if between_set.contains(max_w) {
@@ -372,30 +400,57 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResult {
                     }
                 }
             });
-        println!("\tPunning Relations {punning_relations:?}");
-        //     for (use1, use2) in relations {
-        //         let between_uses: HashSet<_> = union_uses
-        //             .iter()
-        //             .filter(|u| {
-        //                 **u != use1
-        //                     && **u != use2
-        //                     && u.is_between_dominance(&use1, &use2, body).unwrap()
-        //             })
-        //             .collect();
-        //         println!("\t{use1:?}");
-        //         for between_use in between_uses {
-        //             println!("\t|-- {between_use:?}");
-        //         }
-        //         println!("\t|-> {use2:?}");
-        //         let (is_punning, size) = UnionUseKind::is_punning(&use1.kind, &use2.kind, *def_id, tcx);
-        //         let s = if is_punning {
-        //             format!("Punning of {size} bytes")
-        //         } else {
-        //             "No Punning".to_string()
-        //         };
-        //         println!("\t{s}");
-        //         println!();
-        //     }
+        // println!("Punning Relations {punning_relations:?}");
+
+        // Merge relations to Punning infos
+        let punning_infos: HashMap<Place<'_>, PunningInfo<'_>> = punning_relations
+            .into_iter()
+            .map(|(r, (psize, w, between_set))| {
+                let place = *r.kind.place();
+                let info = PunningInfo {
+                    size: psize,
+                    replacable_uses: {
+                        let mut set = HashSet::new();
+                        set.insert(r);
+                        set.insert(w);
+                        for u in between_set {
+                            set.insert(u.clone());
+                        }
+                        set
+                    },
+                };
+                (place, info)
+            })
+            .fold(HashMap::new(), |mut acc, (place, info)| {
+                match acc.get(&place) {
+                    Some(pre_info) => {
+                        if pre_info.size == info.size {
+                            acc.insert(
+                                place,
+                                PunningInfo {
+                                    size: info.size,
+                                    replacable_uses: pre_info
+                                        .replacable_uses
+                                        .union(&info.replacable_uses)
+                                        .cloned()
+                                        .collect(),
+                                },
+                            );
+                            acc
+                        } else {
+                            panic!("Merge failed")
+                        }
+                    }
+                    None => {
+                        acc.insert(place, info);
+                        acc
+                    }
+                }
+            });
+
+        result_map.insert(*def_id, punning_infos);
     }
-    AnalysisResult {}
+    AnalysisResult {
+        punning_map: result_map,
+    }
 }

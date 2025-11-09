@@ -5,7 +5,8 @@ pub fn replace_unions(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
-    let _ = super::analysis::analyze(tcx);
+    let analysis_result = super::analysis::analyze(tcx);
+    println!("{analysis_result:?}");
 
     pprust::crate_to_string_for_macros(&krate)
 }
