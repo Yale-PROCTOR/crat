@@ -16,11 +16,20 @@ pub struct AnalysisResult<'a> {
 
 impl<'a> std::fmt::Debug for AnalysisResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut nowrite = false;
         for (def_id, punning_infos) in &self.punning_map {
-            writeln!(f, "At Function {def_id:?}:")?;
-            for (place, info) in punning_infos {
-                writeln!(f, "For Place {place:?}, {info:?}")?;
+            if punning_infos.is_empty() {
+                continue;
+            } else {
+                nowrite = true;
+                writeln!(f, "At Function {def_id:?}:")?;
+                for (place, info) in punning_infos {
+                    writeln!(f, "For Place {place:?}, {info:?}")?;
+                }
             }
+        }
+        if !nowrite {
+            write!(f, "No Punnings")?;
         }
         Ok(())
     }
@@ -73,7 +82,6 @@ struct UnionUseInfo<'a> {
     kind: UnionUseKind<'a>,
     basic_block: BasicBlock,
     stmt_idx: usize,
-    // statement: Statement<'a>,
 }
 
 impl<'a> std::fmt::Debug for UnionUseKind<'a> {
@@ -94,11 +102,6 @@ impl<'a> std::fmt::Debug for UnionUseKind<'a> {
 
 impl<'a> std::fmt::Debug for UnionUseInfo<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // write!(
-        //     f,
-        //     "UnionUseInfo: kind: {:?}, location: {:?}-{:?}, statement: {:?}",
-        //     self.kind, self.basic_block, self.stmt_idx, self.statement
-        // )
         write!(
             f,
             "{:?} at {:?}-{:?}",
@@ -125,14 +128,14 @@ fn collect_union_uses<'a>(
     if tcx.def_kind(def_id) != DefKind::Fn {
         return None;
     }
-    println!("DEF: {def_id:?}");
+    // println!("DEF: {def_id:?}");
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let body: &Body<'_> = &body.borrow();
     for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        println!("\tBB: {bb:?}");
+        // println!("\tBB: {bb:?}");
         for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
             if let StatementKind::Assign(box (place, value)) = &stmt.kind {
-                println!("\t\tSTMT: {stmt:?}");
+                // println!("\t\tSTMT: {stmt:?}");
                 // Initialize a Union Field
                 if place.ty(body, tcx).ty.is_union() {
                     if let Rvalue::Aggregate(
@@ -149,11 +152,9 @@ fn collect_union_uses<'a>(
                         );
                         let ty = place.ty(body, tcx).ty;
                         union_uses.insert(UnionUseInfo {
-                            // kind: UnionUseKind::InitUnion(place.ty(body, tcx).ty, project_elem),
                             kind: UnionUseKind::InitUnion(*place, ty, project_elem),
                             basic_block: bb,
                             stmt_idx,
-                            // statement: stmt.clone(),
                         });
                     }
                 } else {
@@ -163,14 +164,12 @@ fn collect_union_uses<'a>(
                         if place_ref.ty(body, tcx).ty.is_union() {
                             union_uses.insert(UnionUseInfo {
                                 kind: UnionUseKind::WriteField(
-                                    // place_ref.ty(body, tcx).ty,
                                     place_ref.to_place(tcx),
                                     place_ref.ty(body, tcx).ty,
                                     project_elem,
                                 ),
                                 basic_block: bb,
                                 stmt_idx,
-                                // statement: stmt.clone(),
                             });
                         }
                     }
@@ -182,14 +181,12 @@ fn collect_union_uses<'a>(
                             if rplace_ref.ty(body, tcx).ty.is_union() {
                                 union_uses.insert(UnionUseInfo {
                                     kind: UnionUseKind::ReadField(
-                                        // rplace_ref.ty(body, tcx).ty,
                                         rplace_ref.to_place(tcx),
                                         rplace_ref.ty(body, tcx).ty,
                                         project_elem,
                                     ),
                                     basic_block: bb,
                                     stmt_idx,
-                                    // statement: stmt.clone(),
                                 });
                             }
                         }
@@ -197,7 +194,7 @@ fn collect_union_uses<'a>(
                 }
             }
         }
-        println!("\t\tTERM: {:?}", bbd.terminator().kind);
+        // println!("\t\tTERM: {:?}", bbd.terminator().kind);
     }
     if union_uses.is_empty() {
         None
@@ -217,7 +214,7 @@ fn print_union_uses_map<'a>(union_uses: &HashMap<LocalDefId, HashSet<UnionUseInf
 
 impl<'a> UnionUseInfo<'a> {
     /// Return if Use1 dominates Use2
-    /// - Ignore unreachable basic blocks for now
+    // Ignore unreachable basic blocks for now
     fn dominates(use1: &UnionUseInfo, use2: &UnionUseInfo, basic_blocks: &BasicBlocks) -> bool {
         if use1.basic_block == use2.basic_block {
             use1.stmt_idx <= use2.stmt_idx
@@ -287,7 +284,7 @@ impl<'a> UnionUseInfo<'a> {
 }
 
 impl<'a> UnionUseKind<'a> {
-    fn is_punning(
+    fn is_replacable_punning(
         write_use: &UnionUseKind<'a>,
         read_use: &UnionUseKind<'a>,
         between_set: &HashSet<&UnionUseInfo<'a>>,
@@ -297,6 +294,7 @@ impl<'a> UnionUseKind<'a> {
         match read_use {
             UnionUseKind::ReadField(u1, tu, proj1) => match write_use {
                 UnionUseKind::WriteField(u2, _, proj2) | UnionUseKind::InitUnion(u2, _, proj2) => {
+                    // Punning check by pattern matching and projection comparison
                     if u1 != u2
                         || (proj1 == proj2
                             && between_set.iter().all(|u| match u.kind {
@@ -307,6 +305,8 @@ impl<'a> UnionUseKind<'a> {
                     {
                         (false, 0)
                     } else {
+                        // Replacable check here
+                        // TODO: Check if to/from_bytes are implemented
                         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
                         let body: &Body<'_> = &body.borrow();
                         let typing_env = TypingEnv::post_analysis(tcx, def_id);
@@ -354,6 +354,8 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
             .clone()
             .into_iter()
             .filter_map(|(dominator, dominatee)| {
+                // Assume write dominates read and this relation is punning and replacable
+                // Collect (read, punning_size, (write, between_set))
                 let between_set: HashSet<_> = union_uses
                     .iter()
                     .filter(|u| {
@@ -364,7 +366,7 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
                                 .unwrap()
                     })
                     .collect();
-                let (is_punning, psize) = UnionUseKind::is_punning(
+                let (is_punning, psize) = UnionUseKind::is_replacable_punning(
                     &dominator.kind,
                     &dominatee.kind,
                     &between_set,
@@ -378,6 +380,7 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
                 }
             })
             .fold(HashMap::new(), |mut acc, (r, psize, (w, between_set))| {
+                // Merge punning relations (find maximum dominating write)
                 if let UnionUseKind::InitUnion(_, _, _) = w.kind {
                     if between_set == union_uses.iter().filter(|u| **u != r && **u != w).collect() {
                         acc.insert(r, (psize, w, between_set));
@@ -396,13 +399,14 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
                         *max_between_set = between_set;
                         acc
                     } else {
-                        todo!("Merge failed!")
+                        // Multiple dominators always form a chain
+                        unreachable!("Merge failed!")
                     }
                 }
             });
-        // println!("Punning Relations {punning_relations:?}");
 
-        // Merge relations to Punning infos
+        // For each place, union all replacable uses
+        // TODO: This drops maximum dominating write information for now -> Fix later if needed
         let punning_infos: HashMap<Place<'_>, PunningInfo<'_>> = punning_relations
             .into_iter()
             .map(|(r, (psize, w, between_set))| {
