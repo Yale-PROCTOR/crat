@@ -28,6 +28,7 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(ptr) {
             let array = pprust::expr_to_string(array);
             if signed {
+                self.bytemuck.set(true);
                 return expr!(
                     "
     {{
