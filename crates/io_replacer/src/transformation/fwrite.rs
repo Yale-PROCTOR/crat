@@ -29,10 +29,10 @@ impl TransformVisitor<'_, '_, '_> {
                 format!(
                     "
     {{
-        let size = {size};
+        let ___size = {size};
         crate::stdio::rs_fwrite(
-            bytemuck::cast_slice(&({array})[..(size * ({nitems})) as usize]),
-            size,
+            bytemuck::cast_slice(&({array})[..(___size * ({nitems})) as usize]),
+            ___size,
             {stream_str}
         )
     }}"
@@ -41,10 +41,10 @@ impl TransformVisitor<'_, '_, '_> {
                 format!(
                     "
     {{
-        let size = {size};
+        let ___size = {size};
         crate::stdio::rs_fwrite(
-            &({array})[..(size * ({nitems})) as usize],
-            size,
+            &({array})[..(___size * ({nitems})) as usize],
+            ___size,
             {stream_str}
         )
     }}"
@@ -58,10 +58,10 @@ impl TransformVisitor<'_, '_, '_> {
             format!(
                 "
     {{
-        let size = {size};
+        let ___size = {size};
         crate::stdio::rs_fwrite(
-            std::slice::from_raw_parts(({ptr_str}) as _, (size * ({nitems})) as usize),
-            size,
+            std::slice::from_raw_parts(({ptr_str}) as _, (___size * ({nitems})) as usize),
+            ___size,
             {stream_str}
         )
     }}"
