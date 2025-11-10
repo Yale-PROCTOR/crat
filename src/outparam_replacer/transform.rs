@@ -77,7 +77,7 @@ struct Func {
     index_map: BTreeMap<ParamIdx, Param>,
     /// target return type after transformation
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
-    /// spans where the parameter is fully written. empty for must parameters
+    /// locations where the parameter is fully written. empty for must parameters
     write_locs: FxHashMap<ParamIdx, Vec<Location>>,
 }
 
