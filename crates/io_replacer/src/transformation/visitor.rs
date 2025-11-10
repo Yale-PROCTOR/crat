@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Write as _,
     ops::{Deref, DerefMut},
 };
@@ -17,7 +17,7 @@ use rustc_hir::{
     def::Res,
     {self as hir},
 };
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::{ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym, symbol::Ident};
 use smallvec::smallvec;
 use utils::{
@@ -36,6 +36,7 @@ use super::{
     mir_loc::MirLoc,
     stream_ty::*,
     transform::LibItem,
+    unwrap_paren,
 };
 
 pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
@@ -73,7 +74,8 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     /// is stderr unsupported
     pub(super) is_stderr_unsupported: bool,
 
-    pub(super) tmpfile: bool,
+    pub(super) tempfile: bool,
+    pub(super) bytemuck: Cell<bool>,
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: FxHashSet<TraitBound>,
     pub(super) bound_num: usize,
@@ -388,6 +390,24 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
         let (ExprKind::Paren(e) | ExprKind::Field(e, _)) = &lhs.kind else { return false };
         self.should_prevent_drop(e)
     }
+
+    pub(super) fn i8_array_of_as_mut_ptr<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        if let rustc_ast::ExprKind::MethodCall(call) = &unwrap_paren(e).kind
+            && call.seg.ident.name.as_str() == "as_mut_ptr"
+            && let hir_e = self
+                .ast_to_hir
+                .get_expr(call.receiver.id, self.tcx)
+                .unwrap()
+            && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+            && let ty = typeck.expr_ty(hir_e)
+            && let ty::TyKind::Array(ty, _) = ty.kind()
+            && matches!(ty.kind(), ty::TyKind::Int(ty::IntTy::I8))
+        {
+            Some(&call.receiver)
+        } else {
+            None
+        }
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_, '_> {
@@ -695,7 +715,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                         "tmpfile" => {
                             let new_expr = self.transform_tmpfile();
                             self.replace_expr(expr, new_expr);
-                            self.tmpfile = true;
+                            self.tempfile = true;
                         }
                         "popen" => {
                             let new_expr = self.transform_popen(&args[0], &args[1]);

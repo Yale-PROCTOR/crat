@@ -1,4 +1,8 @@
-use std::{cell::RefCell, fmt::Write as _, fs};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Write as _,
+    fs,
+};
 
 use etrace::some_or;
 use lazy_static::lazy_static;
@@ -28,7 +32,8 @@ use super::{
 #[derive(Debug)]
 pub struct TransformationResult {
     pub code: String,
-    pub tmpfile: bool,
+    pub tempfile: bool,
+    pub bytemuck: bool,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
     pub bound_num: usize,
     pub transformation_time: u128,
@@ -485,7 +490,8 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         is_stdout_unsupported,
         is_stderr_unsupported,
 
-        tmpfile: false,
+        tempfile: false,
+        bytemuck: Cell::new(false),
         current_fns: vec![],
         bounds: FxHashSet::default(),
         bound_num: 0,
@@ -499,7 +505,8 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
     let transformation_time = start.elapsed().as_millis();
 
     let TransformVisitor {
-        tmpfile,
+        tempfile,
+        bytemuck,
         bounds,
         bound_num,
         unsupported_reasons,
@@ -570,7 +577,8 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
     let code = pprust::crate_to_string_for_macros(&krate);
     TransformationResult {
         code,
-        tmpfile,
+        tempfile,
+        bytemuck: bytemuck.get(),
         unsupported_reasons,
         bound_num,
         transformation_time,
@@ -627,15 +635,18 @@ fn stdio_mod(
     utils::item!("{m}")
 }
 
-pub fn add_tempfile(dir: &std::path::Path) {
+pub fn add_deps(dir: &std::path::Path, tempfile: bool, bytemuck: bool) {
     let path = dir.join("Cargo.toml");
     let content = fs::read_to_string(&path).unwrap();
     let mut doc = content.parse::<DocumentMut>().unwrap();
     let dependencies = doc["dependencies"].as_table_mut().unwrap();
-    if !dependencies.contains_key("tempfile") {
+    if tempfile && !dependencies.contains_key("tempfile") {
         dependencies["tempfile"] = toml_edit::value("3.19.1");
-        fs::write(path, doc.to_string()).unwrap();
     }
+    if bytemuck && !dependencies.contains_key("bytemuck") {
+        dependencies["bytemuck"] = toml_edit::value("1.24.0");
+    }
+    fs::write(path, doc.to_string()).unwrap();
 }
 
 fn mir_local_span(

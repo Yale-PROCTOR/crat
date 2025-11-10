@@ -407,9 +407,7 @@ fn main() {
             Pass::Io => {
                 let res = run_compiler_on_path(&file, io_replacer::replace_io).unwrap();
                 std::fs::write(&file, res.code).unwrap();
-                if res.tmpfile {
-                    io_replacer::add_tempfile(&dir);
-                }
+                io_replacer::add_deps(&dir, res.tempfile, res.bytemuck);
             }
             Pass::Pointer => {
                 let s =

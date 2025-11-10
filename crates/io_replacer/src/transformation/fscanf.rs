@@ -2,12 +2,15 @@ use std::{fmt::Write as _, ops::Deref};
 
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
+use rustc_middle::ty;
+use rustc_span::sym;
 use utils::expr;
 
 use super::{
     likely_lit::LikelyLit,
     stream_ty::*,
     transform::LibItem,
+    unwrap_paren,
     visitor::{IndicatorCheck, TransformVisitor},
 };
 
@@ -19,40 +22,119 @@ impl TransformVisitor<'_, '_, '_> {
         args: &[E],
         ic: IndicatorCheck<'_>,
     ) -> Expr {
-        let stream = stream.borrow_for(StreamTrait::BufRead);
-        let fmt = LikelyLit::from_expr(fmt);
-        match fmt {
-            LikelyLit::Lit(fmt) => {
-                // from rustc_ast/src/util/literal.rs
-                let s = fmt.as_str();
-                let mut buf = Vec::with_capacity(s.len());
-                rustc_literal_escaper::unescape_unicode(
-                    fmt.as_str(),
-                    rustc_literal_escaper::Mode::ByteStr,
-                    &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-                );
-                let specs = parse_specs(&buf);
-                let parsing_fn = make_parsing_function(&specs);
-                let err_eof_args = self.err_eof_args(ic);
-                let mut code = format!(
-                    "crate::stdio::{}({}, {}",
-                    parsing_fn.name, stream, err_eof_args
-                );
-                for arg in args.iter().take(parsing_fn.args_num) {
-                    write!(code, ", ({}) as *mut _", pprust::expr_to_string(arg)).unwrap();
-                }
-                code.push(')');
-                self.lib_items.borrow_mut().extend(parsing_fn.lib_items);
-                self.lib_items.borrow_mut().insert(LibItem::Peek);
-                self.lib_items.borrow_mut().insert(LibItem::IsEof);
-                self.parsing_fns
-                    .borrow_mut()
-                    .insert(parsing_fn.name, parsing_fn.code);
-                expr!("{}", code)
-            }
+        match LikelyLit::from_expr(fmt) {
+            LikelyLit::Lit(fmt) => self.transform_fscanf_fmt_lit(stream, fmt.as_str(), args, ic),
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(_, _) => todo!(),
             LikelyLit::Other(_) => todo!(),
+        }
+    }
+
+    fn transform_fscanf_fmt_lit<S: StreamExpr, E: Deref<Target = Expr>>(
+        &self,
+        stream: &S,
+        fmt: &str,
+        args: &[E],
+        ic: IndicatorCheck<'_>,
+    ) -> Expr {
+        let stream = stream.borrow_for(StreamTrait::BufRead);
+        // from rustc_ast/src/util/literal.rs
+        let mut buf = Vec::with_capacity(fmt.len());
+        rustc_literal_escaper::unescape_unicode(
+            fmt,
+            rustc_literal_escaper::Mode::ByteStr,
+            &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+        );
+        let specs = parse_specs(&buf);
+        let parsing_fn = make_parsing_function(&specs);
+        let err_eof_args = self.err_eof_args(ic);
+        let mut code = format!(
+            "crate::stdio::{}({}, {}",
+            parsing_fn.name, stream, err_eof_args
+        );
+        let mut i = 0;
+        let mut decls = String::new();
+        let mut assigns = String::new();
+        for (spec, arg) in specs.iter().filter(|spec| spec.assign).zip(args) {
+            match spec.ty() {
+                ConvTy::Scalar(spec_ty) => {
+                    if let ExprKind::MethodCall(call) = &unwrap_paren(arg).kind
+                        && call.seg.ident.name.as_str() == "map_or"
+                        && let ExprKind::MethodCall(call) = &unwrap_paren(&call.receiver).kind
+                        && call.seg.ident.name.as_str() == "as_deref_mut"
+                        && let hir_e = self
+                            .ast_to_hir
+                            .get_expr(call.receiver.id, self.tcx)
+                            .unwrap()
+                        && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+                        && let ty = typeck.expr_ty(hir_e)
+                        && let ty::TyKind::Adt(adt_def, gargs) = ty.kind()
+                        && self.tcx.item_name(adt_def.did()) == sym::Option
+                        && let [garg] = gargs[..]
+                        && let ty::GenericArgKind::Type(ty) = garg.kind()
+                        && let ty::TyKind::Ref(_, ty, _) = ty.kind()
+                        && ty.to_string() == spec_ty
+                    {
+                        write!(
+                            code,
+                            ", ({}).unwrap()",
+                            pprust::expr_to_string(&call.receiver)
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    if let ExprKind::AddrOf(_, _, e) = &unwrap_paren(arg).kind
+                        && let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap()
+                        && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+                        && let ty = typeck.expr_ty(hir_e).to_string()
+                        && ty == spec_ty
+                    {
+                        write!(code, ", &mut ({})", pprust::expr_to_string(e)).unwrap();
+                        continue;
+                    }
+                    write!(
+                        code,
+                        ", &mut *(({}) as *mut {})",
+                        pprust::expr_to_string(arg),
+                        spec_ty,
+                    )
+                    .unwrap();
+                }
+                ConvTy::String => {
+                    i += 1;
+                    write!(decls, "let mut ___v_{i} = Vec::new();").unwrap();
+                    write!(code, ", &mut ___v_{i}").unwrap();
+                    if let Some(array) = self.i8_array_of_as_mut_ptr(arg) {
+                        let arg = pprust::expr_to_string(array);
+                        write!(
+                            assigns,
+                            "{arg}[..___v_{i}.len()].copy_from_slice(&___v_{i}[..]);"
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    let arg = pprust::expr_to_string(arg);
+                    write!(
+                        assigns,
+                        "let ___buf: &mut [i8] =
+                            std::slice::from_raw_parts_mut(({arg}) as _, ___v_{i}.len());
+                        ___buf.copy_from_slice(&___v_{i}[..]);"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        code.push(')');
+        self.lib_items.borrow_mut().extend(parsing_fn.lib_items);
+        self.lib_items.borrow_mut().insert(LibItem::Peek);
+        self.lib_items.borrow_mut().insert(LibItem::IsEof);
+        self.parsing_fns
+            .borrow_mut()
+            .insert(parsing_fn.name, parsing_fn.code);
+        if decls.is_empty() && assigns.is_empty() {
+            expr!("{code}")
+        } else {
+            expr!("{{ {decls} let ___res = {code}; {assigns} ___res }}")
         }
     }
 }
@@ -60,7 +142,6 @@ impl TransformVisitor<'_, '_, '_> {
 struct ParsingFunction {
     name: String,
     code: String,
-    args_num: usize,
     lib_items: Vec<LibItem>,
 }
 
@@ -123,21 +204,17 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
             "".to_string()
         } else {
             i += 1;
-            write!(args, ", v{i}: *mut {ty}").unwrap();
-            let mut assign = match spec.conversion {
-                Conversion::Str | Conversion::ScanSet(_) => {
-                    format!(
-                        "        let len = _v.len();
-        let buf: &mut [u8] = std::slice::from_raw_parts_mut(v{i}, len + 1);
-        buf[..len].copy_from_slice(&_v);
-        buf[len] = 0;
-"
-                    )
+            let mut assign = match ty {
+                ConvTy::Scalar(ty) => {
+                    write!(args, ", v{i}: &mut {ty}").unwrap();
+                    format!("*v{i} = _v as {ty};\n")
                 }
-                Conversion::Double | Conversion::Seq => format!("        *v{i} = _v;\n"),
-                _ => format!("        *v{i} = _v as {ty};\n"),
+                ConvTy::String => {
+                    write!(args, ", v{i}: &mut Vec<i8>").unwrap();
+                    format!("v{i}.append(&mut _v); v{i}.push(0);")
+                }
             };
-            write!(assign, "        count += 1;").unwrap();
+            write!(assign, "count += 1;").unwrap();
             assign
         };
 
@@ -216,7 +293,7 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
         .unwrap();
         writeln!(
             body,
-            "    if let Some(_v) = _v {{
+            "    if let Some(mut _v) = _v {{
 {assign}
     }} else {{
         return count;
@@ -226,14 +303,13 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     }
     writeln!(body, "    count").unwrap();
     let code = format!(
-        "pub(crate) unsafe fn {name}<R: std::io::BufRead>({args}) -> i32 {{
+        "pub(crate) fn {name}<R: std::io::BufRead>({args}) -> i32 {{
 {body}}}
 "
     );
     ParsingFunction {
         name,
         code,
-        args_num: i,
         lib_items,
     }
 }
@@ -533,9 +609,9 @@ impl Conversion {
         matches!(self, Self::ScanSet { .. })
     }
 
-    fn ty(&self, length: Option<LengthMod>) -> &'static str {
+    fn ty(&self, length: Option<LengthMod>) -> ConvTy {
         use LengthMod::*;
-        match self {
+        let ty = match self {
             Self::Int10 | Self::Int0 => match length {
                 None => "i32",
                 Some(Char) => "i8",
@@ -557,7 +633,7 @@ impl Conversion {
                 Some(LongDouble) => "f128::f128",
                 _ => panic!(),
             },
-            Self::Str | Self::ScanSet { .. } => "u8",
+            Self::Str | Self::ScanSet { .. } => return ConvTy::String,
             Self::Seq => match length {
                 None => "i8",
                 Some(Long) => unimplemented!(),
@@ -566,8 +642,15 @@ impl Conversion {
             Self::Pointer | Self::C | Self::S | Self::Num | Self::Percent => {
                 unimplemented!()
             }
-        }
+        };
+        ConvTy::Scalar(ty)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConvTy {
+    Scalar(&'static str),
+    String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,7 +678,7 @@ impl std::fmt::Display for ConversionSpec {
 }
 
 impl ConversionSpec {
-    pub(super) fn ty(&self) -> &'static str {
+    fn ty(&self) -> ConvTy {
         self.conversion.ty(self.length)
     }
 }
@@ -770,8 +853,8 @@ fn parse_string<R: std::io::BufRead>(
     width: Option<usize>,
     mut err: Option<&mut i32>,
     mut eof: Option<&mut i32>,
-) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = Vec::new();
+) -> Option<Vec<i8>> {
+    let mut v: Vec<i8> = Vec::new();
     while width.is_none_or(|lim| v.len() < lim) {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff {
@@ -781,7 +864,7 @@ fn parse_string<R: std::io::BufRead>(
                 break;
             }
         } else {
-            v.push(c);
+            v.push(c as i8);
         }
         stream.consume(1);
     }
