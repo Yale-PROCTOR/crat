@@ -10,7 +10,7 @@ use super::{
     likely_lit::LikelyLit,
     stream_ty::*,
     transform::LibItem,
-    unwrap_paren,
+    unwrap_cast_and_paren,
     visitor::{IndicatorCheck, TransformVisitor},
 };
 
@@ -58,9 +58,10 @@ impl TransformVisitor<'_, '_, '_> {
         for (spec, arg) in specs.iter().filter(|spec| spec.assign).zip(args) {
             match spec.ty() {
                 ConvTy::Scalar(spec_ty) => {
-                    if let ExprKind::MethodCall(call) = &unwrap_paren(arg).kind
+                    if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(arg).kind
                         && call.seg.ident.name.as_str() == "map_or"
-                        && let ExprKind::MethodCall(call) = &unwrap_paren(&call.receiver).kind
+                        && let ExprKind::MethodCall(call) =
+                            &unwrap_cast_and_paren(&call.receiver).kind
                         && call.seg.ident.name.as_str() == "as_deref_mut"
                         && let hir_e = self
                             .ast_to_hir
@@ -83,7 +84,7 @@ impl TransformVisitor<'_, '_, '_> {
                         .unwrap();
                         continue;
                     }
-                    if let ExprKind::AddrOf(_, _, e) = &unwrap_paren(arg).kind
+                    if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
                         && let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap()
                         && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
                         && let ty = typeck.expr_ty(hir_e).to_string()
@@ -104,13 +105,23 @@ impl TransformVisitor<'_, '_, '_> {
                     i += 1;
                     write!(decls, "let mut ___v_{i} = Vec::new();").unwrap();
                     write!(code, ", &mut ___v_{i}").unwrap();
-                    if let Some(array) = self.i8_array_of_as_mut_ptr(arg) {
+                    if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(arg) {
                         let arg = pprust::expr_to_string(array);
-                        write!(
-                            assigns,
-                            "{arg}[..___v_{i}.len()].copy_from_slice(&___v_{i}[..]);"
-                        )
-                        .unwrap();
+                        if signed {
+                            write!(
+                                assigns,
+                                "({arg})[..___v_{i}.len()].copy_from_slice(&___v_{i}[..]);"
+                            )
+                            .unwrap();
+                        } else {
+                            self.bytemuck.set(true);
+                            write!(
+                                assigns,
+                                "bytemuck::cast_slice_mut(&mut ({arg})[..___v_{i}.len()])
+                                    .copy_from_slice(&___v_{i}[..]);"
+                            )
+                            .unwrap();
+                        }
                         continue;
                     }
                     let arg = pprust::expr_to_string(arg);

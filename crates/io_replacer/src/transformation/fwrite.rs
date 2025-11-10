@@ -18,20 +18,88 @@ impl TransformVisitor<'_, '_, '_> {
         ic: IndicatorCheck<'_>,
     ) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Write);
-        let ptr = pprust::expr_to_string(ptr);
+        let ptr_str = pprust::expr_to_string(ptr);
         let size = pprust::expr_to_string(size);
         let nitems = pprust::expr_to_string(nitems);
         self.lib_items.borrow_mut().insert(LibItem::Fwrite);
+
+        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(ptr) {
+            let array = pprust::expr_to_string(array);
+            let code = if signed {
+                format!(
+                    "
+    {{
+        let size = {size};
+        crate::stdio::rs_fwrite(
+            bytemuck::cast_slice(&({array})[..(size * ({nitems})) as usize]),
+            size,
+            {stream_str}
+        )
+    }}"
+                )
+            } else {
+                format!(
+                    "
+    {{
+        let size = {size};
+        crate::stdio::rs_fwrite(
+            &({array})[..(size * ({nitems})) as usize],
+            size,
+            {stream_str}
+        )
+    }}"
+                )
+            };
+            return self.update_error_no_eof(ic, code, stream);
+        }
+
         self.update_error_no_eof(
             ic,
-            format!("crate::stdio::rs_fwrite({ptr}, {size}, {nitems}, {stream_str})"),
+            format!(
+                "
+    {{
+        let size = {size};
+        crate::stdio::rs_fwrite(
+            std::slice::from_raw_parts(({ptr_str}) as _, (size * ({nitems})) as usize),
+            size,
+            {stream_str}
+        )
+    }}"
+            ),
             stream,
         )
     }
 }
 
 pub(super) static FWRITE: &str = r#"
-pub(crate) unsafe fn rs_fwrite<W: std::io::Write>(
+pub(crate) fn rs_fwrite<W: std::io::Write>(
+    mut buf: &[u8],
+    size: u64,
+    mut stream: W,
+) -> (u64, i32) {
+    let mut i = 0;
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => {
+                return (i / size, 1);
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                i += n as u64;
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return (i / size, 1);
+                }
+            }
+        }
+    }
+    (i / size, 0)
+}
+"#;
+
+pub(super) static FWRITE_UNCHECKED: &str = r#"
+pub(crate) unsafe fn rs_fwrite_unchecked<W: std::io::Write>(
     ptr: *const libc::c_void,
     size: u64,
     nitems: u64,

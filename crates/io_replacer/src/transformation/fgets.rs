@@ -23,15 +23,26 @@ impl TransformVisitor<'_, '_, '_> {
         let err_eof_args = self.err_eof_args(ic);
         self.lib_items.borrow_mut().insert(LibItem::Fgets);
 
-        if let Some(array) = self.i8_array_of_as_mut_ptr(s) {
+        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(s) {
             let array = pprust::expr_to_string(array);
-            return expr!(
-                "crate::stdio::rs_fgets(
-                    &mut ({array})[..({n_str}) as usize],
-                    {stream_str},
-                    {err_eof_args},
-                )"
-            );
+            if signed {
+                return expr!(
+                    "crate::stdio::rs_fgets(
+                        &mut ({array})[..({n_str}) as usize],
+                        {stream_str},
+                        {err_eof_args},
+                    )"
+                );
+            } else {
+                self.bytemuck.set(true);
+                return expr!(
+                    "crate::stdio::rs_fgets(
+                        bytemuck::cast_slice_mut(&mut ({array})[..({n_str}) as usize]),
+                        {stream_str},
+                        {err_eof_args},
+                    ) as *mut u8"
+                );
+            }
         }
 
         expr!(

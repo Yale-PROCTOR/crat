@@ -20,11 +20,10 @@ impl TransformVisitor<'_, '_, '_> {
         let s_str = pprust::expr_to_string(s);
         self.lib_items.borrow_mut().insert(LibItem::Fputs);
 
-        if let Some(array) = self.i8_array_of_as_mut_ptr(s) {
+        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(s) {
             let array = pprust::expr_to_string(array);
             self.bytemuck.set(true);
-            return self.update_error_no_eof(
-                ic,
+            let e = if signed {
                 format!(
                     "crate::stdio::rs_fputs(
                         std::ffi::CStr::from_bytes_until_nul(
@@ -32,9 +31,16 @@ impl TransformVisitor<'_, '_, '_> {
                         ).unwrap(),
                         {stream_str},
                     )"
-                ),
-                stream,
-            );
+                )
+            } else {
+                format!(
+                    "crate::stdio::rs_fputs(
+                        std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
+                        {stream_str},
+                    )"
+                )
+            };
+            return self.update_error_no_eof(ic, e, stream);
         }
 
         self.update_error_no_eof(
@@ -51,20 +57,25 @@ impl TransformVisitor<'_, '_, '_> {
         let s_str = pprust::expr_to_string(s);
         self.lib_items.borrow_mut().insert(LibItem::Puts);
 
-        if let Some(array) = self.i8_array_of_as_mut_ptr(s) {
+        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(s) {
             let array = pprust::expr_to_string(array);
             self.bytemuck.set(true);
-            return self.update_error_no_eof(
-                ic,
+            let e = if signed {
                 format!(
                     "crate::stdio::rs_puts(
                         std::ffi::CStr::from_bytes_until_nul(
                             bytemuck::cast_slice(&({array}))
                         ).unwrap(),
                     )"
-                ),
-                &StdExpr::stdout(),
-            );
+                )
+            } else {
+                format!(
+                    "crate::stdio::rs_puts(
+                        std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
+                    )"
+                )
+            };
+            return self.update_error_no_eof(ic, e, &StdExpr::stdout());
         }
 
         self.update_error_no_eof(
@@ -86,6 +97,16 @@ pub(super) static FPUTS: &str = r#"
 #[inline]
 pub(crate) fn rs_fputs<W: std::io::Write>(s: &std::ffi::CStr, mut stream: W) -> (i32, i32) {
     match stream.write_all(s.to_bytes()) {
+        Ok(_) => (0, 0),
+        Err(_) => (libc::EOF, 1),
+    }
+}
+"#;
+
+pub(super) static FPUTS_UNCHECKED: &str = r#"
+#[inline]
+pub(crate) unsafe fn rs_fputs_unchecked<W: std::io::Write>(s: *const i8, mut stream: W) -> (i32, i32) {
+    match stream.write_all(std::ffi::CStr::from_ptr(s as _).to_bytes()) {
         Ok(_) => (0, 0),
         Err(_) => (libc::EOF, 1),
     }

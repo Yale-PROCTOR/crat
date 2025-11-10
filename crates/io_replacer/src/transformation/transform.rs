@@ -713,9 +713,11 @@ pub(super) enum LibItem {
     Fputc,
     Fputwc,
     Fputs,
+    FputsUnchecked,
     Puts,
     Perror,
     Fwrite,
+    FwriteUnchecked,
     Fflush,
     Seek,
     Fseek,
@@ -732,7 +734,7 @@ pub(super) enum LibItem {
     ChildClose,
 }
 
-static LIB_ITEMS_ARRAY: [(LibItem, &str); 48] = [
+static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
     (LibItem::Peek, super::fscanf::PEEK),
     (LibItem::IsEof, super::fscanf::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
@@ -764,9 +766,11 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 48] = [
     (LibItem::Fputc, super::fputc::FPUTC),
     (LibItem::Fputwc, super::fputc::FWPUTC),
     (LibItem::Fputs, super::fputs::FPUTS),
+    (LibItem::FputsUnchecked, super::fputs::FPUTS_UNCHECKED),
     (LibItem::Puts, super::fputs::PUTS),
     (LibItem::Perror, super::fputs::PERROR),
     (LibItem::Fwrite, super::fwrite::FWRITE),
+    (LibItem::FwriteUnchecked, super::fwrite::FWRITE_UNCHECKED),
     (LibItem::Fflush, super::fflush::FFLUSH),
     (LibItem::Seek, super::fseek::SEEK),
     (LibItem::Fseek, super::fseek::FSEEK),

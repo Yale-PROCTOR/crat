@@ -19,25 +19,66 @@ impl TransformVisitor<'_, '_, '_> {
         ic: IndicatorCheck<'_>,
     ) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Read);
-        let ptr = pprust::expr_to_string(ptr);
+        let ptr_str = pprust::expr_to_string(ptr);
         let size = pprust::expr_to_string(size);
         let nitems = pprust::expr_to_string(nitems);
         let err_eof_args = self.err_eof_args(ic);
         self.lib_items.borrow_mut().insert(LibItem::Fread);
-        expr!("crate::stdio::rs_fread({ptr}, {size}, {nitems}, {stream_str}, {err_eof_args})")
+
+        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(ptr) {
+            let array = pprust::expr_to_string(array);
+            if signed {
+                return expr!(
+                    "
+    {{
+        let size = {size};
+        crate::stdio::rs_fread(
+            bytemuck::cast_slice_mut(&mut ({array})[..(size * ({nitems})) as usize]),
+            size,
+            {stream_str},
+            {err_eof_args},
+        )
+    }}"
+                );
+            } else {
+                return expr!(
+                    "
+    {{
+        let size = {size};
+        crate::stdio::rs_fread(
+            &mut ({array})[..(size * ({nitems})) as usize],
+            size,
+            {stream_str},
+            {err_eof_args},
+        )
+    }}"
+                );
+            }
+        }
+
+        expr!(
+            "
+    {{
+        let size = {size};
+        crate::stdio::rs_fread(
+            std::slice::from_raw_parts_mut(({ptr_str}) as _, (size * ({nitems})) as usize),
+            size,
+            {stream_str},
+            {err_eof_args},
+        )
+    }}"
+        )
     }
 }
 
 pub(super) static FREAD: &str = r#"
-pub(crate) unsafe fn rs_fread<R: std::io::Read>(
-    ptr: *mut libc::c_void,
+pub(crate) fn rs_fread<R: std::io::Read>(
+    mut buf: &mut [u8],
     size: u64,
-    nitems: u64,
     mut stream: R,
     err: Option<&mut i32>,
     eof: Option<&mut i32>,
 ) -> u64 {
-    let mut buf: &mut [u8] = std::slice::from_raw_parts_mut(ptr as _, (size * nitems) as usize);
     let mut i = 0;
     while !buf.is_empty() {
         match stream.read(buf) {
