@@ -3,7 +3,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlocks, Body, Local, Location, Place, ProjectionElem, Rvalue,
-        StatementKind, traversal::Preorder,
+        StatementKind,
     },
     ty::{Ty, TyCtxt, TypingEnv},
 };
@@ -247,16 +247,16 @@ fn collect_relations<'a>(
 
 impl<'a> UnionUseInfo<'a> {
     /// Return if Use2 is reachable from Use1
-    fn reachable(use1: &UnionUseInfo, use2: &UnionUseInfo, body: &Body<'a>) -> bool {
-        if use1.location.block == use2.location.block {
-            use1.location.statement_index <= use2.location.statement_index
-        } else {
-            let preorder = Preorder::new(body, use1.location.block);
-            preorder
-                .into_iter()
-                .any(|(bb, _)| bb == use2.location.block)
-        }
-    }
+    // fn reachable(use1: &UnionUseInfo, use2: &UnionUseInfo, body: &Body<'a>) -> bool {
+    //     if use1.location.block == use2.location.block {
+    //         use1.location.statement_index <= use2.location.statement_index
+    //     } else {
+    //         let preorder = Preorder::new(body, use1.location.block);
+    //         preorder
+    //             .into_iter()
+    //             .any(|(bb, _)| bb == use2.location.block)
+    //     }
+    // }
 
     fn is_between_dominance(
         &self,
@@ -271,8 +271,8 @@ impl<'a> UnionUseInfo<'a> {
             None
         } else {
             Some(
-                UnionUseInfo::reachable(dominator, self, body)
-                    && UnionUseInfo::reachable(self, dominatee, body),
+                dominator.location.is_predecessor_of(self.location, body)
+                    && self.location.is_predecessor_of(dominatee.location, body),
             )
         }
     }
