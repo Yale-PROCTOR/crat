@@ -3,7 +3,7 @@ use rustc_ast::{mut_visit::MutVisitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    self as hir,
+    self as hir, HirId,
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit,
@@ -32,6 +32,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
 
     let mut immutables = FxHashSet::default();
     let mut cells = FxHashSet::default();
+    let mut refcells = FxHashSet::default();
     for (def_id, exprs) in visitor.statics {
         if !statics.contains(&def_id) {
             continue;
@@ -45,6 +46,8 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             )
         }) {
             cells.insert(def_id);
+        } else {
+            refcells.insert(def_id);
         }
     }
 
@@ -69,6 +72,8 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         ast_to_hir,
         immutables,
         cells,
+        refcells,
+        borrows: FxHashMap::default(),
     };
     visitor.visit_crate(&mut krate);
 
@@ -80,6 +85,34 @@ struct AstVisitor<'tcx> {
     ast_to_hir: utils::ir::AstToHir,
     immutables: FxHashSet<LocalDefId>,
     cells: FxHashSet<LocalDefId>,
+    refcells: FxHashSet<LocalDefId>,
+    borrows: FxHashMap<Symbol, bool>,
+}
+
+impl<'tcx> AstVisitor<'tcx> {
+    fn introduce_borrow(&mut self, expr: &mut Expr) {
+        for (x, is_mut) in self.borrows.drain() {
+            let method = if is_mut {
+                "with_borrow_mut"
+            } else {
+                "with_borrow"
+            };
+            let e = pprust::expr_to_string(expr);
+            *expr = expr!("{x}.{method}(|{x}_ref| {e})");
+        }
+    }
+
+    fn get_hir_parent(&self, hir_id: HirId) -> hir::Node<'tcx> {
+        for (_, node) in self.tcx.hir_parent_iter(hir_id) {
+            if let hir::Node::Expr(e) = node
+                && matches!(e.kind, hir::ExprKind::DropTemps(_))
+            {
+                continue;
+            }
+            return node;
+        }
+        panic!()
+    }
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -101,6 +134,16 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             const {{ std::cell::Cell::new({init}) }};
                     }}"
                 );
+            } else if self.refcells.contains(def_id) {
+                let name = static_item.ident.name;
+                let ty = pprust::ty_to_string(&static_item.ty);
+                let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
+                *item = item!(
+                    "thread_local! {{
+                        static {name}: std::cell::RefCell<{ty}> =
+                            const {{ std::cell::RefCell::new({init}) }};
+                    }}"
+                );
             }
         }
     }
@@ -111,37 +154,65 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         let hir_expr = some_or!(self.ast_to_hir.get_expr(expr.id, self.tcx), return);
         match &mut expr.kind {
             ExprKind::Path(_, _) => {
-                if let Some(def_id) = get_static_from_hir_expr(hir_expr)
-                    && self.cells.contains(&def_id)
-                    && !find_context(hir_expr, self.tcx).1
-                {
+                if let Some(def_id) = get_static_from_hir_expr(hir_expr) {
                     let x = self.tcx.item_name(def_id.to_def_id());
-                    *expr = expr!("{x}.get()");
+                    if self.cells.contains(&def_id) {
+                        if !find_context(hir_expr, self.tcx).1 {
+                            *expr = expr!("{x}.get()");
+                        }
+                    } else if self.refcells.contains(&def_id)
+                        && let (ctx, is_mut) = find_context(hir_expr, self.tcx)
+                        && matches!(ctx.kind, hir::ExprKind::Path(..))
+                    {
+                        *self.borrows.entry(x).or_default() |= is_mut;
+                        *expr = expr!("*{x}_ref");
+                    }
                 }
             }
-            ExprKind::Index(_, idx, _) => {
+            ExprKind::Index(base, idx, _) => {
                 let hir::ExprKind::Index(hir_base, _, _) = &hir_expr.kind else {
                     panic!("{hir_expr:?}");
                 };
-                if let Some(def_id) = get_static_from_hir_expr(hir_base)
-                    && self.cells.contains(&def_id)
-                    && !find_context(hir_expr, self.tcx).1
-                {
+                if let Some(def_id) = get_static_from_hir_expr(hir_base) {
                     let x = self.tcx.item_name(def_id.to_def_id());
-                    let idx = pprust::expr_to_string(idx);
-                    *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].get())");
+                    if self.cells.contains(&def_id) {
+                        if !find_context(hir_expr, self.tcx).1 {
+                            let idx = pprust::expr_to_string(idx);
+                            *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].get())");
+                        }
+                    } else if self.refcells.contains(&def_id) {
+                        let is_mut = find_context(hir_expr, self.tcx).1;
+                        *self.borrows.entry(x).or_default() |= is_mut;
+                        **base = expr!("{x}_ref");
+                    }
+                }
+            }
+            ExprKind::Field(e, _) => {
+                let hir::ExprKind::Field(hir_base, _) = &hir_expr.kind else {
+                    panic!("{hir_expr:?}");
+                };
+                if let Some(def_id) = get_static_from_hir_expr(hir_base)
+                    && self.refcells.contains(&def_id)
+                {
+                    let m = find_context(hir_expr, self.tcx).1;
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    *self.borrows.entry(x).or_default() |= m;
+                    **e = expr!("{x}_ref");
                 }
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let hir::ExprKind::Assign(hir_lhs, _, _) = &hir_expr.kind else {
                     panic!("{hir_expr:?}");
                 };
-                if let Some(def_id) = get_static_from_hir_expr(hir_lhs)
-                    && self.cells.contains(&def_id)
-                {
+                if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
                     let x = self.tcx.item_name(def_id.to_def_id());
-                    let rhs = pprust::expr_to_string(rhs);
-                    *expr = expr!("{x}.set({rhs})");
+                    if self.cells.contains(&def_id) {
+                        let rhs = pprust::expr_to_string(rhs);
+                        *expr = expr!("{x}.set({rhs})");
+                    } else if self.refcells.contains(&def_id) {
+                        *self.borrows.entry(x).or_default() |= true;
+                        **lhs = expr!("*{x}_ref");
+                    }
                 } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
                     && let Some(def_id) = get_static_from_hir_expr(hir_base)
                     && self.cells.contains(&def_id)
@@ -169,12 +240,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     AssignOpKind::ShlAssign => "<<",
                     AssignOpKind::ShrAssign => ">>",
                 };
-                if let Some(def_id) = get_static_from_hir_expr(hir_lhs)
-                    && self.cells.contains(&def_id)
-                {
+                if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
                     let x = self.tcx.item_name(def_id.to_def_id());
-                    let rhs = pprust::expr_to_string(rhs);
-                    *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
+                    if self.cells.contains(&def_id) {
+                        let rhs = pprust::expr_to_string(rhs);
+                        *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
+                    } else if self.refcells.contains(&def_id) {
+                        *self.borrows.entry(x).or_default() |= true;
+                        **lhs = expr!("*{x}_ref");
+                    }
                 } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
                     && let Some(def_id) = get_static_from_hir_expr(hir_base)
                     && self.cells.contains(&def_id)
@@ -190,6 +264,51 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         }})"
                     );
                 }
+            }
+            ExprKind::AddrOf(kind, mutability, _) => {
+                let hir::ExprKind::AddrOf(_, _, hir_e) = &hir_expr.kind else {
+                    panic!("{hir_expr:?}");
+                };
+                if let Some(def_id) = get_static_from_hir_expr(hir_e)
+                    && self.refcells.contains(&def_id)
+                {
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    *self.borrows.entry(x).or_default() |= mutability.is_mut();
+                    *expr = match (kind, mutability) {
+                        (BorrowKind::Ref, _) => expr!("{x}_ref"),
+                        (BorrowKind::Raw, Mutability::Not) => expr!("({x}_ref as *const _)"),
+                        (BorrowKind::Raw, Mutability::Mut) => expr!("({x}_ref as *mut _)"),
+                    };
+                }
+            }
+            ExprKind::MethodCall(call) => {
+                let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = &hir_expr.kind else {
+                    panic!("{hir_expr:?}");
+                };
+                if let Some(def_id) = get_static_from_hir_expr(hir_receiver)
+                    && self.refcells.contains(&def_id)
+                    && call.seg.ident.name.as_str() == "as_mut_ptr"
+                {
+                    let x = self.tcx.item_name(def_id.to_def_id());
+                    *self.borrows.entry(x).or_default() |= true;
+                    *expr = expr!("{x}_ref.as_mut_ptr()");
+                }
+            }
+            _ => {}
+        }
+
+        match self.get_hir_parent(hir_expr.hir_id) {
+            hir::Node::Expr(e) => {
+                if let hir::ExprKind::If(p, _, _) | hir::ExprKind::Ret(Some(p)) = e.kind
+                    && std::iter::once(hir_expr.hir_id)
+                        .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
+                        .any(|id| id == p.hir_id)
+                {
+                    self.introduce_borrow(expr);
+                }
+            }
+            hir::Node::Stmt(_) | hir::Node::LetStmt(_) => {
+                self.introduce_borrow(expr);
             }
             _ => {}
         }
@@ -356,6 +475,205 @@ unsafe fn f(i: usize, x: u32) { X[i] += x; }
         run_test(
             code,
             &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_ref() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() { g(&mut X); h(&X); }
+unsafe fn g(x: &mut i32) { *x = 1; }
+unsafe fn h(x: &i32) -> i32 { *x }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".with_borrow(",
+            ],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_raw_ptr() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() { g(&raw mut X); h(&raw const X); }
+unsafe fn g(x: *mut i32) { *x = 1; }
+unsafe fn h(x: *const i32) -> i32 { *x }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".with_borrow(",
+            ],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_path() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() { g(&mut X); if X == 1 { h(X); } }
+unsafe fn g(x: &mut i32) { *x = 1; }
+unsafe fn h(x: i32) -> i32 { x }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".with_borrow(",
+            ],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_assign() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() { g(&mut X); X = 1; }
+unsafe fn g(x: &mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_assign_op() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() { g(&mut X); X += 1; }
+unsafe fn g(x: &mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_array() {
+        let code = r#"
+static mut X: [i32; 1] = [0; 1];
+unsafe fn f(i: usize) { g(X.as_mut_ptr()); let _ = X[i]; }
+unsafe fn g(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".with_borrow(",
+            ],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_array_assign() {
+        let code = r#"
+static mut X: [i32; 1] = [0; 1];
+unsafe fn f(i: usize) { g(X.as_mut_ptr()); X[i] = 1; }
+unsafe fn g(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_array_assign_op() {
+        let code = r#"
+static mut X: [i32; 1] = [0; 1];
+unsafe fn f(i: usize) { g(X.as_mut_ptr()); X[i] += 1; }
+unsafe fn g(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_struct() {
+        let code = r#"
+struct S { x: i32, y: i32 }
+static mut X: S = S { x: 0, y: 0 };
+unsafe fn f() { g(&mut X); h(X.x, X.y); }
+unsafe fn g(x: &mut S) { x.x = 1; x.y = 2; }
+unsafe fn h(x: i32, y: i32) -> i32 { x + y }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".with_borrow(",
+            ],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_struct_assign() {
+        let code = r#"
+struct S { x: i32, y: i32 }
+static mut X: S = S { x: 0, y: 0 };
+unsafe fn f() { g(&mut X); X.x = 1; X.y = 2; }
+unsafe fn g(x: &mut S) { x.x = 1; x.y = 2; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_return() {
+        let code = r#"
+static mut X: i32 = 0;
+unsafe fn f() -> *mut i32 { X = 1; return &raw mut X; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_multiple() {
+        let code = r#"
+static mut X: i32 = 0;
+static mut Y: i32 = 0;
+unsafe fn f() { g(&mut X, &mut Y); }
+unsafe fn g(x: &mut i32, y: &mut i32) { *x = 1; *y = 2; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
             &["static mut"],
         );
     }
