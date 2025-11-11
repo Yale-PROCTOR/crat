@@ -309,9 +309,11 @@ dependencies = [
  "etrace",
  "itertools",
  "petgraph",
+ "points_to",
  "regex",
  "smallvec",
  "tracing",
+ "typed-arena",
  "utils",
 ]
 

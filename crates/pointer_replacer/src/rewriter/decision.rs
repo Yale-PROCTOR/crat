@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::mir::{Local, LocalDecl};
 use rustc_span::def_id::LocalDefId;
@@ -48,12 +48,19 @@ impl DecisionMaker {
         }
     }
 
-    pub fn decide(&self, local: Local, decl: &LocalDecl) -> Option<PtrKind> {
+    pub fn decide(
+        &self,
+        local: Local,
+        decl: &LocalDecl,
+        aliases: Option<&FxHashSet<usize>>,
+    ) -> Option<PtrKind> {
         if !decl.ty.is_any_ptr() {
             return None;
         }
         let mutability = decl.ty.is_mutable_ptr();
-        if self.array_pointers[local] {
+        if aliases.is_some_and(|aliases| aliases.contains(&(local.index() - 1))) {
+            Some(PtrKind::Raw(mutability))
+        } else if self.array_pointers[local] {
             if self.promoted_shared_refs[local] {
                 Some(PtrKind::Slice(false))
             } else if self.promoted_mut_refs.contains(local) {
@@ -123,11 +130,14 @@ impl SigDecisions {
             let sig = rust_program.tcx.fn_sig(*did).skip_binder();
             let input_len = sig.inputs().skip_binder().len();
 
+            let aliases = analysis.aliases.get(did);
+
             let input_decs = body
-                .local_decls.iter().collect::<IndexVec<Local, _>>()
-                .iter_enumerated().skip(1)
-                .take(input_len) // exclude variadic arguments
-                .map(|(param, param_decl)| decision_maker.decide(param, param_decl))
+                .local_decls
+                .iter_enumerated()
+                .skip(1)
+                .take(input_len)
+                .map(|(param, param_decl)| decision_maker.decide(param, param_decl, aliases))
                 .collect();
 
             data.insert(

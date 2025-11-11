@@ -45,13 +45,15 @@ pub fn collect_diffs<'tcx>(
             .skip_binder()
             .len();
 
+        let aliases = analysis.aliases.get(did);
+
         for (local, decl) in body
             .local_decls
             .iter_enumerated()
             .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
         // skip inputs if used as fn ptr
         {
-            if let Some(ptr_kind) = decision_maker.decide(local, decl)
+            if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
                 ptr_kinds.insert(*hir_id, ptr_kind);
