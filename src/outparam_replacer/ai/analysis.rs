@@ -28,7 +28,7 @@ use rustc_middle::{
 };
 use rustc_mir_dataflow::Analysis as _;
 use rustc_span::{
-    Span,
+    BytePos, Span, SyntaxContext,
     def_id::{DefId, LocalDefId},
     source_map::SourceMap,
 };
@@ -64,6 +64,16 @@ impl LoHi {
         assert!(span.ctxt().is_root());
         assert!(span.parent().is_none());
         Self::new(span.lo().0, span.hi().0)
+    }
+
+    #[inline]
+    pub fn to_span(self) -> Span {
+        Span::new(
+            BytePos(self.lo),
+            BytePos(self.hi),
+            SyntaxContext::root(),
+            None,
+        )
     }
 }
 

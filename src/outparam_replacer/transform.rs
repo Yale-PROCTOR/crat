@@ -11,7 +11,7 @@ use rustc_ast::{
     ptr::P,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
     Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, definitions::DefPathData,
@@ -45,6 +45,12 @@ struct Param {
     ty_str: String,
     /// return value indicating success for may output parameter
     succ_value: Option<SuccValue>,
+    /// if true, skip flag declaration and updates
+    simplify_flag_decl: bool,
+    /// if true, skip value declaration
+    simplify_value_decl: bool,
+    /// if true, skip reference declaration
+    simplify_ref_decl: bool,
 }
 
 impl Param {
@@ -212,6 +218,7 @@ pub fn transform(
                 ..
             } = p;
             let param = &hir_body.params[*index];
+            let hir_id = param.hir_id;
             let param_index = ParamIdx::from_usize(*index);
             let mir_local = Local::from_usize(*index + 1);
             let PatKind::Binding(_, _hir_id, ident, _) = param.pat.kind else { unreachable!() };
@@ -223,6 +230,17 @@ pub fn transform(
                 _ => unreachable!("{mir_ty:?}"),
             };
 
+            let rcfws = fn_analysis_result
+                .rcfws
+                .get(&param_index.index())
+                .cloned()
+                .unwrap_or_default();
+            let rcfws = rcfws
+                .into_iter()
+                .map(|lohi| lohi.to_span())
+                .collect::<FxHashSet<_>>();
+
+            let mut simplify_flag_decl = config.simplify;
             complete_writes.iter().for_each(|cw| {
                 let CompleteWrite {
                     block,
@@ -238,17 +256,33 @@ pub fn transform(
                 if *statement_index == bbd.statements.len() {
                     let t = bbd.terminator();
                     assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{t:?}");
+                    let span = t.source_info.span;
+                    let simplify_flag = config.simplify && rcfws.contains(&span);
 
-                    if let Some(arg) = write_arg {
+                    if let Some(arg) = write_arg
+                        && !simplify_flag
+                    {
                         write_args
                             .entry((local_def_id, loc))
                             .or_default()
                             .insert(ParamIdx::from_usize(*arg), name.clone());
+                        simplify_flag_decl &= simplify_flag;
                     }
                 } else {
-                    write_locs.entry(param_index).or_default().push(loc);
+                    let span = bbd.statements[*statement_index].source_info.span;
+                    let simplify_flag = config.simplify && rcfws.contains(&span);
+                    if !simplify_flag {
+                        write_locs.entry(param_index).or_default().push(loc);
+                        simplify_flag_decl &= simplify_flag;
+                    }
                 }
             });
+
+            let simplify_ref_decl = config.simplify && !hir_visitor.ref_uses.contains(&hir_id);
+            if simplify_ref_decl {
+                println!("Simplify {} {hir_id:?} in {:?}", name, local_def_id);
+            }
+            let simplify_value_decl = config.simplify && false;
 
             let succ_value = if succ_param.is_none() {
                 // find the first may parameter which has a value indicating success
@@ -269,6 +303,9 @@ pub fn transform(
                     must: *must,
                     ty_str,
                     succ_value,
+                    simplify_flag_decl,
+                    simplify_value_decl,
+                    simplify_ref_decl,
                 },
             );
         }
@@ -330,6 +367,7 @@ pub fn transform(
                 write_args: &write_args,
                 bounds: &hir_visitor.bounds,
                 call_in_ret: &hir_visitor.call_in_ret,
+                deref_uses: &hir_visitor.deref_uses,
                 updated: false,
             };
             visitor.visit_crate(krate);
@@ -353,6 +391,8 @@ struct TransformVisitor<'tcx, 'a> {
     bounds: &'a FxHashMap<Span, LocalDefId>,
     // maps spans of returns to calls inside them
     call_in_ret: &'a FxHashMap<Span, LocalDefId>,
+    /// maps spans of derefs to their hir ids
+    deref_uses: &'a FxHashMap<Span, FxHashSet<HirId>>,
     /// is this file updated
     updated: bool,
 }
@@ -466,7 +506,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .unwrap_or_else(|| panic!("Failed to find HIR item to node {node_id:?}"));
         let local_def_id = hir_item.owner_id.def_id;
         self.current_fns.push(local_def_id);
-
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(box fn_item) = &mut item.kind
@@ -533,11 +572,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 );
                 let flag_decl = stmt!("let mut {}___s: bool = false;", param.name);
 
-                // TODO: simplify unnecessary declarations
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
-                stmts.insert(0, ref_decl);
-                stmts.insert(0, value_decl);
-                if !param.must {
+                if !param.simplify_value_decl {
+                    stmts.insert(0, value_decl);
+                }
+                if !param.simplify_ref_decl {
+                    stmts.insert(0, ref_decl);
+                }
+                if !param.must && !param.simplify_flag_decl {
+                    println!("{local_def_id:?}");
                     stmts.insert(0, flag_decl);
                 }
             }
@@ -734,6 +777,8 @@ struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     bounds: FxHashMap<Span, LocalDefId>,
     call_in_ret: FxHashMap<Span, LocalDefId>,
+    deref_uses: FxHashMap<Span, FxHashSet<HirId>>,
+    ref_uses: FxHashSet<HirId>,
 }
 
 impl<'tcx> HirVisitor<'tcx> {
@@ -742,6 +787,8 @@ impl<'tcx> HirVisitor<'tcx> {
             tcx,
             bounds: FxHashMap::default(),
             call_in_ret: FxHashMap::default(),
+            deref_uses: FxHashMap::default(),
+            ref_uses: FxHashSet::default(),
         }
     }
 
@@ -756,6 +803,18 @@ impl<'tcx> HirVisitor<'tcx> {
             };
 
             if matches!(e.kind, HirExprKind::Ret(_)) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    fn get_parent_deref(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
+        for (_, parent) in self.tcx.hir_parent_iter(hir_id) {
+            let HirNode::Expr(e) = parent else {
+                return None;
+            };
+            if matches!(e.kind, HirExprKind::Unary(UnOp::Deref, _)) {
                 return Some(e);
             }
         }
@@ -784,18 +843,37 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             && let Some(def_id) = def_id.as_local()
         {
             self.add_bound(path.span, def_id);
+        } else if let Res::Local(id) = path.res {
+            if let Some(deref) = self.get_parent_deref(id) {
+                self.deref_uses.entry(deref.span).or_default().insert(id);
+            } else {
+                self.ref_uses.insert(id);
+            }
         }
     }
 
     fn visit_expr(&mut self, expr: &'tcx HirExpr<'tcx>) {
-        if let HirExprKind::Call(callee, _) = expr.kind
-            && let HirExprKind::Path(QPath::Resolved(_, path)) = callee.kind
-            && let Res::Def(_, def_id) = path.res
-            && let Some(def_id) = def_id.as_local()
-            && let Some(parent) = self.get_parent_return(expr.hir_id)
-        {
-            self.call_in_ret.insert(parent.span, def_id);
+        match expr.kind {
+            HirExprKind::Call(callee, _) => {
+                if let HirExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+                    && let Res::Def(_, def_id) = path.res
+                    && let Some(def_id) = def_id.as_local()
+                {
+                    if let Some(parent) = self.get_parent_return(expr.hir_id) {
+                        self.call_in_ret.insert(parent.span, def_id);
+                    }
+                }
+            }
+            HirExprKind::MethodCall(path, receiver, _, _) => {
+                if path.ident.to_string() == "is_null" {
+                    if let HirExprKind::Path(QPath::Resolved(_, p)) = receiver.kind {
+                        println!("is_null receiver: {:?}", p);
+                    }
+                }
+            }
+            _ => {}
         }
+
         intravisit::walk_expr(self, expr);
     }
 }
