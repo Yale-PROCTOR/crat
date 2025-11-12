@@ -85,6 +85,7 @@ struct Func {
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
     /// locations where the parameter is fully written. empty for must parameters
     write_locs: FxHashMap<ParamIdx, Vec<Location>>,
+    deref_uses: FxHashMap<HirId, ParamIdx>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -180,13 +181,14 @@ pub fn transform(
         path_to_mod_id.insert(path, mod_id);
     });
 
-    let mut hir_visitor = HirVisitor::new(tcx);
-    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
-
+    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let mut thir_to_mir = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
         thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
     }
+
+    let mut hir_visitor = HirVisitor::new(tcx, &thir_to_mir);
+    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
 
     let mut funcs = FxHashMap::default();
     let mut write_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
@@ -209,6 +211,7 @@ pub fn transform(
         let mut succ_param = None;
         let mut index_map: BTreeMap<_, _> = BTreeMap::new();
         let mut write_locs: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut deref_uses: FxHashMap<_, _> = FxHashMap::default();
 
         for p in &fn_analysis_result.output_params {
             let OutputParam {
@@ -218,7 +221,6 @@ pub fn transform(
                 ..
             } = p;
             let param = &hir_body.params[*index];
-            let hir_id = param.hir_id;
             let param_index = ParamIdx::from_usize(*index);
             let mir_local = Local::from_usize(*index + 1);
             let PatKind::Binding(_, _hir_id, ident, _) = param.pat.kind else { unreachable!() };
@@ -278,9 +280,17 @@ pub fn transform(
                 }
             });
 
-            let simplify_ref_decl = config.simplify && !hir_visitor.ref_uses.contains(&hir_id);
+            let simplify_ref_decl =
+                config.simplify && !hir_visitor.ref_uses.contains(&(local_def_id, mir_local));
+            if simplify_ref_decl
+                && let Some(derefs) = hir_visitor.deref_uses.get(&(local_def_id, mir_local))
+            {
+                deref_uses.extend(derefs.iter().map(|hir_id| (*hir_id, param_index)));
+            }
             if simplify_ref_decl {
-                println!("Simplify {} {hir_id:?} in {:?}", name, local_def_id);
+                println!("Simplify {} {mir_local:?} in {:?}", name, local_def_id);
+            } else {
+                println!("Keep {} {mir_local:?} in {:?}", name, local_def_id);
             }
             let simplify_value_decl = config.simplify && false;
 
@@ -333,11 +343,11 @@ pub fn transform(
             index_map,
             return_tys,
             write_locs,
+            deref_uses,
         };
         funcs.insert(local_def_id, func);
     }
 
-    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let res = transform_ast(
         |krate| {
             let source_map = tcx.sess.source_map();
@@ -367,7 +377,6 @@ pub fn transform(
                 write_args: &write_args,
                 bounds: &hir_visitor.bounds,
                 call_in_ret: &hir_visitor.call_in_ret,
-                deref_uses: &hir_visitor.deref_uses,
                 updated: false,
             };
             visitor.visit_crate(krate);
@@ -391,8 +400,6 @@ struct TransformVisitor<'tcx, 'a> {
     bounds: &'a FxHashMap<Span, LocalDefId>,
     // maps spans of returns to calls inside them
     call_in_ret: &'a FxHashMap<Span, LocalDefId>,
-    /// maps spans of derefs to their hir ids
-    deref_uses: &'a FxHashMap<Span, FxHashSet<HirId>>,
     /// is this file updated
     updated: bool,
 }
@@ -616,7 +623,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let mut flag_updates = vec![];
                     for (p, locs) in &func.write_locs {
                         let param = &func.index_map[p];
-                        if !param.must && locs.contains(&loc) {
+                        if !param.must && !param.simplify_flag_decl && locs.contains(&loc) {
                             let update = format!("{}___s = true", param.name);
                             flag_updates.push(update);
                         }
@@ -768,27 +775,43 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.replace_expr(expr, new_expr);
                 }
             }
+            ExprKind::Unary(UnOp::Deref, _) => {
+                let curr_fn = self.current_fn();
+
+                if let Some(func) = self.funcs.get(&curr_fn)
+                    && !func.index_map.is_empty()
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let Some(param_index) = func.deref_uses.get(&hir_expr.hir_id)
+                {
+                    println!("Transform deref expr at {:?}", expr.span);
+                    let param = &func.index_map[param_index];
+                    let new_expr = expr!("{}___v", param.name);
+                    self.replace_expr(expr, new_expr);
+                }
+            }
             _ => {}
         }
     }
 }
 
-struct HirVisitor<'tcx> {
+struct HirVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     bounds: FxHashMap<Span, LocalDefId>,
     call_in_ret: FxHashMap<Span, LocalDefId>,
-    deref_uses: FxHashMap<Span, FxHashSet<HirId>>,
-    ref_uses: FxHashSet<HirId>,
+    deref_uses: FxHashMap<(LocalDefId, Local), FxHashSet<HirId>>,
+    ref_uses: FxHashSet<(LocalDefId, Local)>,
+    thir_to_mir: &'a FxHashMap<LocalDefId, ThirToMir>,
 }
 
-impl<'tcx> HirVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
+impl<'a, 'tcx> HirVisitor<'a, 'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, thir_to_mir: &'a FxHashMap<LocalDefId, ThirToMir>) -> Self {
         Self {
             tcx,
             bounds: FxHashMap::default(),
             call_in_ret: FxHashMap::default(),
             deref_uses: FxHashMap::default(),
             ref_uses: FxHashSet::default(),
+            thir_to_mir,
         }
     }
 
@@ -809,20 +832,25 @@ impl<'tcx> HirVisitor<'tcx> {
         None
     }
 
-    fn get_parent_deref(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
+    fn get_parent_deref(&self, hir_id: HirId) -> Option<HirId> {
         for (_, parent) in self.tcx.hir_parent_iter(hir_id) {
             let HirNode::Expr(e) = parent else {
                 return None;
             };
             if matches!(e.kind, HirExprKind::Unary(UnOp::Deref, _)) {
-                return Some(e);
+                return Some(e.hir_id);
             }
         }
         None
     }
+
+    fn get_mir_local(&self, hir_id: HirId, def_id: LocalDefId) -> Option<Local> {
+        let thir_to_mir = self.thir_to_mir.get(&def_id)?;
+        thir_to_mir.binding_to_local.get(&hir_id).cloned()
+    }
 }
 
-impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -830,24 +858,38 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 
     fn visit_item(&mut self, item: &'tcx HirItem<'tcx>) {
-        intravisit::walk_item(self, item);
-
-        if let HirItemKind::Static(_, ident, _, _body_id) = item.kind {
-            self.add_bound(ident.span, item.owner_id.def_id);
+        match item.kind {
+            HirItemKind::Static(_, ident, _, _) => {
+                self.add_bound(ident.span, item.owner_id.def_id);
+            }
+            _ => {}
         }
+        intravisit::walk_item(self, item);
     }
 
-    fn visit_path(&mut self, path: &HirPath<'tcx>, _: HirId) {
+    fn visit_path(&mut self, path: &HirPath<'tcx>, hir_id: HirId) {
         intravisit::walk_path(self, path);
         if let Res::Def(_, def_id) = path.res
             && let Some(def_id) = def_id.as_local()
         {
             self.add_bound(path.span, def_id);
-        } else if let Res::Local(id) = path.res {
-            if let Some(deref) = self.get_parent_deref(id) {
-                self.deref_uses.entry(deref.span).or_default().insert(id);
+        }
+
+        if let Res::Local(id) = path.res {
+            let def_id = id.owner.def_id;
+            if let Some(parent_id) = self.get_parent_deref(hir_id) {
+                let local = self.get_mir_local(id, def_id);
+                if let Some(local) = local {
+                    self.deref_uses
+                        .entry((def_id, local))
+                        .or_default()
+                        .insert(parent_id);
+                }
             } else {
-                self.ref_uses.insert(id);
+                let local = self.get_mir_local(id, def_id);
+                if let Some(local) = local {
+                    self.ref_uses.insert((def_id, local));
+                }
             }
         }
     }
@@ -861,13 +903,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 {
                     if let Some(parent) = self.get_parent_return(expr.hir_id) {
                         self.call_in_ret.insert(parent.span, def_id);
-                    }
-                }
-            }
-            HirExprKind::MethodCall(path, receiver, _, _) => {
-                if path.ident.to_string() == "is_null" {
-                    if let HirExprKind::Path(QPath::Resolved(_, p)) = receiver.kind {
-                        println!("is_null receiver: {:?}", p);
                     }
                 }
             }
