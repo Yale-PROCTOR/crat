@@ -7,9 +7,15 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Symbol, kw, sym};
+use serde::Deserialize;
 use utils::expr;
 
-pub fn expand(tcx: TyCtxt<'_>) -> String {
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct Config {
+    pub keep_allows: bool,
+}
+
+pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
     let (_, mut krate) = tcx.resolver_for_lowering().steal();
     let krate = Arc::get_mut(&mut krate).unwrap();
     utils::ast::remove_unnecessary_items_from_ast(krate);
@@ -26,6 +32,25 @@ pub fn expand(tcx: TyCtxt<'_>) -> String {
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
     ]);
+    if config.keep_allows {
+        krate.attrs.extend([
+            utils::ast::make_inner_attribute(sym::allow, Symbol::intern("dead_code"), tcx),
+            utils::ast::make_inner_attribute(
+                sym::allow,
+                Symbol::intern("non_camel_case_types"),
+                tcx,
+            ),
+            utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_snake_case"), tcx),
+            utils::ast::make_inner_attribute(
+                sym::allow,
+                Symbol::intern("non_upper_case_globals"),
+                tcx,
+            ),
+            utils::ast::make_inner_attribute(sym::allow, Symbol::intern("unused_assignments"), tcx),
+            utils::ast::make_inner_attribute(sym::allow, Symbol::intern("unused_mut"), tcx),
+        ]);
+    }
+
     AstVisitor.visit_crate(krate);
     pprust::crate_to_string_for_macros(krate)
 }
