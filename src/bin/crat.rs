@@ -15,6 +15,10 @@ use utils::compilation::run_compiler_on_path;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
+    // Expand
+    #[arg(long, help = "Keep allow attributes inserted by C2Rust")]
+    expand_keep_allows: bool,
+
     // Extern
     #[arg(long, help = "Path to the CMake reply index file")]
     extern_cmake_reply_index_file: Option<PathBuf>,
@@ -147,6 +151,8 @@ enum Analysis {
 #[derive(Debug, Default, Deserialize)]
 struct Config {
     #[serde(default)]
+    expand: expander::Config,
+    #[serde(default)]
     r#extern: extern_resolver::Config,
     #[serde(default)]
     r#unsafe: unsafe_resolver::Config,
@@ -214,6 +220,8 @@ fn main() {
             .with_writer(log_file)
             .init();
     }
+
+    config.expand.keep_allows |= args.expand_keep_allows;
 
     if args.extern_cmake_reply_index_file.is_some() {
         config.r#extern.cmake_reply_index_file = args.extern_cmake_reply_index_file;
@@ -344,7 +352,8 @@ fn main() {
         }
         match pass {
             Pass::Expand => {
-                let s = run_compiler_on_path(&file, expander::expand).unwrap();
+                let s = run_compiler_on_path(&file, |tcx| expander::expand(config.expand, tcx))
+                    .unwrap();
                 remove_rs_files(&dir, true);
                 std::fs::write(&file, s).unwrap();
             }
