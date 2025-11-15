@@ -98,7 +98,7 @@ pub(super) static FPUTS: &str = r#"
 pub(crate) fn rs_fputs<W: std::io::Write>(s: &std::ffi::CStr, mut stream: W) -> (i32, i32) {
     match stream.write_all(s.to_bytes()) {
         Ok(_) => (0, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;
@@ -108,7 +108,7 @@ pub(super) static FPUTS_UNCHECKED: &str = r#"
 pub(crate) unsafe fn rs_fputs_unchecked<W: std::io::Write>(s: *const i8, mut stream: W) -> (i32, i32) {
     match stream.write_all(std::ffi::CStr::from_ptr(s as _).to_bytes()) {
         Ok(_) => (0, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;
@@ -123,7 +123,7 @@ pub(crate) fn rs_puts(s: &std::ffi::CStr) -> (i32, i32) {
         .and_then(|_| stream.write_all(b"\n"))
     {
         Ok(_) => (0, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;

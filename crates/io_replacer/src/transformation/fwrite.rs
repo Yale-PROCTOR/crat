@@ -101,7 +101,7 @@ pub(crate) fn rs_fwrite<W: std::io::Write>(
 
 pub(super) static FWRITE_UNCHECKED: &str = r#"
 pub(crate) unsafe fn rs_fwrite_unchecked<W: std::io::Write>(
-    ptr: *const libc::c_void,
+    ptr: *const std::ffi::c_void,
     size: u64,
     nitems: u64,
     mut stream: W,

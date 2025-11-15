@@ -598,9 +598,9 @@ fn stdio_mod(
         pub static mut STDERR_ERROR: i32 = 0;
         unsafe extern "C" {
             #[link_name = "stdout"]
-            pub static mut STDOUT: *mut libc::c_void;
+            pub static mut STDOUT: *mut std::ffi::c_void;
             #[link_name = "stderr"]
-            pub static mut STDERR: *mut libc::c_void;
+            pub static mut STDERR: *mut std::ffi::c_void;
         }
         "#,
     );
