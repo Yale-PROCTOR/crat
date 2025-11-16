@@ -275,7 +275,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     let param_kind = sig_dec
                         .and_then(|sig| sig.input_decs.get(i).copied())
                         .flatten()
-                        .unwrap_or(PtrKind::Raw(m.is_mut()));
+                        .unwrap_or(PtrKind::Raw(
+                            self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
+                        ));
                     self.transform_rhs(arg, harg, param_kind);
                 }
             }
@@ -898,6 +900,33 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 PtrKind::Raw(_) => {}
             },
+        }
+    }
+
+    fn get_mutability_decision(&self, hexpr: &hir::Expr<'tcx>) -> Option<bool> {
+        // find the root of this hir expr and if it's a path, get its decision from ptr_kinds and return its mutability
+        let mut curr_expr = hexpr;
+        loop {
+            match &curr_expr.kind {
+                hir::ExprKind::MethodCall(seg, receiver, ..)
+                    if seg.ident.name.as_str() == "offset" =>
+                {
+                    curr_expr = receiver;
+                }
+                _ => break,
+            }
+        }
+        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &curr_expr.kind
+            && let Res::Local(hir_id) = path.res
+        {
+            match self.ptr_kinds.get(&hir_id) {
+                Some(PtrKind::OptRef(m)) => Some(*m),
+                Some(PtrKind::Slice(m)) => Some(*m),
+                Some(PtrKind::Raw(m)) => Some(*m),
+                None => None,
+            }
+        } else {
+            None
         }
     }
 }
