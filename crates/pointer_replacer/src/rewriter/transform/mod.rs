@@ -841,12 +841,17 @@ impl<'tcx> TransformVisitor<'tcx> {
                                     symbol.as_str().len(), // including null terminator
                                 );
                             }
+                            PtrKind::OptRef(m) => {
+                                // TODO: this is not safe and idiomatic; translating byte string literal to Option<&i8>
+                                *rhs = utils::expr!(
+                                    "({}).as_{}()",
+                                    pprust::expr_to_string(rhs),
+                                    if m { "mut" } else { "ref" },
+                                );
+                            }
                             PtrKind::Raw(_) => {
                                 // skipping cases like
                                 // std::mem::transmute::<&[u8; 18], &[uint8_t; 18]>(b"KAT-TRANSCRIPT-v1\0")
-                            }
-                            _ => {
-                                unimplemented!()
                             }
                         }
                     }
