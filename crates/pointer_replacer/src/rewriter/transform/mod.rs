@@ -9,7 +9,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_hir::{HirId, def::Res};
 use rustc_middle::{ty, ty::TyCtxt};
-use rustc_span::{def_id::LocalDefId, sym::unwrap};
+use rustc_span::{
+    def_id::LocalDefId,
+    sym::{new, unwrap},
+};
 use utils::ir::{AstToHir, mir_ty_to_string};
 
 use super::{
@@ -89,6 +92,38 @@ impl MutVisitor for TransformVisitor<'_> {
         }
 
         mut_visit::walk_item(self, item);
+    }
+
+    fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        let stmts = mut_visit::walk_flat_map_stmt(self, s);
+        let mut new_stmts = smallvec::SmallVec::new();
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
+                    if let ExprKind::Assign(lhs, rhs, _) = &expr.kind
+                        && let ExprKind::AddrOf(BorrowKind::Ref, mutability, rhs_inner) = &rhs.kind
+                        && let ExprKind::MethodCall(_) = rhs_inner.kind
+                    {
+                        new_stmts.push(utils::stmt!(
+                            "let {}_tmp = {};",
+                            mutability.prefix_str(),
+                            pprust::expr_to_string(&rhs_inner),
+                        ));
+                        new_stmts.push(utils::stmt!(
+                            "{} = {}_tmp;",
+                            pprust::expr_to_string(&lhs),
+                            mutability.ref_prefix_str(),
+                        ));
+                    } else {
+                        new_stmts.push(s);
+                    }
+                }
+                _ => {
+                    new_stmts.push(s);
+                }
+            }
+        }
+        return new_stmts;
     }
 
     fn visit_local(&mut self, local: &mut Local) {
