@@ -934,8 +934,21 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     } else {
-                        println!("slice from non-array: {:?}", rhs);
-                        unimplemented!()
+                        if need_cast {
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{1}({0} as *{2} _ as *{2} {3}, 1024)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{1}({0}, 1024)",
+                                pprust::expr_to_string(e),
+                                if m { "_mut" } else { "" },
+                            );
+                        }
                     }
                 }
                 PtrKind::Raw(_) => {}
