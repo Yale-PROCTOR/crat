@@ -94,7 +94,7 @@ fn find_param_aliases<'tcx>(
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
         for call_args in calls {
             for i in 0..body.arg_count {
-                for j in 0..i {
+                for j in i..body.arg_count {
                     if aliases.contains(&i) && aliases.contains(&j) {
                         continue;
                     }
