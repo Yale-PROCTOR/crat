@@ -28,6 +28,8 @@ struct Args {
     extern_source_dir: Option<PathBuf>,
     #[arg(long, help = "Choose an arbitrary one when multiple candidates exist")]
     extern_choose_arbitrary: bool,
+    #[arg(long, help = "Ignore return types when resolving extern functions")]
+    extern_ignore_return_type: bool,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern functions (example: `from::foo to::foo`)")]
     extern_function_hints: Vec<String>,
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"], help = "Resolve hint for extern static variables (example: `from::foo to::foo`)")]
@@ -232,6 +234,7 @@ fn main() {
     if args.extern_source_dir.is_some() {
         config.r#extern.source_dir = args.extern_source_dir;
     }
+    config.r#extern.ignore_return_type |= args.extern_ignore_return_type;
     config.r#extern.choose_arbitrary |= args.extern_choose_arbitrary;
     for args in args.extern_function_hints.chunks(2) {
         let [from, to] = args else { panic!() };

@@ -37,6 +37,8 @@ pub struct Config {
     pub source_dir: Option<PathBuf>,
     #[serde(default)]
     pub choose_arbitrary: bool,
+    #[serde(default)]
+    pub ignore_return_type: bool,
 
     #[serde(default)]
     pub function_hints: Vec<LinkHint>,
@@ -92,7 +94,7 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) -> String {
     });
 
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
-    let result = resolve(tcx);
+    let result = resolve(config.ignore_return_type, tcx);
     let resolve_map = make_resolve_map(&result, &priorities, config, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
     let mut visitor = AstVisitor {
@@ -242,7 +244,7 @@ fn link_externs(
                     priority.map(|p| (cand, p))
                 })
                 .min_by_key(|(_, p)| *p)
-                .unwrap();
+                .unwrap_or_else(|| panic!("{def_id:?}"));
 
             let class = &classes.0[*id];
             let rep = find_representative_def_id(class, tcx);
@@ -288,7 +290,7 @@ struct ResolveResult {
     extern_statics: Vec<(LocalDefId, Vec<EquivClassId>)>,
 }
 
-fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
+fn resolve(ignore_return_type: bool, tcx: TyCtxt<'_>) -> ResolveResult {
     let mut visitor = HirVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let hir_data = visitor.data;
@@ -322,6 +324,7 @@ fn resolve(tcx: TyCtxt<'_>) -> ResolveResult {
         compared_names: FxHashSet::default(),
         possibly_equiv_unnameds: FxHashSet::default(),
         visited_names: FxHashSet::default(),
+        ignore_return_type,
     };
     let mut equiv_adts = FxHashMap::default();
     for scc_id in sccs.post_order() {
@@ -512,6 +515,8 @@ struct TypeComparator<'a, 'tcx> {
 
     possibly_equiv_unnameds: FxHashSet<(LocalDefId, LocalDefId)>,
     visited_names: FxHashSet<Symbol>,
+
+    ignore_return_type: bool,
 }
 
 impl<'tcx> TypeComparator<'_, 'tcx> {
@@ -709,7 +714,7 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
                 return false;
             }
         }
-        self.cmp_tys(sig1.output(), sig2.output())
+        self.ignore_return_type || self.cmp_tys(sig1.output(), sig2.output())
     }
 
     fn cmp_type_of(&mut self, def_id1: LocalDefId, def_id2: LocalDefId) -> bool {
