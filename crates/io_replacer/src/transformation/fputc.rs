@@ -49,7 +49,7 @@ pub(crate) fn rs_fputc<W: std::io::Write>(c: i32, mut stream: W) -> (i32, i32) {
     let c = c as u8;
     match stream.write_all(&[c]) {
         Ok(_) => (c as i32, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;
@@ -58,7 +58,7 @@ pub(super) static FWPUTC: &str = r#"
 pub(crate) fn rs_fputwc<W: std::io::Write>(c: i32, mut stream: W) -> (i32, i32) {
     match write!(stream, "{}", std::char::from_u32(c as _).unwrap()) {
         Ok(_) => (c, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;

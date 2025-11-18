@@ -346,9 +346,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     (PtrKind::OptRef(m), PtrKind::Raw(m1)) => {
                         if need_cast {
                             if *lhs_inner_ty.kind() == ty::TyKind::Int(ty::IntTy::I8) {
-                                // special handling for libc::c_char TODO: better solution for char arrays
+                                // special handling for c_char TODO: better solution for char arrays
                                 *rhs = utils::expr!(
-                                    "(({0}) as *{1} u8 as *{1} libc::c_char).as_{2}()",
+                                    "(({0}) as *{1} u8 as *{1} std::ffi::c_char).as_{2}()",
                                     pprust::expr_to_string(e),
                                     if m { "mut" } else { "const" },
                                     if m { "mut" } else { "ref" },
@@ -433,9 +433,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrKind::OptRef(m) => {
                     if need_cast {
                         if *lhs_inner_ty.kind() == ty::TyKind::Int(ty::IntTy::I8) {
-                            // special handling for libc::c_char TODO: better solution for char arrays
+                            // special handling for c_char TODO: better solution for char arrays
                             *rhs = utils::expr!(
-                                "(({0}) as *{1} u8 as *{1} libc::c_char).as_{2}()",
+                                "(({0}) as *{1} u8 as *{1} std::ffi::c_char).as_{2}()",
                                 pprust::expr_to_string(e),
                                 if m { "mut" } else { "const" },
                                 if m { "mut" } else { "ref" },

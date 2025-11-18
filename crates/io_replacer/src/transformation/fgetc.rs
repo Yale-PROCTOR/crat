@@ -39,7 +39,7 @@ pub(crate) fn rs_fgetc<R: std::io::Read>(
             } else if let Some(err) = err {
                 *err = 1;
             }
-            libc::EOF
+            -1
         }
     }
 }

@@ -1171,7 +1171,7 @@ pub(crate) unsafe fn rs_vfprintf<W: std::io::Write>(
                 }
                 (PrintfConversion::Str, _) => panic!(),
                 (PrintfConversion::Pointer, _) => {
-                    let v = args.arg::<*const libc::c_void>() as usize;
+                    let v = args.arg::<*const std::ffi::c_void>() as usize;
                     if std::fmt::LowerHex::fmt(&v, &mut fmt).is_err() {
                         return (-1, 1);
                     }

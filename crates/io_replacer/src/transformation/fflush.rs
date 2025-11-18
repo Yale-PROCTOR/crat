@@ -24,7 +24,7 @@ pub(super) static FFLUSH: &str = r#"
 pub(crate) fn rs_fflush<W: std::io::Write>(mut stream: W) -> (i32, i32) {
     match stream.flush() {
         Ok(_) => (0, 0),
-        Err(_) => (libc::EOF, 1),
+        Err(_) => (-1, 1),
     }
 }
 "#;
