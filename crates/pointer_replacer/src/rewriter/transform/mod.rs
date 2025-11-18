@@ -714,7 +714,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                     PtrKind::Slice(m) => {
                         if let ExprKind::Index(r, idx_expr, _) = &e.kind {
                             if need_cast {
-                                unimplemented!()
+                                *rhs = utils::expr!(
+                                    "(&{0} {1}[{2}{3}]) as *{0} {4}",
+                                    if m { "mut" } else { "const" },
+                                    pprust::expr_to_string(r),
+                                    pprust::expr_to_string(idx_expr),
+                                    if matches!(idx_expr.kind, ExprKind::Range(_, _, _)) {
+                                        ""
+                                    } else {
+                                        ".."
+                                    },
+                                    lhs_inner_ty,
+                                );
                             } else {
                                 *rhs = utils::expr!(
                                     "&{}{}[{}{}]",
