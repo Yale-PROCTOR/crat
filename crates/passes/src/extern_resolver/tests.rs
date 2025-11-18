@@ -1,7 +1,7 @@
 fn run_test(code1: &str, code2: &str, same: bool) {
     let code = format!("#![feature(extern_types)] mod a {{ {code1} }} mod b {{ {code2} }}");
     utils::compilation::run_compiler_on_str(&code, |tcx| {
-        let res = super::resolve(tcx);
+        let res = super::resolve(false, tcx);
         for classes in res.equiv_adts.values() {
             if same {
                 assert_eq!(classes.0.len(), 1);
