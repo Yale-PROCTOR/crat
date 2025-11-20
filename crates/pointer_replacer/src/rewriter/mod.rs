@@ -1,5 +1,5 @@
 use etrace::some_or;
-use points_to::andersen;
+use points_to::andersen::{self, Var};
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -40,7 +40,7 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
     };
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-    let aliases = find_param_aliases(pre_points_to, &points_to, tcx);
+    let aliases = find_param_aliases(&pre_points_to, &points_to, tcx);
 
     let mut functions = vec![];
     let mut structs = vec![];
@@ -83,7 +83,7 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
 }
 
 fn find_param_aliases<'tcx>(
-    pre: andersen::PreAnalysisData<'tcx>,
+    pre: &andersen::PreAnalysisData<'tcx>,
     points_to: &andersen::Solutions,
     tcx: TyCtxt<'tcx>,
 ) -> FxHashMap<LocalDefId, FxHashSet<usize>> {
@@ -114,4 +114,49 @@ fn find_param_aliases<'tcx>(
         }
     }
     param_aliases
+}
+
+fn find_arg_aliases<'tcx>(
+    pre: &andersen::PreAnalysisData<'tcx>,
+    points_to: &andersen::Solutions,
+    tcx: TyCtxt<'tcx>,
+) -> FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> {
+    let mut param_aliases = FxHashMap::default();
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        let local_decls = &body.local_decls;
+        for i in 0..local_decls.len() {
+            for j in i..local_decls.len() {
+                if locals_may_alias(
+                    &pre,
+                    points_to,
+                    def_id,
+                    rustc_middle::mir::Local::from_usize(i),
+                    rustc_middle::mir::Local::from_usize(j),
+                ) {
+                    let entry: &mut FxHashSet<(usize, usize)> =
+                        param_aliases.entry(def_id).or_default();
+                    entry.insert((i, j));
+                    entry.insert((j, i));
+                }
+            }
+        }
+    }
+    param_aliases
+}
+
+fn locals_may_alias(
+    pre: &andersen::PreAnalysisData,
+    points_to: &andersen::Solutions,
+    fn_def: LocalDefId,
+    a: rustc_middle::mir::Local,
+    b: rustc_middle::mir::Local,
+) -> bool {
+    let va = andersen::Var::Local(fn_def, a);
+    let vb = andersen::Var::Local(fn_def, b);
+    let la = some_or!(pre.vars.get(&va), return false);
+    let lb = some_or!(pre.vars.get(&vb), return false);
+    let sa = &points_to[*la];
+    let sb = &points_to[*lb];
+    sa.iter().any(|x| sb.contains(x))
 }
