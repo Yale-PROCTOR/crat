@@ -8,8 +8,12 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_hir::{HirId, def::Res};
-use rustc_middle::{ty, ty::TyCtxt};
+use rustc_middle::{
+    mir::{self, Statement},
+    ty::{self, TyCtxt},
+};
 use rustc_span::{
+    DUMMY_SP,
     def_id::LocalDefId,
     sym::{new, unwrap},
 };
@@ -595,7 +599,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 pprust::expr_to_string(e),
                                 if m { "_mut" } else { "" },
                                 if m { "mut" } else { "const" },
-                                lhs_inner_ty,
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
                             );
                         } else {
                             *rhs = e.clone();
@@ -714,9 +718,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                     PtrKind::Slice(m) => {
                         if let ExprKind::Index(r, idx_expr, _) = &e.kind {
                             if need_cast {
+                                println!(
+                                    "Casting slice index rhs: {}",
+                                    pprust::expr_to_string(rhs)
+                                );
                                 *rhs = utils::expr!(
-                                    "(&{0} {1}[{2}{3}]) as *{0} {4}",
+                                    "std::slice::from_raw_parts{2}(&{0}({3}[{4}{5}]) as *{1} _ as *{1} {6}, 1024)",
+                                    if m { "mut " } else { "" },
                                     if m { "mut" } else { "const" },
+                                    if m { "_mut" } else { "" },
                                     pprust::expr_to_string(r),
                                     pprust::expr_to_string(idx_expr),
                                     if matches!(idx_expr.kind, ExprKind::Range(_, _, _)) {
@@ -724,7 +734,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                     } else {
                                         ".."
                                     },
-                                    lhs_inner_ty,
+                                    mir_ty_to_string(lhs_inner_ty, self.tcx),
                                 );
                             } else {
                                 *rhs = utils::expr!(
@@ -762,7 +772,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                     if m { "mut" } else { "const" },
                                     pprust::expr_to_string(r),
                                     pprust::expr_to_string(start_expr),
-                                    lhs_inner_ty,
+                                    mir_ty_to_string(lhs_inner_ty, self.tcx),
                                 );
                             } else {
                                 *rhs = utils::expr!(
@@ -773,12 +783,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 );
                             }
                         } else if need_cast || ty_updated {
-                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                             *rhs = utils::expr!(
                                 "&raw {0} ({1}) as *{0} {2}",
                                 if m { "mut" } else { "const" },
                                 pprust::expr_to_string(e),
-                                lhs_inner_ty,
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
                             );
                         } else {
                             *rhs = utils::expr!(
@@ -817,23 +826,46 @@ impl<'tcx> TransformVisitor<'tcx> {
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "offset" =>
             {
-                let mut offset_exprs = vec![];
-                let mut curr_expr = receiver;
-                loop {
-                    match &curr_expr.kind {
-                        ExprKind::MethodCall(box MethodCall {
-                            seg,
-                            receiver: inner_receiver,
-                            args,
-                            ..
-                        }) if seg.ident.name.as_str() == "offset" => {
-                            let idx_expr = unwrap_expr(&args[0]);
-                            offset_exprs.push(idx_expr);
-                            curr_expr = inner_receiver;
+                // HACK: currently, fields are not promoted, so we assume that they remain as raw
+                // pointers
+                if matches!(unwrap_expr(receiver).kind, ExprKind::Field(_, _)) {
+                    match lhs_kind {
+                        PtrKind::Slice(m) => {
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
+                                if m { "_mut" } else { "" },
+                                pprust::expr_to_string(rhs),
+                                if m { "mut" } else { "" },
+                            );
                         }
-                        _ => break,
+                        PtrKind::OptRef(m) => {
+                            *rhs = utils::expr!(
+                                "({}).as_{}()",
+                                pprust::expr_to_string(rhs),
+                                if m { "mut" } else { "ref" },
+                            );
+                        }
+                        PtrKind::Raw(_) => {}
                     }
+                    return;
                 }
+                let mut offset_exprs = vec![];
+                let mut curr_expr = &*rhs;
+                // loop {
+                //     match &curr_expr.kind {
+                //         ExprKind::MethodCall(box MethodCall {
+                //             seg,
+                //             receiver: inner_receiver,
+                //             args,
+                //             ..
+                //         }) if seg.ident.name.as_str() == "offset" => {
+                //             let idx_expr = unwrap_expr(&args[0]);
+                //             offset_exprs.push(idx_expr);
+                //             curr_expr = inner_receiver;
+                //         }
+                //         _ => break,
+                //     }
+                // }
                 if let ExprKind::MethodCall(box MethodCall { seg, receiver, .. }) = &curr_expr.kind
                     && matches!(seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
                 {
@@ -842,24 +874,70 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let index_str = offset_exprs
                     .iter()
                     .rev()
-                    .map(|idx_expr| format!("[({} as usize)..]", pprust::expr_to_string(idx_expr)))
+                    .map(|idx_expr| format!("[({}) as usize..]", pprust::expr_to_string(idx_expr)))
                     .collect::<String>();
                 match lhs_kind {
                     PtrKind::Slice(m) => {
-                        *rhs = utils::expr!(
-                            "&{}{}{}",
-                            if m { "mut " } else { "" },
-                            pprust::expr_to_string(curr_expr),
-                            index_str
-                        );
+                        if need_cast {
+                            *rhs = utils::expr!(
+                                "{6}std::slice::from_raw_parts{1}({3}{0} as *{2} _ as *{2} {4}, 1024){5}",
+                                pprust::expr_to_string(curr_expr),
+                                if m { "_mut" } else { "" },
+                                if m { "mut" } else { "const" },
+                                if m { "mut " } else { "" },
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                                index_str,
+                                if index_str.is_empty() {
+                                    ""
+                                } else {
+                                    if m { "&mut " } else { "&" }
+                                }
+                            );
+                        } else {
+                            // *rhs = utils::expr!(
+                            //     "&{}{}{}",
+                            //     if m { "mut " } else { "" },
+                            //     pprust::expr_to_string(curr_expr),
+                            //     index_str
+                            // );
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{1}({0}{2}, 1024)",
+                                pprust::expr_to_string(curr_expr),
+                                if m { "_mut" } else { "" },
+                                index_str
+                            );
+                        }
                     }
                     PtrKind::OptRef(m) => {
-                        *rhs = utils::expr!(
-                            "Some({}{}{}[0])",
-                            if m { "&mut " } else { "&" },
-                            pprust::expr_to_string(curr_expr),
-                            index_str
-                        );
+                        if need_cast {
+                            *rhs = utils::expr!(
+                                "Some(&{0}*({5}{2}{4} as *{1} _ as *{1} {3}){})",
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(curr_expr),
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                                index_str,
+                                if index_str.is_empty() {
+                                    ""
+                                } else {
+                                    if m { "&mut " } else { "&" }
+                                }
+                            );
+                        } else {
+                            // *rhs = utils::expr!(
+                            //     "Some(&{}{}{}[0])",
+                            //     if m { "mut " } else { "" },
+                            //     pprust::expr_to_string(curr_expr),
+                            //     index_str
+                            // );
+                            *rhs = utils::expr!(
+                                "Some(&{0}*({2} as *{1} {3}))",
+                                if m { "mut " } else { "" },
+                                if m { "mut" } else { "const" },
+                                pprust::expr_to_string(curr_expr),
+                                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            );
+                        }
                     }
                     PtrKind::Raw(_) => {
                         // skipping cases like
