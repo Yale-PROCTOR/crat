@@ -178,7 +178,15 @@ impl MutVisitor for TransformVisitor<'_> {
                 self.transform_rhs(rhs, hir_rhs, lhs_kind);
             }
             ExprKind::Binary(bin_op, l, r)
-                if matches!(bin_op.node, BinOpKind::Eq | BinOpKind::Ne) =>
+                if matches!(
+                    bin_op.node,
+                    BinOpKind::Eq
+                        | BinOpKind::Ne
+                        | BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge
+                ) =>
             {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
