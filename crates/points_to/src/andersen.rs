@@ -696,9 +696,14 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 let name = (seg(0), seg(1), seg(2), seg(3));
                 if let Some(local_def_id) = def_id.as_local() {
                     if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
-                        let span = self.tcx.span_of_impl(impl_def_id).unwrap();
-                        let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
-                        assert_eq!(code, "BitfieldStruct");
+                        let ty = self.tcx.type_of(impl_def_id).skip_binder();
+                        let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
+                        let adt_def_id = adt_def.did().as_local().unwrap();
+                        let bitfield = &self.tss.bitfields[&adt_def_id];
+                        let name = self.tcx.item_name(*def_id);
+                        let name = name.as_str();
+                        let name = name.strip_prefix("set_").unwrap_or(name);
+                        assert!(bitfield.name_to_idx.contains_key(name));
                     } else if is_extern {
                         if output.is_raw_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
