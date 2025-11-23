@@ -5,14 +5,14 @@ use rustc_middle::{
         AggregateKind, BasicBlocks, Body, Local, Location, Place, ProjectionElem, Rvalue,
         StatementKind,
     },
-    ty::{Ty, TyCtxt},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::def_id::LocalDefId;
 
 pub struct AnalysisResult<'a> {
     pub map: FxHashMap<
         LocalDefId,
-        FxHashMap<Place<'a>, FxHashMap<UnionUseInfo<'a>, (bool, Vec<UnionUseInfo<'a>>)>>,
+        FxHashMap<Place<'a>, FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>>,
     >,
 }
 
@@ -28,10 +28,12 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                 for (place, rw) in place_to_rw {
                     writeln!(f, "\tFor Place {place:?}")?;
                     for (read_use, (is_replacable, write_uses)) in rw {
-                        writeln!(f, "\t\tRead Use: {read_use:?}, Replacable: {is_replacable}",)?;
+                        writeln!(f, "\t\tRead Use: {read_use:?}")?;
+                        writeln!(f, "\t\tReplacable: {is_replacable}")?;
                         for write_use in write_uses {
-                            writeln!(f, "\t\t\tFrom Write Use: {write_use:?}")?;
+                            writeln!(f, "\t\tFrom Write Use: {write_use:?}")?;
                         }
+                        writeln!(f, "")?;
                     }
                 }
             }
@@ -42,29 +44,6 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
         Ok(())
     }
 }
-
-// #[derive(Clone, PartialEq, Eq)]
-// pub struct PunningInfo<'a> {
-//     size: u64,
-//     replacable_uses: FxHashSet<UnionUseInfo<'a>>,
-// }
-
-// impl<'a> std::fmt::Debug for PunningInfo<'a> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         let use_str = self
-//             .replacable_uses
-//             .iter()
-//             .map(|u| format!("\t{u:?}\n"))
-//             .collect::<Vec<String>>()
-//             .join("");
-
-//         write!(
-//             f,
-//             "Punning of {} bytes, Replacable uses:\n{}",
-//             self.size, use_str
-//         )
-//     }
-// }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 /// Union Place, Union Type, Field Projection
@@ -87,6 +66,16 @@ impl<'a> UnionUseKind<'a> {
         match self {
             UnionUseKind::InitUnion(_, _, _) | UnionUseKind::WriteField(_, _, _) => true,
             UnionUseKind::ReadField(_, _, _) => false,
+        }
+    }
+
+    fn field_type(&self, body: &Body<'a>, tcx: TyCtxt<'a>) -> Ty<'a> {
+        match self {
+            UnionUseKind::InitUnion(u, _, proj)
+            | UnionUseKind::WriteField(u, _, proj)
+            | UnionUseKind::ReadField(u, _, proj) => {
+                u.project_deeper(&[*proj], tcx).ty(body, tcx).ty
+            }
         }
     }
 }
@@ -131,8 +120,7 @@ fn collect_union_uses_map<'a>(
             union_uses_map.insert(def_id, uses);
         }
     }
-    // union_uses_map
-    todo!()
+    union_uses_map
 }
 
 /// Place -> [UnionUseInfo] for each def_id (function)
@@ -306,94 +294,112 @@ fn filter_closest_w_dom_r<'a>(
     closest_w_dom_r
 }
 
+fn succ_locations<'a>(loc: Location, body: &Body<'a>) -> Vec<Location> {
+    let bb = &body.basic_blocks[loc.block];
+
+    if loc.statement_index < bb.statements.len() {
+        return vec![Location {
+            block: loc.block,
+            statement_index: loc.statement_index + 1,
+        }];
+    }
+
+    let term = bb.terminator();
+    term.successors()
+        .map(|succ_bb| Location {
+            block: succ_bb,
+            statement_index: 0,
+        })
+        .collect()
+}
+
 fn collect_readable_writes<'a>(
+    uses: &[UnionUseInfo<'a>],
     w_dom_r: FxHashMap<UnionUseInfo<'a>, UnionUseInfo<'a>>,
+    body: &Body<'a>,
+) -> FxHashMap<UnionUseInfo<'a>, FxHashSet<UnionUseInfo<'a>>> {
+    // loc -> write use if it is a write
+    let mut loc_to_write: FxHashMap<Location, &UnionUseInfo<'a>> = FxHashMap::default();
+    for u in uses {
+        if u.kind.is_write() {
+            loc_to_write.insert(u.location, u);
+        }
+    }
+
+    let mut result: FxHashMap<UnionUseInfo<'a>, FxHashSet<UnionUseInfo<'a>>> = FxHashMap::default();
+
+    // DFS from dom_write to read_use
+    for (read_use, dom_write) in w_dom_r {
+        let r_loc = read_use.location;
+        let w0_loc = dom_write.location;
+
+        let mut last_write_locs: FxHashSet<Location> = FxHashSet::default();
+
+        // Stack of (current Location, last write Location) for DFS
+        let mut stack: Vec<(Location, Location)> = Vec::new();
+        let mut visited: FxHashSet<(Location, Location)> = FxHashSet::default();
+
+        let start_state = (w0_loc, w0_loc);
+        stack.push(start_state);
+        visited.insert(start_state);
+
+        while let Some((loc, last_loc)) = stack.pop() {
+            // reached read location
+            if loc == r_loc {
+                last_write_locs.insert(last_loc);
+                continue;
+            }
+
+            // update last write location if current location is a write
+            let mut new_last_loc = last_loc;
+            if loc_to_write.contains_key(&loc) {
+                new_last_loc = loc;
+            }
+
+            for succ in succ_locations(loc, body) {
+                let state = (succ, new_last_loc);
+                if visited.insert(state) {
+                    stack.push(state);
+                }
+            }
+        }
+
+        let readable_writes: FxHashSet<UnionUseInfo<'a>> = last_write_locs
+            .into_iter()
+            .map(|loc| loc_to_write.get(&loc).cloned().unwrap().clone())
+            .collect::<FxHashSet<UnionUseInfo<'a>>>();
+
+        result.insert(read_use, readable_writes);
+    }
+
+    result
+}
+
+fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
+    match ty.kind() {
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => true,
+        _ => false,
+    }
+}
+
+fn is_replacable_read<'a>(
+    read_use: &UnionUseInfo<'a>,
+    write_use: &FxHashSet<UnionUseInfo<'a>>,
+    body: &Body<'a>,
     tcx: TyCtxt<'a>,
-) -> FxHashSet<(UnionUseInfo<'a>, Vec<UnionUseInfo<'a>>)> {
-    todo!()
+) -> bool {
+    let rt = read_use.kind.field_type(body, tcx);
+    if !is_byte_implemented_ty(rt) {
+        return false;
+    }
+    for w in write_use {
+        let wt = w.kind.field_type(body, tcx);
+        if !is_byte_implemented_ty(wt) {
+            return false;
+        }
+    }
+    true
 }
-
-fn is_replacable_read(read_use: &UnionUseInfo, write_use: &Vec<UnionUseInfo>, tcx: TyCtxt) -> bool {
-    todo!()
-}
-
-// impl<'a> UnionUseInfo<'a> {
-//     fn is_between_dominance(
-//         &self,
-//         dominator: &UnionUseInfo,
-//         dominatee: &UnionUseInfo,
-//         body: &Body<'a>,
-//     ) -> Option<bool> {
-//         if !dominator
-//             .location
-//             .dominates(dominatee.location, body.basic_blocks.dominators())
-//         {
-//             None
-//         } else {
-//             Some(
-//                 dominator.location.is_predecessor_of(self.location, body)
-//                     && self.location.is_predecessor_of(dominatee.location, body),
-//             )
-//         }
-//     }
-// }
-
-// impl<'a> UnionUseKind<'a> {
-//     fn is_replacable_punning(
-//         write_use: &UnionUseKind<'a>,
-//         read_use: &UnionUseKind<'a>,
-//         between_set: &Vec<&UnionUseInfo<'a>>,
-//         def_id: LocalDefId,
-//         _tcx: TyCtxt<'a>,
-//     ) -> Option<u64> {
-//         match read_use {
-//             UnionUseKind::ReadField(u1, tu, proj1) => match write_use {
-//                 UnionUseKind::WriteField(u2, _, proj2) | UnionUseKind::InitUnion(u2, _, proj2) => {
-//                     // Punning check by pattern matching and projection comparison
-//                     if u1 != u2
-//                         || (proj1 == proj2
-//                             && between_set.iter().all(|u| match u.kind {
-//                                 UnionUseKind::InitUnion(_, _, p)
-//                                 | UnionUseKind::WriteField(_, _, p)
-//                                 | UnionUseKind::ReadField(_, _, p) => p == *proj2,
-//                             }))
-//                     {
-//                         None
-//                     } else {
-//                         // Replacable check here
-//                         // TODO: Check if to/from_bytes are implemented
-//                         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-//                         let body: &Body<'_> = &body.borrow();
-//                         let typing_env = TypingEnv::post_analysis(tcx, def_id);
-//                         let t1 = u1.project_deeper(&[*proj1], tcx).ty(body, tcx).ty;
-//                         let t2 = u2.project_deeper(&[*proj2], tcx).ty(body, tcx).ty;
-
-//                         let is_sized1 = t1.is_sized(tcx, typing_env);
-//                         let is_sized2 = t2.is_sized(tcx, typing_env);
-//                         let is_sized_u = tu.is_sized(tcx, typing_env);
-//                         if !is_sized1 || !is_sized2 || !is_sized_u {
-//                             return None;
-//                         }
-
-//                         let layout1 = tcx.layout_of(typing_env.as_query_input(t1)).unwrap();
-//                         let layout2 = tcx.layout_of(typing_env.as_query_input(t2)).unwrap();
-//                         let layout_u = tcx.layout_of(typing_env.as_query_input(*tu)).unwrap();
-
-//                         if layout1.size.bytes() == layout2.size.bytes()
-//                             && layout1.size.bytes() == layout_u.size.bytes()
-//                         {
-//                             Some(layout1.size.bytes())
-//                         } else {
-//                             None
-//                         }
-//                     }
-//                 }
-//                 _ => None,
-//             },
-//             _ => None,
-//         }
-//     }
-// }
 
 pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
@@ -414,19 +420,22 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
 
             // r -> w where w closest dominator write of r
             let w_dom_r = filter_closest_w_dom_r(dominance_relations);
-
+            println!("{:?}", &w_dom_r);
             // r -> [w1, w2, ...] where r can read from w1, w2, ...
-            let read_write_map = collect_readable_writes(w_dom_r, tcx);
+            let read_write_map = collect_readable_writes(uses, w_dom_r, body);
 
             let read_write_map = read_write_map
                 .into_iter()
                 .map(|(read_use, write_uses)| {
                     (
                         read_use.clone(),
-                        (is_replacable_read(&read_use, &write_uses, tcx), write_uses),
+                        (
+                            is_replacable_read(&read_use, &write_uses, body, tcx),
+                            write_uses,
+                        ),
                     )
                 })
-                .collect::<FxHashMap<UnionUseInfo, (bool, Vec<UnionUseInfo>)>>();
+                .collect::<FxHashMap<UnionUseInfo, (bool, FxHashSet<UnionUseInfo>)>>();
 
             place_map.insert(*place, read_write_map);
         }
