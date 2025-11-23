@@ -9,11 +9,10 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 
+pub type AnalysisMap<'a> =
+    FxHashMap<Place<'a>, FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>>;
 pub struct AnalysisResult<'a> {
-    pub map: FxHashMap<
-        LocalDefId,
-        FxHashMap<Place<'a>, FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>>,
-    >,
+    pub map: FxHashMap<LocalDefId, AnalysisMap<'a>>,
 }
 
 impl<'a> std::fmt::Debug for AnalysisResult<'a> {
@@ -33,7 +32,7 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                         for write_use in write_uses {
                             writeln!(f, "\t\tFrom Write Use: {write_use:?}")?;
                         }
-                        writeln!(f, "")?;
+                        writeln!(f)?;
                     }
                 }
             }
@@ -376,10 +375,10 @@ fn collect_readable_writes<'a>(
 }
 
 fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
-    match ty.kind() {
-        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => true,
-        _ => false,
-    }
+    matches!(
+        ty.kind(),
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+    )
 }
 
 fn is_replacable_read<'a>(
