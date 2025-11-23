@@ -5,18 +5,10 @@ use rustc_ast::{
     *,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::{HirId, def::Res};
-use rustc_middle::{
-    mir::{self, Statement},
-    ty::{self, TyCtxt},
-};
-use rustc_span::{
-    DUMMY_SP,
-    def_id::LocalDefId,
-    sym::{new, unwrap},
-};
+use rustc_middle::ty::{self, TyCtxt};
 use utils::ir::{AstToHir, mir_ty_to_string};
 
 use super::{
@@ -665,25 +657,34 @@ impl<'tcx> TransformVisitor<'tcx> {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                             // HACK: assume length 1024, 0 if null
                             *rhs = utils::expr!(
-                                "({0}){1}.as_{2}().map_or(&{5}[], |x| std::slice::from_raw_parts{3}(x as *{4} _ as *{4} {6}, 1024))",
+                                "
+    if ({0}).is_null() {{
+        &{1}[]
+    }} else {{
+        std::slice::from_raw_parts{2}(({0}){3} as *{4} {5}, 1024)
+    }}
+                                    ",
                                 pprust::expr_to_string(e),
-                                cast_mut,
-                                if m { "mut" } else { "ref" },
-                                if m { "_mut" } else { "" },
-                                if m { "mut" } else { "const" },
                                 if m { "mut " } else { "" },
+                                if m { "_mut" } else { "" },
+                                cast_mut,
+                                if m { "mut" } else { "const" },
                                 lhs_inner_ty,
                             );
                         } else {
                             // HACK: assume length 1024
                             *rhs = utils::expr!(
-                                "({0}){1}.as_{2}().map_or(&{5}[], |x| std::slice::from_raw_parts{3}(x as *{4} _, 1024))",
+                                "
+    if ({0}).is_null() {{
+        &{1}[]
+    }} else {{
+        std::slice::from_raw_parts{2}(({0}){3}, 1024)
+    }}
+                                    ",
                                 pprust::expr_to_string(e),
-                                cast_mut,
-                                if m { "mut" } else { "ref" },
-                                if m { "_mut" } else { "" },
-                                if m { "mut" } else { "const" },
                                 if m { "mut " } else { "" },
+                                if m { "_mut" } else { "" },
+                                cast_mut,
                             );
                         }
                     }
@@ -739,13 +740,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    PtrKind::Slice(m) => {
-                        if let ExprKind::Index(r, idx_expr, _) = &e.kind {
+                    PtrKind::Slice(m) => match &e.kind {
+                        ExprKind::Index(r, idx_expr, _) => {
                             if need_cast {
-                                println!(
-                                    "Casting slice index rhs: {}",
-                                    pprust::expr_to_string(rhs)
-                                );
                                 *rhs = utils::expr!(
                                     "std::slice::from_raw_parts{2}(&{0}({3}[{4}{5}]) as *{1} _ as *{1} {6}, 1024)",
                                     if m { "mut " } else { "" },
@@ -773,18 +770,61 @@ impl<'tcx> TransformVisitor<'tcx> {
                                     }
                                 );
                             }
-                        } else {
+                        }
+                        ExprKind::Unary(UnOp::Deref, e) => {
                             if need_cast {
-                                unimplemented!()
+                                *rhs = utils::expr!(
+                                    "
+    {{
+        let _x = {0};
+        if _x.is_null() {{
+            &{1}[]
+        }} else {{
+            std::slice::from_raw_parts{2}(_x as *{3} {4}, 1024)
+        }}
+    }}
+                                    ",
+                                    pprust::expr_to_string(e),
+                                    if m { "mut " } else { "" },
+                                    if m { "_mut" } else { "" },
+                                    if m { "mut" } else { "const" },
+                                    lhs_inner_ty,
+                                );
                             } else {
                                 *rhs = utils::expr!(
-                                    "&{}[{}]",
-                                    if m { "mut " } else { "" },
+                                    "
+    {{
+        let _x = {0};
+        if _x.is_null() {{
+            &{1}[]
+        }} else {{
+            std::slice::from_raw_parts{2}(_x, 1024)
+        }}
+    }}
+                                    ",
                                     pprust::expr_to_string(e),
+                                    if m { "mut " } else { "" },
+                                    if m { "_mut" } else { "" },
                                 );
                             }
                         }
-                    }
+                        ExprKind::Path(_, _) => {
+                            if need_cast {
+                                *rhs = utils::expr!(
+                                    "
+            std::slice::from_raw_parts{0}(&raw {1} {2} as *{1} {3}, 1024)
+                                    ",
+                                    if m { "_mut" } else { "" },
+                                    if m { "mut" } else { "const" },
+                                    pprust::expr_to_string(e),
+                                    lhs_inner_ty,
+                                );
+                            } else {
+                                todo!("{}", pprust::expr_to_string(e))
+                            }
+                        }
+                        _ => todo!("{}", pprust::expr_to_string(e)),
+                    },
                     PtrKind::Raw(m) => {
                         if let ExprKind::Index(r, box idx_expr, _) = &e.kind
                             && let ExprKind::Range(Some(start_expr), _, _) = &idx_expr.kind
@@ -829,18 +869,31 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let m = seg.ident.name.as_str() == "as_mut_ptr";
                 match lhs_kind {
                     PtrKind::OptRef(_) => {
-                        *rhs = utils::expr!(
-                            "Some(&{}{}[0])",
-                            if m { "mut " } else { "" },
-                            pprust::expr_to_string(receiver)
-                        );
+                        if need_cast {
+                            todo!()
+                        } else {
+                            *rhs = utils::expr!(
+                                "Some(&{}{}[0])",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(receiver)
+                            );
+                        }
                     }
                     PtrKind::Slice(_) => {
-                        *rhs = utils::expr!(
-                            "&{}{}",
-                            if m { "mut " } else { "" },
-                            pprust::expr_to_string(receiver)
-                        );
+                        if need_cast {
+                            *rhs = utils::expr!(
+                                "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
+                                if m { "_mut" } else { "" },
+                                pprust::expr_to_string(e),
+                                if m { "mut" } else { "const" },
+                            );
+                        } else {
+                            *rhs = utils::expr!(
+                                "&{}{}",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(receiver)
+                            );
+                        }
                     }
                     PtrKind::Raw(_) => {
                         // no change needed
@@ -873,7 +926,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                     return;
                 }
-                let mut offset_exprs = vec![];
+                let offset_exprs = vec![];
                 let mut curr_expr = &*rhs;
                 // loop {
                 //     match &curr_expr.kind {
@@ -1049,16 +1102,36 @@ impl<'tcx> TransformVisitor<'tcx> {
                     } else {
                         if need_cast {
                             *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{1}({0} as *{2} _ as *{2} {3}, 1024)",
+                                "
+    {{
+        let _x = {0};
+        if _x.is_null() {{
+            &{1}[]
+        }} else {{
+            std::slice::from_raw_parts{2}(_x as *{3} {4}, 1024)
+        }}
+    }}
+                                    ",
                                 pprust::expr_to_string(e),
+                                if m { "mut " } else { "" },
                                 if m { "_mut" } else { "" },
                                 if m { "mut" } else { "const" },
-                                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                                lhs_inner_ty,
                             );
                         } else {
                             *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{1}({0}, 1024)",
+                                "
+    {{
+        let _x = {0};
+        if _x.is_null() {{
+            &{1}[]
+        }} else {{
+            std::slice::from_raw_parts{2}(_x, 1024)
+        }}
+    }}
+                                    ",
                                 pprust::expr_to_string(e),
+                                if m { "mut " } else { "" },
                                 if m { "_mut" } else { "" },
                             );
                         }
@@ -1171,74 +1244,6 @@ fn mk_slice_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> T
     let ty = mir_ty_to_string(ty, tcx);
     let m = if mutability { "mut " } else { "" };
     utils::ty!("&{m}[{ty}]")
-}
-
-struct OffsetVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    params: FxHashMap<LocalDefId, Vec<HirId>>,
-    offsets: FxHashSet<HirId>,
-}
-
-impl<'tcx> hir::intravisit::Visitor<'tcx> for OffsetVisitor<'tcx> {
-    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
-
-    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-        self.tcx
-    }
-
-    fn visit_fn(
-        &mut self,
-        kind: hir::intravisit::FnKind<'tcx>,
-        decl: &'tcx hir::FnDecl<'tcx>,
-        body_id: hir::BodyId,
-        _: rustc_span::Span,
-        def_id: LocalDefId,
-    ) {
-        let body = self.tcx.hir_body(body_id);
-        let params = body
-            .params
-            .iter()
-            .map(|param| {
-                let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else { panic!() };
-                hir_id
-            })
-            .collect();
-        self.params.insert(def_id, params);
-        hir::intravisit::walk_fn(self, kind, decl, body_id, def_id);
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-        match expr.kind {
-            hir::ExprKind::MethodCall(seg, e, _, _) => {
-                if seg.ident.name == rustc_span::sym::offset
-                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
-                        unwrap_hir_expr(e).kind
-                    && let Res::Local(hir_id) = path.res
-                {
-                    self.offsets.insert(hir_id);
-                }
-            }
-            hir::ExprKind::Call(callee, args) => {
-                if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind
-                    && let Res::Def(_, def_id) = path.res
-                    && matches!(
-                        self.tcx.hir_get_if_local(def_id),
-                        Some(hir::Node::ForeignItem(_))
-                    )
-                    && let Some(name) = utils::ir::def_id_to_symbol(def_id, self.tcx)
-                    && name.as_str() == "strtol"
-                    && let [arg, ..] = args
-                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) =
-                        unwrap_hir_expr(arg).kind
-                    && let Res::Local(hir_id) = path.res
-                {
-                    self.offsets.insert(hir_id);
-                }
-            }
-            _ => {}
-        }
-        hir::intravisit::walk_expr(self, expr);
-    }
 }
 
 fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
