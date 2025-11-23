@@ -374,6 +374,8 @@ fn collect_readable_writes<'a>(
     result
 }
 
+/// TODO: consider more types
+/// Currently, only primitive types can pass
 fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
     matches!(
         ty.kind(),
