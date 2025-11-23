@@ -350,67 +350,80 @@ impl MutVisitor for TransformVisitor<'_> {
                 receiver,
                 args,
                 ..
-            }) if seg.ident.name.as_str() == "offset" => match &unwrap_paren(receiver).kind {
-                ExprKind::Path(_, _) => {
-                    let hir_id = self.hir_id_of_path(receiver.id).unwrap();
-                    let ptr_kind = self.ptr_kinds[&hir_id];
-                    let idx_expr = unwrap_expr(&args[0]);
-                    if let PtrKind::Slice(m) = ptr_kind {
-                        *expr = utils::expr!(
-                            "&{}{}[({}) as usize..]",
-                            if m { "mut " } else { "" },
-                            pprust::expr_to_string(receiver),
-                            pprust::expr_to_string(idx_expr)
-                        );
-                    }
-                }
-                ExprKind::AddrOf(
-                    BorrowKind::Ref,
-                    mutability,
-                    inner @ box Expr {
-                        kind:
-                            ExprKind::Index(
-                                _,
-                                box Expr {
-                                    kind: ExprKind::Range(Some(_), _, _),
-                                    ..
-                                },
-                                _,
-                            ),
+            }) if seg.ident.name.as_str() == "offset" => {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let parent = self.tcx.parent_hir_node(hir_expr.hir_id);
+                if !matches!(
+                    parent,
+                    hir::Node::Expr(hir::Expr {
+                        kind: hir::ExprKind::Unary(UnOp::Deref, _),
                         ..
-                    },
-                ) => {
-                    *expr = utils::expr!(
-                        "{}{}[({}) as usize..]",
-                        mutability.ref_prefix_str(),
-                        pprust::expr_to_string(&inner),
-                        pprust::expr_to_string(unwrap_expr(&args[0])),
-                    );
-                }
-                ExprKind::Cast(_, box cast_ty) => {
-                    let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
-                    if let hir::TyKind::Ptr(_) = cast_ty.kind {
-                        let unwrapped_receiver = unwrap_expr_mut(receiver);
-                        if let ExprKind::Path(_, _) = unwrapped_receiver.kind {
-                            let hir_id = self.hir_id_of_path(unwrapped_receiver.id).unwrap();
-                            match self.ptr_kinds[&hir_id] {
-                                PtrKind::OptRef(_) => {
-                                    unreachable!()
-                                }
-                                PtrKind::Slice(m) => {
-                                    *unwrapped_receiver = utils::expr!(
-                                        "{}.as_{}ptr()",
-                                        pprust::expr_to_string(&unwrapped_receiver),
-                                        if m { "mut_" } else { "" },
-                                    );
-                                }
-                                _ => {}
+                    })
+                ) {
+                    match &unwrap_paren(receiver).kind {
+                        ExprKind::Path(_, _) => {
+                            let hir_id = self.hir_id_of_path(receiver.id).unwrap();
+                            let ptr_kind = self.ptr_kinds[&hir_id];
+                            let idx_expr = unwrap_expr(&args[0]);
+                            if let PtrKind::Slice(m) = ptr_kind {
+                                *expr = utils::expr!(
+                                    "&{}{}[({}) as usize..]",
+                                    if m { "mut " } else { "" },
+                                    pprust::expr_to_string(receiver),
+                                    pprust::expr_to_string(idx_expr)
+                                );
                             }
                         }
+                        ExprKind::AddrOf(
+                            BorrowKind::Ref,
+                            mutability,
+                            inner @ box Expr {
+                                kind:
+                                    ExprKind::Index(
+                                        _,
+                                        box Expr {
+                                            kind: ExprKind::Range(Some(_), _, _),
+                                            ..
+                                        },
+                                        _,
+                                    ),
+                                ..
+                            },
+                        ) => {
+                            *expr = utils::expr!(
+                                "{}{}[({}) as usize..]",
+                                mutability.ref_prefix_str(),
+                                pprust::expr_to_string(&inner),
+                                pprust::expr_to_string(unwrap_expr(&args[0])),
+                            );
+                        }
+                        ExprKind::Cast(_, box cast_ty) => {
+                            let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
+                            if let hir::TyKind::Ptr(_) = cast_ty.kind {
+                                let unwrapped_receiver = unwrap_expr_mut(receiver);
+                                if let ExprKind::Path(_, _) = unwrapped_receiver.kind {
+                                    let hir_id =
+                                        self.hir_id_of_path(unwrapped_receiver.id).unwrap();
+                                    match self.ptr_kinds[&hir_id] {
+                                        PtrKind::OptRef(_) => {
+                                            unreachable!()
+                                        }
+                                        PtrKind::Slice(m) => {
+                                            *unwrapped_receiver = utils::expr!(
+                                                "{}.as_{}ptr()",
+                                                pprust::expr_to_string(&unwrapped_receiver),
+                                                if m { "mut_" } else { "" },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
-            },
+            }
             ExprKind::Ret(Some(ret)) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let hir::ExprKind::Ret(Some(hir_ret)) = hir_expr.kind else {
@@ -646,13 +659,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    (PtrKind::Slice(m), PtrKind::Raw(_)) => {
+                    (PtrKind::Slice(m), PtrKind::Raw(m1)) => {
+                        let cast_mut = if !m1 && m { ".cast_mut()" } else { "" };
                         if need_cast {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                             // HACK: assume length 1024, 0 if null
                             *rhs = utils::expr!(
-                                "({0}).as_{1}().map_or(&{4}[], |x| std::slice::from_raw_parts{2}(x as *{3} _ as *{3} {5}, 1024))",
+                                "({0}){1}.as_{2}().map_or(&{5}[], |x| std::slice::from_raw_parts{3}(x as *{4} _ as *{4} {6}, 1024))",
                                 pprust::expr_to_string(e),
+                                cast_mut,
                                 if m { "mut" } else { "ref" },
                                 if m { "_mut" } else { "" },
                                 if m { "mut" } else { "const" },
@@ -662,8 +677,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                         } else {
                             // HACK: assume length 1024
                             *rhs = utils::expr!(
-                                "({0}).as_{1}().map_or(&{4}[], |x| std::slice::from_raw_parts{2}(x as *{3} _, 1024))",
+                                "({0}){1}.as_{2}().map_or(&{5}[], |x| std::slice::from_raw_parts{3}(x as *{4} _, 1024))",
                                 pprust::expr_to_string(e),
+                                cast_mut,
                                 if m { "mut" } else { "ref" },
                                 if m { "_mut" } else { "" },
                                 if m { "mut" } else { "const" },
