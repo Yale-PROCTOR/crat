@@ -21,6 +21,7 @@ pub mod bin_file_adder;
 pub mod expander;
 pub mod extern_resolver;
 pub mod formatter;
+pub mod interface_fixer;
 pub mod libc_replacer;
 pub mod preprocessor;
 pub mod splitter;

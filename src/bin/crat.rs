@@ -107,6 +107,8 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long, help = "File containing the result of points-to analysis")]
     points_to_file: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
+    c_exposed_fn: Vec<String>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -133,6 +135,7 @@ enum Pass {
     Bin,
     Check,
     Format,
+    Interface,
     Libc,
     OutParam,
     Lock,
@@ -165,7 +168,12 @@ struct Config {
     #[serde(default)]
     outparam: outparam_replacer::Config,
     #[serde(default)]
+    interface: interface_fixer::Config,
+    #[serde(default)]
     andersen: points_to::andersen::Config,
+
+    #[serde(default)]
+    c_exposed_fn: Vec<String>,
 
     #[serde(default)]
     verbose: bool,
@@ -189,6 +197,7 @@ fn main() {
             toml::from_str::<Config>(&content).unwrap()
         })
         .unwrap_or_default();
+    config.c_exposed_fn.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
     config.passes.extend(args.pass);
@@ -306,6 +315,11 @@ fn main() {
         config.outparam.points_to_file = args.points_to_file;
     }
 
+    config
+        .interface
+        .c_exposed_fns
+        .extend(config.c_exposed_fn.iter().cloned());
+
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
             eprintln!("Analysis output is not supported when running passes");
@@ -396,6 +410,13 @@ fn main() {
             }
             Pass::Format => {
                 run_compiler_on_path(&file, formatter::format).unwrap();
+            }
+            Pass::Interface => {
+                let s = run_compiler_on_path(&file, |tcx| {
+                    interface_fixer::fix_interfaces(&config.interface, tcx)
+                })
+                .unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Libc => {
                 let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
