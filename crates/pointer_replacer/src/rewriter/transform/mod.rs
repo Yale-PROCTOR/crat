@@ -217,19 +217,92 @@ impl MutVisitor for TransformVisitor<'_> {
                             PtrKind::Raw(_) => {}
                         }
                     }
-                    ExprKind::Cast(_, box cast_ty) => {
-                        let cast_ty = self.ast_to_hir.get_ty(cast_ty.id, self.tcx).unwrap();
-                        let unwrapped_e = unwrap_expr(e);
-                        if let Some(unwrapped_hir_id) = self.hir_id_of_path(unwrapped_e.id)
-                            && let hir::TyKind::Ptr(_) = cast_ty.kind
-                        {
-                            match self.ptr_kinds[&unwrapped_hir_id] {
-                                PtrKind::OptRef(m) | PtrKind::Slice(m) => {
-                                    let hir_expr =
-                                        self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
-                                    self.transform_rhs(e, hir_expr, PtrKind::Raw(m));
+                    ExprKind::Cast(_, _) => {
+                        let ptr = unwrap_expr(e);
+                        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
+                        let hir_ptr = self.ast_to_hir.get_expr(ptr.id, self.tcx).unwrap();
+                        let typeck = self.tcx.typeck(hir_e.hir_id.owner);
+                        let (ty_to, m) = unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_e)).unwrap();
+                        let (ty_from, _) = unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_ptr)).unwrap();
+                        if ty_to == ty_from {
+                            match &ptr.kind {
+                                ExprKind::Path(_, _) => {
+                                    let hir_id = self.hir_id_of_path(ptr.id).unwrap();
+                                    let ptr_kind = self.ptr_kinds[&hir_id];
+                                    match ptr_kind {
+                                        PtrKind::OptRef(m) => {
+                                            let m = if m { "_mut" } else { "" };
+                                            *e = utils::expr!(
+                                                "{}.as_deref{}().unwrap()",
+                                                pprust::expr_to_string(ptr),
+                                                m
+                                            );
+                                        }
+                                        PtrKind::Slice(_) => {
+                                            *expr =
+                                                utils::expr!("{}[0]", pprust::expr_to_string(ptr));
+                                        }
+                                        PtrKind::Raw(_) => {}
+                                    }
                                 }
-                                PtrKind::Raw(_) => {}
+                                ExprKind::AddrOf(_, _, box pointee) => {
+                                    *expr = pointee.clone();
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match &ptr.kind {
+                                ExprKind::Path(_, _) => {
+                                    let hir_id = self.hir_id_of_path(ptr.id).unwrap();
+                                    let ptr_kind = self.ptr_kinds[&hir_id];
+                                    if safe_conversion(ty_to, ty_from) {
+                                        match ptr_kind {
+                                            PtrKind::OptRef(m) => {
+                                                *e = utils::expr!(
+                                                    "bytemuck::cast_{}::<{}, {}>(({}).as_deref{}().unwrap())",
+                                                    if m { "mut" } else { "ref" },
+                                                    mir_ty_to_string(ty_from, self.tcx),
+                                                    mir_ty_to_string(ty_to, self.tcx),
+                                                    pprust::expr_to_string(ptr),
+                                                    if m { "_mut" } else { "" },
+                                                );
+                                            }
+                                            PtrKind::Slice(m) => {
+                                                self.bytemuck.set(true);
+                                                *e = utils::expr!(
+                                                    "bytemuck::cast_{}::<{}, {}>(&{} ({})[0])",
+                                                    if m { "mut" } else { "ref" },
+                                                    mir_ty_to_string(ty_from, self.tcx),
+                                                    mir_ty_to_string(ty_to, self.tcx),
+                                                    if m { "mut " } else { "" },
+                                                    pprust::expr_to_string(ptr),
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    } else if let PtrKind::OptRef(m) | PtrKind::Slice(m) = ptr_kind
+                                    {
+                                        let hir_expr =
+                                            self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
+                                        self.transform_rhs(e, hir_expr, PtrKind::Raw(m));
+                                    }
+                                }
+                                _ => {
+                                    if safe_conversion(ty_to, ty_from) {
+                                        self.bytemuck.set(true);
+                                        *e = utils::expr!(
+                                            "bytemuck::cast_{}::<{}, {}>({})",
+                                            if m.is_mut() { "mut" } else { "ref" },
+                                            mir_ty_to_string(ty_from, self.tcx),
+                                            mir_ty_to_string(ty_to, self.tcx),
+                                            pprust::expr_to_string(ptr),
+                                        );
+                                    } else {
+                                        let hir_expr =
+                                            self.ast_to_hir.get_expr(e.id, self.tcx).unwrap();
+                                        self.transform_rhs(e, hir_expr, PtrKind::Raw(m.is_mut()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -841,15 +914,31 @@ impl<'tcx> TransformVisitor<'tcx> {
                         }
                         ExprKind::Path(_, _) => {
                             if need_cast {
-                                *rhs = utils::expr!(
-                                    "
+                                if matches!(
+                                    lhs_inner_ty.kind(),
+                                    ty::TyKind::Int(ty::IntTy::I8)
+                                        | ty::TyKind::Uint(ty::UintTy::U8)
+                                ) && rhs_inner_ty.is_numeric()
+                                {
+                                    self.bytemuck.set(true);
+                                    *rhs = utils::expr!(
+                                        "bytemuck::cast_slice{}(std::slice::from_{}(&{}{}))",
+                                        if m { "_mut" } else { "" },
+                                        if m { "mut" } else { "ref" },
+                                        if m { "mut " } else { "" },
+                                        pprust::expr_to_string(e),
+                                    );
+                                } else {
+                                    *rhs = utils::expr!(
+                                        "
             std::slice::from_raw_parts{0}(&raw {1} {2} as *{1} {3}, 1024)
                                     ",
-                                    if m { "_mut" } else { "" },
-                                    if m { "mut" } else { "const" },
-                                    pprust::expr_to_string(e),
-                                    lhs_inner_ty,
-                                );
+                                        if m { "_mut" } else { "" },
+                                        if m { "mut" } else { "const" },
+                                        pprust::expr_to_string(e),
+                                        lhs_inner_ty,
+                                    );
+                                }
                             } else {
                                 *rhs = utils::expr!(
                                     "std::slice::from_{}(&{}{})",
@@ -1304,5 +1393,36 @@ fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
         unwrap_hir_expr(expr)
     } else {
         expr
+    }
+}
+
+#[allow(clippy::match_like_matches_macro)]
+fn safe_conversion(ty_to: ty::Ty<'_>, ty_from: ty::Ty<'_>) -> bool {
+    match (ty_to.kind(), ty_from.kind()) {
+        (ty::Int(ty::IntTy::I8), ty::Uint(ty::UintTy::U8)) => true,
+        (ty::Int(ty::IntTy::I16), ty::Uint(ty::UintTy::U16)) => true,
+        (ty::Int(ty::IntTy::I32), ty::Uint(ty::UintTy::U32)) => true,
+        (ty::Int(ty::IntTy::I64), ty::Uint(ty::UintTy::U64)) => true,
+        (ty::Int(ty::IntTy::I128), ty::Uint(ty::UintTy::U128)) => true,
+        (ty::Int(ty::IntTy::Isize), ty::Uint(ty::UintTy::Usize)) => true,
+        (ty::Uint(ty::UintTy::U8), ty::Int(ty::IntTy::I8)) => true,
+        (ty::Uint(ty::UintTy::U16), ty::Int(ty::IntTy::I16)) => true,
+        (ty::Uint(ty::UintTy::U32), ty::Int(ty::IntTy::I32)) => true,
+        (ty::Uint(ty::UintTy::U64), ty::Int(ty::IntTy::I64)) => true,
+        (ty::Uint(ty::UintTy::U128), ty::Int(ty::IntTy::I128)) => true,
+        (ty::Uint(ty::UintTy::Usize), ty::Int(ty::IntTy::Isize)) => true,
+        (ty::Int(ty::IntTy::I32), ty::Float(ty::FloatTy::F32)) => true,
+        (ty::Float(ty::FloatTy::F32), ty::Int(ty::IntTy::I32)) => true,
+        (ty::Uint(ty::UintTy::U32), ty::Float(ty::FloatTy::F32)) => true,
+        (ty::Float(ty::FloatTy::F32), ty::Uint(ty::UintTy::U32)) => true,
+        (ty::Int(ty::IntTy::I64), ty::Float(ty::FloatTy::F64)) => true,
+        (ty::Float(ty::FloatTy::F64), ty::Int(ty::IntTy::I64)) => true,
+        (ty::Uint(ty::UintTy::U64), ty::Float(ty::FloatTy::F64)) => true,
+        (ty::Float(ty::FloatTy::F64), ty::Uint(ty::UintTy::U64)) => true,
+        (ty::Int(ty::IntTy::I128), ty::Float(ty::FloatTy::F128)) => true,
+        (ty::Float(ty::FloatTy::F128), ty::Int(ty::IntTy::I128)) => true,
+        (ty::Uint(ty::UintTy::U128), ty::Float(ty::FloatTy::F128)) => true,
+        (ty::Float(ty::FloatTy::F128), ty::Uint(ty::UintTy::U128)) => true,
+        _ => false,
     }
 }
