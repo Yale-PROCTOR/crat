@@ -79,7 +79,10 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> (String, bool) {
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
 
-    (pprust::crate_to_string_for_macros(&krate), visitor.bytemuck)
+    (
+        pprust::crate_to_string_for_macros(&krate),
+        visitor.bytemuck.get(),
+    )
 }
 
 fn find_param_aliases<'tcx>(

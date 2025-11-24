@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use etrace::some_or;
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
@@ -23,7 +25,7 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     ast_to_hir: AstToHir,
-    pub bytemuck: bool,
+    pub bytemuck: Cell<bool>,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -289,7 +291,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         }
                                     }
                                     if need_cast {
-                                        self.bytemuck = true;
+                                        self.bytemuck.set(true);
                                         *expr = utils::expr!(
                                             "bytemuck::cast_slice{}::<{}, {}>({}){indices_str}",
                                             if m { "_mut" } else { "" },
@@ -473,7 +475,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             sig_decs,
             ptr_kinds,
             ast_to_hir,
-            bytemuck: false,
+            bytemuck: Cell::new(false),
         }
     }
 
@@ -1060,22 +1062,26 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                 }
             }
-            ExprKind::Lit(token::Lit { kind, symbol, .. }) => {
+            ExprKind::Lit(token::Lit { kind, .. }) => {
                 if kind == &token::LitKind::ByteStr {
                     match lhs_kind {
                         PtrKind::Slice(m) => {
-                            *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{1}({0}.as{1}_ptr(){2}, {3})",
-                                pprust::expr_to_string(e),
-                                if m { "_mut" } else { "" },
-                                match lhs_inner_ty.kind() {
-                                    ty::TyKind::Int(ty::IntTy::I8) =>
-                                        format!(" as *{} i8", if m { "mut" } else { "const" }),
-                                    ty::TyKind::Uint(ty::UintTy::U8) => String::new(),
-                                    _ => unreachable!(),
-                                },
-                                symbol.as_str().len(), // including null terminator
-                            );
+                            if m {
+                                todo!()
+                            } else if matches!(
+                                lhs_inner_ty.kind(),
+                                ty::TyKind::Uint(ty::UintTy::U8)
+                            ) {
+                                *rhs = e.clone();
+                            } else {
+                                assert!(lhs_inner_ty.is_integral());
+                                self.bytemuck.set(true);
+                                *rhs = utils::expr!(
+                                    "bytemuck::cast_slice::<u8, {}>({})",
+                                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                                    pprust::expr_to_string(e),
+                                );
+                            }
                         }
                         PtrKind::OptRef(m) => {
                             // TODO: this is not safe and idiomatic; translating byte string literal to Option<&i8>
