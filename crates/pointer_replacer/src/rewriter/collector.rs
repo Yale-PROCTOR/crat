@@ -1,11 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir as hir;
 use rustc_hir::{
     ExprKind, HirId, QPath, TyKind,
     def::{DefKind, Res},
     intravisit::{Visitor, walk_expr},
 };
-use rustc_middle::{mir::Local, ty::TyCtxt};
+use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, decision::PtrKind};
@@ -21,7 +20,7 @@ pub fn collect_diffs<'tcx>(
 
     // collect each HIR variable's before/after pointer kinds
     for did in rust_program.functions.iter() {
-        let decision_maker = DecisionMaker::new(analysis, did);
+        let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
         // Assume every mir local has one or less corresponding hir id
         let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
@@ -94,58 +93,4 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
     }
 
     collector.fn_ptrs
-}
-
-struct OffsetVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    params: FxHashMap<LocalDefId, Vec<HirId>>,
-    offsets: FxHashSet<HirId>,
-}
-
-impl<'tcx> hir::intravisit::Visitor<'tcx> for OffsetVisitor<'tcx> {
-    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
-
-    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-        self.tcx
-    }
-
-    fn visit_fn(
-        &mut self,
-        kind: hir::intravisit::FnKind<'tcx>,
-        decl: &'tcx hir::FnDecl<'tcx>,
-        body_id: hir::BodyId,
-        _: rustc_span::Span,
-        def_id: LocalDefId,
-    ) {
-        let body = self.tcx.hir_body(body_id);
-        let params = body
-            .params
-            .iter()
-            .map(|param| {
-                let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else { panic!() };
-                hir_id
-            })
-            .collect();
-        self.params.insert(def_id, params);
-        hir::intravisit::walk_fn(self, kind, decl, body_id, def_id);
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-        if let hir::ExprKind::MethodCall(seg, e, _, _) = expr.kind
-            && seg.ident.name == rustc_span::sym::offset
-            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = unwrap_hir_expr(e).kind
-            && let Res::Local(hir_id) = path.res
-        {
-            self.offsets.insert(hir_id);
-        }
-        hir::intravisit::walk_expr(self, expr);
-    }
-}
-
-fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
-    if let hir::ExprKind::Cast(expr, _) | hir::ExprKind::DropTemps(expr) = &expr.kind {
-        unwrap_hir_expr(expr)
-    } else {
-        expr
-    }
 }
