@@ -279,7 +279,10 @@ pub fn analyze(conf: &Config, verbose: bool, tcx: TyCtxt<'_>) -> Statistics {
     }
 
     let start = std::time::Instant::now();
-    let points_to_config = andersen::Config { use_optimized_mir };
+    let points_to_config = andersen::Config {
+        use_optimized_mir,
+        c_exposed_fns: FxHashSet::default(),
+    };
     let pre = andersen::pre_analyze(&points_to_config, &tss, tcx);
     let solutions = if let Some(file) = &conf.points_to_file {
         let arr = std::fs::read(file).unwrap();

@@ -12,7 +12,7 @@ use rustc_middle::{
         interpret::{GlobalAlloc, Scalar},
         visit::Visitor,
     },
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{GenericArgKind, Ty, TyCtxt, TyKind},
 };
 use rustc_span::{
     def_id::{DefId, LocalDefId},
@@ -31,6 +31,7 @@ use super::alloc_finder;
 pub struct Config {
     #[serde(default)]
     pub use_optimized_mir: bool,
+    pub c_exposed_fns: FxHashSet<String>,
 }
 
 pub fn run_analysis(config: &Config, tcx: TyCtxt<'_>) -> Solutions {
@@ -182,6 +183,8 @@ pub struct PreAnalysisData<'tcx> {
     pub union_offsets: FxHashMap<Loc, Vec<usize>>,
     pub graph: LocGraph,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
+
+    pub exposed_fn_arg_vars: Vec<Var>,
 }
 
 pub type Solutions = IndexVec<Loc, ChunkedBitSet<Loc>>;
@@ -266,6 +269,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut graph = FxHashMap::default();
     let mut union_offsets = FxHashMap::default();
     let mut index_prefixes = FxHashMap::default();
+    let mut exposed_fn_args = vec![];
 
     let mut indirect_calls: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
@@ -289,6 +293,11 @@ pub fn pre_analyze<'a, 'tcx>(
         if item.is_fn {
             inv_fns.insert(global_index, item.local_def_id);
         }
+        let exposed = item.is_fn
+            && config
+                .c_exposed_fns
+                .contains(tcx.item_name(item.local_def_id.to_def_id()).as_str());
+        let mut args = vec![];
 
         let mut local_decls = body.local_decls.iter_enumerated();
         let ret = local_decls.next().unwrap();
@@ -337,6 +346,31 @@ pub fn pre_analyze<'a, 'tcx>(
                     }
                 }
             }
+
+            if exposed
+                && (1..=body.arg_count).contains(&local.index())
+                && let ty = match local_decl.ty.kind() {
+                    TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => Some(ty),
+                    TyKind::Adt(adt_def, gargs)
+                        if tcx.item_name(adt_def.did()) == rustc_span::sym::Option =>
+                    {
+                        let GenericArgKind::Type(ty) = gargs[0].kind() else { panic!() };
+                        if let TyKind::Ref(_, ty, _) = ty.kind() {
+                            Some(ty)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+                && let Some(ty) = ty
+            {
+                args.push((local, ty));
+            }
+        }
+
+        if !args.is_empty() {
+            exposed_fn_args.push((item.local_def_id, args));
         }
 
         if !item.is_fn {
@@ -403,6 +437,17 @@ pub fn pre_analyze<'a, 'tcx>(
         }
     }
 
+    let mut exposed_fn_arg_vars = vec![];
+    for (def_id, args) in exposed_fn_args {
+        for (local, ty) in args {
+            let var = Var::Arg(def_id, local);
+            exposed_fn_arg_vars.push(var);
+            vars.insert(var, index_info.next_index());
+            let ty = tss.tys[ty];
+            compute_ends(ty, &mut index_info, def_id);
+        }
+    }
+
     PreAnalysisData {
         bodies,
         alloc_fns,
@@ -418,6 +463,7 @@ pub fn pre_analyze<'a, 'tcx>(
         union_offsets,
         graph,
         var_nodes,
+        exposed_fn_arg_vars,
     }
 }
 
@@ -449,6 +495,13 @@ pub fn analyze<'a, 'tcx>(
         pre,
         graph: Graph::new(pre.index_info.len()),
     };
+    for arg in &pre.exposed_fn_arg_vars {
+        let arg_loc = pre.vars[arg];
+        let Var::Arg(def_id, idx) = arg else { panic!() };
+        let param = Var::Local(*def_id, *idx);
+        let param_loc = pre.vars[&param];
+        analyzer.graph.add_solution(param_loc, arg_loc);
+    }
     for item in &pre.bodies {
         let body = if !config.use_optimized_mir {
             // use MIR before optimization
@@ -730,7 +783,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 } else {
                     match name {
                         ("option" | "result", _, "unwrap", _)
-                        | ("slice", _, "as_ptr" | "as_mut_ptr", _)
+                        | ("slice" | "vec", _, "as_ptr" | "as_mut_ptr", _)
                         | ("ptr", _, _, "offset") => {
                             if let Some(arg) = &arg_locs[0] {
                                 self.transfer_assign(dst, *arg, output);
@@ -1082,6 +1135,7 @@ rustc_index::newtype_index! {
 pub enum Var {
     Local(LocalDefId, Local),
     Alloc(LocalDefId, BasicBlock),
+    Arg(LocalDefId, Local),
 }
 
 impl std::fmt::Debug for Var {
@@ -1089,6 +1143,7 @@ impl std::fmt::Debug for Var {
         match self {
             Var::Local(def_id, local) => write!(f, "{def_id:?}::{local:?}"),
             Var::Alloc(def_id, bb) => write!(f, "{def_id:?}::{bb:?}"),
+            Var::Arg(def_id, i) => write!(f, "{def_id:?}::A{i:?}"),
         }
     }
 }

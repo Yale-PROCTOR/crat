@@ -6,6 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
+use serde::Deserialize;
 use transform::TransformVisitor;
 
 use crate::{
@@ -28,7 +29,12 @@ pub struct Analysis {
     aliases: FxHashMap<LocalDefId, FxHashSet<usize>>,
 }
 
-pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> (String, bool) {
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Config {
+    pub c_exposed_fns: FxHashSet<String>,
+}
+
+pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -37,6 +43,7 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> (String, bool) {
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
     };
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);

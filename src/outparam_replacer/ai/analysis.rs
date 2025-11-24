@@ -263,7 +263,10 @@ pub fn analyze(
     // to ensure further uses of mir are not stolen already, we use mir before optimization
     let use_optimized_mir = false;
     let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
-    let pre_config = andersen::Config { use_optimized_mir };
+    let pre_config = andersen::Config {
+        use_optimized_mir,
+        c_exposed_fns: FxHashSet::default(),
+    };
     let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = if let Some(path) = &config.points_to_file {
         let arr = std::fs::read(path).unwrap();
