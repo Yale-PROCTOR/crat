@@ -93,6 +93,22 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         items
     }
 
+    fn visit_item(&mut self, item: &mut Item) {
+        mut_visit::walk_item(self, item);
+
+        let id = item.id;
+        if let ItemKind::Use(tree) = &mut item.kind
+            && let Some(seg) = tree.prefix.segments.last_mut()
+            && let Some(hir_item) = self.ast_to_hir.get_item(id, self.tcx)
+            && let hir::ItemKind::Use(path, _) = &hir_item.kind
+            && let Some(Res::Def(DefKind::Fn, def_id)) = path.res.value_ns
+            && let Some(def_id) = def_id.as_local()
+            && let Some((_, name)) = self.fixes.get(&def_id)
+        {
+            seg.ident.name = *name;
+        }
+    }
+
     fn visit_expr(&mut self, expr: &mut Expr) {
         mut_visit::walk_expr(self, expr);
 
