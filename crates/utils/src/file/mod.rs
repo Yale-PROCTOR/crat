@@ -70,3 +70,5 @@ pub fn file_param_index<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> 
 }
 
 pub mod api_list;
+pub mod fprintf;
+pub mod fscanf;

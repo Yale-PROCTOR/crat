@@ -5,8 +5,10 @@
 #![feature(allocator_api)]
 #![warn(unused_extern_crates)]
 
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
+extern crate rustc_const_eval;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;

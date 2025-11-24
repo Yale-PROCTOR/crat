@@ -1,5 +1,7 @@
-use rustc_middle::mir::{HasLocalDecls, Operand, Place};
+use rustc_hash::FxHashMap;
+use rustc_middle::mir::{HasLocalDecls, Local, Operand, Place};
 use rustc_span::{Symbol, source_map::Spanned};
+use utils::file::{fprintf, fscanf};
 
 use super::{Fatness, place_vars};
 use crate::analyses::type_qualifier::foster::{
@@ -7,6 +9,7 @@ use crate::analyses::type_qualifier::foster::{
     constraint_system::{BooleanSystem, ConstraintSystem},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn libc_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
@@ -14,6 +17,7 @@ pub fn libc_call<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    string_literals: &FxHashMap<Local, &[u8]>,
     database: &mut BooleanSystem<Fatness>,
 ) {
     match callee.as_str() {
@@ -93,12 +97,51 @@ pub fn libc_call<'tcx>(
             struct_fields,
             database,
         ),
-        "atoi" | "atof" => call_atoi(
+        "atoi" | "atof" | "fgets" | "fputs" | "puts" | "fread" | "fwrite" => {
+            call_fn_with_array_arg(
+                destination,
+                args,
+                local_decls,
+                locals,
+                struct_fields,
+                database,
+                &[0],
+            )
+        }
+        "printf" => call_printf(
             destination,
             args,
             local_decls,
             locals,
             struct_fields,
+            string_literals,
+            database,
+        ),
+        "fprintf" => call_printf(
+            destination,
+            &args[1..],
+            local_decls,
+            locals,
+            struct_fields,
+            string_literals,
+            database,
+        ),
+        "scanf" => call_scanf(
+            destination,
+            args,
+            local_decls,
+            locals,
+            struct_fields,
+            string_literals,
+            database,
+        ),
+        "fscanf" => call_scanf(
+            destination,
+            &args[1..],
+            local_decls,
+            locals,
+            struct_fields,
+            string_literals,
             database,
         ),
         fn_name if fn_name.starts_with("str") => call_str_general(
@@ -293,20 +336,81 @@ fn call_memset<'tcx>(
     }
 }
 
-fn call_atoi<'tcx>(
+fn call_fn_with_array_arg<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
     database: &mut BooleanSystem<Fatness>,
+    indices: &[usize],
 ) {
     let _ = destination;
 
-    assert_eq!(args.len(), 1);
-    let arg = &args[0];
-    let Some(ptr) = arg.node.place() else { return };
-    let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
-    assert!(!ptr_vars.is_empty());
-    database.bottom(ptr_vars.start);
+    for i in indices {
+        let arg = &args[*i];
+        let Some(ptr) = arg.node.place() else { return };
+        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+        assert!(!ptr_vars.is_empty());
+        database.bottom(ptr_vars.start);
+    }
+}
+
+fn call_printf<'tcx>(
+    destination: &Place<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    string_literals: &FxHashMap<Local, &[u8]>,
+    database: &mut BooleanSystem<Fatness>,
+) {
+    let _ = destination;
+
+    let [fmt, args @ ..] = args else { panic!() };
+    let lit = string_literals[&fmt.node.place().unwrap().local];
+    let specs = fprintf::parse_specs(lit);
+    for (arg, spec) in args.iter().zip(specs) {
+        if spec.conversion != fprintf::Conversion::Str {
+            continue;
+        }
+        let Some(ptr) = arg.node.place() else { continue };
+        if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
+            continue;
+        }
+        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+        assert!(!ptr_vars.is_empty());
+        database.bottom(ptr_vars.start);
+    }
+}
+
+fn call_scanf<'tcx>(
+    destination: &Place<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    string_literals: &FxHashMap<Local, &[u8]>,
+    database: &mut BooleanSystem<Fatness>,
+) {
+    let _ = destination;
+
+    let [fmt, args @ ..] = args else { panic!() };
+    let lit = string_literals[&fmt.node.place().unwrap().local];
+    let specs = fscanf::parse_specs(lit);
+    for (arg, spec) in args.iter().zip(specs) {
+        if !matches!(
+            spec.conversion,
+            fscanf::Conversion::Str | fscanf::Conversion::ScanSet(_)
+        ) {
+            continue;
+        }
+        let Some(ptr) = arg.node.place() else { continue };
+        if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
+            continue;
+        }
+        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+        assert!(!ptr_vars.is_empty());
+        database.bottom(ptr_vars.start);
+    }
 }

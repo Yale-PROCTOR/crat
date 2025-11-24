@@ -14,6 +14,7 @@ extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
+extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_parse;
 extern crate rustc_session;
@@ -60,4 +61,17 @@ pub fn format(code: &str) -> String {
         rustc_ast_pretty::pprust::crate_to_string_for_macros(krate)
     })
     .unwrap()
+}
+
+pub fn escape(c: u8) -> Option<&'static str> {
+    match c {
+        b'\n' => Some("\\n"),
+        b'\r' => Some("\\r"),
+        b'\t' => Some("\\t"),
+        b'\\' => Some("\\\\"),
+        b'\'' => Some("\\'"),
+        b'\"' => Some("\\\""),
+        b'\0' => Some("\\0"),
+        _ => None,
+    }
 }
