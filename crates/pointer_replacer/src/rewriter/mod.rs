@@ -28,7 +28,7 @@ pub struct Analysis {
     aliases: FxHashMap<LocalDefId, FxHashSet<usize>>,
 }
 
-pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
+pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -79,7 +79,7 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
 
-    pprust::crate_to_string_for_macros(&krate)
+    (pprust::crate_to_string_for_macros(&krate), visitor.bytemuck)
 }
 
 fn find_param_aliases<'tcx>(

@@ -450,9 +450,10 @@ fn main() {
                 io_replacer::add_deps(&dir, res.tempfile, res.bytemuck);
             }
             Pass::Pointer => {
-                let s =
+                let (s, bytemuck) =
                     run_compiler_on_path(&file, pointer_replacer::replace_local_borrows).unwrap();
                 std::fs::write(&file, s).unwrap();
+                io_replacer::add_deps(&dir, false, bytemuck);
             }
             Pass::Static => {
                 let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();
