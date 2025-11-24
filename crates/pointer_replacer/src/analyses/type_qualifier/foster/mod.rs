@@ -77,6 +77,7 @@ where Domain: BooleanLattice
 }
 
 impl<Qualifier> TypeQualifiers<Qualifier> {
+    #[allow(unused)]
     pub fn function_facts(
         &self,
         did: LocalDefId,

@@ -1,6 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
-use rustc_middle::mir::{Local, LocalDecl};
+use rustc_middle::{
+    mir::{Local, LocalDecl},
+    ty::TyCtxt,
+};
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, collector::collect_fn_ptrs};
@@ -16,22 +19,23 @@ pub enum PtrKind {
     Slice(bool),
 }
 
-pub struct DecisionMaker {
+pub struct DecisionMaker<'tcx> {
+    tcx: TyCtxt<'tcx>,
     promoted_shared_refs: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
     promoted_mut_refs: DenseBitSet<Local>,
 }
 
-impl DecisionMaker {
-    pub fn new(analysis: &Analysis, did: &LocalDefId) -> DecisionMaker {
+impl<'tcx> DecisionMaker<'tcx> {
+    pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
         let promoted_shared_refs = analysis
             .mutability_result
-            .function_body_facts(*did)
+            .function_body_facts(did)
             .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable()))
             .collect::<IndexVec<Local, _>>();
         let array_pointers = analysis
             .fatness_result
-            .function_body_facts(*did)
+            .function_body_facts(did)
             .map(|fatnesses| {
                 fatnesses
                     .iter()
@@ -40,8 +44,9 @@ impl DecisionMaker {
                     .unwrap_or(false)
             })
             .collect::<IndexVec<Local, _>>();
-        let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap().clone();
+        let promoted_mut_refs = analysis.promoted_mut_ref_result.get(&did).unwrap().clone();
         DecisionMaker {
+            tcx,
             promoted_shared_refs,
             array_pointers,
             promoted_mut_refs,
@@ -54,11 +59,11 @@ impl DecisionMaker {
         decl: &LocalDecl,
         aliases: Option<&FxHashSet<usize>>,
     ) -> Option<PtrKind> {
-        if !decl.ty.is_any_ptr() {
-            return None;
-        }
-        let mutability = decl.ty.is_mutable_ptr();
-        if aliases.is_some_and(|aliases| aliases.contains(&(local.index() - 1))) {
+        let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
+        let mutability = m.is_mut();
+        if ty.is_c_void(self.tcx)
+            || aliases.is_some_and(|aliases| aliases.contains(&(local.index() - 1)))
+        {
             Some(PtrKind::Raw(mutability))
         } else if self.array_pointers[local] {
             if self.promoted_shared_refs[local] {
@@ -120,7 +125,7 @@ impl SigDecisions {
                 );
                 continue;
             }
-            let decision_maker = DecisionMaker::new(analysis, did);
+            let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
             let body = &*rust_program
                 .tcx

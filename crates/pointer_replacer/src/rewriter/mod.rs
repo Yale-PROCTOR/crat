@@ -1,5 +1,5 @@
 use etrace::some_or;
-use points_to::andersen::{self, Var};
+use points_to::andersen;
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};

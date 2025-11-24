@@ -618,21 +618,23 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    (PtrKind::Raw(m), PtrKind::Slice(_)) => {
+                    (PtrKind::Raw(m), PtrKind::Slice(m1)) => {
                         if need_cast {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                             *rhs = utils::expr!(
-                                "({0}).as_{1}ptr() as *{2} _ as *{2} {3}",
+                                "({0}).as_{1}ptr(){2} as *{3} _ as *{3} {4}",
                                 pprust::expr_to_string(e),
-                                if m { "mut_" } else { "" },
+                                if m && m1 { "mut_" } else { "" },
+                                if m && !m1 { ".cast_mut()" } else { "" },
                                 if m { "mut" } else { "const" },
                                 lhs_inner_ty,
                             );
                         } else {
                             *rhs = utils::expr!(
-                                "({}).as_{}ptr()",
+                                "({}).as_{}ptr(){}",
                                 pprust::expr_to_string(e),
-                                if m { "mut_" } else { "" },
+                                if m && m1 { "mut_" } else { "" },
+                                if m && !m1 { ".cast_mut()" } else { "" }
                             );
                         }
                     }
@@ -1262,7 +1264,7 @@ fn unwrap_idx(e: &Expr) -> &Expr {
 }
 
 #[inline]
-fn unwrap_ptr_from_mir_ty(ty: ty::Ty<'_>) -> Option<(ty::Ty<'_>, ty::Mutability)> {
+pub fn unwrap_ptr_from_mir_ty(ty: ty::Ty<'_>) -> Option<(ty::Ty<'_>, ty::Mutability)> {
     match ty.kind() {
         ty::TyKind::RawPtr(ty, m) | ty::TyKind::Ref(_, ty, m) => Some((*ty, *m)),
         _ => None,
