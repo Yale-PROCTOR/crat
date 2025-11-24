@@ -311,6 +311,7 @@ dependencies = [
  "petgraph",
  "points_to",
  "regex",
+ "serde",
  "smallvec",
  "tracing",
  "typed-arena",

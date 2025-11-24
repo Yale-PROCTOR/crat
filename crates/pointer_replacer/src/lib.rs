@@ -22,4 +22,4 @@ mod analyses;
 mod rewriter;
 mod utils;
 
-pub use rewriter::replace_local_borrows;
+pub use rewriter::{Config, replace_local_borrows};

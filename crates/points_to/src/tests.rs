@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::ItemKind;
 use rustc_index::{Idx, IndexVec, bit_set::ChunkedBitSet};
 use rustc_middle::{
@@ -127,6 +127,7 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
         let tss = ty_shape::get_ty_shapes(&arena, tcx, true);
         let config = andersen::Config {
             use_optimized_mir: true,
+            c_exposed_fns: FxHashSet::default(),
         };
         let pre = andersen::pre_analyze(&config, &tss, tcx);
         let solutions = andersen::analyze(&config, &pre, &tss, tcx);

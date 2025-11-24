@@ -13,6 +13,7 @@ regex = "1.12.2"
 tracing.workspace = true
 etrace.workspace = true
 typed-arena.workspace = true
+serde.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

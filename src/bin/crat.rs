@@ -170,10 +170,12 @@ struct Config {
     #[serde(default)]
     interface: interface_fixer::Config,
     #[serde(default)]
+    pointer: pointer_replacer::Config,
+    #[serde(default)]
     andersen: points_to::andersen::Config,
 
     #[serde(default)]
-    c_exposed_fn: Vec<String>,
+    c_exposed_fns: Vec<String>,
 
     #[serde(default)]
     verbose: bool,
@@ -197,7 +199,7 @@ fn main() {
             toml::from_str::<Config>(&content).unwrap()
         })
         .unwrap_or_default();
-    config.c_exposed_fn.extend(args.c_exposed_fn);
+    config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
     config.passes.extend(args.pass);
@@ -318,7 +320,15 @@ fn main() {
     config
         .interface
         .c_exposed_fns
-        .extend(config.c_exposed_fn.iter().cloned());
+        .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .pointer
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .andersen
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
@@ -443,8 +453,10 @@ fn main() {
                 io_replacer::add_deps(&dir, res.tempfile, res.bytemuck);
             }
             Pass::Pointer => {
-                let (s, bytemuck) =
-                    run_compiler_on_path(&file, pointer_replacer::replace_local_borrows).unwrap();
+                let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
+                    pointer_replacer::replace_local_borrows(&config.pointer, tcx)
+                })
+                .unwrap();
                 std::fs::write(&file, s).unwrap();
                 io_replacer::add_deps(&dir, false, bytemuck);
             }
