@@ -172,6 +172,21 @@
 //! [b'a' as i8, b'\0' as i8];
 //! ```
 //!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! ::std::mem::transmute::<
+//!     [u8; 2],
+//!     [libc::c_char; 2],
+//! >(*b"a\0");
+//! ```
+//!
+//! We replace such code with the following code:
+//!
+//! ```rust,ignore
+//! [b'a' as i8, b'\0' as i8];
+//! ```
+//!
 //! # Remove `fresh`
 //!
 //! C2Rust may generate code like below:
@@ -477,42 +492,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     && let ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8) =
                         elem_ty.kind()
                 {
-                    let is_signed = elem_ty.is_signed();
-                    let s = lit.symbol.as_str();
-                    let mut buf = Vec::with_capacity(s.len());
-                    rustc_literal_escaper::unescape_unicode(
-                        s,
-                        rustc_literal_escaper::Mode::ByteStr,
-                        &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-                    );
-                    let mut array = "[".to_string();
-                    for c in buf {
-                        write!(array, "b'").unwrap();
-                        match c {
-                            b'\0' => write!(array, "\\0").unwrap(),
-                            b'\'' => write!(array, "\\'").unwrap(),
-                            b'\\' => write!(array, "\\\\").unwrap(),
-                            b'\n' => write!(array, "\\n").unwrap(),
-                            b'\r' => write!(array, "\\r").unwrap(),
-                            b'\t' => write!(array, "\\t").unwrap(),
-                            _ => {
-                                if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == b' ' {
-                                    write!(array, "{}", c as char).unwrap();
-                                } else if c < 0x10 {
-                                    write!(array, "\\x0{c:x}").unwrap();
-                                } else {
-                                    write!(array, "\\x{c:x}").unwrap();
-                                }
-                            }
-                        }
-                        if is_signed {
-                            write!(array, "' as i8, ").unwrap();
-                        } else {
-                            write!(array, "', ").unwrap();
-                        }
-                    }
-                    write!(array, "]").unwrap();
-                    *expr = expr!("{array}");
+                    *expr = transmute_expr(lit.symbol.as_str(), *elem_ty);
                 }
             }
             _ => {}
@@ -520,8 +500,26 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         mut_visit::walk_expr(self, expr);
 
+        let expr_id = expr.id;
         match &mut expr.kind {
-            ExprKind::Call(_, args) => {
+            ExprKind::Call(callee, args) => {
+                if let ExprKind::Path(_, path) = &callee.kind
+                    && let [.., seg] = &path.segments[..]
+                    && seg.ident.name == sym::transmute
+                    && let [arg] = &args[..]
+                    && let ExprKind::Unary(UnOp::Deref, arg) = &arg.kind
+                    && let ExprKind::Lit(lit) = &arg.kind
+                    && matches!(lit.kind, token::LitKind::ByteStr)
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr_id, self.tcx)
+                    && let typeck = self.tcx.typeck(hir_expr.hir_id.owner)
+                    && let e_ty = typeck.expr_ty(hir_expr)
+                    && let ty::TyKind::Array(elem_ty, _) = e_ty.kind()
+                    && let ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8) =
+                        elem_ty.kind()
+                {
+                    *expr = transmute_expr(lit.symbol.as_str(), *elem_ty);
+                    return;
+                }
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let mut indices: Vec<ArgIdx> = vec![];
                 if let Some(if_args) = self.call_to_if_args.get(&hir_expr.hir_id) {
@@ -577,6 +575,44 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             _ => {}
         }
     }
+}
+
+fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
+    let is_signed = elem_ty.is_signed();
+    let mut buf = Vec::with_capacity(s.len());
+    rustc_literal_escaper::unescape_unicode(
+        s,
+        rustc_literal_escaper::Mode::ByteStr,
+        &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+    );
+    let mut array = "[".to_string();
+    for c in buf {
+        write!(array, "b'").unwrap();
+        match c {
+            b'\0' => write!(array, "\\0").unwrap(),
+            b'\'' => write!(array, "\\'").unwrap(),
+            b'\\' => write!(array, "\\\\").unwrap(),
+            b'\n' => write!(array, "\\n").unwrap(),
+            b'\r' => write!(array, "\\r").unwrap(),
+            b'\t' => write!(array, "\\t").unwrap(),
+            _ => {
+                if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == b' ' {
+                    write!(array, "{}", c as char).unwrap();
+                } else if c < 0x10 {
+                    write!(array, "\\x0{c:x}").unwrap();
+                } else {
+                    write!(array, "\\x{c:x}").unwrap();
+                }
+            }
+        }
+        if is_signed {
+            write!(array, "' as i8, ").unwrap();
+        } else {
+            write!(array, "', ").unwrap();
+        }
+    }
+    write!(array, "]").unwrap();
+    expr!("{array}")
 }
 
 fn is_assert_stmt(stmt: &Stmt) -> bool {
@@ -1399,6 +1435,44 @@ pub unsafe extern "C" fn f() {
         &[u8; 9],
         &mut [libc::c_uchar; 9],
     >(b"a\"'\n\r\t\x02\xC2\0");
+}
+            "#,
+            &[
+                "b'a'", "b'\"'", "b'\\\''", "b'\\n'", "b'\\r'", "b'\\t'", "b'\\x02'", "b'\\xc2'",
+                "b'\\0'",
+            ],
+            &["::transmute"],
+        );
+    }
+
+    #[test]
+    fn test_transmute_3() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f() {
+    let mut buf: [libc::c_char; 9] = ::std::mem::transmute::<
+        [u8; 9],
+        [libc::c_char; 9],
+    >(*b"a\"'\n\r\t\x02\xC2\0");
+}
+            "#,
+            &[
+                "b'a'", "b'\"'", "b'\\\''", "b'\\n'", "b'\\r'", "b'\\t'", "b'\\x02'", "b'\\xc2'",
+                "b'\\0'",
+            ],
+            &["::transmute"],
+        );
+    }
+
+    #[test]
+    fn test_transmute_4() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f() {
+    let mut buf: [libc::c_uchar; 9] = ::std::mem::transmute::<
+        [u8; 9],
+        [libc::c_uchar; 9],
+    >(*b"a\"'\n\r\t\x02\xC2\0");
 }
             "#,
             &[
