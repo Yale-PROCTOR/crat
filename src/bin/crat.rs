@@ -99,6 +99,10 @@ struct Args {
     )]
     outparam_print_functions: Vec<String>,
 
+    // IO
+    #[arg(long, help = "Assume that to_str from CStr always succeeds")]
+    io_assume_to_str_ok: bool,
+
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -169,6 +173,8 @@ struct Config {
     r#union: union_replacer::Config,
     #[serde(default)]
     outparam: outparam_replacer::Config,
+    #[serde(default)]
+    io: io_replacer::Config,
     #[serde(default)]
     interface: interface_fixer::Config,
     #[serde(default)]
@@ -320,6 +326,8 @@ fn main() {
         config.outparam.points_to_file = args.points_to_file;
     }
 
+    config.io.assume_to_str_ok |= args.io_assume_to_str_ok;
+
     config
         .interface
         .c_exposed_fns
@@ -455,7 +463,9 @@ fn main() {
                 .unwrap();
             }
             Pass::Io => {
-                let res = run_compiler_on_path(&file, io_replacer::replace_io).unwrap();
+                let res =
+                    run_compiler_on_path(&file, |tcx| io_replacer::replace_io(config.io, tcx))
+                        .unwrap();
                 std::fs::write(&file, res.code).unwrap();
                 io_replacer::add_deps(&dir, res.tempfile, res.bytemuck);
             }

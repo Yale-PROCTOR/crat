@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "etrace",
  "lazy_static",
+ "serde",
  "toml_edit",
  "tracing",
  "typed-arena",

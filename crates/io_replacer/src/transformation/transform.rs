@@ -17,6 +17,7 @@ use rustc_middle::{
     ty::{List, TyCtxt},
 };
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
+use serde::Deserialize;
 use toml_edit::DocumentMut;
 use typed_arena::Arena;
 use utils::{bit_set::BitSet16, file::api_list::Permission};
@@ -29,6 +30,11 @@ use super::{
     visitor::{Parameter, TransformVisitor},
 };
 
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct Config {
+    pub assume_to_str_ok: bool,
+}
+
 #[derive(Debug)]
 pub struct TransformationResult {
     pub code: String,
@@ -40,7 +46,7 @@ pub struct TransformationResult {
     pub analysis_stat: file_analysis::Statistics,
 }
 
-pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
+pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
 
     let arena = Arena::new();
@@ -471,6 +477,7 @@ pub fn replace_io(tcx: TyCtxt<'_>) -> TransformationResult {
         type_arena: &type_arena,
         analysis_res: &analysis_res,
         hir: &hir_ctx,
+        config,
 
         error_returning_fns: &error_returning_fns,
         error_taking_fns: &error_taking_fns,

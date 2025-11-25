@@ -4,7 +4,9 @@ use utils::compilation;
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let res = compilation::run_compiler_on_str(&code, super::replace_io).unwrap();
+    let config = super::Config::default();
+    let res =
+        compilation::run_compiler_on_str(&code, |tcx| super::replace_io(config, tcx)).unwrap();
     let stripped = res
         .code
         .strip_prefix(FORMATTED_PREAMBLE.as_str())

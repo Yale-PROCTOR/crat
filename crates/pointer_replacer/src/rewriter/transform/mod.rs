@@ -11,7 +11,10 @@ use rustc_hash::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::{HirId, def::Res};
 use rustc_middle::ty::{self, TyCtxt};
-use utils::ir::{AstToHir, mir_ty_to_string};
+use utils::{
+    ast::{unwrap_paren, unwrap_paren_mut},
+    ir::{AstToHir, mir_ty_to_string},
+};
 
 use super::{
     Analysis,
@@ -1353,23 +1356,6 @@ fn unwrap_expr_mut(expr: &mut Expr) -> &mut Expr {
             unreachable!()
         };
         unwrap_expr_mut(expr)
-    } else {
-        expr
-    }
-}
-
-fn unwrap_paren(expr: &Expr) -> &Expr {
-    if let ExprKind::Paren(e) = &expr.kind {
-        unwrap_paren(e)
-    } else {
-        expr
-    }
-}
-
-fn unwrap_paren_mut(expr: &mut Expr) -> &mut Expr {
-    if matches!(&expr.kind, ExprKind::Paren(_)) {
-        let ExprKind::Paren(e) = &mut expr.kind else { unreachable!() };
-        unwrap_paren_mut(e)
     } else {
         expr
     }
