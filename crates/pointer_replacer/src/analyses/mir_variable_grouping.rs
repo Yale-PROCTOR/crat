@@ -11,7 +11,10 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 
-use crate::utils::rustc::RustProgram;
+use crate::{
+    analyses::mir::{CallKind, TerminatorExt},
+    utils::rustc::RustProgram,
+};
 
 /// Group MIR locals by their corresponding source variable names.
 /// This includes both locals with debug info and temporaries that are copies.
@@ -64,7 +67,7 @@ impl SourceVarGroups {
 
 fn group_locals_by_source_variable<'tcx>(
     body: &Body<'tcx>,
-    _tcx: TyCtxt<'tcx>,
+    tcx: TyCtxt<'tcx>,
 ) -> FxHashMap<Local, Vec<Local>> {
     // First, collect all locals that have direct debug info
     let mut src_local_to_locals: FxHashMap<Local, Vec<Local>> = FxHashMap::default();
@@ -81,6 +84,18 @@ fn group_locals_by_source_variable<'tcx>(
 
     // Now find temporaries that are copies of source variables
     let copy_relationships = find_copy_relationships(body);
+    let offset_relationships = find_offset_relationships(body, tcx);
+
+    for (real, temp) in offset_relationships {
+        // dest (real var) = std::ptr::offset(src (real var), ...)
+        // src_local is the variable that is present in the source code
+        if let Some(src_local) = local_to_src_local.get(&real).cloned()
+            && !local_to_src_local.contains_key(&temp)
+        {
+            src_local_to_locals.entry(src_local).or_default().push(temp);
+            local_to_src_local.insert(temp, src_local);
+        }
+    }
 
     // Propagate source variable names to temporaries
     // Caveat: the order of copy_relationships should be chronological
@@ -122,6 +137,47 @@ fn find_copy_relationships(body: &Body<'_>) -> Vec<(Local, Local)> {
     let mut visitor = CopyVisitor { copies: Vec::new() };
     visitor.visit_body(body);
     visitor.copies
+}
+
+// dest (real var) = std::ptr::offset(src (real var), ...)
+fn find_offset_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<(Local, Local)> {
+    struct OffsetVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        offsets: Vec<(Local, Local)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for OffsetVisitor<'tcx> {
+        fn visit_terminator(
+            &mut self,
+            terminator: &rustc_middle::mir::Terminator<'tcx>,
+            _location: Location,
+        ) {
+            if let Some(mir_call) = terminator.as_call(self.tcx)
+                && let CallKind::RustLib(def_id) = &mir_call.func
+            {
+                let func_name = self.tcx.def_path_str(*def_id);
+                if func_name.starts_with("std::ptr::")
+                    && func_name.ends_with("offset")
+                    && mir_call.args.len() == 2
+                {
+                    if let Some(dest_local) = mir_call.destination.as_local()
+                        && let Operand::Copy(src_place) | Operand::Move(src_place) =
+                            &mir_call.args[0].node
+                        && let Some(src_local) = src_place.as_local()
+                    {
+                        self.offsets.push((dest_local, src_local));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut visitor = OffsetVisitor {
+        tcx,
+        offsets: Vec::new(),
+    };
+    visitor.visit_body(body);
+    visitor.offsets
 }
 
 // #[cfg(test)]
