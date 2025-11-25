@@ -81,8 +81,8 @@ pub fn format_rust_str_from_bytes<W: std::fmt::Write>(
 ) -> std::fmt::Result {
     for c in String::from_utf8_lossy(bytes).chars() {
         match c {
-            '{' => write!(format, "{{")?,
-            '}' => write!(format, "}}")?,
+            '{' => write!(format, "{{{{")?,
+            '}' => write!(format, "}}}}")?,
             '\n' => write!(format, "\\n")?,
             '\r' => write!(format, "\\r")?,
             '\t' => write!(format, "\\t")?,
