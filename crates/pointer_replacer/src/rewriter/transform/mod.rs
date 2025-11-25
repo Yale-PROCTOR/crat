@@ -41,9 +41,6 @@ impl MutVisitor for TransformVisitor<'_> {
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
-                // let fn_name = fn_item.ident.name.as_str();
-                // let debug = fn_name == "keccak_inc_squeeze";
-
                 // Currently intra-procedural borrow inference:
                 // skip return type; only consider parameters
                 for ((local_decl, input_dec), param) in mir_body
@@ -53,11 +50,6 @@ impl MutVisitor for TransformVisitor<'_> {
                     .zip(&sig_dec.input_decs)
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
-                    // if debug {
-                    //     println!(
-                    //         "Transforming fn {fn_name}:\nparam with decl {local_decl:?} and decision {input_dec:?}\n\n"
-                    //     );
-                    // }
                     match input_dec {
                         Some(PtrKind::OptRef(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -758,41 +750,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                         }
                     }
                     (PtrKind::Slice(m), PtrKind::Raw(m1)) => {
-                        let cast_mut = if !m1 && m { ".cast_mut()" } else { "" };
-                        if need_cast {
-                            let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                            // HACK: assume length 1024, 0 if null
-                            *rhs = utils::expr!(
-                                "
-    if ({0}).is_null() {{
-        &{1}[]
-    }} else {{
-        std::slice::from_raw_parts{2}(({0}){3} as *{4} {5}, 1024)
-    }}
-                                    ",
-                                pprust::expr_to_string(e),
-                                if m { "mut " } else { "" },
-                                if m { "_mut" } else { "" },
-                                cast_mut,
-                                if m { "mut" } else { "const" },
-                                lhs_inner_ty,
-                            );
-                        } else {
-                            // HACK: assume length 1024
-                            *rhs = utils::expr!(
-                                "
-    if ({0}).is_null() {{
-        &{1}[]
-    }} else {{
-        std::slice::from_raw_parts{2}(({0}){3}, 1024)
-    }}
-                                    ",
-                                pprust::expr_to_string(e),
-                                if m { "mut " } else { "" },
-                                if m { "_mut" } else { "" },
-                                cast_mut,
-                            );
-                        }
+                        *rhs = mk_null_checked_slice(e, m, m1, need_cast, lhs_inner_ty, self.tcx);
                     }
                     (PtrKind::Raw(_), PtrKind::Raw(_)) => {}
                 }
@@ -872,45 +830,36 @@ impl<'tcx> TransformVisitor<'tcx> {
                             }
                         }
                         ExprKind::Unary(UnOp::Deref, e) => {
-                            if need_cast {
-                                *rhs = utils::expr!(
-                                    "
-    {{
-        let _x = {0};
-        if _x.is_null() {{
-            &{1}[]
-        }} else {{
-            std::slice::from_raw_parts{2}(_x as *{3} {4}, 1024)
-        }}
-    }}
-                                    ",
-                                    pprust::expr_to_string(e),
-                                    if m { "mut " } else { "" },
-                                    if m { "_mut" } else { "" },
-                                    if m { "mut" } else { "const" },
-                                    lhs_inner_ty,
-                                );
+                            if let ExprKind::MethodCall(call1) = &unwrap_paren(e).kind
+                                && call1.seg.ident.name == rustc_span::sym::offset
+                                && let ExprKind::MethodCall(call2) =
+                                    &unwrap_paren(&call1.receiver).kind
+                                && call2.seg.ident.name.as_str() == "as_mut_ptr"
+                            {
+                                if need_cast {
+                                    todo!("{}", pprust::expr_to_string(e))
+                                } else {
+                                    *rhs = utils::expr!(
+                                        "&{}{}[({}) as usize..]",
+                                        if m { "mut " } else { "" },
+                                        pprust::expr_to_string(&call2.receiver),
+                                        pprust::expr_to_string(&call1.args[0]),
+                                    );
+                                }
                             } else {
-                                *rhs = utils::expr!(
-                                    "
-    {{
-        let _x = {0};
-        if _x.is_null() {{
-            &{1}[]
-        }} else {{
-            std::slice::from_raw_parts{2}(_x, 1024)
-        }}
-    }}
-                                    ",
-                                    pprust::expr_to_string(e),
-                                    if m { "mut " } else { "" },
-                                    if m { "_mut" } else { "" },
+                                *rhs = mk_null_checked_slice(
+                                    e,
+                                    m,
+                                    true,
+                                    need_cast,
+                                    lhs_inner_ty,
+                                    self.tcx,
                                 );
                             }
                         }
                         ExprKind::Path(_, _) => {
                             if need_cast {
-                                if is_byte(lhs_inner_ty) && rhs_inner_ty.is_numeric() {
+                                if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
                                     self.bytemuck.set(true);
                                     *rhs = utils::expr!(
                                         "bytemuck::cast_slice{}(std::slice::from_{}(&{}{}))",
@@ -919,7 +868,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                         if m { "mut " } else { "" },
                                         pprust::expr_to_string(e),
                                     );
-                                } else if is_byte(lhs_inner_ty)
+                                } else if lhs_inner_ty.is_numeric()
                                     && let ty::TyKind::Array(elem_ty, _) = rhs_inner_ty.kind()
                                     && elem_ty.is_numeric()
                                 {
@@ -1014,13 +963,26 @@ impl<'tcx> TransformVisitor<'tcx> {
                         }
                     }
                     PtrKind::Slice(m) => {
+                        // check if receiver is `alloca_allocations.last_mut().unwrap()`
+                        let is_alloca =
+                            if let ExprKind::MethodCall(call) = &unwrap_expr(receiver).kind {
+                                call.seg.ident.name == rustc_span::sym::unwrap
+                            } else {
+                                false
+                            };
                         if need_cast {
-                            if is_byte(lhs_inner_ty) && rhs_inner_ty.is_numeric() {
+                            if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
                                 self.bytemuck.set(true);
                                 *rhs = utils::expr!(
-                                    "bytemuck::cast_slice{}(&{}{})",
+                                    "bytemuck::cast_slice{}({}{})",
                                     if m { "_mut" } else { "" },
-                                    if m { "mut " } else { "" },
+                                    if is_alloca {
+                                        ""
+                                    } else if m {
+                                        "&mut "
+                                    } else {
+                                        "&"
+                                    },
                                     pprust::expr_to_string(receiver),
                                 );
                             } else {
@@ -1033,8 +995,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                             }
                         } else {
                             *rhs = utils::expr!(
-                                "&{}{}",
-                                if m { "mut " } else { "" },
+                                "{}{}",
+                                if is_alloca {
+                                    ""
+                                } else if m {
+                                    "&mut "
+                                } else {
+                                    "&"
+                                },
                                 pprust::expr_to_string(receiver)
                             );
                         }
@@ -1245,40 +1213,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 pprust::expr_to_string(e),
                             );
                         }
-                    } else if need_cast {
-                        *rhs = utils::expr!(
-                            "
-                    {{
-                        let _x = {0};
-                        if _x.is_null() {{
-                            &{1}[]
-                        }} else {{
-                            std::slice::from_raw_parts{2}(_x as *{3} {4}, 1024)
-                        }}
-                    }}
-                                                    ",
-                            pprust::expr_to_string(e),
-                            if m { "mut " } else { "" },
-                            if m { "_mut" } else { "" },
-                            if m { "mut" } else { "const" },
-                            lhs_inner_ty,
-                        );
                     } else {
-                        *rhs = utils::expr!(
-                            "
-                    {{
-                        let _x = {0};
-                        if _x.is_null() {{
-                            &{1}[]
-                        }} else {{
-                            std::slice::from_raw_parts{2}(_x, 1024)
-                        }}
-                    }}
-                                                    ",
-                            pprust::expr_to_string(e),
-                            if m { "mut " } else { "" },
-                            if m { "_mut" } else { "" },
-                        );
+                        *rhs = mk_null_checked_slice(e, m, true, need_cast, lhs_inner_ty, self.tcx);
                     }
                 }
                 PtrKind::Raw(_) => {}
@@ -1327,6 +1263,79 @@ impl<'tcx> TransformVisitor<'tcx> {
             child_id = parent_id;
         }
         false
+    }
+}
+
+fn mk_null_checked_slice<'tcx>(
+    e: &Expr,
+    m: bool,
+    m1: bool,
+    need_cast: bool,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Expr {
+    // HACK: assume length 1024
+    let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
+    if !has_side_effect(e) {
+        if need_cast {
+            utils::expr!(
+                "if ({0}).is_null() {{
+                    &{1}[]
+                }} else {{
+                    std::slice::from_raw_parts{2}(({0}){3} as *{4} {5}, 1024)
+                }}",
+                pprust::expr_to_string(e),
+                if m { "mut " } else { "" },
+                if m { "_mut" } else { "" },
+                cast_mut,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, tcx),
+            )
+        } else {
+            utils::expr!(
+                "if ({0}).is_null() {{
+                    &{1}[]
+                }} else {{
+                    std::slice::from_raw_parts{2}(({0}){3}, 1024)
+                }}",
+                pprust::expr_to_string(e),
+                if m { "mut " } else { "" },
+                if m { "_mut" } else { "" },
+                cast_mut,
+            )
+        }
+    } else if need_cast {
+        utils::expr!(
+            "{{
+                let _x = {};
+                if _x.is_null() {{
+                    &{}[]
+                }} else {{
+                    std::slice::from_raw_parts{}(_x{} as *{} {}, 1024)
+                }}
+            }}",
+            pprust::expr_to_string(e),
+            if m { "mut " } else { "" },
+            if m { "_mut" } else { "" },
+            cast_mut,
+            if m { "mut" } else { "const" },
+            mir_ty_to_string(lhs_inner_ty, tcx),
+        )
+    } else {
+        utils::expr!(
+            "{{
+                let _x = {};
+                if _x.is_null() {{
+                    &{}[]
+                }} else {{
+                    std::slice::from_raw_parts{}(_x{}, 1024)
+                }}
+            }}",
+            pprust::expr_to_string(e),
+            if m { "mut " } else { "" },
+            if m { "_mut" } else { "" },
+            cast_mut,
+        )
     }
 }
 
@@ -1414,14 +1423,6 @@ fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     }
 }
 
-#[inline]
-fn is_byte(ty: ty::Ty<'_>) -> bool {
-    matches!(
-        ty.kind(),
-        ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
-    )
-}
-
 #[allow(clippy::match_like_matches_macro)]
 fn safe_conversion(ty_to: ty::Ty<'_>, ty_from: ty::Ty<'_>) -> bool {
     match (ty_to.kind(), ty_from.kind()) {
@@ -1450,5 +1451,75 @@ fn safe_conversion(ty_to: ty::Ty<'_>, ty_from: ty::Ty<'_>) -> bool {
         (ty::Uint(ty::UintTy::U128), ty::Float(ty::FloatTy::F128)) => true,
         (ty::Float(ty::FloatTy::F128), ty::Uint(ty::UintTy::U128)) => true,
         _ => false,
+    }
+}
+
+fn has_side_effect(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::ConstBlock(_)
+        | ExprKind::Lit(..)
+        | ExprKind::Closure(..)
+        | ExprKind::Underscore
+        | ExprKind::Path(..)
+        | ExprKind::OffsetOf(..) => false,
+        ExprKind::Call(..)
+        | ExprKind::While(..)
+        | ExprKind::ForLoop { .. }
+        | ExprKind::Loop(..)
+        | ExprKind::Assign(..)
+        | ExprKind::AssignOp(..)
+        | ExprKind::Range(None, None, _)
+        | ExprKind::Break(..)
+        | ExprKind::Continue(..)
+        | ExprKind::Ret(..)
+        | ExprKind::InlineAsm(..)
+        | ExprKind::Try(..)
+        | ExprKind::If(..)
+        | ExprKind::Match(..)
+        | ExprKind::Block(..) => true,
+        ExprKind::MethodCall(call) => {
+            let name = call.seg.ident.name.as_str();
+            name != "offset"
+                && name != "unwrap"
+                && name != "as_deref"
+                && name != "as_deref_mut"
+                && name != "as_ptr"
+                && name != "as_mut_ptr"
+                || has_side_effect(&call.receiver)
+                || call.args.iter().any(|e| has_side_effect(e))
+        }
+        ExprKind::Array(exprs) | ExprKind::Tup(exprs) => exprs.iter().any(|e| has_side_effect(e)),
+        ExprKind::Binary(_, e1, e2)
+        | ExprKind::Index(e1, e2, _)
+        | ExprKind::Range(Some(e1), Some(e2), _) => has_side_effect(e1) || has_side_effect(e2),
+        ExprKind::Unary(_, e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::Type(e, _)
+        | ExprKind::Let(_, e, _, _)
+        | ExprKind::Field(e, _)
+        | ExprKind::Range(Some(e), None, _)
+        | ExprKind::Range(None, Some(e), _)
+        | ExprKind::AddrOf(_, _, e)
+        | ExprKind::Repeat(e, _)
+        | ExprKind::Paren(e) => has_side_effect(e),
+        ExprKind::Gen(..) => todo!(),
+        ExprKind::Await(..) => todo!(),
+        ExprKind::Use(..) => todo!(),
+        ExprKind::TryBlock(..) => todo!(),
+        ExprKind::Struct(e) => {
+            e.fields.iter().any(|f| has_side_effect(&f.expr))
+                || if let StructRest::Base(e) = &e.rest {
+                    has_side_effect(e)
+                } else {
+                    false
+                }
+        }
+        ExprKind::Yield(..) => todo!(),
+        ExprKind::Yeet(..) => todo!(),
+        ExprKind::Become(..) => todo!(),
+        ExprKind::IncludedBytes(..) => todo!(),
+        ExprKind::FormatArgs(..) => todo!(),
+        ExprKind::UnsafeBinderCast(..) => todo!(),
+        ExprKind::MacCall(..) | ExprKind::Err(..) | ExprKind::Dummy => panic!(),
     }
 }
