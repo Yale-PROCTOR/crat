@@ -51,7 +51,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         }
     }
 
-    if !cells.is_empty() {
+    if !cells.is_empty() || !refcells.is_empty() {
         krate.attrs.extend([
             utils::ast::make_inner_attribute(sym::feature, sym::never_type, tcx),
             utils::ast::make_inner_attribute(
