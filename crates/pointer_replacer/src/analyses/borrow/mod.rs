@@ -294,7 +294,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                     {
                         let arg0 = &mir_call.args[0].node;
                         if let Some(arg0_place) = arg0.place()
-                            && self.provenance_set.local_data[arg0_place.local].is_some()
+                            && self.provenance_set.local_data[mir_call.destination.local].is_some()
                         {
                             let mut loans = vec![];
                             let loan = self.loans.push(BorrowData {
@@ -474,9 +474,7 @@ impl ProvenanceConstraintGraph {
                         && mir_call.args.len() == 2
                     {
                         let arg0 = &mir_call.args[0].node;
-                        if let Some(arg0_place) = arg0.place()
-                            && self.provenance_set.local_data[arg0_place.local].is_some()
-                        {
+                        if let Some(arg0_place) = arg0.place() {
                             self.visit_assign(
                                 &mir_call.destination,
                                 &Rvalue::Use(Operand::Copy(arg0_place)),
