@@ -110,7 +110,8 @@ fn find_copy_relationships(body: &Body<'_>) -> Vec<(Local, Local)> {
             _location: Location,
         ) {
             if let Some(dest_local) = place.as_local()
-                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue
+                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place))
+                | Rvalue::RawPtr(_, src_place) = rvalue
                 && let Some(src_local) = src_place.as_local()
             {
                 self.copies.push((dest_local, src_local));
