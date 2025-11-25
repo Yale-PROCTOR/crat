@@ -26,7 +26,7 @@ use rustc_mir_dataflow::{fmt::DebugWithContext, points::DenseLocationMap};
 use rustc_span::def_id::LocalDefId;
 use subset_closure::{SubSetClosure, compute_subset_closure};
 
-use super::mir::TerminatorExt;
+use super::mir::{CallKind, TerminatorExt};
 use crate::utils::{dsa::union_find::UnionFind, rustc::RustProgram};
 
 macro_rules! disallow_interprocedural {
@@ -286,7 +286,45 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                 };
                 disallow_interprocedural!();
 
-                if let Some(callee) = mir_call.func.did()
+                // specially handle offset method calls for pointers, just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                if let CallKind::RustLib(def_id) = &mir_call.func {
+                    let func_name = self.tcx.def_path_str(*def_id);
+                    if func_name.starts_with("std::ptr::")
+                        && func_name.ends_with("offset")
+                        && mir_call.args.len() == 2
+                    {
+                        let arg0 = &mir_call.args[0].node;
+                        if let Some(arg0_place) = arg0.place()
+                            && self.provenance_set.local_data[arg0_place.local].is_some()
+                        {
+                            let mut loans = vec![];
+                            let loan = self.loans.push(BorrowData {
+                                location,
+                                borrowed: arg0_place.project_deeper(&[PlaceElem::Deref], self.tcx),
+                                assigned: Borrower::AssignStmt(mir_call.destination),
+                            });
+                            loans.push(loan);
+
+                            for other_local in self
+                                .provenance_set
+                                .tree_borrow_local
+                                .borrow_mut()
+                                .group(arg0_place.local)
+                            {
+                                if arg0_place.local == other_local {
+                                    continue;
+                                }
+                                let loan = self.loans.push(BorrowData {
+                                    location,
+                                    borrowed: Place::from(other_local),
+                                    assigned: Borrower::AssignStmt(mir_call.destination),
+                                });
+                                loans.push(loan);
+                            }
+                            self.location_map.insert(location, loans);
+                        }
+                    }
+                } else if let Some(callee) = mir_call.func.did()
                     && let Some(callee) = callee.as_local()
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
@@ -429,7 +467,25 @@ impl ProvenanceConstraintGraph {
                     return self.super_terminator(terminator, location);
                 };
                 disallow_interprocedural!();
-                if let Some(callee) = mir_call.func.did()
+                // specially handle offset method calls for pointers, just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                if let CallKind::RustLib(def_id) = &mir_call.func {
+                    let func_name = self.tcx.def_path_str(*def_id);
+                    if func_name.starts_with("std::ptr::")
+                        && func_name.ends_with("offset")
+                        && mir_call.args.len() == 2
+                    {
+                        let arg0 = &mir_call.args[0].node;
+                        if let Some(arg0_place) = arg0.place()
+                            && self.provenance_set.local_data[arg0_place.local].is_some()
+                        {
+                            self.visit_assign(
+                                &mir_call.destination,
+                                &Rvalue::Use(Operand::Copy(arg0_place)),
+                                location,
+                            );
+                        }
+                    }
+                } else if let Some(callee) = mir_call.func.did()
                     && let Some(callee) = callee.as_local()
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
