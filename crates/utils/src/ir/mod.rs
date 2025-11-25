@@ -30,18 +30,6 @@ pub fn with_tcx<R, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> R>(f: F) -> R {
 }
 
 #[inline]
-pub fn unescape_byte_str(s: &str) -> Vec<u8> {
-    // from rustc_ast/src/util/literal.rs
-    let mut buf = Vec::with_capacity(s.len());
-    rustc_literal_escaper::unescape_unicode(
-        s,
-        rustc_literal_escaper::Mode::ByteStr,
-        &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-    );
-    buf
-}
-
-#[inline]
 pub fn mir_ty_to_string<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
     let mut buf = String::new();
     format_mir_ty(&mut buf, ty, tcx).unwrap();

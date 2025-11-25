@@ -77,7 +77,7 @@ impl TransformVisitor<'_, '_, '_> {
         args: &[E],
         ctx: FprintfCtx<'_>,
     ) -> Expr {
-        let mut buf = utils::ir::unescape_byte_str(fmt.as_str());
+        let mut buf = utils::unescape_byte_str(fmt.as_str());
         if ctx.wide {
             let mut new_buf: Vec<u8> = vec![];
             for c in buf.chunks_exact(4) {
@@ -309,25 +309,7 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
     let mut width_args = vec![];
     loop {
         let res = fprintf::parse_format(remaining);
-        for c in String::from_utf8_lossy(res.prefix).chars() {
-            match c {
-                '{' => format.push_str("{{"),
-                '}' => format.push_str("}}"),
-                '\n' => format.push_str("\\n"),
-                '\r' => format.push_str("\\r"),
-                '\t' => format.push_str("\\t"),
-                '\\' => format.push_str("\\\\"),
-                '\0' => {}
-                '\"' => format.push_str("\\\""),
-                _ => {
-                    if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == ' ' {
-                        format.push(c);
-                    } else {
-                        write!(format, "\\u{{{:x}}}", c as u32).unwrap();
-                    }
-                }
-            }
-        }
+        utils::format_rust_str_from_bytes(&mut format, res.prefix).unwrap();
         if let Some(cs) = res.conversion_spec {
             let mut fmt = String::new();
             let mut conv = String::new();
