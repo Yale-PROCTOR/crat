@@ -248,7 +248,8 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         self.location_map.insert(location, loans);
                     }
                     Rvalue::CopyForDeref(place)
-                    | Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => {
+                    | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                    | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                         let mut loans = vec![];
                         let loan = self.loans.push(BorrowData {
                             location,
