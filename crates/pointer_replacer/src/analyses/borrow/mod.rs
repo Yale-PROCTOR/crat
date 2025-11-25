@@ -10,6 +10,7 @@ use loan_liveness::{LoanLiveness, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
 use rustc_hash::FxHashMap;
+use rustc_hir::def_id::DefId;
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
@@ -222,7 +223,10 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         let mut loans = vec![];
                         let loan = self.loans.push(BorrowData {
                             location,
-                            borrowed: *place,
+                            // field-sensitive
+                            // borrowed: *place,
+                            // field-insensitive
+                            borrowed: Place::from(place.local),
                             assigned: Borrower::AssignStmt(*lhs),
                         });
                         loans.push(loan);
@@ -285,13 +289,10 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                 };
                 disallow_interprocedural!();
 
-                // specially handle offset method calls for pointers, just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                // specially handle borrowing method (e.g., offset) calls for pointers,
+                // just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
                 if let CallKind::RustLib(def_id) = &mir_call.func {
-                    let func_name = self.tcx.def_path_str(*def_id);
-                    if func_name.starts_with("std::ptr::")
-                        && func_name.ends_with("offset")
-                        && mir_call.args.len() == 2
-                    {
+                    if is_borrowing_method(*def_id, self.tcx) {
                         let arg0 = &mir_call.args[0].node;
                         if let Some(arg0_place) = arg0.place()
                             && self.provenance_set.local_data[mir_call.destination.local].is_some()
@@ -466,13 +467,10 @@ impl ProvenanceConstraintGraph {
                     return self.super_terminator(terminator, location);
                 };
                 disallow_interprocedural!();
-                // specially handle offset method calls for pointers, just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                // specially handle borrowing method (e.g., offset) calls for pointers,
+                // just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
                 if let CallKind::RustLib(def_id) = &mir_call.func {
-                    let func_name = self.tcx.def_path_str(*def_id);
-                    if func_name.starts_with("std::ptr::")
-                        && func_name.ends_with("offset")
-                        && mir_call.args.len() == 2
-                    {
+                    if is_borrowing_method(*def_id, self.tcx) {
                         let arg0 = &mir_call.args[0].node;
                         if let Some(arg0_place) = arg0.place() {
                             self.visit_assign(
@@ -515,6 +513,14 @@ impl ProvenanceConstraintGraph {
         .visit_body(body);
 
         graph
+    }
+}
+
+fn is_borrowing_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
+    !def_id.is_local() && tcx.def_kind(def_id) == rustc_hir::def::DefKind::AssocFn && {
+        let name = tcx.item_name(def_id);
+        let name = name.as_str();
+        name == "offset" || name == "as_ptr" || name == "as_mut_ptr"
     }
 }
 
