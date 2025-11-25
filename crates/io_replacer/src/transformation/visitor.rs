@@ -45,6 +45,7 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) type_arena: &'a TypeArena<'a>,
     pub(super) analysis_res: &'a file_analysis::AnalysisResult<'a>,
     pub(super) hir: &'a HirCtx,
+    pub(super) config: super::Config,
 
     pub(super) error_returning_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
     pub(super) error_taking_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,

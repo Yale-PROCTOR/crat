@@ -19,7 +19,7 @@ mod likely_lit;
 mod mir_loc;
 mod transformation;
 
-pub use transformation::transform::{add_deps, replace_io};
+pub use transformation::transform::{Config, add_deps, replace_io};
 
 #[cfg(test)]
 mod tests;

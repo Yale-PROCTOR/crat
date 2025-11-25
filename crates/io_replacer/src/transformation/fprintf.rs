@@ -2,8 +2,10 @@ use std::{fmt::Write as _, ops::Deref};
 
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
+use rustc_middle::ty;
 use rustc_span::Symbol;
 use utils::{
+    ast::unwrap_paren,
     expr,
     file::fprintf::{self, Conversion, FlagChar, Width},
 };
@@ -107,24 +109,94 @@ impl TransformVisitor<'_, '_, '_> {
             } else {
                 &mut new_args
             };
-            let arg = pprust::expr_to_string(arg);
+            let arg_str = pprust::expr_to_string(arg);
             match cast {
-                "&str" => write!(
-                    args,
-                    "{{
-    let ___s = std::ffi::CStr::from_ptr(({arg}) as _);
+                "&str" => {
+                    let cstr = match &unwrap_paren(arg).kind {
+                        ExprKind::MethodCall(call)
+                            if call.seg.ident.name == rustc_span::sym::as_ptr =>
+                        {
+                            let hir_receiver = self
+                                .ast_to_hir
+                                .get_expr(call.receiver.id, self.tcx)
+                                .unwrap();
+                            let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+                            let ty = typeck.expr_ty(hir_receiver);
+                            let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                                ty.peel_refs().kind()
+                            else {
+                                panic!("{arg_str} {ty}");
+                            };
+                            let receiver_str = pprust::expr_to_string(&call.receiver);
+                            if *ety == self.tcx.types.u8 {
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(&({receiver_str})).unwrap()"
+                                )
+                            } else if ety.is_numeric() {
+                                self.bytemuck.set(true);
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({receiver_str}))).unwrap()"
+                                )
+                            } else {
+                                panic!("{arg_str} {ty}");
+                            }
+                        }
+                        ExprKind::AddrOf(_, _, pointee) => {
+                            let ExprKind::Index(base, idx, _) = &unwrap_paren(pointee).kind else {
+                                panic!("{arg_str}")
+                            };
+                            let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
+                            let typeck = self.tcx.typeck(hir_base.hir_id.owner);
+                            let ty = typeck.expr_ty(hir_base);
+                            let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                                ty.peel_refs().kind()
+                            else {
+                                panic!("{arg_str} {ty}");
+                            };
+                            let base_str = pprust::expr_to_string(base);
+                            let idx_str = pprust::expr_to_string(idx);
+                            if *ety == self.tcx.types.u8 {
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
+                                )
+                            } else if ety.is_numeric() {
+                                self.bytemuck.set(true);
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
+                                )
+                            } else {
+                                panic!("{arg_str} {ty}");
+                            }
+                        }
+                        _ => {
+                            format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
+                        }
+                    };
+                    if self.config.assume_to_str_ok {
+                        write!(args, "{cstr}.to_str().unwrap(), ").unwrap();
+                    } else {
+                        write!(
+                            args,
+                            "{{
+    let ___s = {cstr};
     if let Ok(___s) = ___s.to_str() {{
         ___s.to_string()
     }} else {{
         ___s.to_bytes().iter().map(|&_b| _b as char).collect()
     }}
 }}, "
-                )
-                .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
                 "String" => write!(
                     args,
                     "{{
-    let mut p: *const u8 = {arg} as _;
+    let mut p: *const u8 = {arg_str} as _;
     let mut s: String = String::new();
     loop {{
         let slice = std::slice::from_raw_parts(p, 4);
@@ -149,9 +221,9 @@ impl TransformVisitor<'_, '_, '_> {
                         "crate::stdio::Af64" => self.lib_items.borrow_mut().insert(LibItem::Af64),
                         _ => panic!(),
                     };
-                    write!(args, "{cast}(({arg}) as _), ").unwrap()
+                    write!(args, "{cast}(({arg_str}) as _), ").unwrap()
                 }
-                _ => write!(args, "({arg}) as {cast}, ").unwrap(),
+                _ => write!(args, "({arg_str}) as {cast}, ").unwrap(),
             }
         }
         let stream_str = stream.borrow_for(StreamTrait::Write);
