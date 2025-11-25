@@ -41,7 +41,7 @@ impl TransformVisitor<'_, '_, '_> {
         ic: IndicatorCheck<'_>,
     ) -> Expr {
         let stream = stream.borrow_for(StreamTrait::BufRead);
-        let buf = utils::ir::unescape_byte_str(fmt);
+        let buf = utils::unescape_byte_str(fmt);
         let specs = fscanf::parse_specs(&buf);
         let parsing_fn = make_parsing_function(&specs);
         let err_eof_args = self.err_eof_args(ic);
