@@ -259,9 +259,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                         match ptr_kind {
                                             PtrKind::OptRef(m) => {
                                                 *e = utils::expr!(
-                                                    "bytemuck::cast_{}::<{}, {}>(({}).as_deref{}().unwrap())",
+                                                    "bytemuck::cast_{}::<_, {}>(({}).as_deref{}().unwrap())",
                                                     if m { "mut" } else { "ref" },
-                                                    mir_ty_to_string(ty_from, self.tcx),
                                                     mir_ty_to_string(ty_to, self.tcx),
                                                     pprust::expr_to_string(ptr),
                                                     if m { "_mut" } else { "" },
@@ -270,9 +269,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                             PtrKind::Slice(m) => {
                                                 self.bytemuck.set(true);
                                                 *e = utils::expr!(
-                                                    "bytemuck::cast_{}::<{}, {}>(&{} ({})[0])",
+                                                    "bytemuck::cast_{}::<_, {}>(&{} ({})[0])",
                                                     if m { "mut" } else { "ref" },
-                                                    mir_ty_to_string(ty_from, self.tcx),
                                                     mir_ty_to_string(ty_to, self.tcx),
                                                     if m { "mut " } else { "" },
                                                     pprust::expr_to_string(ptr),
@@ -291,9 +289,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                     if safe_conversion(ty_to, ty_from) {
                                         self.bytemuck.set(true);
                                         *e = utils::expr!(
-                                            "bytemuck::cast_{}::<{}, {}>({})",
+                                            "bytemuck::cast_{}::<_, {}>({})",
                                             if m.is_mut() { "mut" } else { "ref" },
-                                            mir_ty_to_string(ty_from, self.tcx),
                                             mir_ty_to_string(ty_to, self.tcx),
                                             pprust::expr_to_string(ptr),
                                         );
@@ -366,9 +363,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                     if need_cast {
                                         self.bytemuck.set(true);
                                         *expr = utils::expr!(
-                                            "bytemuck::cast_slice{}::<{}, {}>({}){indices_str}",
+                                            "bytemuck::cast_slice{}::<_, {}>({}){indices_str}",
                                             if m { "_mut" } else { "" },
-                                            mir_ty_to_string(inner_ty, self.tcx),
                                             mir_ty_to_string(expr_ty, self.tcx),
                                             pprust::expr_to_string(receiver),
                                         );
@@ -914,12 +910,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                         }
                         ExprKind::Path(_, _) => {
                             if need_cast {
-                                if matches!(
-                                    lhs_inner_ty.kind(),
-                                    ty::TyKind::Int(ty::IntTy::I8)
-                                        | ty::TyKind::Uint(ty::UintTy::U8)
-                                ) && rhs_inner_ty.is_numeric()
-                                {
+                                if is_byte(lhs_inner_ty) && rhs_inner_ty.is_numeric() {
                                     self.bytemuck.set(true);
                                     *rhs = utils::expr!(
                                         "bytemuck::cast_slice{}(std::slice::from_{}(&{}{}))",
@@ -928,6 +919,25 @@ impl<'tcx> TransformVisitor<'tcx> {
                                         if m { "mut " } else { "" },
                                         pprust::expr_to_string(e),
                                     );
+                                } else if is_byte(lhs_inner_ty)
+                                    && let ty::TyKind::Array(elem_ty, _) = rhs_inner_ty.kind()
+                                    && elem_ty.is_numeric()
+                                {
+                                    if *elem_ty == lhs_inner_ty {
+                                        *rhs = utils::expr!(
+                                            "&{}{}",
+                                            if m { "mut " } else { "" },
+                                            pprust::expr_to_string(e),
+                                        );
+                                    } else {
+                                        self.bytemuck.set(true);
+                                        *rhs = utils::expr!(
+                                            "bytemuck::cast_slice{}(&{}{})",
+                                            if m { "_mut" } else { "" },
+                                            if m { "mut " } else { "" },
+                                            pprust::expr_to_string(e),
+                                        );
+                                    }
                                 } else {
                                     *rhs = utils::expr!(
                                         "
@@ -991,9 +1001,8 @@ impl<'tcx> TransformVisitor<'tcx> {
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if matches!(seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") =>
             {
-                let m = seg.ident.name.as_str() == "as_mut_ptr";
                 match lhs_kind {
-                    PtrKind::OptRef(_) => {
+                    PtrKind::OptRef(m) => {
                         if need_cast {
                             todo!()
                         } else {
@@ -1004,14 +1013,24 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    PtrKind::Slice(_) => {
+                    PtrKind::Slice(m) => {
                         if need_cast {
-                            *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
-                                if m { "_mut" } else { "" },
-                                pprust::expr_to_string(e),
-                                if m { "mut" } else { "const" },
-                            );
+                            if is_byte(lhs_inner_ty) && rhs_inner_ty.is_numeric() {
+                                self.bytemuck.set(true);
+                                *rhs = utils::expr!(
+                                    "bytemuck::cast_slice{}(&{}{})",
+                                    if m { "_mut" } else { "" },
+                                    if m { "mut " } else { "" },
+                                    pprust::expr_to_string(receiver),
+                                );
+                            } else {
+                                *rhs = utils::expr!(
+                                    "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
+                                    if m { "_mut" } else { "" },
+                                    pprust::expr_to_string(e),
+                                    if m { "mut" } else { "const" },
+                                );
+                            }
                         } else {
                             *rhs = utils::expr!(
                                 "&{}{}",
@@ -1166,8 +1185,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 assert!(lhs_inner_ty.is_integral());
                                 self.bytemuck.set(true);
                                 *rhs = utils::expr!(
-                                    "bytemuck::cast_slice::<u8, {}>({})",
-                                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                                    "bytemuck::cast_slice({})",
                                     pprust::expr_to_string(e),
                                 );
                             }
@@ -1394,6 +1412,14 @@ fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     } else {
         expr
     }
+}
+
+#[inline]
+fn is_byte(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
+    )
 }
 
 #[allow(clippy::match_like_matches_macro)]
