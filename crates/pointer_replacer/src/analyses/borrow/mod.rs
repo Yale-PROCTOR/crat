@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 
-use colored::Colorize;
 use errors::{Errors, compute_errors};
 use invalidates::{Invalidates, compute_invalidates};
 use itertools::Itertools as _;
@@ -630,8 +629,8 @@ pub fn dump_borrow_inference_mir<'tcx>(
                     .join(", ");
 
                 if !errors.is_empty() {
-                    let error_notification = format!("errors: [{}]", errors);
-                    w.write_fmt(format_args!("\t// {}\n", error_notification.red()))?;
+                    let error_notification = format!("errors: [{errors}]");
+                    w.write_fmt(format_args!("\t// {error_notification}\n"))?;
                 }
 
                 let live_provenances = provenance_liveness
@@ -713,49 +712,6 @@ pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &G
     }
 }
 
-pub fn demote_pointers(
-    program: &RustProgram,
-    global_borrow_ctxt: &GBorrowInferCtxt,
-) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
-    let mut demoted = FxHashMap::default();
-
-    let tcx = program.tcx;
-
-    for f in program.functions.iter() {
-        let body = &*program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(f)
-            .borrow();
-
-        let BorrowInferenceResults {
-            borrow_set, errors, ..
-        } = borrow_inference(tcx, *f, global_borrow_ctxt);
-
-        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
-        for row in errors.rows() {
-            if let Some(loans) = errors.row(row) {
-                invalid_loans.union(loans);
-            }
-        }
-
-        let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
-
-        for loan in invalid_loans.iter() {
-            let borrow_data = &borrow_set.loans[loan];
-            match borrow_data.assigned {
-                Borrower::AssignStmt(assigned) => {
-                    demoted_locals.insert(assigned.local);
-                }
-                Borrower::CallArg(..) => unimplemented!(),
-            }
-        }
-
-        demoted.insert(*f, demoted_locals);
-    }
-
-    demoted
-}
-
 pub fn demote_pointers_iterative(
     program: &RustProgram,
     global_borrow_ctxt: &mut GBorrowInferCtxt,
@@ -776,7 +732,7 @@ pub fn demote_pointers_iterative(
 
             let BorrowInferenceResults {
                 borrow_set, errors, ..
-            } = borrow_inference(tcx, *f, &global_borrow_ctxt);
+            } = borrow_inference(tcx, *f, global_borrow_ctxt);
 
             let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
             for row in errors.rows() {
