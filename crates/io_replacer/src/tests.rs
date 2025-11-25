@@ -660,8 +660,13 @@ fn test_puts() {
     run_test(
         r#"
 unsafe fn f() -> libc::c_int {
+    let mut c: [libc::c_char; 2] = [
+        'a' as i32 as libc::c_char,
+        0 as libc::c_int as libc::c_char,
+    ];
+    puts(c.as_mut_ptr());
     puts(b"a\0" as *const u8 as *const libc::c_char);
-    return puts(b"b\0" as *const u8 as *const libc::c_char);
+    return puts(c.as_mut_ptr()) + puts(b"b\0" as *const u8 as *const libc::c_char);
 }"#,
         &["crate::stdio::rs_puts"],
         &[],

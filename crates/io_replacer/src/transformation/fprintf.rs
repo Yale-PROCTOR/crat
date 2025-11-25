@@ -144,34 +144,35 @@ impl TransformVisitor<'_, '_, '_> {
                             }
                         }
                         ExprKind::AddrOf(_, _, pointee) => {
-                            let ExprKind::Index(base, idx, _) =
+                            if let ExprKind::Index(base, idx, _) =
                                 &unwrap_cast_and_paren(pointee).kind
-                            else {
-                                panic!("{arg_str}")
-                            };
-                            let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
-                            let typeck = self.tcx.typeck(hir_base.hir_id.owner);
-                            let ty = typeck.expr_ty(hir_base);
-                            let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
-                                ty.peel_refs().kind()
-                            else {
-                                panic!("{arg_str} {ty}");
-                            };
-                            let base_str = pprust::expr_to_string(base);
-                            let idx_str = pprust::expr_to_string(idx);
-                            if *ety == self.tcx.types.u8 {
-                                format!(
-                                    "
+                            {
+                                let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
+                                let typeck = self.tcx.typeck(hir_base.hir_id.owner);
+                                let ty = typeck.expr_ty(hir_base);
+                                let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                                    ty.peel_refs().kind()
+                                else {
+                                    panic!("{arg_str} {ty}");
+                                };
+                                let base_str = pprust::expr_to_string(base);
+                                let idx_str = pprust::expr_to_string(idx);
+                                if *ety == self.tcx.types.u8 {
+                                    format!(
+                                        "
     std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
-                                )
-                            } else if ety.is_numeric() {
-                                self.bytemuck.set(true);
-                                format!(
+                                    )
+                                } else if ety.is_numeric() {
+                                    self.bytemuck.set(true);
+                                    format!(
                                     "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
                                 )
+                                } else {
+                                    panic!("{arg_str} {ty}");
+                                }
                             } else {
-                                panic!("{arg_str} {ty}");
+                                format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
                             }
                         }
                         _ => {
