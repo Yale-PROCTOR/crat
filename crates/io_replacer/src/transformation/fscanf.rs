@@ -5,6 +5,7 @@ use rustc_ast_pretty::pprust;
 use rustc_middle::ty;
 use rustc_span::sym;
 use utils::{
+    ast::unwrap_cast_and_paren,
     expr,
     file::fscanf::{self, ConvTy, Conversion, ConversionSpec, LengthMod},
 };
@@ -13,7 +14,6 @@ use super::{
     likely_lit::LikelyLit,
     stream_ty::*,
     transform::LibItem,
-    unwrap_cast_and_paren,
     visitor::{IndicatorCheck, TransformVisitor},
 };
 
@@ -55,6 +55,31 @@ impl TransformVisitor<'_, '_, '_> {
         for (spec, arg) in specs.iter().filter(|spec| spec.assign).zip(args) {
             match spec.ty() {
                 ConvTy::Scalar(spec_ty) => {
+                    if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
+                        && let ExprKind::Unary(UnOp::Deref, e) = &unwrap_cast_and_paren(e).kind
+                        && let ExprKind::MethodCall(call1) = &unwrap_cast_and_paren(e).kind
+                        && call1.seg.ident.name == sym::offset
+                        && let ExprKind::MethodCall(call2) =
+                            &unwrap_cast_and_paren(&call1.receiver).kind
+                        && call2.seg.ident.name.as_str() == "as_mut_ptr"
+                        && let hir_receiver = self
+                            .ast_to_hir
+                            .get_expr(call2.receiver.id, self.tcx)
+                            .unwrap()
+                        && let typeck = self.tcx.typeck(hir_receiver.hir_id.owner)
+                        && let ty = typeck.expr_ty(hir_receiver)
+                        && let ty::TyKind::Array(ty, _) = ty.kind()
+                        && ty.to_string() == spec_ty
+                    {
+                        write!(
+                            code,
+                            ", &mut ({})[({}) as usize]",
+                            pprust::expr_to_string(&call2.receiver),
+                            pprust::expr_to_string(&call1.args[0]),
+                        )
+                        .unwrap();
+                        continue;
+                    }
                     if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(arg).kind
                         && call.seg.ident.name.as_str() == "map_or"
                         && let ExprKind::MethodCall(call) =

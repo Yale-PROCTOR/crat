@@ -94,6 +94,14 @@ pub fn unwrap_paren_mut(expr: &mut Expr) -> &mut Expr {
     }
 }
 
+pub fn unwrap_cast_and_paren(e: &Expr) -> &Expr {
+    if let ExprKind::Cast(e, _) | ExprKind::Paren(e) = &e.kind {
+        unwrap_cast_and_paren(e)
+    } else {
+        e
+    }
+}
+
 #[derive(Debug)]
 pub struct TransformationResult(pub Vec<(PathBuf, String)>);
 

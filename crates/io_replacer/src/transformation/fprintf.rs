@@ -5,7 +5,7 @@ use rustc_ast_pretty::pprust;
 use rustc_middle::ty;
 use rustc_span::Symbol;
 use utils::{
-    ast::unwrap_paren,
+    ast::unwrap_cast_and_paren,
     expr,
     file::fprintf::{self, Conversion, FlagChar, Width},
 };
@@ -112,7 +112,7 @@ impl TransformVisitor<'_, '_, '_> {
             let arg_str = pprust::expr_to_string(arg);
             match cast {
                 "&str" => {
-                    let cstr = match &unwrap_paren(arg).kind {
+                    let cstr = match &unwrap_cast_and_paren(arg).kind {
                         ExprKind::MethodCall(call)
                             if call.seg.ident.name == rustc_span::sym::as_ptr =>
                         {
@@ -144,7 +144,9 @@ impl TransformVisitor<'_, '_, '_> {
                             }
                         }
                         ExprKind::AddrOf(_, _, pointee) => {
-                            let ExprKind::Index(base, idx, _) = &unwrap_paren(pointee).kind else {
+                            let ExprKind::Index(base, idx, _) =
+                                &unwrap_cast_and_paren(pointee).kind
+                            else {
                                 panic!("{arg_str}")
                             };
                             let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
