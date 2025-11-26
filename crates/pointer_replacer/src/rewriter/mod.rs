@@ -1,7 +1,12 @@
+use etrace::some_or;
+use points_to::andersen;
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LocalDefId;
+use serde::Deserialize;
 use transform::TransformVisitor;
 
 use crate::{
@@ -21,26 +26,28 @@ pub struct Analysis {
     mutability_result: MutabilityResult,
     promoted_mut_ref_result: PromotedMutRefResult,
     fatness_result: FatnessResult,
+    aliases: FxHashMap<LocalDefId, FxHashSet<usize>>,
 }
 
-impl Analysis {
-    pub fn new(
-        mutability_result: MutabilityResult,
-        promoted_mut_ref_result: PromotedMutRefResult,
-        fatness_result: FatnessResult,
-    ) -> Self {
-        Analysis {
-            mutability_result,
-            promoted_mut_ref_result,
-            fatness_result,
-        }
-    }
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Config {
+    pub c_exposed_fns: FxHashSet<String>,
 }
 
-pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
+pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let arena = typed_arena::Arena::new();
+    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let andersen_config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
+    };
+    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    let aliases = find_param_aliases(&pre_points_to, &points_to, tcx);
 
     let mut functions = vec![];
     let mut structs = vec![];
@@ -69,11 +76,52 @@ pub fn replace_local_borrows(tcx: TyCtxt<'_>) -> String {
     let promoted_mut_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(analyses::borrow::mutable_references_no_guarantee(&input));
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
-    let analysis_results =
-        Analysis::new(mutability_result, promoted_mut_ref_result, fatness_result);
+    let analysis_results = Analysis {
+        mutability_result,
+        promoted_mut_ref_result,
+        fatness_result,
+        aliases,
+    };
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
 
-    pprust::crate_to_string_for_macros(&krate)
+    (
+        pprust::crate_to_string_for_macros(&krate),
+        visitor.bytemuck.get(),
+    )
+}
+
+fn find_param_aliases<'tcx>(
+    pre: &andersen::PreAnalysisData<'tcx>,
+    points_to: &andersen::Solutions,
+    tcx: TyCtxt<'tcx>,
+) -> FxHashMap<LocalDefId, FxHashSet<usize>> {
+    let mut param_aliases = FxHashMap::default();
+    for def_id in tcx.hir_body_owners() {
+        let calls = some_or!(pre.call_args.get(&def_id), continue);
+        let mut aliases = FxHashSet::default();
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        for call_args in calls {
+            for i in 0..body.arg_count {
+                for j in 0..i {
+                    if aliases.contains(&i) && aliases.contains(&j) {
+                        continue;
+                    }
+                    let arg_i = some_or!(call_args[i], continue);
+                    let arg_j = some_or!(call_args[j], continue);
+                    let mut sol_i = points_to[arg_i].clone();
+                    sol_i.intersect(&points_to[arg_j]);
+                    if !sol_i.is_empty() {
+                        aliases.insert(i);
+                        aliases.insert(j);
+                    }
+                }
+            }
+        }
+        if !aliases.is_empty() {
+            param_aliases.insert(def_id, aliases);
+        }
+    }
+    param_aliases
 }

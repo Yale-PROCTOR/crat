@@ -4,7 +4,9 @@ use utils::compilation;
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let res = compilation::run_compiler_on_str(&code, super::replace_io).unwrap();
+    let config = super::Config::default();
+    let res =
+        compilation::run_compiler_on_str(&code, |tcx| super::replace_io(config, tcx)).unwrap();
     let stripped = res
         .code
         .strip_prefix(FORMATTED_PREAMBLE.as_str())
@@ -658,8 +660,13 @@ fn test_puts() {
     run_test(
         r#"
 unsafe fn f() -> libc::c_int {
+    let mut c: [libc::c_char; 2] = [
+        'a' as i32 as libc::c_char,
+        0 as libc::c_int as libc::c_char,
+    ];
+    puts(c.as_mut_ptr());
     puts(b"a\0" as *const u8 as *const libc::c_char);
-    return puts(b"b\0" as *const u8 as *const libc::c_char);
+    return puts(c.as_mut_ptr()) + puts(b"b\0" as *const u8 as *const libc::c_char);
 }"#,
         &["crate::stdio::rs_puts"],
         &[],

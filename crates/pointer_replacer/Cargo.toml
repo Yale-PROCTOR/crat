@@ -5,12 +5,15 @@ edition = "2024"
 
 [dependencies]
 utils = { path = "../utils" }
+points_to = { path = "../points_to" }
 itertools = "0.14.0"
 small_vec = { package = "smallvec", version = "1.15.1", features = ["const_new"] }
 petgraph = "0.8.2"
 regex = "1.12.2"
 tracing.workspace = true
 etrace.workspace = true
+typed-arena.workspace = true
+serde.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

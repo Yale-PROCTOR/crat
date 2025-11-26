@@ -1,6 +1,6 @@
-use rustc_ast::*;
+use rustc_ast::{token::LitKind, *};
 use rustc_ast_pretty::pprust;
-use utils::expr;
+use utils::{ast::unwrap_cast_and_paren, expr};
 
 use super::{
     stream_ty::*,
@@ -56,6 +56,24 @@ impl TransformVisitor<'_, '_, '_> {
     pub(super) fn transform_puts(&self, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
         let s_str = pprust::expr_to_string(s);
         self.lib_items.borrow_mut().insert(LibItem::Puts);
+
+        if let ExprKind::Lit(lit) = unwrap_cast_and_paren(s).kind
+            && lit.kind == LitKind::ByteStr
+        {
+            let bytes = utils::unescape_byte_str(lit.symbol.as_str());
+            let mut s = String::new();
+            utils::format_rust_str_from_bytes(&mut s, &bytes).unwrap();
+            let e = format!(
+                "{{
+                use std::io::Write;
+                    match write!(&mut std::io::stdout(), \"{s}\\n\") {{
+                        Ok(_) => (0, 0),
+                        Err(_) => (-1, 1),
+                    }}
+                }}"
+            );
+            return self.update_error_no_eof(ic, e, &StdExpr::stdout());
+        }
 
         if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(s) {
             let array = pprust::expr_to_string(array);

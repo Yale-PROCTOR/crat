@@ -9,7 +9,6 @@ extern crate rustc_data_structures;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
-extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_span;
 extern crate smallvec;
@@ -20,7 +19,7 @@ mod likely_lit;
 mod mir_loc;
 mod transformation;
 
-pub use transformation::transform::{add_deps, replace_io};
+pub use transformation::transform::{Config, add_deps, replace_io};
 
 #[cfg(test)]
 mod tests;

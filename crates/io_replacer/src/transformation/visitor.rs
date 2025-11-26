@@ -21,6 +21,7 @@ use rustc_middle::{ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym, symbol::Ident};
 use smallvec::smallvec;
 use utils::{
+    ast::unwrap_cast_and_paren,
     bit_set::{BitSet8, BitSet16},
     expr,
     file::api_list::{self, Origin, Permission},
@@ -36,7 +37,6 @@ use super::{
     mir_loc::MirLoc,
     stream_ty::*,
     transform::LibItem,
-    unwrap_cast_and_paren,
 };
 
 pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
@@ -45,6 +45,7 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     pub(super) type_arena: &'a TypeArena<'a>,
     pub(super) analysis_res: &'a file_analysis::AnalysisResult<'a>,
     pub(super) hir: &'a HirCtx,
+    pub(super) config: super::Config,
 
     pub(super) error_returning_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
     pub(super) error_taking_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,

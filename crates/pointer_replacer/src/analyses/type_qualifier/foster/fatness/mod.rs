@@ -1,10 +1,14 @@
 use std::ops::Range;
 
+use rustc_abi::Size;
+use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
+use rustc_hash::FxHashMap;
 use rustc_middle::mir::{
-    HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Terminator, visit::Visitor,
+    Const, ConstValue, HasLocalDecls, Local, Location, Operand, Place, ProjectionElem, Rvalue,
+    Terminator, visit::Visitor,
 };
 use rustc_span::source_map::Spanned;
-use rustc_type_ir::TyKind;
+use rustc_type_ir::{TyKind, UintTy};
 
 use crate::{
     analyses::{
@@ -22,7 +26,6 @@ use crate::{
 mod libc;
 mod library;
 
-#[allow(unused)]
 pub fn fatness_analysis(rust_program: &RustProgram) -> FatnessResult {
     let mut result = FatnessResult::new_empty(rust_program);
     let mut database = BooleanSystem::new(&result.model);
@@ -46,6 +49,7 @@ pub fn fatness_analysis(rust_program: &RustProgram) -> FatnessResult {
         let mut analysis = FatnessAnalysis {
             ctxt,
             database: &mut database,
+            string_literals: FxHashMap::default(),
         };
 
         analysis.visit_body(body);
@@ -126,6 +130,7 @@ impl BooleanLattice for Fatness {}
 pub struct FatnessAnalysis<'infer, 'tcx, D> {
     ctxt: InferCtxt<'infer, 'tcx, D>,
     database: &'infer mut BooleanSystem<Fatness>,
+    string_literals: FxHashMap<Local, &'tcx [u8]>,
 }
 
 impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'infer, 'tcx, D> {
@@ -141,6 +146,10 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
 
         match rhs {
             Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs) => {
+                if let Some(lit) = self.string_literals.get(&rhs.local) {
+                    self.string_literals.insert(lhs.local, lit);
+                }
+
                 let lhs = place_vars(lhs, local_decls, locals, struct_fields);
                 let rhs = place_vars(rhs, local_decls, locals, struct_fields);
 
@@ -166,6 +175,10 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 }
             }
             Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => {
+                if let Some(lit) = self.string_literals.get(&rhs.local) {
+                    self.string_literals.insert(lhs.local, lit);
+                }
+
                 // for cast, we process the head ptr only
                 let lhs = place_vars(lhs, local_decls, locals, struct_fields);
                 let rhs = place_vars(rhs, local_decls, locals, struct_fields);
@@ -182,11 +195,36 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 }
             }
             Rvalue::Ref(_, _, rhs) | Rvalue::RawPtr(_, rhs) => {
+                if let Some(lit) = self.string_literals.get(&rhs.local) {
+                    self.string_literals.insert(lhs.local, lit);
+                }
+
                 let lhs = place_vars(lhs, local_decls, locals, struct_fields);
                 let rhs = place_vars(rhs, local_decls, locals, struct_fields);
                 for (lhs, rhs) in lhs.skip(1).zip(rhs) {
                     database.guard(lhs, rhs);
                     database.guard(rhs, lhs);
+                }
+            }
+            Rvalue::Use(Operand::Constant(c)) => {
+                // from `rustc_middle/src/ty/print/pretty.rs`
+                if let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), ty) = c.const_
+                    && let TyKind::Ref(_, ty, _) = ty.kind()
+                    && let TyKind::Array(ty, ct_len) = ty.kind()
+                    && matches!(ty.kind(), TyKind::Uint(UintTy::U8))
+                    && let Some(len) = ct_len.try_to_target_usize(self.ctxt.tcx)
+                    && let (prov, offset) = ptr.into_parts()
+                    && let Some(alloc) = self.ctxt.tcx.try_get_global_alloc(prov.alloc_id())
+                    && let GlobalAlloc::Memory(alloc) = alloc
+                    && let range = (AllocRange {
+                        start: offset,
+                        size: Size::from_bytes(len),
+                    })
+                    && let Ok(byte_str) = alloc
+                        .inner()
+                        .get_bytes_strip_provenance(&self.ctxt.tcx, range)
+                {
+                    self.string_literals.insert(lhs.local, byte_str);
                 }
             }
             _ => {
@@ -257,6 +295,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                         local_decls,
                         locals,
                         struct_fields,
+                        &self.string_literals,
                         database,
                     );
                 }

@@ -14,6 +14,7 @@ extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
+extern crate rustc_literal_escaper;
 extern crate rustc_middle;
 extern crate rustc_parse;
 extern crate rustc_session;
@@ -60,4 +61,55 @@ pub fn format(code: &str) -> String {
         rustc_ast_pretty::pprust::crate_to_string_for_macros(krate)
     })
     .unwrap()
+}
+
+#[inline]
+pub fn unescape_byte_str(s: &str) -> Vec<u8> {
+    // from rustc_ast/src/util/literal.rs
+    let mut buf = Vec::with_capacity(s.len());
+    rustc_literal_escaper::unescape_unicode(
+        s,
+        rustc_literal_escaper::Mode::ByteStr,
+        &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+    );
+    buf
+}
+
+pub fn format_rust_str_from_bytes<W: std::fmt::Write>(
+    mut format: W,
+    bytes: &[u8],
+) -> std::fmt::Result {
+    for c in String::from_utf8_lossy(bytes).chars() {
+        match c {
+            '{' => write!(format, "{{{{")?,
+            '}' => write!(format, "}}}}")?,
+            '\n' => write!(format, "\\n")?,
+            '\r' => write!(format, "\\r")?,
+            '\t' => write!(format, "\\t")?,
+            '\\' => write!(format, "\\\\")?,
+            '\0' => {}
+            '\"' => write!(format, "\\\"")?,
+            _ => {
+                if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == ' ' {
+                    write!(format, "{c}")?;
+                } else {
+                    write!(format, "\\u{{{:x}}}", c as u32)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn escape(c: u8) -> Option<&'static str> {
+    match c {
+        b'\n' => Some("\\n"),
+        b'\r' => Some("\\r"),
+        b'\t' => Some("\\t"),
+        b'\\' => Some("\\\\"),
+        b'\'' => Some("\\'"),
+        b'\"' => Some("\\\""),
+        b'\0' => Some("\\0"),
+        _ => None,
+    }
 }

@@ -1,5 +1,7 @@
 //! Borrow inference
 
+use std::cell::RefCell;
+
 use errors::{Errors, compute_errors};
 use invalidates::{Invalidates, compute_invalidates};
 use itertools::Itertools as _;
@@ -8,6 +10,7 @@ use loan_liveness::{LoanLiveness, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
 use rustc_hash::FxHashMap;
+use rustc_hir::def_id::DefId;
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
@@ -23,8 +26,8 @@ use rustc_mir_dataflow::{fmt::DebugWithContext, points::DenseLocationMap};
 use rustc_span::def_id::LocalDefId;
 use subset_closure::{SubSetClosure, compute_subset_closure};
 
-use super::mir::TerminatorExt;
-use crate::utils::rustc::RustProgram;
+use super::mir::{CallKind, TerminatorExt};
+use crate::utils::{dsa::union_find::UnionFind, rustc::RustProgram};
 
 macro_rules! disallow_interprocedural {
     () => {
@@ -75,6 +78,7 @@ impl std::fmt::Debug for ProvenanceData {
 pub struct ProvenanceSet {
     local_data: IndexVec<Local, Option<Provenance>>,
     provenance_data: IndexVec<Provenance, ProvenanceData>,
+    tree_borrow_local: RefCell<UnionFind<Local>>,
 }
 
 pub trait HasProvenanceSet {
@@ -106,6 +110,7 @@ impl HasProvenanceSet for Body<'_> {
         ProvenanceSet {
             local_data,
             provenance_data,
+            tree_borrow_local: RefCell::new(UnionFind::new(body.local_decls.len())),
         }
     }
 }
@@ -168,7 +173,7 @@ impl std::fmt::Debug for BorrowData<'_> {
 
 pub struct BorrowSet<'tcx> {
     loans: IndexVec<Loan, BorrowData<'tcx>>,
-    location_map: FxHashMap<Location, Loan>,
+    location_map: FxHashMap<Location, Vec<Loan>>,
     local_map: SparseBitMatrix<Local, Loan>,
 }
 
@@ -190,7 +195,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
     ) -> BorrowSet<'tcx> {
         struct Vis<'tcx, 'this, D> {
             loans: IndexVec<Loan, BorrowData<'tcx>>,
-            location_map: FxHashMap<Location, Loan>,
+            location_map: FxHashMap<Location, Vec<Loan>>,
             local_decl: &'this D,
             tcx: TyCtxt<'tcx>,
             provenance_set: &'this ProvenanceSet,
@@ -215,21 +220,64 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
 
                 match rvalue {
                     Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                        let mut loans = vec![];
                         let loan = self.loans.push(BorrowData {
                             location,
-                            borrowed: *place,
+                            // field-sensitive
+                            // borrowed: *place,
+                            // field-insensitive
+                            borrowed: Place::from(place.local),
                             assigned: Borrower::AssignStmt(*lhs),
                         });
-                        self.location_map.insert(location, loan);
+                        loans.push(loan);
+
+                        for other_local in self
+                            .provenance_set
+                            .tree_borrow_local
+                            .borrow_mut()
+                            .group(place.local)
+                        {
+                            if place.local == other_local {
+                                continue;
+                            }
+                            let loan = self.loans.push(BorrowData {
+                                location,
+                                borrowed: Place::from(other_local),
+                                assigned: Borrower::AssignStmt(*lhs),
+                            });
+                            loans.push(loan);
+                        }
+
+                        self.location_map.insert(location, loans);
                     }
                     Rvalue::CopyForDeref(place)
-                    | Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) => {
+                    | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                    | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
+                        let mut loans = vec![];
                         let loan = self.loans.push(BorrowData {
                             location,
                             borrowed: place.project_deeper(&[PlaceElem::Deref], self.tcx),
                             assigned: Borrower::AssignStmt(*lhs),
                         });
-                        self.location_map.insert(location, loan);
+                        loans.push(loan);
+
+                        for other_local in self
+                            .provenance_set
+                            .tree_borrow_local
+                            .borrow_mut()
+                            .group(place.local)
+                        {
+                            if place.local == other_local {
+                                continue;
+                            }
+                            let loan = self.loans.push(BorrowData {
+                                location,
+                                borrowed: Place::from(other_local),
+                                assigned: Borrower::AssignStmt(*lhs),
+                            });
+                            loans.push(loan);
+                        }
+                        self.location_map.insert(location, loans);
                     }
                     _ => {}
                 }
@@ -241,7 +289,42 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                 };
                 disallow_interprocedural!();
 
-                if let Some(callee) = mir_call.func.did()
+                // specially handle borrowing method (e.g., offset) calls for pointers,
+                // just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                if let CallKind::RustLib(def_id) = &mir_call.func {
+                    if is_borrowing_method(*def_id, self.tcx) {
+                        let arg0 = &mir_call.args[0].node;
+                        if let Some(arg0_place) = arg0.place()
+                            && self.provenance_set.local_data[mir_call.destination.local].is_some()
+                        {
+                            let mut loans = vec![];
+                            let loan = self.loans.push(BorrowData {
+                                location,
+                                borrowed: arg0_place.project_deeper(&[PlaceElem::Deref], self.tcx),
+                                assigned: Borrower::AssignStmt(mir_call.destination),
+                            });
+                            loans.push(loan);
+
+                            for other_local in self
+                                .provenance_set
+                                .tree_borrow_local
+                                .borrow_mut()
+                                .group(arg0_place.local)
+                            {
+                                if arg0_place.local == other_local {
+                                    continue;
+                                }
+                                let loan = self.loans.push(BorrowData {
+                                    location,
+                                    borrowed: Place::from(other_local),
+                                    assigned: Borrower::AssignStmt(mir_call.destination),
+                                });
+                                loans.push(loan);
+                            }
+                            self.location_map.insert(location, loans);
+                        }
+                    }
+                } else if let Some(callee) = mir_call.func.did()
                     && let Some(callee) = callee.as_local()
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
@@ -256,7 +339,12 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                                     borrowed: arg.project_deeper(&[PlaceElem::Deref], self.tcx),
                                     assigned: Borrower::CallArg(callee, arg_index),
                                 });
-                                self.location_map.insert(location, loan);
+                                // self.location_map.insert(location, loan);
+                                self.location_map
+                                    .entry(location)
+                                    .and_modify(|loans| loans.push(loan))
+                                    .or_default()
+                                    .push(loan);
                             }
                         }
                     }
@@ -336,37 +424,41 @@ impl ProvenanceConstraintGraph {
                 rvalue: &Rvalue<'tcx>,
                 location: Location,
             ) {
-                let Some(&loan) = self.borrow_set.location_map.get(&location) else {
+                let Some(loans) = self.borrow_set.location_map.get(&location) else {
                     return self.super_assign(place, rvalue, location);
                 };
-                let BorrowData {
-                    location: _,
-                    borrowed: rhs,
-                    ..
-                } = &self.borrow_set.loans[loan];
+                for &loan in loans {
+                    let BorrowData {
+                        location: _,
+                        borrowed: rhs,
+                        ..
+                    } = &self.borrow_set.loans[loan];
 
-                let Some(lhs) = place.as_local() else {
-                    return self.super_assign(place, rvalue, location);
-                };
-                let lhs_provenance = self.provenance_set.local_data[lhs].unwrap();
+                    let Some(lhs) = place.as_local() else {
+                        return self.super_assign(place, rvalue, location);
+                    };
+                    let lhs_provenance = self.provenance_set.local_data[lhs].unwrap();
 
-                self.graph.membership.push(MembershipConstraint {
-                    loan,
-                    provenance: lhs_provenance,
-                });
-
-                if !rhs.projection.is_empty()
-                    && rhs
-                        .projection
-                        .iter()
-                        .all(|projection| matches!(projection, PlaceElem::Deref))
-                {
-                    let rhs_provenance = self.provenance_set.local_data[rhs.local].unwrap();
-                    self.graph.subset.push(SubsetConstraint {
-                        sup: lhs_provenance,
-                        sub: rhs_provenance,
-                        _location: location,
+                    self.graph.membership.push(MembershipConstraint {
+                        loan,
+                        provenance: lhs_provenance,
                     });
+
+                    if !rhs.projection.is_empty()
+                        && rhs
+                            .projection
+                            .iter()
+                            .all(|projection| matches!(projection, PlaceElem::Deref))
+                            // rhs provenance might have been disabled by previous iteration, so need a guard here
+                        && self.provenance_set.local_data[rhs.local].is_some()
+                    {
+                        let rhs_provenance = self.provenance_set.local_data[rhs.local].unwrap();
+                        self.graph.subset.push(SubsetConstraint {
+                            sup: lhs_provenance,
+                            sub: rhs_provenance,
+                            _location: location,
+                        });
+                    }
                 }
             }
 
@@ -375,7 +467,20 @@ impl ProvenanceConstraintGraph {
                     return self.super_terminator(terminator, location);
                 };
                 disallow_interprocedural!();
-                if let Some(callee) = mir_call.func.did()
+                // specially handle borrowing method (e.g., offset) calls for pointers,
+                // just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
+                if let CallKind::RustLib(def_id) = &mir_call.func {
+                    if is_borrowing_method(*def_id, self.tcx) {
+                        let arg0 = &mir_call.args[0].node;
+                        if let Some(arg0_place) = arg0.place() {
+                            self.visit_assign(
+                                &mir_call.destination,
+                                &Rvalue::Use(Operand::Copy(arg0_place)),
+                                location,
+                            );
+                        }
+                    }
+                } else if let Some(callee) = mir_call.func.did()
                     && let Some(callee) = callee.as_local()
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
@@ -408,6 +513,14 @@ impl ProvenanceConstraintGraph {
         .visit_body(body);
 
         graph
+    }
+}
+
+pub fn is_borrowing_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
+    !def_id.is_local() && tcx.def_kind(def_id) == rustc_hir::def::DefKind::AssocFn && {
+        let name = tcx.item_name(def_id);
+        let name = name.as_str();
+        name == "offset" || name == "as_ptr" || name == "as_mut_ptr"
     }
 }
 
@@ -519,7 +632,10 @@ pub fn dump_borrow_inference_mir<'tcx>(
                     .map(|loan| format!("{:?}", &borrow_set.loans[loan]))
                     .join(", ");
 
-                w.write_fmt(format_args!("\t// errors: [{errors}]\n",))?;
+                if !errors.is_empty() {
+                    let error_notification = format!("errors: [{errors}]");
+                    w.write_fmt(format_args!("\t// {error_notification}\n"))?;
+                }
 
                 let live_provenances = provenance_liveness
                     .row(point_index)
@@ -600,44 +716,74 @@ pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &G
     }
 }
 
-pub fn demote_pointers(
+pub fn demote_pointers_iterative(
     program: &RustProgram,
-    global_borrow_ctxt: &GBorrowInferCtxt,
+    global_borrow_ctxt: &mut GBorrowInferCtxt,
 ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
     let mut demoted = FxHashMap::default();
 
     let tcx = program.tcx;
 
-    for f in program.functions.iter() {
-        let body = &*program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(f)
-            .borrow();
+    // TODO: super dumb fixed pointer iteration. Need to switch to worklist
+    let mut any_func_changed = true;
+    while any_func_changed {
+        any_func_changed = false;
+        for f in program.functions.iter() {
+            let body = &*program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(f)
+                .borrow();
 
-        let BorrowInferenceResults {
-            borrow_set, errors, ..
-        } = borrow_inference(tcx, *f, global_borrow_ctxt);
+            let BorrowInferenceResults {
+                borrow_set, errors, ..
+            } = borrow_inference(tcx, *f, global_borrow_ctxt);
 
-        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
-        for row in errors.rows() {
-            if let Some(loans) = errors.row(row) {
-                invalid_loans.union(loans);
-            }
-        }
-
-        let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
-
-        for loan in invalid_loans.iter() {
-            let borrow_data = &borrow_set.loans[loan];
-            match borrow_data.assigned {
-                Borrower::AssignStmt(assigned) => {
-                    demoted_locals.insert(assigned.local);
+            let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
+            for row in errors.rows() {
+                if let Some(loans) = errors.row(row) {
+                    invalid_loans.union(loans);
                 }
-                Borrower::CallArg(..) => unimplemented!(),
             }
-        }
 
-        demoted.insert(*f, demoted_locals);
+            let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
+
+            // for demoted locals
+            // Step 1. merge it with the local of the invalidated loan
+            // Step 2. disable their provenance in the next iteration
+
+            let provenance_set = global_borrow_ctxt.provenances.get_mut(f).unwrap();
+
+            // Step 1
+            for loan in invalid_loans.iter() {
+                let borrow_data = &borrow_set.loans[loan];
+                match borrow_data.assigned {
+                    Borrower::AssignStmt(assigned) => {
+                        demoted_locals.insert(assigned.local);
+                        provenance_set
+                            .tree_borrow_local
+                            .get_mut()
+                            .union(assigned.local, borrow_data.borrowed.local);
+                    }
+                    Borrower::CallArg(..) => unimplemented!(),
+                }
+            }
+
+            // Step 2
+            for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {
+                if demoted_locals.contains(local) && provenance.is_some() {
+                    any_func_changed = true;
+                    *provenance = None;
+                }
+            }
+
+            // demoted.insert(*f, demoted_locals);
+            demoted
+                .entry(*f)
+                .and_modify(|d: &mut DenseBitSet<Local>| {
+                    d.union(&demoted_locals);
+                })
+                .or_insert(demoted_locals);
+        }
     }
 
     demoted
@@ -652,8 +798,9 @@ pub fn mutable_references_no_guarantee(
 ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
     let mut mutable_references = FxHashMap::default();
 
-    let global_borrow_ctxt = GBorrowInferCtxt::all_pointers(program);
-    let demoted = demote_pointers(program, &global_borrow_ctxt);
+    let mut global_borrow_ctxt = GBorrowInferCtxt::all_pointers(program);
+    // let demoted = demote_pointers(program, &global_borrow_ctxt);
+    let demoted = demote_pointers_iterative(program, &mut global_borrow_ctxt);
 
     for (&f, demoted) in demoted.iter() {
         let provenance_set = &global_borrow_ctxt.provenances[&f];

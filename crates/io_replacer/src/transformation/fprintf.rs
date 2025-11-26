@@ -2,8 +2,13 @@ use std::{fmt::Write as _, ops::Deref};
 
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
+use rustc_middle::ty;
 use rustc_span::Symbol;
-use utils::expr;
+use utils::{
+    ast::unwrap_cast_and_paren,
+    expr,
+    file::fprintf::{self, Conversion, FlagChar, Width},
+};
 
 use super::{
     likely_lit::LikelyLit,
@@ -72,15 +77,7 @@ impl TransformVisitor<'_, '_, '_> {
         args: &[E],
         ctx: FprintfCtx<'_>,
     ) -> Expr {
-        // from rustc_ast/src/util/literal.rs
-        let s = fmt.as_str();
-        let mut buf = Vec::with_capacity(s.len());
-        rustc_literal_escaper::unescape_unicode(
-            fmt.as_str(),
-            rustc_literal_escaper::Mode::ByteStr,
-            &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
-        );
-
+        let mut buf = utils::unescape_byte_str(fmt.as_str());
         if ctx.wide {
             let mut new_buf: Vec<u8> = vec![];
             for c in buf.chunks_exact(4) {
@@ -112,24 +109,97 @@ impl TransformVisitor<'_, '_, '_> {
             } else {
                 &mut new_args
             };
-            let arg = pprust::expr_to_string(arg);
+            let arg_str = pprust::expr_to_string(arg);
             match cast {
-                "&str" => write!(
-                    args,
-                    "{{
-    let ___s = std::ffi::CStr::from_ptr(({arg}) as _);
+                "&str" => {
+                    let cstr = match &unwrap_cast_and_paren(arg).kind {
+                        ExprKind::MethodCall(call)
+                            if call.seg.ident.name == rustc_span::sym::as_ptr =>
+                        {
+                            let hir_receiver = self
+                                .ast_to_hir
+                                .get_expr(call.receiver.id, self.tcx)
+                                .unwrap();
+                            let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+                            let ty = typeck.expr_ty(hir_receiver);
+                            let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                                ty.peel_refs().kind()
+                            else {
+                                panic!("{arg_str} {ty}");
+                            };
+                            let receiver_str = pprust::expr_to_string(&call.receiver);
+                            if *ety == self.tcx.types.u8 {
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(&({receiver_str})).unwrap()"
+                                )
+                            } else if ety.is_numeric() {
+                                self.bytemuck.set(true);
+                                format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({receiver_str}))).unwrap()"
+                                )
+                            } else {
+                                panic!("{arg_str} {ty}");
+                            }
+                        }
+                        ExprKind::AddrOf(_, _, pointee) => {
+                            if let ExprKind::Index(base, idx, _) =
+                                &unwrap_cast_and_paren(pointee).kind
+                            {
+                                let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
+                                let typeck = self.tcx.typeck(hir_base.hir_id.owner);
+                                let ty = typeck.expr_ty(hir_base);
+                                let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                                    ty.peel_refs().kind()
+                                else {
+                                    panic!("{arg_str} {ty}");
+                                };
+                                let base_str = pprust::expr_to_string(base);
+                                let idx_str = pprust::expr_to_string(idx);
+                                if *ety == self.tcx.types.u8 {
+                                    format!(
+                                        "
+    std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
+                                    )
+                                } else if ety.is_numeric() {
+                                    self.bytemuck.set(true);
+                                    format!(
+                                    "
+    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
+                                )
+                                } else {
+                                    panic!("{arg_str} {ty}");
+                                }
+                            } else {
+                                format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
+                            }
+                        }
+                        _ => {
+                            format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
+                        }
+                    };
+                    if self.config.assume_to_str_ok {
+                        write!(args, "{cstr}.to_str().unwrap(), ").unwrap();
+                    } else {
+                        write!(
+                            args,
+                            "{{
+    let ___s = {cstr};
     if let Ok(___s) = ___s.to_str() {{
         ___s.to_string()
     }} else {{
         ___s.to_bytes().iter().map(|&_b| _b as char).collect()
     }}
 }}, "
-                )
-                .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
                 "String" => write!(
                     args,
                     "{{
-    let mut p: *const u8 = {arg} as _;
+    let mut p: *const u8 = {arg_str} as _;
     let mut s: String = String::new();
     loop {{
         let slice = std::slice::from_raw_parts(p, 4);
@@ -154,9 +224,9 @@ impl TransformVisitor<'_, '_, '_> {
                         "crate::stdio::Af64" => self.lib_items.borrow_mut().insert(LibItem::Af64),
                         _ => panic!(),
                     };
-                    write!(args, "{cast}(({arg}) as _), ").unwrap()
+                    write!(args, "{cast}(({arg_str}) as _), ").unwrap()
                 }
-                _ => write!(args, "({arg}) as {cast}, ").unwrap(),
+                _ => write!(args, "({arg_str}) as {cast}, ").unwrap(),
             }
         }
         let stream_str = stream.borrow_for(StreamTrait::Write);
@@ -239,26 +309,8 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
     let mut width_count = 0;
     let mut width_args = vec![];
     loop {
-        let res = parse_format(remaining);
-        for c in String::from_utf8_lossy(res.prefix).chars() {
-            match c {
-                '{' => format.push_str("{{"),
-                '}' => format.push_str("}}"),
-                '\n' => format.push_str("\\n"),
-                '\r' => format.push_str("\\r"),
-                '\t' => format.push_str("\\t"),
-                '\\' => format.push_str("\\\\"),
-                '\0' => {}
-                '\"' => format.push_str("\\\""),
-                _ => {
-                    if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == ' ' {
-                        format.push(c);
-                    } else {
-                        write!(format, "\\u{{{:x}}}", c as u32).unwrap();
-                    }
-                }
-            }
-        }
+        let res = fprintf::parse_format(remaining);
+        utils::format_rust_str_from_bytes(&mut format, res.prefix).unwrap();
         if let Some(cs) = res.conversion_spec {
             let mut fmt = String::new();
             let mut conv = String::new();
@@ -339,410 +391,6 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
         format,
         casts,
         width_args,
-    }
-}
-
-struct ParseResult<'a> {
-    prefix: &'a [u8],
-    conversion_spec: Option<ConversionSpec>,
-    remaining: Option<&'a [u8]>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    Percent,
-    Flag,
-    Width,
-    Period,
-    Precision,
-    Length,
-    H,
-    L,
-    Conversion,
-}
-
-fn err(s: &[u8], i: Option<usize>) -> ! {
-    panic!("{}", String::from_utf8_lossy(&s[i.unwrap()..]));
-}
-
-fn parse_format(s: &[u8]) -> ParseResult<'_> {
-    let mut start_idx = None;
-    let mut state = State::Percent;
-    let mut flags = vec![];
-    let mut width = None;
-    let mut precision = None;
-    let mut length = None;
-    let mut conversion = None;
-    for (i, c) in s.iter().enumerate() {
-        if state == State::Percent {
-            if *c == b'%' {
-                start_idx = Some(i);
-                state = State::Flag;
-            }
-        } else if (b'1'..=b'9').contains(c) || (*c == b'0' && state != State::Flag) {
-            match state {
-                State::Flag => {
-                    width = Some(Width::Decimal((c - b'0') as usize));
-                    state = State::Width;
-                }
-                State::Width => {
-                    let Some(Width::Decimal(n)) = &mut width else { unreachable!() };
-                    *n = *n * 10 + (c - b'0') as usize;
-                }
-                State::Precision => match &mut precision {
-                    None => precision = Some(Width::Decimal((c - b'0') as usize)),
-                    Some(Width::Decimal(n)) => *n = *n * 10 + (c - b'0') as usize,
-                    _ => unreachable!(),
-                },
-                _ => err(s, start_idx),
-            }
-        } else if let Some(flag) = FlagChar::from_u8(*c) {
-            flags.push(flag);
-        } else if *c == b'*' {
-            match state {
-                State::Flag => {
-                    width = Some(Width::Asterisk);
-                    state = State::Period;
-                }
-                State::Precision => {
-                    precision = Some(Width::Asterisk);
-                    state = State::Length;
-                }
-                _ => err(s, start_idx),
-            }
-        } else if *c == b'.' {
-            if matches!(state, State::Flag | State::Width | State::Period) {
-                state = State::Precision;
-            } else {
-                err(s, start_idx);
-            }
-        } else if let Some(len) = LengthMod::from_u8(*c) {
-            match len {
-                LengthMod::Short => match state {
-                    State::Flag
-                    | State::Width
-                    | State::Period
-                    | State::Precision
-                    | State::Length => {
-                        state = State::H;
-                    }
-                    State::H => {
-                        length = Some(LengthMod::Char);
-                        state = State::Conversion;
-                    }
-                    _ => err(s, start_idx),
-                },
-                LengthMod::Long => match state {
-                    State::Flag
-                    | State::Width
-                    | State::Period
-                    | State::Precision
-                    | State::Length => {
-                        state = State::L;
-                    }
-                    State::L => {
-                        length = Some(LengthMod::LongLong);
-                        state = State::Conversion;
-                    }
-                    _ => err(s, start_idx),
-                },
-                _ => {
-                    length = Some(len);
-                    state = State::Conversion;
-                }
-            }
-        } else if let Some(conv) = Conversion::from_u8(*c) {
-            match state {
-                State::Flag
-                | State::Width
-                | State::Period
-                | State::Precision
-                | State::Length
-                | State::Conversion => {
-                    conversion = Some((conv, i));
-                    break;
-                }
-                State::H => {
-                    length = Some(LengthMod::Short);
-                    conversion = Some((conv, i));
-                    break;
-                }
-                State::L => {
-                    length = Some(LengthMod::Long);
-                    conversion = Some((conv, i));
-                    break;
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            err(s, start_idx);
-        }
-    }
-
-    if let Some(start_idx) = start_idx {
-        if let Some((conversion, last_idx)) = conversion {
-            ParseResult {
-                prefix: &s[..start_idx],
-                conversion_spec: Some(ConversionSpec {
-                    flags,
-                    width,
-                    precision,
-                    length,
-                    conversion,
-                }),
-                remaining: Some(&s[last_idx + 1..]),
-            }
-        } else {
-            err(s, Some(start_idx));
-        }
-    } else {
-        ParseResult {
-            prefix: s,
-            conversion_spec: None,
-            remaining: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlagChar {
-    Apostrophe,
-    Minus,
-    Plus,
-    Space,
-    Hash,
-    Zero,
-}
-
-impl std::fmt::Display for FlagChar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Apostrophe => write!(f, "'"),
-            Self::Minus => write!(f, "-"),
-            Self::Plus => write!(f, "+"),
-            Self::Space => write!(f, " "),
-            Self::Hash => write!(f, "#"),
-            Self::Zero => write!(f, "0"),
-        }
-    }
-}
-
-impl FlagChar {
-    #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
-        match c {
-            b'\'' => Some(Self::Apostrophe),
-            b'-' => Some(Self::Minus),
-            b'+' => Some(Self::Plus),
-            b' ' => Some(Self::Space),
-            b'#' => Some(Self::Hash),
-            b'0' => Some(Self::Zero),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Width {
-    Asterisk,
-    Decimal(usize),
-}
-
-impl std::fmt::Display for Width {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Width::Asterisk => write!(f, "*"),
-            Width::Decimal(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LengthMod {
-    Char,
-    Short,
-    Long,
-    LongLong,
-    IntMax,
-    Size,
-    PtrDiff,
-    LongDouble,
-}
-
-impl std::fmt::Display for LengthMod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Char => write!(f, "hh"),
-            Self::Short => write!(f, "h"),
-            Self::Long => write!(f, "l"),
-            Self::LongLong => write!(f, "ll"),
-            Self::IntMax => write!(f, "j"),
-            Self::Size => write!(f, "z"),
-            Self::PtrDiff => write!(f, "t"),
-            Self::LongDouble => write!(f, "L"),
-        }
-    }
-}
-
-impl LengthMod {
-    #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
-        match c {
-            b'h' => Some(Self::Short),
-            b'l' => Some(Self::Long),
-            b'j' => Some(Self::IntMax),
-            b'z' => Some(Self::Size),
-            b't' => Some(Self::PtrDiff),
-            b'L' => Some(Self::LongDouble),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Conversion {
-    Int,
-    Octal,
-    Unsigned,
-    Hexadecimal,
-    HexadecimalUpper,
-    Double,
-    DoubleExp,
-    DoubleAuto,
-    DoubleHex,
-    Char,
-    Str,
-    Pointer,
-    Num,
-    C,
-    S,
-    Percent,
-}
-
-impl std::fmt::Display for Conversion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Int => write!(f, "d"),
-            Self::Octal => write!(f, "o"),
-            Self::Unsigned => write!(f, "u"),
-            Self::Hexadecimal => write!(f, "x"),
-            Self::HexadecimalUpper => write!(f, "X"),
-            Self::Double => write!(f, "f"),
-            Self::DoubleExp => write!(f, "e"),
-            Self::DoubleAuto => write!(f, "g"),
-            Self::DoubleHex => write!(f, "a"),
-            Self::Char => write!(f, "c"),
-            Self::Str => write!(f, "s"),
-            Self::Pointer => write!(f, "p"),
-            Self::Num => write!(f, "n"),
-            Self::C => write!(f, "C"),
-            Self::S => write!(f, "S"),
-            Self::Percent => write!(f, "%"),
-        }
-    }
-}
-
-impl Conversion {
-    #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
-        match c {
-            b'd' | b'i' => Some(Self::Int),
-            b'o' => Some(Self::Octal),
-            b'u' => Some(Self::Unsigned),
-            b'x' => Some(Self::Hexadecimal),
-            b'X' => Some(Self::HexadecimalUpper),
-            b'f' | b'F' => Some(Self::Double),
-            b'e' | b'E' => Some(Self::DoubleExp),
-            b'g' | b'G' => Some(Self::DoubleAuto),
-            b'a' | b'A' => Some(Self::DoubleHex),
-            b'c' => Some(Self::Char),
-            b's' => Some(Self::Str),
-            b'p' => Some(Self::Pointer),
-            b'n' => Some(Self::Num),
-            b'C' => Some(Self::C),
-            b'S' => Some(Self::S),
-            b'%' => Some(Self::Percent),
-            _ => None,
-        }
-    }
-
-    fn ty(self, length: Option<LengthMod>) -> Option<&'static str> {
-        use LengthMod::*;
-        let t = match self {
-            Self::Int => match length {
-                None => "i32",
-                Some(Char) => "i8",
-                Some(Short) => "i16",
-                Some(Long | LongLong | IntMax | Size) => "i64",
-                Some(PtrDiff) => "u64",
-                Some(LongDouble) => panic!(),
-            },
-            Self::Octal | Self::Unsigned => match length {
-                None => "u32",
-                Some(Char) => "u8",
-                Some(Short) => "u16",
-                Some(Long | LongLong | IntMax | Size | PtrDiff) => "u64",
-                Some(LongDouble) => panic!(),
-            },
-            Self::Hexadecimal | Self::HexadecimalUpper => match length {
-                None => "crate::stdio::Xu32",
-                Some(Char) => "crate::stdio::Xu8",
-                Some(Short) => "crate::stdio::Xu16",
-                Some(Long | LongLong | IntMax | Size | PtrDiff) => "crate::stdio::Xu64",
-                Some(LongDouble) => panic!(),
-            },
-            Self::Double | Self::DoubleExp => match length {
-                None | Some(Long) => "f64",
-                Some(LongDouble) => "f128::f128",
-                _ => panic!(),
-            },
-            Self::DoubleAuto => match length {
-                None | Some(Long) => "crate::stdio::Gf64",
-                _ => panic!(),
-            },
-            Self::DoubleHex => match length {
-                None | Some(Long) => "crate::stdio::Af64",
-                _ => panic!(),
-            },
-            Self::Char => "u8 as char",
-            Self::Str => match length {
-                None => "&str",
-                Some(Long) => "String",
-                _ => panic!(),
-            },
-            Self::Pointer => "usize",
-            Self::C | Self::S => panic!(),
-            Self::Num | Self::Percent => return None,
-        };
-        Some(t)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ConversionSpec {
-    flags: Vec<FlagChar>,
-    width: Option<Width>,
-    precision: Option<Width>,
-    length: Option<LengthMod>,
-    conversion: Conversion,
-}
-
-impl std::fmt::Display for ConversionSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "%")?;
-        for flag in &self.flags {
-            write!(f, "{flag}")?;
-        }
-        if let Some(width) = self.width {
-            write!(f, "{width}")?;
-        }
-        if let Some(precision) = self.precision {
-            write!(f, ".{precision}")?;
-        }
-        if let Some(length) = self.length {
-            write!(f, "{length}")?;
-        }
-        write!(f, "{}", self.conversion)
     }
 }
 

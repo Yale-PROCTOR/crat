@@ -9,7 +9,7 @@ use rustc_mir_dataflow::{
 };
 
 use super::{Provenance, ProvenanceSet};
-use crate::analyses::liveness::MaybeLiveLocals;
+use crate::analyses::{liveness::MaybeLiveLocals, mir::TerminatorExt};
 
 /// The set of program points that a [`Provenance`] is live on exit
 pub(crate) type ProvenanceLiveness = SparseBitMatrix<PointIndex, Provenance>;
@@ -45,6 +45,19 @@ pub fn compute_provenance_liveness<'tcx>(
                 .flat_map(|local| provenance_set.local_data[local])
             {
                 provenance_liveness.insert(point_index, provenance);
+            }
+
+            if position == bb_len - 1 {
+                // This is a terminator
+                if let Some(terminator) = &bb_data.terminator
+                    && let Some(mir_call) = terminator.as_call(tcx)
+                    && let Some(dest_local) = mir_call.destination.as_local()
+                    && let Some(dest_provenance) = provenance_set.local_data[dest_local]
+                {
+                    // Make the destination provenance live at terminator location
+                    let point_index = location_map.point_from_location(location);
+                    provenance_liveness.insert(point_index, dest_provenance);
+                }
             }
         }
     }

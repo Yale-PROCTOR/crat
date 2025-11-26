@@ -1,16 +1,14 @@
-use rustc_data_structures::fx::FxHashSet;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     ExprKind, HirId, QPath, TyKind,
     def::{DefKind, Res},
     intravisit::{Visitor, walk_expr},
 };
-use rustc_index::IndexVec;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, decision::PtrKind};
-use crate::utils::rustc::RustProgram;
+use crate::{rewriter::decision::DecisionMaker, utils::rustc::RustProgram};
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
@@ -22,17 +20,7 @@ pub fn collect_diffs<'tcx>(
 
     // collect each HIR variable's before/after pointer kinds
     for did in rust_program.functions.iter() {
-        let promoted_shared_refs = analysis
-            .mutability_result
-            .function_body_facts(*did) // output + inputs
-            .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable())) // No mutables behind shared refs
-            .collect::<IndexVec<Local, _>>();
-        let _array_pointers = analysis
-            .fatness_result
-            .function_body_facts(*did) // output + inputs
-            .map(|fatnesses| fatnesses.iter().next().map(|&f| f.is_arr()).unwrap_or(false))
-            .collect::<IndexVec<Local, _>>();
-        let promoted_mut_refs = analysis.promoted_mut_ref_result.get(did).unwrap();
+        let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
         // Assume every mir local has one or less corresponding hir id
         let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
@@ -56,31 +44,17 @@ pub fn collect_diffs<'tcx>(
             .skip_binder()
             .len();
 
+        let aliases = analysis.aliases.get(did);
+
         for (local, decl) in body
             .local_decls
             .iter_enumerated()
             .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
         // skip inputs if used as fn ptr
         {
-            if !decl.ty.is_any_ptr() {
-                continue;
-            }
-            let mutability = decl.ty.is_mutable_ptr();
-            let ptr_kind =
-            // TODO: More precise filtering of array pointers
-            // if array_pointers[local] {
-            //     PtrKind::Raw(mutability) // TODO: handle array pointers properly
-            // } else
-            if promoted_shared_refs[local] {
-                PtrKind::OptRef(false)
-            } else if promoted_mut_refs.contains(local) {
-                PtrKind::OptRef(mutability)
-            } else if decl.ty.is_raw_ptr() {
-                PtrKind::Raw(mutability)
-            } else {
-                continue;
-            };
-            if let Some(hir_id) = local_to_binding.get(&local) {
+            if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
+                && let Some(hir_id) = local_to_binding.get(&local)
+            {
                 ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }

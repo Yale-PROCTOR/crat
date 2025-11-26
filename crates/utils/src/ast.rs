@@ -77,6 +77,31 @@ pub fn get_attr_arg(args: &AttrArgs) -> Option<Symbol> {
     Some(sym)
 }
 
+pub fn unwrap_paren(expr: &Expr) -> &Expr {
+    if let ExprKind::Paren(e) = &expr.kind {
+        unwrap_paren(e)
+    } else {
+        expr
+    }
+}
+
+pub fn unwrap_paren_mut(expr: &mut Expr) -> &mut Expr {
+    if matches!(&expr.kind, ExprKind::Paren(_)) {
+        let ExprKind::Paren(e) = &mut expr.kind else { unreachable!() };
+        unwrap_paren_mut(e)
+    } else {
+        expr
+    }
+}
+
+pub fn unwrap_cast_and_paren(e: &Expr) -> &Expr {
+    if let ExprKind::Cast(e, _) | ExprKind::Paren(e) = &e.kind {
+        unwrap_cast_and_paren(e)
+    } else {
+        e
+    }
+}
+
 #[derive(Debug)]
 pub struct TransformationResult(pub Vec<(PathBuf, String)>);
 
