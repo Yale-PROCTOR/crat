@@ -348,14 +348,14 @@ pub fn transform(
                 if is_unit {
                     derefs
                         .iter()
-                        .map(|deref_hir_id| (*deref_hir_id, param_index))
+                        .map(|deref| (deref, param_index))
                         .collect::<FxHashSet<_>>()
                 } else {
                     derefs
                         .iter()
-                        .filter_map(|deref_hir_id| {
+                        .filter_map(|deref| {
                             if let Some(Assign { loc, span, rhs, .. }) =
-                                hir_visitor.assigns.get(deref_hir_id)
+                                hir_visitor.assigns.get(&deref.hir_id)
                                 && let Some(returns) = hir_visitor.returns.get_mut(&local_def_id)
                             {
                                 let source_map = tcx.sess.source_map();
@@ -373,14 +373,15 @@ pub fn transform(
                                 assert!(assigned_returns.len() <= 1);
 
                                 if let Some((_, return_hir_id)) = assigned_returns.first() {
+                                    // If there is an assignment before return, remove the assign and return the value
                                     direct_returns.insert(*return_hir_id, rhs.clone());
                                     simpl_assigns.insert(*loc);
                                     None
                                 } else {
-                                    Some((*deref_hir_id, param_index))
+                                    Some((deref, param_index))
                                 }
                             } else {
-                                Some((*deref_hir_id, param_index))
+                                Some((deref, param_index))
                             }
                         })
                         .collect::<FxHashSet<_>>()
@@ -388,17 +389,35 @@ pub fn transform(
             } else {
                 FxHashSet::default()
             };
-
-            // check if there are no uses of pointer and value, and no remaining returns for must param
+            // check if there are no uses of pointer and value
             let simplify_value_decl = config.simplify
                 && !is_unit
                 && deref_uses.is_empty()
                 && !hir_visitor.ref_uses.contains(&(local_def_id, mir_local));
 
             // simplify 3: rewrite dereferenced ptr to direct value uses
-            let simplify_ref_decl =
-                config.simplify && !hir_visitor.ref_uses.contains(&(local_def_id, mir_local));
-            if simplify_ref_decl {
+            let mut simplify_ref_decl = false;
+            if config.simplify {
+                let deref_uses = if !hir_visitor.ref_uses.contains(&(local_def_id, mir_local)) {
+                    simplify_ref_decl = true;
+                    deref_uses
+                        .into_iter()
+                        .map(|(deref, param_index)| (deref.hir_id, param_index))
+                        .collect::<FxHashMap<_, _>>()
+                } else {
+                    // if there are ref uses, only simplify derefs in call or return
+                    deref_uses
+                        .into_iter()
+                        .filter_map(|(deref, param_index)| {
+                            if deref.in_call_or_ret {
+                                Some((deref.hir_id, param_index))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<FxHashMap<_, _>>()
+                };
+
                 simpl_derefs.extend(deref_uses);
             }
 
@@ -1038,6 +1057,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Assign {
     hir_id: HirId,
     loc: Location,
@@ -1045,10 +1065,17 @@ struct Assign {
     rhs: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct Deref {
+    hir_id: HirId,
+    in_call_or_ret: bool,
+}
+
 enum Parent<'tcx> {
     Deref(HirId),
     Ret(&'tcx HirExpr<'tcx>),
     Assign(HirId),
+    Call,
 }
 
 struct HirVisitor<'a, 'tcx> {
@@ -1060,7 +1087,7 @@ struct HirVisitor<'a, 'tcx> {
     /// HirId of assigns which has a call inside them
     call_in_assigns: FxHashSet<HirId>,
     /// in function, the set of deref hir ids of a local
-    deref_uses: FxHashMap<(LocalDefId, Local), FxHashSet<HirId>>,
+    deref_uses: FxHashMap<(LocalDefId, Local), FxHashSet<Deref>>,
     /// in function, a local is used without deref
     ref_uses: FxHashSet<(LocalDefId, Local)>,
     /// maps HirId of lhs to assignment info
@@ -1095,6 +1122,17 @@ impl<'a, 'tcx> HirVisitor<'a, 'tcx> {
         self.bounds.insert(span, def_id);
     }
 
+    fn get_local_def_id(&self, expr: &HirExpr<'tcx>) -> Option<LocalDefId> {
+        if let HirExprKind::Path(QPath::Resolved(_, path)) = expr.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            Some(def_id)
+        } else {
+            None
+        }
+    }
+
     fn get_parent(&self, hir_id: HirId) -> Option<Parent<'tcx>> {
         for (_, parent) in self.tcx.hir_parent_iter(hir_id) {
             let HirNode::Expr(e) = parent else {
@@ -1105,6 +1143,11 @@ impl<'a, 'tcx> HirVisitor<'a, 'tcx> {
                 HirExprKind::Ret(_) => return Some(Parent::Ret(e)),
                 HirExprKind::Unary(UnOp::Deref, _) => return Some(Parent::Deref(e.hir_id)),
                 HirExprKind::Assign(_, _, _) => return Some(Parent::Assign(e.hir_id)),
+                HirExprKind::Call(callee, _) => {
+                    if self.get_local_def_id(callee).is_some() {
+                        return Some(Parent::Call);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1154,10 +1197,16 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
             let def_id = id.owner.def_id;
             if let Some(Parent::Deref(parent_id)) = self.get_parent(hir_id) {
                 if let Some(local) = self.get_mir_local(id, def_id) {
+                    let parent = self.get_parent(parent_id);
+                    let deref = Deref {
+                        hir_id: parent_id,
+                        in_call_or_ret: matches!(parent, Some(Parent::Call) | Some(Parent::Ret(_))),
+                    };
+
                     self.deref_uses
                         .entry((def_id, local))
                         .or_default()
-                        .insert(parent_id);
+                        .insert(deref);
                 }
             } else {
                 let local = self.get_mir_local(id, def_id);
@@ -1172,9 +1221,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
         match expr.kind {
             HirExprKind::Call(callee, _) => {
                 let parent = self.get_parent(expr.hir_id);
-                if let HirExprKind::Path(QPath::Resolved(_, path)) = callee.kind
-                    && let Res::Def(_, def_id) = path.res
-                    && let Some(def_id) = def_id.as_local()
+                if let Some(def_id) = self.get_local_def_id(callee)
                     && let Some(Parent::Ret(parent)) = parent
                 {
                     self.call_in_ret.insert(parent.span, def_id);
