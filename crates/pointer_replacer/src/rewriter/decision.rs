@@ -21,18 +21,13 @@ pub enum PtrKind {
 
 pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
-    promoted_shared_refs: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
     promoted_mut_refs: DenseBitSet<Local>,
+    promoted_shared_refs: DenseBitSet<Local>,
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
     pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
-        let promoted_shared_refs = analysis
-            .mutability_result
-            .function_body_facts(did)
-            .map(|mutabilities| mutabilities.iter().all(|&m| m.is_immutable()))
-            .collect::<IndexVec<Local, _>>();
         let array_pointers = analysis
             .fatness_result
             .function_body_facts(did)
@@ -45,11 +40,16 @@ impl<'tcx> DecisionMaker<'tcx> {
             })
             .collect::<IndexVec<Local, _>>();
         let promoted_mut_refs = analysis.promoted_mut_ref_result.get(&did).unwrap().clone();
+        let promoted_shared_refs = analysis
+            .promoted_shared_ref_result
+            .get(&did)
+            .unwrap()
+            .clone();
         DecisionMaker {
             tcx,
-            promoted_shared_refs,
             array_pointers,
             promoted_mut_refs,
+            promoted_shared_refs,
         }
     }
 
@@ -66,14 +66,14 @@ impl<'tcx> DecisionMaker<'tcx> {
         {
             Some(PtrKind::Raw(mutability))
         } else if self.array_pointers[local] {
-            if self.promoted_shared_refs[local] {
+            if self.promoted_shared_refs.contains(local) {
                 Some(PtrKind::Slice(false))
             } else if self.promoted_mut_refs.contains(local) {
                 Some(PtrKind::Slice(true))
             } else {
                 Some(PtrKind::Raw(mutability))
             }
-        } else if self.promoted_shared_refs[local] {
+        } else if self.promoted_shared_refs.contains(local) {
             Some(PtrKind::OptRef(false))
         } else if self.promoted_mut_refs.contains(local) {
             Some(PtrKind::OptRef(mutability))
