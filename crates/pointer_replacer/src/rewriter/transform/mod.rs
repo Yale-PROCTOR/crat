@@ -655,11 +655,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                         // TODO: handle c char arrays properly
                         if need_cast {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                            // HACK: assume length 1024 if not null, 0 if null
+                            // HACK: assume length 100000 if not null, 0 if null
                             *rhs = utils::expr!(
                                 "
     ({}).as_deref{1}()
-        .map_or(&{3}[], |x| std::slice::from_raw_parts{1}(x as *{2} _ as *{2} {4}, 1024))
+        .map_or(&{3}[], |x| std::slice::from_raw_parts{1}(x as *{2} _ as *{2} {4}, 100000))
                                 ",
                                 pprust::expr_to_string(e),
                                 if m { "_mut" } else { "" },
@@ -668,10 +668,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 lhs_inner_ty,
                             );
                         } else {
-                            // HACK: assume length 1024 if not null, 0 if null
+                            // HACK: assume length 100000 if not null, 0 if null
                             *rhs = utils::expr!(
                                 "
-    ({}).as_deref{1}().map_or(&{2}[], |x| std::slice::from_raw_parts{1}(x, 1024))
+    ({}).as_deref{1}().map_or(&{2}[], |x| std::slice::from_raw_parts{1}(x, 100000))
                                 ",
                                 pprust::expr_to_string(e),
                                 if m { "_mut" } else { "" },
@@ -853,7 +853,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                         ExprKind::Index(r, idx_expr, _) => {
                             if need_cast {
                                 *rhs = utils::expr!(
-                                    "std::slice::from_raw_parts{2}(&{0}({3}[{4}{5}]) as *{1} _ as *{1} {6}, 1024)",
+                                    "std::slice::from_raw_parts{2}(&{0}({3}[{4}{5}]) as *{1} _ as *{1} {6}, 100000)",
                                     if m { "mut " } else { "" },
                                     if m { "mut" } else { "const" },
                                     if m { "_mut" } else { "" },
@@ -941,7 +941,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 } else {
                                     *rhs = utils::expr!(
                                         "
-            std::slice::from_raw_parts{0}(&raw {1} {2} as *{1} {3}, 1024)
+            std::slice::from_raw_parts{0}(&raw {1} {2} as *{1} {3}, 100000)
                                     ",
                                         if m { "_mut" } else { "" },
                                         if m { "mut" } else { "const" },
@@ -1038,7 +1038,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 );
                             } else {
                                 *rhs = utils::expr!(
-                                    "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
+                                    "std::slice::from_raw_parts{}(({}) as *{} _, 100000)",
                                     if m { "_mut" } else { "" },
                                     pprust::expr_to_string(e),
                                     if m { "mut" } else { "const" },
@@ -1072,7 +1072,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     match lhs_kind {
                         PtrKind::Slice(m) => {
                             *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{}(({}) as *{} _, 1024)",
+                                "std::slice::from_raw_parts{}(({}) as *{} _, 100000)",
                                 if m { "_mut" } else { "" },
                                 pprust::expr_to_string(rhs),
                                 if m { "mut" } else { "" },
@@ -1120,7 +1120,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     PtrKind::Slice(m) => {
                         if need_cast {
                             *rhs = utils::expr!(
-                                "{6}std::slice::from_raw_parts{1}({3}{0} as *{2} _ as *{2} {4}, 1024){5}",
+                                "{6}std::slice::from_raw_parts{1}({3}{0} as *{2} _ as *{2} {4}, 100000){5}",
                                 pprust::expr_to_string(curr_expr),
                                 if m { "_mut" } else { "" },
                                 if m { "mut" } else { "const" },
@@ -1143,7 +1143,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                             //     index_str
                             // );
                             *rhs = utils::expr!(
-                                "std::slice::from_raw_parts{1}({0}{2}, 1024)",
+                                "std::slice::from_raw_parts{1}({0}{2}, 100000)",
                                 pprust::expr_to_string(curr_expr),
                                 if m { "_mut" } else { "" },
                                 index_str
@@ -1325,7 +1325,7 @@ fn mk_null_checked_slice<'tcx>(
     lhs_inner_ty: ty::Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> Expr {
-    // HACK: assume length 1024
+    // HACK: assume length 100000
     let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
     if !has_side_effect(e) {
         if need_cast {
@@ -1333,7 +1333,7 @@ fn mk_null_checked_slice<'tcx>(
                 "if ({0}).is_null() {{
                     &{1}[]
                 }} else {{
-                    std::slice::from_raw_parts{2}(({0}){3} as *{4} {5}, 1024)
+                    std::slice::from_raw_parts{2}(({0}){3} as *{4} {5}, 100000)
                 }}",
                 pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
@@ -1347,7 +1347,7 @@ fn mk_null_checked_slice<'tcx>(
                 "if ({0}).is_null() {{
                     &{1}[]
                 }} else {{
-                    std::slice::from_raw_parts{2}(({0}){3}, 1024)
+                    std::slice::from_raw_parts{2}(({0}){3}, 100000)
                 }}",
                 pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
@@ -1362,7 +1362,7 @@ fn mk_null_checked_slice<'tcx>(
                 if _x.is_null() {{
                     &{}[]
                 }} else {{
-                    std::slice::from_raw_parts{}(_x{} as *{} {}, 1024)
+                    std::slice::from_raw_parts{}(_x{} as *{} {}, 100000)
                 }}
             }}",
             pprust::expr_to_string(e),
@@ -1379,7 +1379,7 @@ fn mk_null_checked_slice<'tcx>(
                 if _x.is_null() {{
                     &{}[]
                 }} else {{
-                    std::slice::from_raw_parts{}(_x{}, 1024)
+                    std::slice::from_raw_parts{}(_x{}, 100000)
                 }}
             }}",
             pprust::expr_to_string(e),
