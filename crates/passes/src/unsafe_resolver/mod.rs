@@ -20,11 +20,14 @@ use serde::Deserialize;
 use smallvec::smallvec;
 use utils::{path, unsafety};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub remove_unused: bool,
     pub remove_no_mangle: bool,
+    pub remove_extern_c: bool,
     pub replace_pub: bool,
+
+    pub c_exposed_fns: FxHashSet<String>,
 }
 
 pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
@@ -56,12 +59,14 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used.entry(def_id).or_default().extend(visitor.callees);
     }
 
-    let entries = if visitor.mains.is_empty() {
-        // when no main, consider all functions as entry points
-        &visitor.fns
-    } else {
-        &visitor.mains
-    };
+    let mut entries = visitor.mains;
+    for f in visitor.fns {
+        let name = tcx.item_name(f.to_def_id());
+        if config.c_exposed_fns.contains(name.as_str()) {
+            entries.push(f);
+        }
+    }
+
     let used_items: FxHashSet<_> = entries
         .iter()
         .flat_map(|def_id| utils::graph::reachable_vertices(&used, *def_id))
@@ -105,22 +110,22 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         unsafe_fns,
         used_items,
         removable_uses,
-        config: *config,
+        config,
     };
     visitor.visit_crate(&mut krate);
 
     pprust::crate_to_string_for_macros(&krate)
 }
 
-struct AstVisitor {
+struct AstVisitor<'a> {
     ast_to_hir: utils::ir::AstToHir,
     unsafe_fns: FxHashSet<LocalDefId>,
     used_items: FxHashSet<LocalDefId>,
     removable_uses: FxHashSet<LocalDefId>,
-    config: Config,
+    config: &'a Config,
 }
 
-impl mut_visit::MutVisitor for AstVisitor {
+impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn flat_map_foreign_item(
         &mut self,
         item: P<ast::ForeignItem>,
@@ -185,8 +190,15 @@ impl mut_visit::MutVisitor for AstVisitor {
     }
 
     fn visit_item(&mut self, item: &mut ast::Item) {
+        let is_exposed_fn = if let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind {
+            self.config.c_exposed_fns.contains(ident.name.as_str())
+        } else {
+            false
+        };
+
         let path = path!("crate");
-        if self.config.replace_pub && item.vis.kind.is_pub() {
+
+        if self.config.replace_pub && item.vis.kind.is_pub() && !is_exposed_fn {
             if let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind
                 && ident.name == sym::main
             {
@@ -199,11 +211,18 @@ impl mut_visit::MutVisitor for AstVisitor {
             }
         }
 
-        if self.config.remove_no_mangle {
+        if self.config.remove_no_mangle && !is_exposed_fn {
             item.attrs.retain(|attr| {
                 let ast::AttrKind::Normal(normal) = &attr.kind else { return true };
                 normal.item.path.segments.last().unwrap().ident.name != sym::no_mangle
             });
+        }
+
+        if self.config.remove_extern_c
+            && !is_exposed_fn
+            && let ast::ItemKind::Fn(box ast::Fn { sig, .. }) = &mut item.kind
+        {
+            sig.header.ext = ast::Extern::None;
         }
 
         if let ast::ItemKind::Fn(box ast::Fn { sig, .. }) = &mut item.kind
