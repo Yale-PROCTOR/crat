@@ -5,7 +5,9 @@ fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], e
         let config = super::Config {
             remove_unused,
             remove_no_mangle: false,
+            remove_extern_c: false,
             replace_pub: false,
+            c_exposed_fns: FxHashSet::default(),
         };
         super::resolve_unsafe(&config, tcx)
     })

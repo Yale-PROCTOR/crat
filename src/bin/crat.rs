@@ -42,6 +42,8 @@ struct Args {
     unsafe_remove_unused: bool,
     #[arg(long, help = "Remove no_mangle attributes")]
     unsafe_remove_no_mangle: bool,
+    #[arg(long, help = "Remove extern \"C\" annotations")]
+    unsafe_remove_extern_c: bool,
     #[arg(long, help = "Replace `pub` with `pub(crate)`")]
     unsafe_replace_pub: bool,
 
@@ -173,7 +175,7 @@ struct Config {
     andersen: points_to::andersen::Config,
 
     #[serde(default)]
-    c_exposed_fn: Vec<String>,
+    c_exposed_fns: Vec<String>,
 
     #[serde(default)]
     verbose: bool,
@@ -197,7 +199,7 @@ fn main() {
             toml::from_str::<Config>(&content).unwrap()
         })
         .unwrap_or_default();
-    config.c_exposed_fn.extend(args.c_exposed_fn);
+    config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
     config.passes.extend(args.pass);
@@ -269,6 +271,7 @@ fn main() {
 
     config.r#unsafe.remove_unused |= args.unsafe_remove_unused;
     config.r#unsafe.remove_no_mangle |= args.unsafe_remove_no_mangle;
+    config.r#unsafe.remove_extern_c |= args.unsafe_remove_extern_c;
     config.r#unsafe.replace_pub |= args.unsafe_replace_pub;
 
     for arg in args.bin_ignore {
@@ -318,7 +321,11 @@ fn main() {
     config
         .interface
         .c_exposed_fns
-        .extend(config.c_exposed_fn.iter().cloned());
+        .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .r#unsafe
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
