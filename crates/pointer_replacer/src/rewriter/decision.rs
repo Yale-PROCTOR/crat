@@ -19,6 +19,14 @@ pub enum PtrKind {
     Slice(bool),
 }
 
+impl PtrKind {
+    pub fn is_mut(&self) -> bool {
+        match self {
+            PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) => *m,
+        }
+    }
+}
+
 pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
     array_pointers: IndexVec<Local, bool>,
@@ -76,7 +84,7 @@ impl<'tcx> DecisionMaker<'tcx> {
         } else if self.promoted_shared_refs.contains(local) {
             Some(PtrKind::OptRef(false))
         } else if self.promoted_mut_refs.contains(local) {
-            Some(PtrKind::OptRef(mutability))
+            Some(PtrKind::OptRef(true))
         } else if decl.ty.is_raw_ptr() {
             Some(PtrKind::Raw(mutability))
         } else {
