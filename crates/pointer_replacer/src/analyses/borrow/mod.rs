@@ -516,7 +516,7 @@ impl ProvenanceConstraintGraph {
     }
 }
 
-fn is_borrowing_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
+pub fn is_borrowing_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
     !def_id.is_local() && tcx.def_kind(def_id) == rustc_hir::def::DefKind::AssocFn && {
         let name = tcx.item_name(def_id);
         let name = name.as_str();

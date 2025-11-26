@@ -154,20 +154,12 @@ fn find_offset_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<
         ) {
             if let Some(mir_call) = terminator.as_call(self.tcx)
                 && let CallKind::RustLib(def_id) = &mir_call.func
+                && super::borrow::is_borrowing_method(*def_id, self.tcx)
+                && let Some(dest_local) = mir_call.destination.as_local()
+                && let Operand::Copy(src_place) | Operand::Move(src_place) = &mir_call.args[0].node
+                && let Some(src_local) = src_place.as_local()
             {
-                let func_name = self.tcx.def_path_str(*def_id);
-                if func_name.starts_with("std::ptr::")
-                    && func_name.ends_with("offset")
-                    && mir_call.args.len() == 2
-                {
-                    if let Some(dest_local) = mir_call.destination.as_local()
-                        && let Operand::Copy(src_place) | Operand::Move(src_place) =
-                            &mir_call.args[0].node
-                        && let Some(src_local) = src_place.as_local()
-                    {
-                        self.offsets.push((dest_local, src_local));
-                    }
-                }
+                self.offsets.push((dest_local, src_local));
             }
         }
     }
