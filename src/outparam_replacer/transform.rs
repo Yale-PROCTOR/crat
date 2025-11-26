@@ -93,6 +93,8 @@ rustc_index::newtype_index! {
     pub struct RetIdx {}
 }
 
+type WriteForReturn = FxHashMap<Location, (FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>;
+
 struct Func {
     is_unit: bool,
     index_map: BTreeMap<ParamIdx, Param>,
@@ -106,7 +108,7 @@ struct Func {
     /// Locations where assign to the parameter can be simplified
     simpl_assigns: FxHashSet<Location>,
     /// location where return value is written and params written at the point
-    wfrs: FxHashMap<Location, (FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>,
+    wfrs: Option<WriteForReturn>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -243,32 +245,34 @@ pub fn transform(
         let mut simpl_assigns: FxHashSet<_> = FxHashSet::default();
 
         // locations of write for return value
-        let wfrs = if config.simplify && !is_unit {
-            fn_analysis_result
-                .wfrs
-                .iter()
-                .map(|wfr| {
-                    let loc = Location {
-                        block: BasicBlock::from_usize(wfr.block),
-                        statement_index: wfr.statement_index,
-                    };
-                    (
-                        loc,
+        let wfrs = if config.simplify && !is_unit && !fn_analysis_result.wfrs.is_empty() {
+            Some(
+                fn_analysis_result
+                    .wfrs
+                    .iter()
+                    .map(|wfr| {
+                        let loc = Location {
+                            block: BasicBlock::from_usize(wfr.block),
+                            statement_index: wfr.statement_index,
+                        };
                         (
-                            wfr.mays
-                                .iter()
-                                .map(|i| ParamIdx::from_usize(*i))
-                                .collect::<FxHashSet<_>>(),
-                            wfr.musts
-                                .iter()
-                                .map(|i| ParamIdx::from_usize(*i))
-                                .collect::<FxHashSet<_>>(),
-                        ),
-                    )
-                })
-                .collect::<FxHashMap<_, _>>()
+                            loc,
+                            (
+                                wfr.mays
+                                    .iter()
+                                    .map(|i| ParamIdx::from_usize(*i))
+                                    .collect::<FxHashSet<_>>(),
+                                wfr.musts
+                                    .iter()
+                                    .map(|i| ParamIdx::from_usize(*i))
+                                    .collect::<FxHashSet<_>>(),
+                            ),
+                        )
+                    })
+                    .collect::<FxHashMap<_, _>>(),
+            )
         } else {
-            FxHashMap::default()
+            None
         };
 
         for p in &fn_analysis_result.output_params {
@@ -306,7 +310,7 @@ pub fn transform(
             } else {
                 FxHashSet::default()
             };
-            let mut simplify_flag_decl = config.simplify;
+            let mut simplify_flag_decl = config.simplify && !is_unit;
             complete_writes.iter().for_each(|cw| {
                 let CompleteWrite {
                     block,
@@ -864,9 +868,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .unwrap_or_else(|| panic!("Failed to find HIR expr for return expr"));
                     let hir_id = hir_expr.hir_id;
 
-                    let wfr: Option<(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)> = if func.is_unit {
+                    let wfr: Option<(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)> = if func.is_unit
+                        || func.wfrs.is_none()
+                    {
                         None
                     } else {
+                        let wfrs = func.wfrs.as_ref().unwrap();
                         let mut expr_locs = self.get_mir_locs_for_expr(expr.id).unwrap_or_default();
 
                         // handle where return value has multiple MIR blocks
@@ -878,7 +885,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 .map(|loc| loc.block)
                                 .collect::<FxHashSet<_>>();
 
-                            for wfr in func.wfrs.keys() {
+                            for wfr in wfrs.keys() {
                                 if blocks.contains(&wfr.block) && !expr_locs.contains(wfr) {
                                     expr_locs.push(*wfr);
                                 }
@@ -888,7 +895,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         Some(expr_locs.iter().fold(
                             (FxHashSet::default(), FxHashSet::default()),
                             |(mays, musts), loc| {
-                                if let Some((loc_mays, loc_musts)) = func.wfrs.get(loc) {
+                                if let Some((loc_mays, loc_musts)) = wfrs.get(loc) {
                                     let mays = mays.union(loc_mays).cloned().collect();
                                     let musts = if musts.is_empty() {
                                         loc_musts.clone()
