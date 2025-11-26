@@ -404,6 +404,8 @@ impl MutVisitor for TransformVisitor<'_> {
                     None
                 };
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+
+                let mut optref_borrowing_args: FxHashMap<_, Vec<_>> = FxHashMap::default();
                 for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
                     let ty = typeck.expr_ty_adjusted(harg);
                     let (_, m) = some_or!(unwrap_ptr_from_mir_ty(ty), continue);
@@ -414,6 +416,52 @@ impl MutVisitor for TransformVisitor<'_> {
                             self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
                         ));
                     self.transform_rhs(arg, harg, param_kind);
+
+                    if let ExprKind::Call(callee, args) = &unwrap_paren(arg).kind
+                        && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
+                        && path.segments.last().unwrap().ident.name == rustc_span::sym::Some
+                        && let [arg] = &args[..]
+                        && let ExprKind::AddrOf(_, m, pointee) = &unwrap_paren(arg).kind
+                        && let ExprKind::Unary(UnOp::Deref, e) = &unwrap_subscript(pointee).kind
+                        && let ExprKind::MethodCall(call) = &unwrap_paren(e).kind
+                        && call.seg.ident.name == rustc_span::sym::unwrap
+                        && let ExprKind::MethodCall(call) = &unwrap_paren(&call.receiver).kind
+                        && let name = call.seg.ident.name.as_str()
+                        && (name == "as_deref" || name == "as_deref_mut")
+                        && let ExprKind::Path(_, path) = &unwrap_paren(&call.receiver).kind
+                    {
+                        let name = path.segments.last().unwrap().ident.name;
+                        optref_borrowing_args
+                            .entry(name)
+                            .or_default()
+                            .push((i, m.is_mut()));
+                    }
+                }
+
+                let mut lets = String::new();
+                for (name, bargs) in optref_borrowing_args {
+                    if bargs.len() <= 1 || bargs.iter().all(|(_, m)| !*m) {
+                        break;
+                    }
+                    use std::fmt::Write as _;
+                    write!(
+                        &mut lets,
+                        "let {name}_borrowed = {name}.as_deref_mut().unwrap();",
+                    )
+                    .unwrap();
+                    for (i, _) in bargs {
+                        let arg = &mut args[i];
+                        if let ExprKind::Call(_, args) = &mut unwrap_paren_mut(arg).kind
+                            && let [arg] = &mut args[..]
+                            && let ExprKind::AddrOf(_, _, pointee) = &mut unwrap_paren_mut(arg).kind
+                        {
+                            let arg = unwrap_subscript_mut(pointee);
+                            *arg = utils::expr!("{name}_borrowed");
+                        }
+                    }
+                }
+                if !lets.is_empty() {
+                    *expr = utils::expr!("{{ {lets} {} }}", pprust::expr_to_string(expr))
                 }
             }
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
@@ -1407,6 +1455,29 @@ fn unwrap_hir_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     } else {
         expr
     }
+}
+
+fn unwrap_subscript(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Index(e, _, _) | ExprKind::Field(e, _) | ExprKind::Paren(e) => {
+            unwrap_subscript(e)
+        }
+        _ => expr,
+    }
+}
+
+fn unwrap_subscript_mut(expr: &mut Expr) -> &mut Expr {
+    if !matches!(
+        expr.kind,
+        ExprKind::Index(_, _, _) | ExprKind::Field(_, _) | ExprKind::Paren(_)
+    ) {
+        return expr;
+    }
+    let (ExprKind::Index(e, _, _) | ExprKind::Field(e, _) | ExprKind::Paren(e)) = &mut expr.kind
+    else {
+        unreachable!()
+    };
+    unwrap_subscript_mut(e)
 }
 
 #[allow(clippy::match_like_matches_macro)]
