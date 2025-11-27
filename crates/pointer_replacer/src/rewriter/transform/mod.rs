@@ -1198,11 +1198,21 @@ impl<'tcx> TransformVisitor<'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
-                    e = utils::expr!(
-                        "({})[({}) as usize..]",
-                        pprust::expr_to_string(&e),
-                        pprust::expr_to_string(offset),
-                    );
+                    if matches!(unwrap_paren(offset).kind, ExprKind::Unary(UnOp::Neg, _)) {
+                        e = utils::expr!(
+                            "({}).as{}_ptr().offset({})",
+                            pprust::expr_to_string(&e),
+                            if m { "_mut" } else { "" },
+                            pprust::expr_to_string(offset),
+                        );
+                        e = self.slice_from_raw(&e, m, m, from_ty, from_ty);
+                    } else {
+                        e = utils::expr!(
+                            "({})[({}) as usize..]",
+                            pprust::expr_to_string(&e),
+                            pprust::expr_to_string(offset),
+                        );
+                    }
                 }
                 PtrExprProj::Cast(ty) => {
                     let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
