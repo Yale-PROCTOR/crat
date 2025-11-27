@@ -8,6 +8,9 @@ use utils::compilation::run_compiler_on_path;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
+    #[arg(long, help = "Show spans for unsafe operations")]
+    unsafe_show_spans: bool,
+
     #[arg(help = "Finder to run")]
     finder: Finder,
 
@@ -49,7 +52,10 @@ fn main() {
             run_compiler_on_path(&file, finders::mir::run).unwrap();
         }
         Finder::Unsafe => {
-            run_compiler_on_path(&file, finders::unsafe_finder::find_unsafe).unwrap();
+            run_compiler_on_path(&file, |tcx| {
+                finders::unsafe_finder::find_unsafe(args.unsafe_show_spans, tcx)
+            })
+            .unwrap();
         }
     }
 }
