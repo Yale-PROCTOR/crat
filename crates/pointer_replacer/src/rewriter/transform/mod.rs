@@ -184,8 +184,8 @@ impl MutVisitor for TransformVisitor<'_> {
                     panic!("{hir_expr:?}")
                 };
                 let ty = typeck.expr_ty_adjusted(hir_l);
-                if unwrap_ptr_from_mir_ty(ty).is_some() {
-                    let kind = PtrKind::Raw(false);
+                if let Some((_, m)) = unwrap_ptr_from_mir_ty(ty) {
+                    let kind = PtrKind::Raw(m.is_mut());
                     self.transform_rhs(l, hir_l, kind);
                     self.transform_rhs(r, hir_r, kind);
                 }
