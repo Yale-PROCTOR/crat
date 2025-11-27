@@ -226,7 +226,15 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                             // field-sensitive
                             // borrowed: *place,
                             // field-insensitive
-                            borrowed: Place::from(place.local),
+                            borrowed: {
+                                let is_indirect = place.is_indirect_first_projection();
+                                let place = Place::from(place.local);
+                                if is_indirect {
+                                    place.project_deeper(&[PlaceElem::Deref], self.tcx)
+                                } else {
+                                    place
+                                }
+                            },
                             assigned: Borrower::AssignStmt(*lhs),
                         });
                         loans.push(loan);
