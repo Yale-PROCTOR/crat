@@ -287,11 +287,12 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 };
                 if let Some(def_id) = get_static_from_hir_expr(hir_receiver)
                     && self.refcells.contains(&def_id)
-                    && call.seg.ident.name.as_str() == "as_mut_ptr"
+                    && let name = call.seg.ident.name.as_str()
+                    && (name == "as_mut_ptr" || name == "as_ptr")
                 {
                     let x = self.tcx.item_name(def_id.to_def_id());
                     *self.borrows.entry(x).or_default() |= true;
-                    *expr = expr!("{x}_ref.as_mut_ptr()");
+                    *expr = expr!("{x}_ref.{name}()");
                 }
             }
             _ => {}
