@@ -3,7 +3,7 @@
 //! This module handles the mapping between MIR locals and source variables,
 //! including temporaries that don't have debug info but are copies of source variables.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{Body, Local, Location, Operand, Place, Rvalue, VarDebugInfoContents, visit::Visitor},
@@ -113,33 +113,18 @@ fn group_locals_by_source_variable<'tcx>(
     }
 
     // Now find temporaries that are copies of source variables
-    let copy_relationships = find_copy_relationships(body);
-    let offset_relationships = find_offset_relationships(body, tcx);
-
-    for (real, temp) in offset_relationships {
-        if temp.as_usize() == 0 {
-            // skip _0 (return place)
-            continue;
-        }
-        // dest (real var) = std::ptr::offset(src (real var), ...)
-        // src_local is the variable that is present in the source code
-        if let Some(src_local) = local_to_src_local.get(&real).cloned()
-            && !local_to_src_local.contains_key(&temp)
-        {
-            src_local_to_locals.entry(src_local).or_default().push(temp);
-            local_to_src_local.insert(temp, src_local);
-        }
-    }
+    let rels = find_relationships(body, tcx);
 
     // Propagate source variable names to temporaries
     // Caveat: the order of copy_relationships should be chronological
-    for (dest, src) in copy_relationships {
+    for (dest, src) in rels.copies {
         if dest.as_usize() == 0 {
             // skip _0 (return place)
             continue;
         }
         if let Some(src_local) = local_to_src_local.get(&src).cloned()
             && !local_to_src_local.contains_key(&dest)
+            && !rels.args.contains(&dest)
         {
             src_local_to_locals.entry(src_local).or_default().push(dest);
             local_to_src_local.insert(dest, src_local);
@@ -149,13 +134,20 @@ fn group_locals_by_source_variable<'tcx>(
     src_local_to_locals
 }
 
+#[derive(Default)]
+struct Relationships {
+    copies: Vec<(Local, Local)>,
+    args: FxHashSet<Local>,
+}
+
 /// Find copy relationships between locals (dest = copy src or dest = move src)
-fn find_copy_relationships(body: &Body<'_>) -> Vec<(Local, Local)> {
-    struct CopyVisitor {
-        copies: Vec<(Local, Local)>,
+fn find_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Relationships {
+    struct CopyVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        rels: Relationships,
     }
 
-    impl<'tcx> Visitor<'tcx> for CopyVisitor {
+    impl<'tcx> Visitor<'tcx> for CopyVisitor<'tcx> {
         fn visit_assign(
             &mut self,
             place: &Place<'tcx>,
@@ -163,28 +155,26 @@ fn find_copy_relationships(body: &Body<'_>) -> Vec<(Local, Local)> {
             _location: Location,
         ) {
             if let Some(dest_local) = place.as_local()
-                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place))
-                | Rvalue::RawPtr(_, src_place) = rvalue
+                && let Rvalue::Use(Operand::Copy(src_place) | Operand::Move(src_place)) = rvalue
                 && let Some(src_local) = src_place.as_local()
             {
-                self.copies.push((dest_local, src_local));
+                self.rels.copies.push((dest_local, src_local));
+            }
+
+            if let Rvalue::BinaryOp(_, box (l, r)) = rvalue {
+                if let Some(l) = l.place()
+                    && let Some(l) = l.as_local()
+                {
+                    self.rels.args.insert(l);
+                }
+                if let Some(r) = r.place()
+                    && let Some(r) = r.as_local()
+                {
+                    self.rels.args.insert(r);
+                }
             }
         }
-    }
 
-    let mut visitor = CopyVisitor { copies: Vec::new() };
-    visitor.visit_body(body);
-    visitor.copies
-}
-
-// dest (real var) = std::ptr::offset(src (real var), ...)
-fn find_offset_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<(Local, Local)> {
-    struct OffsetVisitor<'tcx> {
-        tcx: TyCtxt<'tcx>,
-        offsets: Vec<(Local, Local)>,
-    }
-
-    impl<'tcx> Visitor<'tcx> for OffsetVisitor<'tcx> {
         fn visit_terminator(
             &mut self,
             terminator: &rustc_middle::mir::Terminator<'tcx>,
@@ -193,54 +183,18 @@ fn find_offset_relationships<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<
             if let Some(mir_call) = terminator.as_call(self.tcx)
                 && let CallKind::RustLib(def_id) = &mir_call.func
                 && super::borrow::is_borrowing_method(*def_id, self.tcx)
-                && let Some(dest_local) = mir_call.destination.as_local()
-                && let Operand::Copy(src_place) | Operand::Move(src_place) = &mir_call.args[0].node
-                && let Some(src_local) = src_place.as_local()
+                && let Operand::Copy(place) | Operand::Move(place) = &mir_call.args[0].node
+                && let Some(local) = place.as_local()
             {
-                self.offsets.push((dest_local, src_local));
+                self.rels.args.insert(local);
             }
         }
     }
 
-    let mut visitor = OffsetVisitor {
+    let mut visitor = CopyVisitor {
         tcx,
-        offsets: Vec::new(),
+        rels: Relationships::default(),
     };
     visitor.visit_body(body);
-    visitor.offsets
+    visitor.rels
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn test_source_variable_grouping() {
-//         const PROGRAM: &str = "
-//         pub struct object {
-//             pub name: usize,
-//         }
-//         unsafe fn json_parse_object() {
-//             let mut element = 0 as *mut object;
-//             let mut previous = 0 as *mut object;
-//             previous = element;
-//             (*element).name = 0;
-//             (*previous).name = 0;
-//         }";
-
-//         utils::rustc::run_compiler(PROGRAM, |program| {
-//             let tcx = program.tcx;
-//             let f = program.functions[0];
-//             let body = &*tcx
-//                 .mir_drops_elaborated_and_const_checked(f.expect_local())
-//                 .borrow();
-
-//             let groups = group_locals_by_source_variable(body, tcx);
-
-//             println!("Source variable groups:");
-//             for (src_local, locals) in &groups {
-//                 println!("  {:?}: {:?}", src_local, locals);
-//             }
-//         });
-//     }
-// }
