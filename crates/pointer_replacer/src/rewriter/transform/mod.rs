@@ -269,7 +269,18 @@ impl MutVisitor for TransformVisitor<'_> {
                             **e = utils::expr!("{}.unwrap()", pprust::expr_to_string(e));
                         }
                         PtrKind::Slice(_) => {
-                            *expr = utils::expr!("(*{})[0]", pprust::expr_to_string(e));
+                            if let ExprKind::AddrOf(_, _, inner) = &unwrap_paren(e).kind
+                                && let ExprKind::Index(inner, idx, _) = &unwrap_paren(inner).kind
+                                && let ExprKind::Range(Some(start), _, _) = &unwrap_paren(idx).kind
+                            {
+                                *expr = utils::expr!(
+                                    "({})[{}]",
+                                    pprust::expr_to_string(inner),
+                                    pprust::expr_to_string(start),
+                                );
+                            } else {
+                                *expr = utils::expr!("(*{})[0]", pprust::expr_to_string(e));
+                            }
                         }
                     }
                 }
@@ -916,7 +927,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         if !need_cast {
             utils::expr!(
-                "&{}({})[..]",
+                "&{}({})",
                 if m { "mut " } else { "" },
                 pprust::expr_to_string(e),
             )
