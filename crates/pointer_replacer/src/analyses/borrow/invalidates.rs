@@ -12,6 +12,7 @@ use super::{
     BorrowSet, Loan,
     places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
 };
+use crate::analyses::borrow::ProvenanceSet;
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
@@ -19,6 +20,7 @@ pub fn compute_invalidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
@@ -28,6 +30,7 @@ pub fn compute_invalidates<'tcx>(
         tcx,
         body,
         borrow_set,
+        provenance_set,
         location_map,
     }
     .visit_body(body);
@@ -40,6 +43,7 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'g Body<'tcx>,
     borrow_set: &'g BorrowSet<'tcx>,
+    provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
 }
 
@@ -66,6 +70,11 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
 
         for loan in borrows_for_place_base.iter() {
             let borrow_data = &self.borrow_set.loans[loan];
+            if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
+                && !self.provenance_set.provenance_data[p].is_mutable()
+            {
+                continue; // loan of immutable provenance does not invalidate
+            }
             if places_conflict(
                 self.tcx,
                 self.body,

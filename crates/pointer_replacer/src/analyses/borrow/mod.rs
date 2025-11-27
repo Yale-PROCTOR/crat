@@ -53,15 +53,22 @@ rustc_index::newtype_index! {
 pub type PromotedMutRefs = FxHashMap<LocalDefId, DenseBitSet<Local>>;
 
 pub enum ProvenanceData {
-    PlaceHolder(Local),
-    Local(Local),
+    PlaceHolder(Local, bool), // (Local, is_mutable)
+    Local(Local, bool),       // (Local, is_mutable)
 }
 
 impl ProvenanceData {
     pub fn local(&self) -> Local {
         match self {
-            ProvenanceData::PlaceHolder(local) => *local,
-            ProvenanceData::Local(local) => *local,
+            ProvenanceData::PlaceHolder(local, _) => *local,
+            ProvenanceData::Local(local, _) => *local,
+        }
+    }
+
+    pub fn is_mutable(&self) -> bool {
+        match self {
+            ProvenanceData::PlaceHolder(_, is_mutable) => *is_mutable,
+            ProvenanceData::Local(_, is_mutable) => *is_mutable,
         }
     }
 }
@@ -69,7 +76,8 @@ impl ProvenanceData {
 impl std::fmt::Debug for ProvenanceData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let local = self.local();
-        f.write_fmt(format_args!("'{local:?}"))
+        let is_mutable = self.is_mutable();
+        f.write_fmt(format_args!("'{local:?} (mutable: {is_mutable})"))
     }
 }
 
@@ -82,13 +90,18 @@ pub struct ProvenanceSet {
 }
 
 pub trait HasProvenanceSet {
-    fn provenance_set<I>(&self, is_candidate: I) -> ProvenanceSet
-    where I: Fn(Local) -> bool;
+    fn provenance_set<I, J>(&self, is_candidate: I, is_mutable: J) -> ProvenanceSet
+    where
+        I: Fn(Local) -> bool,
+        J: Fn(Local) -> bool;
 }
 
 impl HasProvenanceSet for Body<'_> {
-    fn provenance_set<I>(&self, is_candidate: I) -> ProvenanceSet
-    where I: Fn(Local) -> bool {
+    fn provenance_set<I, J>(&self, is_candidate: I, is_mutable: J) -> ProvenanceSet
+    where
+        I: Fn(Local) -> bool,
+        J: Fn(Local) -> bool,
+    {
         let body = self;
         let mut local_data = IndexVec::from_elem_n(None, body.local_decls.len());
         let mut provenance_data = IndexVec::new();
@@ -99,9 +112,9 @@ impl HasProvenanceSet for Body<'_> {
         {
             if local_decl.ty.is_any_ptr() && is_candidate(local) {
                 let data = if local.index() <= body.arg_count {
-                    ProvenanceData::PlaceHolder(local)
+                    ProvenanceData::PlaceHolder(local, is_mutable(local)) // Parameters
                 } else {
-                    ProvenanceData::Local(local)
+                    ProvenanceData::Local(local, is_mutable(local)) // Locals
                 };
                 *provenance = Some(provenance_data.push(data));
             }
@@ -120,10 +133,12 @@ pub struct GBorrowInferCtxt {
 }
 
 impl GBorrowInferCtxt {
-    pub fn new<I, J>(program: &RustProgram, is_candidate: I) -> Self
+    pub fn new<I, J, K, L>(program: &RustProgram, is_candidate: I, is_mutable: K) -> Self
     where
         I: Fn(LocalDefId) -> J,
         J: Fn(Local) -> bool,
+        K: Fn(LocalDefId) -> L,
+        L: Fn(Local) -> bool,
     {
         let mut provenances = FxHashMap::default();
         for f in program.functions.iter().copied() {
@@ -132,14 +147,36 @@ impl GBorrowInferCtxt {
                 .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
             let is_candidate = is_candidate(f);
-            provenances.insert(f, body.provenance_set(is_candidate));
+            let is_mutable = is_mutable(f);
+            provenances.insert(f, body.provenance_set(is_candidate, is_mutable));
         }
 
         GBorrowInferCtxt { provenances }
     }
 
-    pub fn all_pointers(program: &RustProgram) -> Self {
-        GBorrowInferCtxt::new(program, |_| |_| true)
+    pub fn _all_pointers(program: &RustProgram) -> Self {
+        GBorrowInferCtxt::new(program, |_| |_| true, |_| |_| false)
+    }
+
+    // Classify immutable pointers (their loans do not demote pointers)
+    pub fn classified_pointers(
+        program: &RustProgram,
+        mutables: &FxHashMap<LocalDefId, IndexVec<Local, bool>>,
+    ) -> Self {
+        GBorrowInferCtxt::new(
+            program,
+            |_| |_| true,
+            |did| {
+                let mutables = mutables.get(&did);
+                move |local| {
+                    if let Some(mutables) = mutables {
+                        mutables[local]
+                    } else {
+                        false
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -572,7 +609,7 @@ pub fn borrow_inference<'tcx>(
         &requires,
         &killed,
     );
-    let invalidates = compute_invalidates(tcx, body, &borrow_set, &location_map);
+    let invalidates = compute_invalidates(tcx, body, &borrow_set, provenance_set, &location_map);
     let errors = compute_errors(&borrow_set, &loan_liveness, &invalidates);
 
     BorrowInferenceResults {
@@ -742,9 +779,10 @@ pub fn demote_pointers_iterative(
                 .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
 
+            let inference = borrow_inference(tcx, *f, global_borrow_ctxt);
             let BorrowInferenceResults {
                 borrow_set, errors, ..
-            } = borrow_inference(tcx, *f, global_borrow_ctxt);
+            } = inference;
 
             let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
             for row in errors.rows() {
@@ -803,27 +841,40 @@ pub fn demote_pointers_iterative(
 /// 2. implement the necessary fixpoint iteration to compute inferred bounds.
 pub fn mutable_references_no_guarantee(
     program: &RustProgram,
-) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+    mutables: &FxHashMap<LocalDefId, IndexVec<Local, bool>>,
+) -> (
+    FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    FxHashMap<LocalDefId, DenseBitSet<Local>>,
+) {
     let mut mutable_references = FxHashMap::default();
+    let mut shared_references = FxHashMap::default();
 
-    let mut global_borrow_ctxt = GBorrowInferCtxt::all_pointers(program);
+    let mut global_borrow_ctxt = GBorrowInferCtxt::classified_pointers(program, mutables);
     // let demoted = demote_pointers(program, &global_borrow_ctxt);
     let demoted = demote_pointers_iterative(program, &mut global_borrow_ctxt);
 
     for (&f, demoted) in demoted.iter() {
         let provenance_set = &global_borrow_ctxt.provenances[&f];
-        let mut promoted = DenseBitSet::new_empty(demoted.domain_size());
+        let mut promoted_mutable = DenseBitSet::new_empty(demoted.domain_size());
+        let mut promoted_shared = DenseBitSet::new_empty(demoted.domain_size());
         for (local, local_data) in provenance_set.local_data.iter_enumerated() {
-            if local_data.is_some() {
-                promoted.insert(local);
+            if let Some(d) = local_data {
+                let is_mutable = &provenance_set.provenance_data[*d].is_mutable();
+                if *is_mutable {
+                    promoted_mutable.insert(local);
+                } else {
+                    promoted_shared.insert(local);
+                }
             }
         }
-        promoted.subtract(demoted);
+        promoted_mutable.subtract(demoted);
+        promoted_shared.subtract(demoted);
 
-        mutable_references.insert(f, promoted);
+        mutable_references.insert(f, promoted_mutable);
+        shared_references.insert(f, promoted_shared);
     }
 
-    mutable_references
+    (mutable_references, shared_references)
 }
 
 // #[cfg(test)]

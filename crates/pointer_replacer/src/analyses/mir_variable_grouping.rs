@@ -4,7 +4,7 @@
 //! including temporaries that don't have debug info but are copies of source variables.
 
 use rustc_hash::FxHashMap;
-use rustc_index::bit_set::DenseBitSet;
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{Body, Local, Location, Operand, Place, Rvalue, VarDebugInfoContents, visit::Visitor},
     ty::TyCtxt,
@@ -12,7 +12,10 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 
 use crate::{
-    analyses::mir::{CallKind, TerminatorExt},
+    analyses::{
+        mir::{CallKind, TerminatorExt},
+        type_qualifier::foster::{TypeQualifiers, mutability::Mutability},
+    },
     utils::rustc::RustProgram,
 };
 
@@ -63,6 +66,33 @@ impl SourceVarGroups {
         }
         result
     }
+
+    pub fn postprocess_mut_res(
+        &self,
+        program: &RustProgram,
+        mutability_result: &TypeQualifiers<Mutability>,
+    ) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
+        program
+            .functions
+            .iter()
+            .map(|&f| {
+                let mut muts = mutability_result
+                    .function_body_facts(f)
+                    .map(|muts| muts.iter().any(|&m| m.is_mutable()))
+                    .collect::<IndexVec<_, _>>();
+                if let Some(groups) = self.inner.get(&f) {
+                    // if any local in the group is mutable, mark all as mutable
+                    for locals in groups.values() {
+                        let is_mutable = locals.iter().any(|local| muts[*local]);
+                        for local in locals {
+                            muts[*local] = is_mutable;
+                        }
+                    }
+                }
+                (f, muts)
+            })
+            .collect::<FxHashMap<_, _>>()
+    }
 }
 
 fn group_locals_by_source_variable<'tcx>(
@@ -87,6 +117,10 @@ fn group_locals_by_source_variable<'tcx>(
     let offset_relationships = find_offset_relationships(body, tcx);
 
     for (real, temp) in offset_relationships {
+        if temp.as_usize() == 0 {
+            // skip _0 (return place)
+            continue;
+        }
         // dest (real var) = std::ptr::offset(src (real var), ...)
         // src_local is the variable that is present in the source code
         if let Some(src_local) = local_to_src_local.get(&real).cloned()
@@ -100,6 +134,10 @@ fn group_locals_by_source_variable<'tcx>(
     // Propagate source variable names to temporaries
     // Caveat: the order of copy_relationships should be chronological
     for (dest, src) in copy_relationships {
+        if dest.as_usize() == 0 {
+            // skip _0 (return place)
+            continue;
+        }
         if let Some(src_local) = local_to_src_local.get(&src).cloned()
             && !local_to_src_local.contains_key(&dest)
         {

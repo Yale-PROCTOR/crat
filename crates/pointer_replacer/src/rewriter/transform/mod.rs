@@ -679,7 +679,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                             );
                         }
                     }
-                    (PtrKind::Raw(m), PtrKind::OptRef(_)) => {
+                    (PtrKind::Raw(m0), PtrKind::OptRef(m1)) => {
                         if need_cast {
                             let lhs_inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                             *rhs = utils::expr!(
@@ -687,8 +687,8 @@ impl<'tcx> TransformVisitor<'tcx> {
     ({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x as *{2} _ as *{2} {3})
                                 ",
                                 pprust::expr_to_string(e),
-                                if m { "_mut" } else { "" },
-                                if m { "mut" } else { "const" },
+                                if m0 { "_mut" } else { "" },
+                                if m0 { "mut" } else { "const" },
                                 lhs_inner_ty,
                             );
                         } else if extern_ty {
@@ -699,17 +699,23 @@ impl<'tcx> TransformVisitor<'tcx> {
         None => std::ptr::null{}(),
     }}
 ",
-                                if m { "mut " } else { "" },
+                                if m0 { "mut " } else { "" },
                                 pprust::expr_to_string(e),
-                                if m { "mut" } else { "const" },
+                                if m0 { "mut" } else { "const" },
                                 mir_ty_to_string(rhs_inner_ty, self.tcx),
-                                if m { "_mut" } else { "" },
+                                if m0 { "_mut" } else { "" },
                             );
                         } else {
                             *rhs = utils::expr!(
-                                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |x| x)",
+                                "({}).as_deref{2}().map_or(std::ptr::null{1}(), |x| x{3})",
                                 pprust::expr_to_string(e),
-                                if m { "_mut" } else { "" },
+                                if m0 { "_mut" } else { "" },
+                                if m1 { "_mut" } else { "" },
+                                match (m0, m1) {
+                                    (true, false) => " as *const _ as *mut _",
+                                    (false, true) => " as *mut _ as *const _",
+                                    _ => "",
+                                }
                             );
                         }
                     }
