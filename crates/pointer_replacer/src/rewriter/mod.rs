@@ -79,20 +79,6 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         source_var_groups.postprocess_promoted_mut_refs(mutable_references);
     let promoted_shared_ref_result =
         source_var_groups.postprocess_promoted_mut_refs(shared_references);
-    // for (def_id, promoted_refs) in &promoted_mut_ref_result {
-    //     println!(
-    //         "Function {}: Promoted mutable references: {:?}",
-    //         tcx.def_path_str(*def_id),
-    //         promoted_refs,
-    //     );
-    // }
-    // for (def_id, promoted_refs) in &promoted_shared_ref_result {
-    //     println!(
-    //         "Function {}: Promoted shared references: {:?}",
-    //         tcx.def_path_str(*def_id),
-    //         promoted_refs,
-    //     );
-    // }
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let analysis_results = Analysis {
         promoted_mut_ref_result,

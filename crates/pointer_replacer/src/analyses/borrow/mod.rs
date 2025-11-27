@@ -780,15 +780,6 @@ pub fn demote_pointers_iterative(
                 .borrow();
 
             let inference = borrow_inference(tcx, *f, global_borrow_ctxt);
-
-            // dump_borrow_inference_mir(
-            //     tcx,
-            //     body,
-            //     &inference,
-            //     &global_borrow_ctxt,
-            //     &mut std::io::stdout(),
-            // )
-            // .unwrap();
             let BorrowInferenceResults {
                 borrow_set, errors, ..
             } = inference;
@@ -841,14 +832,6 @@ pub fn demote_pointers_iterative(
         }
     }
 
-    // println!("Final demoted pointers:");
-    // for (&f, demoted) in demoted.iter() {
-    //     let demoted_locals = demoted
-    //         .iter()
-    //         .map(|local| format!("{:?}", local))
-    //         .join(", ");
-    //     println!("{}: [{demoted_locals}]", program.tcx.def_path_str(f));
-    // }
     demoted
 }
 
@@ -891,22 +874,6 @@ pub fn mutable_references_no_guarantee(
         shared_references.insert(f, promoted_shared);
     }
 
-    // println!("Mutable references (no guarantee):");
-    // for (&f, ok_locals) in mutable_references.iter() {
-    //     let ok_locals_str = ok_locals
-    //         .iter()
-    //         .map(|local| format!("{:?}", local))
-    //         .join(", ");
-    //     println!("{}: [{ok_locals_str}]", program.tcx.def_path_str(f));
-    // }
-    // println!("Shared references (no guarantee):");
-    // for (&f, ok_locals) in shared_references.iter() {
-    //     let ok_locals_str = ok_locals
-    //         .iter()
-    //         .map(|local| format!("{:?}", local))
-    //         .join(", ");
-    //     println!("{}: [{ok_locals_str}]", program.tcx.def_path_str(f));
-    // }
     (mutable_references, shared_references)
 }
 

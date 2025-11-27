@@ -37,13 +37,6 @@ impl SourceVarGroups {
             // Store groups for function f
             inner.insert(f, groups);
         }
-        // println!("Source variable groups:");
-        // for (def_id, groups) in &inner {
-        //     println!("Function {}:", rust_program.tcx.def_path_str(*def_id));
-        //     for (src_local, locals) in groups {
-        //         println!("  {:?}: {:?}", src_local, locals);
-        //     }
-        // }
         Self { inner }
     }
 
