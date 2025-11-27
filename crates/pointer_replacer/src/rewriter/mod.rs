@@ -4,7 +4,6 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
-use rustc_index::IndexVec;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
 use serde::Deserialize;
@@ -12,9 +11,8 @@ use transform::TransformVisitor;
 
 use crate::{
     analyses::{
-        self,
-        borrow::PromotedMutRefs as PromotedMutRefResult,
-        type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
+        self, borrow::PromotedMutRefs as PromotedMutRefResult,
+        type_qualifier::foster::fatness::FatnessResult,
     },
     utils::rustc::RustProgram,
 };
@@ -24,7 +22,6 @@ mod decision;
 mod transform;
 
 pub struct Analysis {
-    mutability_result: MutabilityResult,
     promoted_mut_ref_result: PromotedMutRefResult,
     promoted_shared_ref_result: PromotedMutRefResult,
     fatness_result: FatnessResult,
@@ -75,15 +72,29 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
+    let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
     let (mutable_references, shared_references) =
-        analyses::borrow::mutable_references_no_guarantee(&input, &mutability_result);
+        analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
     let promoted_mut_ref_result =
         source_var_groups.postprocess_promoted_mut_refs(mutable_references);
     let promoted_shared_ref_result =
         source_var_groups.postprocess_promoted_mut_refs(shared_references);
+    // for (def_id, promoted_refs) in &promoted_mut_ref_result {
+    //     println!(
+    //         "Function {}: Promoted mutable references: {:?}",
+    //         tcx.def_path_str(*def_id),
+    //         promoted_refs,
+    //     );
+    // }
+    // for (def_id, promoted_refs) in &promoted_shared_ref_result {
+    //     println!(
+    //         "Function {}: Promoted shared references: {:?}",
+    //         tcx.def_path_str(*def_id),
+    //         promoted_refs,
+    //     );
+    // }
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let analysis_results = Analysis {
-        mutability_result,
         promoted_mut_ref_result,
         promoted_shared_ref_result,
         fatness_result,

@@ -9,7 +9,6 @@ use killed::{Killed, compute_killed};
 use loan_liveness::{LoanLiveness, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
-use rustc_ast::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{
@@ -28,10 +27,7 @@ use rustc_span::def_id::LocalDefId;
 use subset_closure::{SubSetClosure, compute_subset_closure};
 
 use super::mir::{CallKind, TerminatorExt};
-use crate::{
-    analyses::type_qualifier::foster::{TypeQualifiers, mutability},
-    utils::{dsa::union_find::UnionFind, rustc::RustProgram},
-};
+use crate::utils::{dsa::union_find::UnionFind, rustc::RustProgram};
 
 macro_rules! disallow_interprocedural {
     () => {
@@ -80,7 +76,8 @@ impl ProvenanceData {
 impl std::fmt::Debug for ProvenanceData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let local = self.local();
-        f.write_fmt(format_args!("'{local:?}"))
+        let is_mutable = self.is_mutable();
+        f.write_fmt(format_args!("'{local:?} (mutable: {is_mutable})"))
     }
 }
 
@@ -157,7 +154,7 @@ impl GBorrowInferCtxt {
         GBorrowInferCtxt { provenances }
     }
 
-    pub fn all_pointers(program: &RustProgram) -> Self {
+    pub fn _all_pointers(program: &RustProgram) -> Self {
         GBorrowInferCtxt::new(program, |_| |_| true, |_| |_| false)
     }
 
@@ -782,9 +779,19 @@ pub fn demote_pointers_iterative(
                 .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
 
+            let inference = borrow_inference(tcx, *f, &global_borrow_ctxt);
+
+            // dump_borrow_inference_mir(
+            //     tcx,
+            //     body,
+            //     &inference,
+            //     &global_borrow_ctxt,
+            //     &mut std::io::stdout(),
+            // )
+            // .unwrap();
             let BorrowInferenceResults {
                 borrow_set, errors, ..
-            } = borrow_inference(tcx, *f, global_borrow_ctxt);
+            } = inference;
 
             let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
             for row in errors.rows() {
@@ -834,6 +841,14 @@ pub fn demote_pointers_iterative(
         }
     }
 
+    // println!("Final demoted pointers:");
+    // for (&f, demoted) in demoted.iter() {
+    //     let demoted_locals = demoted
+    //         .iter()
+    //         .map(|local| format!("{:?}", local))
+    //         .join(", ");
+    //     println!("{}: [{demoted_locals}]", program.tcx.def_path_str(f));
+    // }
     demoted
 }
 
@@ -843,24 +858,11 @@ pub fn demote_pointers_iterative(
 /// 2. implement the necessary fixpoint iteration to compute inferred bounds.
 pub fn mutable_references_no_guarantee(
     program: &RustProgram,
-    mutability_result: &TypeQualifiers<mutability::Mutability>,
+    mutables: &FxHashMap<LocalDefId, IndexVec<Local, bool>>,
 ) -> (
     FxHashMap<LocalDefId, DenseBitSet<Local>>,
     FxHashMap<LocalDefId, DenseBitSet<Local>>,
 ) {
-    let mutables = program
-        .functions
-        .iter()
-        .map(|&f| {
-            (
-                f,
-                mutability_result
-                    .function_body_facts(f)
-                    .map(|muts| muts.iter().any(|&m| m.is_mutable()))
-                    .collect::<IndexVec<_, _>>(),
-            )
-        })
-        .collect::<FxHashMap<_, _>>();
     let mut mutable_references = FxHashMap::default();
     let mut shared_references = FxHashMap::default();
 
@@ -889,6 +891,22 @@ pub fn mutable_references_no_guarantee(
         shared_references.insert(f, promoted_shared);
     }
 
+    // println!("Mutable references (no guarantee):");
+    // for (&f, ok_locals) in mutable_references.iter() {
+    //     let ok_locals_str = ok_locals
+    //         .iter()
+    //         .map(|local| format!("{:?}", local))
+    //         .join(", ");
+    //     println!("{}: [{ok_locals_str}]", program.tcx.def_path_str(f));
+    // }
+    // println!("Shared references (no guarantee):");
+    // for (&f, ok_locals) in shared_references.iter() {
+    //     let ok_locals_str = ok_locals
+    //         .iter()
+    //         .map(|local| format!("{:?}", local))
+    //         .join(", ");
+    //     println!("{}: [{ok_locals_str}]", program.tcx.def_path_str(f));
+    // }
     (mutable_references, shared_references)
 }
 
