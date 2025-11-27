@@ -609,7 +609,7 @@ pub fn borrow_inference<'tcx>(
         &requires,
         &killed,
     );
-    let invalidates = compute_invalidates(tcx, body, &borrow_set, &provenance_set, &location_map);
+    let invalidates = compute_invalidates(tcx, body, &borrow_set, provenance_set, &location_map);
     let errors = compute_errors(&borrow_set, &loan_liveness, &invalidates);
 
     BorrowInferenceResults {
@@ -779,7 +779,7 @@ pub fn demote_pointers_iterative(
                 .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
 
-            let inference = borrow_inference(tcx, *f, &global_borrow_ctxt);
+            let inference = borrow_inference(tcx, *f, global_borrow_ctxt);
 
             // dump_borrow_inference_mir(
             //     tcx,
@@ -866,7 +866,7 @@ pub fn mutable_references_no_guarantee(
     let mut mutable_references = FxHashMap::default();
     let mut shared_references = FxHashMap::default();
 
-    let mut global_borrow_ctxt = GBorrowInferCtxt::classified_pointers(program, &mutables);
+    let mut global_borrow_ctxt = GBorrowInferCtxt::classified_pointers(program, mutables);
     // let demoted = demote_pointers(program, &global_borrow_ctxt);
     let demoted = demote_pointers_iterative(program, &mut global_borrow_ctxt);
 

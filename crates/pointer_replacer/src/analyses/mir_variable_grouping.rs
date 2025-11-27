@@ -79,7 +79,7 @@ impl SourceVarGroups {
         program: &RustProgram,
         mutability_result: &TypeQualifiers<Mutability>,
     ) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
-        let mutables = program
+        program
             .functions
             .iter()
             .map(|&f| {
@@ -98,9 +98,7 @@ impl SourceVarGroups {
                 }
                 (f, muts)
             })
-            .collect::<FxHashMap<_, _>>();
-
-        mutables
+            .collect::<FxHashMap<_, _>>()
     }
 }
 
