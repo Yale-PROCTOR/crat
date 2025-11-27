@@ -826,7 +826,26 @@ impl<'tcx> TransformVisitor<'tcx> {
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
-        if !has_side_effect(e) {
+
+        if is_offset_call(e) {
+            // we assume that the pointer is not null when offset is called
+            if !need_cast {
+                utils::expr!(
+                    "std::slice::from_raw_parts{}(({}){}, 100000)",
+                    if m { "_mut" } else { "" },
+                    pprust::expr_to_string(e),
+                    cast_mut,
+                )
+            } else {
+                utils::expr!(
+                    "std::slice::from_raw_parts{}(({}){} as *{} _, 100000)",
+                    if m { "_mut" } else { "" },
+                    pprust::expr_to_string(e),
+                    cast_mut,
+                    if m { "mut" } else { "const" },
+                )
+            }
+        } else if !has_side_effect(e) {
             if !need_cast {
                 utils::expr!(
                     "if ({0}).is_null() {{
@@ -1391,6 +1410,14 @@ fn hir_unwrap_subscript<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'t
         | hir::ExprKind::Field(e, _)
         | hir::ExprKind::DropTemps(e) => hir_unwrap_subscript(e),
         _ => expr,
+    }
+}
+
+fn is_offset_call(expr: &Expr) -> bool {
+    if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind {
+        call.seg.ident.name == rustc_span::sym::offset
+    } else {
+        false
     }
 }
 
