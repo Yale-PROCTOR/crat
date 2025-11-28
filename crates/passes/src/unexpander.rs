@@ -14,13 +14,19 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Symbol, kw, sym};
+use serde::Deserialize;
 use smallvec::{SmallVec, smallvec};
 use utils::{
     ast::{unwrap_paren, unwrap_paren_mut},
     attr, expr, item,
 };
 
-pub fn unexpand(tcx: TyCtxt<'_>) -> String {
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct Config {
+    pub use_print: bool,
+}
+
+pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -36,6 +42,7 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
         tcx,
         ast_to_hir: pre_visitor.ast_to_hir,
         ctx: pre_visitor.ctx,
+        config,
     };
     visitor.visit_crate(&mut krate);
 
@@ -79,6 +86,7 @@ struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: utils::ir::AstToHir,
     ctx: Ctx,
+    config: Config,
 }
 
 impl MutVisitor for AstVisitor<'_> {
@@ -221,12 +229,14 @@ impl MutVisitor for AstVisitor<'_> {
             };
             let format = pprust::expr_to_string(arg);
             let format = format.strip_prefix("format_args!(").unwrap();
-            if is_empty
+            if self.config.use_print
+                && is_empty
                 && let Some(name) = name
                 && name.as_str() == "stdout"
             {
                 *expr = utils::expr!("print!({format}");
-            } else if is_empty
+            } else if self.config.use_print
+                && is_empty
                 && let Some(name) = name
                 && name.as_str() == "stderr"
             {
@@ -375,7 +385,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirBodyVisitor<'tcx> {
 #[cfg(test)]
 mod tests {
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
-        let s = utils::compilation::run_compiler_on_str(code, super::unexpand).unwrap();
+        let config = super::Config { use_print: true };
+        let s = utils::compilation::run_compiler_on_str(code, |tcx| super::unexpand(config, tcx))
+            .unwrap();
         utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
         for include in includes {
             assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
