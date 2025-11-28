@@ -105,7 +105,7 @@ pub fn unwrap_cast_and_paren(e: &Expr) -> &Expr {
 pub fn unwrap_cast_and_paren_mut(expr: &mut Expr) -> &mut Expr {
     if matches!(&expr.kind, ExprKind::Paren(_) | ExprKind::Cast(_, _)) {
         let (ExprKind::Paren(e) | ExprKind::Cast(e, _)) = &mut expr.kind else { unreachable!() };
-        unwrap_paren_mut(e)
+        unwrap_cast_and_paren_mut(e)
     } else {
         expr
     }

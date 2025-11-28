@@ -104,7 +104,7 @@ fn remove_cast(expr: &Expr) -> &Expr {
     remove_cast(expr)
 }
 
-impl<'a> TransformVisitor<'_, 'a, '_> {
+impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
     fn loc_if_unsupported(&self, expr: &Expr) -> Option<MirLoc> {
         self.unsupported
             .get(&expr.span)
@@ -392,22 +392,19 @@ impl<'a> TransformVisitor<'_, 'a, '_> {
         self.should_prevent_drop(e)
     }
 
-    pub(super) fn byte_array_of_as_mut_ptr<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, bool)> {
+    pub(super) fn array_of_as_ptr<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, ty::Ty<'tcx>)> {
         if let rustc_ast::ExprKind::MethodCall(call) = &unwrap_cast_and_paren(e).kind
-            && call.seg.ident.name.as_str() == "as_mut_ptr"
+            && let name = call.seg.ident.name.as_str()
+            && (name == "as_mut_ptr" || name == "as_ptr")
             && let hir_e = self
                 .ast_to_hir
                 .get_expr(call.receiver.id, self.tcx)
                 .unwrap()
             && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
-            && let ty = typeck.expr_ty(hir_e)
-            && let ty::TyKind::Array(ty, _) = ty.kind()
-            && matches!(
-                ty.kind(),
-                ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
-            )
+            && let ty = typeck.expr_ty(hir_e).peel_refs()
+            && let ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) = ty.kind()
         {
-            Some((&call.receiver, ty.is_signed()))
+            Some((&call.receiver, *ty))
         } else {
             None
         }

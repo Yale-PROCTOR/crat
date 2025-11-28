@@ -24,6 +24,7 @@ pub mod formatter;
 pub mod interface_fixer;
 pub mod libc_replacer;
 pub mod preprocessor;
+pub mod simplifier;
 pub mod splitter;
 pub mod unexpander;
 pub mod unsafe_resolver;

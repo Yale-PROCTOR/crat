@@ -103,6 +103,13 @@ struct Args {
     #[arg(long, help = "Assume that to_str from CStr always succeeds")]
     io_assume_to_str_ok: bool,
 
+    // Unexpand
+    #[arg(
+        long,
+        help = "Use `print!` or `eprint!` instead of `write!` if possible"
+    )]
+    unexpand_use_print: bool,
+
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -149,6 +156,7 @@ enum Pass {
     Io,
     Pointer,
     Static,
+    Simpl,
 }
 
 #[derive(Clone, Debug, ValueEnum, Deserialize)]
@@ -177,6 +185,8 @@ struct Config {
     io: io_replacer::Config,
     #[serde(default)]
     interface: interface_fixer::Config,
+    #[serde(default)]
+    unexpand: unexpander::Config,
     #[serde(default)]
     pointer: pointer_replacer::Config,
     #[serde(default)]
@@ -328,6 +338,8 @@ fn main() {
 
     config.io.assume_to_str_ok |= args.io_assume_to_str_ok;
 
+    config.unexpand.use_print |= args.unexpand_use_print;
+
     config
         .interface
         .c_exposed_fns
@@ -418,7 +430,9 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Unexpand => {
-                let s = run_compiler_on_path(&file, unexpander::unexpand).unwrap();
+                let s =
+                    run_compiler_on_path(&file, |tcx| unexpander::unexpand(config.unexpand, tcx))
+                        .unwrap();
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Split => {
@@ -479,6 +493,10 @@ fn main() {
             }
             Pass::Static => {
                 let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();
+                std::fs::write(&file, s).unwrap();
+            }
+            Pass::Simpl => {
+                let s = run_compiler_on_path(&file, simplifier::simplify).unwrap();
                 std::fs::write(&file, s).unwrap();
             }
         }

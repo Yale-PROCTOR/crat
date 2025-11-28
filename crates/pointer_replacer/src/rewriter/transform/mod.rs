@@ -961,13 +961,7 @@ impl<'tcx> TransformVisitor<'tcx> {
     }
 
     fn same_size(&self, ty1: ty::Ty<'tcx>, ty2: ty::Ty<'tcx>, def_id: LocalDefId) -> bool {
-        self.ty_size(ty1, def_id) == self.ty_size(ty2, def_id)
-    }
-
-    fn ty_size(&self, ty: ty::Ty<'tcx>, def_id: LocalDefId) -> u64 {
-        let typing_env = ty::TypingEnv::post_analysis(self.tcx, def_id);
-        let layout = self.tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
-        layout.size.bytes()
+        utils::ir::ty_size(ty1, def_id, self.tcx) == utils::ir::ty_size(ty2, def_id, self.tcx)
     }
 
     fn get_mutability_decision(&self, hexpr: &hir::Expr<'tcx>) -> Option<bool> {
