@@ -58,6 +58,14 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
         {
             return false;
         }
+        if !visitor.ctx.use_transmute
+            && let ast::AttrKind::Normal(attr) = &attr.kind
+            && attr.item.path.segments.last().unwrap().ident.name == sym::warn
+            && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
+            && arg.as_str() == "mutable_transmutes"
+        {
+            return false;
+        }
         true
     });
 
@@ -194,6 +202,7 @@ struct Ctx {
     derived_traits: FxHashMap<LocalDefId, Vec<Symbol>>,
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
     use_intrinsics: bool,
+    use_transmute: bool,
 }
 
 struct BitField {
@@ -268,6 +277,9 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
             && pre.iter().any(|s| s.ident.name == sym::intrinsics)
         {
             self.ctx.use_intrinsics = true;
+        }
+        if path.segments.last().unwrap().ident.name == sym::transmute {
+            self.ctx.use_transmute = true;
         }
         visit::walk_path(self, path);
     }

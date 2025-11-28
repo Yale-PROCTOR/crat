@@ -22,6 +22,9 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
     krate.attrs.clear();
     krate.attrs.extend([
         utils::ast::make_inner_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
+        utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_camel_case_types"), tcx),
+        utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_snake_case"), tcx),
+        utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_upper_case_globals"), tcx),
         utils::ast::make_inner_attribute(sym::feature, sym::c_variadic, tcx),
         utils::ast::make_inner_attribute(sym::feature, sym::extern_types, tcx),
         utils::ast::make_inner_attribute(sym::feature, sym::linkage, tcx),
@@ -35,17 +38,6 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
     if config.keep_allows {
         krate.attrs.extend([
             utils::ast::make_inner_attribute(sym::allow, Symbol::intern("dead_code"), tcx),
-            utils::ast::make_inner_attribute(
-                sym::allow,
-                Symbol::intern("non_camel_case_types"),
-                tcx,
-            ),
-            utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_snake_case"), tcx),
-            utils::ast::make_inner_attribute(
-                sym::allow,
-                Symbol::intern("non_upper_case_globals"),
-                tcx,
-            ),
             utils::ast::make_inner_attribute(sym::allow, Symbol::intern("unused_assignments"), tcx),
             utils::ast::make_inner_attribute(sym::allow, Symbol::intern("unused_mut"), tcx),
         ]);
