@@ -141,6 +141,12 @@ pub fn format_mir_ty<'tcx, W: std::fmt::Write>(
                 }
                 format_mir_ty(out, *arg_ty, tcx)?;
             }
+            if header.c_variadic {
+                if !ty.inputs().is_empty() {
+                    write!(out, ", ")?;
+                }
+                write!(out, "...")?;
+            }
             write!(out, ") -> ")?;
             format_mir_ty(out, ty.output(), tcx)
         }
