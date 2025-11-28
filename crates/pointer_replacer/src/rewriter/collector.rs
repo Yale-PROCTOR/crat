@@ -52,6 +52,7 @@ pub fn collect_diffs<'tcx>(
             .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
         // skip inputs if used as fn ptr
         {
+            let aliases = aliases.and_then(|aliases| aliases.get(&local));
             if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
