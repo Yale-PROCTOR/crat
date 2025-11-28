@@ -25,9 +25,9 @@ impl TransformVisitor<'_, '_, '_> {
         let err_eof_args = self.err_eof_args(ic);
         self.lib_items.borrow_mut().insert(LibItem::Fread);
 
-        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(ptr) {
-            let array = pprust::expr_to_string(array);
-            if signed {
+        if let Some((array, ty)) = self.array_of_as_ptr(ptr) {
+            if ty == self.tcx.types.i8 {
+                let array = pprust::expr_to_string(array);
                 self.bytemuck.set(true);
                 return expr!(
                     "
@@ -41,7 +41,8 @@ impl TransformVisitor<'_, '_, '_> {
         )
     }}"
                 );
-            } else {
+            } else if ty == self.tcx.types.u8 {
+                let array = pprust::expr_to_string(array);
                 return expr!(
                     "
     {{

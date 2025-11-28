@@ -80,6 +80,12 @@ impl TransformVisitor<'_, '_, '_> {
                         .unwrap();
                         continue;
                     }
+                    if let Some((array, ty)) = self.array_of_as_ptr(arg)
+                        && ty.to_string() == spec_ty
+                    {
+                        write!(code, ", &mut ({})[0]", pprust::expr_to_string(array)).unwrap();
+                        continue;
+                    }
                     if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(arg).kind
                         && call.seg.ident.name.as_str() == "map_or"
                         && let ExprKind::MethodCall(call) =
@@ -127,15 +133,17 @@ impl TransformVisitor<'_, '_, '_> {
                     i += 1;
                     write!(decls, "let mut ___v_{i} = Vec::new();").unwrap();
                     write!(code, ", &mut ___v_{i}").unwrap();
-                    if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(arg) {
-                        let arg = pprust::expr_to_string(array);
-                        if signed {
+                    if let Some((array, ty)) = self.array_of_as_ptr(arg) {
+                        if ty == self.tcx.types.i8 {
+                            let arg = pprust::expr_to_string(array);
                             write!(
                                 assigns,
                                 "({arg})[..___v_{i}.len()].copy_from_slice(&___v_{i}[..]);"
                             )
                             .unwrap();
-                        } else {
+                            continue;
+                        } else if ty == self.tcx.types.u8 {
+                            let arg = pprust::expr_to_string(array);
                             self.bytemuck.set(true);
                             write!(
                                 assigns,
@@ -143,8 +151,8 @@ impl TransformVisitor<'_, '_, '_> {
                                     .copy_from_slice(&___v_{i}[..]);"
                             )
                             .unwrap();
+                            continue;
                         }
-                        continue;
                     }
                     let arg = pprust::expr_to_string(arg);
                     write!(

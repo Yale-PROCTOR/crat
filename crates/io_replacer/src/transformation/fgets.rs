@@ -23,9 +23,9 @@ impl TransformVisitor<'_, '_, '_> {
         let err_eof_args = self.err_eof_args(ic);
         self.lib_items.borrow_mut().insert(LibItem::Fgets);
 
-        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(s) {
-            let array = pprust::expr_to_string(array);
-            if signed {
+        if let Some((array, ty)) = self.array_of_as_ptr(s) {
+            if ty == self.tcx.types.i8 {
+                let array = pprust::expr_to_string(array);
                 return expr!(
                     "crate::stdio::rs_fgets(
                         &mut ({array})[..({n_str}) as usize],
@@ -33,7 +33,8 @@ impl TransformVisitor<'_, '_, '_> {
                         {err_eof_args},
                     )"
                 );
-            } else {
+            } else if ty == self.tcx.types.u8 {
+                let array = pprust::expr_to_string(array);
                 self.bytemuck.set(true);
                 return expr!(
                     "crate::stdio::rs_fgets(

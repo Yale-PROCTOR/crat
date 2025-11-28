@@ -23,11 +23,11 @@ impl TransformVisitor<'_, '_, '_> {
         let nitems = pprust::expr_to_string(nitems);
         self.lib_items.borrow_mut().insert(LibItem::Fwrite);
 
-        if let Some((array, signed)) = self.byte_array_of_as_mut_ptr(ptr) {
-            let array = pprust::expr_to_string(array);
-            let code = if signed {
+        if let Some((array, ty)) = self.array_of_as_ptr(ptr) {
+            if ty == self.tcx.types.i8 {
+                let array = pprust::expr_to_string(array);
                 self.bytemuck.set(true);
-                format!(
+                let code = format!(
                     "
     {{
         let ___size = {size};
@@ -37,9 +37,11 @@ impl TransformVisitor<'_, '_, '_> {
             {stream_str}
         )
     }}"
-                )
-            } else {
-                format!(
+                );
+                return self.update_error_no_eof(ic, code, stream);
+            } else if ty == self.tcx.types.u8 {
+                let array = pprust::expr_to_string(array);
+                let code = format!(
                     "
     {{
         let ___size = {size};
@@ -49,9 +51,9 @@ impl TransformVisitor<'_, '_, '_> {
             {stream_str}
         )
     }}"
-                )
-            };
-            return self.update_error_no_eof(ic, code, stream);
+                );
+                return self.update_error_no_eof(ic, code, stream);
+            }
         }
 
         self.update_error_no_eof(
