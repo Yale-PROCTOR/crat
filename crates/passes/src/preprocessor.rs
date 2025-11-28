@@ -1248,7 +1248,7 @@ pub unsafe extern "C" fn f(x: libc::c_int) {
 }
             "#,
             &["mut x", "x + x"],
-            &["let mut y: libc::c_int = x;"],
+            &["let mut y: i32 = x;"],
         );
     }
 
@@ -1263,8 +1263,8 @@ pub unsafe extern "C" fn f(mut x: libc::c_int, mut p: *mut libc::c_int) {
     g(p, g(p, 0 as libc::c_int));
 }
             "#,
-            &[" = g(p, 0 as libc::c_int);"],
-            &["p, g(p, 0 as libc::c_int)"],
+            &[" = g(p, 0 as i32);"],
+            &["p, g(p, 0 as i32)"],
         );
     }
 
@@ -1404,7 +1404,7 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_int) {
     *fresh0;
 }
             "#,
-            &["*p.offset(0 as libc::c_int as isize)"],
+            &["*p.offset(0 as i32 as isize)"],
             &["fresh0"],
         );
     }
@@ -1419,7 +1419,7 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
     *fresh0;
 }
             "#,
-            &["*p.offset(0 as libc::c_int as isize)"],
+            &["*p.offset(0 as i32 as isize)"],
             &["fresh0"],
         );
     }

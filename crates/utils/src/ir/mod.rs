@@ -64,7 +64,18 @@ pub fn format_mir_ty<'tcx, W: std::fmt::Write>(
         TyKind::Adt(adt_def, args) => {
             let path_str = tcx.def_path_str(adt_def.did());
             if path_str.starts_with("std") {
-                write!(out, "{path_str}",)?;
+                let name = tcx.item_name(adt_def.did());
+                let name = name.as_str();
+                if name == "Option"
+                    || name == "Result"
+                    || name == "Vec"
+                    || name == "String"
+                    || name == "Box"
+                {
+                    write!(out, "{name}",)?;
+                } else {
+                    write!(out, "{path_str}",)?;
+                }
             } else {
                 write!(out, "crate::{}", tcx.def_path_str(adt_def.did()))?;
             }
