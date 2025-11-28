@@ -2,10 +2,10 @@ use std::ops::ControlFlow;
 
 use etrace::some_or;
 use rustc_ast::{
-    self as ast,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
+    *,
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -15,7 +15,10 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{Symbol, kw, sym};
 use smallvec::{SmallVec, smallvec};
-use utils::{attr, expr, item};
+use utils::{
+    ast::{unwrap_paren, unwrap_paren_mut},
+    attr, expr, item,
+};
 
 pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
@@ -50,7 +53,7 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
     }
 
     krate.attrs.retain(|attr| {
-        if let ast::AttrKind::Normal(attr) = &attr.kind
+        if let AttrKind::Normal(attr) = &attr.kind
             && attr.item.path.segments.last().unwrap().ident.name == sym::feature
             && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
             && let arg = arg.as_str()
@@ -59,7 +62,7 @@ pub fn unexpand(tcx: TyCtxt<'_>) -> String {
             return false;
         }
         if !visitor.ctx.use_transmute
-            && let ast::AttrKind::Normal(attr) = &attr.kind
+            && let AttrKind::Normal(attr) = &attr.kind
             && attr.item.path.segments.last().unwrap().ident.name == sym::warn
             && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
             && arg.as_str() == "mutable_transmutes"
@@ -79,17 +82,17 @@ struct AstVisitor<'tcx> {
 }
 
 impl MutVisitor for AstVisitor<'_> {
-    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
+    fn flat_map_item(&mut self, item: P<Item>) -> SmallVec<[P<Item>; 1]> {
         if utils::ast::is_automatically_derived(&item.attrs) {
             return smallvec![];
         }
         mut_visit::walk_flat_map_item(self, item)
     }
 
-    fn visit_item(&mut self, item: &mut ast::Item) {
+    fn visit_item(&mut self, item: &mut Item) {
         if matches!(
             item.kind,
-            ast::ItemKind::Struct(..) | ast::ItemKind::Union(..) | ast::ItemKind::Enum(..)
+            ItemKind::Struct(..) | ItemKind::Union(..) | ItemKind::Enum(..)
         ) {
             let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
             if let Some(traits) = self.ctx.derived_traits.get(local_def_id) {
@@ -103,10 +106,10 @@ impl MutVisitor for AstVisitor<'_> {
             }
         }
         match &mut item.kind {
-            ast::ItemKind::Struct(_, _, vd) => {
+            ItemKind::Struct(_, _, vd) => {
                 let local_def_id = self.ast_to_hir.global_map.get(&item.id).unwrap();
                 if let Some(bitfields) = self.ctx.bitfields.get(local_def_id) {
-                    let ast::VariantData::Struct { fields, .. } = vd else { panic!() };
+                    let VariantData::Struct { fields, .. } = vd else { panic!() };
                     for field in fields {
                         let bitfields =
                             some_or!(bitfields.get(&field.ident.unwrap().name), continue);
@@ -120,22 +123,22 @@ impl MutVisitor for AstVisitor<'_> {
                     }
                 }
             }
-            ast::ItemKind::Const(const_item) => {
-                if let ast::TyKind::Path(_, path) = &const_item.ty.kind
+            ItemKind::Const(const_item) => {
+                if let TyKind::Path(_, path) = &const_item.ty.kind
                     && let Some(seg) = path.segments.last()
                     && seg.ident.name == sym::LocalKey
-                    && let Some(box ast::GenericArgs::AngleBracketed(args)) = &seg.args
-                    && let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(ty))] = &args.args[..]
+                    && let Some(box GenericArgs::AngleBracketed(args)) = &seg.args
+                    && let [AngleBracketedArg::Arg(GenericArg::Type(ty))] = &args.args[..]
                     && let Some(init) = &const_item.expr
-                    && let ast::ExprKind::Block(block, _) = &init.kind
+                    && let ExprKind::Block(block, _) = &init.kind
                     && let [stmt, ..] = &block.stmts[..]
-                    && let ast::StmtKind::Item(stmt_item) = &stmt.kind
-                    && let ast::ItemKind::Const(inner_item) = &stmt_item.kind
+                    && let StmtKind::Item(stmt_item) = &stmt.kind
+                    && let ItemKind::Const(inner_item) = &stmt_item.kind
                     && inner_item.ident.name.as_str() == "__INIT"
                     && let Some(init) = &inner_item.expr
-                    && let ast::ExprKind::Block(block, _) = &init.kind
+                    && let ExprKind::Block(block, _) = &init.kind
                     && let [stmt] = &block.stmts[..]
-                    && let ast::StmtKind::Expr(init) = &stmt.kind
+                    && let StmtKind::Expr(init) = &stmt.kind
                 {
                     let name = const_item.ident.name;
                     let ty = pprust::ty_to_string(ty);
@@ -148,9 +151,9 @@ impl MutVisitor for AstVisitor<'_> {
         mut_visit::walk_item(self, item);
     }
 
-    fn visit_expr(&mut self, expr: &mut ast::Expr) {
-        if let ast::ExprKind::Call(callee, args) = &expr.kind
-            && let ast::ExprKind::Path(None, callee) = &callee.kind
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if let ExprKind::Call(callee, args) = &expr.kind
+            && let ExprKind::Path(None, callee) = &callee.kind
             && let [.., md, func] = &callee.segments[..]
         {
             let md = md.ident.name;
@@ -161,7 +164,7 @@ impl MutVisitor for AstVisitor<'_> {
                 } else if func == sym::panic
                     && let [arg] = &args[..]
                 {
-                    if let ast::ExprKind::Lit(lit) = &arg.kind
+                    if let ExprKind::Lit(lit) = &arg.kind
                         && lit.symbol.as_str() == "internal error: entered unreachable code"
                     {
                         *expr = expr!("unreachable!()");
@@ -192,8 +195,56 @@ impl MutVisitor for AstVisitor<'_> {
                     panic!("{func}");
                 }
             }
+        } else if let ExprKind::Match(scrutinee, arms, _) = &mut expr.kind
+            && let scrutinee = unwrap_paren_mut(scrutinee)
+            && let ExprKind::MethodCall(call) = &scrutinee.kind
+            && call.seg.ident.name == rustc_span::sym::write_fmt
+            && let [arg] = &call.args[..]
+            && let arg = unwrap_paren(arg)
+            && matches!(arg.kind, ExprKind::FormatArgs(_))
+        {
+            let is_empty = arms.iter().all(|arm| {
+                if let ExprKind::Block(block, _) = &arm.body.as_ref().unwrap().kind {
+                    block.stmts.is_empty()
+                } else {
+                    false
+                }
+            });
+            let receiver = unwrap_addr_of(&call.receiver);
+            let name = if let ExprKind::Call(callee, args) = &receiver.kind
+                && args.is_empty()
+                && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
+            {
+                Some(path.segments.last().unwrap().ident.name)
+            } else {
+                None
+            };
+            let format = pprust::expr_to_string(arg);
+            let format = format.strip_prefix("format_args!(").unwrap();
+            if is_empty
+                && let Some(name) = name
+                && name.as_str() == "stdout"
+            {
+                *expr = utils::expr!("print!({format}");
+            } else if is_empty
+                && let Some(name) = name
+                && name.as_str() == "stderr"
+            {
+                *expr = utils::expr!("eprint!({format}");
+            } else {
+                let receiver = pprust::expr_to_string(&call.receiver);
+                *scrutinee = utils::expr!("write!({receiver}, {format}");
+            }
         }
         mut_visit::walk_expr(self, expr);
+    }
+}
+
+fn unwrap_addr_of(expr: &Expr) -> &Expr {
+    if let ExprKind::AddrOf(_, _, e) | ExprKind::Paren(e) = &expr.kind {
+        unwrap_addr_of(e)
+    } else {
+        expr
     }
 }
 
@@ -219,9 +270,9 @@ struct Previsitor<'tcx> {
 }
 
 impl<'ast> Visitor<'ast> for Previsitor<'_> {
-    fn visit_item(&mut self, item: &'ast ast::Item) {
+    fn visit_item(&mut self, item: &'ast Item) {
         if utils::ast::is_automatically_derived(&item.attrs)
-            && matches!(item.kind, ast::ItemKind::Impl(_))
+            && matches!(item.kind, ItemKind::Impl(_))
         {
             let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();
             let hir::ItemKind::Impl(imp) = hir_item.kind else { panic!() };
@@ -318,5 +369,73 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirBodyVisitor<'tcx> {
             }
         }
         intravisit::walk_local(self, local)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
+        let s = utils::compilation::run_compiler_on_str(code, super::unexpand).unwrap();
+        utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
+        for include in includes {
+            assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+        }
+        for exclude in excludes {
+            assert!(
+                !s.contains(exclude),
+                "Expected not to find `{exclude}` in:\n{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_print() {
+        run_test(
+            r#"
+fn f() {
+    use std::io::Write;
+    match (&mut std::io::stdout()).write_fmt(format_args!("")) {
+        Ok(_) => {}
+        Err(_) => {}
+    };
+}
+            "#,
+            &["print!"],
+            &["stdout", "write_fmt", "format_args"],
+        )
+    }
+
+    #[test]
+    fn test_eprint() {
+        run_test(
+            r#"
+fn f() {
+    use std::io::Write;
+    match (&mut std::io::stderr()).write_fmt(format_args!("")) {
+        Ok(_) => {}
+        Err(_) => {}
+    };
+}
+            "#,
+            &["eprint!"],
+            &["stdout", "write_fmt", "format_args"],
+        )
+    }
+
+    #[test]
+    fn test_write() {
+        run_test(
+            r#"
+fn f() {
+    use std::io::Write;
+    let x: i32 = match (&mut std::io::stdout()).write_fmt(format_args!("")) {
+        Ok(_) => (0, 0),
+        Err(_) => (-1, 1),
+    }.0;
+}
+            "#,
+            &["write!"],
+            &["write_fmt", "format_args"],
+        )
     }
 }
