@@ -4,15 +4,16 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use serde::Deserialize;
 use transform::TransformVisitor;
 
 use crate::{
     analyses::{
-        self, borrow::PromotedMutRefs as PromotedMutRefResult,
-        type_qualifier::foster::fatness::FatnessResult,
+        self,
+        borrow::PromotedMutRefs as PromotedMutRefResult,
+        type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
 };
@@ -24,8 +25,9 @@ mod transform;
 pub struct Analysis {
     promoted_mut_ref_result: PromotedMutRefResult,
     promoted_shared_ref_result: PromotedMutRefResult,
+    mutability_result: MutabilityResult,
     fatness_result: FatnessResult,
-    aliases: FxHashMap<LocalDefId, FxHashSet<usize>>,
+    aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -83,6 +85,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
+        mutability_result,
         fatness_result,
         aliases,
     };
@@ -100,25 +103,24 @@ fn find_param_aliases<'tcx>(
     pre: &andersen::PreAnalysisData<'tcx>,
     points_to: &andersen::Solutions,
     tcx: TyCtxt<'tcx>,
-) -> FxHashMap<LocalDefId, FxHashSet<usize>> {
+) -> FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>> {
     let mut param_aliases = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
         let calls = some_or!(pre.call_args.get(&def_id), continue);
-        let mut aliases = FxHashSet::default();
+        let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
         for call_args in calls {
             for i in 0..body.arg_count {
                 for j in 0..i {
-                    if aliases.contains(&i) && aliases.contains(&j) {
-                        continue;
-                    }
                     let arg_i = some_or!(call_args[i], continue);
                     let arg_j = some_or!(call_args[j], continue);
                     let mut sol_i = points_to[arg_i].clone();
                     sol_i.intersect(&points_to[arg_j]);
                     if !sol_i.is_empty() {
-                        aliases.insert(i);
-                        aliases.insert(j);
+                        let i = Local::from_usize(i + 1);
+                        let j = Local::from_usize(j + 1);
+                        aliases.entry(i).or_default().insert(j);
+                        aliases.entry(j).or_default().insert(i);
                     }
                 }
             }

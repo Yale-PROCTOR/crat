@@ -29,6 +29,7 @@ impl PtrKind {
 
 pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
+    mutable_pointers: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
     promoted_mut_refs: DenseBitSet<Local>,
     promoted_shared_refs: DenseBitSet<Local>,
@@ -36,16 +37,15 @@ pub struct DecisionMaker<'tcx> {
 
 impl<'tcx> DecisionMaker<'tcx> {
     pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
+        let mutable_pointers = analysis
+            .mutability_result
+            .function_body_facts(did)
+            .map(|mutabilities| mutabilities.iter().any(|m| m.is_mutable()))
+            .collect::<IndexVec<Local, _>>();
         let array_pointers = analysis
             .fatness_result
             .function_body_facts(did)
-            .map(|fatnesses| {
-                fatnesses
-                    .iter()
-                    .next()
-                    .map(|&f| f.is_arr())
-                    .unwrap_or(false)
-            })
+            .map(|fatnesses| fatnesses.iter().next().map(|f| f.is_arr()).unwrap_or(false))
             .collect::<IndexVec<Local, _>>();
         let promoted_mut_refs = analysis.promoted_mut_ref_result.get(&did).unwrap().clone();
         let promoted_shared_refs = analysis
@@ -56,6 +56,7 @@ impl<'tcx> DecisionMaker<'tcx> {
         DecisionMaker {
             tcx,
             array_pointers,
+            mutable_pointers,
             promoted_mut_refs,
             promoted_shared_refs,
         }
@@ -65,12 +66,16 @@ impl<'tcx> DecisionMaker<'tcx> {
         &self,
         local: Local,
         decl: &LocalDecl,
-        aliases: Option<&FxHashSet<usize>>,
+        aliases: Option<&FxHashSet<Local>>,
     ) -> Option<PtrKind> {
         let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
         let mutability = m.is_mut();
         if ty.is_c_void(self.tcx)
-            || aliases.is_some_and(|aliases| aliases.contains(&(local.index() - 1)))
+            || aliases.is_some_and(|aliases| {
+                std::iter::once(local)
+                    .chain(aliases.iter().copied())
+                    .any(|l| self.mutable_pointers[l])
+            })
         {
             Some(PtrKind::Raw(mutability))
         } else if self.array_pointers[local] {
@@ -150,7 +155,10 @@ impl SigDecisions {
                 .iter_enumerated()
                 .skip(1)
                 .take(input_len)
-                .map(|(param, param_decl)| decision_maker.decide(param, param_decl, aliases))
+                .map(|(param, param_decl)| {
+                    let aliases = aliases.and_then(|aliases| aliases.get(&param));
+                    decision_maker.decide(param, param_decl, aliases)
+                })
                 .collect();
 
             data.insert(
