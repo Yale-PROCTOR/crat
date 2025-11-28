@@ -237,7 +237,11 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
-use utils::{expr, ir::AstToHir, ty};
+use utils::{
+    expr,
+    ir::{AstToHir, mir_ty_to_string},
+    ty,
+};
 
 pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
@@ -340,19 +344,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         if let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx)
             && let hir::TyKind::Path(QPath::Resolved(_, path)) = hir_ty.kind
             && let Res::Def(DefKind::TyAlias, def_id) = path.res
-            && let Some(def_id) = def_id.as_local()
-            && let mir_ty = self.tcx.type_of(def_id).skip_binder()
-            && utils::file::file_param_index(mir_ty, self.tcx).is_some()
         {
-            let item = self.tcx.hir_expect_item(def_id);
-            let hir::ItemKind::TyAlias(_, _, hir_ty) = item.kind else { panic!() };
-            let hir_ty = self
-                .tcx
-                .sess
-                .source_map()
-                .span_to_snippet(hir_ty.span)
-                .unwrap();
-            *ty = ty!("{hir_ty}");
+            let mir_ty = self.tcx.type_of(def_id).skip_binder();
+            if utils::file::file_param_index(mir_ty, self.tcx).is_some()
+                || mir_ty.is_numeric() && is_libc_ty(path.segments.last().unwrap().ident.as_str())
+            {
+                *ty = ty!("{}", mir_ty_to_string(mir_ty, self.tcx));
+            }
         }
     }
 
@@ -650,6 +648,27 @@ fn ref_to_ptr(block: &mut Block) {
         let m = if m.is_mut() { "mut" } else { "const" };
         **e = expr!("({e_str}) as *{m} _");
     }
+}
+
+fn is_libc_ty(ty: &str) -> bool {
+    if ty.starts_with("c_") {
+        return true;
+    }
+    if ty.ends_with("_t")
+        && (ty.starts_with("int")
+            || ty.starts_with("__int")
+            || ty.starts_with("uint")
+            || ty.starts_with("__uint")
+            || ty.starts_with("off")
+            || ty.starts_with("__off")
+            || ty.starts_with("size")
+            || ty.starts_with("__size")
+            || ty.starts_with("isize")
+            || ty.starts_with("__isize"))
+    {
+        return true;
+    }
+    false
 }
 
 #[allow(variant_size_differences)]
@@ -1229,7 +1248,7 @@ pub unsafe extern "C" fn f(x: libc::c_int) {
 }
             "#,
             &["mut x", "x + x"],
-            &["let mut y: libc::c_int = x;"],
+            &["let mut y: i32 = x;"],
         );
     }
 
@@ -1244,8 +1263,8 @@ pub unsafe extern "C" fn f(mut x: libc::c_int, mut p: *mut libc::c_int) {
     g(p, g(p, 0 as libc::c_int));
 }
             "#,
-            &[" = g(p, 0 as libc::c_int);"],
-            &["p, g(p, 0 as libc::c_int)"],
+            &[" = g(p, 0 as i32);"],
+            &["p, g(p, 0 as i32)"],
         );
     }
 
@@ -1385,7 +1404,7 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_int) {
     *fresh0;
 }
             "#,
-            &["*p.offset(0 as libc::c_int as isize)"],
+            &["*p.offset(0 as i32 as isize)"],
             &["fresh0"],
         );
     }
@@ -1400,7 +1419,7 @@ pub unsafe extern "C" fn f(mut p: *mut libc::c_uint) {
     *fresh0;
 }
             "#,
-            &["*p.offset(0 as libc::c_int as isize)"],
+            &["*p.offset(0 as i32 as isize)"],
             &["fresh0"],
         );
     }
