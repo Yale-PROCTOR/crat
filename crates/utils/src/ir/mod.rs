@@ -26,7 +26,17 @@ pub fn is_option(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
 
 #[inline]
 pub fn with_tcx<R, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> R>(f: F) -> R {
-    rustc_middle::ty::tls::with_opt(|tcx| f(tcx.unwrap()))
+    ty::tls::with_opt(|tcx| f(tcx.unwrap()))
+}
+
+pub fn ty_size<'tcx>(
+    ty: ty::Ty<'tcx>,
+    def_id: impl IntoQueryParam<DefId>,
+    tcx: TyCtxt<'tcx>,
+) -> u64 {
+    let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
+    let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
+    layout.size.bytes()
 }
 
 #[inline]

@@ -198,17 +198,17 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         let path = path!("crate");
 
-        if self.config.replace_pub && item.vis.kind.is_pub() && !is_exposed_fn {
-            if let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind
-                && ident.name == sym::main
-            {
-            } else {
-                item.vis.kind = ast::VisibilityKind::Restricted {
-                    path: ast::ptr::P::new(path),
-                    id: DUMMY_NODE_ID,
-                    shorthand: true,
-                };
-            }
+        if self.config.replace_pub
+            && item.vis.kind.is_pub()
+            && !is_exposed_fn
+            && let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind
+            && ident.name != sym::main
+        {
+            item.vis.kind = ast::VisibilityKind::Restricted {
+                path: ast::ptr::P::new(path),
+                id: DUMMY_NODE_ID,
+                shorthand: true,
+            };
         }
 
         if self.config.remove_no_mangle && !is_exposed_fn {

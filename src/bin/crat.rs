@@ -149,6 +149,7 @@ enum Pass {
     Io,
     Pointer,
     Static,
+    Simpl,
 }
 
 #[derive(Clone, Debug, ValueEnum, Deserialize)]
@@ -479,6 +480,10 @@ fn main() {
             }
             Pass::Static => {
                 let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();
+                std::fs::write(&file, s).unwrap();
+            }
+            Pass::Simpl => {
+                let s = run_compiler_on_path(&file, simplifier::simplify).unwrap();
                 std::fs::write(&file, s).unwrap();
             }
         }
