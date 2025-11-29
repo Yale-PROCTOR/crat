@@ -13,9 +13,10 @@ use rustc_hir::{
     self as hir, QPath, def::Res, def_id::LocalDefId, intravisit, intravisit::Visitor as _,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
-use rustc_span::{Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Symbol, kw, sym};
 use serde::Deserialize;
 use smallvec::{SmallVec, smallvec};
+use thin_vec::thin_vec;
 use utils::{
     ast::{unwrap_paren, unwrap_paren_mut},
     attr, expr, item,
@@ -158,6 +159,35 @@ impl MutVisitor for AstVisitor<'_> {
             _ => {}
         }
         mut_visit::walk_item(self, item);
+    }
+
+    fn flat_map_stmt(&mut self, stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+        let mut stmts = mut_visit::walk_flat_map_stmt(self, stmt);
+        for stmt in &mut stmts {
+            // { use std::io::Write; print!(..) }; => print!(..);
+            if let StmtKind::Semi(e) = &mut stmt.kind
+                && let ExprKind::Block(block, _) = &mut e.kind
+                && let [stmt1, stmt2] = &mut block.stmts[..]
+                && let StmtKind::Item(item) = &stmt1.kind
+                && matches!(item.kind, ItemKind::Use(_))
+                && let StmtKind::Expr(expr) = &mut stmt2.kind
+                && let expr = unwrap_paren_mut(expr)
+                && let ExprKind::MacCall(mac) = &expr.kind
+                && let name = mac.path.segments.last().unwrap().ident.name.as_str()
+                && (name == "print" || name == "eprint")
+            {
+                let dummy = Expr {
+                    id: DUMMY_NODE_ID,
+                    kind: ExprKind::Dummy,
+                    span: DUMMY_SP,
+                    attrs: thin_vec![],
+                    tokens: None,
+                };
+                let expr: Expr = std::mem::replace(expr, dummy);
+                **e = expr;
+            }
+        }
+        stmts
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {

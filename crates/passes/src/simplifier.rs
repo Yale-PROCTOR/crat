@@ -134,7 +134,7 @@ impl<'tcx> AstVisitor<'tcx> {
     fn compress_casts(&self, expr: &hir::Expr) -> Option<Vec<ty::Ty<'tcx>>> {
         let typeck = self.tcx.typeck(expr.hir_id.owner);
         let ty = typeck.expr_ty(expr);
-        if !ty.is_integral() {
+        if !ty.is_integral() && !ty.is_bool() {
             return None;
         }
         match expr.kind {
