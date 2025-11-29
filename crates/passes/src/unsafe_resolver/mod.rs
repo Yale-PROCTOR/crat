@@ -292,22 +292,13 @@ struct HirVisitor<'tcx> {
     fns: Vec<LocalDefId>,
     uses: Vec<(LocalDefId, Vec<DefId>)>,
     used: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
-    item_mods: FxHashMap<LocalDefId, LocalDefId>,
+    item_mods: FxHashMap<LocalDefId, LocalModDefId>,
 }
 
 impl HirVisitor<'_> {
     fn add_item_mod(&mut self, def_id: LocalDefId) {
-        let module = self
-            .tcx
-            .hir_parent_iter(HirId::make_owner(def_id))
-            .find_map(|(hir_id, node)| {
-                let hir::Node::Item(item) = node else { return None };
-                let hir::ItemKind::Mod(_, _) = item.kind else { return None };
-                Some(hir_id.owner.def_id)
-            });
-        if let Some(module) = module {
-            self.item_mods.insert(def_id, module);
-        }
+        self.item_mods
+            .insert(def_id, self.tcx.parent_module_from_def_id(def_id));
     }
 }
 
