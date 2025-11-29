@@ -118,7 +118,9 @@ pub fn unwrap_cast_then_as_ptr(expr: &Expr) -> Option<&Expr> {
         {
             Some(&call.receiver)
         }
-        ExprKind::Cast(e, _) | ExprKind::Paren(e) => unwrap_cast_then_as_ptr(e),
+        ExprKind::AddrOf(BorrowKind::Ref, _, e) | ExprKind::Cast(e, _) | ExprKind::Paren(e) => {
+            unwrap_cast_then_as_ptr(e)
+        }
         _ => None,
     }
 }

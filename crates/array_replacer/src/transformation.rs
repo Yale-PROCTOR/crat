@@ -60,12 +60,16 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             some_or!(self.ast_to_hir.get_expr(src_expr.id, self.tcx), return);
 
                         let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
-                        let dest_ty = typeck.expr_ty(dest_hir_expr);
-                        let src_ty = typeck.expr_ty(src_hir_expr);
-                        if let TyKind::Ref(_, dest_slice_ty, _) = dest_ty.kind()
-                            && let TyKind::Slice(dest_inner_ty) = dest_slice_ty.kind()
-                            && let TyKind::Ref(_, src_slice_ty, _) = src_ty.kind()
-                            && let TyKind::Slice(src_inner_ty) = src_slice_ty.kind()
+                        let mut dest_ty = typeck.expr_ty(dest_hir_expr);
+                        let mut src_ty = typeck.expr_ty(src_hir_expr);
+                        while let TyKind::Ref(_, dest_inner_ty, _) = dest_ty.kind() {
+                            dest_ty = dest_inner_ty.clone();
+                        }
+                        while let TyKind::Ref(_, src_inner_ty, _) = src_ty.kind() {
+                            src_ty = src_inner_ty.clone();
+                        }
+                        if let TyKind::Slice(dest_inner_ty) = dest_ty.kind()
+                            && let TyKind::Slice(src_inner_ty) = src_ty.kind()
                             && dest_inner_ty == src_inner_ty
                         {
                             let size_expr = &args[2];
