@@ -1,7 +1,15 @@
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
-use rustc_hir::{self as hir};
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    def::Res,
+    def_id::{LocalDefId, LocalModDefId},
+    intravisit, {self as hir},
+};
+use rustc_middle::{
+    hir::nested_filter,
+    ty::{self, TyCtxt},
+};
 use rustc_span::{DUMMY_SP, Symbol};
 use thin_vec::thin_vec;
 use utils::{ast::unwrap_cast_and_paren_mut, ir::AstToHir};
@@ -13,7 +21,16 @@ pub fn simplify(tcx: TyCtxt<'_>) -> String {
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
 
-    let mut visitor = AstVisitor { tcx, ast_to_hir };
+    let mut hir_visitor = HirVisitor {
+        tcx,
+        imports: FxHashMap::default(),
+    };
+    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
+    let mut visitor = AstVisitor {
+        tcx,
+        ast_to_hir,
+        imports: hir_visitor.imports,
+    };
 
     visitor.visit_crate(&mut expanded_ast);
     pprust::crate_to_string_for_macros(&expanded_ast)
@@ -22,6 +39,7 @@ pub fn simplify(tcx: TyCtxt<'_>) -> String {
 struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
+    imports: FxHashMap<LocalModDefId, FxHashSet<LocalDefId>>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -80,6 +98,24 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             };
             let inner = std::mem::replace::<Expr>(e, dummy);
             *expr = inner;
+        }
+    }
+
+    fn visit_ty(&mut self, ty: &mut Ty) {
+        mut_visit::walk_ty(self, ty);
+
+        if let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx)
+            && let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &hir_ty.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(local_def_id) = def_id.as_local()
+            && let mod_id = self.tcx.parent_module(hir_ty.hir_id)
+            && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
+                || self
+                    .imports
+                    .get(&mod_id)
+                    .is_some_and(|s| s.contains(&local_def_id)))
+        {
+            *ty = utils::ty!("{}", self.tcx.item_name(def_id));
         }
     }
 }
@@ -323,6 +359,36 @@ impl Int {
             Self::Isize(v) => v < 0,
             _ => false,
         }
+    }
+}
+
+struct HirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    imports: FxHashMap<LocalModDefId, FxHashSet<LocalDefId>>,
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_use(&mut self, path: &'tcx rustc_hir::UsePath<'tcx>, hir_id: rustc_hir::HirId) {
+        intravisit::walk_use(self, path, hir_id);
+
+        let mod_id = self.tcx.parent_module(path.segments[0].hir_id);
+        let mut add = |res: Option<Res>| {
+            if let Some(res) = res
+                && let Res::Def(_, def_id) = res
+                && let Some(def_id) = def_id.as_local()
+            {
+                self.imports.entry(mod_id).or_default().insert(def_id);
+            }
+        };
+        add(path.res.value_ns);
+        add(path.res.type_ns);
+        add(path.res.macro_ns);
     }
 }
 
