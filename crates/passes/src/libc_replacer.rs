@@ -13,6 +13,7 @@ use utils::{ast::unwrap_paren, expr};
 use crate::libc_replacer::errno::ErrorCode;
 
 mod errno;
+mod str_utils;
 mod strto;
 
 #[derive(Debug)]
@@ -295,6 +296,10 @@ impl MutVisitor for TransformVisitor<'_> {
                 "atoi" => {
                     let [arg] = args.as_slice() else { panic!() };
                     *expr = self.transform_atoi(arg);
+                }
+                "strlen" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    *expr = self.transform_strlen(arg);
                 }
                 _ => {}
             }

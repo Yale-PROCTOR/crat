@@ -22,7 +22,7 @@ impl super::TransformVisitor<'_> {
                 let array = pprust::expr_to_string(array);
                 return utils::expr!(
                     "crate::c_lib::strtod(
-                        &({array})[..],
+                        &({array}),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {error},
                     )"
@@ -32,7 +32,7 @@ impl super::TransformVisitor<'_> {
                 self.bytemuck = true;
                 return utils::expr!(
                     "crate::c_lib::strtod(
-                        bytemuck::cast_slice(&({array})[..]),
+                        bytemuck::cast_slice(&({array})),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {error},
                     )"
@@ -73,7 +73,7 @@ impl super::TransformVisitor<'_> {
                 let array = pprust::expr_to_string(array);
                 return utils::expr!(
                     "crate::c_lib::strtol(
-                        &({array})[..],
+                        &({array}),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {base_str},
                         {error},
@@ -84,7 +84,7 @@ impl super::TransformVisitor<'_> {
                 self.bytemuck = true;
                 return utils::expr!(
                     "crate::c_lib::strtol(
-                        bytemuck::cast_slice(&({array})[..]),
+                        bytemuck::cast_slice(&({array})),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {base_str},
                         {error},
@@ -127,7 +127,7 @@ impl super::TransformVisitor<'_> {
                 let array = pprust::expr_to_string(array);
                 return utils::expr!(
                     "crate::c_lib::strtoul(
-                        &({array})[..],
+                        &({array}),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {base_str},
                         {error},
@@ -138,7 +138,7 @@ impl super::TransformVisitor<'_> {
                 self.bytemuck = true;
                 return utils::expr!(
                     "crate::c_lib::strtoul(
-                        bytemuck::cast_slice(&({array})[..]),
+                        bytemuck::cast_slice(&({array})),
                         ({endptr_str} as *mut *const u8).as_mut(),
                         {base_str},
                         {error},
@@ -167,11 +167,11 @@ impl super::TransformVisitor<'_> {
         if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
             if ty == self.tcx.types.u8 {
                 let array = pprust::expr_to_string(array);
-                return utils::expr!("crate::c_lib::atof(&({array})[..])");
+                return utils::expr!("crate::c_lib::atof(&({array}))");
             } else if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
                 self.bytemuck = true;
-                return utils::expr!("crate::c_lib::atof(bytemuck::cast_slice(&({array})[..]))");
+                return utils::expr!("crate::c_lib::atof(bytemuck::cast_slice(&({array})))");
             }
         }
 
@@ -187,11 +187,11 @@ impl super::TransformVisitor<'_> {
         if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
             if ty == self.tcx.types.u8 {
                 let array = pprust::expr_to_string(array);
-                return utils::expr!("crate::c_lib::atoi(&({array})[..])");
+                return utils::expr!("crate::c_lib::atoi(&({array}))");
             } else if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
                 self.bytemuck = true;
-                return utils::expr!("crate::c_lib::atoi(bytemuck::cast_slice(&({array})[..]))");
+                return utils::expr!("crate::c_lib::atoi(bytemuck::cast_slice(&({array})))");
             }
         }
 

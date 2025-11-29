@@ -138,7 +138,7 @@ impl TransformVisitor<'_, '_, '_> {
                             let arg = pprust::expr_to_string(array);
                             write!(
                                 assigns,
-                                "({arg})[..___v_{i}.len()].copy_from_slice(&___v_{i}[..]);"
+                                "({arg})[..___v_{i}.len()].copy_from_slice(&___v_{i});"
                             )
                             .unwrap();
                             continue;
@@ -148,7 +148,7 @@ impl TransformVisitor<'_, '_, '_> {
                             write!(
                                 assigns,
                                 "bytemuck::cast_slice_mut(&mut ({arg})[..___v_{i}.len()])
-                                    .copy_from_slice(&___v_{i}[..]);"
+                                    .copy_from_slice(&___v_{i});"
                             )
                             .unwrap();
                             continue;
@@ -159,7 +159,7 @@ impl TransformVisitor<'_, '_, '_> {
                         assigns,
                         "let ___buf: &mut [i8] =
                             std::slice::from_raw_parts_mut(({arg}) as _, ___v_{i}.len());
-                        ___buf.copy_from_slice(&___v_{i}[..]);"
+                        ___buf.copy_from_slice(&___v_{i});"
                     )
                     .unwrap();
                 }
