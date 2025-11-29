@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
 use rustc_middle::ty::TyCtxt;
 use thin_vec::ThinVec;
-use utils::expr;
+use utils::{ast::unwrap_paren, expr};
 
 use crate::libc_replacer::errno::ErrorCode;
 
@@ -110,6 +110,12 @@ impl MutVisitor for TransformVisitor<'_> {
             if let StmtKind::Semi(expr) = &stmt.kind
                 && let Some(hir_id) = self.ast_to_hir.local_map.get(&expr.id)
                 && self.errno_calls.assigns.contains(hir_id)
+            {
+                false
+            } else if let StmtKind::Semi(expr) = &stmt.kind
+                && let ExprKind::Call(callee, _) = &unwrap_paren(expr).kind
+                && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
+                && path.segments.last().unwrap().ident.as_str() == "setlocale"
             {
                 false
             } else {
@@ -282,6 +288,14 @@ impl MutVisitor for TransformVisitor<'_> {
                         .and_then(|hir_id| self.source_nums.get(hir_id));
                     *expr = self.transform_strtoul(arg1, arg2, arg3, num.copied());
                 }
+                "atof" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    *expr = self.transform_atof(arg);
+                }
+                "atoi" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    *expr = self.transform_atoi(arg);
+                }
                 _ => {}
             }
         } else if let ExprKind::Binary(op, lhs, rhs) = &expr.kind
@@ -392,6 +406,8 @@ enum LibItem {
     Strtod,
     Strtol,
     Strtoul,
+    Atof,
+    Atoi,
     Peek,
     ParseFloat,
     ParseInteger,
@@ -403,6 +419,8 @@ impl LibItem {
             LibItem::Strtod => "strtod",
             LibItem::Strtol => "strtol",
             LibItem::Strtoul => "strtoul",
+            LibItem::Atof => "atof",
+            LibItem::Atoi => "atoi",
             LibItem::Peek => "peek",
             LibItem::ParseFloat => "parse_float",
             LibItem::ParseInteger => "parse_integer",
@@ -414,6 +432,8 @@ impl LibItem {
             LibItem::Strtod => strto::STRTOD,
             LibItem::Strtol => strto::STRTOL,
             LibItem::Strtoul => strto::STRTOUL,
+            LibItem::Atof => strto::ATOF,
+            LibItem::Atoi => strto::ATOI,
             LibItem::Peek => utils::c_lib::PEEK,
             LibItem::ParseFloat => utils::c_lib::PARSE_FLOAT,
             LibItem::ParseInteger => utils::c_lib::PARSE_INTEGER,

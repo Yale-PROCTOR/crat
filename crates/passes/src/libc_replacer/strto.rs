@@ -156,6 +156,47 @@ impl super::TransformVisitor<'_> {
             )"
         )
     }
+
+    pub fn transform_atof(&mut self, s: &Expr) -> Expr {
+        let s_str = pprust::expr_to_string(s);
+        self.num_traits = true;
+        self.lib_items.insert(LibItem::Atof);
+        self.lib_items.insert(LibItem::ParseFloat);
+        self.lib_items.insert(LibItem::Peek);
+
+        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
+            if ty == self.tcx.types.u8 {
+                let array = pprust::expr_to_string(array);
+                return utils::expr!("crate::c_lib::atof(&({array})[..])");
+            } else if ty == self.tcx.types.i8 {
+                let array = pprust::expr_to_string(array);
+                self.bytemuck = true;
+                return utils::expr!("crate::c_lib::atof(bytemuck::cast_slice(&({array})[..]))");
+            }
+        }
+
+        utils::expr!("crate::c_lib::atof(std::slice::from_raw_parts(({s_str}) as _, 100000))")
+    }
+
+    pub fn transform_atoi(&mut self, s: &Expr) -> Expr {
+        let s_str = pprust::expr_to_string(s);
+        self.lib_items.insert(LibItem::Atoi);
+        self.lib_items.insert(LibItem::ParseInteger);
+        self.lib_items.insert(LibItem::Peek);
+
+        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
+            if ty == self.tcx.types.u8 {
+                let array = pprust::expr_to_string(array);
+                return utils::expr!("crate::c_lib::atoi(&({array})[..])");
+            } else if ty == self.tcx.types.i8 {
+                let array = pprust::expr_to_string(array);
+                self.bytemuck = true;
+                return utils::expr!("crate::c_lib::atoi(bytemuck::cast_slice(&({array})[..]))");
+            }
+        }
+
+        utils::expr!("crate::c_lib::atoi(std::slice::from_raw_parts(({s_str}) as _, 100000))")
+    }
 }
 
 pub const STRTOD: &str = r#"
@@ -214,5 +255,23 @@ pub fn strtoul(
         *erange = e;
     }
     v.unwrap_or(0)
+}
+"#;
+
+pub const ATOF: &str = r#"
+pub fn atof(
+    mut str: &[u8],
+) -> f64 {
+    let (v, _) = parse_float(&mut str, None, None, None);
+    v.unwrap_or(0.0)
+}
+"#;
+
+pub const ATOI: &str = r#"
+pub fn atoi(
+    mut str: &[u8],
+) -> i32 {
+    let (v, _) = parse_integer(&mut str, 10, true, None, None, None);
+    v.unwrap_or(0) as i32
 }
 "#;
