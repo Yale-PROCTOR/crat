@@ -134,7 +134,7 @@ impl TransformVisitor<'_, '_, '_> {
     std::ffi::CStr::from_bytes_until_nul(&({receiver_str})).unwrap()"
                                 )
                             } else if ety.is_numeric() {
-                                self.bytemuck.set(true);
+                                self.dependencies.bytemuck.set(true);
                                 format!(
                                     "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({receiver_str}))).unwrap()"
@@ -163,7 +163,7 @@ impl TransformVisitor<'_, '_, '_> {
     std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
                                     )
                                 } else if ety.is_numeric() {
-                                    self.bytemuck.set(true);
+                                    self.dependencies.bytemuck.set(true);
                                     format!(
                                     "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"

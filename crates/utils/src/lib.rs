@@ -50,6 +50,15 @@ pub fn find_lib_path(dir: &std::path::Path) -> Result<String, String> {
     Ok(path.clone())
 }
 
+pub fn add_dependency(dir: &std::path::Path, name: &str, version: &str) {
+    let path = dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let mut doc = content.parse::<toml_edit::DocumentMut>().unwrap();
+    let dependencies = doc["dependencies"].as_table_mut().unwrap();
+    dependencies[name] = toml_edit::value(version);
+    std::fs::write(path, doc.to_string()).unwrap();
+}
+
 pub fn type_check(tcx: rustc_middle::ty::TyCtxt<'_>) {
     let () = tcx.analysis(());
 }

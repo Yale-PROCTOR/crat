@@ -7,6 +7,7 @@ edition = "2024"
 etrace.workspace = true
 typed-arena.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 lazy_static.workspace = true
 
 [package.metadata.rust-analyzer]

@@ -207,7 +207,6 @@ dependencies = [
  "etrace",
  "lazy_static",
  "serde",
- "toml_edit",
  "tracing",
  "typed-arena",
  "utils",
@@ -607,6 +606,7 @@ dependencies = [
  "etrace",
  "lazy_static",
  "toml",
+ "toml_edit",
  "typed-arena",
 ]
 

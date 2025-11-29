@@ -23,7 +23,7 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(s) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let e = format!(
                     "crate::c_lib::rs_fputs(
                         std::ffi::CStr::from_bytes_until_nul(
@@ -80,7 +80,7 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(s) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let e = format!(
                     "crate::c_lib::rs_puts(
                         std::ffi::CStr::from_bytes_until_nul(

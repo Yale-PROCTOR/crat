@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     fmt::Write as _,
     ops::{Deref, DerefMut},
 };
@@ -36,7 +36,7 @@ use super::{
     hir_ctx::{HirCtx, HirLoc},
     mir_loc::MirLoc,
     stream_ty::*,
-    transform::LibItem,
+    transform::{Dependencies, LibItem},
 };
 
 pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
@@ -75,8 +75,7 @@ pub(super) struct TransformVisitor<'tcx, 'a, 'b> {
     /// is stderr unsupported
     pub(super) is_stderr_unsupported: bool,
 
-    pub(super) tempfile: bool,
-    pub(super) bytemuck: Cell<bool>,
+    pub(super) dependencies: Dependencies,
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: FxHashSet<TraitBound>,
     pub(super) bound_num: usize,
@@ -716,7 +715,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                         "tmpfile" => {
                             let new_expr = self.transform_tmpfile();
                             self.replace_expr(expr, new_expr);
-                            self.tempfile = true;
+                            self.dependencies.tempfile.set(true);
                         }
                         "popen" => {
                             let new_expr = self.transform_popen(&args[0], &args[1]);

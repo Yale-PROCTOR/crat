@@ -35,7 +35,7 @@ impl TransformVisitor<'_, '_, '_> {
                 );
             } else if ty == self.tcx.types.u8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 return expr!(
                     "crate::c_lib::rs_fgets(
                         bytemuck::cast_slice_mut(&mut ({array})[..({n_str}) as usize]),

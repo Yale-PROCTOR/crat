@@ -1,7 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
     fmt::Write as _,
-    fs,
 };
 
 use etrace::some_or;
@@ -18,7 +17,6 @@ use rustc_middle::{
 };
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
 use serde::Deserialize;
-use toml_edit::DocumentMut;
 use typed_arena::Arena;
 use utils::{bit_set::BitSet16, file::api_list::Permission};
 
@@ -38,12 +36,18 @@ pub struct Config {
 #[derive(Debug)]
 pub struct TransformationResult {
     pub code: String,
-    pub tempfile: bool,
-    pub bytemuck: bool,
+    pub dependencies: Dependencies,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
     pub bound_num: usize,
     pub transformation_time: u128,
     pub analysis_stat: file_analysis::Statistics,
+}
+
+#[derive(Debug, Default)]
+pub struct Dependencies {
+    pub tempfile: Cell<bool>,
+    pub bytemuck: Cell<bool>,
+    pub num_traits: Cell<bool>,
 }
 
 pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
@@ -497,8 +501,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
         is_stdout_unsupported,
         is_stderr_unsupported,
 
-        tempfile: false,
-        bytemuck: Cell::new(false),
+        dependencies: Dependencies::default(),
         current_fns: vec![],
         bounds: FxHashSet::default(),
         bound_num: 0,
@@ -512,8 +515,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     let transformation_time = start.elapsed().as_millis();
 
     let TransformVisitor {
-        tempfile,
-        bytemuck,
+        dependencies,
         bounds,
         bound_num,
         unsupported_reasons,
@@ -584,8 +586,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     let code = pprust::crate_to_string_for_macros(&krate);
     TransformationResult {
         code,
-        tempfile,
-        bytemuck: bytemuck.get(),
+        dependencies,
         unsupported_reasons,
         bound_num,
         transformation_time,
@@ -640,20 +641,6 @@ fn lib_mod(
     }
     m.push('}');
     utils::item!("{m}")
-}
-
-pub fn add_deps(dir: &std::path::Path, tempfile: bool, bytemuck: bool) {
-    let path = dir.join("Cargo.toml");
-    let content = fs::read_to_string(&path).unwrap();
-    let mut doc = content.parse::<DocumentMut>().unwrap();
-    let dependencies = doc["dependencies"].as_table_mut().unwrap();
-    if tempfile && !dependencies.contains_key("tempfile") {
-        dependencies["tempfile"] = toml_edit::value("3.19.1");
-    }
-    if bytemuck && !dependencies.contains_key("bytemuck") {
-        dependencies["bytemuck"] = toml_edit::value("1.24.0");
-    }
-    fs::write(path, doc.to_string()).unwrap();
 }
 
 fn mir_local_span(

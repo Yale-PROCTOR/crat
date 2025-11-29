@@ -26,7 +26,7 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(ptr) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let code = format!(
                     "
     {{

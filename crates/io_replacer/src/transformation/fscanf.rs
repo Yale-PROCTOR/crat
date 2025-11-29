@@ -144,7 +144,7 @@ impl TransformVisitor<'_, '_, '_> {
                             continue;
                         } else if ty == self.tcx.types.u8 {
                             let arg = pprust::expr_to_string(array);
-                            self.bytemuck.set(true);
+                            self.dependencies.bytemuck.set(true);
                             write!(
                                 assigns,
                                 "bytemuck::cast_slice_mut(&mut ({arg})[..___v_{i}.len()])
@@ -166,6 +166,9 @@ impl TransformVisitor<'_, '_, '_> {
             }
         }
         code.push(')');
+        if parsing_fn.num_traits {
+            self.dependencies.num_traits.set(true);
+        }
         self.lib_items.borrow_mut().extend(parsing_fn.lib_items);
         self.lib_items.borrow_mut().insert(LibItem::Peek);
         self.lib_items.borrow_mut().insert(LibItem::IsEof);
@@ -184,10 +187,12 @@ struct ParsingFunction {
     name: String,
     code: String,
     lib_items: Vec<LibItem>,
+    num_traits: bool,
 }
 
 fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     let mut lib_items = vec![];
+    let mut num_traits = false;
     let mut name = "scan".to_string();
     let mut args = String::new();
     write!(
@@ -287,6 +292,7 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
                 "parse_hexadecimal"
             }
             Conversion::Double => {
+                num_traits = true;
                 lib_items.push(LibItem::ParseFloat);
                 match spec.length {
                     None => {
@@ -357,6 +363,7 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
         name,
         code,
         lib_items,
+        num_traits,
     }
 }
 
@@ -469,14 +476,6 @@ fn parse_f32<R: std::io::BufRead>(
         width,
         err,
         eof,
-        FloatValues {
-            infinity_value: f32::INFINITY,
-            neg_infinity_value: f32::NEG_INFINITY,
-            nan_value: f32::NAN,
-            zero_value: 0.0,
-            is_infinite: f32::is_infinite,
-        },
-        str::parse,
     ).0
 }
 "#;
@@ -493,14 +492,6 @@ fn parse_f64<R: std::io::BufRead>(
         width,
         err,
         eof,
-        FloatValues {
-            infinity_value: f64::INFINITY,
-            neg_infinity_value: f64::NEG_INFINITY,
-            nan_value: f64::NAN,
-            zero_value: 0.0,
-            is_infinite: f64::is_infinite,
-        },
-        str::parse,
     ).0
 }
 "#;
@@ -517,35 +508,17 @@ fn parse_f128<R: std::io::BufRead>(
         width,
         err,
         eof,
-        FloatValues {
-            infinity_value: f128::f128::INFINITY,
-            neg_infinity_value: f128::f128::NEG_INFINITY,
-            nan_value: f128::f128::NAN,
-            zero_value: f128::f128::ZERO,
-            is_infinite: f128::f128::is_infinite,
-        },
-        |s| <f128::f128 as num_traits::Num>::from_str_radix(s, 10),
     ).0
 }
 "#;
 
 pub(super) static PARSE_FLOAT: &str = r#"
-struct FloatValues<F> {
-    infinity_value: F,
-    neg_infinity_value: F,
-    nan_value: F,
-    zero_value: F,
-    is_infinite: fn(F) -> bool,
-}
-
 #[inline]
-fn parse_float<R: std::io::BufRead, F: Copy + PartialEq, E>(
+fn parse_float<R: std::io::BufRead, F: num_traits::Float + num_traits::Num>(
     mut stream: R,
     width: Option<usize>,
     mut err: Option<&mut i32>,
     mut eof: Option<&mut i32>,
-    values: FloatValues<F>,
-    parse: impl Fn(&str) -> Result<F, E>,
 ) -> (Option<F>, bool) {
     let mut neg = false;
     while peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()).is_ascii_whitespace() {
@@ -574,9 +547,9 @@ fn parse_float<R: std::io::BufRead, F: Copy + PartialEq, E>(
     if i == 3 || i == 8 {
         peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         let v = if neg {
-            values.neg_infinity_value
+            F::neg_infinity()
         } else {
-            values.infinity_value
+            F::infinity()
         };
         return (Some(v), false);
     } else if i > 0 {
@@ -597,7 +570,7 @@ fn parse_float<R: std::io::BufRead, F: Copy + PartialEq, E>(
     }
     if i == 3 {
         peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
-        return (Some(values.nan_value), false);
+        return (Some(F::nan()), false);
     } else if i > 0 {
         return (None, false);
     }
@@ -662,11 +635,11 @@ fn parse_float<R: std::io::BufRead, F: Copy + PartialEq, E>(
     }
 
     let s = std::str::from_utf8(&v).unwrap();
-    let f = match parse(s) {
+    let f = match F::from_str_radix(s, 10) {
         Ok(f) => f,
         Err(_) => panic!(),
     };
-    let erange = (values.is_infinite)(f) || is_nonzero && f == values.zero_value;
+    let erange = f.is_infinite() || is_nonzero && f.is_zero();
     (Some(f), erange)
 }
 "#;
