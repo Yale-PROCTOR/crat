@@ -62,11 +62,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                         let mut dest_ty = typeck.expr_ty(dest_hir_expr);
                         let mut src_ty = typeck.expr_ty(src_hir_expr);
-                        while let TyKind::Ref(_, dest_inner_ty, _) = dest_ty.kind() {
-                            dest_ty = dest_inner_ty.clone();
+                        let mut is_dest_ref = false;
+                        let mut is_src_ref = false;
+                        while let TyKind::Ref(_, _dest_ty, _) = dest_ty.kind() {
+                            is_dest_ref = true;
+                            dest_ty = _dest_ty.clone();
                         }
-                        while let TyKind::Ref(_, src_inner_ty, _) = src_ty.kind() {
-                            src_ty = src_inner_ty.clone();
+                        while let TyKind::Ref(_, _src_ty, _) = src_ty.kind() {
+                            is_src_ref = true;
+                            src_ty = _src_ty.clone();
                         }
                         if let TyKind::Slice(dest_inner_ty) = dest_ty.kind()
                             && let TyKind::Slice(src_inner_ty) = src_ty.kind()
@@ -89,10 +93,12 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                                 // could not determine length, use size_expr directly
                                 self.bytemuck.set(true);
                                 *expr = utils::expr!(
-                                    "(bytemuck::cast_slice_mut::<_, u8>({0})[..({2}) as usize]).copy_from_slice(&bytemuck::cast_slice({1})[..({2}) as usize])",
+                                    "(bytemuck::cast_slice_mut::<_, u8>({3}{0})[..({2}) as usize]).copy_from_slice(&bytemuck::cast_slice({4}{1})[..({2}) as usize])",
                                     pprust::expr_to_string(dest_expr),
                                     pprust::expr_to_string(src_expr),
-                                    pprust::expr_to_string(&size_expr)
+                                    pprust::expr_to_string(&size_expr),
+                                    if is_dest_ref { "" } else { "&mut " },
+                                    if is_src_ref { "" } else { "&" }
                                 )
                             }
                         }
