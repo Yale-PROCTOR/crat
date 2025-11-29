@@ -23,9 +23,9 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(s) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let e = format!(
-                    "crate::stdio::rs_fputs(
+                    "crate::c_lib::rs_fputs(
                         std::ffi::CStr::from_bytes_until_nul(
                             bytemuck::cast_slice(&({array}))
                         ).unwrap(),
@@ -36,7 +36,7 @@ impl TransformVisitor<'_, '_, '_> {
             } else if ty == self.tcx.types.u8 {
                 let array = pprust::expr_to_string(array);
                 let e = format!(
-                    "crate::stdio::rs_fputs(
+                    "crate::c_lib::rs_fputs(
                         std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
                         {stream_str},
                     )"
@@ -48,7 +48,7 @@ impl TransformVisitor<'_, '_, '_> {
         self.update_error_no_eof(
             ic,
             format!(
-                "crate::stdio::rs_fputs(std::ffi::CStr::from_ptr(({s_str}) as _), {stream_str})"
+                "crate::c_lib::rs_fputs(std::ffi::CStr::from_ptr(({s_str}) as _), {stream_str})"
             ),
             stream,
         )
@@ -80,9 +80,9 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(s) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let e = format!(
-                    "crate::stdio::rs_puts(
+                    "crate::c_lib::rs_puts(
                         std::ffi::CStr::from_bytes_until_nul(
                             bytemuck::cast_slice(&({array}))
                         ).unwrap(),
@@ -92,7 +92,7 @@ impl TransformVisitor<'_, '_, '_> {
             } else if ty == self.tcx.types.u8 {
                 let array = pprust::expr_to_string(array);
                 let e = format!(
-                    "crate::stdio::rs_puts(
+                    "crate::c_lib::rs_puts(
                         std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
                     )"
                 );
@@ -102,7 +102,7 @@ impl TransformVisitor<'_, '_, '_> {
 
         self.update_error_no_eof(
             ic,
-            format!("crate::stdio::rs_puts(std::ffi::CStr::from_ptr(({s_str}) as _))"),
+            format!("crate::c_lib::rs_puts(std::ffi::CStr::from_ptr(({s_str}) as _))"),
             &StdExpr::stdout(),
         )
     }
@@ -111,7 +111,7 @@ impl TransformVisitor<'_, '_, '_> {
     pub(super) fn transform_perror(&self, s: &Expr) -> Expr {
         let s = pprust::expr_to_string(s);
         self.lib_items.borrow_mut().insert(LibItem::Perror);
-        expr!("crate::stdio::rs_perror({})", s)
+        expr!("crate::c_lib::rs_perror({})", s)
     }
 }
 

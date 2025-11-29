@@ -354,10 +354,10 @@ impl Conversion {
                 Some(LongDouble) => panic!(),
             },
             Self::Hexadecimal | Self::HexadecimalUpper => match length {
-                None => "crate::stdio::Xu32",
-                Some(Char) => "crate::stdio::Xu8",
-                Some(Short) => "crate::stdio::Xu16",
-                Some(Long | LongLong | IntMax | Size | PtrDiff) => "crate::stdio::Xu64",
+                None => "crate::c_lib::Xu32",
+                Some(Char) => "crate::c_lib::Xu8",
+                Some(Short) => "crate::c_lib::Xu16",
+                Some(Long | LongLong | IntMax | Size | PtrDiff) => "crate::c_lib::Xu64",
                 Some(LongDouble) => panic!(),
             },
             Self::Double | Self::DoubleExp => match length {
@@ -366,11 +366,11 @@ impl Conversion {
                 _ => panic!(),
             },
             Self::DoubleAuto => match length {
-                None | Some(Long) => "crate::stdio::Gf64",
+                None | Some(Long) => "crate::c_lib::Gf64",
                 _ => panic!(),
             },
             Self::DoubleHex => match length {
-                None | Some(Long) => "crate::stdio::Af64",
+                None | Some(Long) => "crate::c_lib::Af64",
                 _ => panic!(),
             },
             Self::Char => "u8 as char",

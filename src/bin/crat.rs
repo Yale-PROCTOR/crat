@@ -458,8 +458,14 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Libc => {
-                let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
-                std::fs::write(&file, s).unwrap();
+                let res = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
+                std::fs::write(&file, res.code).unwrap();
+                if res.bytemuck {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                if res.num_traits {
+                    utils::add_dependency(&dir, "num-traits", "0.2.19");
+                }
             }
             Pass::OutParam => {
                 run_compiler_on_path(&file, |tcx| {
@@ -481,7 +487,15 @@ fn main() {
                     run_compiler_on_path(&file, |tcx| io_replacer::replace_io(config.io, tcx))
                         .unwrap();
                 std::fs::write(&file, res.code).unwrap();
-                io_replacer::add_deps(&dir, res.tempfile, res.bytemuck);
+                if res.dependencies.tempfile.get() {
+                    utils::add_dependency(&dir, "tempfile", "3.19.1");
+                }
+                if res.dependencies.bytemuck.get() {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                if res.dependencies.num_traits.get() {
+                    utils::add_dependency(&dir, "num-traits", "0.2.19");
+                }
             }
             Pass::Pointer => {
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
@@ -489,7 +503,9 @@ fn main() {
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
-                io_replacer::add_deps(&dir, false, bytemuck);
+                if bytemuck {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
             }
             Pass::Static => {
                 let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();

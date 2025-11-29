@@ -59,7 +59,7 @@ impl TransformVisitor<'_, '_, '_> {
         }
         let stream_str = stream.borrow_for(StreamTrait::Write);
         let fmt = pprust::expr_to_string(fmt);
-        let mut s = format!("crate::stdio::rs_fprintf({stream_str}, {fmt}");
+        let mut s = format!("crate::c_lib::rs_fprintf({stream_str}, {fmt}");
         for arg in args {
             let arg = pprust::expr_to_string(arg);
             s.push_str(", ");
@@ -134,7 +134,7 @@ impl TransformVisitor<'_, '_, '_> {
     std::ffi::CStr::from_bytes_until_nul(&({receiver_str})).unwrap()"
                                 )
                             } else if ety.is_numeric() {
-                                self.bytemuck.set(true);
+                                self.dependencies.bytemuck.set(true);
                                 format!(
                                     "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({receiver_str}))).unwrap()"
@@ -163,7 +163,7 @@ impl TransformVisitor<'_, '_, '_> {
     std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
                                     )
                                 } else if ety.is_numeric() {
-                                    self.bytemuck.set(true);
+                                    self.dependencies.bytemuck.set(true);
                                     format!(
                                     "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
@@ -213,15 +213,15 @@ impl TransformVisitor<'_, '_, '_> {
 }}, "
                 )
                 .unwrap(),
-                "crate::stdio::Xu8" | "crate::stdio::Xu16" | "crate::stdio::Xu32"
-                | "crate::stdio::Xu64" | "crate::stdio::Gf64" | "crate::stdio::Af64" => {
+                "crate::c_lib::Xu8" | "crate::c_lib::Xu16" | "crate::c_lib::Xu32"
+                | "crate::c_lib::Xu64" | "crate::c_lib::Gf64" | "crate::c_lib::Af64" => {
                     match cast {
-                        "crate::stdio::Xu8" => self.lib_items.borrow_mut().insert(LibItem::Xu8),
-                        "crate::stdio::Xu16" => self.lib_items.borrow_mut().insert(LibItem::Xu16),
-                        "crate::stdio::Xu32" => self.lib_items.borrow_mut().insert(LibItem::Xu32),
-                        "crate::stdio::Xu64" => self.lib_items.borrow_mut().insert(LibItem::Xu64),
-                        "crate::stdio::Gf64" => self.lib_items.borrow_mut().insert(LibItem::Gf64),
-                        "crate::stdio::Af64" => self.lib_items.borrow_mut().insert(LibItem::Af64),
+                        "crate::c_lib::Xu8" => self.lib_items.borrow_mut().insert(LibItem::Xu8),
+                        "crate::c_lib::Xu16" => self.lib_items.borrow_mut().insert(LibItem::Xu16),
+                        "crate::c_lib::Xu32" => self.lib_items.borrow_mut().insert(LibItem::Xu32),
+                        "crate::c_lib::Xu64" => self.lib_items.borrow_mut().insert(LibItem::Xu64),
+                        "crate::c_lib::Gf64" => self.lib_items.borrow_mut().insert(LibItem::Gf64),
+                        "crate::c_lib::Af64" => self.lib_items.borrow_mut().insert(LibItem::Af64),
                         _ => panic!(),
                     };
                     write!(args, "{cast}(({arg_str}) as _), ").unwrap()
@@ -283,7 +283,7 @@ impl TransformVisitor<'_, '_, '_> {
         self.lib_items.borrow_mut().extend(VFPRINTF_ITEMS);
         self.update_error_no_eof(
             ic,
-            format!("crate::stdio::rs_vfprintf({stream_str}, {fmt}, {args})"),
+            format!("crate::c_lib::rs_vfprintf({stream_str}, {fmt}, {args})"),
             stream,
         )
     }

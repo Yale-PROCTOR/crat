@@ -85,6 +85,7 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
         tcx,
         thir: &thir,
         bindings: FxHashMap::default(),
+        verbose,
     };
     for param in &thir.params {
         if let Some(pat) = &param.pat {
@@ -521,7 +522,7 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
             ExprKind::PlaceUnwrapUnsafeBinder { .. } => panic!(),
             ExprKind::ValueUnwrapUnsafeBinder { .. } => panic!(),
             ExprKind::WrapUnsafeBinder { .. } => panic!(),
-            ExprKind::Closure(_) => panic!(),
+            ExprKind::Closure(_) => {} // TODO
             ExprKind::OffsetOf { .. } => panic!(),
             ExprKind::Yield { .. } => panic!(),
         }
@@ -1015,6 +1016,7 @@ struct BindingVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     thir: &'a Thir<'tcx>,
     bindings: FxHashMap<Span, (HirId, Ty<'tcx>)>,
+    verbose: bool,
 }
 
 impl<'a, 'tcx> TVisitor<'a, 'tcx> for BindingVisitor<'a, 'tcx> {
@@ -1028,7 +1030,9 @@ impl<'a, 'tcx> TVisitor<'a, 'tcx> for BindingVisitor<'a, 'tcx> {
             if let Some((old, _)) = old {
                 let old = self.tcx.hir_name(old);
                 let var = self.tcx.hir_name(var.0);
-                println!("{old} {var}");
+                if self.verbose {
+                    println!("{old} {var}");
+                }
             }
         }
         thir::visit::walk_pat(self, pat);

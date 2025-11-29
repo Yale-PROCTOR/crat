@@ -1154,7 +1154,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         match hir_unwrap_subscript(expr).kind {
             hir::ExprKind::Path(_) => PathOrDeref::Path,
             hir::ExprKind::Unary(UnOp::Deref, e) => {
-                let e = &hir_unwrap_drop_temps(e);
+                let e = utils::hir::unwrap_drop_temps(e);
                 let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = e.kind else {
                     return PathOrDeref::Other;
                 };
@@ -1393,29 +1393,21 @@ fn unwrap_subscript_mut(expr: &mut Expr) -> &mut Expr {
     unwrap_subscript_mut(e)
 }
 
-fn hir_unwrap_drop_temps<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
-    if let hir::ExprKind::DropTemps(e) = expr.kind {
-        hir_unwrap_drop_temps(e)
-    } else {
-        expr
-    }
-}
-
 fn hir_unwrap_cast<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
-    if let hir::ExprKind::Cast(e, _) = hir_unwrap_drop_temps(expr).kind {
+    if let hir::ExprKind::Cast(e, _) = utils::hir::unwrap_drop_temps(expr).kind {
         hir_unwrap_cast(e)
     } else {
-        hir_unwrap_drop_temps(expr)
+        utils::hir::unwrap_drop_temps(expr)
     }
 }
 
 fn hir_unwrap_addr_of_deref<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
-    if let hir::ExprKind::AddrOf(_, _, e) = hir_unwrap_drop_temps(expr).kind
-        && let hir::ExprKind::Unary(UnOp::Deref, e) = hir_unwrap_drop_temps(e).kind
+    if let hir::ExprKind::AddrOf(_, _, e) = utils::hir::unwrap_drop_temps(expr).kind
+        && let hir::ExprKind::Unary(UnOp::Deref, e) = utils::hir::unwrap_drop_temps(e).kind
     {
         hir_unwrap_addr_of_deref(e)
     } else {
-        hir_unwrap_drop_temps(expr)
+        utils::hir::unwrap_drop_temps(expr)
     }
 }
 

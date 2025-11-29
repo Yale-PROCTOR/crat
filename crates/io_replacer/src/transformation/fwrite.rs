@@ -26,12 +26,12 @@ impl TransformVisitor<'_, '_, '_> {
         if let Some((array, ty)) = self.array_of_as_ptr(ptr) {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
-                self.bytemuck.set(true);
+                self.dependencies.bytemuck.set(true);
                 let code = format!(
                     "
     {{
         let ___size = {size};
-        crate::stdio::rs_fwrite(
+        crate::c_lib::rs_fwrite(
             bytemuck::cast_slice(&({array})[..(___size * ({nitems})) as usize]),
             ___size,
             {stream_str}
@@ -45,7 +45,7 @@ impl TransformVisitor<'_, '_, '_> {
                     "
     {{
         let ___size = {size};
-        crate::stdio::rs_fwrite(
+        crate::c_lib::rs_fwrite(
             &({array})[..(___size * ({nitems})) as usize],
             ___size,
             {stream_str}
@@ -62,7 +62,7 @@ impl TransformVisitor<'_, '_, '_> {
                 "
     {{
         let ___size = {size};
-        crate::stdio::rs_fwrite(
+        crate::c_lib::rs_fwrite(
             std::slice::from_raw_parts(({ptr_str}) as _, (___size * ({nitems})) as usize),
             ___size,
             {stream_str}

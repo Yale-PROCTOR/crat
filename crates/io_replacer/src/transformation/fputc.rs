@@ -20,7 +20,7 @@ impl TransformVisitor<'_, '_, '_> {
         self.lib_items.borrow_mut().insert(LibItem::Fputc);
         self.update_error_no_eof(
             ic,
-            format!("crate::stdio::rs_fputc({c}, {stream_str})"),
+            format!("crate::c_lib::rs_fputc({c}, {stream_str})"),
             stream,
         )
     }
@@ -37,7 +37,7 @@ impl TransformVisitor<'_, '_, '_> {
         self.lib_items.borrow_mut().insert(LibItem::Fputwc);
         self.update_error_no_eof(
             ic,
-            format!("crate::stdio::rs_fputwc({c}, {stream_str})"),
+            format!("crate::c_lib::rs_fputwc({c}, {stream_str})"),
             stream,
         )
     }

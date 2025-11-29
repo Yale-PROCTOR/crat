@@ -1,7 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
     fmt::Write as _,
-    fs,
 };
 
 use etrace::some_or;
@@ -18,7 +17,6 @@ use rustc_middle::{
 };
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
 use serde::Deserialize;
-use toml_edit::DocumentMut;
 use typed_arena::Arena;
 use utils::{bit_set::BitSet16, file::api_list::Permission};
 
@@ -38,12 +36,18 @@ pub struct Config {
 #[derive(Debug)]
 pub struct TransformationResult {
     pub code: String,
-    pub tempfile: bool,
-    pub bytemuck: bool,
+    pub dependencies: Dependencies,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
     pub bound_num: usize,
     pub transformation_time: u128,
     pub analysis_stat: file_analysis::Statistics,
+}
+
+#[derive(Debug, Default)]
+pub struct Dependencies {
+    pub tempfile: Cell<bool>,
+    pub bytemuck: Cell<bool>,
+    pub num_traits: Cell<bool>,
 }
 
 pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
@@ -497,8 +501,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
         is_stdout_unsupported,
         is_stderr_unsupported,
 
-        tempfile: false,
-        bytemuck: Cell::new(false),
+        dependencies: Dependencies::default(),
         current_fns: vec![],
         bounds: FxHashSet::default(),
         bound_num: 0,
@@ -512,8 +515,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     let transformation_time = start.elapsed().as_millis();
 
     let TransformVisitor {
-        tempfile,
-        bytemuck,
+        dependencies,
         bounds,
         bound_num,
         unsupported_reasons,
@@ -540,7 +542,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items.insert(LibItem::ChildClose);
     }
 
-    krate.items.push(rustc_ast::ptr::P(stdio_mod(
+    krate.items.push(rustc_ast::ptr::P(lib_mod(
         &bounds,
         &lib_items,
         &parsing_fns,
@@ -584,8 +586,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     let code = pprust::crate_to_string_for_macros(&krate);
     TransformationResult {
         code,
-        tempfile,
-        bytemuck: bytemuck.get(),
+        dependencies,
         unsupported_reasons,
         bound_num,
         transformation_time,
@@ -593,12 +594,12 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     }
 }
 
-fn stdio_mod(
+fn lib_mod(
     bounds: &FxHashSet<TraitBound>,
     lib_items: &FxHashSet<LibItem>,
     parsing_fns: &FxHashMap<String, String>,
 ) -> rustc_ast::Item {
-    let mut m = "mod stdio {".to_string();
+    let mut m = "mod c_lib {".to_string();
     m.push_str(
         r#"
         pub static mut STDOUT_ERROR: i32 = 0;
@@ -640,20 +641,6 @@ fn stdio_mod(
     }
     m.push('}');
     utils::item!("{m}")
-}
-
-pub fn add_deps(dir: &std::path::Path, tempfile: bool, bytemuck: bool) {
-    let path = dir.join("Cargo.toml");
-    let content = fs::read_to_string(&path).unwrap();
-    let mut doc = content.parse::<DocumentMut>().unwrap();
-    let dependencies = doc["dependencies"].as_table_mut().unwrap();
-    if tempfile && !dependencies.contains_key("tempfile") {
-        dependencies["tempfile"] = toml_edit::value("3.19.1");
-    }
-    if bytemuck && !dependencies.contains_key("bytemuck") {
-        dependencies["bytemuck"] = toml_edit::value("1.24.0");
-    }
-    fs::write(path, doc.to_string()).unwrap();
 }
 
 fn mir_local_span(
@@ -699,11 +686,11 @@ pub(super) enum LibItem {
     ParseF128,
     ParseFloat,
     ParseDecimal,
+    ParseIntAuto,
     ParseOctal,
-    ParseInteger,
-    ParseIntState,
+    ParseUnsigned,
     ParseHexadecimal,
-    ParseIntegerAuto,
+    ParseInteger,
     Fprintf,
     Vfprintf,
     Xu8,
@@ -741,8 +728,8 @@ pub(super) enum LibItem {
     ChildClose,
 }
 
-static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
-    (LibItem::Peek, super::fscanf::PEEK),
+static LIB_ITEMS_ARRAY: &[(LibItem, &str)] = &[
+    (LibItem::Peek, utils::c_lib::PEEK),
     (LibItem::IsEof, super::fscanf::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
     (LibItem::ParseScanSet, super::fscanf::PARSE_SCAN_SET),
@@ -750,13 +737,13 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
     (LibItem::ParseF32, super::fscanf::PARSE_F32),
     (LibItem::ParseF64, super::fscanf::PARSE_F64),
     (LibItem::ParseF128, super::fscanf::PARSE_F128),
-    (LibItem::ParseFloat, super::fscanf::PARSE_FLOAT),
+    (LibItem::ParseFloat, utils::c_lib::PARSE_FLOAT),
     (LibItem::ParseDecimal, super::fscanf::PARSE_DECIMAL),
+    (LibItem::ParseIntAuto, super::fscanf::PARSE_INT_AUTO),
     (LibItem::ParseOctal, super::fscanf::PARSE_OCTAL),
-    (LibItem::ParseInteger, super::fscanf::PARSE_INTEGER),
-    (LibItem::ParseIntState, super::fscanf::PARSE_INT_STATE),
+    (LibItem::ParseUnsigned, super::fscanf::PARSE_UNSIGNED),
     (LibItem::ParseHexadecimal, super::fscanf::PARSE_HEXADECIMAL),
-    (LibItem::ParseIntegerAuto, super::fscanf::PARSE_INTEGER_AUTO),
+    (LibItem::ParseInteger, utils::c_lib::PARSE_INTEGER),
     (LibItem::Fprintf, super::fprintf::FPRINTF),
     (LibItem::Vfprintf, super::fprintf::VFPRINTF),
     (LibItem::Xu8, super::fprintf::XU8),

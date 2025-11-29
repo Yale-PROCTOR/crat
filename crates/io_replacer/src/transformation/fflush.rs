@@ -15,7 +15,7 @@ impl TransformVisitor<'_, '_, '_> {
     ) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Write);
         self.lib_items.borrow_mut().insert(LibItem::Fflush);
-        self.update_error_no_eof(ic, format!("crate::stdio::rs_fflush({stream_str})"), stream)
+        self.update_error_no_eof(ic, format!("crate::c_lib::rs_fflush({stream_str})"), stream)
     }
 }
 

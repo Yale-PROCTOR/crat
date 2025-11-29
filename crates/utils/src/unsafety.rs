@@ -449,7 +449,12 @@ impl<'a, 'tcx, H: UnsafetyHandler> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tc
                     } else {
                         None
                     };
-                    self.requires_unsafe(expr.span, CallToUnsafeFunction(func_id));
+                    if func_id.is_none_or(|func_id| {
+                        let name = self.tcx.item_name(func_id);
+                        name != rustc_span::sym::new_v1_formatted
+                    }) {
+                        self.requires_unsafe(expr.span, CallToUnsafeFunction(func_id));
+                    }
                 } else if let &ty::FnDef(func_did, _) = fn_ty.kind() {
                     if !self
                         .tcx

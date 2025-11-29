@@ -207,7 +207,6 @@ dependencies = [
  "etrace",
  "lazy_static",
  "serde",
- "toml_edit",
  "tracing",
  "typed-arena",
  "utils",
@@ -278,6 +277,7 @@ name = "passes"
 version = "0.1.0"
 dependencies = [
  "etrace",
+ "lazy_static",
  "serde",
  "serde_json",
  "toml_edit",
@@ -607,6 +607,7 @@ dependencies = [
  "etrace",
  "lazy_static",
  "toml",
+ "toml_edit",
  "typed-arena",
 ]
 

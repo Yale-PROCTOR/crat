@@ -21,7 +21,7 @@ impl TransformVisitor<'_, '_, '_> {
                 .{1}(std::process::Stdio::piped())
                 .spawn()
                 .ok()
-                .map(|c| crate::stdio::Child::new(c))"#,
+                .map(|c| crate::c_lib::Child::new(c))"#,
                     command,
                     field
                 )
