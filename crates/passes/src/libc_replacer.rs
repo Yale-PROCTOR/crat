@@ -301,6 +301,23 @@ impl MutVisitor for TransformVisitor<'_> {
                     let [arg] = args.as_slice() else { panic!() };
                     *expr = self.transform_strlen(arg);
                 }
+                "strncpy" => {
+                    if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                        && let rustc_hir::Node::Stmt(stmt) =
+                            self.tcx.parent_hir_node(hir_expr.hir_id)
+                        && matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                        && let [arg1, arg2, arg3] = args.as_slice()
+                        && let Some(e) = self.transform_strncpy(arg1, arg2, arg3)
+                    {
+                        *expr = e;
+                    }
+                }
+                "strcspn" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcspn(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
                 _ => {}
             }
         } else if let ExprKind::Binary(op, lhs, rhs) = &expr.kind

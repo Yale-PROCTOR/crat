@@ -167,7 +167,7 @@ pub fn libc_call<'tcx>(
                 database,
             );
         }
-        "fdopen" | "fopen" | "atoi" | "atof" => return,
+        "fdopen" | "fopen" | "atoi" | "atof" | "strcspn" => return,
         _ => {}
     }
 
