@@ -514,6 +514,7 @@ fn main() {
             }
             Pass::Simpl => {
                 let s = run_compiler_on_path(&file, simplifier::simplify).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Array => {
                 let (s, bytemuck) =

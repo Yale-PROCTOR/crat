@@ -74,14 +74,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         }
                         if let TyKind::Slice(dest_inner_ty) = dest_ty.kind()
                             && let TyKind::Slice(src_inner_ty) = src_ty.kind()
-                            && dest_inner_ty == src_inner_ty
                         {
                             let size_expr = &args[2];
-                            if let Some(len_expr) = self.get_len_from_size(
-                                size_expr,
-                                dest_inner_ty.clone(),
-                                hir_expr.hir_id.owner.def_id,
-                            ) {
+                            if dest_inner_ty == src_inner_ty
+                                && let Some(len_expr) = self.get_len_from_size(
+                                    size_expr,
+                                    dest_inner_ty.clone(),
+                                    hir_expr.hir_id.owner.def_id,
+                                )
+                            {
                                 // replace memcpy with slice copy
                                 *expr = utils::expr!(
                                     "({0}[..({2}) as usize]).copy_from_slice(&{1}[..({2}) as usize])",
