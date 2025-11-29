@@ -458,8 +458,14 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Libc => {
-                let s = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
-                std::fs::write(&file, s).unwrap();
+                let res = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
+                std::fs::write(&file, res.code).unwrap();
+                if res.bytemuck {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                if res.num_traits {
+                    utils::add_dependency(&dir, "num-traits", "0.2.19");
+                }
             }
             Pass::OutParam => {
                 run_compiler_on_path(&file, |tcx| {

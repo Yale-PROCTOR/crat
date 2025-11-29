@@ -10,6 +10,7 @@ serde_json.workspace = true
 etrace.workspace = true
 typed-arena.workspace = true
 toml_edit.workspace = true
+lazy_static.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

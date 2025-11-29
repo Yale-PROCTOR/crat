@@ -52,6 +52,7 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         "never_type",
         "panic_internals",
         "thread_local_internals",
+        "coverage_attribute",
     ]
     .into_iter()
     .collect();

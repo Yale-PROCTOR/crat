@@ -21,7 +21,6 @@ use rustc_middle::{ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym, symbol::Ident};
 use smallvec::smallvec;
 use utils::{
-    ast::unwrap_cast_and_paren,
     bit_set::{BitSet8, BitSet16},
     expr,
     file::api_list::{self, Origin, Permission},
@@ -392,21 +391,7 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
     }
 
     pub(super) fn array_of_as_ptr<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, ty::Ty<'tcx>)> {
-        if let rustc_ast::ExprKind::MethodCall(call) = &unwrap_cast_and_paren(e).kind
-            && let name = call.seg.ident.name.as_str()
-            && (name == "as_mut_ptr" || name == "as_ptr")
-            && let hir_e = self
-                .ast_to_hir
-                .get_expr(call.receiver.id, self.tcx)
-                .unwrap()
-            && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
-            && let ty = typeck.expr_ty(hir_e).peel_refs()
-            && let ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) = ty.kind()
-        {
-            Some((&call.receiver, *ty))
-        } else {
-            None
-        }
+        utils::ir::array_of_as_ptr(e, &self.ast_to_hir, self.tcx)
     }
 }
 

@@ -728,8 +728,8 @@ pub(super) enum LibItem {
     ChildClose,
 }
 
-static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
-    (LibItem::Peek, super::fscanf::PEEK),
+static LIB_ITEMS_ARRAY: &[(LibItem, &str)] = &[
+    (LibItem::Peek, utils::c_lib::PEEK),
     (LibItem::IsEof, super::fscanf::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
     (LibItem::ParseScanSet, super::fscanf::PARSE_SCAN_SET),
@@ -737,13 +737,13 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
     (LibItem::ParseF32, super::fscanf::PARSE_F32),
     (LibItem::ParseF64, super::fscanf::PARSE_F64),
     (LibItem::ParseF128, super::fscanf::PARSE_F128),
-    (LibItem::ParseFloat, super::fscanf::PARSE_FLOAT),
+    (LibItem::ParseFloat, utils::c_lib::PARSE_FLOAT),
     (LibItem::ParseDecimal, super::fscanf::PARSE_DECIMAL),
     (LibItem::ParseIntAuto, super::fscanf::PARSE_INT_AUTO),
     (LibItem::ParseOctal, super::fscanf::PARSE_OCTAL),
     (LibItem::ParseUnsigned, super::fscanf::PARSE_UNSIGNED),
     (LibItem::ParseHexadecimal, super::fscanf::PARSE_HEXADECIMAL),
-    (LibItem::ParseInteger, super::fscanf::PARSE_INTEGER),
+    (LibItem::ParseInteger, utils::c_lib::PARSE_INTEGER),
     (LibItem::Fprintf, super::fprintf::FPRINTF),
     (LibItem::Vfprintf, super::fprintf::VFPRINTF),
     (LibItem::Xu8, super::fprintf::XU8),

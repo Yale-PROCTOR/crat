@@ -25,11 +25,13 @@ extern crate thin_vec;
 
 pub mod ast;
 pub mod bit_set;
+pub mod c_lib;
 pub mod compilation;
 pub mod disjoint_set;
 pub mod equiv_classes;
 pub mod file;
 pub mod graph;
+pub mod hir;
 pub mod ir;
 pub mod ty_shape;
 pub mod unsafety;

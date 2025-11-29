@@ -1,5 +1,6 @@
 //! utils for working with HIR and MIR
 
+use rustc_ast as ast;
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::{
     mir::{Body, TerminatorKind},
@@ -37,6 +38,25 @@ pub fn ty_size<'tcx>(
     let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
     let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
     layout.size.bytes()
+}
+
+pub fn array_of_as_ptr<'e, 'tcx>(
+    e: &'e ast::Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<(&'e ast::Expr, ty::Ty<'tcx>)> {
+    if let rustc_ast::ExprKind::MethodCall(call) = &crate::ast::unwrap_cast_and_paren(e).kind
+        && let name = call.seg.ident.name.as_str()
+        && (name == "as_mut_ptr" || name == "as_ptr")
+        && let hir_e = ast_to_hir.get_expr(call.receiver.id, tcx).unwrap()
+        && let typeck = tcx.typeck(hir_e.hir_id.owner)
+        && let ty = typeck.expr_ty(hir_e).peel_refs()
+        && let ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) = ty.kind()
+    {
+        Some((&call.receiver, *ty))
+    } else {
+        None
+    }
 }
 
 #[inline]
