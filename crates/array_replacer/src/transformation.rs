@@ -1,13 +1,15 @@
+use std::cell::Cell;
+
 use etrace::some_or;
 use rustc_ast::{mut_visit::MutVisitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashSet;
-use rustc_hir::{def::DefKind, def_id::LocalDefId};
+use rustc_hir::{self as hir, def::DefKind, def_id::LocalDefId};
 use rustc_middle::ty::{TyCtxt, TyKind, TypingEnv};
 use rustc_span::sym;
 use utils::ast::{unwrap_cast_and_paren, unwrap_cast_then_as_ptr};
 
-pub fn replace_array(tcx: TyCtxt<'_>) -> String {
+pub fn replace_array(tcx: TyCtxt<'_>) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -19,15 +21,23 @@ pub fn replace_array(tcx: TyCtxt<'_>) -> String {
         }
     }
 
-    let mut visitor = AstVisitor { tcx, ast_to_hir };
+    let mut visitor = AstVisitor {
+        tcx,
+        ast_to_hir,
+        bytemuck: Cell::new(false),
+    };
     visitor.visit_crate(&mut krate);
 
-    pprust::crate_to_string_for_macros(&krate)
+    (
+        pprust::crate_to_string_for_macros(&krate),
+        visitor.bytemuck.get(),
+    )
 }
 
 struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: utils::ir::AstToHir,
+    pub bytemuck: Cell<bool>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -38,13 +48,6 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         match &mut expr.kind {
             ExprKind::Call(func, args) => {
                 let func_name = some_or!(get_fn_name_from_expr(&**func), return);
-                // let hir::ExprKind::Call(hir_func, _) = &hir_expr.kind else {
-                //     panic!("{hir_expr:?}");
-                // };
-                // let Some(def_id) = get_fn_from_hir_expr(hir_func) else {
-                //     panic!("{hir_func:?}");
-                // };
-                // no symbol::memcpy?
                 match func_name.as_str() {
                     "memcpy" => {
                         // check if the first and second arguments are slices
@@ -66,22 +69,31 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             && dest_inner_ty == src_inner_ty
                         {
                             let size_expr = &args[2];
-                            let len_expr = self.extract_len_from_size(
+                            if let Some(len_expr) = self.get_len_from_size(
                                 size_expr,
                                 dest_inner_ty.clone(),
                                 hir_expr.hir_id.owner.def_id,
-                            );
-                            // replace memcpy with slice copy
-                            *expr = utils::expr!(
-                                "({0}[..({2}) as usize]).copy_from_slice(&{1}[..({2}) as usize])",
-                                pprust::expr_to_string(dest_expr),
-                                pprust::expr_to_string(src_expr),
-                                pprust::expr_to_string(&len_expr)
-                            )
+                            ) {
+                                // replace memcpy with slice copy
+                                *expr = utils::expr!(
+                                    "({0}[..({2}) as usize]).copy_from_slice(&{1}[..({2}) as usize])",
+                                    pprust::expr_to_string(dest_expr),
+                                    pprust::expr_to_string(src_expr),
+                                    pprust::expr_to_string(&len_expr)
+                                )
+                            } else {
+                                // could not determine length, use size_expr directly
+                                self.bytemuck.set(true);
+                                *expr = utils::expr!(
+                                    "(bytemuck::cast_slice_mut::<_, u8>({0})[..({2}) as usize]).copy_from_slice(&bytemuck::cast_slice({1})[..({2}) as usize])",
+                                    pprust::expr_to_string(dest_expr),
+                                    pprust::expr_to_string(src_expr),
+                                    pprust::expr_to_string(&size_expr)
+                                )
+                            }
                         }
-
-                        // check if both dest and src are slices
                     }
+                    "memset" => {}
                     _ => {}
                 }
             }
@@ -91,12 +103,12 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 }
 
 impl<'tcx> AstVisitor<'tcx> {
-    fn extract_len_from_size(
+    fn get_len_from_size(
         &self,
         size_expr: &Expr,
         ty: rustc_middle::ty::Ty<'tcx>,
         def_id: LocalDefId,
-    ) -> Expr {
+    ) -> Option<Expr> {
         if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(size_expr).kind
             && call.seg.ident.name == sym::wrapping_mul
             && call.args.len() == 1
@@ -122,16 +134,12 @@ impl<'tcx> AstVisitor<'tcx> {
                     let ty_generic = typeck.node_type(ty_generic.hir_id);
                     if self.ty_size(ty_generic.clone(), def_id) == self.ty_size(ty.clone(), def_id)
                     {
-                        return operand_2.clone();
+                        return Some(operand_2.clone());
                     }
                 }
             }
         }
-        utils::expr!(
-            "{}/{}",
-            pprust::expr_to_string(size_expr),
-            self.ty_size(ty, def_id)
-        )
+        None
     }
 
     fn ty_size(&self, ty: rustc_middle::ty::Ty<'tcx>, def_id: LocalDefId) -> u64 {
@@ -185,7 +193,7 @@ fn get_fn_name_from_expr(expr: &Expr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
-        let s = utils::compilation::run_compiler_on_str(code, super::replace_array).unwrap();
+        let (s, _) = utils::compilation::run_compiler_on_str(code, super::replace_array).unwrap();
         println!("{}", s);
         utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
         for include in includes {
