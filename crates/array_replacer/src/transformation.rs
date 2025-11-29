@@ -50,7 +50,6 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 let func_name = some_or!(get_fn_name_from_expr(&**func), return);
                 match func_name.as_str() {
                     "memcpy" => {
-                        // check if the first and second arguments are slices
                         let dest_expr = some_or!(unwrap_cast_then_as_ptr(&args[0]), return);
                         let src_expr = some_or!(unwrap_cast_then_as_ptr(&args[1]), return);
 
@@ -72,8 +71,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             is_src_ref = true;
                             src_ty = _src_ty.clone();
                         }
-                        if let TyKind::Slice(dest_inner_ty) = dest_ty.kind()
-                            && let TyKind::Slice(src_inner_ty) = src_ty.kind()
+                        // check if the first and second arguments are slices
+                        if let TyKind::Slice(dest_inner_ty) | TyKind::Array(dest_inner_ty, _) =
+                            dest_ty.kind()
+                            && let TyKind::Slice(src_inner_ty) | TyKind::Array(src_inner_ty, _) =
+                                src_ty.kind()
                         {
                             let size_expr = &args[2];
                             if dest_inner_ty == src_inner_ty
@@ -104,7 +106,34 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             }
                         }
                     }
-                    "memset" => {}
+                    "memset" => {
+                        let dest_expr = some_or!(unwrap_cast_then_as_ptr(&args[0]), return);
+                        let src_expr = unwrap_cast_and_paren(&args[1]);
+
+                        let dest_hir_expr =
+                            some_or!(self.ast_to_hir.get_expr(dest_expr.id, self.tcx), return);
+
+                        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                        let mut dest_ty = typeck.expr_ty(dest_hir_expr);
+                        let mut is_dest_ref = false;
+                        while let TyKind::Ref(_, _dest_ty, _) = dest_ty.kind() {
+                            is_dest_ref = true;
+                            dest_ty = _dest_ty.clone();
+                        }
+                        // check if the first argument is a slice / array
+                        if let TyKind::Slice(_) | TyKind::Array(_, _) = dest_ty.kind() {
+                            let size_expr = &args[2];
+                            // could not determine length, use size_expr directly
+                            self.bytemuck.set(true);
+                            *expr = utils::expr!(
+                                "(bytemuck::cast_slice_mut::<_, u8>({3}{0})[..({2}) as usize]).fill({1} as u8)",
+                                pprust::expr_to_string(dest_expr),
+                                pprust::expr_to_string(src_expr),
+                                pprust::expr_to_string(&size_expr),
+                                if is_dest_ref { "" } else { "&mut " },
+                            )
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -231,6 +260,27 @@ pub unsafe extern "C" fn merge_sort(mut a: &mut [usize], mut b: &mut [usize], mu
     memcpy((b).as_mut_ptr() as *mut _, (a).as_ptr() as *const _,
         (::std::mem::size_of::<usize>() as
                     libc::c_ulong).wrapping_mul(size as libc::c_ulong));
+}
+"#;
+        run_test(code, &[], &["memcpy"]);
+    }
+
+    #[test]
+    fn test_memset() {
+        let code = r#"
+use libc;
+extern "C" {
+    fn memset(_: *mut libc::c_void, _: libc::c_int,
+    _: libc::c_ulong)
+    -> *mut libc::c_void;
+}
+unsafe fn main_0() {
+    let mut source: [libc::c_char; 100] = [0; 100];
+    memset(
+        (source).as_mut_ptr() as *mut _,
+        'A' as i32,
+        (100 as libc::c_int - 1 as libc::c_int) as libc::c_ulong,
+    );
 }
 "#;
         run_test(code, &[], &[]);
