@@ -1,0 +1,12 @@
+[package]
+name = "array_replacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+etrace.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+

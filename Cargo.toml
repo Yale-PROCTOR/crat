@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/array_replacer",
   "crates/finders",
   "crates/io_replacer",
   "crates/passes",
@@ -27,6 +28,7 @@ lazy_static = "1.5.0"
 tracing = "0.1.41"
 
 [dependencies]
+array_replacer = { path = "crates/array_replacer" }
 finders = { path = "crates/finders" }
 io_replacer = { path = "crates/io_replacer" }
 passes = { path = "crates/passes" }
