@@ -519,7 +519,9 @@ fn main() {
                 let (s, bytemuck) =
                     run_compiler_on_path(&file, array_replacer::replace_array).unwrap();
                 std::fs::write(&file, s).unwrap();
-                io_replacer::add_deps(&dir, false, bytemuck);
+                if bytemuck {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
             }
         }
     }
