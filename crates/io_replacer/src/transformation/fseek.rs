@@ -25,7 +25,7 @@ impl TransformVisitor<'_, '_, '_> {
                 };
                 self.lib_items.borrow_mut().insert(LibItem::Seek);
                 expr!(
-                    "crate::stdio::rs_seek({}, std::io::SeekFrom::{}(({}) as _))",
+                    "crate::c_lib::rs_seek({}, std::io::SeekFrom::{}(({}) as _))",
                     stream,
                     v,
                     off
@@ -34,7 +34,7 @@ impl TransformVisitor<'_, '_, '_> {
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(path, _) => {
                 self.lib_items.borrow_mut().insert(LibItem::Fseek);
-                expr!("crate::stdio::rs_fseek({}, {}, {})", stream, off, path)
+                expr!("crate::c_lib::rs_fseek({}, {}, {})", stream, off, path)
             }
             LikelyLit::Other(_) => todo!(),
         }
@@ -44,14 +44,14 @@ impl TransformVisitor<'_, '_, '_> {
     pub(super) fn transform_ftell<S: StreamExpr>(&self, stream: &S) -> Expr {
         let stream = stream.borrow_for(StreamTrait::Seek);
         self.lib_items.borrow_mut().insert(LibItem::Ftell);
-        expr!("crate::stdio::rs_ftell({})", stream)
+        expr!("crate::c_lib::rs_ftell({})", stream)
     }
 
     #[inline]
     pub(super) fn transform_rewind<S: StreamExpr>(&self, stream: &S) -> Expr {
         let stream = stream.borrow_for(StreamTrait::Seek);
         self.lib_items.borrow_mut().insert(LibItem::Rewind);
-        expr!("crate::stdio::rs_rewind({})", stream)
+        expr!("crate::c_lib::rs_rewind({})", stream)
     }
 }
 

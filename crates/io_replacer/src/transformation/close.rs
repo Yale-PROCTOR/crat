@@ -42,7 +42,7 @@ impl TransformVisitor<'_, '_, '_> {
         expr!(
             "{{
     let mut __x = {};
-    let __v = crate::stdio::Close::close(&mut __x);
+    let __v = crate::c_lib::Close::close(&mut __x);
     drop(__x);
     __v
 }}",

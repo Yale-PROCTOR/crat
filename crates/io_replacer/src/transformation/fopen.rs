@@ -102,7 +102,7 @@ impl TransformVisitor<'_, '_, '_> {
             OpenMode::Unknown => {
                 self.lib_items.borrow_mut().insert(LibItem::Fopen);
                 expr!(
-                    "crate::stdio::rs_fopen({}, {})",
+                    "crate::c_lib::rs_fopen({}, {})",
                     path,
                     pprust::expr_to_string(mode),
                 )

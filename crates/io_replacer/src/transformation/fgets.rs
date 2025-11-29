@@ -27,7 +27,7 @@ impl TransformVisitor<'_, '_, '_> {
             if ty == self.tcx.types.i8 {
                 let array = pprust::expr_to_string(array);
                 return expr!(
-                    "crate::stdio::rs_fgets(
+                    "crate::c_lib::rs_fgets(
                         &mut ({array})[..({n_str}) as usize],
                         {stream_str},
                         {err_eof_args},
@@ -37,7 +37,7 @@ impl TransformVisitor<'_, '_, '_> {
                 let array = pprust::expr_to_string(array);
                 self.bytemuck.set(true);
                 return expr!(
-                    "crate::stdio::rs_fgets(
+                    "crate::c_lib::rs_fgets(
                         bytemuck::cast_slice_mut(&mut ({array})[..({n_str}) as usize]),
                         {stream_str},
                         {err_eof_args},
@@ -47,7 +47,7 @@ impl TransformVisitor<'_, '_, '_> {
         }
 
         expr!(
-            "crate::stdio::rs_fgets(
+            "crate::c_lib::rs_fgets(
                 std::slice::from_raw_parts_mut(({s_str}) as _, ({n_str}) as _),
                 {stream_str},
                 {err_eof_args},

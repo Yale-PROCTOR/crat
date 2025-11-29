@@ -1234,12 +1234,12 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "rename" => {
-                            let new_expr = expr!("crate::stdio::rs_rename");
+                            let new_expr = expr!("crate::c_lib::rs_rename");
                             self.lib_items.borrow_mut().insert(LibItem::Rename);
                             self.replace_expr(callee, new_expr);
                         }
                         "remove" => {
-                            let new_expr = expr!("crate::stdio::rs_remove");
+                            let new_expr = expr!("crate::c_lib::rs_remove");
                             self.lib_items.borrow_mut().insert(LibItem::Remove);
                             self.replace_expr(callee, new_expr);
                         }
@@ -1504,15 +1504,15 @@ impl TransformVisitor<'_, '_, '_> {
             if self.analysis_res.unsupported_stdout_errors {
                 write!(
                     new_expr,
-                    "if {stream} == crate::stdio::STDOUT as _ {{ let (___v, ___error) = crate::stdio::{rs_name}("
+                    "if {stream} == crate::c_lib::STDOUT as _ {{ let (___v, ___error) = crate::c_lib::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
-                new_expr.push_str("); crate::stdio::STDOUT_ERROR = ___error; ___v } else ");
+                new_expr.push_str("); crate::c_lib::STDOUT_ERROR = ___error; ___v } else ");
             } else {
                 write!(
                     new_expr,
-                    "if {stream} == crate::stdio::STDOUT as _ {{ crate::stdio::{rs_name}("
+                    "if {stream} == crate::c_lib::STDOUT as _ {{ crate::c_lib::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
@@ -1523,15 +1523,15 @@ impl TransformVisitor<'_, '_, '_> {
             if self.analysis_res.unsupported_stderr_errors {
                 write!(
                     new_expr,
-                    "if {stream} == crate::stdio::STDERR as _ {{ let (___v, ___error) = crate::stdio::{rs_name}("
+                    "if {stream} == crate::c_lib::STDERR as _ {{ let (___v, ___error) = crate::c_lib::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
-                new_expr.push_str("); crate::stdio::STDERR_ERROR = ___error; ___v } else ");
+                new_expr.push_str("); crate::c_lib::STDERR_ERROR = ___error; ___v } else ");
             } else {
                 write!(
                     new_expr,
-                    "if {stream} == crate::stdio::STDERR as _ {{ crate::stdio::{rs_name}("
+                    "if {stream} == crate::c_lib::STDERR as _ {{ crate::c_lib::{rs_name}("
                 )
                 .unwrap();
                 write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
@@ -1559,23 +1559,23 @@ impl TransformVisitor<'_, '_, '_> {
         }
         let stream = pprust::expr_to_string(stream);
         if stream == "stdout" {
-            return (Some(expr!("crate::stdio::STDOUT_ERROR")), false);
+            return (Some(expr!("crate::c_lib::STDOUT_ERROR")), false);
         }
         if stream == "stderr" {
-            return (Some(expr!("crate::stdio::STDERR_ERROR")), false);
+            return (Some(expr!("crate::c_lib::STDERR_ERROR")), false);
         }
         let mut new_expr = String::new();
         if stdout {
             write!(
                 new_expr,
-                "if {stream} == crate::stdio::STDOUT as _ {{ crate::stdio::STDOUT_ERROR }} else ",
+                "if {stream} == crate::c_lib::STDOUT as _ {{ crate::c_lib::STDOUT_ERROR }} else ",
             )
             .unwrap();
         }
         if stderr {
             write!(
                 new_expr,
-                "if {stream} == crate::stdio::STDERR as _ {{ crate::stdio::STDERR_ERROR }} else ",
+                "if {stream} == crate::c_lib::STDERR as _ {{ crate::c_lib::STDERR_ERROR }} else ",
             )
             .unwrap();
         }
@@ -1628,11 +1628,11 @@ impl TransformVisitor<'_, '_, '_> {
         let ty = stream.ty();
         if ty.must_stdout() {
             if self.analysis_res.unsupported_stdout_errors {
-                update.push_str("crate::stdio::STDOUT_ERROR = 1;");
+                update.push_str("crate::c_lib::STDOUT_ERROR = 1;");
             }
         } else if ty.must_stderr() {
             if self.analysis_res.unsupported_stderr_errors {
-                update.push_str("crate::stdio::STDERR_ERROR = 1;");
+                update.push_str("crate::c_lib::STDERR_ERROR = 1;");
             }
         } else if ty.may_std()
             && (self.analysis_res.unsupported_stdout_errors
@@ -1642,14 +1642,14 @@ impl TransformVisitor<'_, '_, '_> {
             self.lib_items.borrow_mut().insert(LibItem::AsRawFd);
             write!(
                 update,
-                "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"
+                "{{ let fd = crate::c_lib::AsRawFd::as_raw_fd({stream});"
             )
             .unwrap();
             if self.analysis_res.unsupported_stdout_errors {
-                update.push_str("if fd == 1 { crate::stdio::STDOUT_ERROR = 1; }");
+                update.push_str("if fd == 1 { crate::c_lib::STDOUT_ERROR = 1; }");
             }
             if self.analysis_res.unsupported_stderr_errors {
-                update.push_str("if fd == 2 { crate::stdio::STDERR_ERROR = 1; }");
+                update.push_str("if fd == 2 { crate::c_lib::STDERR_ERROR = 1; }");
             }
             update.push('}');
         }
@@ -1670,11 +1670,11 @@ impl TransformVisitor<'_, '_, '_> {
         let ty = stream.ty();
         if ty.must_stdout() {
             if self.analysis_res.unsupported_stdout_errors {
-                update.push_str("crate::stdio::STDOUT_ERROR = ___error;");
+                update.push_str("crate::c_lib::STDOUT_ERROR = ___error;");
             }
         } else if ty.must_stderr() {
             if self.analysis_res.unsupported_stderr_errors {
-                update.push_str("crate::stdio::STDERR_ERROR = ___error;");
+                update.push_str("crate::c_lib::STDERR_ERROR = ___error;");
             }
         } else if ty.may_std()
             && (self.analysis_res.unsupported_stdout_errors
@@ -1684,14 +1684,14 @@ impl TransformVisitor<'_, '_, '_> {
             self.lib_items.borrow_mut().insert(LibItem::AsRawFd);
             write!(
                 update,
-                "{{ let fd = crate::stdio::AsRawFd::as_raw_fd({stream});"
+                "{{ let fd = crate::c_lib::AsRawFd::as_raw_fd({stream});"
             )
             .unwrap();
             if self.analysis_res.unsupported_stdout_errors {
-                update.push_str("if fd == 1 { crate::stdio::STDOUT_ERROR = ___error; }");
+                update.push_str("if fd == 1 { crate::c_lib::STDOUT_ERROR = ___error; }");
             }
             if self.analysis_res.unsupported_stderr_errors {
-                update.push_str("if fd == 2 { crate::stdio::STDERR_ERROR = ___error; }");
+                update.push_str("if fd == 2 { crate::c_lib::STDERR_ERROR = ___error; }");
             }
             update.push('}');
         }

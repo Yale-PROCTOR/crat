@@ -540,7 +540,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items.insert(LibItem::ChildClose);
     }
 
-    krate.items.push(rustc_ast::ptr::P(stdio_mod(
+    krate.items.push(rustc_ast::ptr::P(lib_mod(
         &bounds,
         &lib_items,
         &parsing_fns,
@@ -593,12 +593,12 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
     }
 }
 
-fn stdio_mod(
+fn lib_mod(
     bounds: &FxHashSet<TraitBound>,
     lib_items: &FxHashSet<LibItem>,
     parsing_fns: &FxHashMap<String, String>,
 ) -> rustc_ast::Item {
-    let mut m = "mod stdio {".to_string();
+    let mut m = "mod c_lib {".to_string();
     m.push_str(
         r#"
         pub static mut STDOUT_ERROR: i32 = 0;
@@ -699,11 +699,11 @@ pub(super) enum LibItem {
     ParseF128,
     ParseFloat,
     ParseDecimal,
+    ParseIntAuto,
     ParseOctal,
-    ParseInteger,
-    ParseIntState,
+    ParseUnsigned,
     ParseHexadecimal,
-    ParseIntegerAuto,
+    ParseInteger,
     Fprintf,
     Vfprintf,
     Xu8,
@@ -752,11 +752,11 @@ static LIB_ITEMS_ARRAY: [(LibItem, &str); 50] = [
     (LibItem::ParseF128, super::fscanf::PARSE_F128),
     (LibItem::ParseFloat, super::fscanf::PARSE_FLOAT),
     (LibItem::ParseDecimal, super::fscanf::PARSE_DECIMAL),
+    (LibItem::ParseIntAuto, super::fscanf::PARSE_INT_AUTO),
     (LibItem::ParseOctal, super::fscanf::PARSE_OCTAL),
-    (LibItem::ParseInteger, super::fscanf::PARSE_INTEGER),
-    (LibItem::ParseIntState, super::fscanf::PARSE_INT_STATE),
+    (LibItem::ParseUnsigned, super::fscanf::PARSE_UNSIGNED),
     (LibItem::ParseHexadecimal, super::fscanf::PARSE_HEXADECIMAL),
-    (LibItem::ParseIntegerAuto, super::fscanf::PARSE_INTEGER_AUTO),
+    (LibItem::ParseInteger, super::fscanf::PARSE_INTEGER),
     (LibItem::Fprintf, super::fprintf::FPRINTF),
     (LibItem::Vfprintf, super::fprintf::VFPRINTF),
     (LibItem::Xu8, super::fprintf::XU8),
