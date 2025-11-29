@@ -583,7 +583,9 @@ fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
         rustc_literal_escaper::Mode::ByteStr,
         &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
     );
+    let all_same = buf.first().is_some_and(|c1| buf.iter().all(|c2| c1 == c2));
     let mut array = "[".to_string();
+    let len = buf.len();
     for c in buf {
         write!(array, "b'").unwrap();
         match c {
@@ -602,6 +604,15 @@ fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
                     write!(array, "\\x{c:x}").unwrap();
                 }
             }
+        }
+        if all_same {
+            if is_signed {
+                write!(array, "' as i8; ").unwrap();
+            } else {
+                write!(array, "'; ").unwrap();
+            }
+            write!(array, "{len}").unwrap();
+            break;
         }
         if is_signed {
             write!(array, "' as i8, ").unwrap();
