@@ -111,20 +111,6 @@ pub fn unwrap_cast_and_paren_mut(expr: &mut Expr) -> &mut Expr {
     }
 }
 
-pub fn unwrap_cast_then_as_ptr(expr: &Expr) -> Option<&Expr> {
-    match &expr.kind {
-        ExprKind::MethodCall(call)
-            if matches!(call.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") =>
-        {
-            Some(&call.receiver)
-        }
-        ExprKind::AddrOf(BorrowKind::Ref, _, e) | ExprKind::Cast(e, _) | ExprKind::Paren(e) => {
-            unwrap_cast_then_as_ptr(e)
-        }
-        _ => None,
-    }
-}
-
 #[derive(Debug)]
 pub struct TransformationResult(pub Vec<(PathBuf, String)>);
 
