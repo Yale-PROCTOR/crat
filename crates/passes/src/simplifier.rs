@@ -111,32 +111,54 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
 impl<'tcx> AstVisitor<'tcx> {
     fn visit_post(&self, expr: &mut Expr) {
-        if let ExprKind::Paren(e) = &mut expr.kind
-            && is_atomic(e)
-        {
-            let dummy = Expr {
-                id: DUMMY_NODE_ID,
-                kind: ExprKind::Dummy,
-                span: DUMMY_SP,
-                attrs: thin_vec![],
-                tokens: None,
-            };
-            let inner = std::mem::replace::<Expr>(e, dummy);
-            *expr = inner;
-        } else if let ExprKind::Binary(op, l, r) = &expr.kind
-            && (is_zero(l)
-                && matches!(
-                    op.node,
-                    BinOpKind::Mul
-                        | BinOpKind::Div
-                        | BinOpKind::Rem
-                        | BinOpKind::BitAnd
-                        | BinOpKind::Shl
-                        | BinOpKind::Shr
-                )
-                || is_zero(r) && matches!(op.node, BinOpKind::Mul | BinOpKind::BitAnd))
-        {
-            *expr = utils::expr!("0");
+        let id = expr.id;
+        match &mut expr.kind {
+            ExprKind::Paren(e) => {
+                if is_atomic(e) {
+                    let dummy = Expr {
+                        id: DUMMY_NODE_ID,
+                        kind: ExprKind::Dummy,
+                        span: DUMMY_SP,
+                        attrs: thin_vec![],
+                        tokens: None,
+                    };
+                    let inner = std::mem::replace::<Expr>(e, dummy);
+                    *expr = inner;
+                }
+            }
+            ExprKind::Binary(op, l, r) => {
+                if is_zero(l)
+                    && matches!(
+                        op.node,
+                        BinOpKind::Mul
+                            | BinOpKind::Div
+                            | BinOpKind::Rem
+                            | BinOpKind::BitAnd
+                            | BinOpKind::Shl
+                            | BinOpKind::Shr
+                    )
+                    || is_zero(r) && matches!(op.node, BinOpKind::Mul | BinOpKind::BitAnd)
+                {
+                    // avoid clippy::erasing_op
+                    *expr = utils::expr!("0");
+                } else if matches!(op.node, BinOpKind::Le | BinOpKind::Gt)
+                    && is_zero(r)
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(id, self.tcx)
+                    && let hir::ExprKind::Binary(_, hir_l, _) = &hir_expr.kind
+                    && let typeck = self.tcx.typeck(hir_expr.hir_id.owner)
+                    && let ty = typeck.expr_ty(hir_l)
+                    && ty.is_integral()
+                    && !ty.is_signed()
+                {
+                    // avoid clippy::absurd_extreme_comparisons
+                    if op.node == BinOpKind::Le {
+                        op.node = BinOpKind::Eq;
+                    } else {
+                        op.node = BinOpKind::Ne;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
