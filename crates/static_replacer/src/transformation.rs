@@ -288,7 +288,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 if let Some(def_id) = get_static_from_hir_expr(hir_receiver)
                     && self.refcells.contains(&def_id)
                     && let name = call.seg.ident.name.as_str()
-                    && (name == "as_mut_ptr" || name == "as_ptr")
+                    && (name == "as_mut_ptr"
+                        || name == "as_ptr"
+                        || name == "copy_from_slice"
+                        || name == "fill")
                 {
                     let x = self.tcx.item_name(def_id.to_def_id());
                     *self.borrows.entry(x).or_default() |= true;
@@ -339,7 +342,7 @@ fn find_context<'a, 'tcx>(
                     if receiver.hir_id == expr.hir_id {
                         let method = method.ident.name.as_str();
                         match method {
-                            "as_mut_ptr" => {
+                            "as_mut_ptr" | "copy_from_slice" | "fill" => {
                                 expr = parent;
                                 mutated = true;
                             }

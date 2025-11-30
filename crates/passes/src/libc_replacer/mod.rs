@@ -13,6 +13,7 @@ use utils::{ast::unwrap_paren, expr};
 use crate::libc_replacer::errno::ErrorCode;
 
 mod errno;
+mod mem_utils;
 mod str_utils;
 mod strto;
 
@@ -315,6 +316,18 @@ impl MutVisitor for TransformVisitor<'_> {
                 "strcspn" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_strcspn(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "memcpy" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memcpy(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memset" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memset(arg1, arg2, arg3) {
                         *expr = e;
                     }
                 }
