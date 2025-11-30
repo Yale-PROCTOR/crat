@@ -48,12 +48,19 @@ pub fn array_of_as_ptr<'e, 'tcx>(
     if let rustc_ast::ExprKind::MethodCall(call) = &crate::ast::unwrap_cast_and_paren(e).kind
         && let name = call.seg.ident.name.as_str()
         && (name == "as_mut_ptr" || name == "as_ptr")
-        && let hir_e = ast_to_hir.get_expr(call.receiver.id, tcx).unwrap()
-        && let typeck = tcx.typeck(hir_e.hir_id.owner)
-        && let ty = typeck.expr_ty(hir_e).peel_refs()
-        && let ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) = ty.kind()
+        && let Some(hir_e) = ast_to_hir.get_expr(call.receiver.id, tcx)
     {
-        Some((&call.receiver, *ty))
+        let typeck = tcx.typeck(hir_e.hir_id.owner);
+        let ty = typeck.expr_ty(hir_e).peel_refs();
+        let ty = match ty.kind() {
+            ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) => *ty,
+            ty::TyKind::Adt(adt_def, gargs) if tcx.item_name(adt_def.did()) == sym::Vec => {
+                let ty::GenericArgKind::Type(ty) = gargs[0].kind() else { panic!() };
+                ty
+            }
+            _ => return None,
+        };
+        Some((&call.receiver, ty))
     } else {
         None
     }
