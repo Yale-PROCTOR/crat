@@ -71,6 +71,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             } else if let Some(tys) = self.compress_casts(hir_expr) {
                 let e = unwrap_cast_and_paren_mut(expr);
                 mut_visit::walk_expr(self, e);
+                self.visit_post(e);
                 let mut e_str = pprust::expr_to_string(e);
                 if !is_atomic(e) {
                     e_str = format!("({e_str})");
@@ -86,19 +87,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         mut_visit::walk_expr(self, expr);
 
-        if let ExprKind::Paren(e) = &mut expr.kind
-            && is_atomic(e)
-        {
-            let dummy = Expr {
-                id: DUMMY_NODE_ID,
-                kind: ExprKind::Dummy,
-                span: DUMMY_SP,
-                attrs: thin_vec![],
-                tokens: None,
-            };
-            let inner = std::mem::replace::<Expr>(e, dummy);
-            *expr = inner;
-        }
+        self.visit_post(expr);
     }
 
     fn visit_ty(&mut self, ty: &mut Ty) {
@@ -121,6 +110,36 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 }
 
 impl<'tcx> AstVisitor<'tcx> {
+    fn visit_post(&self, expr: &mut Expr) {
+        if let ExprKind::Paren(e) = &mut expr.kind
+            && is_atomic(e)
+        {
+            let dummy = Expr {
+                id: DUMMY_NODE_ID,
+                kind: ExprKind::Dummy,
+                span: DUMMY_SP,
+                attrs: thin_vec![],
+                tokens: None,
+            };
+            let inner = std::mem::replace::<Expr>(e, dummy);
+            *expr = inner;
+        } else if let ExprKind::Binary(op, l, r) = &expr.kind
+            && (is_zero(l)
+                && matches!(
+                    op.node,
+                    BinOpKind::Mul
+                        | BinOpKind::Div
+                        | BinOpKind::Rem
+                        | BinOpKind::BitAnd
+                        | BinOpKind::Shl
+                        | BinOpKind::Shr
+                )
+                || is_zero(r) && matches!(op.node, BinOpKind::Mul | BinOpKind::BitAnd))
+        {
+            *expr = utils::expr!("0");
+        }
+    }
+
     fn eval_lit_cast(&self, expr: &hir::Expr) -> Option<Int> {
         let typeck = self.tcx.typeck(expr.hir_id.owner);
         let ty = typeck.expr_ty(expr);
@@ -198,6 +217,14 @@ impl<'tcx> AstVisitor<'tcx> {
             hir::ExprKind::DropTemps(e) => self.compress_casts(e),
             _ => Some(vec![ty]),
         }
+    }
+}
+
+fn is_zero(expr: &Expr) -> bool {
+    if let ExprKind::Lit(lit) = &expr.kind {
+        lit.kind == token::LitKind::Integer && lit.symbol.as_str() == "0"
+    } else {
+        false
     }
 }
 

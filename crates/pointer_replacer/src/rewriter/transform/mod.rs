@@ -838,8 +838,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
 
-        if is_offset_call(e) {
-            // we assume that the pointer is not null when offset is called
+        if let Some(name) = method_call_name(e)
+            && let name = name.as_str()
+            && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
+        {
+            // we assume that the pointer is not null when such methods are called
             if !need_cast {
                 utils::expr!(
                     "std::slice::from_raw_parts{}(({}){}, 100000)",
@@ -1420,11 +1423,11 @@ fn hir_unwrap_subscript<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'t
     }
 }
 
-fn is_offset_call(expr: &Expr) -> bool {
+fn method_call_name(expr: &Expr) -> Option<Symbol> {
     if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind {
-        call.seg.ident.name == rustc_span::sym::offset
+        Some(call.seg.ident.name)
     } else {
-        false
+        None
     }
 }
 
