@@ -338,6 +338,26 @@ struct AstVisitor<'tcx> {
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
+    fn visit_item(&mut self, item: &mut Item) {
+        mut_visit::walk_item(self, item);
+
+        // remove unnecessary unsafe blocks after removing transmute
+        let expr = match &mut item.kind {
+            ItemKind::Static(item) => item.expr.as_mut(),
+            ItemKind::Const(item) => item.expr.as_mut(),
+            _ => None,
+        };
+        if let Some(expr) = expr
+            && let ExprKind::Block(block, _) = &mut expr.kind
+            && block.rules == BlockCheckMode::Unsafe(UnsafeSource::UserProvided)
+            && let [stmt] = &mut block.stmts[..]
+            && let StmtKind::Expr(e) = &mut stmt.kind
+            && matches!(e.kind, ExprKind::Array(_) | ExprKind::Repeat(_, _))
+        {
+            **expr = utils::ast::take_expr(e);
+        }
+    }
+
     fn visit_ty(&mut self, ty: &mut Ty) {
         mut_visit::walk_ty(self, ty);
 
@@ -605,7 +625,7 @@ fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
                 }
             }
         }
-        if all_same {
+        if all_same && len > 1 {
             if is_signed {
                 write!(array, "' as i8; ").unwrap();
             } else {
