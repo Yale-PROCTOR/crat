@@ -119,8 +119,7 @@ pub fn has_side_effects(expr: &Expr) -> bool {
         | ExprKind::Underscore
         | ExprKind::Path(..)
         | ExprKind::OffsetOf(..) => false,
-        ExprKind::Call(..)
-        | ExprKind::While(..)
+        ExprKind::While(..)
         | ExprKind::ForLoop { .. }
         | ExprKind::Loop(..)
         | ExprKind::Assign(..)
@@ -134,6 +133,14 @@ pub fn has_side_effects(expr: &Expr) -> bool {
         | ExprKind::If(..)
         | ExprKind::Match(..)
         | ExprKind::Block(..) => true,
+        ExprKind::Call(callee, args) => {
+            if let ExprKind::Path(_, path) = &callee.kind {
+                let name = path.segments.last().unwrap().ident.name.as_str();
+                name != "null" && name != "null_mut" && args.iter().all(|e| has_side_effects(e))
+            } else {
+                true
+            }
+        }
         ExprKind::MethodCall(call) => {
             let name = call.seg.ident.name.as_str();
             name != "offset"
