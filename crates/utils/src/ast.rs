@@ -7,7 +7,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_parse::parser::{AttemptLocalParseRecovery, ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
 use rustc_span::{DUMMY_SP, FileName, RealFileName, Symbol, sym};
-use thin_vec::ThinVec;
+use thin_vec::{ThinVec, thin_vec};
 
 use crate::ir;
 
@@ -179,6 +179,20 @@ pub fn has_side_effects(expr: &Expr) -> bool {
         ExprKind::UnsafeBinderCast(..) => todo!(),
         ExprKind::MacCall(..) | ExprKind::Err(..) | ExprKind::Dummy => panic!(),
     }
+}
+
+pub fn dummy_expr() -> Expr {
+    Expr {
+        id: DUMMY_NODE_ID,
+        kind: ExprKind::Dummy,
+        span: DUMMY_SP,
+        attrs: thin_vec![],
+        tokens: None,
+    }
+}
+
+pub fn take_expr(expr: &mut Expr) -> Expr {
+    std::mem::replace(expr, dummy_expr())
 }
 
 #[derive(Debug)]

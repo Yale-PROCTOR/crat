@@ -12,8 +12,7 @@ use rustc_middle::{
     thir,
     ty::{self, TyCtxt},
 };
-use rustc_span::{DUMMY_SP, Symbol};
-use thin_vec::thin_vec;
+use rustc_span::Symbol;
 use utils::{
     ast::unwrap_cast_and_paren_mut,
     ir::{AstToHir, HirToThir, ThirToMir},
@@ -194,15 +193,7 @@ impl<'tcx> AstVisitor<'tcx> {
         match &mut expr.kind {
             ExprKind::Paren(e) => {
                 if is_atomic(e) {
-                    let dummy = Expr {
-                        id: DUMMY_NODE_ID,
-                        kind: ExprKind::Dummy,
-                        span: DUMMY_SP,
-                        attrs: thin_vec![],
-                        tokens: None,
-                    };
-                    let inner = std::mem::replace::<Expr>(e, dummy);
-                    *expr = inner;
+                    *expr = utils::ast::take_expr(e);
                 }
             }
             ExprKind::Binary(op, l, r) => {
