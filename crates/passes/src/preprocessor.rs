@@ -238,6 +238,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
 use utils::{
+    ast::unwrap_cast_and_paren,
     expr,
     ir::{AstToHir, mir_ty_to_string},
     ty,
@@ -352,9 +353,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && block.rules == BlockCheckMode::Unsafe(UnsafeSource::UserProvided)
             && let [stmt] = &mut block.stmts[..]
             && let StmtKind::Expr(e) = &mut stmt.kind
-            && matches!(e.kind, ExprKind::Array(_) | ExprKind::Repeat(_, _))
         {
-            **expr = utils::ast::take_expr(e);
+            let is_safe = match &e.kind {
+                ExprKind::Array(es) => es.iter().all(|e| is_lit(e)),
+                ExprKind::Repeat(e, _) => is_lit(e),
+                _ => false,
+            };
+            if is_safe {
+                **expr = utils::ast::take_expr(e);
+            }
         }
     }
 
@@ -593,6 +600,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             _ => {}
         }
     }
+}
+
+#[inline]
+fn is_lit(e: &Expr) -> bool {
+    matches!(unwrap_cast_and_paren(e).kind, ExprKind::Lit(_))
 }
 
 fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
