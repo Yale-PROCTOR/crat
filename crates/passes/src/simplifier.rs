@@ -8,13 +8,20 @@ use rustc_hir::{
 };
 use rustc_middle::{
     hir::nested_filter,
+    mir::Location,
+    thir,
     ty::{self, TyCtxt},
 };
 use rustc_span::{DUMMY_SP, Symbol};
 use thin_vec::thin_vec;
-use utils::{ast::unwrap_cast_and_paren_mut, ir::AstToHir};
+use utils::{
+    ast::unwrap_cast_and_paren_mut,
+    ir::{AstToHir, HirToThir, ThirToMir},
+};
 
 use crate::rustc_ast::mut_visit::MutVisitor as _;
+
+mod unused_assignments;
 
 pub fn simplify(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
@@ -26,10 +33,17 @@ pub fn simplify(tcx: TyCtxt<'_>) -> String {
         imports: FxHashMap::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
+
+    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
+    let unused_assignments = unused_assignments::find_unused_assignments(tcx);
+
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
+        hir_to_thir,
+        thir_to_mir: unused_assignments.thir_to_mir,
         imports: hir_visitor.imports,
+        dead_assignments: unused_assignments.dead_assignments,
     };
 
     visitor.visit_crate(&mut expanded_ast);
@@ -39,10 +53,60 @@ pub fn simplify(tcx: TyCtxt<'_>) -> String {
 struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
+    hir_to_thir: HirToThir,
+    thir_to_mir: FxHashMap<LocalDefId, ThirToMir>,
     imports: FxHashMap<LocalModDefId, FxHashSet<LocalDefId>>,
+    dead_assignments: FxHashSet<(LocalDefId, Location)>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
+    fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        let mut stmts = mut_visit::walk_flat_map_stmt(self, s);
+        stmts.retain(|stmt| {
+            if let StmtKind::Semi(e) = &stmt.kind
+                && let ExprKind::Assign(_, r, _) | ExprKind::AssignOp(_, _, r) = &e.kind
+                && !utils::ast::has_side_effects(r)
+                && let Some(hir_stmt) = self.ast_to_hir.get_stmt(stmt.id, self.tcx)
+                && let hir::StmtKind::Semi(e) = hir_stmt.kind
+                && matches!(
+                    e.kind,
+                    hir::ExprKind::Assign(_, _, _) | hir::ExprKind::AssignOp(_, _, _)
+                )
+                && let Some(loc) = self.hir_expr_to_loc(e)
+            {
+                !self
+                    .dead_assignments
+                    .contains(&(e.hir_id.owner.def_id, loc))
+            } else {
+                true
+            }
+        });
+        stmts
+    }
+
+    fn visit_local(&mut self, local: &mut Local) {
+        mut_visit::walk_local(self, local);
+
+        if let LocalKind::Init(init) = &local.kind
+            && !utils::ast::has_side_effects(init)
+            && let Some(hir_let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _, _) = hir_let_stmt.pat.kind
+            && let Some(init) = hir_let_stmt.init
+            && let Some(loc) = self.hir_expr_to_loc(init)
+            && self
+                .dead_assignments
+                .contains(&(hir_let_stmt.hir_id.owner.def_id, loc))
+        {
+            let typeck = self.tcx.typeck(hir_let_stmt.hir_id.owner);
+            let ty = typeck.node_type(hir_id);
+            local.kind = LocalKind::Decl;
+            if local.ty.is_none() {
+                let ty = utils::ir::mir_ty_to_string(ty, self.tcx);
+                local.ty = Some(ptr::P(utils::ty!("{ty}")));
+            }
+        }
+    }
+
     fn visit_expr(&mut self, expr: &mut Expr) {
         if matches!(expr.kind, ExprKind::Cast(_, _)) {
             let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
@@ -110,6 +174,21 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 }
 
 impl<'tcx> AstVisitor<'tcx> {
+    fn hir_expr_to_loc(&self, expr: &hir::Expr<'tcx>) -> Option<Location> {
+        let expr = utils::hir::unwrap_drop_temps(expr);
+        let (thir, _) = self.tcx.thir_body(expr.hir_id.owner).unwrap();
+        let thir = thir.borrow();
+        if let Some(expr_id) = self.hir_to_thir.exprs.get(&expr.hir_id)
+            && let expr_id = thir_unwrap_use(*expr_id, &thir)
+            && let Some(thir_to_mir) = self.thir_to_mir.get(&expr.hir_id.owner.def_id)
+            && let Some(locs) = thir_to_mir.expr_to_locs.get(&expr_id)
+        {
+            locs.first().copied()
+        } else {
+            None
+        }
+    }
+
     fn visit_post(&self, expr: &mut Expr) {
         let id = expr.id;
         match &mut expr.kind {
@@ -239,6 +318,16 @@ impl<'tcx> AstVisitor<'tcx> {
             hir::ExprKind::DropTemps(e) => self.compress_casts(e),
             _ => Some(vec![ty]),
         }
+    }
+}
+
+fn thir_unwrap_use(expr_id: thir::ExprId, body: &thir::Thir<'_>) -> thir::ExprId {
+    if let thir::ExprKind::Use { source } | thir::ExprKind::Scope { value: source, .. } =
+        body[expr_id].kind
+    {
+        thir_unwrap_use(source, body)
+    } else {
+        expr_id
     }
 }
 
