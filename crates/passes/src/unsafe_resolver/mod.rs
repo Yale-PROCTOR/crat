@@ -38,12 +38,10 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut visitor = HirVisitor {
         tcx,
         mains: vec![],
-        main0s: vec![],
-        param_to_main0: FxHashMap::default(),
-        param_used_main0s: FxHashSet::default(),
         fns: vec![],
         uses: vec![],
         used: FxHashMap::default(),
+        used_locals: FxHashSet::default(),
         item_mods: FxHashMap::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
@@ -108,39 +106,27 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
 
     let unsafe_fns = find_unsafe_fns(tcx);
 
-    let safe_main_mods: FxHashSet<_> = visitor
-        .main0s
-        .iter()
-        .filter_map(|def_id| {
-            if !unsafe_fns.contains(def_id) && !visitor.param_used_main0s.contains(def_id) {
-                Some(tcx.parent_module_from_def_id(*def_id))
-            } else {
-                None
-            }
-        })
-        .collect();
-
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
         unsafe_fns,
         used_items,
+        used_locals: visitor.used_locals,
         removable_uses,
         config,
-        safe_main_mods,
     };
     visitor.visit_crate(&mut krate);
 
     pprust::crate_to_string_for_macros(&krate)
 }
 
-struct AstVisitor<'a, 'tcx> {
+struct AstVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: utils::ir::AstToHir,
     unsafe_fns: FxHashSet<LocalDefId>,
     used_items: FxHashSet<LocalDefId>,
+    used_locals: FxHashSet<HirId>,
     removable_uses: FxHashSet<LocalDefId>,
-    safe_main_mods: FxHashSet<LocalModDefId>,
     config: &'a Config,
 }
 
@@ -203,59 +189,80 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
         items.retain(|item| match &item.kind {
             ast::ItemKind::Mod(_, _, ast::ModKind::Loaded(items, _, _, _)) => !items.is_empty(),
             ast::ItemKind::ForeignMod(md) => !md.items.is_empty(),
-            ast::ItemKind::Fn(box ast::Fn { ident, sig, .. }) => {
-                if ident.name == sym::main
-                    && matches!(sig.decl.output, ast::FnRetTy::Default(_))
-                    && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
-                    && let mod_id = self.tcx.parent_module_from_def_id(*def_id)
-                    && self.safe_main_mods.contains(&mod_id)
-                {
-                    false
-                } else {
-                    true
-                }
-            }
             _ => true,
         });
         items
     }
 
     fn visit_item(&mut self, item: &mut ast::Item) {
-        let is_exposed_fn = if let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind {
-            self.config.c_exposed_fns.contains(ident.name.as_str())
+        mut_visit::walk_item(self, item);
+
+        let is_exposed_fn = if let ast::ItemKind::Fn(box ast::Fn {
+            ident, sig, body, ..
+        }) = &mut item.kind
+        {
+            let is_exposed_fn = self.config.c_exposed_fns.contains(ident.name.as_str());
+
+            if self.config.replace_pub
+                && item.vis.kind.is_pub()
+                && !is_exposed_fn
+                && ident.name != sym::main
+            {
+                item.vis.kind = ast::VisibilityKind::Restricted {
+                    path: ast::ptr::P::new(path!("crate")),
+                    id: DUMMY_NODE_ID,
+                    shorthand: true,
+                };
+            }
+
+            if self.config.remove_extern_c && !is_exposed_fn {
+                sig.header.ext = ast::Extern::None;
+            }
+
+            if let Some(def_id) = self.ast_to_hir.global_map.get(&item.id) {
+                if !self.unsafe_fns.contains(def_id)
+                    && matches!(sig.header.safety, ast::Safety::Unsafe(_))
+                {
+                    sig.header.safety = ast::Safety::Default;
+                }
+
+                let hir::Node::Item(hir_item) = self.tcx.hir_node_by_def_id(*def_id) else {
+                    panic!()
+                };
+                let hir::ItemKind::Fn { body, .. } = hir_item.kind else { panic!() };
+                let body = self.tcx.hir_body(body);
+                for (param, hparam) in sig.decl.inputs.iter_mut().zip(body.params) {
+                    if let hir::PatKind::Binding(_, hir_id, _, _) = hparam.pat.kind
+                        && !self.used_locals.contains(&hir_id)
+                    {
+                        param.pat.kind = ast::PatKind::Wild;
+                    }
+                }
+            }
+
+            if let Some(body) = body
+                && ident.name == sym::main
+                && let [.., stmt] = &mut body.stmts[..]
+                && let ast::StmtKind::Expr(expr0) = &mut stmt.kind
+                && let ast::ExprKind::Block(block, _) = &mut expr0.kind
+                && let [stmt] = &mut block.stmts[..]
+                && let ast::StmtKind::Expr(expr1) = &mut stmt.kind
+                && let ast::ExprKind::Call(_, args) = &expr1.kind
+                && let [arg] = &args[..]
+                && let ast::ExprKind::Call(callee, _) = &arg.kind
+                && let Some(hir_callee) = self.ast_to_hir.get_expr(callee.id, self.tcx)
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &hir_callee.kind
+                && let Res::Def(_, def_id) = path.res
+                && let Some(def_id) = def_id.as_local()
+                && !self.unsafe_fns.contains(&def_id)
+            {
+                **expr0 = utils::ast::take_expr(expr1);
+            }
+
+            is_exposed_fn
         } else {
             false
         };
-        let is_safe_main0 = if let ast::ItemKind::Fn(box ast::Fn { ident, sig, .. }) =
-            &mut item.kind
-            && ident.name.as_str() == "main_0"
-            && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
-            && let mod_id = self.tcx.parent_module_from_def_id(*def_id)
-            && self.safe_main_mods.contains(&mod_id)
-        {
-            ident.name = sym::main;
-            item.vis.kind = ast::VisibilityKind::Public;
-            sig.decl.inputs.clear();
-            true
-        } else {
-            false
-        };
-
-        let path = path!("crate");
-
-        if self.config.replace_pub
-            && item.vis.kind.is_pub()
-            && !is_exposed_fn
-            && !is_safe_main0
-            && let ast::ItemKind::Fn(box ast::Fn { ident, .. }) = item.kind
-            && ident.name != sym::main
-        {
-            item.vis.kind = ast::VisibilityKind::Restricted {
-                path: ast::ptr::P::new(path),
-                id: DUMMY_NODE_ID,
-                shorthand: true,
-            };
-        }
 
         if self.config.remove_no_mangle && !is_exposed_fn {
             item.attrs.retain(|attr| {
@@ -263,35 +270,48 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
                 normal.item.path.segments.last().unwrap().ident.name != sym::no_mangle
             });
         }
+    }
 
-        if self.config.remove_extern_c
-            && !is_exposed_fn
-            && let ast::ItemKind::Fn(box ast::Fn { sig, .. }) = &mut item.kind
-        {
-            sig.header.ext = ast::Extern::None;
-        }
-
-        if let ast::ItemKind::Fn(box ast::Fn { sig, .. }) = &mut item.kind
-            && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
-            && !self.unsafe_fns.contains(def_id)
-            && matches!(sig.header.safety, ast::Safety::Unsafe(_))
-        {
-            sig.header.safety = ast::Safety::Default;
-        }
-
-        mut_visit::walk_item(self, item);
+    fn flat_map_stmt(&mut self, s: ast::Stmt) -> smallvec::SmallVec<[ast::Stmt; 1]> {
+        let mut stmts = mut_visit::walk_flat_map_stmt(self, s);
+        stmts.retain(|stmt| {
+            let unused = if let Some(hir_stmt) = self.ast_to_hir.get_stmt(stmt.id, self.tcx)
+                && let hir::StmtKind::Let(hir_let_stmt) = hir_stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = hir_let_stmt.pat.kind
+            {
+                !self.used_locals.contains(&hir_id)
+            } else {
+                false
+            };
+            if unused {
+                let ast::StmtKind::Let(local) = &mut stmt.kind else { panic!() };
+                match &mut local.kind {
+                    ast::LocalKind::Decl => false,
+                    ast::LocalKind::Init(e) => {
+                        if utils::ast::has_side_effects(e) {
+                            local.pat.kind = ast::PatKind::Wild;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    ast::LocalKind::InitElse(_, _) => true,
+                }
+            } else {
+                true
+            }
+        });
+        stmts
     }
 }
 
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     mains: Vec<LocalDefId>,
-    main0s: Vec<LocalDefId>,
-    param_to_main0: FxHashMap<HirId, LocalDefId>,
-    param_used_main0s: FxHashSet<LocalDefId>,
     fns: Vec<LocalDefId>,
     uses: Vec<(LocalDefId, Vec<DefId>)>,
     used: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+    used_locals: FxHashSet<HirId>,
     item_mods: FxHashMap<LocalDefId, LocalModDefId>,
 }
 
@@ -317,19 +337,10 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
         self.add_item_mod(item.owner_id.def_id);
         match item.kind {
-            hir::ItemKind::Fn { ident, body, .. } => {
+            hir::ItemKind::Fn { ident, .. } => {
                 self.fns.push(item.owner_id.def_id);
                 if ident.name == sym::main {
                     self.mains.push(item.owner_id.def_id);
-                }
-                if ident.name.as_str() == "main_0" {
-                    self.main0s.push(item.owner_id.def_id);
-                    let body = self.tcx.hir_body(body);
-                    for param in body.params {
-                        if let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind {
-                            self.param_to_main0.insert(hir_id, item.owner_id.def_id);
-                        }
-                    }
                 }
             }
             hir::ItemKind::Impl(imp) => {
@@ -436,9 +447,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 }
             }
             Res::Local(hir_id) => {
-                if let Some(def_id) = self.param_to_main0.get(&hir_id) {
-                    self.param_used_main0s.insert(*def_id);
-                }
+                self.used_locals.insert(hir_id);
             }
             _ => {}
         }

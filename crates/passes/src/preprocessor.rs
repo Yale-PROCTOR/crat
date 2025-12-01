@@ -238,6 +238,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
 use utils::{
+    ast::unwrap_cast_and_paren,
     expr,
     ir::{AstToHir, mir_ty_to_string},
     ty,
@@ -338,6 +339,32 @@ struct AstVisitor<'tcx> {
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
+    fn visit_item(&mut self, item: &mut Item) {
+        mut_visit::walk_item(self, item);
+
+        // remove unnecessary unsafe blocks after removing transmute
+        let expr = match &mut item.kind {
+            ItemKind::Static(item) => item.expr.as_mut(),
+            ItemKind::Const(item) => item.expr.as_mut(),
+            _ => None,
+        };
+        if let Some(expr) = expr
+            && let ExprKind::Block(block, _) = &mut expr.kind
+            && block.rules == BlockCheckMode::Unsafe(UnsafeSource::UserProvided)
+            && let [stmt] = &mut block.stmts[..]
+            && let StmtKind::Expr(e) = &mut stmt.kind
+        {
+            let is_safe = match &e.kind {
+                ExprKind::Array(es) => es.iter().all(|e| is_lit(e)),
+                ExprKind::Repeat(e, _) => is_lit(e),
+                _ => false,
+            };
+            if is_safe {
+                **expr = utils::ast::take_expr(e);
+            }
+        }
+    }
+
     fn visit_ty(&mut self, ty: &mut Ty) {
         mut_visit::walk_ty(self, ty);
 
@@ -575,6 +602,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     }
 }
 
+#[inline]
+fn is_lit(e: &Expr) -> bool {
+    matches!(unwrap_cast_and_paren(e).kind, ExprKind::Lit(_))
+}
+
 fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
     let is_signed = elem_ty.is_signed();
     let mut buf = Vec::with_capacity(s.len());
@@ -605,7 +637,7 @@ fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
                 }
             }
         }
-        if all_same {
+        if all_same && len > 1 {
             if is_signed {
                 write!(array, "' as i8; ").unwrap();
             } else {

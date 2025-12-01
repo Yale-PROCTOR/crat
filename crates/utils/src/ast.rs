@@ -7,7 +7,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_parse::parser::{AttemptLocalParseRecovery, ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
 use rustc_span::{DUMMY_SP, FileName, RealFileName, Symbol, sym};
-use thin_vec::ThinVec;
+use thin_vec::{ThinVec, thin_vec};
 
 use crate::ir;
 
@@ -109,6 +109,97 @@ pub fn unwrap_cast_and_paren_mut(expr: &mut Expr) -> &mut Expr {
     } else {
         expr
     }
+}
+
+pub fn has_side_effects(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::ConstBlock(_)
+        | ExprKind::Lit(..)
+        | ExprKind::Closure(..)
+        | ExprKind::Underscore
+        | ExprKind::Path(..)
+        | ExprKind::OffsetOf(..) => false,
+        ExprKind::While(..)
+        | ExprKind::ForLoop { .. }
+        | ExprKind::Loop(..)
+        | ExprKind::Assign(..)
+        | ExprKind::AssignOp(..)
+        | ExprKind::Range(None, None, _)
+        | ExprKind::Break(..)
+        | ExprKind::Continue(..)
+        | ExprKind::Ret(..)
+        | ExprKind::InlineAsm(..)
+        | ExprKind::Try(..)
+        | ExprKind::If(..)
+        | ExprKind::Match(..)
+        | ExprKind::Block(..) => true,
+        ExprKind::Call(callee, args) => {
+            if let ExprKind::Path(_, path) = &callee.kind {
+                let name = path.segments.last().unwrap().ident.name.as_str();
+                name != "null" && name != "null_mut" || args.iter().any(|e| has_side_effects(e))
+            } else {
+                true
+            }
+        }
+        ExprKind::MethodCall(call) => {
+            let name = call.seg.ident.name.as_str();
+            name != "offset"
+                && name != "unwrap"
+                && name != "as_deref"
+                && name != "as_deref_mut"
+                && name != "as_ptr"
+                && name != "as_mut_ptr"
+                || has_side_effects(&call.receiver)
+                || call.args.iter().any(|e| has_side_effects(e))
+        }
+        ExprKind::Array(exprs) | ExprKind::Tup(exprs) => exprs.iter().any(|e| has_side_effects(e)),
+        ExprKind::Binary(_, e1, e2)
+        | ExprKind::Index(e1, e2, _)
+        | ExprKind::Range(Some(e1), Some(e2), _) => has_side_effects(e1) || has_side_effects(e2),
+        ExprKind::Unary(_, e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::Type(e, _)
+        | ExprKind::Let(_, e, _, _)
+        | ExprKind::Field(e, _)
+        | ExprKind::Range(Some(e), None, _)
+        | ExprKind::Range(None, Some(e), _)
+        | ExprKind::AddrOf(_, _, e)
+        | ExprKind::Repeat(e, _)
+        | ExprKind::Paren(e) => has_side_effects(e),
+        ExprKind::Gen(..) => todo!(),
+        ExprKind::Await(..) => todo!(),
+        ExprKind::Use(..) => todo!(),
+        ExprKind::TryBlock(..) => todo!(),
+        ExprKind::Struct(e) => {
+            e.fields.iter().any(|f| has_side_effects(&f.expr))
+                || if let StructRest::Base(e) = &e.rest {
+                    has_side_effects(e)
+                } else {
+                    false
+                }
+        }
+        ExprKind::Yield(..) => todo!(),
+        ExprKind::Yeet(..) => todo!(),
+        ExprKind::Become(..) => todo!(),
+        ExprKind::IncludedBytes(..) => todo!(),
+        ExprKind::FormatArgs(..) => todo!(),
+        ExprKind::UnsafeBinderCast(..) => todo!(),
+        ExprKind::MacCall(..) | ExprKind::Err(..) | ExprKind::Dummy => panic!(),
+    }
+}
+
+pub fn dummy_expr() -> Expr {
+    Expr {
+        id: DUMMY_NODE_ID,
+        kind: ExprKind::Dummy,
+        span: DUMMY_SP,
+        attrs: thin_vec![],
+        tokens: None,
+    }
+}
+
+pub fn take_expr(expr: &mut Expr) -> Expr {
+    std::mem::replace(expr, dummy_expr())
 }
 
 #[derive(Debug)]

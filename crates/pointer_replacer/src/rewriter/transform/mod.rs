@@ -838,8 +838,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
 
-        if is_offset_call(e) {
-            // we assume that the pointer is not null when offset is called
+        if let Some(name) = method_call_name(e)
+            && let name = name.as_str()
+            && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
+        {
+            // we assume that the pointer is not null when such methods are called
             if !need_cast {
                 utils::expr!(
                     "std::slice::from_raw_parts{}(({}){}, 100000)",
@@ -856,7 +859,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if m { "mut" } else { "const" },
                 )
             }
-        } else if !has_side_effect(e) {
+        } else if !utils::ast::has_side_effects(e) {
             if !need_cast {
                 utils::expr!(
                     "if ({0}).is_null() {{
@@ -1420,81 +1423,11 @@ fn hir_unwrap_subscript<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'t
     }
 }
 
-fn is_offset_call(expr: &Expr) -> bool {
+fn method_call_name(expr: &Expr) -> Option<Symbol> {
     if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind {
-        call.seg.ident.name == rustc_span::sym::offset
+        Some(call.seg.ident.name)
     } else {
-        false
-    }
-}
-
-fn has_side_effect(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::ConstBlock(_)
-        | ExprKind::Lit(..)
-        | ExprKind::Closure(..)
-        | ExprKind::Underscore
-        | ExprKind::Path(..)
-        | ExprKind::OffsetOf(..) => false,
-        ExprKind::Call(..)
-        | ExprKind::While(..)
-        | ExprKind::ForLoop { .. }
-        | ExprKind::Loop(..)
-        | ExprKind::Assign(..)
-        | ExprKind::AssignOp(..)
-        | ExprKind::Range(None, None, _)
-        | ExprKind::Break(..)
-        | ExprKind::Continue(..)
-        | ExprKind::Ret(..)
-        | ExprKind::InlineAsm(..)
-        | ExprKind::Try(..)
-        | ExprKind::If(..)
-        | ExprKind::Match(..)
-        | ExprKind::Block(..) => true,
-        ExprKind::MethodCall(call) => {
-            let name = call.seg.ident.name.as_str();
-            name != "offset"
-                && name != "unwrap"
-                && name != "as_deref"
-                && name != "as_deref_mut"
-                && name != "as_ptr"
-                && name != "as_mut_ptr"
-                || has_side_effect(&call.receiver)
-                || call.args.iter().any(|e| has_side_effect(e))
-        }
-        ExprKind::Array(exprs) | ExprKind::Tup(exprs) => exprs.iter().any(|e| has_side_effect(e)),
-        ExprKind::Binary(_, e1, e2)
-        | ExprKind::Index(e1, e2, _)
-        | ExprKind::Range(Some(e1), Some(e2), _) => has_side_effect(e1) || has_side_effect(e2),
-        ExprKind::Unary(_, e)
-        | ExprKind::Cast(e, _)
-        | ExprKind::Type(e, _)
-        | ExprKind::Let(_, e, _, _)
-        | ExprKind::Field(e, _)
-        | ExprKind::Range(Some(e), None, _)
-        | ExprKind::Range(None, Some(e), _)
-        | ExprKind::AddrOf(_, _, e)
-        | ExprKind::Repeat(e, _)
-        | ExprKind::Paren(e) => has_side_effect(e),
-        ExprKind::Gen(..) => todo!(),
-        ExprKind::Await(..) => todo!(),
-        ExprKind::Use(..) => todo!(),
-        ExprKind::TryBlock(..) => todo!(),
-        ExprKind::Struct(e) => {
-            e.fields.iter().any(|f| has_side_effect(&f.expr))
-                || if let StructRest::Base(e) = &e.rest {
-                    has_side_effect(e)
-                } else {
-                    false
-                }
-        }
-        ExprKind::Yield(..) => todo!(),
-        ExprKind::Yeet(..) => todo!(),
-        ExprKind::Become(..) => todo!(),
-        ExprKind::IncludedBytes(..) => todo!(),
-        ExprKind::FormatArgs(..) => todo!(),
-        ExprKind::UnsafeBinderCast(..) => todo!(),
-        ExprKind::MacCall(..) | ExprKind::Err(..) | ExprKind::Dummy => panic!(),
+        None
     }
 }
 
