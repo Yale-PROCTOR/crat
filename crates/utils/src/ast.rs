@@ -136,7 +136,7 @@ pub fn has_side_effects(expr: &Expr) -> bool {
         ExprKind::Call(callee, args) => {
             if let ExprKind::Path(_, path) = &callee.kind {
                 let name = path.segments.last().unwrap().ident.name.as_str();
-                name != "null" && name != "null_mut" && args.iter().all(|e| has_side_effects(e))
+                name != "null" && name != "null_mut" || args.iter().any(|e| has_side_effects(e))
             } else {
                 true
             }

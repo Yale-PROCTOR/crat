@@ -50,15 +50,25 @@ pub fn find_unused_assignments(tcx: TyCtxt<'_>) -> UnusedAssignments {
                 }
             }
             let terminator = bbd.terminator();
-            if let mir::TerminatorKind::Call { destination, .. } = terminator.kind {
+            if let mir::TerminatorKind::Call {
+                destination,
+                target: Some(target),
+                ..
+            } = terminator.kind
+            {
                 let loc = mir::Location {
-                    block: bb,
-                    statement_index: bbd.statements.len(),
+                    block: target,
+                    statement_index: 0,
                 };
+                cursor.seek_after_primary_effect(loc);
                 let lives = cursor.get();
                 if let Some(local) = destination.as_local()
                     && !lives.contains(local)
                 {
+                    let loc = mir::Location {
+                        block: bb,
+                        statement_index: bbd.statements.len(),
+                    };
                     dead_assignments.insert((def_id, loc));
                 }
             }
