@@ -11,7 +11,7 @@ use rustc_ast::{
     ptr::P,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
     Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, definitions::DefPathData,
@@ -33,6 +33,18 @@ use utils::{
 
 use crate::outparam_replacer::ai::analysis::*;
 
+#[derive(Default, Clone, Copy, Debug)]
+struct Counter {
+    removed_value_defs: usize,
+    removed_pointer_defs: usize,
+    removed_pointer_uses: usize,
+    direct_returns: usize,
+    success_returns: usize,
+    failure_returns: usize,
+    removed_flag_sets: usize,
+    removed_flag_defs: usize,
+}
+
 #[derive(Debug, Clone)]
 struct Param {
     /// index of the parameter in the signature
@@ -45,6 +57,15 @@ struct Param {
     ty_str: String,
     /// return value indicating success for may output parameter
     succ_value: Option<SuccValue>,
+
+    /// if true, skip flag declaration
+    simplify_flag_decl: bool,
+    /// if true, skip value declaration
+    simplify_value_decl: bool,
+    /// if true, skip reference declaration
+    simplify_ref_decl: bool,
+    /// HirId of return and value written to param before return
+    direct_returns: FxHashMap<HirId, String>,
 }
 
 impl Param {
@@ -72,6 +93,8 @@ rustc_index::newtype_index! {
     pub struct RetIdx {}
 }
 
+type WriteForReturn = FxHashMap<Location, (FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>;
+
 struct Func {
     is_unit: bool,
     index_map: BTreeMap<ParamIdx, Param>,
@@ -79,6 +102,13 @@ struct Func {
     return_tys: IndexVec<RetIdx, ReturnTyItem>,
     /// locations where the parameter is fully written. empty for must parameters
     write_locs: FxHashMap<ParamIdx, Vec<Location>>,
+
+    /// HirIds where deref of the parameter can be simplified
+    simpl_derefs: FxHashMap<HirId, ParamIdx>,
+    /// Locations where assign to the parameter can be simplified
+    simpl_assigns: FxHashSet<Location>,
+    /// location where return value is written and params written at the point
+    wfrs: Option<WriteForReturn>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,16 +204,21 @@ pub fn transform(
         path_to_mod_id.insert(path, mod_id);
     });
 
-    let mut hir_visitor = HirVisitor::new(tcx);
-    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
-
+    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let mut thir_to_mir = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
         thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
     }
 
+    let mut hir_visitor = HirVisitor::new(tcx, &hir_to_thir, &thir_to_mir);
+    tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
+    hir_visitor
+        .assigns
+        .retain(|_, assign| !hir_visitor.call_in_assigns.contains(&assign.hir_id));
+
     let mut funcs = FxHashMap::default();
     let mut write_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+    let mut counter = Counter::default();
 
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
@@ -200,9 +235,45 @@ pub fn transform(
             .mir_drops_elaborated_and_const_checked(local_def_id)
             .borrow();
 
+        let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+        let is_unit = sig.output().is_unit();
+
         let mut succ_param = None;
         let mut index_map: BTreeMap<_, _> = BTreeMap::new();
         let mut write_locs: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut simpl_derefs: FxHashMap<_, _> = FxHashMap::default();
+        let mut simpl_assigns: FxHashSet<_> = FxHashSet::default();
+
+        // locations of write for return value
+        let wfrs = if config.simplify && !is_unit && !fn_analysis_result.wfrs.is_empty() {
+            Some(
+                fn_analysis_result
+                    .wfrs
+                    .iter()
+                    .map(|wfr| {
+                        let loc = Location {
+                            block: BasicBlock::from_usize(wfr.block),
+                            statement_index: wfr.statement_index,
+                        };
+                        (
+                            loc,
+                            (
+                                wfr.mays
+                                    .iter()
+                                    .map(|i| ParamIdx::from_usize(*i))
+                                    .collect::<FxHashSet<_>>(),
+                                wfr.musts
+                                    .iter()
+                                    .map(|i| ParamIdx::from_usize(*i))
+                                    .collect::<FxHashSet<_>>(),
+                            ),
+                        )
+                    })
+                    .collect::<FxHashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
 
         for p in &fn_analysis_result.output_params {
             let OutputParam {
@@ -223,6 +294,23 @@ pub fn transform(
                 _ => unreachable!("{mir_ty:?}"),
             };
 
+            // simplify 1: once may parameter is fully written, flag sets can be removed
+            let rcfws = if config.simplify {
+                fn_analysis_result
+                    .rcfws
+                    .get(&param_index.index())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(block, statement_index)| Location {
+                        block: BasicBlock::from_usize(block),
+                        statement_index,
+                    })
+                    .collect::<FxHashSet<_>>()
+            } else {
+                FxHashSet::default()
+            };
+            let mut simplify_flag_decl = config.simplify && !is_unit;
             complete_writes.iter().for_each(|cw| {
                 let CompleteWrite {
                     block,
@@ -239,24 +327,110 @@ pub fn transform(
                     let t = bbd.terminator();
                     assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{t:?}");
 
-                    if let Some(arg) = write_arg {
+                    if config.simplify && rcfws.contains(&loc) {
+                        counter.removed_flag_sets += 1;
+                    } else if let Some(arg) = write_arg {
                         write_args
                             .entry((local_def_id, loc))
                             .or_default()
                             .insert(ParamIdx::from_usize(*arg), name.clone());
+                        simplify_flag_decl = false;
                     }
+                } else if config.simplify && rcfws.contains(&loc) {
+                    counter.removed_flag_sets += 1;
                 } else {
                     write_locs.entry(param_index).or_default().push(loc);
+                    simplify_flag_decl = false;
                 }
             });
 
+            // simplify 2: for assignments before return, return the value directly
+            let mut direct_returns = FxHashMap::default();
+            let deref_uses = if config.simplify
+                && let Some(derefs) = hir_visitor.deref_uses.get(&(local_def_id, mir_local))
+            {
+                if is_unit {
+                    derefs
+                        .iter()
+                        .map(|deref| (deref, param_index))
+                        .collect::<FxHashSet<_>>()
+                } else {
+                    derefs
+                        .iter()
+                        .filter_map(|deref| {
+                            if let Some(Assign { loc, span, rhs, .. }) =
+                                hir_visitor.assigns.get(&deref.hir_id)
+                                && let Some(returns) = hir_visitor.returns.get_mut(&local_def_id)
+                            {
+                                let source_map = tcx.sess.source_map();
+
+                                let assigned_returns = returns
+                                    .extract_if(|(ret_span, _)| {
+                                        source_map
+                                            .span_to_snippet(span.between(*ret_span))
+                                            .unwrap()
+                                            .chars()
+                                            .all(|c| c.is_whitespace() || c == ';')
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                assert!(assigned_returns.len() <= 1);
+
+                                if let Some((_, return_hir_id)) = assigned_returns.first() {
+                                    // If there is an assignment before return, remove the assign and return the value
+                                    direct_returns.insert(*return_hir_id, rhs.clone());
+                                    simpl_assigns.insert(*loc);
+                                    None
+                                } else {
+                                    Some((deref, param_index))
+                                }
+                            } else {
+                                Some((deref, param_index))
+                            }
+                        })
+                        .collect::<FxHashSet<_>>()
+                }
+            } else {
+                FxHashSet::default()
+            };
+            // check if there are no uses of pointer and value
+            let simplify_value_decl = config.simplify
+                && !is_unit
+                && deref_uses.is_empty()
+                && !hir_visitor.ref_uses.contains(&(local_def_id, mir_local));
+
+            // simplify 3: rewrite dereferenced ptr to direct value uses
+            let mut simplify_ref_decl = false;
+            if config.simplify {
+                let deref_uses = if !hir_visitor.ref_uses.contains(&(local_def_id, mir_local)) {
+                    simplify_ref_decl = true;
+                    deref_uses
+                        .into_iter()
+                        .map(|(deref, param_index)| (deref.hir_id, param_index))
+                        .collect::<FxHashMap<_, _>>()
+                } else {
+                    // if there are ref uses, only simplify derefs in call or return
+                    deref_uses
+                        .into_iter()
+                        .filter_map(|(deref, param_index)| {
+                            if deref.in_call_or_ret {
+                                Some((deref.hir_id, param_index))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<FxHashMap<_, _>>()
+                };
+
+                simpl_derefs.extend(deref_uses);
+            }
+
+            // find the first may parameter which has a value indicating success
             let succ_value = if succ_param.is_none() {
-                // find the first may parameter which has a value indicating success
                 SuccValue::from(p)
             } else {
                 None
             };
-
             if succ_value.is_some() {
                 succ_param = Some(param_index);
             }
@@ -269,14 +443,15 @@ pub fn transform(
                     must: *must,
                     ty_str,
                     succ_value,
+                    simplify_flag_decl,
+                    simplify_value_decl,
+                    simplify_ref_decl,
+                    direct_returns,
                 },
             );
         }
 
         // given the analysis result, decide how to transform the return type
-        let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
-        let is_unit = sig.output().is_unit();
-
         let mut return_tys: IndexVec<RetIdx, ReturnTyItem> = IndexVec::new();
 
         if let Some(index) = succ_param {
@@ -296,11 +471,13 @@ pub fn transform(
             index_map,
             return_tys,
             write_locs,
+            simpl_derefs,
+            simpl_assigns,
+            wfrs,
         };
         funcs.insert(local_def_id, func);
     }
 
-    let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let res = transform_ast(
         |krate| {
             let source_map = tcx.sess.source_map();
@@ -331,12 +508,18 @@ pub fn transform(
                 bounds: &hir_visitor.bounds,
                 call_in_ret: &hir_visitor.call_in_ret,
                 updated: false,
+                counter: &mut counter,
             };
             visitor.visit_crate(krate);
             visitor.updated
         },
         tcx,
     );
+
+    if config.simplify {
+        println!("{counter:#?}");
+    }
+
     res.apply();
 }
 
@@ -351,10 +534,12 @@ struct TransformVisitor<'tcx, 'a> {
     write_args: &'a FxHashMap<(LocalDefId, Location), FxHashMap<ParamIdx, String>>,
     /// bound occurrence (ident) span to def_id
     bounds: &'a FxHashMap<Span, LocalDefId>,
-    // maps spans of returns to calls inside them
+    /// maps spans of returns to calls inside them
     call_in_ret: &'a FxHashMap<Span, LocalDefId>,
     /// is this file updated
     updated: bool,
+    /// tracks simplification status
+    counter: &'a mut Counter,
 }
 
 impl TransformVisitor<'_, '_> {
@@ -384,7 +569,7 @@ impl TransformVisitor<'_, '_> {
         let set_flag = if let Some(arg_to_param) = write_args
             && let Some(caller_param) = arg_to_param.get(&index)
         {
-            format!(" {caller_param}___s = true")
+            format!("; {caller_param}___s = true")
         } else {
             String::new()
         };
@@ -392,35 +577,89 @@ impl TransformVisitor<'_, '_> {
         // TODO: enable more robust detection
         if arg.contains("&mut ") {
             if must {
-                format!("*({arg}) = {rhs};{set_flag}")
+                format!("*({arg}) = {rhs}{set_flag}")
             } else {
-                format!("if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }}")
+                format!("if let Some(v___) = {rhs} {{ *({arg}) = v___{set_flag} }}")
             }
         } else if must {
-            format!("if !({arg}.is_null()) {{ *({arg}) = {rhs};{set_flag} }}")
+            format!("if !({arg}.is_null()) {{ *({arg}) = {rhs}{set_flag} }}")
         } else {
             format!(
-                "if !(({arg}).is_null()) {{ if let Some(v___) = {rhs} {{ *({arg}) = v___;{set_flag} }} }}"
+                "if !(({arg}).is_null()) {{ if let Some(v___) = {rhs} {{ *({arg}) = v___{set_flag} }} }}"
             )
         }
     }
 
-    fn get_return_value(&self, func: &Func, orig_ret: Option<String>) -> String {
+    fn get_simpl_name(&self, param: &Param, hir_id: Option<HirId>) -> Option<String> {
+        let hir_id = hir_id?;
+        let name = param.direct_returns.get(&hir_id)?;
+        Some(name.clone())
+    }
+
+    fn get_name(&mut self, param: &Param, hir_id: Option<HirId>) -> String {
+        if let Some(name) = self.get_simpl_name(param, hir_id) {
+            self.counter.direct_returns += 1;
+            name
+        } else {
+            format!("{}___v", param.name)
+        }
+    }
+
+    fn get_return_value(
+        &mut self,
+        func: &Func,
+        wfr: Option<&(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>,
+        orig_ret: Option<String>,
+        hir_id: Option<HirId>,
+    ) -> String {
         let mut ret_vals = vec![];
+        let orig_ret = orig_ret.as_ref();
         for ret_ty in &func.return_tys {
             let ret_val = match ret_ty {
-                ReturnTyItem::Orig => orig_ret.as_ref().unwrap().clone(),
-                ReturnTyItem::Type(param) => format!("{}___v", param.name),
-                ReturnTyItem::Result(param) => format!(
-                    "if {}___s {{ Ok({}___v) }} else {{ Err({}) }}",
-                    param.name,
-                    param.name,
-                    orig_ret.as_ref().unwrap()
-                ),
-                ReturnTyItem::Option(param) => format!(
-                    "if {}___s {{ Some({}___v) }} else {{ None }}",
-                    param.name, param.name
-                ),
+                ReturnTyItem::Orig => orig_ret.unwrap().clone(),
+                ReturnTyItem::Type(param) => self.get_name(param, hir_id),
+                ReturnTyItem::Result(param) => {
+                    let name = self.get_name(param, hir_id);
+                    if let Some((may, must)) = wfr {
+                        if must.contains(&param.index) {
+                            self.counter.success_returns += 1;
+                            format!("Ok({name})")
+                        } else if !may.contains(&param.index) {
+                            self.counter.failure_returns += 1;
+                            format!("Err({})", orig_ret.unwrap())
+                        } else {
+                            format!(
+                                "if {}___s {{ Ok({}) }} else {{ Err({}) }}",
+                                param.name,
+                                name,
+                                orig_ret.unwrap()
+                            )
+                        }
+                    } else {
+                        format!(
+                            "if {}___s {{ Ok({}) }} else {{ Err({}) }}",
+                            param.name,
+                            name,
+                            orig_ret.unwrap()
+                        )
+                    }
+                }
+                ReturnTyItem::Option(param) => {
+                    let name = self.get_name(param, hir_id);
+                    if let Some((may, must)) = wfr {
+                        if must.contains(&param.index) {
+                            self.counter.success_returns += 1;
+                            format!("Some({name})")
+                        } else if !may.contains(&param.index) {
+                            self.counter.failure_returns += 1;
+                            String::from("None")
+                        } else {
+                            format!("if {}___s {{ Some({}) }} else {{ None }}", param.name, name)
+                        }
+                    } else {
+                        format!("if {}___s {{ Some({}) }} else {{ None }}", param.name, name)
+                    }
+                }
             };
             ret_vals.push(ret_val);
         }
@@ -431,7 +670,7 @@ impl TransformVisitor<'_, '_> {
         }
     }
 
-    fn get_mir_loc_for_expr(&self, expr_id: NodeId) -> Option<Location> {
+    fn get_mir_locs_for_expr(&self, expr_id: NodeId) -> Option<Vec<Location>> {
         let hir_expr = self.ast_to_hir.get_expr(expr_id, self.tcx)?;
 
         let hir_id = hir_expr.hir_id;
@@ -441,7 +680,15 @@ impl TransformVisitor<'_, '_> {
 
         let thir_expr_id = self.hir_to_thir.exprs.get(&hir_expr.hir_id)?;
 
-        let mir_locs = thir_to_mir.expr_to_locs.get(thir_expr_id)?;
+        thir_to_mir
+            .expr_to_locs
+            .get(thir_expr_id)
+            .cloned()
+            .map(|locs| locs.to_vec())
+    }
+
+    fn get_mir_loc_for_expr(&self, expr_id: NodeId) -> Option<Location> {
+        let mir_locs = self.get_mir_locs_for_expr(expr_id)?;
 
         if mir_locs.len() == 1 {
             Some(mir_locs[0])
@@ -466,7 +713,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .unwrap_or_else(|| panic!("Failed to find HIR item to node {node_id:?}"));
         let local_def_id = hir_item.owner_id.def_id;
         self.current_fns.push(local_def_id);
-
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(box fn_item) = &mut item.kind
@@ -533,19 +779,33 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 );
                 let flag_decl = stmt!("let mut {}___s: bool = false;", param.name);
 
-                // TODO: simplify unnecessary declarations
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
-                stmts.insert(0, ref_decl);
-                stmts.insert(0, value_decl);
+
+                if param.simplify_ref_decl {
+                    self.counter.removed_pointer_defs += 1;
+                } else {
+                    stmts.insert(0, ref_decl);
+                }
+
+                if param.simplify_value_decl {
+                    self.counter.removed_value_defs += 1;
+                } else {
+                    stmts.insert(0, value_decl);
+                }
+
                 if !param.must {
-                    stmts.insert(0, flag_decl);
+                    if param.simplify_flag_decl {
+                        self.counter.removed_flag_defs += 1;
+                    } else {
+                        stmts.insert(0, flag_decl);
+                    }
                 }
             }
 
             // for unit function without return statement, add a return
             if func.is_unit {
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
-                let ret = self.get_return_value(func, None);
+                let ret = self.get_return_value(func, None, None, None);
                 let ret_stmt = stmt!("return {};", ret);
                 stmts.push(ret_stmt);
             }
@@ -570,22 +830,27 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .get_mir_loc_for_expr(expr.id)
                         .unwrap_or_else(|| panic!("Failed to find MIR location for assign expr"));
 
-                    let mut flag_updates = vec![];
-                    for (p, locs) in &func.write_locs {
-                        let param = &func.index_map[p];
-                        if !param.must && locs.contains(&loc) {
-                            let update = format!("{}___s = true", param.name);
-                            flag_updates.push(update);
-                        }
-                    }
-
-                    if !flag_updates.is_empty() {
-                        let new_expr = expr!(
-                            "{{ {}; {} }}",
-                            flag_updates.join("; "),
-                            pprust::expr_to_string(expr),
-                        );
+                    if func.simpl_assigns.contains(&loc) {
+                        let new_expr = expr!("()");
                         self.replace_expr(expr, new_expr);
+                    } else {
+                        let mut flag_updates = vec![];
+                        for (p, locs) in &func.write_locs {
+                            let param = &func.index_map[p];
+                            if !param.must && locs.contains(&loc) {
+                                let update = format!("{}___s = true", param.name);
+                                flag_updates.push(update);
+                            }
+                        }
+
+                        if !flag_updates.is_empty() {
+                            let new_expr = expr!(
+                                "{{ {}; {} }}",
+                                flag_updates.join("; "),
+                                pprust::expr_to_string(expr),
+                            );
+                            self.replace_expr(expr, new_expr);
+                        }
                     }
                 }
             }
@@ -597,13 +862,66 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     && !func.index_map.is_empty()
                 {
                     let orig_ret = opt_expr.as_ref().map(|e| pprust::expr_to_string(e));
+                    let hir_expr = self
+                        .ast_to_hir
+                        .get_expr(expr.id, self.tcx)
+                        .unwrap_or_else(|| panic!("Failed to find HIR expr for return expr"));
+                    let hir_id = hir_expr.hir_id;
+
+                    let wfr: Option<(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)> = if func.is_unit
+                        || func.wfrs.is_none()
+                    {
+                        None
+                    } else {
+                        let wfrs = func.wfrs.as_ref().unwrap();
+                        let mut expr_locs = self.get_mir_locs_for_expr(expr.id).unwrap_or_default();
+
+                        // handle where return value has multiple MIR blocks
+                        if let Some(opt_expr) = opt_expr.as_ref() {
+                            let blocks = self
+                                .get_mir_locs_for_expr(opt_expr.id)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|loc| loc.block)
+                                .collect::<FxHashSet<_>>();
+
+                            for wfr in wfrs.keys() {
+                                if blocks.contains(&wfr.block) && !expr_locs.contains(wfr) {
+                                    expr_locs.push(*wfr);
+                                }
+                            }
+                        }
+
+                        Some(expr_locs.iter().fold(
+                            (FxHashSet::default(), FxHashSet::default()),
+                            |(mays, musts), loc| {
+                                if let Some((loc_mays, loc_musts)) = wfrs.get(loc) {
+                                    let mays = mays.union(loc_mays).cloned().collect();
+                                    let musts = if musts.is_empty() {
+                                        loc_musts.clone()
+                                    } else {
+                                        musts.intersection(loc_musts).cloned().collect()
+                                    };
+                                    (mays, musts)
+                                } else {
+                                    (mays, musts)
+                                }
+                            },
+                        ))
+                    };
 
                     if let Some(callee) = self.call_in_ret.get(&expr.span)
                         && let Some(callee) = self.funcs.get(callee)
                         && !callee.index_map.is_empty()
                     {
                         // if return contains a call to function being transformed
-                        let ret_val = self.get_return_value(func, Some("rv___".to_string()));
+                        let ret_val = self.get_return_value(
+                            func,
+                            wfr.as_ref(),
+                            Some("rv___".to_string()),
+                            Some(hir_id),
+                        );
+
                         let new_return = expr!(
                             "{{ let rv___ = {}; return {} }}",
                             orig_ret.unwrap(),
@@ -611,7 +929,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         );
                         self.replace_expr(expr, new_return);
                     } else {
-                        let new_return = expr!("return {}", self.get_return_value(func, orig_ret));
+                        let new_return = expr!(
+                            "return {}",
+                            self.get_return_value(func, wfr.as_ref(), orig_ret, Some(hir_id))
+                        );
                         self.replace_expr(expr, new_return);
                     }
                 }
@@ -718,11 +1039,24 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             };
                             let assign_ret = assign_ret.join("; ");
                             expr!(
-                                "(match ({{ {binding}; {assign_ret} }}) {{ Ok(v___) => {{ {mtch_assign} {v} }} Err(v___) => v___ }})",
+                                "(match {{ {binding}; {assign_ret} }} {{ Ok(v___) => {{ {mtch_assign}; {v} }} Err(v___) => v___ }})",
                             )
                         }
                     };
                     self.replace_expr(expr, new_expr);
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, _) => {
+                if let Some(curr_fn) = self.current_fns.last()
+                    && let Some(func) = self.funcs.get(curr_fn)
+                    && !func.index_map.is_empty()
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let Some(param_index) = func.simpl_derefs.get(&hir_expr.hir_id)
+                {
+                    let param = &func.index_map[param_index];
+                    let new_expr = expr!("{}___v", param.name);
+                    self.replace_expr(expr, new_expr);
+                    self.counter.removed_pointer_uses += 1;
                 }
             }
             _ => {}
@@ -730,18 +1064,64 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 }
 
-struct HirVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    bounds: FxHashMap<Span, LocalDefId>,
-    call_in_ret: FxHashMap<Span, LocalDefId>,
+#[derive(Debug, Clone)]
+struct Assign {
+    hir_id: HirId,
+    loc: Location,
+    span: Span,
+    rhs: String,
 }
 
-impl<'tcx> HirVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct Deref {
+    hir_id: HirId,
+    in_call_or_ret: bool,
+}
+
+enum Parent<'tcx> {
+    Deref(HirId),
+    Ret(&'tcx HirExpr<'tcx>),
+    Assign(HirId),
+    Call,
+}
+
+struct HirVisitor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    /// bound occurrence (ident) span to def_id
+    bounds: FxHashMap<Span, LocalDefId>,
+    /// spans of returns to function called inside them
+    call_in_ret: FxHashMap<Span, LocalDefId>,
+    /// HirId of assigns which has a call inside them
+    call_in_assigns: FxHashSet<HirId>,
+    /// in function, the set of deref hir ids of a local
+    deref_uses: FxHashMap<(LocalDefId, Local), FxHashSet<Deref>>,
+    /// in function, a local is used without deref
+    ref_uses: FxHashSet<(LocalDefId, Local)>,
+    /// maps HirId of lhs to assignment info
+    assigns: FxHashMap<HirId, Assign>,
+    /// span and HirId of return expressions
+    returns: FxHashMap<LocalDefId, FxHashSet<(Span, HirId)>>,
+    hir_to_thir: &'a HirToThir,
+    thir_to_mir: &'a FxHashMap<LocalDefId, ThirToMir>,
+}
+
+impl<'a, 'tcx> HirVisitor<'a, 'tcx> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        hir_to_thir: &'a HirToThir,
+        thir_to_mir: &'a FxHashMap<LocalDefId, ThirToMir>,
+    ) -> Self {
         Self {
             tcx,
             bounds: FxHashMap::default(),
             call_in_ret: FxHashMap::default(),
+            call_in_assigns: FxHashSet::default(),
+            deref_uses: FxHashMap::default(),
+            ref_uses: FxHashSet::default(),
+            assigns: FxHashMap::default(),
+            returns: FxHashMap::default(),
+            hir_to_thir,
+            thir_to_mir,
         }
     }
 
@@ -749,21 +1129,56 @@ impl<'tcx> HirVisitor<'tcx> {
         self.bounds.insert(span, def_id);
     }
 
-    fn get_parent_return(&self, hir_id: HirId) -> Option<&HirExpr<'_>> {
+    fn get_local_def_id(&self, expr: &HirExpr<'tcx>) -> Option<LocalDefId> {
+        if let HirExprKind::Path(QPath::Resolved(_, path)) = expr.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            Some(def_id)
+        } else {
+            None
+        }
+    }
+
+    fn get_parent(&self, hir_id: HirId) -> Option<Parent<'tcx>> {
         for (_, parent) in self.tcx.hir_parent_iter(hir_id) {
             let HirNode::Expr(e) = parent else {
                 return None;
             };
 
-            if matches!(e.kind, HirExprKind::Ret(_)) {
-                return Some(e);
+            match &e.kind {
+                HirExprKind::Ret(_) => return Some(Parent::Ret(e)),
+                HirExprKind::Unary(UnOp::Deref, _) => return Some(Parent::Deref(e.hir_id)),
+                HirExprKind::Assign(_, _, _) => return Some(Parent::Assign(e.hir_id)),
+                HirExprKind::Call(callee, _) => {
+                    if self.get_local_def_id(callee).is_some() {
+                        return Some(Parent::Call);
+                    }
+                }
+                _ => {}
             }
         }
         None
     }
+
+    fn get_mir_local(&self, hir_id: HirId, def_id: LocalDefId) -> Option<Local> {
+        let thir_to_mir = self.thir_to_mir.get(&def_id)?;
+        thir_to_mir.binding_to_local.get(&hir_id).cloned()
+    }
+
+    fn get_mir_loc(&self, hir_id: HirId, def_id: LocalDefId) -> Option<Location> {
+        let thir_expr_id = self.hir_to_thir.exprs.get(&hir_id)?;
+        let thir_to_mir = self.thir_to_mir.get(&def_id)?;
+        let mir_locs = thir_to_mir.expr_to_locs.get(thir_expr_id)?;
+        if mir_locs.len() == 1 {
+            Some(mir_locs[0])
+        } else {
+            None
+        }
+    }
 }
 
-impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -771,30 +1186,80 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 
     fn visit_item(&mut self, item: &'tcx HirItem<'tcx>) {
-        intravisit::walk_item(self, item);
-
-        if let HirItemKind::Static(_, ident, _, _body_id) = item.kind {
+        if let HirItemKind::Static(_, ident, _, _) = item.kind {
             self.add_bound(ident.span, item.owner_id.def_id);
         }
+        intravisit::walk_item(self, item);
     }
 
-    fn visit_path(&mut self, path: &HirPath<'tcx>, _: HirId) {
+    fn visit_path(&mut self, path: &HirPath<'tcx>, hir_id: HirId) {
         intravisit::walk_path(self, path);
         if let Res::Def(_, def_id) = path.res
             && let Some(def_id) = def_id.as_local()
         {
             self.add_bound(path.span, def_id);
         }
+
+        if let Res::Local(id) = path.res {
+            let def_id = id.owner.def_id;
+            if let Some(Parent::Deref(parent_id)) = self.get_parent(hir_id) {
+                if let Some(local) = self.get_mir_local(id, def_id) {
+                    let parent = self.get_parent(parent_id);
+                    let deref = Deref {
+                        hir_id: parent_id,
+                        in_call_or_ret: matches!(parent, Some(Parent::Call) | Some(Parent::Ret(_))),
+                    };
+
+                    self.deref_uses
+                        .entry((def_id, local))
+                        .or_default()
+                        .insert(deref);
+                }
+            } else {
+                let local = self.get_mir_local(id, def_id);
+                if let Some(local) = local {
+                    self.ref_uses.insert((def_id, local));
+                }
+            }
+        }
     }
 
     fn visit_expr(&mut self, expr: &'tcx HirExpr<'tcx>) {
-        if let HirExprKind::Call(callee, _) = expr.kind
-            && let HirExprKind::Path(QPath::Resolved(_, path)) = callee.kind
-            && let Res::Def(_, def_id) = path.res
-            && let Some(def_id) = def_id.as_local()
-            && let Some(parent) = self.get_parent_return(expr.hir_id)
-        {
-            self.call_in_ret.insert(parent.span, def_id);
+        match expr.kind {
+            HirExprKind::Call(callee, _) => {
+                let parent = self.get_parent(expr.hir_id);
+                if let Some(def_id) = self.get_local_def_id(callee)
+                    && let Some(Parent::Ret(parent)) = parent
+                {
+                    self.call_in_ret.insert(parent.span, def_id);
+                }
+                if let Some(Parent::Assign(hir_id)) = parent {
+                    self.call_in_assigns.insert(hir_id);
+                }
+            }
+            HirExprKind::Assign(lhs, rhs, _) => {
+                let hir_id = expr.hir_id;
+                let def_id = hir_id.owner.def_id;
+
+                if let Some(loc) = self.get_mir_loc(hir_id, def_id) {
+                    let source_map = self.tcx.sess.source_map();
+                    let assign = Assign {
+                        hir_id,
+                        loc,
+                        span: expr.span,
+                        rhs: source_map.span_to_snippet(rhs.span).unwrap(),
+                    };
+                    self.assigns.insert(lhs.hir_id, assign);
+                }
+            }
+            HirExprKind::Ret(_) => {
+                let def_id = expr.hir_id.owner.def_id;
+                self.returns
+                    .entry(def_id)
+                    .or_default()
+                    .insert((expr.span, expr.hir_id));
+            }
+            _ => {}
         }
         intravisit::walk_expr(self, expr);
     }

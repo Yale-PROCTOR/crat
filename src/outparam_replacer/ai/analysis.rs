@@ -46,27 +46,6 @@ use crate::{
     ir_utils::{self, hir_to_thir::HirToThir},
 };
 
-// TODO: Remove span translation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct LoHi {
-    pub lo: u32,
-    pub hi: u32,
-}
-
-impl LoHi {
-    #[inline]
-    fn new(lo: u32, hi: u32) -> Self {
-        Self { lo, hi }
-    }
-
-    #[inline]
-    pub fn from_span(span: Span) -> Self {
-        assert!(span.ctxt().is_root());
-        assert!(span.parent().is_none());
-        Self::new(span.lo().0, span.hi().0)
-    }
-}
-
 // The result of the output parameter analysis
 pub type AnalysisResult = FxHashMap<String, FnAnalysisRes>;
 pub type FunctionSummaries = FxHashMap<String, FunctionSummary>;
@@ -136,7 +115,7 @@ impl FunctionSummary {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FnAnalysisRes {
     pub output_params: Vec<OutputParam>,
-    pub wbrs: Vec<WriteBeforeReturn>,
+    pub wfrs: Vec<WriteForReturn>,
     pub rcfws: Rcfws,
 }
 
@@ -149,14 +128,15 @@ pub struct OutputParam {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WriteBeforeReturn {
-    pub span: LoHi,
+pub struct WriteForReturn {
+    pub block: usize,
+    pub statement_index: usize,
     pub mays: BTreeSet<usize>,
     pub musts: BTreeSet<usize>,
 }
 
 // Removable checks for Write s
-pub type Rcfws = BTreeMap<usize, BTreeSet<LoHi>>;
+pub type Rcfws = BTreeMap<usize, BTreeSet<(usize, usize)>>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CompleteWrite {
@@ -295,7 +275,7 @@ pub fn analyze(
     let mut call_args_map = FxHashMap::default();
     let mut analysis_times: FxHashMap<_, u128> = FxHashMap::default();
 
-    let mut wbrs: FxHashMap<DefId, Vec<WriteBeforeReturn>> = FxHashMap::default();
+    let mut wfrs: FxHashMap<DefId, Vec<WriteForReturn>> = FxHashMap::default();
     let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
         FxHashMap::default();
     let mut time = 0;
@@ -413,7 +393,7 @@ pub fn analyze(
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
 
-                let mut wbr = vec![];
+                let mut wfr = vec![];
                 let mut bb_must = BTreeMap::new();
 
                 let mut stack = vec![];
@@ -421,23 +401,28 @@ pub fn analyze(
                 if let Some(ret_location) = ret_location
                     && !analyzer.info.is_unit
                 {
-                    if let Some((ret_loc_assign0, ret_loc)) =
-                        analyzer.exists_assign0(&body, ret_location.block)
-                    {
-                        stack.push((ret_loc, ret_loc_assign0));
-                    } else if let Some(v) = body.basic_blocks.predecessors().get(ret_location.block)
-                    {
-                        for i in v {
-                            if let Some((sp, ret_loc)) = analyzer.exists_assign0(&body, *i) {
-                                stack.push((ret_loc, sp));
+                    let mut visited = BTreeSet::new();
+                    let mut work_list = VecDeque::new();
+                    work_list.push_back(ret_location.block);
+
+                    while let Some(bb) = work_list.pop_front() {
+                        if !visited.insert(bb) {
+                            continue;
+                        }
+
+                        if let Some((assign_loc, ret_loc)) = analyzer.exists_assign0(&body, bb) {
+                            stack.push((ret_loc, assign_loc));
+                        } else if let Some(preds) = body.basic_blocks.predecessors().get(bb) {
+                            for pred in preds {
+                                work_list.push_back(*pred);
                             }
                         }
                     }
 
                     let empty_map = BTreeMap::new();
-                    for (loc, sp) in stack.iter() {
+                    for (ret_loc, assign_loc) in stack.iter() {
                         let writes: Vec<_> = states
-                            .get(loc)
+                            .get(ret_loc)
                             .unwrap_or(&empty_map)
                             .values()
                             .map(|st| st.writes.as_set())
@@ -460,13 +445,17 @@ pub fn analyze(
                             .flatten()
                             .map(|p| p.base.index() - 1)
                             .collect();
-                        let span = LoHi::from_span(*sp);
-                        bb_must.insert(loc.block, musts.clone());
-                        wbr.push(WriteBeforeReturn { span, mays, musts });
+                        bb_must.insert(ret_loc.block, musts.clone());
+                        wfr.push(WriteForReturn {
+                            block: assign_loc.block.as_usize(),
+                            statement_index: assign_loc.statement_index,
+                            mays,
+                            musts,
+                        });
                     }
                 }
 
-                wbrs.insert(*def_id, wbr);
+                wfrs.insert(*def_id, wfr);
                 bb_musts.insert(*def_id, bb_must);
 
                 // Handle unremovable parameters
@@ -582,13 +571,8 @@ pub fn analyze(
                                 };
 
                                 if always_write {
-                                    let location = Location {
-                                        block: BasicBlock::from_usize(*block),
-                                        statement_index: *statement_index,
-                                    };
-                                    let span = LoHi::from_span(body.source_info(location).span);
                                     let entry = rcfw.entry(*index);
-                                    entry.or_default().insert(span);
+                                    entry.or_default().insert((*block, *statement_index));
                                 }
                             }
                         }
@@ -603,7 +587,7 @@ pub fn analyze(
     }
 
     if config.max_loop_head_states <= 1 {
-        wbrs.clear();
+        wfrs.clear();
         rcfws.clear();
     }
 
@@ -627,11 +611,11 @@ pub fn analyze(
         .into_iter()
         .map(|(def_id, summary)| {
             let output_params = output_params_map.remove(&def_id).unwrap();
-            let wbrs = wbrs.remove(&def_id).unwrap_or_default();
+            let wfrs = wfrs.remove(&def_id).unwrap_or_default();
             let rcfws = rcfws.remove(&def_id).unwrap_or_default();
             let res = FnAnalysisRes {
                 output_params,
-                wbrs,
+                wfrs,
                 rcfws,
             };
             let path_str = tcx.def_path_str(def_id);
@@ -1546,7 +1530,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         self.info.expands_path(place)
     }
 
-    fn exists_assign0(&self, body: &Body<'tcx>, bb: BasicBlock) -> Option<(Span, Location)> {
+    fn exists_assign0(&self, body: &Body<'tcx>, bb: BasicBlock) -> Option<(Location, Location)> {
         if self.info.is_unit {
             return None;
         }
@@ -1554,13 +1538,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if let StatementKind::Assign(rb) = &stmt.kind
                 && (**rb).0.local.as_u32() == 0u32
             {
-                return Some((
-                    stmt.source_info.span,
-                    Location {
-                        block: bb,
-                        statement_index: i,
-                    },
-                ));
+                let location = Location {
+                    block: bb,
+                    statement_index: i,
+                };
+                return Some((location, location));
             }
         }
         let term = body.basic_blocks[bb].terminator();
@@ -1576,7 +1558,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             && destination.local.as_u32() == 0u32
         {
             return Some((
-                term.source_info.span,
+                Location {
+                    block: bb,
+                    statement_index: body.basic_blocks[bb].statements.len(),
+                },
                 Location {
                     block: target.unwrap(),
                     statement_index: 0,
