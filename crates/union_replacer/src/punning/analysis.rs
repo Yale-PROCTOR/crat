@@ -1,10 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
-    mir::{
-        AggregateKind, BasicBlocks, Body, Local, Location, Place, ProjectionElem, Rvalue,
-        StatementKind,
-    },
+    mir::{AggregateKind, Body, Local, Location, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::def_id::LocalDefId;
@@ -17,16 +14,27 @@ pub struct AnalysisResult<'a> {
 
 impl<'a> std::fmt::Debug for AnalysisResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut nowrite = false;
+        let mut nowrite = true;
         for (def_id, place_to_rw) in &self.map {
             if place_to_rw.is_empty() {
                 continue;
             } else {
-                nowrite = true;
-                writeln!(f, "At Function {def_id:?}:")?;
+                let mut fb = false;
                 for (place, rw) in place_to_rw {
-                    writeln!(f, "\tFor Place {place:?}")?;
+                    let mut pb = false;
                     for (read_use, (is_replacable, write_uses)) in rw {
+                        if write_uses.is_empty() {
+                            continue;
+                        }
+                        if !pb {
+                            if !fb {
+                                writeln!(f, "At Function {def_id:?}:")?;
+                                fb = true;
+                                nowrite = false;
+                            }
+                            writeln!(f, "\tFor Place {place:?}")?;
+                            pb = true;
+                        }
                         writeln!(f, "\t\tRead Use: {read_use:?}")?;
                         writeln!(f, "\t\tReplacable: {is_replacable}")?;
                         for write_use in write_uses {
@@ -37,8 +45,8 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                 }
             }
         }
-        if !nowrite {
-            write!(f, "No reads")?;
+        if nowrite {
+            write!(f, "No Punnings")?;
         }
         Ok(())
     }
@@ -53,6 +61,7 @@ enum UnionUseKind<'a> {
 }
 
 impl<'a> UnionUseKind<'a> {
+    #[allow(dead_code)]
     fn place(&self) -> &Place<'a> {
         match self {
             UnionUseKind::InitUnion(place, _, _) => place,
@@ -217,7 +226,7 @@ fn collect_union_uses<'a>(
     }
 }
 
-fn print_union_uses_map<'a>(
+fn _print_union_uses_map<'a>(
     union_uses: &FxHashMap<LocalDefId, FxHashMap<Place<'a>, Vec<UnionUseInfo<'a>>>>,
 ) {
     for (def_id, uses) in union_uses {
@@ -231,90 +240,22 @@ fn print_union_uses_map<'a>(
     }
 }
 
-impl<'a> UnionUseInfo<'a> {
-    /// Find dominatees of self (except self)
-    fn extract_dominated(
-        &self,
-        union_uses: &[UnionUseInfo<'a>],
-        basic_blocks: &BasicBlocks,
-    ) -> FxHashSet<UnionUseInfo<'a>> {
-        union_uses
-            .iter()
-            .filter(|&u| {
-                *u != *self
-                    && self
-                        .location
-                        .dominates(u.location, basic_blocks.dominators())
-            })
-            .cloned()
-            .collect()
-    }
-}
-
-/// Assume all union uses are for the same union place
-fn collect_dominance_relations<'a>(
-    union_uses: &Vec<UnionUseInfo<'a>>,
-    basic_blocks: &BasicBlocks,
-) -> FxHashSet<(UnionUseInfo<'a>, UnionUseInfo<'a>)> {
-    let mut relations = FxHashSet::default();
-    for use1 in union_uses {
-        let dominated = use1.extract_dominated(union_uses, basic_blocks);
-        for use2 in dominated {
-            if use1.kind.place() == use2.kind.place() {
-                relations.insert((use1.clone(), use2));
-            }
-        }
-    }
-    relations
-}
-
-/// Assume all union uses are for the same union place
-/// Return: Read -> Latest Dominator Write (w dom r)
-fn filter_closest_w_dom_r<'a>(
-    dominance_relations: FxHashSet<(UnionUseInfo<'a>, UnionUseInfo<'a>)>,
-) -> FxHashMap<UnionUseInfo<'a>, UnionUseInfo<'a>> {
-    let w_dom_r: Vec<(UnionUseInfo<'a>, UnionUseInfo<'a>)> = dominance_relations
-        .clone()
-        .into_iter()
-        .filter(|(u1, u2)| u1.kind.is_write() && !u2.kind.is_write())
-        .collect();
-
-    let mut closest_w_dom_r: FxHashMap<UnionUseInfo<'a>, UnionUseInfo<'a>> = FxHashMap::default();
-    for (w_use, r_use) in w_dom_r {
-        if let Some(existing_w_use) = closest_w_dom_r.get(&r_use) {
-            if dominance_relations.contains(&(existing_w_use.clone(), w_use.clone())) {
-                closest_w_dom_r.insert(r_use, w_use);
-            }
-        } else {
-            closest_w_dom_r.insert(r_use, w_use);
-        }
-    }
-
-    closest_w_dom_r
-}
-
-fn succ_locations<'a>(loc: Location, body: &Body<'a>) -> Vec<Location> {
-    let bb = &body.basic_blocks[loc.block];
-
-    if loc.statement_index < bb.statements.len() {
+fn pred_locations<'a>(loc: Location, body: &Body<'a>) -> Vec<Location> {
+    if loc.statement_index > 0 {
         return vec![Location {
             block: loc.block,
-            statement_index: loc.statement_index + 1,
+            statement_index: loc.statement_index - 1,
         }];
     }
 
-    let term = bb.terminator();
-    term.successors()
-        .map(|succ_bb| Location {
-            block: succ_bb,
-            statement_index: 0,
-        })
+    body.basic_blocks.predecessors()[loc.block]
+        .iter()
+        .map(|&pred_bb| body.terminator_loc(pred_bb))
         .collect()
 }
 
 fn collect_readable_writes<'a>(
     uses: &[UnionUseInfo<'a>],
-    w_dom_r: FxHashMap<UnionUseInfo<'a>, UnionUseInfo<'a>>,
     body: &Body<'a>,
 ) -> FxHashMap<UnionUseInfo<'a>, FxHashSet<UnionUseInfo<'a>>> {
     // loc -> write use if it is a write
@@ -327,48 +268,35 @@ fn collect_readable_writes<'a>(
 
     let mut result: FxHashMap<UnionUseInfo<'a>, FxHashSet<UnionUseInfo<'a>>> = FxHashMap::default();
 
-    // DFS from dom_write to read_use
-    for (read_use, dom_write) in w_dom_r {
-        let r_loc = read_use.location;
-        let w0_loc = dom_write.location;
+    let read_uses = uses
+        .iter()
+        .filter(|u| !u.kind.is_write())
+        .cloned()
+        .collect::<Vec<_>>();
 
-        let mut last_write_locs: FxHashSet<Location> = FxHashSet::default();
+    for read_use in read_uses {
+        let mut reachable_writes: FxHashSet<UnionUseInfo<'a>> = FxHashSet::default();
+        let mut stack: Vec<Location> = Vec::new();
+        let mut visited: FxHashSet<Location> = FxHashSet::default();
 
-        // Stack of (current Location, last write Location) for DFS
-        let mut stack: Vec<(Location, Location)> = Vec::new();
-        let mut visited: FxHashSet<(Location, Location)> = FxHashSet::default();
+        stack.extend(pred_locations(read_use.location, body));
 
-        let start_state = (w0_loc, w0_loc);
-        stack.push(start_state);
-        visited.insert(start_state);
-
-        while let Some((loc, last_loc)) = stack.pop() {
-            // reached read location
-            if loc == r_loc {
-                last_write_locs.insert(last_loc);
+        while let Some(loc) = stack.pop() {
+            if !visited.insert(loc) {
                 continue;
             }
 
-            // update last write location if current location is a write
-            let mut new_last_loc = last_loc;
-            if loc_to_write.contains_key(&loc) {
-                new_last_loc = loc;
+            if let Some(write_use) = loc_to_write.get(&loc) {
+                reachable_writes.insert((*write_use).clone());
+                continue;
             }
 
-            for succ in succ_locations(loc, body) {
-                let state = (succ, new_last_loc);
-                if visited.insert(state) {
-                    stack.push(state);
-                }
+            for pred in pred_locations(loc, body) {
+                stack.push(pred);
             }
         }
 
-        let readable_writes: FxHashSet<UnionUseInfo<'a>> = last_write_locs
-            .into_iter()
-            .map(|loc| loc_to_write.get(&loc).cloned().unwrap().clone())
-            .collect::<FxHashSet<UnionUseInfo<'a>>>();
-
-        result.insert(read_use, readable_writes);
+        result.insert(read_use.clone(), reachable_writes);
     }
 
     result
@@ -404,9 +332,9 @@ fn is_replacable_read<'a>(
 
 pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
-    println!();
-    print_union_uses_map(&union_uses_map);
-    println!();
+    // println!();
+    // _print_union_uses_map(&union_uses_map);
+    // println!();
     let mut result_map = FxHashMap::default();
 
     for (def_id, union_uses) in union_uses_map {
@@ -416,14 +344,8 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
         let mut place_map = FxHashMap::default();
 
         for (place, uses) in &union_uses {
-            println!("For Place {place:?}:");
-            let dominance_relations = collect_dominance_relations(uses, &body.basic_blocks);
-
-            // r -> w where w closest dominator write of r
-            let w_dom_r = filter_closest_w_dom_r(dominance_relations);
-            println!("{:?}", &w_dom_r);
-            // r -> [w1, w2, ...] where r can read from w1, w2, ...
-            let read_write_map = collect_readable_writes(uses, w_dom_r, body);
+            // println!("For Place {place:?}:");
+            let read_write_map = collect_readable_writes(uses, body);
 
             let read_write_map = read_write_map
                 .into_iter()
