@@ -558,18 +558,22 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let offsets2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
                 offsets.extend(offsets2);
                 let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                    AbsPtr::alphas(
-                        ptrs.iter()
-                            .cloned()
-                            .map(|mut ptr| {
-                                let last = ptr.projections.last_mut();
-                                if let Some(AbsProjElem::Index(i)) = last {
-                                    *i = i.to_i64().add(&args[1].intv).to_u64();
-                                }
-                                ptr
-                            })
-                            .collect(),
-                    )
+                    if ptrs.iter().any(|ptr| matches!(ptr.base, AbsBase::Arg(_))) {
+                        AbsPtr::top()
+                    } else {
+                        AbsPtr::alphas(
+                            ptrs.iter()
+                                .cloned()
+                                .map(|mut ptr| {
+                                    let last = ptr.projections.last_mut();
+                                    if let Some(AbsProjElem::Index(i)) = last {
+                                        *i = i.to_i64().add(&args[1].intv).to_u64();
+                                    }
+                                    ptr
+                                })
+                                .collect(),
+                        )
+                    }
                 } else {
                     AbsPtr::top()
                 };
