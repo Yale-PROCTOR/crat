@@ -26,6 +26,9 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                         if write_uses.is_empty() {
                             continue;
                         }
+                        if !is_replacable {
+                            continue;
+                        }
                         if !pb {
                             if !fb {
                                 writeln!(f, "At Function {def_id:?}:")?;
