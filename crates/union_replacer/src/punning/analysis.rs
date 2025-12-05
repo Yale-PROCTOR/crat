@@ -6,8 +6,13 @@ use rustc_middle::{
 };
 use rustc_span::def_id::LocalDefId;
 
-pub type AnalysisMap<'a> =
-    FxHashMap<Place<'a>, FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>>;
+pub type AnalysisMap<'a> = FxHashMap<
+    Place<'a>,
+    (
+        UnionUseInfo<'a>,
+        FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>,
+    ),
+>;
 pub struct AnalysisResult<'a> {
     pub map: FxHashMap<LocalDefId, AnalysisMap<'a>>,
 }
@@ -22,7 +27,7 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                 let mut fb = false;
                 for (place, rw) in place_to_rw {
                     let mut pb = false;
-                    for (read_use, (is_replacable, write_uses)) in rw {
+                    for (read_use, (is_replacable, write_uses)) in &rw.1 {
                         if write_uses.is_empty() {
                             continue;
                         }
@@ -36,6 +41,7 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                                 nowrite = false;
                             }
                             writeln!(f, "\tFor Place {place:?}")?;
+                            writeln!(f, "\t\t(Init Use: {:?})", rw.0)?;
                             pb = true;
                         }
                         writeln!(f, "\t\tRead Use: {read_use:?}")?;
@@ -143,14 +149,14 @@ fn collect_union_uses<'a>(
     if tcx.def_kind(def_id) != DefKind::Fn {
         return None;
     }
-    // println!("DEF: {def_id:?}");
+    println!("DEF: {def_id:?}");
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let body: &Body<'_> = &body.borrow();
     for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        // println!("\tBB: {bb:?}");
+        println!("\tBB: {bb:?}");
         for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
+            println!("\t\tSTMT {stmt_idx}: {stmt:?}");
             if let StatementKind::Assign(box (place, value)) = &stmt.kind {
-                // println!("\t\tSTMT: {stmt:?}");
                 // Initialize a Union Field
                 if place.ty(body, tcx).ty.is_union() {
                     if let Rvalue::Aggregate(
@@ -220,7 +226,7 @@ fn collect_union_uses<'a>(
                 }
             }
         }
-        // println!("\t\tTERM: {:?}", bbd.terminator().kind);
+        println!("\t\tTERM: {:?}", bbd.terminator().kind);
     }
     if union_uses.is_empty() {
         None
@@ -348,6 +354,11 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
 
         for (place, uses) in &union_uses {
             // println!("For Place {place:?}:");
+            let init_use = uses
+                .iter()
+                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _)))
+                .unwrap();
+
             let read_write_map = collect_readable_writes(uses, body);
 
             let read_write_map = read_write_map
@@ -363,7 +374,7 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
                 })
                 .collect::<FxHashMap<UnionUseInfo, (bool, FxHashSet<UnionUseInfo>)>>();
 
-            place_map.insert(*place, read_write_map);
+            place_map.insert(*place, (init_use.clone(), read_write_map));
         }
 
         result_map.insert(def_id, place_map);
