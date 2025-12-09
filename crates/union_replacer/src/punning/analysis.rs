@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{AggregateKind, Body, Local, Location, Place, ProjectionElem, Rvalue, StatementKind},
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -63,8 +63,8 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 /// Union Place, Union Type, Field Projection
-enum UnionUseKind<'a> {
-    InitUnion(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
+pub enum UnionUseKind<'a> {
+    InitUnion(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>, u64),
     WriteField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
     ReadField(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>),
 }
@@ -73,7 +73,7 @@ impl<'a> UnionUseKind<'a> {
     #[allow(dead_code)]
     fn place(&self) -> &Place<'a> {
         match self {
-            UnionUseKind::InitUnion(place, _, _) => place,
+            UnionUseKind::InitUnion(place, _, _, _) => place,
             UnionUseKind::WriteField(place, _, _) => place,
             UnionUseKind::ReadField(place, _, _) => place,
         }
@@ -81,14 +81,14 @@ impl<'a> UnionUseKind<'a> {
 
     fn is_write(&self) -> bool {
         match self {
-            UnionUseKind::InitUnion(_, _, _) | UnionUseKind::WriteField(_, _, _) => true,
+            UnionUseKind::InitUnion(_, _, _, _) | UnionUseKind::WriteField(_, _, _) => true,
             UnionUseKind::ReadField(_, _, _) => false,
         }
     }
 
     fn field_type(&self, body: &Body<'a>, tcx: TyCtxt<'a>) -> Ty<'a> {
         match self {
-            UnionUseKind::InitUnion(u, _, proj)
+            UnionUseKind::InitUnion(u, _, proj, _)
             | UnionUseKind::WriteField(u, _, proj)
             | UnionUseKind::ReadField(u, _, proj) => {
                 u.project_deeper(&[*proj], tcx).ty(body, tcx).ty
@@ -97,18 +97,11 @@ impl<'a> UnionUseKind<'a> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-/// All useinfo related operations are considered only within the same function(def id) for now.
-pub struct UnionUseInfo<'a> {
-    kind: UnionUseKind<'a>,
-    location: Location,
-}
-
 impl<'a> std::fmt::Debug for UnionUseKind<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnionUseKind::InitUnion(place, ty, proj) => {
-                write!(f, "InitUnion({place:?}, {ty:?}, {proj:?})")
+            UnionUseKind::InitUnion(place, ty, proj, size) => {
+                write!(f, "InitUnion({place:?}, {ty:?} ({size}bytes), {proj:?})")
             }
             UnionUseKind::WriteField(place, ty, proj) => {
                 write!(f, "WriteField({place:?}, {ty:?}, {proj:?})")
@@ -118,6 +111,13 @@ impl<'a> std::fmt::Debug for UnionUseKind<'a> {
             }
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+/// All useinfo related operations are considered only within the same function(def id) for now.
+pub struct UnionUseInfo<'a> {
+    pub kind: UnionUseKind<'a>,
+    pub location: Location,
 }
 
 impl<'a> std::fmt::Debug for UnionUseInfo<'a> {
@@ -172,8 +172,16 @@ fn collect_union_uses<'a>(
                             place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
                         );
                         let ty = place.ty(body, tcx).ty;
+                        let typing_env = TypingEnv::post_analysis(tcx, def_id);
+                        let size = if ty.is_sized(tcx, typing_env) {
+                            let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
+                            layout.size.bytes()
+                        } else {
+                            0
+                        };
+
                         union_uses.entry(*place).or_default().push(UnionUseInfo {
-                            kind: UnionUseKind::InitUnion(*place, ty, project_elem),
+                            kind: UnionUseKind::InitUnion(*place, ty, project_elem, size),
                             location: Location {
                                 block: bb,
                                 statement_index: stmt_idx,
@@ -356,7 +364,7 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
             // println!("For Place {place:?}:");
             let init_use = uses
                 .iter()
-                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _)))
+                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)))
                 .unwrap();
 
             let read_write_map = collect_readable_writes(uses, body);
