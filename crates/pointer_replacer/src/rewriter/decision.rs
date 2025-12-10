@@ -65,7 +65,7 @@ impl<'tcx> DecisionMaker<'tcx> {
     pub fn decide(
         &self,
         local: Local,
-        decl: &LocalDecl,
+        decl: &LocalDecl<'tcx>,
         aliases: Option<&FxHashSet<Local>>,
     ) -> Option<PtrKind> {
         let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
@@ -76,6 +76,7 @@ impl<'tcx> DecisionMaker<'tcx> {
                     .chain(aliases.iter().copied())
                     .any(|l| self.mutable_pointers[l])
             })
+            || utils::file::contains_file_ty(ty, self.tcx)
         {
             Some(PtrKind::Raw(mutability))
         } else if self.array_pointers[local] {
