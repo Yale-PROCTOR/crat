@@ -1,6 +1,6 @@
 # Crat
 
-**C**-to-**R**ust **A**utomatic **T**ranslator
+**C**-originated **R**ust **A**dvancing **T**ransformer
 
 ## Usage
 
