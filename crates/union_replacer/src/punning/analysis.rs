@@ -149,13 +149,13 @@ fn collect_union_uses<'a>(
     if tcx.def_kind(def_id) != DefKind::Fn {
         return None;
     }
-    println!("DEF: {def_id:?}");
+    // println!("DEF: {def_id:?}");
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let body: &Body<'_> = &body.borrow();
     for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        println!("\tBB: {bb:?}");
+        // println!("\tBB: {bb:?}");
         for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
-            println!("\t\tSTMT {stmt_idx}: {stmt:?}");
+            // println!("\t\tSTMT {stmt_idx}: {stmt:?}");
             if let StatementKind::Assign(box (place, value)) = &stmt.kind {
                 // Initialize a Union Field
                 if place.ty(body, tcx).ty.is_union() {
@@ -234,7 +234,7 @@ fn collect_union_uses<'a>(
                 }
             }
         }
-        println!("\t\tTERM: {:?}", bbd.terminator().kind);
+        // println!("\t\tTERM: {:?}", bbd.terminator().kind);
     }
     if union_uses.is_empty() {
         None
@@ -324,7 +324,7 @@ fn collect_readable_writes<'a>(
 fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
     matches!(
         ty.kind(),
-        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) /* TODO: TyKind::Bool | TyKind::Char --> Byte 변환 시에 u8/u32를 거친 다음에 변환 */
     )
 }
 

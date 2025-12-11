@@ -11,15 +11,22 @@ pub fn replace_unions(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
 
     let analysis_result = super::analysis::analyze(tcx);
-    println!("{analysis_result:?}");
+    // println!("{analysis_result:?}");
     let mut visitor = TransformVisitor::new(tcx, &mut krate, analysis_result);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+    
+    // Original
+    let str = pprust::crate_to_string_for_macros(&krate);
+    println!("\n{str}");
+    println!("\n================= Transform =================");
 
     visitor.visit_crate(&mut krate);
 
+    // Transformed
     let str = pprust::crate_to_string_for_macros(&krate);
     println!("\n{str}");
     str
+
     // pprust::crate_to_string_for_macros(&krate)
 }
 
@@ -35,10 +42,24 @@ struct TransformVisitor<'tcx> {
 impl MutVisitor for TransformVisitor<'_> {
     fn visit_expr(&mut self, expr: &mut Expr) {
         if let Some((def_id, mir_locs)) = self.get_mir_func_locs_from_node(&expr.id) {
-            println!(
-                "\tExpr: {}\n\t\tMIR --> {def_id:?}: {mir_locs:?}",
-                pprust::expr_to_string(expr)
-            );
+            let infos = self.transform_info.get(&def_id);
+            if let Some(infos) = infos {
+                for info in infos {
+                    let read_locs = &info.read_locs;
+                    // TODO: Multiple Locations
+                    let mir_loc = &mir_locs[0];
+                    if read_locs.contains(mir_loc) {
+                        let ident = info.ident.as_ref().unwrap();
+
+                        let typecheck = self.tcx.typeck(def_id);
+                        let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                        let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
+
+                        *expr =
+                            utils::expr!("{}::from_be_bytes({}_bytes)", expr_ty.to_string(), ident);
+                    }
+                }
+            }
         }
         rustc_ast::mut_visit::walk_expr(self, expr);
     }
@@ -52,7 +73,7 @@ impl MutVisitor for TransformVisitor<'_> {
                 StmtKind::Let(local) => match &local.kind {
                     rustc_ast::LocalKind::Init(init_expr) => {
                         let pat = local.pat;
-                        if let Some((def_id, mir_locs)) =
+                        if let Some((def_id, mir_loc)) =
                             self.get_mir_func_locs_from_node(&init_expr.id)
                         {
                             let infos = self.transform_info.get_mut(&def_id);
@@ -61,7 +82,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                 for info in infos {
                                     let init_loc = info.init_loc;
                                     // Init Location Found
-                                    if mir_locs.contains(&init_loc) {
+                                    if mir_loc.contains(&init_loc) {
                                         found = true;
                                         let ident = match &pat.kind {
                                             rustc_ast::PatKind::Ident(_, ident, _) => {
@@ -71,36 +92,44 @@ impl MutVisitor for TransformVisitor<'_> {
                                         };
                                         info.ident = ident.clone();
 
+                                        let val_expr = get_init_field_expr(init_expr).unwrap();
+
+                                        let typecheck = self.tcx.typeck(def_id);
+                                        let hir_expr = self
+                                            .ast_to_hir
+                                            .get_expr(val_expr.id, self.tcx)
+                                            .unwrap();
+                                        let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
+
                                         // Transform Init
-                                        // TODO: from/to_bytes
-                                        // TODO: mut tag
                                         if let Some(replacable) = info.write_locs.get(&init_loc) {
                                             if *replacable {
                                                 // Replacable Init
                                                 new_stmts.push(utils::stmt!(
-                                                    "let mut {}_bytes: [u8; {}] = ({}).to_bytes();",
+                                                    "let mut {}_bytes: [u8; {}] = ({} as {}).to_be_bytes();",
                                                     ident.unwrap(),
                                                     info.size,
-                                                    pprust::expr_to_string(init_expr)
+                                                    pprust::expr_to_string(val_expr),
+                                                    expr_ty.to_string()
                                                 ));
                                             } else {
                                                 // Non-Replacable Init
                                                 new_stmts.push(s.clone());
                                                 new_stmts.push(utils::stmt!(
-                                                    "let mut {}_bytes: [u8; {}] = ({}).to_bytes();",
+                                                    "let mut {}_bytes: [u8; {}] = ({} as {}).to_be_bytes();",
                                                     ident.unwrap(),
                                                     info.size,
-                                                    pprust::expr_to_string(init_expr)
+                                                    pprust::expr_to_string(val_expr),
+                                                    expr_ty.to_string()
                                                 ));
                                             }
                                         } else {
-                                            // Non-Replacable Init
+                                            // Non-Replacable Init but will not be read
                                             new_stmts.push(s.clone());
                                             new_stmts.push(utils::stmt!(
-                                                "let mut {}_bytes: [u8; {}] = ({}).to_bytes();",
+                                                "let mut {}_bytes: [u8; {}];",
                                                 ident.unwrap(),
                                                 info.size,
-                                                pprust::expr_to_string(init_expr)
                                             ));
                                         }
                                     }
@@ -115,15 +144,59 @@ impl MutVisitor for TransformVisitor<'_> {
                             new_stmts.push(s.clone());
                         }
                     }
-                    _ => new_stmts.push(s.clone()), // TODO? LocalKind - Decl, InitElse
+                    _ => new_stmts.push(s.clone()), /* TODO? LocalKind - Decl, InitElse --> 다른 형태의 Init도 고려? */
                 },
                 // Writes
                 StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
-                    println!("\tStmt Expr: {}", pprust::expr_to_string(&expr));
-                    if let Some((def_id, mir_locs)) = self.get_mir_func_locs_from_node(&expr.id) {
-                        println!("\t\tMIR --> {def_id:?}: {mir_locs:?}",);
+                    if let Some((def_id, mir_loc)) = self.get_mir_func_locs_from_node(&expr.id) {
+                        let infos = self.transform_info.get(&def_id);
+                        if let Some(infos) = infos {
+                            let mut found = false;
+                            for info in infos {
+                                let write_locs = &info.write_locs;
+                                // TODO: Multiple Locations
+                                if let Some(replacable) = write_locs.get(&mir_loc[0]) {
+                                    found = true;
+                                    let ident = info.ident.as_ref().unwrap();
+                                    let rhs_expr = match &expr.kind {
+                                        rustc_ast::ExprKind::Assign(_, rhs_expr, _) => rhs_expr,
+                                        _ => unreachable!(),
+                                    };
+
+                                    let typecheck = self.tcx.typeck(def_id);
+                                    let hir_expr =
+                                        self.ast_to_hir.get_expr(rhs_expr.id, self.tcx).unwrap();
+                                    let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
+
+                                    if *replacable {
+                                        // Replacable Write
+                                        new_stmts.push(utils::stmt!(
+                                            "{}_bytes = ({} as {}).to_be_bytes();",
+                                            ident,
+                                            pprust::expr_to_string(rhs_expr),
+                                            expr_ty.to_string()
+                                        ));
+                                    } else {
+                                        // Non-Replacable Write
+                                        new_stmts.push(s.clone());
+                                        new_stmts.push(utils::stmt!(
+                                            "{}_bytes = ({} as {}).to_be_bytes();",
+                                            ident,
+                                            pprust::expr_to_string(rhs_expr),
+                                            expr_ty.to_string()
+                                        ));
+                                    }
+                                }
+                            }
+                            if !found {
+                                new_stmts.push(s.clone());
+                            }
+                        } else {
+                            new_stmts.push(s.clone());
+                        }
+                    } else {
+                        new_stmts.push(s.clone());
                     }
-                    new_stmts.push(s.clone());
                 }
                 _ => new_stmts.push(s.clone()),
             }
@@ -166,7 +239,7 @@ impl<'a> TransformVisitor<'a> {
             .get(thir_expr_id)
             .cloned()
             .map(|locs| locs.to_vec())
-            .map(|locs| (def_id, locs))
+            .map(|loc| (def_id, loc))
     }
 }
 
@@ -220,5 +293,17 @@ impl<'a> AnalysisResult<'a> {
             result.insert(def_id, trans_info_vec);
         }
         result
+    }
+}
+
+fn get_init_field_expr(init_expr: &Expr) -> Option<&Expr> {
+    if let rustc_ast::ExprKind::Struct(struct_expr) = &init_expr.kind {
+        if let Some(field) = struct_expr.fields.first() {
+            Some(&field.expr)
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
