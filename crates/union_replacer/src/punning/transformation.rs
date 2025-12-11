@@ -11,14 +11,14 @@ pub fn replace_unions(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
 
     let analysis_result = super::analysis::analyze(tcx);
-    println!("{:?}", analysis_result);
+    println!("{analysis_result:?}");
     let mut visitor = TransformVisitor::new(tcx, &mut krate, analysis_result);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     visitor.visit_crate(&mut krate);
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    println!("\n{}", str);
+    println!("\n{str}");
     str
     // pprust::crate_to_string_for_macros(&krate)
 }
@@ -59,7 +59,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             if let Some(infos) = infos {
                                 let mut found = false;
                                 for info in infos {
-                                    let init_loc = info.init_loc.clone();
+                                    let init_loc = info.init_loc;
                                     // Init Location Found
                                     if mir_locs.contains(&init_loc) {
                                         found = true;
@@ -156,10 +156,10 @@ impl<'a> TransformVisitor<'a> {
     }
 
     fn get_mir_func_locs_from_node(&self, node_id: &NodeId) -> Option<(LocalDefId, Vec<Location>)> {
-        let hir_id = self.ast_to_hir.local_map.get(&node_id)?;
+        let hir_id = self.ast_to_hir.local_map.get(node_id)?;
         let def_id = hir_id.owner.def_id;
         let thir_to_mir = self.thir_to_mir.get(&def_id)?;
-        let thir_expr_id = self.hir_to_thir.exprs.get(&hir_id)?;
+        let thir_expr_id = self.hir_to_thir.exprs.get(hir_id)?;
 
         thir_to_mir
             .expr_to_locs
