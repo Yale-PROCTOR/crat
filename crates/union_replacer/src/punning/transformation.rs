@@ -11,18 +11,13 @@ pub fn replace_unions(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
 
     let analysis_result = super::analysis::analyze(tcx);
-    // println!("{analysis_result:?}");
+    println!("{analysis_result:?}");
+
     let mut visitor = TransformVisitor::new(tcx, &mut krate, analysis_result);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-    
-    // Original
-    let str = pprust::crate_to_string_for_macros(&krate);
-    println!("\n{str}");
-    println!("\n================= Transform =================");
 
     visitor.visit_crate(&mut krate);
 
-    // Transformed
     let str = pprust::crate_to_string_for_macros(&krate);
     println!("\n{str}");
     str
@@ -50,13 +45,21 @@ impl MutVisitor for TransformVisitor<'_> {
                     let mir_loc = &mir_locs[0];
                     if read_locs.contains(mir_loc) {
                         let ident = info.ident.as_ref().unwrap();
+                        match &expr.kind {
+                            // TODO: Check right field to transform
+                            rustc_ast::ExprKind::Field(_, _) => {
+                                let typecheck = self.tcx.typeck(def_id);
+                                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                                let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
 
-                        let typecheck = self.tcx.typeck(def_id);
-                        let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
-                        let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
-
-                        *expr =
-                            utils::expr!("{}::from_be_bytes({}_bytes)", expr_ty.to_string(), ident);
+                                *expr = utils::expr!(
+                                    "{}::from_be_bytes({}_bytes)",
+                                    expr_ty.to_string(),
+                                    ident
+                                );
+                            }
+                            _ => continue,
+                        }
                     }
                 }
             }
