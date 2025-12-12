@@ -349,9 +349,6 @@ fn is_replacable_read<'a>(
 
 pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
-    // println!();
-    // _print_union_uses_map(&union_uses_map);
-    // println!();
     let mut result_map = FxHashMap::default();
 
     for (def_id, union_uses) in union_uses_map {
@@ -361,11 +358,17 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
         let mut place_map = FxHashMap::default();
 
         for (place, uses) in &union_uses {
-            // println!("For Place {place:?}:");
+            // println!("For Place {place:?}:\n\tUses:{uses:?}");
             let init_use = uses
                 .iter()
-                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)))
-                .unwrap();
+                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)));
+            
+            // TODO: 현재는 union 변수로의 init이 없으면 skip
+            // Ex. struct의 field로 union이 있는 경우는 skip
+            if init_use.is_none() {
+                continue;
+            }
+            let init_use = init_use.unwrap();
 
             let read_write_map = collect_readable_writes(uses, body);
 

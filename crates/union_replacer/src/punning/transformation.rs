@@ -41,13 +41,18 @@ impl MutVisitor for TransformVisitor<'_> {
             if let Some(infos) = infos {
                 for info in infos {
                     let read_locs = &info.read_locs;
-                    // TODO: Multiple Locations
+                    // TODO: Multiple Locations?
+                    // 한 ast expr가 여러 mir location에 매핑되는 경우?
+                    assert_eq!(mir_locs.len(), 1);
                     let mir_loc = &mir_locs[0];
                     if read_locs.contains(mir_loc) {
                         let ident = info.ident.as_ref().unwrap();
                         match &expr.kind {
                             // TODO: Check right field to transform
-                            rustc_ast::ExprKind::Field(_, _) => {
+                            rustc_ast::ExprKind::Field(e, _) => {
+                                if pprust::expr_to_string(e) != *ident {
+                                    continue;
+                                }
                                 let typecheck = self.tcx.typeck(def_id);
                                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                                 let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
@@ -128,6 +133,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                             }
                                         } else {
                                             // Non-Replacable Init but will not be read
+                                            // --> Define byte array with no initialization
                                             new_stmts.push(s.clone());
                                             new_stmts.push(utils::stmt!(
                                                 "let mut {}_bytes: [u8; {}];",
@@ -151,14 +157,15 @@ impl MutVisitor for TransformVisitor<'_> {
                 },
                 // Writes
                 StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
-                    if let Some((def_id, mir_loc)) = self.get_mir_func_locs_from_node(&expr.id) {
+                    if let Some((def_id, mir_locs)) = self.get_mir_func_locs_from_node(&expr.id) {
                         let infos = self.transform_info.get(&def_id);
                         if let Some(infos) = infos {
                             let mut found = false;
                             for info in infos {
                                 let write_locs = &info.write_locs;
-                                // TODO: Multiple Locations
-                                if let Some(replacable) = write_locs.get(&mir_loc[0]) {
+                                // TODO: Multiple Locations?
+                                assert_eq!(mir_locs.len(), 1);
+                                if let Some(replacable) = write_locs.get(&mir_locs[0]) {
                                     found = true;
                                     let ident = info.ident.as_ref().unwrap();
                                     let rhs_expr = match &expr.kind {
