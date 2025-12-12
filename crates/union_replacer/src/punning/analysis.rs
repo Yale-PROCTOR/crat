@@ -320,11 +320,11 @@ fn collect_readable_writes<'a>(
 }
 
 /// TODO: consider more types
-/// Currently, only primitive types can pass
+/// Only primitive types can pass currently
 fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
     matches!(
         ty.kind(),
-        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) /* TODO: TyKind::Bool | TyKind::Char --> Byte 변환 시에 u8/u32를 거친 다음에 변환 */
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) // TODO: TyKind::Bool | TyKind::Char
     )
 }
 
@@ -362,8 +362,8 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
             let init_use = uses
                 .iter()
                 .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)));
-            
-            // TODO: 현재는 union 변수로의 init이 없으면 skip
+
+            // TODO: 현재는 union type 변수를 직접 사용하는 경우가 아니면 skip
             // Ex. struct의 field로 union이 있는 경우는 skip
             if init_use.is_none() {
                 continue;

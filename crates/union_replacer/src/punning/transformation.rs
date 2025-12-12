@@ -48,7 +48,6 @@ impl MutVisitor for TransformVisitor<'_> {
                     if read_locs.contains(mir_loc) {
                         let ident = info.ident.as_ref().unwrap();
                         match &expr.kind {
-                            // TODO: Check right field to transform
                             rustc_ast::ExprKind::Field(e, _) => {
                                 if pprust::expr_to_string(e) != *ident {
                                     continue;
@@ -133,11 +132,12 @@ impl MutVisitor for TransformVisitor<'_> {
                                             }
                                         } else {
                                             // Non-Replacable Init but will not be read
-                                            // --> Define byte array with no initialization
+                                            // --> Define byte array with dummy initialization
                                             new_stmts.push(s.clone());
                                             new_stmts.push(utils::stmt!(
-                                                "let mut {}_bytes: [u8; {}];",
+                                                "let mut {}_bytes: [u8; {}] = [0u8; {}];",
                                                 ident.unwrap(),
+                                                info.size,
                                                 info.size,
                                             ));
                                         }
@@ -153,7 +153,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             new_stmts.push(s.clone());
                         }
                     }
-                    _ => new_stmts.push(s.clone()), /* TODO? LocalKind - Decl, InitElse --> 다른 형태의 Init도 고려? */
+                    _ => new_stmts.push(s.clone()), /* TODO: 다른 형태의 Init도 고려? LocalKind - Decl, InitElse */
                 },
                 // Writes
                 StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
