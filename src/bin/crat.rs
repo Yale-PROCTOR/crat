@@ -484,8 +484,10 @@ fn main() {
                 .unwrap();
             }
             Pass::Punning => {
-                let s =
-                    run_compiler_on_path(&file, union_replacer::punning::replace_unions).unwrap();
+                let s = run_compiler_on_path(&file, |tcx| {
+                    union_replacer::punning::replace_unions(tcx, config.verbose)
+                })
+                .unwrap();
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Io => {

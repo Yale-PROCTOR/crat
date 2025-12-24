@@ -1,11 +1,13 @@
+use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{AggregateKind, Body, Local, Location, Place, ProjectionElem, Rvalue, StatementKind},
-    ty::{Ty, TyCtxt, TyKind, TypingEnv},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::def_id::LocalDefId;
 
+/// Union Place -> (Init Union Use, (Read Union Use -> (is_replacable, [Write Union Use readable from the Read Use])))
 pub type AnalysisMap<'a> = FxHashMap<
     Place<'a>,
     (
@@ -61,7 +63,7 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 /// Union Place, Union Type, Field Projection
 pub enum UnionUseKind<'a> {
     InitUnion(Place<'a>, Ty<'a>, ProjectionElem<Local, Ty<'a>>, u64),
@@ -113,7 +115,7 @@ impl<'a> std::fmt::Debug for UnionUseKind<'a> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 /// All useinfo related operations are considered only within the same function(def id) for now.
 pub struct UnionUseInfo<'a> {
     pub kind: UnionUseKind<'a>,
@@ -172,13 +174,7 @@ fn collect_union_uses<'a>(
                             place.project_deeper(&[project_elem], tcx).ty(body, tcx).ty
                         );
                         let ty = place.ty(body, tcx).ty;
-                        let typing_env = TypingEnv::post_analysis(tcx, def_id);
-                        let size = if ty.is_sized(tcx, typing_env) {
-                            let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
-                            layout.size.bytes()
-                        } else {
-                            0
-                        };
+                        let size = utils::ir::ty_size(ty, def_id, tcx);
 
                         union_uses.entry(*place).or_default().push(UnionUseInfo {
                             kind: UnionUseKind::InitUnion(*place, ty, project_elem, size),
@@ -272,14 +268,14 @@ fn pred_locations<'a>(loc: Location, body: &Body<'a>) -> Vec<Location> {
 }
 
 fn collect_readable_writes<'a>(
-    uses: &[UnionUseInfo<'a>],
+    uses: Vec<UnionUseInfo<'a>>,
     body: &Body<'a>,
 ) -> FxHashMap<UnionUseInfo<'a>, FxHashSet<UnionUseInfo<'a>>> {
     // loc -> write use if it is a write
-    let mut loc_to_write: FxHashMap<Location, &UnionUseInfo<'a>> = FxHashMap::default();
-    for u in uses {
+    let mut loc_to_write: FxHashMap<Location, UnionUseInfo<'a>> = FxHashMap::default();
+    for u in &uses {
         if u.kind.is_write() {
-            loc_to_write.insert(u.location, u);
+            loc_to_write.insert(u.location, *u);
         }
     }
 
@@ -287,9 +283,7 @@ fn collect_readable_writes<'a>(
 
     let read_uses = uses
         .iter()
-        .filter(|u| !u.kind.is_write())
-        .cloned()
-        .collect::<Vec<_>>();
+        .filter_map(|u| if !u.kind.is_write() { Some(*u) } else { None });
 
     for read_use in read_uses {
         let mut reachable_writes: FxHashSet<UnionUseInfo<'a>> = FxHashSet::default();
@@ -304,7 +298,7 @@ fn collect_readable_writes<'a>(
             }
 
             if let Some(write_use) = loc_to_write.get(&loc) {
-                reachable_writes.insert((*write_use).clone());
+                reachable_writes.insert(*write_use);
                 continue;
             }
 
@@ -313,7 +307,7 @@ fn collect_readable_writes<'a>(
             }
         }
 
-        result.insert(read_use.clone(), reachable_writes);
+        result.insert(read_use, reachable_writes);
     }
 
     result
@@ -331,6 +325,7 @@ fn is_byte_implemented_ty<'a>(ty: Ty<'a>) -> bool {
 fn is_replacable_read<'a>(
     read_use: &UnionUseInfo<'a>,
     write_use: &FxHashSet<UnionUseInfo<'a>>,
+    def_id: LocalDefId,
     body: &Body<'a>,
     tcx: TyCtxt<'a>,
 ) -> bool {
@@ -340,35 +335,38 @@ fn is_replacable_read<'a>(
     }
     for w in write_use {
         let wt = w.kind.field_type(body, tcx);
-        if !is_byte_implemented_ty(wt) {
+        let rt_size = utils::ir::ty_size(rt, def_id, tcx);
+        let wt_size = utils::ir::ty_size(wt, def_id, tcx);
+        if !is_byte_implemented_ty(wt) && rt_size != wt_size {
             return false;
         }
     }
     true
 }
 
-pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
+pub fn analyze(tcx: TyCtxt, verbose: bool) -> AnalysisResult {
     let union_uses_map = collect_union_uses_map(tcx);
     let mut result_map = FxHashMap::default();
 
+    if verbose {
+        println!("Starting Union Punning Analysis");
+    }
     for (def_id, union_uses) in union_uses_map {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
         let body: &Body<'_> = &body.borrow();
 
         let mut place_map = FxHashMap::default();
 
-        for (place, uses) in &union_uses {
+        for (place, uses) in union_uses {
             // println!("For Place {place:?}:\n\tUses:{uses:?}");
             let init_use = uses
                 .iter()
-                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)));
+                .find(|u| matches!(u.kind, UnionUseKind::InitUnion(_, _, _, _)))
+                .copied();
 
-            // TODO: 현재는 union type 변수를 직접 사용하는 경우가 아니면 skip
-            // Ex. struct의 field로 union이 있는 경우는 skip
-            if init_use.is_none() {
-                continue;
-            }
-            let init_use = init_use.unwrap();
+            // Currently, skip cases where union type variables are not used directly.
+            // Ex. Skip if union is a field of a struct
+            let init_use = some_or!(init_use, continue);
 
             let read_write_map = collect_readable_writes(uses, body);
 
@@ -376,19 +374,25 @@ pub fn analyze(tcx: TyCtxt) -> AnalysisResult {
                 .into_iter()
                 .map(|(read_use, write_uses)| {
                     (
-                        read_use.clone(),
+                        read_use,
                         (
-                            is_replacable_read(&read_use, &write_uses, body, tcx),
+                            is_replacable_read(&read_use, &write_uses, def_id, body, tcx),
                             write_uses,
                         ),
                     )
                 })
                 .collect::<FxHashMap<UnionUseInfo, (bool, FxHashSet<UnionUseInfo>)>>();
 
-            place_map.insert(*place, (init_use.clone(), read_write_map));
+            place_map.insert(place, (init_use, read_write_map));
         }
 
         result_map.insert(def_id, place_map);
     }
-    AnalysisResult { map: result_map }
+
+    let analysis_result = AnalysisResult { map: result_map };
+    if verbose {
+        println!("Union Punning Analysis Done");
+        println!("Analysis Result:\n{analysis_result:?}");
+    }
+    analysis_result
 }
