@@ -21,7 +21,6 @@ pub struct AnalysisResult<'a> {
 
 impl<'a> std::fmt::Debug for AnalysisResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut nowrite = true;
         for (def_id, place_to_rw) in &self.map {
             if place_to_rw.is_empty() {
                 continue;
@@ -33,17 +32,13 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                         if write_uses.is_empty() {
                             continue;
                         }
-                        if !is_replacable {
-                            continue;
-                        }
                         if !pb {
                             if !fb {
                                 writeln!(f, "At Function {def_id:?}:")?;
                                 fb = true;
-                                nowrite = false;
                             }
                             writeln!(f, "\tFor Place {place:?}")?;
-                            writeln!(f, "\t\t(Init Use: {:?})", rw.0)?;
+                            writeln!(f, "\t\t(Init Use: {:?})\n", rw.0)?;
                             pb = true;
                         }
                         writeln!(f, "\t\tRead Use: {read_use:?}")?;
@@ -55,9 +50,6 @@ impl<'a> std::fmt::Debug for AnalysisResult<'a> {
                     }
                 }
             }
-        }
-        if nowrite {
-            write!(f, "No Punnings")?;
         }
         Ok(())
     }
@@ -337,7 +329,7 @@ fn is_replacable_read<'a>(
         let wt = w.kind.field_type(body, tcx);
         let rt_size = utils::ir::ty_size(rt, def_id, tcx);
         let wt_size = utils::ir::ty_size(wt, def_id, tcx);
-        if !is_byte_implemented_ty(wt) && rt_size != wt_size {
+        if !is_byte_implemented_ty(wt) || rt_size != wt_size {
             return false;
         }
     }

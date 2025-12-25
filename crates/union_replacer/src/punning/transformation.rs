@@ -313,6 +313,9 @@ impl<'a> AnalysisResult<'a> {
                             .or_insert(if replacable { Some(true) } else { None });
                     }
                 }
+                if read_locs.is_empty() {
+                    continue;
+                }
                 let trans_info = TransformInfo {
                     ident: None,
                     size,
