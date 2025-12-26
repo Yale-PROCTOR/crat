@@ -1,3 +1,4 @@
+use etrace::some_or;
 use rustc_ast::{Crate, Expr, NodeId, Stmt, StmtKind, mut_visit, mut_visit::MutVisitor};
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
@@ -100,7 +101,8 @@ impl MutVisitor for TransformVisitor<'_> {
                         let replacable = info.write_locs.get(&mir_loc).unwrap();
 
                         let typecheck = self.tcx.typeck(def_id);
-                        let hir_expr = self.ast_to_hir.get_expr(rhs_expr.id, self.tcx).unwrap();
+                        let hir_expr =
+                            some_or!(self.ast_to_hir.get_expr(rhs_expr.id, self.tcx), return);
                         let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
                         if let Some(replacable) = replacable {
                             if *replacable {
@@ -237,7 +239,9 @@ impl<'a> TransformVisitor<'a> {
         let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
         let mut thir_to_mir = FxHashMap::default();
         for def_id in tcx.hir_body_owners() {
-            thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
+            if analysis.map.contains_key(&def_id) {
+                thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
+            }
         }
 
         Self {
