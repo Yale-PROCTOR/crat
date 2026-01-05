@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use rustc_middle::{mir::Location, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use smallvec::SmallVec;
-use utils::ir::{AstToHir, HirToThir, ThirToMir};
+use utils::ir::{AstToHir, HirToThir, ThirToMir, mir_ty_to_string};
 
 use super::analysis::AnalysisResult;
 
@@ -43,7 +43,7 @@ fn get_write_info_by_mir_loc<'a>(
     if let Some(infos) = infos {
         for info in infos {
             let write_locs = &info.write_locs;
-            if write_locs.keys().collect::<Vec<_>>().contains(&mir_loc) {
+            if write_locs.contains_key(mir_loc) {
                 return Some(info);
             }
         }
@@ -108,19 +108,19 @@ impl MutVisitor for TransformVisitor<'_> {
                             if *replacable {
                                 // Replacable Write
                                 *expr = utils::expr!(
-                                    "{}_bytes = ({} as {}).to_be_bytes()",
+                                    "{}_bytes = ({} as {}).to_ne_bytes()",
                                     ident,
                                     pprust::expr_to_string(rhs_expr),
-                                    expr_ty.to_string()
+                                    mir_ty_to_string(expr_ty, self.tcx)
                                 );
                             } else {
                                 // Non-Replacable Write
                                 *expr = utils::expr!(
-                                    "{{ {}; {}_bytes = ({} as {}).to_be_bytes() }}",
+                                    "{{ {}; {}_bytes = ({} as {}).to_ne_bytes() }}",
                                     pprust::expr_to_string(expr),
                                     ident,
                                     pprust::expr_to_string(rhs_expr),
-                                    expr_ty.to_string()
+                                    mir_ty_to_string(expr_ty, self.tcx)
                                 );
                             }
                         }
@@ -147,7 +147,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
 
                             *expr = utils::expr!(
-                                "{}::from_be_bytes({}_bytes)",
+                                "{}::from_ne_bytes({}_bytes)",
                                 utils::ir::mir_ty_to_string(expr_ty, self.tcx),
                                 ident
                             );
@@ -188,26 +188,17 @@ impl MutVisitor for TransformVisitor<'_> {
                         let expr_ty = typecheck.expr_ty_adjusted(hir_expr);
 
                         // Transform Init
-                        if let Some(Some(replacable)) = info.write_locs.get(&init_loc) {
-                            if *replacable {
-                                // Replacable Init
-                                new_stmts.push(utils::stmt!(
-                                    "let mut {}_bytes: [u8; {}] = ({} as {}).to_be_bytes();",
-                                    ident.unwrap(),
-                                    info.size,
-                                    pprust::expr_to_string(val_expr),
-                                    expr_ty.to_string()
-                                ));
-                            } else {
-                                // Non-Replacable Init
-                                new_stmts.push(utils::stmt!(
-                                    "let mut {}_bytes: [u8; {}] = ({} as {}).to_be_bytes();",
-                                    ident.unwrap(),
-                                    info.size,
-                                    pprust::expr_to_string(val_expr),
-                                    expr_ty.to_string()
-                                ));
-                            }
+                        if let Some(Some(_replacable)) = info.write_locs.get(&init_loc) {
+                            // If a value in write_locs is not None, then the type to write can be transformed into bytes
+                            // Also, it is readable from some replacable reads
+                            // Add a byte array definition with the rvalue in bytes
+                            new_stmts.push(utils::stmt!(
+                                "let mut {}_bytes: [u8; {}] = ({} as {}).to_ne_bytes();",
+                                ident.unwrap(),
+                                info.size,
+                                pprust::expr_to_string(val_expr),
+                                mir_ty_to_string(expr_ty, self.tcx)
+                            ));
                         } else {
                             // Non-Replacable Init but will not be read
                             // Define byte array with dummy initialization
@@ -283,6 +274,7 @@ struct TransformInfo {
     /// - Some(true): replacable
     /// - Some(false): readable from both non-readable and replacable reads
     /// - None: otherwise (e.g., readable only from non-replacable read)
+    /// - If the type to write cannot be transformed into bytes, it will be None (as all reads will be non-replacable, see analysis::is_replacable_read)
     /// - If a write is not readable from any read, it will not be in this map
     pub write_locs: FxHashMap<Location, Option<bool>>,
 }
@@ -318,6 +310,7 @@ impl<'a> AnalysisResult<'a> {
                     }
                 }
                 if read_locs.is_empty() {
+                    // If all reads are non-replacable, skip
                     continue;
                 }
                 let trans_info = TransformInfo {

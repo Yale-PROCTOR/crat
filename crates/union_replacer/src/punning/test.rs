@@ -1,11 +1,14 @@
 #[cfg(test)]
 mod tests {
-    fn run_test(code: &str) {
+    fn run_test(code: &str, no_transform: bool) {
         let s = utils::compilation::run_compiler_on_str(code, |tcx| {
             super::super::replace_unions(tcx, true)
         })
         .unwrap();
         utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
+        if !no_transform {
+            assert!(s.contains("to_ne_bytes"));
+        }
     }
 
     const BASE: &str = r#"
@@ -52,7 +55,7 @@ mod tests {
         }
         "#;
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -68,7 +71,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -83,7 +86,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, true);
     }
 
     #[test]
@@ -105,7 +108,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -127,7 +130,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -146,7 +149,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -167,7 +170,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -188,7 +191,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -211,7 +214,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -234,7 +237,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -257,7 +260,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     #[test]
@@ -283,7 +286,7 @@ mod tests {
         "#;
 
         let code = format!("{BASE}\n{code}");
-        run_test(&code);
+        run_test(&code, false);
     }
 
     // #[test]
