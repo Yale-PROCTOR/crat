@@ -12,7 +12,7 @@ use rustc_hir::{self as hir, HirId, def::Res, def_id::LocalDefId};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
 use utils::{
-    ast::{unwrap_cast_and_paren, unwrap_paren, unwrap_paren_mut},
+    ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
     ir::{AstToHir, mir_ty_to_string},
 };
 
@@ -160,7 +160,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 let lhs_ty = typeck.expr_ty(hir_lhs);
                 let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
                 let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind {
-                    let hir_id = self.hir_id_of_path(lhs.id).unwrap();
+                    let hir_id = self
+                        .hir_id_of_path(lhs.id)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(lhs)));
                     self.ptr_kinds[&hir_id]
                 } else {
                     PtrKind::Raw(m.is_mut())
@@ -331,8 +333,37 @@ impl<'tcx> TransformVisitor<'tcx> {
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
-        let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
+        let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
         let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_ptr));
+
+        if let ExprKind::If(_, t, Some(f)) = &mut e.kind {
+            let hir::ExprKind::If(_, hir_t, Some(hir_f)) = hir_e.kind else {
+                panic!("{}", pprust::expr_to_string(e));
+            };
+            let StmtKind::Expr(t) = &mut t.stmts.last_mut().unwrap().kind else {
+                panic!("{}", pprust::expr_to_string(e));
+            };
+            let hir::ExprKind::Block(hir_t, _) = hir_t.kind else {
+                panic!("{}", pprust::expr_to_string(e));
+            };
+            let kind1 = self.transform_ptr(t, hir_t.expr.unwrap(), ctx);
+            let kind2 = if let ExprKind::Block(f, _) = &mut f.kind {
+                let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else {
+                    panic!("{}", pprust::expr_to_string(e));
+                };
+                let hir::ExprKind::Block(hir_f, _) = hir_f.kind else {
+                    panic!("{}", pprust::expr_to_string(e));
+                };
+                self.transform_ptr(f, hir_f.expr.unwrap(), ctx)
+            } else {
+                // if-else chain
+                self.transform_ptr(f, hir_f, ctx)
+            };
+            assert_eq!(kind1, kind2);
+            return kind1;
+        }
+
+        let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
         let pe = self
             .ptr_expr(e, hir_e)
             .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
@@ -360,7 +391,8 @@ impl<'tcx> TransformVisitor<'tcx> {
         let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
         let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap();
-        let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx).unwrap();
+        let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
+            .unwrap_or_else(|| panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr)));
         let need_cast = lhs_inner_ty != rhs_inner_ty;
 
         let def_id = hir_ptr.hir_id.owner.def_id;
@@ -617,7 +649,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     return PtrKind::Raw(m);
                 }
-                PtrCtx::Rhs(PtrKind::OptRef(_)) => panic!(),
+                PtrCtx::Rhs(PtrKind::OptRef(_)) => panic!("{}", pprust::expr_to_string(ptr)),
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
                     assert!(!m);
                     if lhs_inner_ty == self.tcx.types.u8 {
@@ -638,7 +670,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             ty::TyKind::Array(_, _) => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => self.ptr_kinds[&hir_id].is_mut(),
-                PathOrDeref::Other => panic!("{:?}", pe.hir_base),
+                PathOrDeref::Other => panic!("{}", pprust::expr_to_string(pe.base)),
             },
             _ => panic!("{:?}", pe.base_ty),
         };
@@ -1360,6 +1392,20 @@ fn unwrap_addr_of_deref(expr: &Expr) -> &Expr {
         unwrap_addr_of_deref(e)
     } else {
         unwrap_paren(expr)
+    }
+}
+
+fn unwrap_addr_of_deref_mut(expr: &mut Expr) -> &mut Expr {
+    let expr = unwrap_paren_mut(expr);
+    if let ExprKind::AddrOf(_, _, e) = &unwrap_paren(expr).kind
+        && let ExprKind::Unary(UnOp::Deref, _) = &unwrap_paren(e).kind
+    {
+        let ExprKind::AddrOf(_, _, e) = &mut expr.kind else { unreachable!() };
+        let e = unwrap_paren_mut(e);
+        let ExprKind::Unary(UnOp::Deref, e) = &mut e.kind else { unreachable!() };
+        unwrap_addr_of_deref_mut(e)
+    } else {
+        expr
     }
 }
 
