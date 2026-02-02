@@ -198,7 +198,7 @@ impl MutVisitor for AstVisitor<'_> {
             let md = md.ident.name;
             let func = func.ident.name;
             if md == sym::panicking {
-                if func.as_str() == "panic_explicit" {
+                if func.as_str() == "panic_explicit" || func.as_str() == "panic_fmt" {
                     *expr = expr!("panic!()");
                 } else if func == sym::panic
                     && let [arg] = &args[..]
