@@ -222,6 +222,20 @@
 //! p = p.offset(1);
 //! fresh0;
 //! ```
+//!
+//! # Replace `as_mut_ptr` with `as_ptr`
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! strcmp(s.as_mut_ptr(), t.as_mut_ptr());
+//! ```
+//!
+//! We replace such code with the following code:
+//!
+//! ```rust,ignore
+//! strcmp(s.as_ptr(), t.as_ptr());
+//! ```
 
 use std::fmt::Write as _;
 
@@ -569,10 +583,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     *expr = expr!("{new_expr}");
                 }
             }
-            ExprKind::MethodCall(box call) => {
-                if call.seg.ident.name.as_str() != "unwrap" {
-                    return;
+            ExprKind::MethodCall(box call) if call.seg.ident.name.as_str() == "as_mut_ptr" => {
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                let ty = typeck.expr_ty_adjusted(hir_expr);
+                if let ty::TyKind::RawPtr(_, ty::Mutability::Not) = ty.kind() {
+                    call.seg.ident.name = sym::as_ptr;
                 }
+            }
+            ExprKind::MethodCall(box call) if call.seg.ident.name.as_str() == "unwrap" => {
                 let ExprKind::Paren(e) = &call.receiver.kind else { return };
                 let ExprKind::Call(callee, e) = &e.kind else { return };
                 let ExprKind::Path(_, path) = &callee.kind else { return };
@@ -1733,6 +1752,27 @@ pub unsafe extern "C" fn f(mut p: *mut s) -> libc::c_int {
             "#,
             &["fresh0 = *p", "(*p).x = 1", "return (fresh0).x"],
             &["fresh0 = p", "(*fresh0).x = 1", "return (*fresh0).x"],
+        );
+    }
+
+    #[test]
+    fn test_as_mut_ptr() {
+        run_test(
+            r#"
+extern "C" {
+    fn strcmp(
+        __s1: *const core::ffi::c_char,
+        __s2: *const core::ffi::c_char,
+    ) -> core::ffi::c_int;
+}
+unsafe fn f() {
+    let mut x: [core::ffi::c_char; 1] = [0; 1];
+    let mut y: [core::ffi::c_char; 1] = [0; 1];
+    strcmp(x.as_mut_ptr(), y.as_mut_ptr());
+}
+            "#,
+            &["as_ptr"],
+            &["as_mut_ptr"],
         );
     }
 }
