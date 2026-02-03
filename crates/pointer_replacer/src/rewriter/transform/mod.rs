@@ -224,19 +224,32 @@ impl MutVisitor for TransformVisitor<'_> {
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "is_null" =>
             {
-                if matches!(receiver.kind, ExprKind::Path(_, _)) {
-                    let hir_id = self.hir_id_of_path(receiver.id).unwrap();
-                    let ptr_kind = self.ptr_kinds[&hir_id];
+                if matches!(receiver.kind, ExprKind::Path(_, _))
+                    && let Some(hir_id) = self.hir_id_of_path(receiver.id)
+                    && let Some(ptr_kind) = self.ptr_kinds.get(&hir_id)
+                {
                     match ptr_kind {
                         PtrKind::OptRef(_) => {
-                            *expr = utils::expr!("{}.is_none()", pprust::expr_to_string(receiver));
+                            seg.ident.name = Symbol::intern("is_none");
                         }
                         PtrKind::Slice(_) => {
-                            *expr = utils::expr!("{}.is_empty()", pprust::expr_to_string(receiver));
+                            seg.ident.name = Symbol::intern("is_empty");
                         }
                         PtrKind::Raw(_) => {}
                     }
                 }
+            }
+            ExprKind::MethodCall(box MethodCall {
+                seg,
+                receiver,
+                args,
+                ..
+            }) if seg.ident.name.as_str() == "offset_from" => {
+                let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx).unwrap();
+                self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(true)));
+                let [arg] = &mut args[..] else { panic!() };
+                let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx).unwrap();
+                self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
             }
             ExprKind::Ret(Some(ret)) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
@@ -602,9 +615,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(_)) => {
                     return PtrKind::Raw(m);
                 }
-                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(_)) => {
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
                     assert!(pe.projs.is_empty());
-                    *ptr = self.raw_from_opt_ref(pe.base, m, lhs_inner_ty, rhs_inner_ty);
+                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Slice(m1)) => {
@@ -617,11 +630,17 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::OptRef(m);
                 }
-                (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(_)) => {
+                (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
                     assert!(pe.projs.is_empty());
                     // can be used for deref, so type must be specified
-                    *ptr =
-                        self.opt_ref_from_opt_ref(pe.base, m, lhs_inner_ty, rhs_inner_ty, def_id);
+                    *ptr = self.opt_ref_from_opt_ref(
+                        pe.base,
+                        m,
+                        m1,
+                        lhs_inner_ty,
+                        rhs_inner_ty,
+                        def_id,
+                    );
                     return PtrKind::OptRef(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::Slice(_)) => {
@@ -649,9 +668,22 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     return PtrKind::Raw(m);
                 }
-                PtrCtx::Rhs(PtrKind::OptRef(_)) => panic!("{}", pprust::expr_to_string(ptr)),
+                PtrCtx::Rhs(PtrKind::OptRef(m)) => {
+                    assert!(!m, "{}", pprust::expr_to_string(ptr));
+                    if lhs_inner_ty == self.tcx.types.u8 {
+                        *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
+                    } else {
+                        assert!(lhs_inner_ty.is_numeric());
+                        self.bytemuck.set(true);
+                        *ptr = utils::expr!(
+                            "bytemuck::cast_slice({}).first()",
+                            pprust::expr_to_string(e)
+                        );
+                    }
+                    return PtrKind::OptRef(m);
+                }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    assert!(!m);
+                    assert!(!m, "{}", pprust::expr_to_string(ptr));
                     if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = e.clone();
                     } else {
@@ -691,10 +723,12 @@ impl<'tcx> TransformVisitor<'tcx> {
         &self,
         e: &Expr,
         m: bool,
+        m1: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         let extern_ty = matches!(rhs_inner_ty.kind(), ty::TyKind::Foreign(_));
         if extern_ty {
             utils::expr!(
@@ -702,24 +736,28 @@ impl<'tcx> TransformVisitor<'tcx> {
                     Some(x) => *x as *{} {},
                     None => std::ptr::null{}(),
                 }}",
-                if m { "mut " } else { "" },
+                if m && m1 { "mut " } else { "" },
                 pprust::expr_to_string(e),
-                if m { "mut" } else { "const" },
-                mir_ty_to_string(rhs_inner_ty, self.tcx),
-                if m { "_mut" } else { "" },
+                if m && m1 { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                if m && m1 { "_mut" } else { "" },
             )
         } else if !need_cast {
             utils::expr!(
-                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |_x| _x)",
+                "({}).as_deref{1}().map_or(std::ptr::null{1}::<{2}>(), |_x| _x){3}",
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
+                if m && m1 { "_mut" } else { "" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                cast_mut,
             )
         } else {
             utils::expr!(
-                "({}).as_deref{1}().map_or(std::ptr::null{1}(), |_x| _x as *{2} _ as *{2} _)",
+                "({}).as_deref{1}().map_or(std::ptr::null{1}::<{2}>(), |_x| _x as *{3} _ as *{3} _){4}",
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
-                if m { "mut" } else { "const" },
+                if m && m1 { "_mut" } else { "" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                if m && m1 { "mut" } else { "const" },
+                cast_mut,
             )
         }
     }
@@ -785,6 +823,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         &self,
         e: &Expr,
         m: bool,
+        m1: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
         def_id: LocalDefId,
@@ -794,7 +833,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             utils::expr!(
                 "({}).as_deref{}()",
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
+                if m && m1 { "_mut" } else { "" },
             )
         } else if lhs_inner_ty.is_numeric()
             && rhs_inner_ty.is_numeric()
@@ -805,8 +844,8 @@ impl<'tcx> TransformVisitor<'tcx> {
             utils::expr!(
                 "({}).as_deref{}().map(|_x| bytemuck::cast_{}::<_, {}>(_x))",
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
-                if m { "mut" } else { "ref" },
+                if m && m1 { "_mut" } else { "" },
+                if m && m1 { "mut" } else { "ref" },
                 mir_ty_to_string(lhs_inner_ty, self.tcx),
             )
         } else {
@@ -814,9 +853,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             utils::expr!(
                 "({}).as_deref{}().map(|_x| &{}*(_x as *{3} _ as *{3} {4}))",
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
-                if m { "mut " } else { "" },
-                if m { "mut" } else { "const" },
+                if m && m1 { "_mut" } else { "" },
+                if m && m1 { "mut " } else { "" },
+                if m && m1 { "mut" } else { "const" },
                 mir_ty_to_string(lhs_inner_ty, self.tcx),
             )
         }
@@ -1168,11 +1207,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                 }
                 hir::ExprKind::MethodCall(seg, receiver, _, _) => {
+                    let name = seg.ident.name.as_str();
                     if curr_id != receiver.hir_id {
                         return ExprCtx::Rvalue;
-                    } else if seg.ident.name.as_str() == "as_mut_ptr" {
+                    } else if name == "as_mut_ptr" || name.starts_with("set_") {
                         return ExprCtx::AddrTaken(true);
-                    } else if seg.ident.name.as_str() == "as_ptr" {
+                    } else if name == "as_ptr" {
                         return ExprCtx::AddrTaken(false);
                     } else {
                         return ExprCtx::Rvalue;
