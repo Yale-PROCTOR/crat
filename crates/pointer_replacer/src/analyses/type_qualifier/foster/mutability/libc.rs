@@ -74,7 +74,7 @@ pub fn libc_call<'tcx>(
         }
         "strlen" | "strdup" | "strcmp" | "strcasecmp" | "strncmp" | "strncasecmp" | "strcspn"
         | "atoi" | "atof" | "printf" | "fprintf" | "fdopen" | "fopen" | "regerror" | "regexec"
-        | "regfree" | "getenv" | "realloc" | "free" => {}
+        | "regfree" | "getenv" | "realloc" | "free" | "memcmp" => {}
         _ => {
             conservative_call(
                 destination,
