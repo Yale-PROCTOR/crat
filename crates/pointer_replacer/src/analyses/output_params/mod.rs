@@ -3,7 +3,7 @@
 
 use eliminable_temporaries::eliminable_temporaries;
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::MixedBitSet;
 use rustc_middle::{
@@ -13,7 +13,6 @@ use rustc_middle::{
 
 use crate::{
     analyses::{
-        alias::{AliasResult, alias_results},
         mir::{CallGraphPostOrder, CallKind, MirFunctionCall, TerminatorExt},
         type_qualifier::foster::mutability::{Mutability, MutabilityResult},
     },
@@ -24,8 +23,12 @@ mod eliminable_temporaries;
 
 pub type OutputParams = FxHashMap<LocalDefId, MixedBitSet<Local>>;
 
-pub fn show_output_params(program: &RustProgram, mutability_result: &MutabilityResult) {
-    let output_params = compute_output_params(program, mutability_result);
+pub fn show_output_params(
+    program: &RustProgram,
+    mutability_result: &MutabilityResult,
+    aliases: &FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
+) {
+    let output_params = compute_output_params(program, mutability_result, aliases);
 
     for (did, noalias_params) in output_params {
         let noalias_params_str = noalias_params
@@ -39,13 +42,12 @@ pub fn show_output_params(program: &RustProgram, mutability_result: &MutabilityR
 pub fn compute_output_params(
     program: &RustProgram,
     mutability_result: &MutabilityResult,
+    aliases: &FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
 ) -> OutputParams {
     let mut output_params = FxHashMap::default();
     output_params.reserve(program.functions.len());
     let mut copies = FxHashMap::default();
     copies.reserve(program.functions.len());
-
-    let alias_result = alias_results(program);
 
     for &did in program.functions.iter() {
         let body = &*program
@@ -54,7 +56,7 @@ pub fn compute_output_params(
             .borrow();
         output_params.insert(
             did,
-            conservative(program.tcx, body, &alias_result, mutability_result),
+            conservative(program.tcx, body, aliases, mutability_result),
         );
         copies.insert(did, eliminable_temporaries(body));
     }
@@ -70,7 +72,7 @@ pub fn compute_output_params(
                     || iterate(
                         body,
                         copies.get(&def_id).unwrap(),
-                        &alias_result,
+                        aliases,
                         mutability_result,
                         &mut output_params,
                         tcx,
@@ -88,12 +90,12 @@ pub fn compute_output_params(
 fn conservative<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-    alias_result: &AliasResult,
+    aliases: &FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     mutability_result: &MutabilityResult,
 ) -> MixedBitSet<Local> {
-    let location_of = alias_result.local_locations(&body.source.def_id());
     let body_did = body.source.def_id();
     let function_facts = mutability_result.function_facts(body_did.expect_local(), tcx);
+    let local_aliases = aliases.get(&body_did.expect_local());
 
     let mut output_params = MixedBitSet::new_empty(body.local_decls.len());
     for (local, _) in
@@ -113,16 +115,18 @@ fn conservative<'tcx>(
         output_params.insert(local);
     }
 
-    for arg in body.args_iter() {
-        for local in body.local_decls.indices() {
-            if arg == local {
-                continue;
-            }
-            if alias_result.may_alias(location_of[arg.index()], location_of[local.index()]) {
-                let def_path_str = tcx.def_path_str(body_did);
-                #[cfg(debug_assertions)]
-                eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
-                output_params.remove(arg);
+    if let Some(local_aliases) = local_aliases {
+        for arg in body.args_iter() {
+            if let Some(aliased_with) = local_aliases.get(&arg) {
+                for &local in aliased_with {
+                    if !body.args_iter().any(|a| a == local) {
+                        let def_path_str = tcx.def_path_str(body_did);
+                        #[cfg(debug_assertions)]
+                        eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
+                        output_params.remove(arg);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -133,14 +137,14 @@ fn conservative<'tcx>(
 fn iterate<'tcx>(
     body: &Body<'tcx>,
     copies: &MixedBitSet<Local>,
-    alias_result: &AliasResult,
+    aliases: &FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     mutability_result: &MutabilityResult,
     known_facts: &mut OutputParams,
     tcx: TyCtxt<'tcx>,
 ) -> bool {
-    let location_of = alias_result.local_locations(&body.source.def_id());
     let body_did = body.source.def_id();
     let function_facts = mutability_result.function_facts(body_did.expect_local(), tcx);
+    let local_aliases = aliases.get(&body_did.expect_local());
     let transitive_output_position_temporaries =
         transitive_output_position_temporaries(known_facts, copies, body, tcx);
     let output_params = known_facts
@@ -159,15 +163,17 @@ fn iterate<'tcx>(
                 )
             })
     {
-        if body
-            .local_decls
-            .indices()
-            .filter(|&local| arg != local)
-            .filter(|&local| !transitive_output_position_temporaries.contains(local))
-            .all(|local| {
-                !alias_result.may_alias(location_of[arg.index()], location_of[local.index()])
+        let aliases_non_params = local_aliases
+            .and_then(|la| la.get(&arg))
+            .map(|aliased| {
+                aliased.iter().any(|&local| {
+                    !body.args_iter().any(|a| a == local)
+                        && !transitive_output_position_temporaries.contains(local)
+                })
             })
-        {
+            .unwrap_or(false);
+
+        if !aliases_non_params {
             let def_path_str = tcx.def_path_str(body_did);
             #[cfg(debug_assertions)]
             eprintln!(
