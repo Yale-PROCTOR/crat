@@ -159,10 +159,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 };
                 let lhs_ty = typeck.expr_ty(hir_lhs);
                 let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
-                let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind {
-                    let hir_id = self
-                        .hir_id_of_path(lhs.id)
-                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(lhs)));
+                let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind
+                    && let Some(hir_id) = self.hir_id_of_path(lhs.id)
+                {
                     self.ptr_kinds[&hir_id]
                 } else {
                     PtrKind::Raw(m.is_mut())
@@ -399,11 +398,22 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrCtx::Deref(_) => panic!(),
             }
         }
+        if pe.is_integer() {
+            match ctx {
+                PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                    assert!(matches!(ptr.kind, ExprKind::Cast(..)));
+                    return PtrKind::Raw(m);
+                }
+                _ => panic!(),
+            }
+        }
 
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
         let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
-        let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap();
+        let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or_else(|| {
+            panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr));
+        });
         let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
             .unwrap_or_else(|| panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr)));
         let need_cast = lhs_inner_ty != rhs_inner_ty;
@@ -702,7 +712,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             ty::TyKind::Array(_, _) => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => self.ptr_kinds[&hir_id].is_mut(),
-                PathOrDeref::Other => panic!("{}", pprust::expr_to_string(pe.base)),
+                PathOrDeref::Other => {
+                    panic!("{}", pprust::expr_to_string(pe.base))
+                }
             },
             _ => panic!("{:?}", pe.base_ty),
         };
@@ -1171,6 +1183,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                     None
                 }
             }
+            ExprKind::Binary(_, _, _) if base_ty.is_usize() => Some(PtrExpr::new(
+                expr,
+                hir_expr,
+                base_ty,
+                PtrExprBaseKind::Integer,
+            )),
+            ExprKind::Array(..) => Some(PtrExpr::new(
+                expr,
+                hir_expr,
+                base_ty,
+                PtrExprBaseKind::Array,
+            )),
             _ => None,
         }
     }
@@ -1242,7 +1266,7 @@ impl<'tcx> TransformVisitor<'tcx> {
 
     fn is_base_not_a_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
         match pe.base_kind {
-            PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca => true,
+            PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca | PtrExprBaseKind::Array => true,
             PtrExprBaseKind::Other => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => {
@@ -1367,6 +1391,8 @@ enum PtrExprBaseKind {
     Alloca,
     ByteStr,
     Zero,
+    Integer,
+    Array,
     Other,
 }
 
@@ -1419,6 +1445,13 @@ impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
     #[inline]
     fn is_zero(&self) -> bool {
         self.base_kind == PtrExprBaseKind::Zero
+            && self.projs.is_empty()
+            && !self.addr_of
+            && !self.as_ptr
+    }
+
+    fn is_integer(&self) -> bool {
+        self.base_kind == PtrExprBaseKind::Integer
             && self.projs.is_empty()
             && !self.addr_of
             && !self.as_ptr
