@@ -1321,15 +1321,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
-                    } else if matches!(unwrap_paren(offset).kind, ExprKind::Unary(UnOp::Neg, _)) {
-                        e = utils::expr!(
-                            "({}).as{}_ptr().offset({})",
-                            pprust::expr_to_string(&e),
-                            if m { "_mut" } else { "" },
-                            pprust::expr_to_string(offset),
-                        );
-                        e = self.slice_from_raw(&e, m, m, from_ty, from_ty);
-                        is_raw = true;
+                    // } else if matches!(unwrap_paren(offset).kind, ExprKind::Unary(UnOp::Neg, _)) {
+                    //     e = utils::expr!(
+                    //         "({}).as{}_ptr().offset({})",
+                    //         pprust::expr_to_string(&e),
+                    //         if m { "_mut" } else { "" },
+                    //         pprust::expr_to_string(offset),
+                    //     );
+                    //     e = self.slice_from_raw(&e, m, m, from_ty, from_ty);
+                    //     is_raw = true;
                     } else {
                         e = utils::expr!(
                             "({})[({}) as usize..]",
