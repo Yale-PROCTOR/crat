@@ -453,7 +453,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && let LocalKind::Init(box e) = &mut local.kind
         {
             if matches!(mode, hir::BindingMode(hir::ByRef::Yes(_), _))
-                && !self.non_pointer_uses.contains(&id)
+                && (matches!(e.kind, ExprKind::Unary(UnOp::Deref, _))
+                    || (matches!(e.kind, ExprKind::Field(_, _))
+                        && !self.non_pointer_uses.contains(&id)))
             {
                 self.let_ref_exprs.insert(id, e.clone());
                 self.lets_to_remove.insert(hir_stmt.hir_id);
