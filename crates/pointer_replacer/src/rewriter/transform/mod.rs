@@ -375,6 +375,16 @@ impl<'tcx> TransformVisitor<'tcx> {
             return kind1;
         }
 
+        if let ExprKind::Block(block, _) = &mut e.kind {
+            let hir::ExprKind::Block(hir_block, _) = hir_e.kind else {
+                panic!("{}", pprust::expr_to_string(e));
+            };
+            let StmtKind::Expr(inner) = &mut block.stmts.last_mut().unwrap().kind else {
+                panic!("{}", pprust::expr_to_string(e));
+            };
+            return self.transform_ptr(inner, hir_block.expr.unwrap(), ctx);
+        }
+
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
         let mut pe = self
             .ptr_expr(e, hir_e)
@@ -395,7 +405,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = utils::expr!("std::ptr::null{}()", if m { "_mut" } else { "" });
                     return PtrKind::Raw(m);
                 }
-                PtrCtx::Deref(_) => panic!(),
+                PtrCtx::Deref(m) => {
+                    return PtrKind::Raw(m);
+                }
             }
         }
 

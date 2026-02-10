@@ -252,7 +252,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
 use utils::{
-    ast::unwrap_cast_and_paren,
+    ast::{unwrap_cast_and_paren, unwrap_paren},
     expr,
     ir::{AstToHir, mir_ty_to_string},
     ty,
@@ -541,6 +541,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             _ => {}
         }
 
+        if let Some(replacement) = self.try_replace_offsetof(expr) {
+            *expr = replacement;
+        }
+
         mut_visit::walk_expr(self, expr);
 
         let expr_id = expr.id;
@@ -622,6 +626,40 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             }
             _ => {}
         }
+    }
+}
+
+impl<'tcx> AstVisitor<'tcx> {
+    /// Detect `&[mut] (*(0 as *mut T)).field as *mut/const _ as usize`
+    /// and replace with `core::mem::offset_of!(T, field)`.
+    fn try_replace_offsetof(&self, expr: &Expr) -> Option<Expr> {
+        let ExprKind::Cast(inner, _) = &expr.kind else { return None };
+
+        let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        if typeck.expr_ty(hir_expr) != self.tcx.types.usize {
+            return None;
+        }
+
+        let inner = unwrap_cast_and_paren(inner);
+        let ExprKind::AddrOf(_, _, field_expr) = &inner.kind else { return None };
+
+        let ExprKind::Field(base, field_ident) = &field_expr.kind else { return None };
+        let deref_expr = unwrap_paren(base);
+        let ExprKind::Unary(UnOp::Deref, null_cast) = &deref_expr.kind else { return None };
+
+        let ExprKind::Cast(zero_lit, _) = &unwrap_paren(null_cast).kind else { return None };
+        let ExprKind::Lit(lit) = &unwrap_cast_and_paren(zero_lit).kind else { return None };
+        if lit.kind != token::LitKind::Integer || lit.symbol.as_str() != "0" {
+            return None;
+        }
+
+        let hir_deref = self.ast_to_hir.get_expr(deref_expr.id, self.tcx)?;
+        let struct_ty = typeck.expr_ty(hir_deref);
+        let ty_str = mir_ty_to_string(struct_ty, self.tcx);
+        let field_name = field_ident.name;
+
+        Some(expr!("core::mem::offset_of!({ty_str}, {field_name})"))
     }
 }
 
@@ -1787,5 +1825,30 @@ unsafe fn f() {
             &["as_ptr"],
             &["as_mut_ptr"],
         );
+    }
+
+    #[test]
+    fn test_offset_of() {
+        run_test(
+            r#"
+#[repr(C)]
+struct test {
+    a: i32,
+    b: i32,
+}
+unsafe fn f(i: *mut i32) -> *mut test {
+    (i as *mut i8)
+        .offset(-(&mut (*(0 as *mut test)).a as *mut i32 as usize as isize))
+        as *mut test
+}
+unsafe fn g(i: *mut i32) -> *mut test {
+    (i as *mut i8)
+        .offset(-(&mut (*(0 as *mut test)).b as *mut i32 as usize as isize))
+        as *mut test
+}
+            "#,
+            &["offset_of!(crate::test, a)", "offset_of!(crate::test, b)"],
+            &["*(0 as"],
+        )
     }
 }
