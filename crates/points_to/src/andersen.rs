@@ -601,7 +601,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     }
                 }
             }
-            Rvalue::NullaryOp(_, _) => unreachable!(),
+            Rvalue::NullaryOp(_, _) => {}
             Rvalue::UnaryOp(op, r) => {
                 if matches!(op, UnOp::Neg)
                     && let Some(r) = self.transfer_op(r, ctx)
