@@ -159,10 +159,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 };
                 let lhs_ty = typeck.expr_ty(hir_lhs);
                 let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
-                let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind {
-                    let hir_id = self
-                        .hir_id_of_path(lhs.id)
-                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(lhs)));
+                let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind
+                    && let Some(hir_id) = self.hir_id_of_path(lhs.id)
+                {
                     self.ptr_kinds[&hir_id]
                 } else {
                     PtrKind::Raw(m.is_mut())
@@ -377,7 +376,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
 
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
-        let pe = self
+        let mut pe = self
             .ptr_expr(e, hir_e)
             .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
 
@@ -403,7 +402,29 @@ impl<'tcx> TransformVisitor<'tcx> {
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
         let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
-        let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap();
+
+        if pe.cast_int {
+            match ctx {
+                PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                    let mut base = pe.base.clone();
+                    // Rewrite inner pointer before integer casting
+                    let kind =
+                        self.transform_ptr(&mut base, pe.hir_base, PtrCtx::Rhs(PtrKind::Raw(m)));
+                    pe.base = &base;
+                    // Assume always need a cast from integer to pointer
+                    pe.push_cast(lhs_ty);
+
+                    let is_raw = matches!(kind, PtrKind::Raw(_));
+                    *ptr = self.projected_expr(&pe, m, is_raw);
+                    return PtrKind::Raw(m);
+                }
+                _ => panic!("{}", pprust::expr_to_string(ptr)),
+            }
+        }
+
+        let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or_else(|| {
+            panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr));
+        });
         let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
             .unwrap_or_else(|| panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr)));
         let need_cast = lhs_inner_ty != rhs_inner_ty;
@@ -514,7 +535,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             let is_alloca = pe.base_kind == PtrExprBaseKind::Alloca;
             match ctx {
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
                     if !need_cast {
                         *ptr = utils::expr!(
                             "({}).as_{}ptr()",
@@ -532,7 +553,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Raw(m);
                 }
                 PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
                     if !need_cast {
                         *ptr = utils::expr!(
                             "Some(&{}({})[0])",
@@ -566,7 +587,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::OptRef(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
+
                     if !need_cast {
                         *ptr = utils::expr!(
                             "{}({})",
@@ -621,7 +643,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Slice(m1)) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
                     *ptr = self.raw_from_slice(&base, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Raw(m);
                 }
@@ -644,7 +666,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::OptRef(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::Slice(_)) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
                     *ptr = self.opt_ref_from_slice(&base, m, lhs_inner_ty, rhs_inner_ty, def_id);
                     return PtrKind::OptRef(m);
                 }
@@ -655,7 +677,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(_)), PtrKind::OptRef(_)) => panic!(),
                 (PtrCtx::Rhs(PtrKind::Slice(m)) | PtrCtx::Deref(m), PtrKind::Slice(_)) => {
-                    let base = self.projected_expr(&pe, m);
+                    let base = self.projected_expr(&pe, m, false);
                     // can be used for deref, so type must be specified
                     *ptr = self.slice_from_slice(&base, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
@@ -702,7 +724,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             ty::TyKind::Array(_, _) => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => self.ptr_kinds[&hir_id].is_mut(),
-                PathOrDeref::Other => panic!("{}", pprust::expr_to_string(pe.base)),
+                PathOrDeref::Other => {
+                    panic!("{}", pprust::expr_to_string(pe.base))
+                }
             },
             _ => panic!("{:?}", pe.base_ty),
         };
@@ -1091,6 +1115,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let he = hir_unwrap_cast(hir_expr);
                 let mut ptr_expr = self.ptr_expr(e, he)?;
                 ptr_expr.push_cast(base_ty);
+                if base_ty.is_usize() {
+                    ptr_expr.cast_int = true;
+                }
                 Some(ptr_expr)
             }
             ExprKind::Field(_, _) => Some(PtrExpr::new(
@@ -1167,10 +1194,31 @@ impl<'tcx> TransformVisitor<'tcx> {
                         base_ty,
                         PtrExprBaseKind::Alloca,
                     ))
+                } else if name == "wrapping_add" || name == "wrapping_sub" {
+                    let opkind = match name {
+                        "wrapping_add" => OpKind::WrappingAdd,
+                        "wrapping_sub" => OpKind::WrappingSub,
+                        _ => panic!(),
+                    };
+                    let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;
+                    ptr_expr.push_integer_op(&call.args[0], opkind);
+                    Some(ptr_expr)
                 } else {
                     None
                 }
             }
+            ExprKind::Binary(binop, lhs, rhs) if base_ty.is_usize() => {
+                let hir::ExprKind::Binary(_, hlhs, _) = hir_expr.kind else { panic!() };
+                let mut ptr_expr = self.ptr_expr(lhs, hlhs)?;
+                ptr_expr.push_integer_bin_op(rhs, binop.node);
+                Some(ptr_expr)
+            }
+            ExprKind::Array(..) => Some(PtrExpr::new(
+                expr,
+                hir_expr,
+                base_ty,
+                PtrExprBaseKind::Array,
+            )),
             _ => None,
         }
     }
@@ -1242,7 +1290,7 @@ impl<'tcx> TransformVisitor<'tcx> {
 
     fn is_base_not_a_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
         match pe.base_kind {
-            PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca => true,
+            PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca | PtrExprBaseKind::Array => true,
             PtrExprBaseKind::Other => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => {
@@ -1251,13 +1299,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                         PtrKind::OptRef(_) | PtrKind::Slice(_)
                     )
                 }
-                PathOrDeref::Other => false,
+                PathOrDeref::Other => pe.base_ty.is_array(),
             },
             _ => false,
         }
     }
 
-    fn projected_expr(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Expr {
+    fn projected_expr(&self, pe: &PtrExpr<'_, 'tcx>, m: bool, mut is_raw: bool) -> Expr {
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -1267,14 +1315,21 @@ impl<'tcx> TransformVisitor<'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
-                    if matches!(unwrap_paren(offset).kind, ExprKind::Unary(UnOp::Neg, _)) {
+                    if is_raw {
                         e = utils::expr!(
-                            "({}).as{}_ptr().offset({})",
+                            "({}).offset({})",
                             pprust::expr_to_string(&e),
-                            if m { "_mut" } else { "" },
                             pprust::expr_to_string(offset),
                         );
-                        e = self.slice_from_raw(&e, m, m, from_ty, from_ty);
+                    // } else if matches!(unwrap_paren(offset).kind, ExprKind::Unary(UnOp::Neg, _)) {
+                    //     e = utils::expr!(
+                    //         "({}).as{}_ptr().offset({})",
+                    //         pprust::expr_to_string(&e),
+                    //         if m { "_mut" } else { "" },
+                    //         pprust::expr_to_string(offset),
+                    //     );
+                    //     e = self.slice_from_raw(&e, m, m, from_ty, from_ty);
+                    //     is_raw = true;
                     } else {
                         e = utils::expr!(
                             "({})[({}) as usize..]",
@@ -1283,17 +1338,64 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                     }
                 }
-                PtrExprProj::Cast(ty) => {
-                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
-                    if matches!(e.kind, ExprKind::Index(..)) || is_array {
+                PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    if is_raw {
+                        e = utils::expr!("({}) as usize", pprust::expr_to_string(&e),);
+                    } else {
                         e = utils::expr!(
-                            "&{}({})",
-                            if m { "mut " } else { "" },
+                            "({}).as{}_ptr() as usize",
                             pprust::expr_to_string(&e),
+                            if m { "_mut" } else { "" },
                         );
                     }
-                    e = self.slice_from_slice(&e, m, to_ty, from_ty);
-                    from_ty = to_ty;
+                    is_raw = true;
+                }
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
+                    if is_raw {
+                        e = utils::expr!(
+                            "({}) as *{} {}",
+                            pprust::expr_to_string(&e),
+                            if m { "mut" } else { "const" },
+                            mir_ty_to_string(to_ty, self.tcx),
+                        );
+                        from_ty = to_ty;
+                    } else {
+                        if matches!(e.kind, ExprKind::Index(..)) || is_array {
+                            e = utils::expr!(
+                                "&{}({})",
+                                if m { "mut " } else { "" },
+                                pprust::expr_to_string(&e),
+                            );
+                        }
+                        e = self.slice_from_slice(&e, m, to_ty, from_ty);
+                        from_ty = to_ty;
+                    }
+                }
+                PtrExprProj::IntegerOp(expr, op) => {
+                    let method = match op {
+                        OpKind::WrappingAdd => "wrapping_add",
+                        OpKind::WrappingSub => "wrapping_sub",
+                    };
+                    e = utils::expr!(
+                        "({}).{}({})",
+                        pprust::expr_to_string(&e),
+                        method,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+                PtrExprProj::IntegerBinOp(expr, op) => {
+                    let op_str = match op {
+                        BinOpKind::BitAnd => "&",
+                        BinOpKind::BitOr => "|",
+                        _ => panic!(),
+                    };
+                    e = utils::expr!(
+                        "({}) {} ({})",
+                        pprust::expr_to_string(&e),
+                        op_str,
+                        pprust::expr_to_string(expr),
+                    );
                 }
             }
             is_array = false;
@@ -1367,13 +1469,22 @@ enum PtrExprBaseKind {
     Alloca,
     ByteStr,
     Zero,
+    Array,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    WrappingAdd,
+    WrappingSub,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum PtrExprProj<'a, 'tcx> {
     Offset(&'a Expr),
     Cast(ty::Ty<'tcx>),
+    IntegerOp(&'a Expr, OpKind),
+    IntegerBinOp(&'a Expr, BinOpKind),
 }
 
 #[derive(Debug, Clone)]
@@ -1385,6 +1496,7 @@ struct PtrExpr<'a, 'tcx> {
     base_kind: PtrExprBaseKind,
     as_ptr: bool,
     projs: Vec<PtrExprProj<'a, 'tcx>>,
+    cast_int: bool,
 }
 
 impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
@@ -1403,6 +1515,7 @@ impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
             base_kind,
             as_ptr: false,
             projs: vec![],
+            cast_int: false,
         }
     }
 
@@ -1414,6 +1527,16 @@ impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
     #[inline]
     fn push_cast(&mut self, ty: ty::Ty<'tcx>) {
         self.projs.push(PtrExprProj::Cast(ty));
+    }
+
+    #[inline]
+    fn push_integer_op(&mut self, expr: &'a Expr, op: OpKind) {
+        self.projs.push(PtrExprProj::IntegerOp(expr, op));
+    }
+
+    #[inline]
+    fn push_integer_bin_op(&mut self, expr: &'a Expr, op: BinOpKind) {
+        self.projs.push(PtrExprProj::IntegerBinOp(expr, op));
     }
 
     #[inline]
