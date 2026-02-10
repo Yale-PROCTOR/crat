@@ -332,6 +332,7 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
         fresh_pointers,
         fresh_pointer_renames,
         stmt_swaps,
+        non_pointer_uses: visitor.ctx.non_pointer_uses,
     };
 
     visitor.visit_crate(&mut expanded_ast);
@@ -350,6 +351,7 @@ struct AstVisitor<'tcx> {
     fresh_pointers: FxHashSet<HirId>,
     fresh_pointer_renames: FxHashMap<HirId, Symbol>,
     stmt_swaps: FxHashMap<HirId, Vec<usize>>,
+    non_pointer_uses: FxHashSet<HirId>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -450,7 +452,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && let hir::PatKind::Binding(mode, id, _, _) = hir_stmt.pat.kind
             && let LocalKind::Init(box e) = &mut local.kind
         {
-            if matches!(mode, hir::BindingMode(hir::ByRef::Yes(_), _)) {
+            if matches!(mode, hir::BindingMode(hir::ByRef::Yes(_), _))
+                && !self.non_pointer_uses.contains(&id)
+            {
                 self.let_ref_exprs.insert(id, e.clone());
                 self.lets_to_remove.insert(hir_stmt.hir_id);
             } else if self.fresh_pointers.contains(&id) {
@@ -917,6 +921,8 @@ struct HirCtx {
     pointer_uses: FxHashMap<HirId, Vec<PointerUse>>,
     /// integer-pointer-type fresh variable used for deref in lhs
     fresh_lets: FxHashMap<HirId, LhsFreshLet>,
+    /// variables used without deref
+    non_pointer_uses: FxHashSet<HirId>,
 }
 
 struct HirVisitor<'tcx> {
@@ -1072,23 +1078,30 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         self.ctx.used_vars.insert(hir_id);
                     }
 
-                    if ty.is_raw_ptr() {
-                        let pointer_use = if let hir::Node::Expr(parent) = parent
-                            && let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind
-                        {
-                            if is_lhs(parent, self.tcx) {
+                    if let hir::Node::Expr(parent) = parent
+                        && let hir::ExprKind::Unary(hir::UnOp::Deref, _) = parent.kind
+                    {
+                        if ty.is_raw_ptr() {
+                            let pointer_use = if is_lhs(parent, self.tcx) {
                                 PointerUse::LvalueDeref
                             } else {
                                 PointerUse::RvalueDeref
-                            }
-                        } else {
-                            PointerUse::NonDeref
-                        };
-                        self.ctx
-                            .pointer_uses
-                            .entry(hir_id)
-                            .or_default()
-                            .push(pointer_use);
+                            };
+                            self.ctx
+                                .pointer_uses
+                                .entry(hir_id)
+                                .or_default()
+                                .push(pointer_use);
+                        }
+                    } else {
+                        if ty.is_raw_ptr() {
+                            self.ctx
+                                .pointer_uses
+                                .entry(hir_id)
+                                .or_default()
+                                .push(PointerUse::NonDeref);
+                        }
+                        self.ctx.non_pointer_uses.insert(hir_id);
                     }
                 }
             }
