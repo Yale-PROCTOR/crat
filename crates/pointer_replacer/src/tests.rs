@@ -1299,6 +1299,102 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+// ===== slice_from_raw Branch A tests: method call (offset/as_mut_ptr/as_ptr) =====
+
+/// slice_from_raw Branch A1 (no cast): `q = p.offset(2)` where p is Raw, q is Slice.
+/// `method_call_name(p.offset(2))` → "offset" → skip null check, no cast needed.
+#[test]
+fn test_sfr_method_call_no_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut r: *mut libc::c_int = &mut x;
+    *p = 1 as libc::c_int;
+    *r = 2 as libc::c_int;
+    let mut q: *mut libc::c_int = p.offset(2 as isize);
+    *q.offset(0 as isize) = 10 as libc::c_int;
+    return *q.offset(0 as isize);
+}
+"#,
+        &["from_raw_parts_mut", "p.offset"],
+        &["is_null", "let _x"],
+    );
+}
+
+/// slice_from_raw Branch A2 (with cast): `q = p.offset(2) as *mut c_short` where p is Raw.
+/// `unwrap_cast_and_paren` strips cast → "offset" → Branch A, `need_cast=true` → `as *mut _`.
+#[test]
+fn test_sfr_method_call_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut r: *mut libc::c_int = &mut x;
+    *p = 1 as libc::c_int;
+    *r = 2 as libc::c_int;
+    let mut q: *mut libc::c_short = p.offset(2 as isize) as *mut libc::c_short;
+    *q.offset(0 as isize) = 10 as libc::c_short;
+    return *q.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["from_raw_parts_mut", "as *mut _"],
+        &["is_null", "let _x"],
+    );
+}
+
+// ===== slice_from_raw Branch C tests: side effects =====
+// A function call returning a raw pointer has side effects (Call is not whitelisted)
+// and reaches the fallthrough path (PtrExprBaseKind::Other at line 1153).
+// transform_ptr does NOT recurse into Call expressions, so slice_from_raw sees the
+// full call expression and hits Branch C.
+
+/// slice_from_raw Branch C1 (side effects, no cast): `q = identity(p)` where
+/// identity is an extern function returning a raw pointer. `has_side_effects(Call)` → true,
+/// same types → C1. Uses extern to avoid parameter transformation.
+#[test]
+fn test_sfr_side_effects_no_cast() {
+    run_test(
+        r#"
+use ::libc;
+extern "C" { fn identity(p: *mut libc::c_int) -> *mut libc::c_int; }
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut q: *mut libc::c_int = identity(&mut x);
+    *q.offset(0 as isize) = 10 as libc::c_int;
+    return *q.offset(0 as isize);
+}
+"#,
+        &["let _x", "from_raw_parts_mut"],
+        &["as *mut _"],
+    );
+}
+
+/// slice_from_raw Branch C2 (side effects, with cast): `q = identity(p) as *mut c_short`.
+/// `has_side_effects(Call)` → true, different types → need_cast → C2. Uses extern to
+/// avoid parameter transformation.
+#[test]
+fn test_sfr_side_effects_cast() {
+    run_test(
+        r#"
+use ::libc;
+extern "C" { fn identity(p: *mut libc::c_int) -> *mut libc::c_int; }
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut q: *mut libc::c_short = identity(&mut x) as *mut libc::c_short;
+    *q.offset(0 as isize) = 10 as libc::c_short;
+    return *q.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["let _x", "from_raw_parts_mut", "as *mut _"],
+        &[],
+    );
+}
+
 /// Fallthrough + Raw: overlapping borrows from struct field `s.data` → both demoted to Raw.
 #[test]
 fn test_field_ptr_raw() {
