@@ -528,6 +528,171 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+// ===== addr_of tests: RHS is `&mut x` (taking address of a local variable) =====
+// The `addr_of` branch handles RHS expressions of the form `&mut x`.
+// 3 PtrKind contexts (Raw, OptRef, Slice) × 2-3 sub-cases (need_cast, ty_updated).
+
+// --- Raw context ---
+
+/// addr_of with Raw context, no cast: overlapping borrows on x demote both
+/// pointers to Raw. Output: `&raw mut (x)`.
+#[test]
+fn test_addr_of_raw() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut r: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    *r = 20 as libc::c_int;
+    return *p;
+}
+"#,
+        &["&raw mut"],
+        &["Some(", "slice::from"],
+    );
+}
+
+/// addr_of with Raw context, with cast: overlapping borrows + type cast.
+/// Output: `&raw mut (x) as *mut i16`.
+#[test]
+fn test_addr_of_raw_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_short = &mut x as *mut libc::c_int as *mut libc::c_short;
+    let mut r: *mut libc::c_short = &mut x as *mut libc::c_int as *mut libc::c_short;
+    *p = 10 as libc::c_short;
+    *r = 20 as libc::c_short;
+    return *p as libc::c_int;
+}
+"#,
+        &["&raw mut", "as *mut i16"],
+        &["Some("],
+    );
+}
+
+// --- OptRef context ---
+
+/// addr_of with OptRef context, no cast: simple `&mut x` usage, no conflicts.
+/// Output: `Some(&mut (x))`.
+#[test]
+fn test_addr_of_ref() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    return *p;
+}
+"#,
+        &["Some(&mut", "Option<&mut i32>"],
+        &["*mut", "bytemuck"],
+    );
+}
+
+/// addr_of with OptRef context, bytemuck cast: same-size numerics (c_int vs c_uint).
+/// p is read-only so m=false → `Some(bytemuck::cast_ref::<_, u32>(&(x)))`.
+#[test]
+fn test_addr_of_ref_bytemuck() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_uint = &mut x as *mut libc::c_int as *mut libc::c_uint;
+    return *p as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_ref", "Option<&u32>"],
+        &["*mut"],
+    );
+}
+
+/// addr_of with OptRef context, non-bytemuck cast: different-size numerics
+/// (c_int vs c_short). p is read-only so m=false → `Some(&*(&raw const (x) as *const i16))`.
+#[test]
+fn test_addr_of_ref_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_short = &mut x as *mut libc::c_int as *mut libc::c_short;
+    return *p as libc::c_int;
+}
+"#,
+        &["&raw const", "as *const i16", "Some("],
+        &["bytemuck"],
+    );
+}
+
+// --- Slice context ---
+
+/// addr_of with Slice context, no cast: `&mut x` with .offset() usage gives
+/// p array_pointer status → Slice. Output: `std::slice::from_mut(&mut (x))`.
+#[test]
+fn test_addr_of_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    return *p.offset(0 as isize);
+}
+"#,
+        &["slice::from_mut", "&mut [i32]"],
+        &["*mut", "bytemuck"],
+    );
+}
+
+/// addr_of with Slice context, bytemuck cast: same-size numerics (c_int vs c_uint)
+/// with .offset() usage. Output: `std::slice::from_mut(bytemuck::cast_mut(&mut (x)))`.
+#[test]
+fn test_addr_of_slice_bytemuck() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_uint = &mut x as *mut libc::c_int as *mut libc::c_uint;
+    *p.offset(0 as isize) = 10 as libc::c_uint;
+    return *p.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_mut", "slice::from_mut", "&mut [u32]"],
+        &["*mut"],
+    );
+}
+
+/// addr_of with Slice context, non-bytemuck cast: different-size numerics
+/// (c_int vs c_short) with .offset() usage.
+/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 100000)`.
+#[test]
+fn test_addr_of_slice_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_short = &mut x as *mut libc::c_int as *mut libc::c_short;
+    *p.offset(0 as isize) = 10 as libc::c_short;
+    return *p.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["from_raw_parts_mut", "&raw mut", "&mut [i16]"],
+        &["bytemuck"],
+    );
+}
+
 // --- Non-usize cast + offset ---
 
 /// OptRef q = Slice (p as *mut c_uint).offset(2): projected_expr first
