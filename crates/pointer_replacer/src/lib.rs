@@ -23,3 +23,6 @@ mod rewriter;
 mod utils;
 
 pub use rewriter::{Config, replace_local_borrows};
+
+#[cfg(test)]
+mod tests;
