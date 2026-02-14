@@ -744,3 +744,127 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &["*mut"],
     );
 }
+
+// ===== visit_expr code path tests =====
+
+/// Binary pointer comparison (ExprKind::Binary with comparison ops on pointer-typed operands).
+/// Both sides are transformed as PtrKind::Raw — OptRef pointers get converted via
+/// `map_or(null_mut, ...)` for the comparison.
+#[test]
+fn test_ptr_comparison() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut y: libc::c_int = 43 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut q: *mut libc::c_int = &mut y;
+    *p = 10 as libc::c_int;
+    *q = 20 as libc::c_int;
+    if p == q { return 1 as libc::c_int; }
+    return 0 as libc::c_int;
+}
+"#,
+        &["Option<&mut i32>", "null_mut"],
+        &[],
+    );
+}
+
+/// Function call with pointer argument — local function, sig_decs lookup succeeds.
+/// bar's parameter is transformed to OptRef, and the call site converts p accordingly.
+#[test]
+fn test_ptr_call_arg() {
+    run_test(
+        r#"
+use ::libc;
+unsafe fn bar(p: *mut libc::c_int) -> libc::c_int { return *p; }
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    return bar(p);
+}
+"#,
+        &["Option<&i32>", "as_deref()"],
+        &[],
+    );
+}
+
+/// `.is_null()` on OptRef pointer → `.is_none()`.
+#[test]
+fn test_is_null_ref() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    if p.is_null() { return 0 as libc::c_int; }
+    return *p;
+}
+"#,
+        &["is_none", "Option<&mut i32>"],
+        &["is_null"],
+    );
+}
+
+/// `.is_null()` on Slice pointer → `.is_empty()`.
+#[test]
+fn test_is_null_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    if p.is_null() { return 0 as libc::c_int; }
+    return *p.offset(0 as isize);
+}
+"#,
+        &["is_empty", "&mut [i32]"],
+        &["is_null"],
+    );
+}
+
+/// Return statement with raw pointer return type — p is internally OptRef
+/// but the function returns `*mut c_int`, so the return coerces p to Raw.
+#[test]
+fn test_return_raw_ptr() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> *mut libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    return p;
+}
+"#,
+        &["&raw mut"],
+        &["Option<", "&mut ["],
+    );
+}
+
+/// Slice deref fallback: `*p` on a Slice variable without offset → `(p)[0]`.
+/// When p is Slice but deref doesn't match the `&arr[start..]` pattern,
+/// the else branch at line 296 produces `(*p)[0]`.
+#[test]
+fn test_deref_slice_no_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(1 as isize) = 10 as libc::c_int;
+    *p = 20 as libc::c_int;
+    return *p;
+}
+"#,
+        &["[0]", "&mut [i32]"],
+        &["*mut"],
+    );
+}
