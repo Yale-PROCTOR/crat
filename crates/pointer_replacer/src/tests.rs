@@ -423,3 +423,159 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &["bytemuck"],
     );
 }
+
+// ===== projected_expr tests: offset and cast projections on Slice base =====
+// When the RHS is `p.offset(n)` or `(p as *mut T).offset(n)` and p is Slice,
+// projected_expr transforms the projections before passing to the conversion
+// function. Offset becomes `[(n) as usize..]`; non-usize cast calls
+// slice_from_slice internally.
+
+// --- Single offset ---
+
+/// OptRef q = Slice p.offset(2): projected_expr transforms offset to
+/// slice range `(p)[(2) as usize..]`, then opt_ref_from_slice → .first().
+#[test]
+fn test_ref_eq_slice_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_int = p.offset(2 as isize);
+    return *q;
+}
+"#,
+        &["as usize..]", ".first()", "Option<&i32>"],
+        &["*mut"],
+    );
+}
+
+/// Slice q = Slice p.offset(2): projected_expr transforms offset to
+/// slice range, then slice_from_slice → &mut(...).
+#[test]
+fn test_slice_eq_slice_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_int = p.offset(2 as isize);
+    *q.offset(0 as isize) = 30 as libc::c_int;
+    return *q.offset(0 as isize);
+}
+"#,
+        &["as usize..]", "&mut [i32]"],
+        &["*mut"],
+    );
+}
+
+// --- Multiple offsets ---
+
+/// OptRef q = Slice p.offset(2).offset(1): projected_expr chains two
+/// offset projections into nested slice ranges.
+#[test]
+fn test_ref_eq_slice_multi_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_int = p.offset(2 as isize).offset(1 as isize);
+    return *q;
+}
+"#,
+        &[
+            "(2 as isize) as usize..]",
+            "(1 as isize) as usize..]",
+            ".first()",
+        ],
+        &["*mut"],
+    );
+}
+
+/// Slice q = Slice p.offset(2).offset(1): projected_expr chains two
+/// offset projections, then slice_from_slice → &mut(...).
+#[test]
+fn test_slice_eq_slice_multi_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_int = p.offset(2 as isize).offset(1 as isize);
+    *q.offset(0 as isize) = 30 as libc::c_int;
+    return *q.offset(0 as isize);
+}
+"#,
+        &[
+            "(2 as isize) as usize..]",
+            "(1 as isize) as usize..]",
+            "&mut [i32]",
+        ],
+        &["*mut"],
+    );
+}
+
+// --- Non-usize cast + offset ---
+
+/// OptRef q = Slice (p as *mut c_uint).offset(2): projected_expr first
+/// applies cast via slice_from_slice (bytemuck for same-size numerics),
+/// then offset → `(bytemuck::cast_slice(p))[(2) as usize..]`.
+#[test]
+fn test_ref_eq_slice_cast_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_uint = (p as *mut libc::c_uint).offset(2 as isize);
+    return *q as libc::c_int;
+}
+"#,
+        &[
+            "bytemuck::cast_slice",
+            "as usize..]",
+            ".first()",
+            "Option<&u32>",
+        ],
+        &["*mut"],
+    );
+}
+
+/// Slice q = Slice (p as *mut c_uint).offset(2): projected_expr first
+/// applies cast via slice_from_slice (bytemuck), then offset →
+/// `(bytemuck::cast_slice_mut(p))[(2) as usize..]`.
+#[test]
+fn test_slice_eq_slice_cast_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    let mut q: *mut libc::c_uint = (p as *mut libc::c_uint).offset(2 as isize);
+    *q.offset(0 as isize) = 30 as libc::c_uint;
+    return *q.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_slice_mut", "as usize..]", "&mut [u32]"],
+        &["*mut"],
+    );
+}
