@@ -868,3 +868,156 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &["*mut"],
     );
 }
+
+// ===== transform_ptr code path tests: null literal, if-else, block, cast_int =====
+
+/// Null literal (`0 as *mut T`) assigned to OptRef pointer → `None`.
+/// Exercises the `is_zero() + PtrCtx::Rhs(OptRef)` branch.
+#[test]
+fn test_null_ptr_opt_ref() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    p = 0 as *mut libc::c_int;
+    return if p.is_null() { 0 as libc::c_int } else { 1 as libc::c_int };
+}
+"#,
+        &["None", "Option<&mut i32>"],
+        &["null_mut"],
+    );
+}
+
+/// Null literal (`0 as *mut T`) assigned to Slice pointer → `&mut []`.
+/// Exercises the `is_zero() + PtrCtx::Rhs(Slice)` branch.
+#[test]
+fn test_null_ptr_slice() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    p = 0 as *mut libc::c_int;
+    return 0 as libc::c_int;
+}
+"#,
+        &["&mut []", "&mut [i32]"],
+        &["null_mut"],
+    );
+}
+
+/// Null literal (`0 as *mut T`) assigned to Raw pointer → `std::ptr::null_mut()`.
+/// Exercises the `is_zero() + PtrCtx::Rhs(Raw)` branch.
+#[test]
+fn test_null_ptr_raw() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut r: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    *r = 20 as libc::c_int;
+    p = 0 as *mut libc::c_int;
+    return *r;
+}
+"#,
+        &["null_mut"],
+        &["None"],
+    );
+}
+
+/// Dereference of null literal: `*(0 as *mut T)`.
+/// Exercises the `is_zero() + PtrCtx::Deref` branch, which returns `PtrKind::Raw(m)`
+/// and leaves the expression unchanged. The result is a raw deref that passes through.
+#[test]
+fn test_deref_null() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = *(0 as *mut libc::c_int);
+    return x;
+}
+"#,
+        &["*(0"],
+        &["Option<", "&mut ["],
+    );
+}
+
+/// If-else (ternary) pointer expression: `p = if cond { &mut x } else { &mut y }`.
+/// Exercises the `ExprKind::If` branch in `transform_ptr` — both branches
+/// are recursively transformed.
+#[test]
+fn test_if_else_ptr() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut y: libc::c_int = 43 as libc::c_int;
+    let mut cond: libc::c_int = 1 as libc::c_int;
+    let mut p: *mut libc::c_int = if cond != 0 { &mut x } else { &mut y };
+    *p = 10 as libc::c_int;
+    return *p;
+}
+"#,
+        &["Option<&mut i32>", "Some(&mut"],
+        &["*mut"],
+    );
+}
+
+/// Block-wrapped pointer expression: `p = { &mut x }`.
+/// Exercises the `ExprKind::Block` branch in `transform_ptr` — the inner
+/// expression is recursively transformed.
+#[test]
+fn test_block_ptr() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = { &mut x };
+    *p = 10 as libc::c_int;
+    return *p;
+}
+"#,
+        &["Option<&mut i32>", "Some(&mut"],
+        &["*mut"],
+    );
+}
+
+/// Integer-to-pointer cast via usize bitwise op: `q = (p as usize | 0) as *mut c_int`.
+/// Exercises the `cast_int` branch in `transform_ptr` — the Binary expression
+/// prevents `unwrap_cast_and_paren` from stripping the usize cast, so `ptr_expr`
+/// sees a Cast to usize and sets `cast_int = true`. q must be Raw (overlapping
+/// borrow) to match `PtrCtx::Rhs(Raw)`. Uses `|` (not `+`) since `projected_expr`
+/// only handles `BitAnd`/`BitOr` for `IntegerBinOp`.
+#[test]
+fn test_cast_int_ptr() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut y: libc::c_int = 43 as libc::c_int;
+    let mut q: *mut libc::c_int = &mut y;
+    let mut s: *mut libc::c_int = &mut y;
+    *q = 1 as libc::c_int;
+    *s = 2 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    q = (p as usize | 0 as usize) as *mut libc::c_int;
+    return *q;
+}
+"#,
+        &["as usize"],
+        &[],
+    );
+}
