@@ -1021,3 +1021,305 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &[],
     );
 }
+
+// ===== as_ptr + Raw context tests (lines 549-565) =====
+
+/// as_ptr + Raw, no cast: overlapping borrows from `.as_mut_ptr()` demote both
+/// to Raw. Same types → `!need_cast`. Output: `(arr).as_mut_ptr()`.
+#[test]
+fn test_as_ptr_raw_no_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    let mut q: *mut libc::c_int = arr.as_mut_ptr();
+    *p = 10 as libc::c_int;
+    *q = 20 as libc::c_int;
+    return *p;
+}
+"#,
+        &["as_mut_ptr()"],
+        &["Some(", "Option<"],
+    );
+}
+
+/// as_ptr + Raw, with cast: overlapping borrows + type cast (c_int vs c_short).
+/// Output: `(arr).as_mut_ptr() as *mut _`.
+#[test]
+fn test_as_ptr_raw_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_short = arr.as_mut_ptr() as *mut libc::c_short;
+    let mut q: *mut libc::c_short = arr.as_mut_ptr() as *mut libc::c_short;
+    *p = 10 as libc::c_short;
+    *q = 20 as libc::c_short;
+    return *p as libc::c_int;
+}
+"#,
+        &["as_mut_ptr() as *mut"],
+        &["Some(", "Option<"],
+    );
+}
+
+// ===== as_ptr + OptRef context tests (lines 567-599) =====
+
+/// as_ptr + OptRef, no cast: single borrow from `.as_mut_ptr()`, no overlap,
+/// no offset → promoted to OptRef. Same types. Output: `Some(&mut (arr)[0])`.
+#[test]
+fn test_as_ptr_ref_no_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p = 10 as libc::c_int;
+    return *p;
+}
+"#,
+        &["Some(", "[0])"],
+        &["*mut", "bytemuck"],
+    );
+}
+
+/// as_ptr + OptRef, bytemuck cast: single borrow, c_int vs c_uint (same-size numerics).
+/// Output: `Some(bytemuck::cast_mut::<_, u32>(&mut (arr)[0]))`.
+#[test]
+fn test_as_ptr_ref_bytemuck() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_uint = arr.as_mut_ptr() as *mut libc::c_uint;
+    *p = 10 as libc::c_uint;
+    return *p as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_", "[0])"],
+        &["*mut"],
+    );
+}
+
+/// as_ptr + OptRef, non-bytemuck cast: single borrow, c_int (4B) vs c_short (2B)
+/// → different size → else branch. Output: `Some(&mut *(arr).as_mut_ptr() as *mut i16)`.
+#[test]
+fn test_as_ptr_ref_ptr_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_short = arr.as_mut_ptr() as *mut libc::c_short;
+    *p = 10 as libc::c_short;
+    return *p as libc::c_int;
+}
+"#,
+        &["Some(", "as *"],
+        &["bytemuck"],
+    );
+}
+
+// ===== as_ptr + Slice + need_cast tests (lines 616-637) =====
+
+/// as_ptr + Slice, bytemuck cast: same-size numerics (c_int ↔ c_uint) with offset.
+/// Output: `bytemuck::cast_slice_mut(&mut (arr))`.
+#[test]
+fn test_as_ptr_slice_bytemuck() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_uint = arr.as_mut_ptr() as *mut libc::c_uint;
+    *p.offset(0 as isize) = 10 as libc::c_uint;
+    *p.offset(1 as isize) = 20 as libc::c_uint;
+    return *p.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_slice"],
+        &["from_raw_parts"],
+    );
+}
+
+/// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
+/// Non-numeric rhs_inner_ty → `from_raw_parts_mut`.
+#[test]
+fn test_as_ptr_slice_raw_parts() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Pair {
+    pub a: libc::c_int,
+    pub b: libc::c_int,
+}
+impl Copy for Pair {}
+impl Clone for Pair {
+    fn clone(&self) -> Self { *self }
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [Pair; 10] = [Pair { a: 0, b: 0 }; 10];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr() as *mut libc::c_int;
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    *p.offset(1 as isize) = 20 as libc::c_int;
+    return *p.offset(0 as isize);
+}
+"#,
+        &["from_raw_parts"],
+        &["bytemuck"],
+    );
+}
+
+// ===== ByteStr tests (lines 700-732) =====
+
+/// ByteStr + OptRef, u8: byte string literal used as `*const u8`, single deref
+/// (no offset) → OptRef. `lhs_inner_ty == u8` → `.first()`.
+#[test]
+fn test_bytestr_opt_ref_u8() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut s: *const libc::c_uchar = b"hello\x00" as *const u8;
+    return *s as libc::c_int;
+}
+"#,
+        &[".first()"],
+        &["*const", "bytemuck"],
+    );
+}
+
+/// ByteStr + OptRef, numeric cast: byte string cast to `*const c_int`.
+/// `lhs_inner_ty = i32` (numeric, not u8) → `bytemuck::cast_slice(...).first()`.
+#[test]
+fn test_bytestr_opt_ref_numeric() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut s: *const libc::c_int = b"hell" as *const u8 as *const libc::c_int;
+    return *s;
+}
+"#,
+        &["bytemuck::cast_slice", ".first()"],
+        &["*const"],
+    );
+}
+
+/// ByteStr + Slice, u8: byte string with offset → Slice. `lhs_inner_ty == u8`
+/// → expression cloned.
+#[test]
+fn test_bytestr_slice_u8() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut s: *const libc::c_uchar = b"hello\x00" as *const u8;
+    let a: libc::c_uchar = *s.offset(0 as isize);
+    let b: libc::c_uchar = *s.offset(1 as isize);
+    return (a as libc::c_int) + (b as libc::c_int);
+}
+"#,
+        &["&[u8]"],
+        &["*const", "bytemuck"],
+    );
+}
+
+/// ByteStr + Slice, numeric cast: byte string cast to `*const c_int` with offset.
+/// `lhs_inner_ty = i32` (not u8) → `bytemuck::cast_slice(...)`.
+#[test]
+fn test_bytestr_slice_numeric() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut s: *const libc::c_int = b"hellworl" as *const u8 as *const libc::c_int;
+    let a: libc::c_int = *s.offset(0 as isize);
+    let b: libc::c_int = *s.offset(1 as isize);
+    return a + b;
+}
+"#,
+        &["bytemuck::cast_slice"],
+        &["*const"],
+    );
+}
+
+// ===== Fallthrough tests (lines 734-755): struct field pointer access =====
+
+/// Fallthrough + OptRef: struct field `s.data` is a `*mut c_int` → `PtrExprBaseKind::Other`.
+/// Single borrow → promoted to OptRef.
+#[test]
+fn test_field_ptr_opt_ref() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Foo {
+    pub data: *mut libc::c_int,
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut s: Foo = Foo { data: &mut x };
+    let mut p: *mut libc::c_int = s.data;
+    *p = 10 as libc::c_int;
+    return *p;
+}
+"#,
+        &["Option<&mut i32>"],
+        &["*mut i32"],
+    );
+}
+
+/// Fallthrough + Slice: struct field `s.data` with `.offset()` → Slice.
+#[test]
+fn test_field_ptr_slice() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Foo {
+    pub data: *mut libc::c_int,
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut s: Foo = Foo { data: &mut x };
+    let mut p: *mut libc::c_int = s.data;
+    *p.offset(0 as isize) = 10 as libc::c_int;
+    return *p.offset(0 as isize);
+}
+"#,
+        &["&mut [i32]"],
+        &["*mut i32"],
+    );
+}
+
+/// Fallthrough + Raw: overlapping borrows from struct field `s.data` → both demoted to Raw.
+#[test]
+fn test_field_ptr_raw() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Foo {
+    pub data: *mut libc::c_int,
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut s: Foo = Foo { data: &mut x };
+    let mut p: *mut libc::c_int = s.data;
+    let mut q: *mut libc::c_int = s.data;
+    *p = 10 as libc::c_int;
+    *q = 20 as libc::c_int;
+    return *p;
+}
+"#,
+        &["s.data"],
+        &["Option<", "&mut ["],
+    );
+}
