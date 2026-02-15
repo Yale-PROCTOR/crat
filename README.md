@@ -4,8 +4,13 @@
 
 ## Setup
 
-There is no specific requirement to build and run Crat. Just make sure that you
-have Cargo installed.
+To build and run ownership analysis, install the Z3 development package and Cargo.
+
+On Ubuntu/Debian:
+
+```bash
+apt-get install libz3-dev
+```
 
 ## Preparation
 
