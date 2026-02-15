@@ -12,7 +12,7 @@ regex = "1.12.2"
 anyhow = "1.0"
 indexmap = "2.2.6"
 cadical = "0.1"
-z3 = { version = "0.19.7", features = ["static-link-z3"] }
+z3 = "0.19.7"
 tracing.workspace = true
 etrace.workspace = true
 typed-arena.workspace = true
