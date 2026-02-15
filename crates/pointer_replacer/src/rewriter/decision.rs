@@ -69,30 +69,28 @@ impl<'tcx> DecisionMaker<'tcx> {
         aliases: Option<&FxHashSet<Local>>,
     ) -> Option<PtrKind> {
         let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
-        let mutability = m.is_mut();
-        if ty.is_c_void(self.tcx)
-            || aliases.is_some_and(|aliases| {
-                std::iter::once(local)
-                    .chain(aliases.iter().copied())
-                    .any(|l| self.mutable_pointers[l])
-            })
-            || utils::file::contains_file_ty(ty, self.tcx)
-        {
-            Some(PtrKind::Raw(mutability))
+        if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
+            Some(PtrKind::Raw(m.is_mut()))
+        } else if aliases.is_some_and(|aliases| {
+            std::iter::once(local)
+                .chain(aliases.iter().copied())
+                .any(|l| self.mutable_pointers[l])
+        }) {
+            Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self.array_pointers[local] {
             if self.promoted_shared_refs.contains(local) {
                 Some(PtrKind::Slice(false))
             } else if self.promoted_mut_refs.contains(local) {
                 Some(PtrKind::Slice(true))
             } else {
-                Some(PtrKind::Raw(mutability))
+                Some(PtrKind::Raw(self.mutable_pointers[local]))
             }
         } else if self.promoted_shared_refs.contains(local) {
             Some(PtrKind::OptRef(false))
         } else if self.promoted_mut_refs.contains(local) {
             Some(PtrKind::OptRef(true))
         } else if decl.ty.is_raw_ptr() {
-            Some(PtrKind::Raw(mutability))
+            Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else {
             None
         }

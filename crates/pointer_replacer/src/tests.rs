@@ -53,7 +53,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &["null_mut", "Option<&mut"],
+        &["null", "Option<&mut"],
         &[],
     );
 }
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &[".as_mut_ptr()", "&mut [i32]"],
+        &[".as_", "_ptr()", "&mut [i32]"],
         &[],
     );
 }
@@ -1439,5 +1439,26 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 "#,
         &["s.data"],
         &["Option<", "&mut ["],
+    );
+}
+
+/// Raw pointer mutability cast: `p` is *mut (writes through it), `q` is *const
+/// (only compared). The comparison `p == q` requires matching types, so a cast
+/// is inserted.
+#[test]
+fn test_raw_ptr_mutability_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 0 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    let mut q: *mut libc::c_int = &mut x;
+    *p = 1 as libc::c_int;
+    return (p == q) as libc::c_int;
+}
+"#,
+        &["*mut", "*const"],
+        &[],
     );
 }
