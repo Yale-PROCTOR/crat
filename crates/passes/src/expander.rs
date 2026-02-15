@@ -30,6 +30,7 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
         utils::ast::make_inner_attribute(sym::feature, sym::linkage, tcx),
         utils::ast::make_inner_attribute(sym::feature, sym::rustc_private, tcx),
         utils::ast::make_inner_attribute(sym::feature, sym::thread_local, tcx),
+        utils::ast::make_inner_attribute(sym::feature, sym::builtin_syntax, tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
