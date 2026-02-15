@@ -43,6 +43,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used: FxHashMap::default(),
         used_locals: FxHashSet::default(),
         item_mods: FxHashMap::default(),
+        extern_c_fn_ptrs: FxHashSet::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let mut used = visitor.used;
@@ -113,6 +114,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used_items,
         used_locals: visitor.used_locals,
         removable_uses,
+        extern_c_fn_ptrs: visitor.extern_c_fn_ptrs,
         config,
     };
     visitor.visit_crate(&mut krate);
@@ -127,6 +129,7 @@ struct AstVisitor<'tcx, 'a> {
     used_items: FxHashSet<LocalDefId>,
     used_locals: FxHashSet<HirId>,
     removable_uses: FxHashSet<LocalDefId>,
+    extern_c_fn_ptrs: FxHashSet<LocalDefId>,
     config: &'a Config,
 }
 
@@ -215,7 +218,14 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
                 };
             }
 
-            if self.config.remove_extern_c && !is_exposed_fn {
+            if self.config.remove_extern_c
+                && !is_exposed_fn
+                && !self
+                    .ast_to_hir
+                    .global_map
+                    .get(&item.id)
+                    .is_some_and(|def_id| self.extern_c_fn_ptrs.contains(def_id))
+            {
                 sig.header.ext = ast::Extern::None;
             }
 
@@ -313,6 +323,7 @@ struct HirVisitor<'tcx> {
     used: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     used_locals: FxHashSet<HirId>,
     item_mods: FxHashMap<LocalDefId, LocalModDefId>,
+    extern_c_fn_ptrs: FxHashSet<LocalDefId>,
 }
 
 impl HirVisitor<'_> {
@@ -452,6 +463,20 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             _ => {}
         }
         intravisit::walk_path(self, path)
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::Cast(inner, ty) = expr.kind
+            && let hir::TyKind::BareFn(bare_fn_ty) = ty.kind
+            && !bare_fn_ty.abi.is_rustic_abi()
+            && let hir::ExprKind::Path(ref qpath) = inner.kind
+            && let hir::QPath::Resolved(_, path) = qpath
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            self.extern_c_fn_ptrs.insert(def_id);
+        }
+        intravisit::walk_expr(self, expr);
     }
 }
 
