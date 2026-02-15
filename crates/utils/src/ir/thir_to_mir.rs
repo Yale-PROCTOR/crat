@@ -407,6 +407,11 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                 }
                 UnOp::PtrMetadata => panic!(),
             },
+            ExprKind::OffsetOf { .. } => {
+                ctx.handle_rvalue("OffsetOf", expr_id, |rvalue| {
+                    matches!(rvalue, Rvalue::NullaryOp(_, _))
+                });
+            }
 
             ExprKind::LogicalOp { .. } => {
                 if !ctx.nested_logical_exprs.contains(&expr_id) {
@@ -523,7 +528,6 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
             ExprKind::ValueUnwrapUnsafeBinder { .. } => panic!(),
             ExprKind::WrapUnsafeBinder { .. } => panic!(),
             ExprKind::Closure(_) => {} // TODO
-            ExprKind::OffsetOf { .. } => panic!(),
             ExprKind::Yield { .. } => panic!(),
         }
     }

@@ -110,7 +110,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         if matches!(expr.kind, ExprKind::Cast(_, _)) {
             let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
             if let Some(v) = self.eval_lit_cast(hir_expr) {
-                let annotation = if self.need_annotation(hir_expr) {
+                let annotation = if self.need_annotation(hir_expr) || !v.fits_i32() {
                     let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                     let ty = typeck.expr_ty(hir_expr);
                     format!("{ty}")
@@ -158,16 +158,25 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         if let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx)
             && let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &hir_ty.kind
-            && let Res::Def(_, def_id) = path.res
-            && let Some(local_def_id) = def_id.as_local()
-            && let mod_id = self.tcx.parent_module(hir_ty.hir_id)
-            && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
-                || self
-                    .imports
-                    .get(&mod_id)
-                    .is_some_and(|s| s.contains(&local_def_id)))
+            && let Res::Def(kind, def_id) = path.res
         {
-            *ty = utils::ty!("{}", self.tcx.item_name(def_id));
+            if kind == hir::def::DefKind::TyAlias
+                && let mir_ty = self.tcx.type_of(def_id).skip_binder()
+                && (utils::file::file_param_index(mir_ty, self.tcx).is_some()
+                    || mir_ty.is_numeric()
+                        && is_libc_ty(path.segments.last().unwrap().ident.as_str()))
+            {
+                *ty = utils::ty!("{}", utils::ir::mir_ty_to_string(mir_ty, self.tcx));
+            } else if let Some(local_def_id) = def_id.as_local()
+                && let mod_id = self.tcx.parent_module(hir_ty.hir_id)
+                && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
+                    || self
+                        .imports
+                        .get(&mod_id)
+                        .is_some_and(|s| s.contains(&local_def_id)))
+            {
+                *ty = utils::ty!("{}", self.tcx.item_name(def_id));
+            }
         }
     }
 }
@@ -310,6 +319,27 @@ impl<'tcx> AstVisitor<'tcx> {
             _ => Some(vec![ty]),
         }
     }
+}
+
+fn is_libc_ty(ty: &str) -> bool {
+    if ty.starts_with("c_") {
+        return true;
+    }
+    if ty.ends_with("_t")
+        && (ty.starts_with("int")
+            || ty.starts_with("__int")
+            || ty.starts_with("uint")
+            || ty.starts_with("__uint")
+            || ty.starts_with("off")
+            || ty.starts_with("__off")
+            || ty.starts_with("size")
+            || ty.starts_with("__size")
+            || ty.starts_with("isize")
+            || ty.starts_with("__isize"))
+    {
+        return true;
+    }
+    false
 }
 
 fn thir_unwrap_use(expr_id: thir::ExprId, body: &thir::Thir<'_>) -> thir::ExprId {
@@ -489,6 +519,20 @@ impl Int {
             _ => false,
         }
     }
+
+    fn fits_i32(self) -> bool {
+        match self {
+            Self::I8(_) | Self::I16(_) | Self::I32(_) => true,
+            Self::U8(_) | Self::U16(_) => true,
+            Self::U32(v) => v <= i32::MAX as u32,
+            Self::I64(v) => v >= i32::MIN as i64 && v <= i32::MAX as i64,
+            Self::U64(v) => v <= i32::MAX as u64,
+            Self::I128(v) => v >= i32::MIN as i128 && v <= i32::MAX as i128,
+            Self::U128(v) => v <= i32::MAX as u128,
+            Self::Isize(v) => v >= i32::MIN as isize && v <= i32::MAX as isize,
+            Self::Usize(v) => v <= i32::MAX as usize,
+        }
+    }
 }
 
 struct HirVisitor<'tcx> {
@@ -632,5 +676,10 @@ mod tests {
             &["x.0"],
             &["((x.0))"],
         )
+    }
+
+    #[test]
+    fn test_int_cast_out_of_i32_range() {
+        run_test("fn f() { 0xb504f32d as u32; }", &["0xb504f32du32"], &["as"])
     }
 }

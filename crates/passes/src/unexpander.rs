@@ -54,6 +54,7 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         "panic_internals",
         "thread_local_internals",
         "coverage_attribute",
+        "builtin_syntax",
     ]
     .into_iter()
     .collect();
@@ -277,6 +278,15 @@ impl MutVisitor for AstVisitor<'_> {
                 *scrutinee = utils::expr!("write!({receiver}, {format}");
             }
         }
+        if let ExprKind::OffsetOf(ty, fields) = &expr.kind {
+            let ty_str = pprust::ty_to_string(ty);
+            let fields_str = fields
+                .iter()
+                .map(|f| f.name.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            *expr = utils::expr!("core::mem::offset_of!({ty_str}, {fields_str})");
+        }
         mut_visit::walk_expr(self, expr);
     }
 }
@@ -429,6 +439,19 @@ mod tests {
                 "Expected not to find `{exclude}` in:\n{s}"
             );
         }
+    }
+
+    #[test]
+    fn test_offset_of() {
+        run_test(
+            r#"
+#[repr(C)]
+struct S { a: i32, b: i64 }
+fn f() -> usize { core::mem::offset_of!(S, b) }
+            "#,
+            &["offset_of!"],
+            &["builtin"],
+        )
     }
 
     #[test]

@@ -334,3 +334,50 @@ unsafe fn g(mut x: i32) -> i32 {
 "#;
     run_test(code, &["f"]);
 }
+
+fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let config = super::Config {
+            remove_unused: false,
+            remove_no_mangle: false,
+            remove_extern_c: true,
+            replace_pub: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        super::resolve_unsafe(&config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+        utils::type_check(tcx);
+    })
+    .expect(&transformed);
+    for include in includes {
+        assert!(
+            transformed.contains(include),
+            "{transformed}\ndoes not contain \"{include}\"",
+        );
+    }
+    for exclude in excludes {
+        assert!(
+            !transformed.contains(exclude),
+            "{transformed}\ncontains \"{exclude}\"",
+        );
+    }
+}
+
+#[test]
+fn test_extern_c_fn_ptr_preserved() {
+    let code = r#"
+extern "C" fn f(x: i32) -> i32 {
+    x
+}
+extern "C" fn g(x: i32) -> i32 {
+    x + 1
+}
+fn main() {
+    let p = f as extern "C" fn(i32) -> i32;
+    g(0);
+}
+"#;
+    run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
+}
