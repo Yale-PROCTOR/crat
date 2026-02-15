@@ -110,7 +110,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         if matches!(expr.kind, ExprKind::Cast(_, _)) {
             let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
             if let Some(v) = self.eval_lit_cast(hir_expr) {
-                let annotation = if self.need_annotation(hir_expr) {
+                let annotation = if self.need_annotation(hir_expr) || !v.fits_i32() {
                     let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                     let ty = typeck.expr_ty(hir_expr);
                     format!("{ty}")
@@ -519,6 +519,20 @@ impl Int {
             _ => false,
         }
     }
+
+    fn fits_i32(self) -> bool {
+        match self {
+            Self::I8(_) | Self::I16(_) | Self::I32(_) => true,
+            Self::U8(_) | Self::U16(_) => true,
+            Self::U32(v) => v <= i32::MAX as u32,
+            Self::I64(v) => v >= i32::MIN as i64 && v <= i32::MAX as i64,
+            Self::U64(v) => v <= i32::MAX as u64,
+            Self::I128(v) => v >= i32::MIN as i128 && v <= i32::MAX as i128,
+            Self::U128(v) => v <= i32::MAX as u128,
+            Self::Isize(v) => v >= i32::MIN as isize && v <= i32::MAX as isize,
+            Self::Usize(v) => v <= i32::MAX as usize,
+        }
+    }
 }
 
 struct HirVisitor<'tcx> {
@@ -662,5 +676,10 @@ mod tests {
             &["x.0"],
             &["((x.0))"],
         )
+    }
+
+    #[test]
+    fn test_int_cast_out_of_i32_range() {
+        run_test("fn f() { 0xb504f32d as u32; }", &["0xb504f32du32"], &["as"])
     }
 }
