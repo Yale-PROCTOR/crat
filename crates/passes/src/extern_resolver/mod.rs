@@ -24,6 +24,7 @@ use typed_arena::Arena;
 use utils::{
     disjoint_set::DisjointSets,
     equiv_classes::{EquivClassId, EquivClasses},
+    expr,
     ir::AstToHir,
     item, path,
 };
@@ -39,6 +40,8 @@ pub struct Config {
     pub choose_arbitrary: bool,
     #[serde(default)]
     pub ignore_return_type: bool,
+    #[serde(default)]
+    pub ignore_param_type: bool,
 
     #[serde(default)]
     pub function_hints: Vec<LinkHint>,
@@ -94,13 +97,19 @@ pub fn resolve_extern(config: &Config, tcx: TyCtxt<'_>) -> String {
     });
 
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
-    let result = resolve(config.ignore_return_type, tcx);
+    let result = resolve(config.ignore_return_type, config.ignore_param_type, tcx);
     let resolve_map = make_resolve_map(&result, &priorities, config, tcx);
+    let cast_map = if config.ignore_param_type {
+        make_cast_map(&resolve_map, tcx)
+    } else {
+        FxHashMap::default()
+    };
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
         resolve_map,
+        cast_map,
         used_stack: vec![],
         updated: false,
     };
@@ -180,6 +189,43 @@ fn make_resolve_map(
     assert!(!link_failed);
 
     resolve_map
+}
+
+/// For each extern fn in `resolve_map`, compare parameter types with the resolved fn.
+/// Returns a map from the extern fn's def_id to a vec of target parameter types (as strings)
+/// for parameters where the types differ. `None` means no cast needed for that parameter.
+fn make_cast_map(
+    resolve_map: &FxHashMap<LocalDefId, LocalDefId>,
+    tcx: TyCtxt<'_>,
+) -> FxHashMap<LocalDefId, Vec<Option<String>>> {
+    let mut cast_map = FxHashMap::default();
+    for (&extern_id, &resolved_id) in resolve_map {
+        if !tcx.def_kind(extern_id).is_fn_like() {
+            continue;
+        }
+        let extern_sig = tcx.fn_sig(extern_id).skip_binder().skip_binder();
+        let resolved_sig = tcx.fn_sig(resolved_id).skip_binder().skip_binder();
+        let extern_inputs = extern_sig.inputs();
+        let resolved_inputs = resolved_sig.inputs();
+        if extern_inputs.len() != resolved_inputs.len() {
+            continue;
+        }
+        let casts: Vec<Option<String>> = extern_inputs
+            .iter()
+            .zip(resolved_inputs)
+            .map(|(extern_ty, resolved_ty)| {
+                if extern_ty != resolved_ty {
+                    Some(utils::ir::mir_ty_to_string(*resolved_ty, tcx))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if casts.iter().any(|c| c.is_some()) {
+            cast_map.insert(extern_id, casts);
+        }
+    }
+    cast_map
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,7 +336,7 @@ struct ResolveResult {
     extern_statics: Vec<(LocalDefId, Vec<EquivClassId>)>,
 }
 
-fn resolve(ignore_return_type: bool, tcx: TyCtxt<'_>) -> ResolveResult {
+fn resolve(ignore_return_type: bool, ignore_param_type: bool, tcx: TyCtxt<'_>) -> ResolveResult {
     let mut visitor = HirVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let hir_data = visitor.data;
@@ -325,6 +371,7 @@ fn resolve(ignore_return_type: bool, tcx: TyCtxt<'_>) -> ResolveResult {
         possibly_equiv_unnameds: FxHashSet::default(),
         visited_names: FxHashSet::default(),
         ignore_return_type,
+        ignore_param_type,
     };
     let mut equiv_adts = FxHashMap::default();
     for scc_id in sccs.post_order() {
@@ -517,6 +564,7 @@ struct TypeComparator<'a, 'tcx> {
     visited_names: FxHashSet<Symbol>,
 
     ignore_return_type: bool,
+    ignore_param_type: bool,
 }
 
 impl<'tcx> TypeComparator<'_, 'tcx> {
@@ -709,9 +757,11 @@ impl<'tcx> TypeComparator<'_, 'tcx> {
         {
             return false;
         }
-        for (ty1, ty2) in inputs1.iter().zip(inputs2) {
-            if !self.cmp_tys(*ty1, *ty2) {
-                return false;
+        if !self.ignore_param_type {
+            for (ty1, ty2) in inputs1.iter().zip(inputs2) {
+                if !self.cmp_tys(*ty1, *ty2) {
+                    return false;
+                }
             }
         }
         self.ignore_return_type || self.cmp_tys(sig1.output(), sig2.output())
@@ -732,6 +782,7 @@ struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
     resolve_map: FxHashMap<LocalDefId, LocalDefId>,
+    cast_map: FxHashMap<LocalDefId, Vec<Option<String>>>,
     used_stack: Vec<FxHashSet<LocalDefId>>,
     updated: bool,
 }
@@ -815,6 +866,25 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             SmallVec::new()
         } else {
             mut_visit::walk_flat_map_foreign_item(self, item)
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        mut_visit::walk_expr(self, expr);
+
+        if let ast::ExprKind::Call(callee, args) = &mut expr.kind
+            && let ast::ExprKind::Path(_, path) = &callee.kind
+            && let Some(res) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Res::Def(_, def_id) = *res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(casts) = self.cast_map.get(&def_id)
+        {
+            for (arg, cast) in args.iter_mut().zip(casts) {
+                if let Some(target_ty) = cast {
+                    let arg_str = pprust::expr_to_string(arg);
+                    *arg = P(expr!("({}) as {}", arg_str, target_ty));
+                }
+            }
         }
     }
 
