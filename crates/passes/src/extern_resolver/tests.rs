@@ -364,3 +364,42 @@ fn test_ignore_param_type() {
         &["extern \"C\" {"],
     );
 }
+
+#[test]
+fn test_ignore_param_type_resolved_adt() {
+    run_extern_test(
+        "
+    #![feature(extern_types)]
+    mod a {
+        #[repr(C)]
+        pub struct s {
+            pub a: core::ffi::c_int,
+        }
+        extern \"C\" {
+            pub fn bar(_: *mut s) -> core::ffi::c_int;
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn foo() -> core::ffi::c_int {
+            let mut x: s = s { a: 0 };
+            return bar(&mut x);
+        }
+    }
+    mod b {
+        #[repr(C)]
+        pub struct s {
+            pub a: core::ffi::c_int,
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn bar(mut x: *mut s) -> core::ffi::c_int {
+            return (*x).a;
+        }
+    }
+",
+        super::Config {
+            ignore_param_type: true,
+            ..Default::default()
+        },
+        &["use crate::b::bar"],
+        &["extern \"C\" {", " as "],
+    );
+}

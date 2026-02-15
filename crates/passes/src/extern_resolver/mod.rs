@@ -214,7 +214,7 @@ fn make_cast_map(
             .iter()
             .zip(resolved_inputs)
             .map(|(extern_ty, resolved_ty)| {
-                if extern_ty != resolved_ty {
+                if !tys_equal_after_resolution(*extern_ty, *resolved_ty, resolve_map) {
                     Some(utils::ir::mir_ty_to_string(*resolved_ty, tcx))
                 } else {
                     None
@@ -226,6 +226,54 @@ fn make_cast_map(
         }
     }
     cast_map
+}
+
+/// Compare two types for equality, considering that ADT def_ids in `resolve_map`
+/// that map to the same representative should be treated as equal.
+fn tys_equal_after_resolution<'tcx>(
+    ty1: ty::Ty<'tcx>,
+    ty2: ty::Ty<'tcx>,
+    resolve_map: &FxHashMap<LocalDefId, LocalDefId>,
+) -> bool {
+    use ty::*;
+    match (ty1.kind(), ty2.kind()) {
+        (Adt(adt1, args1), Adt(adt2, args2)) => {
+            let did1 = resolve_def_id(adt1.did(), resolve_map);
+            let did2 = resolve_def_id(adt2.did(), resolve_map);
+            did1 == did2
+                && args1.len() == args2.len()
+                && args1.iter().zip(args2.iter()).all(|(a1, a2)| {
+                    use rustc_type_ir::GenericArgKind::*;
+                    match (a1.kind(), a2.kind()) {
+                        (Type(t1), Type(t2)) => tys_equal_after_resolution(t1, t2, resolve_map),
+                        _ => a1 == a2,
+                    }
+                })
+        }
+        (RawPtr(t1, m1), RawPtr(t2, m2)) => {
+            m1 == m2 && tys_equal_after_resolution(*t1, *t2, resolve_map)
+        }
+        (Ref(r1, t1, m1), Ref(r2, t2, m2)) => {
+            r1 == r2 && m1 == m2 && tys_equal_after_resolution(*t1, *t2, resolve_map)
+        }
+        (Array(t1, c1), Array(t2, c2)) => {
+            c1 == c2 && tys_equal_after_resolution(*t1, *t2, resolve_map)
+        }
+        (Slice(t1), Slice(t2)) => tys_equal_after_resolution(*t1, *t2, resolve_map),
+        _ => ty1 == ty2,
+    }
+}
+
+fn resolve_def_id(
+    def_id: rustc_span::def_id::DefId,
+    resolve_map: &FxHashMap<LocalDefId, LocalDefId>,
+) -> rustc_span::def_id::DefId {
+    if let Some(local) = def_id.as_local()
+        && let Some(&resolved) = resolve_map.get(&local)
+    {
+        return resolved.to_def_id();
+    }
+    def_id
 }
 
 #[allow(clippy::too_many_arguments)]
