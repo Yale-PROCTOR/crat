@@ -1395,6 +1395,28 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+// ===== addr_of + pointer arithmetic tests =====
+
+/// addr_of with cast + offset: `*(&mut x as *mut c_int as *mut c_char).offset(1) = 0`.
+/// The addr_of block builds a slice via `std::slice::from_mut`, applies Cast via
+/// bytemuck::cast_slice_mut, then Offset as range indexing. visit_expr converts
+/// `*&mut slice[n..]` → `slice[n]`.
+#[test]
+fn test_addr_of_cast_offset() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() {
+    let mut x: libc::c_int = 0 as libc::c_int;
+    *(&mut x as *mut libc::c_int as *mut libc::c_char)
+        .offset(1 as libc::c_int as isize) = 0 as libc::c_char;
+}
+"#,
+        &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize]"],
+        &["*mut", "as *mut"],
+    );
+}
+
 /// Fallthrough + Raw: overlapping borrows from struct field `s.data` → both demoted to Raw.
 #[test]
 fn test_field_ptr_raw() {
