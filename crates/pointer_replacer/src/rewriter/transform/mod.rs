@@ -184,7 +184,7 @@ impl MutVisitor for TransformVisitor<'_> {
                 let hir::ExprKind::Binary(_, hir_l, hir_r) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
-                let ty = typeck.expr_ty_adjusted(hir_l);
+                let ty = typeck.expr_ty(hir_l);
                 if let Some((_, m)) = unwrap_ptr_from_mir_ty(ty) {
                     let kind = PtrKind::Raw(m.is_mut());
                     self.transform_rhs(l, hir_l, kind);
@@ -459,6 +459,77 @@ impl<'tcx> TransformVisitor<'tcx> {
             } else {
                 false
             };
+            // Handle addr_of with pointer arithmetic (offset, wrapping_add, etc.)
+            // by building a slice from the base and applying projections as slice ops.
+            if pe.projs.iter().any(|p| {
+                matches!(
+                    p,
+                    PtrExprProj::Offset(_)
+                        | PtrExprProj::IntegerOp(..)
+                        | PtrExprProj::IntegerBinOp(..)
+                )
+            }) {
+                let m = match ctx {
+                    PtrCtx::Rhs(PtrKind::Raw(m))
+                    | PtrCtx::Rhs(PtrKind::OptRef(m))
+                    | PtrCtx::Rhs(PtrKind::Slice(m))
+                    | PtrCtx::Deref(m) => m,
+                };
+                // Create initial slice from the single element:
+                //   std::slice::from_mut(&mut x) or std::slice::from_ref(&x)
+                let base_str = pprust::expr_to_string(pe.base);
+                let mut result = utils::expr!(
+                    "std::slice::from_{}(&{}({}))",
+                    if m { "mut" } else { "ref" },
+                    if m { "mut " } else { "" },
+                    base_str,
+                );
+                // Apply projections (mirrors projected_expr logic for !is_raw)
+                let mut from_ty = pe.base_ty;
+                for proj in &pe.projs {
+                    match proj {
+                        PtrExprProj::Cast(ty) if !ty.is_usize() => {
+                            let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
+                            if from_ty != to_ty {
+                                result = self.slice_from_slice(&result, m, to_ty, from_ty);
+                            }
+                            from_ty = to_ty;
+                        }
+                        PtrExprProj::Offset(offset) => {
+                            result = utils::expr!(
+                                "({})[({}) as usize..]",
+                                pprust::expr_to_string(&result),
+                                pprust::expr_to_string(offset),
+                            );
+                        }
+                        // Complex arithmetic or cast-to-usize: leave as raw
+                        _ => return PtrKind::Raw(m),
+                    }
+                }
+                // Final wrapping depends on the target context
+                match ctx {
+                    PtrCtx::Deref(m) | PtrCtx::Rhs(PtrKind::Slice(m)) => {
+                        *ptr = self.slice_from_slice(&result, m, lhs_inner_ty, rhs_inner_ty);
+                        return PtrKind::Slice(m);
+                    }
+                    PtrCtx::Rhs(PtrKind::OptRef(m)) => {
+                        *ptr =
+                            self.opt_ref_from_slice(&result, m, lhs_inner_ty, rhs_inner_ty, def_id);
+                        return PtrKind::OptRef(m);
+                    }
+                    PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                        let (_, m_lhs) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+                        *ptr = self.raw_from_slice(
+                            &result,
+                            m,
+                            m_lhs.is_mut(),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::Raw(m);
+                    }
+                }
+            }
             match ctx {
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     if !need_cast && !ty_updated {
