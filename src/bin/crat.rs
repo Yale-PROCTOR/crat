@@ -482,7 +482,12 @@ fn main() {
                     if config.outparam.size {
                         outparam_replacer::ai::analysis::size(tcx);
                     } else {
-                        outparam_replacer::transform::transform(tcx, &dir, &lib_path, &config.outparam)
+                        outparam_replacer::transform::transform(
+                            tcx,
+                            &dir,
+                            &lib_path,
+                            &config.outparam,
+                        )
                     }
                 })
                 .unwrap();
