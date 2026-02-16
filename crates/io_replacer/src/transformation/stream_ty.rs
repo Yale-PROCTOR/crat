@@ -626,6 +626,14 @@ pub(super) fn convert_expr(
             assert!(consume);
             format!("std::io::BufReader::new({expr})")
         }
+        (to, BufReader(from)) if to == *from => {
+            assert!(consume);
+            format!("{expr}.into_inner()")
+        }
+        (to, BufWriter(from)) if to == *from => {
+            assert!(consume);
+            format!("{expr}.into_inner().unwrap()")
+        }
         (Ptr(to), from) => {
             if consume {
                 let converted = convert_expr(*to, from, expr, true, is_non_local);

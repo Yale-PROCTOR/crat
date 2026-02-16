@@ -1632,6 +1632,48 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_return_read_close() {
+    run_test(
+        r#"
+unsafe fn g() -> *mut FILE {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    return stream;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = g();
+    fclose(stream);
+}"#,
+        &["crate::c_lib::rs_fgetc", "into_inner", "drop"],
+        &["FILE", "fopen", "fclose"],
+    );
+}
+
+#[test]
+fn test_return_write_close() {
+    run_test(
+        r#"
+unsafe fn g() -> *mut FILE {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    fputc(0, stream);
+    return stream;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = g();
+    fclose(stream);
+}"#,
+        &["crate::c_lib::rs_fputc", "into_inner", "drop"],
+        &["FILE", "fopen", "fclose"],
+    );
+}
+
+#[test]
 fn test_return_box_close() {
     run_test(
         r#"
