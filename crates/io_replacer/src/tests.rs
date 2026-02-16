@@ -2758,6 +2758,26 @@ pub unsafe extern "C" fn f(mut x: libc::c_int, mut s: *mut s) {
     );
 }
 
+#[test]
+fn test_field_as_deref() {
+    run_test(
+        r#"
+#[repr(C)]
+struct s {
+    f: *mut FILE,
+    x: libc::c_int,
+}
+unsafe fn foo(mut s: Option<&mut s>) {
+    fprintf(
+        (*(s).as_deref().unwrap()).f,
+        b"Hello, World!\n\0" as *const u8 as *const libc::c_char,
+    );
+}"#,
+        &["write!", "as_deref_mut"],
+        &["as_deref()"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
