@@ -123,6 +123,34 @@ fn main() {
     );
 }
 
+#[test]
+fn test_transformation_unused_auto_derived() {
+    let code = r#"
+struct S {
+    _x: u32,
+}
+#[automatically_derived]
+impl S {
+    fn get_x(&self) -> u32 {
+        self._x
+    }
+    fn set_x(&mut self, val: u32) {
+        self._x = val;
+    }
+}
+fn main() {
+    let mut s = S { _x: 0 };
+    s.set_x(1);
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["fn main()", "fn get_x(", "fn set_x(", "struct S"],
+        &[],
+    );
+}
+
 fn run_test(code: &str, unsafe_fns: &[&str]) {
     utils::compilation::run_compiler_on_str(&code, |tcx| {
         let res: Vec<_> = super::find_unsafe_fns(tcx)

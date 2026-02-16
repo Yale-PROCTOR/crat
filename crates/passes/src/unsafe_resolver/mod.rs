@@ -408,6 +408,20 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                             .insert(assoc_item.owner_id.def_id);
                     }
                 }
+
+                if imp.of_trait.is_none()
+                    && self.tcx.is_automatically_derived(item.owner_id.to_def_id())
+                {
+                    let item_ids: Vec<LocalDefId> =
+                        imp.items.iter().map(|r| r.id.owner_id.def_id).collect();
+                    for &a in &item_ids {
+                        for &b in &item_ids {
+                            if a != b {
+                                self.used.entry(a).or_default().insert(b);
+                            }
+                        }
+                    }
+                }
             }
             hir::ItemKind::Trait(_, _, _, _, _, items) => {
                 for item_ref in items {
