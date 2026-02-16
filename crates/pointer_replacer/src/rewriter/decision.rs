@@ -160,11 +160,20 @@ impl SigDecisions {
                 })
                 .collect();
 
+            let return_local = Local::from_u32(0);
+            let return_decl = &body.local_decls[return_local];
+            let return_aliases = aliases.and_then(|a| a.get(&return_local));
+            let output_dec = match decision_maker.decide(return_local, return_decl, return_aliases)
+            {
+                Some(PtrKind::Raw(m)) => Some(PtrKind::Raw(m)),
+                _ => None, // no borrow inference for returns yet
+            };
+
             data.insert(
                 *did,
                 SigDecision {
                     input_decs,
-                    output_dec: None, // Currently intra-procedural borrow inference
+                    output_dec,
                 },
             );
         }

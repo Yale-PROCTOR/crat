@@ -1462,3 +1462,19 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &[],
     );
 }
+
+/// Return type mutability: function returns a pointer that is never written through,
+/// so the return type should become *const.
+#[test]
+fn test_return_type_mutability() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(mut x: *mut libc::c_int) -> *mut libc::c_int {
+    return x;
+}
+"#,
+        &["*const"],
+        &[],
+    );
+}

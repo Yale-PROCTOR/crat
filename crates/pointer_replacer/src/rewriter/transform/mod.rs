@@ -44,8 +44,6 @@ impl MutVisitor for TransformVisitor<'_> {
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
-                // Currently intra-procedural borrow inference:
-                // skip return type; only consider parameters
                 for ((local_decl, input_dec), param) in mir_body
                     .local_decls
                     .iter()
@@ -88,6 +86,15 @@ impl MutVisitor for TransformVisitor<'_> {
                             *param.ty = mk_raw_ptr_ty(inner_ty, *m, self.tcx);
                         }
                         None => continue,
+                    }
+                }
+
+                if let Some(PtrKind::Raw(m)) = sig_dec.output_dec {
+                    let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
+                    if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty)
+                        && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
+                    {
+                        *ret_ty = P(mk_raw_ptr_ty(inner_ty, m, self.tcx));
                     }
                 }
             }
@@ -272,7 +279,13 @@ impl MutVisitor for TransformVisitor<'_> {
                     .skip_binder()
                     .skip_binder();
                 if let ty::TyKind::RawPtr(_, m) = sig.output().kind() {
-                    let kind = PtrKind::Raw(m.is_mut());
+                    let owner_did = hir_ret.hir_id.owner.def_id;
+                    let kind = self
+                        .sig_decs
+                        .data
+                        .get(&owner_did)
+                        .and_then(|sd| sd.output_dec)
+                        .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_rhs(ret, hir_ret, kind);
                 }
             }
