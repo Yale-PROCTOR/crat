@@ -1478,3 +1478,25 @@ pub unsafe extern "C" fn foo(mut x: *mut libc::c_int) -> *mut libc::c_int {
         &[],
     );
 }
+
+/// Call-site cast: callee's return type mutability changes and the caller
+/// needs a cast to match.
+#[test]
+fn test_call_site_return_type_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(mut x: *mut libc::c_int) -> *mut libc::c_int {
+    return x;
+}
+pub unsafe extern "C" fn bar() {
+    let mut x: libc::c_int = 0 as libc::c_int;
+    let mut p: *mut libc::c_int = 0 as *mut libc::c_int;
+    let mut q: *mut *mut libc::c_int = &mut p;
+    *q = foo(&mut x);
+}
+"#,
+        &["*const"],
+        &[],
+    );
+}

@@ -847,8 +847,27 @@ impl<'tcx> TransformVisitor<'tcx> {
             },
             _ => panic!("{:?}", pe.base_ty),
         };
+        // Override m1 if this is a call to a function whose return type was changed
+        let m1 = if let hir::ExprKind::Call(func, _) = pe.hir_base.kind
+            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(PtrKind::Raw(m)) =
+                self.sig_decs.data.get(&def_id).and_then(|sd| sd.output_dec)
+        {
+            m
+        } else {
+            m1
+        };
         match ctx {
-            PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => PtrKind::Raw(m),
+            PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
+                if m != m1 {
+                    let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                    let m_str = if m { "mut" } else { "const" };
+                    *ptr = utils::expr!("{} as *{} {}", pprust::expr_to_string(e), m_str, inner_ty);
+                }
+                PtrKind::Raw(m)
+            }
             PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                 *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                 PtrKind::OptRef(m)
