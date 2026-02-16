@@ -236,11 +236,25 @@
 //! ```rust,ignore
 //! strcmp(s.as_ptr(), t.as_ptr());
 //! ```
+//!
+//! # Hoist bitfield setter arguments
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! (*p).set_x(((*p).x() + 1 as c_int) as c_int);
+//! ```
+//!
+//! We hoist such arguments as follows:
+//!
+//! ```rust,ignore
+//! { let __arg_0 = ((*p).x() + 1 as c_int) as c_int; (*p).set_x(__arg_0) }
+//! ```
 
 use std::fmt::Write as _;
 
 use etrace::some_or;
-use rustc_ast::{mut_visit::MutVisitor as _, *};
+use rustc_ast::{mut_visit::MutVisitor as _, visit, visit::Visitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
@@ -610,6 +624,22 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     *expr = expr!("{new_expr}");
                 }
             }
+            ExprKind::MethodCall(box call)
+                if call.seg.ident.name.as_str().starts_with("set_") && call.args.len() == 1 =>
+            {
+                let arg = &call.args[0];
+                if let Some(base) = receiver_base_ident(&call.receiver)
+                    && expr_contains_ident(arg, base)
+                {
+                    let arg_str = pprust::expr_to_string(arg);
+                    let recv_str = pprust::expr_to_string(&call.receiver);
+                    let new_expr = format!(
+                        "{{ let __arg_0 = {arg_str}; {recv_str}.{}(__arg_0) }}",
+                        call.seg.ident.name
+                    );
+                    *expr = expr!("{new_expr}");
+                }
+            }
             ExprKind::MethodCall(box call) if call.seg.ident.name.as_str() == "as_mut_ptr" => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
@@ -680,6 +710,37 @@ impl<'tcx> AstVisitor<'tcx> {
 
         Some(expr!("core::mem::offset_of!({ty_str}, {field_name})"))
     }
+}
+
+fn receiver_base_ident(expr: &Expr) -> Option<Symbol> {
+    match &expr.kind {
+        ExprKind::Path(_, path) => path.segments.last().map(|s| s.ident.name),
+        ExprKind::Unary(_, e) | ExprKind::Paren(e) | ExprKind::Field(e, _) => {
+            receiver_base_ident(e)
+        }
+        _ => None,
+    }
+}
+
+fn expr_contains_ident(expr: &Expr, name: Symbol) -> bool {
+    struct Finder {
+        name: Symbol,
+        found: bool,
+    }
+    impl<'ast> visit::Visitor<'ast> for Finder {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let ExprKind::Path(_, path) = &expr.kind
+                && path.segments.iter().any(|s| s.ident.name == self.name)
+            {
+                self.found = true;
+                return;
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+    let mut finder = Finder { name, found: false };
+    finder.visit_expr(expr);
+    finder.found
 }
 
 #[inline]
@@ -1885,5 +1946,26 @@ unsafe fn f() {
             &["as_ptr"],
             &["as_mut_ptr"],
         );
+    }
+
+    #[test]
+    fn test_bitfield_setter() {
+        run_test(
+            r#"
+#[repr(C)]
+pub struct s {
+    pub data: [u8; 4],
+}
+impl s {
+    pub fn x(&self) -> core::ffi::c_int { 0 }
+    pub fn set_x(&mut self, _val: core::ffi::c_int) {}
+}
+pub unsafe extern "C" fn foo(mut p: *mut s) {
+    (*p).set_x(((*p).x() + 1 as core::ffi::c_int) as core::ffi::c_int);
+}
+            "#,
+            &["let __arg_0"],
+            &[],
+        )
     }
 }
