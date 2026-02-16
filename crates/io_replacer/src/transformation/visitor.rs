@@ -1315,6 +1315,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let param_pot = some_or!(self.param_pot(p), continue);
                                 let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
                                 let permissions = param_pot.permissions;
+                                upgrade_deref_mut(arg);
                                 self.convert_rhs(arg, param_pot);
                                 if param_pot.ty.contains_impl() {
                                     if is_null {

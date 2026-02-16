@@ -2778,6 +2778,26 @@ unsafe fn foo(mut s: Option<&mut s>) {
     );
 }
 
+#[test]
+fn test_field_as_deref_user_fn() {
+    run_test(
+        r#"
+#[repr(C)]
+struct s {
+    f: *mut FILE,
+    x: libc::c_int,
+}
+unsafe fn bar(mut f: *mut FILE) {
+    fprintf(f, b"Hello, World!\n\0" as *const u8 as *const libc::c_char);
+}
+unsafe fn foo(mut s: Option<&mut s>) {
+    bar((*(s).as_deref().unwrap()).f);
+}"#,
+        &["as_deref_mut"],
+        &["as_deref()"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
