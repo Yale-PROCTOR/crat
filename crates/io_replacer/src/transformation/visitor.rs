@@ -102,6 +102,26 @@ fn remove_cast(expr: &Expr) -> &Expr {
     remove_cast(expr)
 }
 
+fn upgrade_deref_mut(expr: &mut Expr) {
+    match &mut expr.kind {
+        ExprKind::MethodCall(box call) => {
+            if call.seg.ident.name.as_str() == "as_deref" {
+                call.seg.ident.name = Symbol::intern("as_deref_mut");
+            }
+            upgrade_deref_mut(&mut call.receiver);
+        }
+        ExprKind::Field(e, _)
+        | ExprKind::Unary(_, e)
+        | ExprKind::Paren(e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::AddrOf(_, _, e)
+        | ExprKind::Index(e, _, _) => {
+            upgrade_deref_mut(e);
+        }
+        _ => {}
+    }
+}
+
 impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
     fn loc_if_unsupported(&self, expr: &Expr) -> Option<MirLoc> {
         self.unsupported
@@ -719,6 +739,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let is_non_local = self.is_non_local(args[0].span);
                             let new_expr = self.transform_fclose(&args[0], *ty, is_non_local);
@@ -730,6 +751,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let is_non_local = self.is_non_local(args[0].span);
                             let new_expr = self.transform_pclose(&args[0], *ty, is_non_local);
@@ -752,6 +774,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let ic = self.indicator_check(&args[0]);
@@ -772,6 +795,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let ic = self.indicator_check(&args[0]);
@@ -795,6 +819,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[2]);
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                             let stream = TypedExpr::new(&args[2], ty);
                             let ic = self.indicator_check(&args[2]);
@@ -807,6 +832,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[3]);
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
                             let ic = self.indicator_check(&args[3]);
@@ -820,6 +846,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[3]);
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
                             let ic = self.indicator_check(&args[3]);
@@ -833,6 +860,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[2]);
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                             let stream = TypedExpr::new(&args[2], ty);
                             let ic = self.indicator_check(&args[2]);
@@ -845,6 +873,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let name = self.analysis_res.span_to_expr_loc[&args[0].span];
                             let ind = self.tracked_loc_to_index[&name];
                             let new_expr = expr!("___v_{}_eof", ind);
@@ -864,6 +893,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let name = self.analysis_res.span_to_expr_loc[&args[0].span];
                             let ind = self.tracked_loc_to_index[&name];
                             let new_expr = expr!("___v_{}_error", ind);
@@ -875,6 +905,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ic = self.indicator_check(&args[0]);
                             let new_expr = expr!("{}", self.clear(ic));
                             self.replace_expr(expr, new_expr);
@@ -897,6 +928,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
@@ -964,6 +996,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let ic = self.indicator_check(&args[0]);
@@ -999,6 +1032,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[1]);
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
                             let ic = self.indicator_check(&args[1]);
@@ -1034,6 +1068,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[1]);
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
                             let ic = self.indicator_check(&args[1]);
@@ -1058,6 +1093,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[1]);
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
                             let ic = self.indicator_check(&args[1]);
@@ -1101,6 +1137,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 }
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[3]);
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
                             let ic = self.indicator_check(&args[3]);
@@ -1129,6 +1166,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             if matches!(remove_cast(&args[0]).kind, ExprKind::Lit(_)) {
                                 self.replace_expr(expr, expr!("0"));
                             } else {
+                                upgrade_deref_mut(&mut args[0]);
                                 let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                                 let stream = TypedExpr::new(&args[0], ty);
                                 let ic = self.indicator_check(&args[0]);
@@ -1142,6 +1180,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let new_expr = self.transform_fseek(&stream, &args[1], &args[2]);
@@ -1153,6 +1192,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let new_expr = self.transform_ftell(&stream);
@@ -1164,6 +1204,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let new_expr = self.transform_rewind(&stream);
@@ -1191,6 +1232,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let new_expr = self.transform_fileno(&stream);
@@ -1202,6 +1244,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let name = self.hir.callee_span_to_stream_name[&callee.span];
@@ -1217,6 +1260,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 self.unsupported_reasons.push(reasons);
                                 return;
                             }
+                            upgrade_deref_mut(&mut args[0]);
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let name = self.hir.callee_span_to_stream_name[&callee.span];
@@ -1271,6 +1315,7 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                                 let param_pot = some_or!(self.param_pot(p), continue);
                                 let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
                                 let permissions = param_pot.permissions;
+                                upgrade_deref_mut(arg);
                                 self.convert_rhs(arg, param_pot);
                                 if param_pot.ty.contains_impl() {
                                     if is_null {
