@@ -305,7 +305,13 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
                 ExprKind::Call(callee, _) => {
                     if let ExprKind::Path(_, path) = &callee.kind {
                         let name = path.segments.last().unwrap().ident;
-                        if name.as_str() == "Some" {
+                        let name = name.as_str();
+                        if name == "Some" {
+                            return;
+                        } else if name == "null" || name == "null_mut" {
+                            if matches!(lhs_pot.ty, StreamType::Option(_)) {
+                                self.replace_expr(rhs, expr!("None"));
+                            }
                             return;
                         }
                     }
