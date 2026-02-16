@@ -45,6 +45,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let andersen_config = andersen::Config {
         use_optimized_mir: false,
         c_exposed_fns: config.c_exposed_fns.clone(),
+        time: false,
     };
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);

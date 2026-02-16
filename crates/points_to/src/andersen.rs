@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::hash_map::Entry};
+use std::{cell::RefCell, collections::hash_map::Entry, time::Instant};
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
@@ -32,11 +32,35 @@ pub struct Config {
     #[serde(default)]
     pub use_optimized_mir: bool,
     pub c_exposed_fns: FxHashSet<String>,
+    pub time: bool,
+}
+
+struct Timer {
+    show: bool,
+    start: Instant,
+}
+
+impl Timer {
+    fn new(show: bool) -> Self {
+        Self {
+            show,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if self.show {
+            println!("{:.3}s", self.start.elapsed().as_secs_f64());
+        }
+    }
 }
 
 pub fn run_analysis(config: &Config, tcx: TyCtxt<'_>) -> Solutions {
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx, config.use_optimized_mir);
+    let _t = Timer::new(config.time);
     let pre = pre_analyze(config, &tss, tcx);
     analyze(config, &pre, &tss, tcx)
 }

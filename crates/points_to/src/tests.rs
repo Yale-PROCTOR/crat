@@ -128,6 +128,7 @@ where F: FnOnce(AnalysisResult, TyCtxt<'_>) + Send {
         let config = andersen::Config {
             use_optimized_mir: true,
             c_exposed_fns: FxHashSet::default(),
+            time: false,
         };
         let pre = andersen::pre_analyze(&config, &tss, tcx);
         let solutions = andersen::analyze(&config, &pre, &tss, tcx);

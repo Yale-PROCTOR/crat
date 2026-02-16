@@ -65,6 +65,8 @@ struct Args {
     // Andersen
     #[arg(long, help = "Use optimized MIR for points-to analysis")]
     andersen_use_optimized_mir: bool,
+    #[arg(long, help = "Enable printing of analysis time")]
+    andersen_time: bool,
 
     // Union
     #[arg(long, value_delimiter = ',', help = "Target unions to replace")]
@@ -100,6 +102,8 @@ struct Args {
         help = "Print analysis results of the specified functions"
     )]
     outparam_print_functions: Vec<String>,
+    #[arg(long)]
+    outparam_size: bool,
 
     // IO
     #[arg(long, help = "Assume that to_str from CStr always succeeds")]
@@ -304,6 +308,7 @@ fn main() {
     }
 
     config.andersen.use_optimized_mir |= args.andersen_use_optimized_mir;
+    config.andersen.time |= args.andersen_time;
 
     for u in args.union_target {
         config.r#union.targets.insert(u);
@@ -324,6 +329,7 @@ fn main() {
     config.outparam.check_param_alias |= args.outparam_check_param_alias;
     config.outparam.no_widening |= args.outparam_no_widening;
     config.outparam.simplify |= args.outparam_simplify;
+    config.outparam.size |= args.outparam_size;
 
     config
         .outparam
@@ -473,7 +479,11 @@ fn main() {
             }
             Pass::OutParam => {
                 run_compiler_on_path(&file, |tcx| {
-                    outparam_replacer::transform::transform(tcx, &dir, &lib_path, &config.outparam)
+                    if config.outparam.size {
+                        outparam_replacer::ai::analysis::size(tcx);
+                    } else {
+                        outparam_replacer::transform::transform(tcx, &dir, &lib_path, &config.outparam)
+                    }
                 })
                 .unwrap();
             }

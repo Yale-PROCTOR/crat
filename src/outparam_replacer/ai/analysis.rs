@@ -168,6 +168,34 @@ pub fn write_analysis_result(path: &Path, result: &AnalysisResult) {
     serde_json::to_writer_pretty(file, &writes).unwrap();
 }
 
+pub fn size(tcx: TyCtxt<'_>) {
+    let mut funcs: usize = 0;
+        let mut blocks: usize = 0;
+        let mut stmts: usize = 0;
+
+        for id in tcx.hir_free_items() {
+            let item = tcx.hir_item(id);
+            if let Some(ident) = item.kind.ident()
+                && ident.name.as_str() == "main"
+            {
+                continue;
+            }
+            if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
+                continue;
+            }
+
+            let def_id = id.owner_id;
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(def_id)
+                .borrow();
+            funcs += 1;
+            blocks += body.basic_blocks.len();
+            stmts += ir_utils::body_size(&body);
+        }
+
+        println!("{} {} {}", funcs, blocks, stmts);
+}
+
 pub fn analyze(
     config: &crate::outparam_replacer::Config,
     verbose: bool,
@@ -246,6 +274,7 @@ pub fn analyze(
     let pre_config = andersen::Config {
         use_optimized_mir,
         c_exposed_fns: FxHashSet::default(),
+        time: false,
     };
     let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = if let Some(path) = &config.points_to_file {

@@ -34,6 +34,7 @@ pub fn analyze(gc: bool, tcx: TyCtxt<'_>) -> AnalysisResult {
     let pre_config = andersen::Config {
         use_optimized_mir,
         c_exposed_fns: FxHashSet::default(),
+        time: false,
     };
     let pre = andersen::pre_analyze(&pre_config, &tss, tcx);
     let solutions = andersen::analyze(&pre_config, &pre, &tss, tcx);
