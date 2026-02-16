@@ -254,7 +254,7 @@
 use std::fmt::Write as _;
 
 use etrace::some_or;
-use rustc_ast::{mut_visit::MutVisitor as _, visit, visit::Visitor as _, *};
+use rustc_ast::{mut_visit::MutVisitor as _, ptr::P, visit, visit::Visitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
@@ -265,6 +265,7 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Span, Symbol, sym};
+use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_paren},
     expr,
@@ -350,7 +351,83 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     };
 
     visitor.visit_crate(&mut expanded_ast);
+    replace_inline_extern_fns(&mut expanded_ast.items);
     pprust::crate_to_string_for_macros(&expanded_ast)
+}
+
+const INLINE_EXTERN_FUNCTIONS: &[&str] = &["atoi", "atol", "atof"];
+
+fn replace_inline_extern_fns(items: &mut ThinVec<P<Item>>) {
+    // Recurse into submodules first
+    for item in items.iter_mut() {
+        if let ItemKind::Mod(_, _, ModKind::Loaded(sub_items, _, _, _)) = &mut item.kind {
+            replace_inline_extern_fns(sub_items);
+        }
+    }
+
+    // Collect extern declarations from matching inline functions
+    let mut extern_decls: Vec<String> = Vec::new();
+    let mut to_remove: Vec<usize> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let ItemKind::Fn(box Fn { ident, sig, .. }) = &item.kind else { continue };
+        if !INLINE_EXTERN_FUNCTIONS.contains(&ident.name.as_str()) {
+            continue;
+        }
+        if !item.attrs.iter().any(|attr| {
+            let AttrKind::Normal(attr) = &attr.kind else { return false };
+            attr.item.path.segments.last().unwrap().ident.name == sym::inline
+        }) {
+            continue;
+        }
+
+        // Build extern declaration string
+        let mut decl = format!("fn {}(", ident.name);
+        for (j, param) in sig.decl.inputs.iter().enumerate() {
+            if j > 0 {
+                decl.push_str(", ");
+            }
+            // Extract param name, stripping mut
+            if let PatKind::Ident(_, ident, _) = &param.pat.kind {
+                write!(decl, "{}: ", ident.name).unwrap();
+            } else {
+                write!(decl, "_: ").unwrap();
+            }
+            decl.push_str(&pprust::ty_to_string(&param.ty));
+        }
+        decl.push(')');
+        if let FnRetTy::Ty(ty) = &sig.decl.output {
+            write!(decl, " -> {}", pprust::ty_to_string(ty)).unwrap();
+        }
+        decl.push(';');
+        extern_decls.push(decl);
+        to_remove.push(i);
+    }
+
+    if extern_decls.is_empty() {
+        return;
+    }
+
+    // Find the first extern "C" block and append declarations
+    if let Some(foreign_mod_item) = items
+        .iter_mut()
+        .find(|item| matches!(&item.kind, ItemKind::ForeignMod(fm) if fm.safety == Safety::Default))
+    {
+        let ItemKind::ForeignMod(fm) = &mut foreign_mod_item.kind else { unreachable!() };
+        for decl_str in &extern_decls {
+            // Parse as: extern "C" { fn ...; }
+            let parsed = utils::ast::parse_items(format!("extern \"C\" {{ {decl_str} }}"));
+            let ItemKind::ForeignMod(parsed_fm) = &parsed[0].kind else { panic!() };
+            for fi in &parsed_fm.items {
+                fm.items.push(fi.clone());
+            }
+        }
+    }
+
+    // Remove matched inline functions (in reverse order to preserve indices)
+    for i in to_remove.into_iter().rev() {
+        items.remove(i);
+    }
 }
 
 struct AstVisitor<'tcx> {
@@ -1966,6 +2043,29 @@ pub unsafe extern "C" fn foo(mut p: *mut s) {
             "#,
             &["let __arg_0"],
             &[],
+        )
+    }
+
+    #[test]
+    fn test_inline_extern() {
+        run_test(
+            r#"
+extern "C" {
+    fn strtod(__nptr: *const core::ffi::c_char, __endptr: *mut *mut core::ffi::c_char) -> core::ffi::c_double;
+    fn strtol(__nptr: *const core::ffi::c_char, __endptr: *mut *mut core::ffi::c_char, __base: core::ffi::c_int) -> core::ffi::c_long;
+}
+pub const NULL: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+#[inline]
+unsafe extern "C" fn atoi(mut __nptr: *const core::ffi::c_char) -> core::ffi::c_int {
+    return strtol(__nptr, NULL as *mut *mut core::ffi::c_char, 10 as core::ffi::c_int) as core::ffi::c_int;
+}
+#[no_mangle]
+pub unsafe extern "C" fn foo(mut c: *mut core::ffi::c_char) -> core::ffi::c_int {
+    return atoi(c);
+}
+            "#,
+            &["fn atoi("],
+            &["#[inline]", "return strtol("],
         )
     }
 }
