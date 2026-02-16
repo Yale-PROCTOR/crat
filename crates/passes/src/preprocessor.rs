@@ -565,6 +565,27 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     *expr = transmute_expr(lit.symbol.as_str(), *elem_ty);
                     return;
                 }
+                // Replace as_mut_ptr with as_ptr for printf/fprintf arguments
+                if let ExprKind::Path(_, path) = &callee.kind
+                    && let [.., seg] = &path.segments[..]
+                {
+                    let skip = if seg.ident.name.as_str() == "printf" {
+                        Some(1)
+                    } else if seg.ident.name.as_str() == "fprintf" {
+                        Some(2)
+                    } else {
+                        None
+                    };
+                    if let Some(skip) = skip {
+                        for arg in args.iter_mut().skip(skip) {
+                            if let ExprKind::MethodCall(box call) = &mut arg.kind
+                                && call.seg.ident.name.as_str() == "as_mut_ptr"
+                            {
+                                call.seg.ident.name = sym::as_ptr;
+                            }
+                        }
+                    }
+                }
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let mut indices: Vec<ArgIdx> = vec![];
                 if let Some(if_args) = self.call_to_if_args.get(&hir_expr.hir_id) {
@@ -1827,5 +1848,42 @@ unsafe fn g(i: *mut i32) -> *mut test {
             &["offset_of!(crate::test, a)", "offset_of!(crate::test, b)"],
             &["*(0 as"],
         )
+    }
+
+    #[test]
+    fn test_printf_as_mut_ptr() {
+        run_test(
+            r#"
+extern "C" {
+    fn printf(__format: *const core::ffi::c_char, ...) -> core::ffi::c_int;
+}
+unsafe fn f() {
+    let mut buf: [core::ffi::c_char; 10] = [0; 10];
+    printf(b"%s\0" as *const u8 as *const core::ffi::c_char, buf.as_mut_ptr());
+}
+            "#,
+            &["as_ptr"],
+            &["as_mut_ptr"],
+        );
+    }
+
+    #[test]
+    fn test_fprintf_as_mut_ptr() {
+        run_test(
+            r#"
+#[repr(C)]
+struct FILE;
+extern "C" {
+    fn fprintf(__stream: *mut FILE, __format: *const core::ffi::c_char, ...) -> core::ffi::c_int;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    let mut buf: [core::ffi::c_char; 10] = [0; 10];
+    fprintf(stream, b"%s\0" as *const u8 as *const core::ffi::c_char, buf.as_mut_ptr());
+}
+            "#,
+            &["as_ptr"],
+            &["as_mut_ptr"],
+        );
     }
 }
