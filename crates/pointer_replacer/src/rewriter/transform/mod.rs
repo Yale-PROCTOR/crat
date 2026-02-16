@@ -44,8 +44,6 @@ impl MutVisitor for TransformVisitor<'_> {
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
-                // Currently intra-procedural borrow inference:
-                // skip return type; only consider parameters
                 for ((local_decl, input_dec), param) in mir_body
                     .local_decls
                     .iter()
@@ -71,14 +69,32 @@ impl MutVisitor for TransformVisitor<'_> {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
                                 .unwrap_or_else(|| {
                                     panic!(
-                                        "Expected array pointer type, got {ty:?} in {local_decl:?}",
+                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
                                         ty = local_decl.ty
                                     )
                                 });
                             *param.ty = mk_slice_ty(inner_ty, *m, self.tcx);
                         }
-                        Some(PtrKind::Raw(_)) => continue,
+                        Some(PtrKind::Raw(m)) => {
+                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
+                                        ty = local_decl.ty
+                                    )
+                                });
+                            *param.ty = mk_raw_ptr_ty(inner_ty, *m, self.tcx);
+                        }
                         None => continue,
+                    }
+                }
+
+                if let Some(PtrKind::Raw(m)) = sig_dec.output_dec {
+                    let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
+                    if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty)
+                        && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
+                    {
+                        *ret_ty = P(mk_raw_ptr_ty(inner_ty, m, self.tcx));
                     }
                 }
             }
@@ -138,7 +154,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 PtrKind::Slice(m) => {
                     local.ty = Some(P(mk_slice_ty(lhs_inner_ty, m, self.tcx)));
                 }
-                PtrKind::Raw(_) => {}
+                PtrKind::Raw(m) => {
+                    local.ty = Some(P(mk_raw_ptr_ty(lhs_inner_ty, m, self.tcx)));
+                }
             }
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
@@ -261,7 +279,13 @@ impl MutVisitor for TransformVisitor<'_> {
                     .skip_binder()
                     .skip_binder();
                 if let ty::TyKind::RawPtr(_, m) = sig.output().kind() {
-                    let kind = PtrKind::Raw(m.is_mut());
+                    let owner_did = hir_ret.hir_id.owner.def_id;
+                    let kind = self
+                        .sig_decs
+                        .data
+                        .get(&owner_did)
+                        .and_then(|sd| sd.output_dec)
+                        .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_rhs(ret, hir_ret, kind);
                 }
             }
@@ -717,7 +741,17 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Some(rhs_kind) = self.ptr_kinds.get(&hir_id)
         {
             match (ctx, *rhs_kind) {
-                (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(_)) => {
+                (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
+                    if m != m1 {
+                        let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        let m_str = if m { "mut" } else { "const" };
+                        *ptr = utils::expr!(
+                            "{} as *{} {}",
+                            pprust::expr_to_string(ptr),
+                            m_str,
+                            inner_ty
+                        );
+                    }
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
@@ -813,8 +847,27 @@ impl<'tcx> TransformVisitor<'tcx> {
             },
             _ => panic!("{:?}", pe.base_ty),
         };
+        // Override m1 if this is a call to a function whose return type was changed
+        let m1 = if let hir::ExprKind::Call(func, _) = pe.hir_base.kind
+            && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(PtrKind::Raw(m)) =
+                self.sig_decs.data.get(&def_id).and_then(|sd| sd.output_dec)
+        {
+            m
+        } else {
+            m1
+        };
         match ctx {
-            PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => PtrKind::Raw(m),
+            PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
+                if m != m1 {
+                    let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                    let m_str = if m { "mut" } else { "const" };
+                    *ptr = utils::expr!("{} as *{} {}", pprust::expr_to_string(e), m_str, inner_ty);
+                }
+                PtrKind::Raw(m)
+            }
             PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                 *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                 PtrKind::OptRef(m)
@@ -1544,6 +1597,13 @@ fn mk_slice_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> T
     let ty = mir_ty_to_string(ty, tcx);
     let m = if mutability { "mut " } else { "" };
     utils::ty!("&{m}[{ty}]")
+}
+
+#[inline]
+fn mk_raw_ptr_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    let m = if mutability { "mut" } else { "const" };
+    utils::ty!("*{m} {ty}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
