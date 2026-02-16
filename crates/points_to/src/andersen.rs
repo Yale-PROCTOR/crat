@@ -52,7 +52,7 @@ impl Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         if self.show {
-            println!("{:.3}s", self.start.elapsed().as_secs_f64());
+            println!("Points-to Analysis Time: {:.3}s", self.start.elapsed().as_secs_f64());
         }
     }
 }
