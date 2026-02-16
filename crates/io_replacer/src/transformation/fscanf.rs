@@ -398,14 +398,14 @@ fn parse_scan_set<R: std::io::BufRead>(
     mut eof: Option<&mut i32>,
     pos: bool,
     set: &[u8],
-) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = Vec::new();
+) -> Option<Vec<i8>> {
+    let mut v: Vec<i8> = Vec::new();
     while width.is_none_or(|lim| v.len() < lim) {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
         if c == 0xff || set.contains(&c) != pos {
             break;
         }
-        v.push(c);
+        v.push(c as i8);
         stream.consume(1);
     }
     if v.is_empty() {
