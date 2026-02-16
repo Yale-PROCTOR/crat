@@ -137,7 +137,7 @@ pub struct Obj {
 pub union C2RustUnnamed_1 {
     pub value: libc::c_int,
     pub c2rust_unnamed: C2RustUnnamed_4,
-    pub name: [libc::c_char; 1],
+    pub name: [libc::c_char; 24],
     pub fn_0: Option::<Primitive>,
     pub c2rust_unnamed_0: C2RustUnnamed_3,
     pub c2rust_unnamed_1: C2RustUnnamed_2,
