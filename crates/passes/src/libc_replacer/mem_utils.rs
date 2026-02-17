@@ -13,7 +13,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
             && let Some(len_expr) = self.get_len_from_size(n, ty1, hir_n.hir_id.owner.def_id)
         {
             Some(utils::expr!(
-                "({0}[..({2}) as usize]).copy_from_slice(&{1}[..({2}) as usize])",
+                "((&mut ({0}))[..({2}) as usize]).copy_from_slice(&(&({1}))[..({2}) as usize])",
                 pprust::expr_to_string(array1),
                 pprust::expr_to_string(array2),
                 pprust::expr_to_string(&len_expr)
@@ -22,13 +22,13 @@ impl<'tcx> super::TransformVisitor<'tcx> {
             self.bytemuck = true;
             let array1 = pprust::expr_to_string(array1);
             let array1 = if ty1 == self.tcx.types.u8 {
-                format!("({array1})")
+                format!("(&mut ({array1}))")
             } else {
                 format!("bytemuck::cast_slice_mut::<_, u8>(&mut ({array1}))")
             };
             let array2 = pprust::expr_to_string(array2);
             let array2 = if ty2 == self.tcx.types.u8 {
-                format!("({array2})")
+                format!("(&({array2}))")
             } else {
                 format!("bytemuck::cast_slice(&({array2}))")
             };
@@ -48,7 +48,7 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         let n = pprust::expr_to_string(n);
         if ty == self.tcx.types.u8 || ty == self.tcx.types.i8 {
             Some(utils::expr!(
-                "({array})[..({n}) as usize].fill(({c}) as {ty})"
+                "(&mut ({array}))[..({n}) as usize].fill(({c}) as {ty})"
             ))
         } else if ty.is_numeric() {
             self.bytemuck = true;

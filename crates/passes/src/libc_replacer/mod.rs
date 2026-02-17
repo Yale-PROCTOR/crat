@@ -16,6 +16,8 @@ mod errno;
 mod mem_utils;
 mod str_utils;
 mod strto;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug)]
 pub struct TransformationResult {
