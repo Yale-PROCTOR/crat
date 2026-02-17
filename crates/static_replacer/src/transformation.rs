@@ -309,16 +309,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         .any(|id| id == p.hir_id)
                 {
                     // Don't introduce borrows at If condition boundary when
-                    // the If is the RHS of Assign/AssignOp — the Stmt boundary
-                    // will wrap the whole assignment instead.
+                    // the If is embedded in a larger expression — the Stmt
+                    // boundary will wrap the whole statement instead.
                     let skip = matches!(e.kind, hir::ExprKind::If(..))
-                        && match self.get_hir_parent(e.hir_id) {
-                            hir::Node::Expr(p) => matches!(
-                                p.kind,
-                                hir::ExprKind::Assign(..) | hir::ExprKind::AssignOp(..)
-                            ),
-                            _ => false,
-                        };
+                        && !matches!(
+                            self.get_hir_parent(e.hir_id),
+                            hir::Node::Stmt(_) | hir::Node::LetStmt(_) | hir::Node::Block(_)
+                        );
                     if !skip {
                         self.introduce_borrow(expr);
                     }
@@ -703,6 +700,24 @@ unsafe fn g(x: &mut i32, y: &mut i32) { *x = 1; *y = 2; }
 static mut X: [i32; 10] = [0; 10];
 unsafe fn f() { g(X.as_mut_ptr()); X[0] = if X[1] != 0 { 1 } else { 0 }; }
 unsafe fn g(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_if_call() {
+        let code = r#"
+static mut S: [i32; 10] = [0; 10];
+unsafe fn f() {
+    h(S.as_mut_ptr());
+    g(S[0], if S[1] != 0 { 1 } else { 0 });
+}
+unsafe fn g(x: i32, y: i32) {}
+unsafe fn h(x: *mut i32) { *x = 1; }
 "#;
         run_test(
             code,
