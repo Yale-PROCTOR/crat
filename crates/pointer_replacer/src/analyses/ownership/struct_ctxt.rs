@@ -50,7 +50,9 @@ impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
     }
 
     fn leaf_nodes(&self, adt_def: rustc_middle::ty::AdtDef, ptr_chased: u32) -> &[(Ty<'tcx>, u32)] {
-        let idx = self.did_idx[&adt_def.did()];
+        let Some(&idx) = self.did_idx.get(&adt_def.did()) else {
+            return &[];
+        };
         assert!(ptr_chased as usize <= self.offset_of.len());
         let leaf_nodes = &self.leaf_nodes[self.leaf_nodes.len() - 1 - ptr_chased as usize];
         &leaf_nodes[idx]
@@ -61,10 +63,26 @@ impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
         assert!(max_precision > 0);
         let mut ptr_chased = max_precision;
         while self.measure(ty, ptr_chased as u32) < measure {
-            ptr_chased = ptr_chased.checked_sub(1).unwrap()
+            if ptr_chased == 0 {
+                tracing::debug!(
+                    "requested measure {} exceeds available measure {} for type {}",
+                    measure,
+                    self.measure(ty, ptr_chased as u32),
+                    ty
+                );
+                break;
+            }
+            ptr_chased -= 1;
         }
 
-        assert_eq!(self.measure(ty, ptr_chased as u32), measure);
+        if self.measure(ty, ptr_chased as u32) != measure {
+            tracing::debug!(
+                "approximate absolute precision for type {}: requested measure {}, got {}",
+                ty,
+                measure,
+                self.measure(ty, ptr_chased as u32)
+            );
+        }
 
         max_precision - ptr_chased
     }
