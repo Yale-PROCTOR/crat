@@ -264,7 +264,7 @@ use rustc_hir::{
     intravisit,
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
 use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_paren},
@@ -348,6 +348,7 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
         fresh_pointer_renames,
         stmt_swaps,
         non_pointer_uses: visitor.ctx.non_pointer_uses,
+        string_literal_statics: visitor.ctx.string_literal_statics,
     };
 
     visitor.visit_crate(&mut expanded_ast);
@@ -441,11 +442,29 @@ struct AstVisitor<'tcx> {
     fresh_pointer_renames: FxHashMap<HirId, Symbol>,
     stmt_swaps: FxHashMap<HirId, Vec<usize>>,
     non_pointer_uses: FxHashSet<HirId>,
+    string_literal_statics: FxHashSet<LocalDefId>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn visit_item(&mut self, item: &mut Item) {
         mut_visit::walk_item(self, item);
+
+        // Replace *const i8 string literal statics with [i8; N] arrays
+        if let ItemKind::Static(box ref mut static_item) = item.kind
+            && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
+            && self.string_literal_statics.contains(def_id)
+            && let Some(ref init_expr) = static_item.expr
+        {
+            let inner = unwrap_cast_and_paren(init_expr);
+            if let ExprKind::Lit(lit) = &inner.kind
+                && matches!(lit.kind, token::LitKind::ByteStr)
+            {
+                let array_expr = transmute_expr(lit.symbol.as_str(), self.tcx.types.i8);
+                let len = byte_string_len(lit.symbol.as_str());
+                static_item.expr = Some(P(array_expr));
+                static_item.ty = Box::new(ty!("[i8; {len}]"));
+            }
+        }
 
         // remove unnecessary unsafe blocks after removing transmute
         let expr = match &mut item.kind {
@@ -569,10 +588,18 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             ExprKind::Path(_, _) => {
                 if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                     && let hir::ExprKind::Path(QPath::Resolved(_, path)) = hir_expr.kind
-                    && let Res::Local(hir_id) = path.res
-                    && let Some(name) = self.vars_to_replace.get(&hir_id)
                 {
-                    *expr = expr!("{name}");
+                    if let Res::Local(hir_id) = path.res
+                        && let Some(name) = self.vars_to_replace.get(&hir_id)
+                    {
+                        *expr = expr!("{name}");
+                    } else if let Res::Def(DefKind::Static { .. }, def_id) = path.res
+                        && let Some(local_def_id) = def_id.as_local()
+                        && self.string_literal_statics.contains(&local_def_id)
+                    {
+                        let path_str = pprust::expr_to_string(expr);
+                        *expr = expr!("{path_str}.as_ptr()");
+                    }
                 }
             }
             ExprKind::If(c, t, f) => {
@@ -821,6 +848,24 @@ fn expr_contains_ident(expr: &Expr, name: Symbol) -> bool {
 #[inline]
 fn is_lit(e: &Expr) -> bool {
     matches!(unwrap_cast_and_paren(e).kind, ExprKind::Lit(_))
+}
+
+fn is_byte_string_init(expr: &hir::Expr<'_>) -> bool {
+    match &expr.kind {
+        hir::ExprKind::Cast(inner, _) => is_byte_string_init(inner),
+        hir::ExprKind::Lit(lit) => matches!(lit.node, rustc_ast::LitKind::ByteStr(..)),
+        _ => false,
+    }
+}
+
+fn byte_string_len(s: &str) -> usize {
+    let mut len = 0;
+    rustc_literal_escaper::unescape_unicode(
+        s,
+        rustc_literal_escaper::Mode::ByteStr,
+        &mut |_, _| len += 1,
+    );
+    len
 }
 
 fn transmute_expr(s: &str, elem_ty: ty::Ty<'_>) -> Expr {
@@ -1097,6 +1142,8 @@ struct HirCtx {
     fresh_lets: FxHashMap<HirId, LhsFreshLet>,
     /// variables used without deref
     non_pointer_uses: FxHashSet<HirId>,
+    /// static def_ids whose type is *const i8 and initializer is a byte string literal
+    string_literal_statics: FxHashSet<LocalDefId>,
 }
 
 struct HirVisitor<'tcx> {
@@ -1126,6 +1173,23 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
+    }
+
+    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+        intravisit::walk_item(self, item);
+
+        if let hir::ItemKind::Static(_, _, _, body_id) = item.kind {
+            let def_id = item.owner_id.def_id;
+            let mir_ty = self.tcx.type_of(def_id).skip_binder();
+            if let ty::TyKind::RawPtr(inner, ty::Mutability::Not) = mir_ty.kind()
+                && (*inner == self.tcx.types.i8 || *inner == self.tcx.types.u8)
+            {
+                let body = self.tcx.hir_body(body_id);
+                if is_byte_string_init(body.value) {
+                    self.ctx.string_literal_statics.insert(def_id);
+                }
+            }
+        }
     }
 
     fn visit_block(&mut self, block: &'tcx hir::Block<'tcx>) {
@@ -2065,5 +2129,25 @@ pub unsafe extern "C" fn foo(mut c: *mut core::ffi::c_char) -> core::ffi::c_int 
             &["fn atoi("],
             &["#[inline]", "return strtol("],
         )
+    }
+
+    #[test]
+    fn test_string_literal_static() {
+        run_test(
+            r#"
+extern "C" {
+    fn printf(__format: *const core::ffi::c_char, ...) -> core::ffi::c_int;
+}
+#[no_mangle]
+pub static mut s: *const core::ffi::c_char = b"Hello, World!\0" as *const u8
+    as *const core::ffi::c_char;
+#[no_mangle]
+pub unsafe extern "C" fn foo() {
+    printf(b"%s\n\0" as *const u8 as *const core::ffi::c_char, s);
+}
+            "#,
+            &["[i8;", "as_ptr()"],
+            &["*const core::ffi::c_char ="],
+        );
     }
 }
