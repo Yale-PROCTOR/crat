@@ -6,7 +6,8 @@ use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::{
     visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
-    Body, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind, TerminatorKind,
+    Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind,
+    TerminatorKind,
 };
 
 use super::{whole_program::WholeProgramResults, Ownership};
@@ -72,16 +73,18 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         &self.model.raw[start.index()..end.index()]
     }
 
-    pub fn fn_sig(&self, r#fn: &DefId, tcx: rustc_middle::ty::TyCtxt) -> impl Iterator<Item = &[Qualifier]> {
+    pub fn fn_sig(
+        &self,
+        r#fn: &DefId,
+        tcx: rustc_middle::ty::TyCtxt,
+    ) -> impl Iterator<Item = &[Qualifier]> {
         let fn_result = self.fn_results(r#fn);
         let body = tcx.optimized_mir(*r#fn);
         fn_result.results().take(body.arg_count + 1)
     }
 
     fn print_fn_sigs(&self, tcx: rustc_middle::ty::TyCtxt, fns: &[DefId])
-    where
-        Qualifier: std::fmt::Display,
-    {
+    where Qualifier: std::fmt::Display {
         for did in fns {
             let mut fn_sig = self.fn_sig(did, tcx);
             let ret = fn_sig.next().unwrap();
@@ -94,13 +97,13 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
     }
 
     fn print_struct_sigs(&self, tcx: rustc_middle::ty::TyCtxt, structs: &[DefId])
-    where
-        Qualifier: std::fmt::Display,
-    {
+    where Qualifier: std::fmt::Display {
         for did in structs {
             let struct_results = self.struct_results(did);
             let struct_ty = tcx.type_of(*did).skip_binder();
-            let rustc_middle::ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else { unreachable!() };
+            let rustc_middle::ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else {
+                unreachable!()
+            };
             println!("{} {{", tcx.def_path_str(*did));
             for (field_def, qualifiers) in adt_def.all_fields().zip(struct_results) {
                 println!(
@@ -114,9 +117,7 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
     }
 
     pub fn print_results(&self, program: &RustProgram)
-    where
-        Qualifier: std::fmt::Display,
-    {
+    where Qualifier: std::fmt::Display {
         let structs = program
             .structs
             .iter()
@@ -262,7 +263,9 @@ impl<'tcx> WholeProgramResults<'tcx> {
 
             let mut proxy_temporaries = FxHashSet::default();
             for bb_data in body.basic_blocks.iter() {
-                let Some(terminator) = &bb_data.terminator else { continue; };
+                let Some(terminator) = &bb_data.terminator else {
+                    continue;
+                };
                 if let TerminatorKind::Call { args, .. } = &terminator.kind {
                     proxy_temporaries.extend(
                         args.iter()
@@ -271,7 +274,11 @@ impl<'tcx> WholeProgramResults<'tcx> {
                 }
             }
             for (local, local_decl) in body.local_decls.iter_enumerated() {
-                if matches!(local_decl.local_info(), LocalInfo::DerefTemp) {
+                if matches!(
+                    local_decl.local_info.as_ref(),
+                    ClearCrossCrate::Set(local_info)
+                        if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
+                ) {
                     proxy_temporaries.insert(local);
                 }
             }

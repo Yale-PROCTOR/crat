@@ -1,15 +1,16 @@
 use std::{num::NonZeroU32, ops::Range};
 
-use crate::analyses::ownership::vec_vec::VecVec;
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::{LocalDecl, LocalInfo},
+    mir::{ClearCrossCrate, LocalDecl, LocalInfo},
     ty::TyKind,
 };
 
 use super::consume::Voidable;
-use crate::analyses::ownership::{ptr::Measurable, struct_ctxt::StructCtxt, CrateCtxt};
+use crate::analyses::ownership::{
+    ptr::Measurable, struct_ctxt::StructCtxt, vec_vec::VecVec, CrateCtxt,
+};
 
 pub mod infer;
 // pub mod prune;
@@ -68,9 +69,11 @@ pub fn local_measure<'tcx>(
 ) -> Option<NonZeroU32> {
     let ty = local_decl.ty;
     let measure = measurable.measure(ty, 0);
-    (!matches!(local_decl.local_info(), LocalInfo::DerefTemp))
-        .then(|| NonZeroU32::new(measure))
-        .flatten()
+    let is_deref_temp = matches!(
+        local_decl.local_info.as_ref(),
+        ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
+    );
+    (!is_deref_temp).then(|| NonZeroU32::new(measure)).flatten()
 }
 
 #[inline]
@@ -213,8 +216,7 @@ pub trait Mode {
     /// `Store<'a>` is a reference to a storage that holds
     /// the newly added constraint.
     type Store<'a>
-    where
-        Self: 'a;
+    where Self: 'a;
     fn store_linear(store: Self::Store<'_>, x: Var, y: Var, z: Var);
 
     fn store_assumption(store: Self::Store<'_>, x: Var, sign: bool);
@@ -457,8 +459,7 @@ impl Database for Z3Database {
         for sig in sigs.clone() {
             assert_eq!(
                 sig,
-                self.z3_ast
-                    .push(z3::ast::Bool::new_const(sig.as_u32()))
+                self.z3_ast.push(z3::ast::Bool::new_const(sig.as_u32()))
             )
         }
         sigs
@@ -466,11 +467,9 @@ impl Database for Z3Database {
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver
-            .assert(&z3::ast::Bool::or(&[&!x, &!y]));
+        self.solver.assert(&z3::ast::Bool::or(&[&!x, &!y]));
         self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
-        self.solver
-            .assert(&z3::ast::Bool::or(&[x, y, &!z]));
+        self.solver.assert(&z3::ast::Bool::or(&[x, y, &!z]));
         self.solver.assert(&z3::ast::Bool::or(&[&!y, z]));
     }
 
@@ -493,8 +492,7 @@ impl Database for Z3Database {
 
     fn push_approx_linear_impl(&mut self, x: Var, y: Var, z: Var) {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver
-            .assert(&z3::ast::Bool::or(&[&!x, &!y]));
+        self.solver.assert(&z3::ast::Bool::or(&[&!x, &!y]));
         self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
         self.solver.assert(&z3::ast::Bool::or(&[&!y, z]));
     }
@@ -503,7 +501,6 @@ impl Database for Z3Database {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
         self.solver.assert(&z3::ast::Bool::or(&[&!x, &y]));
         self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
-        self.solver
-            .assert(&z3::ast::Bool::or(&[x, &!y, &!z]));
+        self.solver.assert(&z3::ast::Bool::or(&[x, &!y, &!z]));
     }
 }

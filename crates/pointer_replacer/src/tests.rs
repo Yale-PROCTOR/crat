@@ -1500,3 +1500,265 @@ pub unsafe extern "C" fn bar() {
         &[],
     );
 }
+
+mod ownership_analysis {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hir::{def_id::DefId, ItemKind, OwnerNode};
+    use rustc_middle::{mir::Local, ty::TyCtxt};
+    use rustc_span::def_id::LocalDefId;
+
+    use crate::{
+        analyses::{
+            output_params::compute_output_params,
+            ownership::{
+                ssa::{consume::Consume, AnalysisResults},
+                whole_program::WholeProgramAnalysis,
+                AnalysisKind, CrateCtxt, Ownership, Param,
+            },
+            type_qualifier::foster::mutability::mutability_analysis,
+        },
+        utils::rustc::RustProgram,
+    };
+
+    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
+        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    }
+
+    fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn analyze_program<'tcx>(
+        program: &RustProgram<'tcx>,
+    ) -> crate::analyses::ownership::whole_program::WholeProgramResults<'tcx> {
+        let mutability_result = mutability_analysis(program);
+        let aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>> =
+            FxHashMap::default();
+        let output_params = compute_output_params(program, &mutability_result, &aliases);
+        let crate_ctxt = CrateCtxt::new(program);
+        <WholeProgramAnalysis as AnalysisKind>::analyze(crate_ctxt, &output_params)
+            .expect("ownership analysis should succeed")
+    }
+
+    fn find_function(program: &RustProgram<'_>, name: &str) -> DefId {
+        program
+            .functions
+            .iter()
+            .map(|did| did.to_def_id())
+            .find(|&did| {
+                let path = program.tcx.def_path_str(did);
+                path.rsplit("::").next() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    #[test]
+    fn ownership_from_option_and_display() {
+        assert_eq!(Ownership::from(Some(true)), Ownership::Owning);
+        assert_eq!(Ownership::from(Some(false)), Ownership::Transient);
+        assert_eq!(Ownership::from(None), Ownership::Unknown);
+
+        assert_eq!(Ownership::Owning.to_string(), "&move");
+        assert_eq!(Ownership::Transient.to_string(), "&");
+        assert_eq!(Ownership::Unknown.to_string(), "&any");
+    }
+
+    #[test]
+    fn param_helpers_cover_normal_and_output_variants() {
+        let normal = Param::Normal(7u8);
+        assert!(!normal.is_output());
+        assert_eq!(normal.clone().to_input(), 7);
+        assert_eq!(normal.clone().to_output(), None);
+        assert_eq!(normal.clone().expect_normal(), 7);
+
+        let output = Param::Output(Consume {
+            r#use: 11u8,
+            def: 13u8,
+        });
+        assert!(output.is_output());
+        assert_eq!(output.clone().to_input(), 11);
+        assert_eq!(output.clone().to_output(), Some(13));
+        let consume = output.clone().expect_output();
+        assert_eq!(consume.r#use, 11);
+        assert_eq!(consume.def, 13);
+
+        let mapped = output.map(|x| x as u16 + 1);
+        let mapped = mapped.expect_output();
+        assert_eq!(mapped.r#use, 12);
+        assert_eq!(mapped.def, 14);
+    }
+
+    #[test]
+    fn malloc_source_marks_return_as_owning() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    malloc(4)
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let alloc_one = find_function(&program, "alloc_one");
+
+                let ret = results
+                    .fn_sig(alloc_one)
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .expect_normal();
+                assert_eq!(ret, [Ownership::Owning]);
+            },
+        );
+    }
+
+    #[test]
+    fn free_sink_clears_ownership_before_return() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut i32);
+}
+
+pub unsafe fn alloc_then_free() -> *mut i32 {
+    let p = malloc(4);
+    free(p);
+    p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let did = find_function(&program, "alloc_then_free");
+
+                // `free` is modeled as a sink, so returning the same pointer should not
+                // keep it in an owning state.
+                let ret = results.fn_sig(did).next().unwrap().unwrap().expect_normal();
+                assert_eq!(ret, [Ownership::Transient]);
+            },
+        );
+    }
+
+    #[test]
+    fn ownership_propagates_through_local_function_calls() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc() -> *mut i32 {
+    malloc(4)
+}
+
+pub unsafe fn wrapper() -> *mut i32 {
+    alloc()
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+
+                let alloc = find_function(&program, "alloc");
+                let wrapper = find_function(&program, "wrapper");
+
+                let alloc_ret = results
+                    .fn_sig(alloc)
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .expect_normal();
+                let wrapper_ret = results
+                    .fn_sig(wrapper)
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .expect_normal();
+
+                assert_eq!(alloc_ret, [Ownership::Owning]);
+                assert_eq!(wrapper_ret, [Ownership::Owning]);
+            },
+        );
+    }
+
+    #[test]
+    fn unknown_foreign_calls_are_treated_conservatively() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn mystery(ptr: *mut i32) -> *mut i32;
+}
+
+pub unsafe fn passthrough_unknown(p: *mut i32) -> *mut i32 {
+    mystery(p)
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let did = find_function(&program, "passthrough_unknown");
+
+                let mut sig = results.fn_sig(did);
+                let ret = sig.next().unwrap().unwrap().expect_normal();
+                let arg = sig.next().unwrap().unwrap().expect_output();
+
+                // For unknown calls, the analysis borrows the destination and only lends args.
+                assert_eq!(ret, [Ownership::Transient]);
+                assert_eq!(arg.r#use[0], Ownership::Owning);
+                assert_eq!(arg.def[0], Ownership::Owning);
+            },
+        );
+    }
+
+    #[test]
+    fn mutable_pointer_to_pointer_argument_becomes_output_param() {
+        run_compiler(
+            r#"
+pub unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
+    *out = value;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let did = find_function(&program, "write_out");
+
+                let mut sig = results.fn_sig(did);
+                assert!(sig.next().unwrap().is_none());
+
+                let output_like = sig.next().unwrap().unwrap();
+                let passthrough = sig.next().unwrap().unwrap();
+
+                let output_like = output_like.expect_output();
+                assert_eq!(output_like.r#use[0], Ownership::Owning);
+                assert_eq!(output_like.def[0], Ownership::Owning);
+                assert!(matches!(passthrough, Param::Normal(_)));
+            },
+        );
+    }
+}

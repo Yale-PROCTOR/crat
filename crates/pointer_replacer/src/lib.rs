@@ -8,6 +8,7 @@
 #![feature(impl_trait_in_assoc_type)]
 #![warn(unused_extern_crates)]
 
+extern crate either;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
@@ -20,14 +21,13 @@ extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
 extern crate rustc_span;
 extern crate rustc_type_ir;
-extern crate either;
 extern crate smallvec;
 
 mod analyses;
 mod rewriter;
 mod utils;
 
-pub use rewriter::{Config, replace_local_borrows};
+pub use rewriter::{replace_local_borrows, Config};
 
 #[cfg(test)]
 mod tests;

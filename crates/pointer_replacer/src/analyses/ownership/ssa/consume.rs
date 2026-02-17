@@ -1,11 +1,10 @@
-use crate::analyses::ownership::vec_vec::{VecVec, VecVecConstruction};
 use rustc_data_structures::sso::SsoHashSet;
 use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::{
     mir::{
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
-        BasicBlock, BasicBlockData, Body, CastKind, Local, LocalInfo, Location, Place,
-        ProjectionElem, Rvalue, TerminatorKind,
+        BasicBlock, BasicBlockData, Body, CastKind, ClearCrossCrate, Local, LocalInfo, Location,
+        Place, ProjectionElem, Rvalue, TerminatorKind,
     },
     ty::TyCtxt,
 };
@@ -14,6 +13,7 @@ use smallvec::SmallVec;
 use crate::analyses::ownership::{
     ptr::Measurable,
     ssa::{constraint::local_has_non_zero_measure, state::SSAIdx},
+    vec_vec::{VecVec, VecVecConstruction},
     CrateCtxt,
 };
 
@@ -117,8 +117,7 @@ impl Consume<SSAIdx> {
 }
 
 impl<Iter, T> Consume<Iter>
-where
-    Iter: Iterator<Item = T>,
+where Iter: Iterator<Item = T>
 {
     pub fn transpose(self) -> impl Iterator<Item = Consume<T>> {
         self.r#use
@@ -222,7 +221,9 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
 
     let mut call_arg_temps: SsoHashSet<Local> = SsoHashSet::default();
     for bb_data in body.basic_blocks.iter() {
-        let Some(terminator) = &bb_data.terminator else { continue; };
+        let Some(terminator) = &bb_data.terminator else {
+            continue;
+        };
         if let TerminatorKind::Call { args, .. } = &terminator.kind {
             call_arg_temps.extend(
                 args.iter()
@@ -287,7 +288,7 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
                 Rvalue::Cast(CastKind::PointerWithExposedProvenance, operand, _)
                     if operand.place().is_some() =>
                 {
-                    return
+                    return;
                 }
                 Rvalue::BinaryOp(_, _)
                 | Rvalue::UnaryOp(_, _)
@@ -329,14 +330,18 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
             }
 
             let ty = place.ty(self.body, self.tcx).ty;
-            let local_info = self.body.local_decls[place.local].local_info();
+            let is_deref_temp = matches!(
+                self.body.local_decls[place.local].local_info.as_ref(),
+                ClearCrossCrate::Set(local_info)
+                    if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
+            );
 
             // generate consumes with base local non-empty
             if self
                 .crate_ctxt
                 .struct_ctxt
                 .contains_ptr(self.body.local_decls[place.local].ty)
-                && !matches!(local_info, LocalInfo::DerefTemp)
+                && !is_deref_temp
                 && !self.call_arg_temps.contains(&place.local)
             {
                 let consume = if self.crate_ctxt.struct_ctxt.contains_ptr(ty)
