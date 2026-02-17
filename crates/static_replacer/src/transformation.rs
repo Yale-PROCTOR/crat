@@ -290,6 +290,8 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     && let name = call.seg.ident.name.as_str()
                     && (name == "as_mut_ptr"
                         || name == "as_ptr"
+                        || name == "as_mut"
+                        || name == "take"
                         || name == "copy_from_slice"
                         || name == "fill")
                 {
@@ -718,6 +720,23 @@ unsafe fn f() {
 }
 unsafe fn g(x: i32, y: i32) {}
 unsafe fn h(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_option_methods() {
+        let code = r#"
+static mut S: Option<i32> = None;
+unsafe fn f() {
+    S = Some(1);
+    if S.as_mut().is_some() {}
+    let _x = S.take();
+}
 "#;
         run_test(
             code,
