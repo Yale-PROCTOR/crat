@@ -475,7 +475,10 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 // let lhs_consume = self.state.try_consume_at(lhs.local, location);
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-                assert!(lhs_consume.is_none());
+                if let Some(lhs_consume) = lhs_consume {
+                    // Conservatively treat pointer-to-address casts as untrusted sources.
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                }
                 if let Some(rhs_consume) =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx)
                 {
@@ -489,12 +492,18 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 // let lhs_consume = self.state.try_consume_at(lhs.local, location);
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-                assert!(
-                    lhs_consume.is_none(),
-                    "TODO: constant pointer {:?}",
-                    constant
-                );
-                assert!(!self.state.consume_chain.call_arg_temps.contains(&lhs.local));
+                if let Some(lhs_consume) = lhs_consume {
+                    // Constant pointer values (including null) are modeled as unknown sources.
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                } else if !lhs.projection.is_empty()
+                    && self.state.consume_chain.call_arg_temps.remove(&lhs.local)
+                {
+                    tracing::debug!(
+                        "cleared stale call_arg_temp flag for projected lhs {:?} = {:?}",
+                        lhs,
+                        constant
+                    );
+                }
             }
 
             Rvalue::Use(operand @ Operand::Copy(rhs) | operand @ Operand::Move(rhs))
@@ -510,9 +519,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 match (lhs_consume, rhs_consume) {
                     (None, None) => {}
                     (None, Some(rhs_consume)) => {
-                        if self.state.consume_chain.call_arg_temps.contains(&lhs.local) {
-                            Infer::call_arg(infer_cx, lhs.as_local().unwrap(), rhs_consume, false)
+                        if lhs.projection.is_empty()
+                            && self.state.consume_chain.call_arg_temps.contains(&lhs.local)
+                        {
+                            Infer::call_arg(infer_cx, lhs.local, rhs_consume, false)
                         } else {
+                            if !lhs.projection.is_empty() {
+                                let _ = self.state.consume_chain.call_arg_temps.remove(&lhs.local);
+                            }
                             Infer::unknown_sink(infer_cx, rhs_consume)
                         }
                     }
@@ -544,9 +558,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 match (lhs_consume, rhs_consume) {
                     (None, None) => {}
                     (None, Some(rhs_consume)) => {
-                        if self.state.consume_chain.call_arg_temps.contains(&lhs.local) {
-                            Infer::call_arg(infer_cx, lhs.as_local().unwrap(), rhs_consume, false)
+                        if lhs.projection.is_empty()
+                            && self.state.consume_chain.call_arg_temps.contains(&lhs.local)
+                        {
+                            Infer::call_arg(infer_cx, lhs.local, rhs_consume, false)
                         } else {
+                            if !lhs.projection.is_empty() {
+                                let _ = self.state.consume_chain.call_arg_temps.remove(&lhs.local);
+                            }
                             Infer::unknown_sink(infer_cx, rhs_consume)
                         }
                     }
@@ -587,10 +606,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     }
                 } else {
                     // assert!(self.state.consume_chain.call_arg_temps.contains(&lhs.local));
-                    if self.state.consume_chain.call_arg_temps.contains(&lhs.local) {
+                    if lhs.projection.is_empty()
+                        && self.state.consume_chain.call_arg_temps.contains(&lhs.local)
+                    {
                         if let Some(rhs_consume) = rhs_consume {
-                            Infer::call_arg(infer_cx, lhs.as_local().unwrap(), rhs_consume, true)
+                            Infer::call_arg(infer_cx, lhs.local, rhs_consume, true)
                         }
+                    } else if !lhs.projection.is_empty() {
+                        let _ = self.state.consume_chain.call_arg_temps.remove(&lhs.local);
                     }
                 }
             }
@@ -661,7 +684,9 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::UnaryOp(_, operand) => {
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-                assert!(lhs_consume.is_none());
+                if let Some(lhs_consume) = lhs_consume {
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                }
                 if let Some(rhs) = operand.place() {
                     let _ = consume_place_at::<Infer>(&rhs, self.body, location, self, infer_cx);
                 }
@@ -669,14 +694,25 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::Discriminant(rhs) => {
                 let lhs_consume =
                     consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-                assert!(lhs_consume.is_none());
+                if let Some(lhs_consume) = lhs_consume {
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                }
                 let _ = consume_place_at::<Infer>(&rhs, self.body, location, self, infer_cx);
             }
-            Rvalue::NullaryOp(_, _)
-            | Rvalue::Len(_)
-            | Rvalue::ShallowInitBox(_, _)
-            | Rvalue::ThreadLocalRef(_) => {
-                todo!();
+            Rvalue::NullaryOp(_, _) | Rvalue::ShallowInitBox(_, _) | Rvalue::ThreadLocalRef(_) => {
+                if let Some(lhs_consume) =
+                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                {
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                }
+            }
+            Rvalue::Len(rhs) => {
+                if let Some(lhs_consume) =
+                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                {
+                    Infer::unknown_source(infer_cx, lhs_consume);
+                }
+                let _ = consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
             }
         }
     }

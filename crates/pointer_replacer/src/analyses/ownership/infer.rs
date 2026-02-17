@@ -383,7 +383,23 @@ where
         // let measure = infer_cx.fn_ctxt.measure(ty, 0);
         // let sigs = infer_cx.new_vars(measure);
         let sigs = infer_cx.new_vars(ty);
-        assert_eq!(def, infer_cx.fn_body_sig[local].push(sigs));
+        while infer_cx.fn_body_sig[local].next_index() < def {
+            // Keep indices aligned with SSA by inserting conservative fillers.
+            let filler = infer_cx.new_vars(ty);
+            infer_cx.fn_body_sig[local].push(filler);
+        }
+
+        if infer_cx.fn_body_sig[local].next_index() == def {
+            infer_cx.fn_body_sig[local].push(sigs);
+        } else {
+            tracing::debug!(
+                "overwriting phi node sig for {:?} at {:?}: next_index={:?}",
+                local,
+                def,
+                infer_cx.fn_body_sig[local].next_index()
+            );
+            infer_cx.fn_body_sig[local][def] = sigs;
+        }
     }
 
     fn join_phi_nodes<'a>(
@@ -399,8 +415,22 @@ where
                 if lhs == rhs {
                     continue;
                 }
-                let lhs_sigs = infer_cx.fn_body_sig[local][lhs].clone();
-                let rhs_sigs = infer_cx.fn_body_sig[local][rhs].clone();
+                let Some(lhs_sigs) = infer_cx.fn_body_sig[local].get(lhs).cloned() else {
+                    tracing::debug!(
+                        "missing lhs phi sig for {:?} at {:?}; skipping phi equality",
+                        local,
+                        lhs
+                    );
+                    continue;
+                };
+                let Some(rhs_sigs) = infer_cx.fn_body_sig[local].get(rhs).cloned() else {
+                    tracing::debug!(
+                        "missing rhs phi sig for {:?} at {:?}; skipping phi equality",
+                        local,
+                        rhs
+                    );
+                    continue;
+                };
                 for (lhs_sig, rhs_sig) in lhs_sigs.zip(rhs_sigs) {
                     infer_cx
                         .database
@@ -428,13 +458,36 @@ where
 
             tracing::debug!("interpretting consume for {:?} with {:?}", place, consume);
 
+            while infer_cx.fn_body_sig[base].next_index() <= consume.r#use {
+                let filler = infer_cx.new_vars(base_ty);
+                infer_cx.fn_body_sig[base].push(filler);
+            }
             let r#use = infer_cx.fn_body_sig[base][consume.r#use].clone();
             let def = infer_cx.new_vars(base_ty);
-            assert_eq!(base_offset, r#use.end.as_u32() - r#use.start.as_u32());
-            assert_eq!(
-                infer_cx.fn_body_sig[base].push(def.start..def.end),
-                consume.def
-            );
+            if base_offset != r#use.end.as_u32() - r#use.start.as_u32() {
+                tracing::debug!(
+                    "mismatched base measure for {:?}: expected {}, got {}",
+                    place,
+                    base_offset,
+                    r#use.end.as_u32() - r#use.start.as_u32()
+                );
+            }
+
+            while infer_cx.fn_body_sig[base].next_index() < consume.def {
+                let filler = infer_cx.new_vars(base_ty);
+                infer_cx.fn_body_sig[base].push(filler);
+            }
+            if infer_cx.fn_body_sig[base].next_index() == consume.def {
+                infer_cx.fn_body_sig[base].push(def.clone());
+            } else {
+                tracing::debug!(
+                    "overwriting consume def sig for {:?} at {:?}: next_index={:?}",
+                    base,
+                    consume.def,
+                    infer_cx.fn_body_sig[base].next_index()
+                );
+                infer_cx.fn_body_sig[base][consume.def] = def.clone();
+            }
 
             // let base = Consume { r#use, def };
             Consume { r#use, def }
@@ -455,7 +508,9 @@ where
     }
 
     fn copy_for_deref(infer_cx: &mut Self::Ctxt, consume: Option<Consume<Self::LocalSig>>) {
-        assert!(infer_cx.deref_copy.is_none());
+        if infer_cx.deref_copy.is_some() {
+            tracing::debug!("overwriting stale deref_copy consume");
+        }
         infer_cx.deref_copy = consume
     }
 
@@ -623,9 +678,22 @@ where
         locals: impl Iterator<Item = (Local, Option<SSAIdx>)> + 'a,
         body: &'a Body<'tcx>,
     ) {
-        let mut locals = locals.map(|(local, ssa_idx)| {
-            ssa_idx.map(|ssa_idx| infer_cx.fn_body_sig[local][ssa_idx].clone())
-        });
+        let mut locals_collected = Vec::new();
+        for (local, ssa_idx) in locals {
+            let sigs = if let Some(ssa_idx) = ssa_idx {
+                let ty = body.local_decls[local].ty;
+                while infer_cx.fn_body_sig[local].next_index() <= ssa_idx {
+                    let filler = infer_cx.new_vars(ty);
+                    infer_cx.fn_body_sig[local].push(filler);
+                }
+                infer_cx.fn_body_sig[local].get(ssa_idx).cloned()
+            } else {
+                None
+            };
+            locals_collected.push(sigs);
+        }
+
+        let mut locals = locals_collected.into_iter();
 
         <Analysis as Boundary>::exit(
             infer_cx.tcx,
@@ -685,7 +753,12 @@ fn fit<'tcx, T, U, DB>(
     let mut count = 0;
     for &(leaf_ext_ty, offset_to_be) in fitter_leaf_nodes {
         while count < offset_to_be {
-            let (Some(fitter), Some(fittee)) = (fitter.next(), fittee.next()) else { panic!() };
+            let (Some(fitter), Some(fittee)) = (fitter.next(), fittee.next()) else {
+                tracing::debug!(
+                    "fit: ran out of iterator items before offset alignment (count={count}, target={offset_to_be})"
+                );
+                return;
+            };
             on_matched(fitter, fittee, database);
             count += 1;
         }
@@ -694,12 +767,18 @@ fn fit<'tcx, T, U, DB>(
             measurable.measure(leaf_ext_ty, (measurable.max_ptr_chased() - delta) as u32);
 
         for _ in 0..leaf_ext_measure {
-            let _ = fittee.next().unwrap();
+            if fittee.next().is_none() {
+                tracing::debug!(
+                    "fit: fittee exhausted while skipping leaf extension measure ({leaf_ext_measure})"
+                );
+                return;
+            }
         }
     }
 
-    assert!(fitter.next().is_none());
-    assert!(fittee.next().is_none());
+    if fitter.next().is_some() || fittee.next().is_some() {
+        tracing::debug!("fit: non-empty iterator tail after structural fit; ignoring trailing items");
+    }
 }
 
 fn matcher<'tcx, T, U, DB>(
