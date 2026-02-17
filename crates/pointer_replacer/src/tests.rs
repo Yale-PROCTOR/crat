@@ -1761,4 +1761,146 @@ pub unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
             },
         );
     }
+
+    #[test]
+    fn solidify_marks_return_local_as_owning_for_malloc() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    malloc(4)
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let solidified = results.solidify(&program);
+                let did = find_function(&program, "alloc_one");
+
+                let return_local = Local::from_u32(0);
+                let ret_local = solidified.fn_results(&did).local_result(return_local);
+                assert_eq!(ret_local, [Ownership::Owning]);
+            },
+        );
+    }
+
+    #[test]
+    fn refinement_reaches_high_precision_for_nested_pointer_output() {
+        run_compiler(
+            r#"
+pub unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
+    *out = value;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let did = find_function(&program, "write_out");
+                assert!(
+                    results.precision(&did) >= 2,
+                    "nested pointer flow should keep precision >= 2",
+                );
+
+                let solidified = results.solidify(&program);
+                let output_param = solidified.fn_results(&did).local_result(Local::from_u32(1));
+                assert_eq!(output_param.len(), 2);
+                assert_eq!(output_param[0], Ownership::Owning);
+            },
+        );
+    }
+
+    #[test]
+    fn refinement_drops_precision_for_conflicting_phi_merge() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn phi_merge(flag: bool, p: *mut i32) -> *mut i32 {
+    let mut x: *mut i32 = p;
+    if flag {
+        x = malloc(4);
+    }
+    x
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let did = find_function(&program, "phi_merge");
+                assert_eq!(
+                    results.precision(&did),
+                    0,
+                    "conflicting phi merge should force conservative precision fallback",
+                );
+
+                let solidified = results.solidify(&program);
+                let body = tcx.optimized_mir(did);
+                let fn_results = solidified.fn_results(&did);
+
+                let ptr_temporaries = body
+                    .local_decls
+                    .iter_enumerated()
+                    .filter(|(local, decl)| {
+                        decl.ty.is_raw_ptr()
+                            && local.index() > body.arg_count
+                            && local.index() != 0
+                    })
+                    .map(|(local, _)| local)
+                    .collect::<Vec<_>>();
+
+                assert!(
+                    !ptr_temporaries.is_empty(),
+                    "expected at least one pointer temporary around branch merge",
+                );
+
+                assert!(ptr_temporaries.iter().all(|&local| {
+                    fn_results
+                        .local_result(local)
+                        .first()
+                        .is_none_or(|ownership| !ownership.is_owning())
+                }));
+            },
+        );
+    }
+
+    #[test]
+    fn solidify_struct_field_results_are_exposed() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn make_holder() -> Holder {
+    Holder { p: malloc(4) }
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let solidified = results.solidify(&program);
+
+                let holder = program
+                    .structs
+                    .iter()
+                    .map(|did| did.to_def_id())
+                    .find(|&did| tcx.def_path_str(did).rsplit("::").next() == Some("Holder"))
+                    .expect("struct `Holder` not found");
+
+                let fields = solidified.struct_results(&holder).collect::<Vec<_>>();
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].len(), 1);
+            },
+        );
+    }
 }
