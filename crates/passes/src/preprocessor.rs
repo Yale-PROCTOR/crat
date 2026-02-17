@@ -1420,15 +1420,27 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         .contains(&local_def_id)
                 {
                     let (_, parent) = self.tcx.hir_parent_iter(expr.hir_id).next().unwrap();
-                    if !matches!(
-                        parent,
-                        hir::Node::Expr(hir::Expr {
+                    if let hir::Node::Expr(
+                        parent_expr @ hir::Expr {
                             kind: hir::ExprKind::Index(..),
                             ..
-                        })
-                    ) {
+                        },
+                    ) = parent
+                    {
+                        if is_lhs(parent_expr, self.tcx) {
+                            self.ctx.array_string_literal_statics.remove(&local_def_id);
+                        }
+                    } else {
                         self.ctx.array_string_literal_statics.remove(&local_def_id);
                     }
+                }
+
+                if let Res::Def(DefKind::Static { .. }, def_id) = path.res
+                    && let Some(local_def_id) = def_id.as_local()
+                    && self.ctx.string_literal_statics.contains(&local_def_id)
+                    && is_lhs(expr, self.tcx)
+                {
+                    self.ctx.string_literal_statics.remove(&local_def_id);
                 }
             }
             _ => {}
@@ -2262,6 +2274,42 @@ pub unsafe extern "C" fn foo() {
             "#,
             &["[&[i8]; 2]", "as_ptr()"],
             &["[*const core::ffi::c_char; 2]"],
+        );
+    }
+
+    #[test]
+    fn test_string_literal_static_assign() {
+        run_test(
+            r#"
+#[no_mangle]
+pub static mut s: *const core::ffi::c_char = b"Hello, World!\0" as *const u8
+    as *const core::ffi::c_char;
+#[no_mangle]
+pub unsafe extern "C" fn foo() {
+    s = b"Hi\0" as *const u8 as *const core::ffi::c_char;
+}
+            "#,
+            &["*const core::ffi::c_char ="],
+            &["[i8;"],
+        );
+    }
+
+    #[test]
+    fn test_array_string_literal_static_assign() {
+        run_test(
+            r#"
+#[no_mangle]
+pub static mut s: [*const core::ffi::c_char; 2] = [
+    b"Hello\0" as *const u8 as *const core::ffi::c_char,
+    b"World\0" as *const u8 as *const core::ffi::c_char,
+];
+#[no_mangle]
+pub unsafe extern "C" fn foo() {
+    s[0 as core::ffi::c_int as usize] = b"Hi\0" as *const u8 as *const core::ffi::c_char;
+}
+            "#,
+            &["[*const core::ffi::c_char; 2]"],
+            &["[&[i8]; 2]"],
         );
     }
 }
