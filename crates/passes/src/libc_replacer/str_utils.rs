@@ -33,14 +33,14 @@ impl super::TransformVisitor<'_> {
                 let array1 = pprust::expr_to_string(array1);
                 let array2 = pprust::expr_to_string(array2);
                 return Some(utils::expr!(
-                    "({array1})[..({n_str})].copy_from_slice(&({array2})[..({n_str})])"
+                    "(&mut ({array1}))[..({n_str})].copy_from_slice(&({array2})[..({n_str})])"
                 ));
             } else if ty1 == self.tcx.types.u8 || ty1 == self.tcx.types.i8 {
                 self.bytemuck = true;
                 let array1 = pprust::expr_to_string(array1);
                 let array2 = pprust::expr_to_string(array2);
                 return Some(utils::expr!(
-                    "({array1})[..({n_str})].copy_from_slice(bytemuck::cast_slice(&({array2})[..({n_str})]))"
+                    "(&mut ({array1}))[..({n_str})].copy_from_slice(bytemuck::cast_slice(&({array2})[..({n_str})]))"
                 ));
             }
         }
