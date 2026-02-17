@@ -335,6 +335,16 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
         }
     }
 
+    visitor
+        .ctx
+        .string_literal_statics
+        .retain(|def_id| !visitor.ctx.string_literal_static_excludes.contains(def_id));
+    visitor.ctx.array_string_literal_statics.retain(|def_id| {
+        !visitor
+            .ctx
+            .array_string_literal_static_excludes
+            .contains(def_id)
+    });
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
@@ -1201,9 +1211,11 @@ struct HirCtx {
     non_pointer_uses: FxHashSet<HirId>,
     /// static def_ids whose type is *const i8 and initializer is a byte string literal
     string_literal_statics: FxHashSet<LocalDefId>,
+    string_literal_static_excludes: FxHashSet<LocalDefId>,
     /// static def_ids whose type is [*const i8; N] with all byte string literal elements,
     /// where every use is an index expression
     array_string_literal_statics: FxHashSet<LocalDefId>,
+    array_string_literal_static_excludes: FxHashSet<LocalDefId>,
 }
 
 struct HirVisitor<'tcx> {
@@ -1414,10 +1426,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
                 if let Res::Def(DefKind::Static { .. }, def_id) = path.res
                     && let Some(local_def_id) = def_id.as_local()
-                    && self
-                        .ctx
-                        .array_string_literal_statics
-                        .contains(&local_def_id)
                 {
                     let (_, parent) = self.tcx.hir_parent_iter(expr.hir_id).next().unwrap();
                     if let hir::Node::Expr(
@@ -1428,19 +1436,22 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     ) = parent
                     {
                         if is_lhs(parent_expr, self.tcx) {
-                            self.ctx.array_string_literal_statics.remove(&local_def_id);
+                            self.ctx
+                                .array_string_literal_static_excludes
+                                .insert(local_def_id);
                         }
                     } else {
-                        self.ctx.array_string_literal_statics.remove(&local_def_id);
+                        self.ctx
+                            .array_string_literal_static_excludes
+                            .insert(local_def_id);
                     }
                 }
 
                 if let Res::Def(DefKind::Static { .. }, def_id) = path.res
                     && let Some(local_def_id) = def_id.as_local()
-                    && self.ctx.string_literal_statics.contains(&local_def_id)
                     && is_lhs(expr, self.tcx)
                 {
-                    self.ctx.string_literal_statics.remove(&local_def_id);
+                    self.ctx.string_literal_static_excludes.insert(local_def_id);
                 }
             }
             _ => {}
