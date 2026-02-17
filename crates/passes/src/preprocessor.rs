@@ -414,13 +414,11 @@ fn replace_inline_extern_fns(items: &mut ThinVec<P<Item>>) {
         .find(|item| matches!(&item.kind, ItemKind::ForeignMod(fm) if fm.safety == Safety::Default))
     {
         let ItemKind::ForeignMod(fm) = &mut foreign_mod_item.kind else { unreachable!() };
-        for decl_str in &extern_decls {
+        for decl_str in extern_decls {
             // Parse as: extern "C" { fn ...; }
-            let parsed = utils::ast::parse_items(format!("extern \"C\" {{ {decl_str} }}"));
-            let ItemKind::ForeignMod(parsed_fm) = &parsed[0].kind else { panic!() };
-            for fi in &parsed_fm.items {
-                fm.items.push(fi.clone());
-            }
+            let mut parsed = utils::ast::parse_items(format!("extern \"C\" {{ {decl_str} }}"));
+            let ItemKind::ForeignMod(parsed_fm) = &mut parsed[0].kind else { panic!() };
+            fm.items.append(&mut parsed_fm.items);
         }
     }
 
