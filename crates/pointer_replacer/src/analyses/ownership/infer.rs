@@ -1,18 +1,21 @@
 use std::ops::Range;
 
-use crate::analyses::ownership::assoc::AssocExt;
 use rustc_index::IndexVec;
 use rustc_middle::{
-    mir::{Body, Local, LocalInfo, Location, Operand, Place, PlaceElem, ProjectionElem},
+    mir::{
+        Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, PlaceElem,
+        ProjectionElem,
+    },
     ty::{AdtDef, Ty, TyCtxt, TyKind},
 };
-use rustc_type_ir::TyKind::FnDef;
 use rustc_span::source_map::Spanned;
+use rustc_type_ir::TyKind::FnDef;
 use smallvec::SmallVec;
 
 use self::boundary::Boundary;
 use super::{AnalysisKind, Precision};
 use crate::analyses::ownership::{
+    assoc::AssocExt,
     ptr::{decompose_ty, Measurable},
     ssa::{
         constraint::{
@@ -178,7 +181,12 @@ where
                 if let Some(ty_mut) = ty.builtin_deref(true) {
                     let var = vars.next().unwrap();
                     if let Some(dom) = dom {
-                        database.push_less_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), var, dom)
+                        database
+                            .push_less_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                (),
+                                var,
+                                dom,
+                            )
                     }
 
                     dom = Some(var);
@@ -288,7 +296,11 @@ where
             for (pre, post) in base.r#use.zip(base.def) {
                 infer_cx
                     .database
-                    .push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), pre, post);
+                    .push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        pre,
+                        post,
+                    );
             }
             return None;
         }
@@ -348,7 +360,6 @@ where
     <Analysis as AnalysisKind<'infercx, 'db, 'tcx>>::DB: 'infercx,
 {
     type Ctxt = InferCtxt<'infercx, 'db, 'tcx, Analysis>;
-
     type LocalSig = LocalSig;
 
     #[inline]
@@ -392,7 +403,11 @@ where
                 for (lhs_sig, rhs_sig) in lhs_sigs.zip(rhs_sigs) {
                     infer_cx
                         .database
-                        .push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), lhs_sig, rhs_sig)
+                        .push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            lhs_sig,
+                            rhs_sig,
+                        )
                 }
             }
         }
@@ -422,7 +437,10 @@ where
 
             // let base = Consume { r#use, def };
             Consume { r#use, def }
-        } else if matches!(body.local_decls[base].local_info(), LocalInfo::DerefTemp) {
+        } else if matches!(
+            body.local_decls[base].local_info.as_ref(),
+            ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
+        ) {
             if let Some(consume) = infer_cx.deref_copy.take() {
                 consume
             } else {
@@ -455,10 +473,22 @@ where
             &infer_cx.struct_ctxt,
             infer_cx.database,
             |lhs, rhs, database| {
-                database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>((), lhs.r#use, false);
+                database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                    (),
+                    lhs.r#use,
+                    false,
+                );
                 if ENSURE_MOVE {
-                    database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), lhs.def, rhs.r#use);
-                    database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>((), rhs.def, false);
+                    database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        lhs.def,
+                        rhs.r#use,
+                    );
+                    database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        rhs.def,
+                        false,
+                    );
                 } else {
                     database.push_linear::<crate::analyses::ownership::ssa::constraint::Debug>(
                         (),
@@ -494,7 +524,11 @@ where
         for (r#use, def) in consume.r#use.zip(consume.def) {
             infer_cx
                 .database
-                .push_less_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), def, r#use);
+                .push_less_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                    (),
+                    def,
+                    r#use,
+                );
         }
     }
 
@@ -579,7 +613,7 @@ where
             }
         } else {
             // closure or fn ptr
-            /* TODO */
+            // TODO
         }
     }
 
@@ -604,11 +638,17 @@ where
 
         // finalize temporaries
         for vars in locals {
-            let Some(vars) = vars else { continue; };
+            let Some(vars) = vars else {
+                continue;
+            };
             for var in vars {
                 infer_cx
                     .database
-                    .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>((), var, false)
+                    .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        var,
+                        false,
+                    )
             }
         }
     }
