@@ -313,9 +313,24 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     // Don't introduce borrows at If condition boundary when
                     // the If is embedded in a larger expression — the Stmt
                     // boundary will wrap the whole statement instead.
+                    // But do NOT skip for else-if: the inner If is in the
+                    // else branch and its condition is a separate scope.
+                    let parent_of_if = self.get_hir_parent(e.hir_id);
+                    let is_else_if = if let hir::Node::Expr(pe) = parent_of_if
+                        && let hir::ExprKind::If(cond, _, _) = &pe.kind
+                    {
+                        e.hir_id != cond.hir_id
+                            && !self
+                                .tcx
+                                .hir_parent_id_iter(e.hir_id)
+                                .any(|id| id == cond.hir_id)
+                    } else {
+                        false
+                    };
                     let skip = matches!(e.kind, hir::ExprKind::If(..))
+                        && !is_else_if
                         && !matches!(
-                            self.get_hir_parent(e.hir_id),
+                            parent_of_if,
                             hir::Node::Stmt(_) | hir::Node::LetStmt(_) | hir::Node::Block(_)
                         );
                     if !skip {
@@ -741,6 +756,27 @@ unsafe fn f() {
         run_test(
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_else_if() {
+        let code = r#"
+static mut S: [i32; 10] = [0; 10];
+unsafe fn f(y: i32) -> i32 {
+    if y != 0 {
+        return 0
+    } else if S[0] != 0 {
+        return 1
+    }
+    return g(&mut S);
+}
+unsafe fn g(x: &mut [i32; 10]) -> i32 { x[0] }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow("],
             &["static mut"],
         );
     }
