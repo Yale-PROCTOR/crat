@@ -5,7 +5,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::mir::{BasicBlock, Body, Local};
 use smallvec::SmallVec;
 

@@ -1,20 +1,20 @@
 use rustc_data_structures::sso::SsoHashSet;
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
-        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
         BasicBlock, BasicBlockData, Body, CastKind, ClearCrossCrate, Local, LocalInfo, Location,
         Place, ProjectionElem, Rvalue, TerminatorKind,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     },
     ty::TyCtxt,
 };
 use smallvec::SmallVec;
 
 use crate::analyses::ownership::{
+    CrateCtxt,
     ptr::Measurable,
     ssa::{constraint::local_has_non_zero_measure, state::SSAIdx},
     vec_vec::{VecVec, VecVecConstruction},
-    CrateCtxt,
 };
 
 /// TODO unify call argument temporaries and deref copy temporaries as proxy

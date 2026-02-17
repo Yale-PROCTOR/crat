@@ -5,12 +5,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::{
-    visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind,
     TerminatorKind,
+    visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
 };
 
-use super::{whole_program::WholeProgramResults, Ownership};
+use super::{Ownership, whole_program::WholeProgramResults};
 use crate::{
     analyses::ownership::{
         discretization::{self, Discretization},

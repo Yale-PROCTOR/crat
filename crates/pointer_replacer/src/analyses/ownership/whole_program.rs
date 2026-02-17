@@ -12,33 +12,33 @@ use rustc_middle::{
 };
 
 use self::state::{initial_inter_ctxt, initial_ssa_state, refine_state};
-use super::{total_deref_level, AnalysisKind, Ownership, Precision};
-use crate::analyses::ownership::{
-    call_graph::FnSig,
-    infer::{FnSummary, InferCtxt},
-    ptr::Measurable,
-    ssa::{
-        constraint::{
-            infer::Renamer, initialize_local, Database, Gen, GlobalAssumptions, Var, Z3Database,
+use super::{AnalysisKind, Ownership, Precision, total_deref_level};
+use crate::analyses::{
+    output_params::OutputParams,
+    ownership::{
+        CrateCtxt, Param,
+        call_graph::FnSig,
+        infer::{FnSummary, InferCtxt},
+        ptr::Measurable,
+        ssa::{
+            AnalysisResults, FnResults,
+            constraint::{
+                Database, Gen, GlobalAssumptions, Var, Z3Database, infer::Renamer, initialize_local,
+            },
+            consume::Consume,
+            state::SSAState,
         },
-        consume::Consume,
-        state::SSAState,
-        AnalysisResults, FnResults,
+        struct_ctxt::{RestrictedStructCtxt, StructCtxt},
     },
-    struct_ctxt::{RestrictedStructCtxt, StructCtxt},
-    CrateCtxt, Param,
 };
-use crate::analyses::output_params::OutputParams;
 
 /// whole program analysis
 pub enum WholeProgramAnalysis {}
 
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAnalysis {
-    type Results = WholeProgramResults<'tcx>;
-
-    type InterCtxt = &'analysis InterCtxt;
-
     type DB = Z3Database;
+    type InterCtxt = &'analysis InterCtxt;
+    type Results = WholeProgramResults<'tcx>;
 
     fn analyze(
         mut crate_ctxt: CrateCtxt<'tcx>,
@@ -86,10 +86,7 @@ pub struct WholeProgramResults<'tcx> {
 }
 
 impl<'tcx> WholeProgramResults<'tcx> {
-    pub fn fields<'a>(
-        &'a self,
-        r#struct: &DefId,
-    ) -> impl Iterator<Item = &'a [Ownership]> + 'a {
+    pub fn fields<'a>(&'a self, r#struct: &DefId) -> impl Iterator<Item = &'a [Ownership]> + 'a {
         self.struct_fields
             .fields(&self.struct_ctxt, r#struct)
             .map(|range| &self.model[range.start.index()..range.end.index()])
@@ -228,10 +225,12 @@ fn solve_crate(
         }
         Right(previous_results) => {
             crate_ctxt.struct_ctxt.increase_precision(crate_ctxt.tcx);
-            let (inter_ctxt, fns) =
-                previous_results
-                    .1
-                    .refine(previous_results.0, crate_ctxt, &mut var_gen, &mut database);
+            let (inter_ctxt, fns) = previous_results.1.refine(
+                previous_results.0,
+                crate_ctxt,
+                &mut var_gen,
+                &mut database,
+            );
             for (did, ssa_state, precision) in fns {
                 let body = crate_ctxt.tcx.optimized_mir(did);
                 let fn_summary = solve_body(
@@ -291,17 +290,15 @@ fn retrieve_model(database: Z3Database, var_gen: Gen) -> Vec<Ownership> {
 impl<'analysis_results, 'tcx: 'analysis_results> AnalysisResults<'analysis_results>
     for WholeProgramResults<'tcx>
 {
-    type Value = Ownership;
-
-    type Param = Param<&'analysis_results [Ownership]>;
-
-    type FnSig = impl Iterator<Item = Option<Self::Param>>;
-
     type FnResults = (
         &'analysis_results FnSummary,
         &'analysis_results [Ownership],
         RestrictedStructCtxt<'analysis_results, 'tcx>,
     );
+    type Param = Param<&'analysis_results [Ownership]>;
+    type Value = Ownership;
+
+    type FnSig = impl Iterator<Item = Option<Self::Param>>;
 
     fn fn_results(&'analysis_results self, r#fn: DefId) -> Option<Self::FnResults> {
         let (fn_summary, precision) = self.fn_locals.fn_summaries.get(&r#fn)?;
@@ -446,11 +443,12 @@ impl FnLocals {
                                 crate_ctxt.struct_ctxt.with_max_precision(precision),
                             )?;
                             assert!(!r#use.is_empty());
-                            database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                (),
-                                r#use.start,
-                                true,
-                            );
+                            database
+                                .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    r#use.start,
+                                    true,
+                                );
                             let def = initialize_local(
                                 local_decl,
                                 var_gen,
@@ -458,11 +456,12 @@ impl FnLocals {
                                 crate_ctxt.struct_ctxt.with_max_precision(precision),
                             )?;
                             assert!(!def.is_empty());
-                            database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                (),
-                                def.start,
-                                true,
-                            );
+                            database
+                                .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    def.start,
+                                    true,
+                                );
 
                             Some(Param::Output(Consume { r#use, def }))
                         }

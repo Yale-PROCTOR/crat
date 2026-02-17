@@ -15,20 +15,21 @@ use smallvec::SmallVec;
 use self::boundary::Boundary;
 use super::{AnalysisKind, Precision};
 use crate::analyses::ownership::{
+    CrateCtxt,
     assoc::AssocExt,
-    ptr::{decompose_ty, Measurable},
+    ptr::{Measurable, decompose_ty},
     ssa::{
+        FnResults,
         constraint::{
+            Database, Gen, GlobalAssumptions, Var,
             infer::{InferMode, Renamer},
-            initialize_local, Database, Gen, GlobalAssumptions, Var,
+            initialize_local,
         },
         consume::Consume,
         join_points::PhiNode,
         state::{SSAIdx, SSAState},
-        FnResults,
     },
     struct_ctxt::{RestrictedStructCtxt, StructCtxt},
-    CrateCtxt,
 };
 
 pub mod boundary;

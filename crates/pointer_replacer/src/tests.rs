@@ -1503,7 +1503,7 @@ pub unsafe extern "C" fn bar() {
 
 mod ownership_analysis {
     use rustc_hash::{FxHashMap, FxHashSet};
-    use rustc_hir::{def_id::DefId, ItemKind, OwnerNode};
+    use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
 
@@ -1511,9 +1511,9 @@ mod ownership_analysis {
         analyses::{
             output_params::compute_output_params,
             ownership::{
-                ssa::{consume::Consume, AnalysisResults},
-                whole_program::WholeProgramAnalysis,
                 AnalysisKind, CrateCtxt, Ownership, Param,
+                ssa::{AnalysisResults, consume::Consume},
+                whole_program::WholeProgramAnalysis,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         },
@@ -1846,9 +1846,7 @@ pub unsafe fn phi_merge(flag: bool, p: *mut i32) -> *mut i32 {
                     .local_decls
                     .iter_enumerated()
                     .filter(|(local, decl)| {
-                        decl.ty.is_raw_ptr()
-                            && local.index() > body.arg_count
-                            && local.index() != 0
+                        decl.ty.is_raw_ptr() && local.index() > body.arg_count && local.index() != 0
                     })
                     .map(|(local, _)| local)
                     .collect::<Vec<_>>();

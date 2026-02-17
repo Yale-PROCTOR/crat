@@ -1,15 +1,20 @@
-use crate::analyses::ownership::vec_vec::VecVec;
-use petgraph::{algo::TarjanScc, graph::DiGraph, graph::NodeIndex};
+use petgraph::{
+    algo::TarjanScc,
+    graph::{DiGraph, NodeIndex},
+};
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
-    mir::{visit::Visitor, Terminator, TerminatorKind},
+    mir::{Terminator, TerminatorKind, visit::Visitor},
     ty::TyCtxt,
 };
 use rustc_type_ir::TyKind::FnDef;
 use smallvec::SmallVec;
 
-use crate::analyses::lattice::{FlatSet, Lattice};
+use crate::analyses::{
+    lattice::{FlatSet, Lattice},
+    ownership::vec_vec::VecVec,
+};
 
 pub struct FnSig<T> {
     pub ret: T,
@@ -74,11 +79,17 @@ struct MonotonicityChecker<'me, 'tcx> {
 
 impl<'me, 'tcx> Visitor<'tcx> for MonotonicityChecker<'me, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _: rustc_middle::mir::Location) {
-        let TerminatorKind::Call { func, .. } = &terminator.kind else { return; };
-        let Some(func) = func.constant() else { return; };
+        let TerminatorKind::Call { func, .. } = &terminator.kind else {
+            return;
+        };
+        let Some(func) = func.constant() else {
+            return;
+        };
         let ty = func.ty();
         let &FnDef(callee, _) = ty.kind() else { unreachable!() };
-        let Some(local_did) = callee.as_local() else { return; };
+        let Some(local_did) = callee.as_local() else {
+            return;
+        };
 
         match self.tcx.hir_node_by_def_id(local_did) {
             rustc_hir::Node::ForeignItem(foreign_item) => match foreign_item.ident.as_str() {
@@ -234,15 +245,8 @@ impl<'me, 'tcx> Visitor<'tcx> for CallGraphConstruction<'me> {
         terminator: &Terminator<'tcx>,
         _location: rustc_middle::mir::Location,
     ) {
-        let TerminatorKind::Call {
-            func,
-            ..
-        } = &terminator.kind else {
-            return
-        };
-        let Some(func_constant) = func.constant() else {
-            return
-        };
+        let TerminatorKind::Call { func, .. } = &terminator.kind else { return };
+        let Some(func_constant) = func.constant() else { return };
         let ty = func_constant.ty();
         let &FnDef(callee, _generic_args) = ty.kind() else {
             unreachable!("what could it be? {}", ty)
@@ -254,12 +258,11 @@ impl<'me, 'tcx> Visitor<'tcx> for CallGraphConstruction<'me> {
 
 #[cfg(test)]
 mod test {
-    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
     use rustc_middle::ty::TyCtxt;
     use utils::compilation;
 
     use super::CallGraph;
-    use rustc_hir::def_id::DefId;
 
     const TEST_PROGRAMS: &str = "
         fn f() {

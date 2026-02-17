@@ -7,31 +7,27 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 
-use super::{matcher, CallArgs, InferCtxt};
+use super::{CallArgs, InferCtxt, matcher};
 use crate::analyses::{
     lattice::FlatSet,
     ownership::{
+        AnalysisKind, CrateCtxt,
         call_graph::Monotonicity,
+        ptr::Measurable,
+        ssa::{
+            constraint::{Database, GlobalAssumptions, Var, infer::InferMode},
+            consume::Consume,
+        },
+        struct_ctxt::StructCtxt,
         whole_program::WholeProgramAnalysis,
-        AnalysisKind,
-        CrateCtxt,
     },
-};
-use crate::analyses::ownership::{
-    ptr::Measurable,
-    ssa::{
-        constraint::{infer::InferMode, Database, GlobalAssumptions, Var},
-        consume::Consume,
-    },
-    struct_ctxt::StructCtxt,
 };
 
 pub mod libc;
 pub mod library;
 
 pub trait Boundary<'infercx, 'db, 'tcx>: AnalysisKind<'infercx, 'db, 'tcx> + Sized
-where
-    'tcx: 'infercx,
+where 'tcx: 'infercx
 {
     fn call(
         infer_cx: &mut InferCtxt<'infercx, 'db, 'tcx, Self>,
@@ -96,8 +92,7 @@ where
 }
 
 impl<'infercx, 'db, 'tcx> Boundary<'infercx, 'db, 'tcx> for WholeProgramAnalysis
-where
-    'tcx: 'infercx,
+where 'tcx: 'infercx
 {
     fn call(
         infer_cx: &mut InferCtxt<'infercx, 'db, 'tcx, Self>,
@@ -130,7 +125,11 @@ where
                             dest.r#use,
                             false,
                         );
-                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), dest.def, ret);
+                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            dest.def,
+                            ret,
+                        );
                     },
                 );
             }
@@ -253,7 +252,11 @@ where
                     let precision = struct_ctxt.absolute_precision(ty, measure);
 
                     for (input, sig) in input.clone().zip(input_sigs.clone()) {
-                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), input, sig)
+                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            input,
+                            sig,
+                        )
                     }
 
                     if !is_output {
@@ -330,7 +333,11 @@ where
             let param = param.expect_normal();
             assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
             for (arg, param) in arg.zip(param.clone()) {
-                database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), arg, param);
+                database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                    (),
+                    arg,
+                    param,
+                );
             }
 
             let mut param = param;
@@ -357,12 +364,20 @@ where
                     // if output then output
                     assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
                     for (arg, param) in arg.zip(param) {
-                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), arg, param);
+                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            arg,
+                            param,
+                        );
                     }
                 } else {
                     // if not then finalize
                     for arg in arg {
-                        database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>((), arg, false);
+                        database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            arg,
+                            false,
+                        );
                     }
                 }
             }
@@ -411,7 +426,12 @@ fn apply_global_assumptions<'tcx>(
         if let Some(ty_mut) = ty.builtin_deref(true) {
             let input = input.next().unwrap();
             if let Some((field, dom)) = field_ctxt.next().zip(dom) {
-                database.push_eq_min::<crate::analyses::ownership::ssa::constraint::Debug>((), input, field, dom);
+                database.push_eq_min::<crate::analyses::ownership::ssa::constraint::Debug>(
+                    (),
+                    input,
+                    field,
+                    dom,
+                );
             }
             dom = Some(input);
             precision -= 1;

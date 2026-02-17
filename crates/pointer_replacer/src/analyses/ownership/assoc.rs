@@ -3,8 +3,7 @@ use std::{alloc::Allocator, borrow::Borrow};
 use smallvec::SmallVec;
 
 pub trait AssocExt<K, V>
-where
-    K: Eq,
+where K: Eq
 {
     #[inline]
     fn contains_key<Q: ?Sized>(&self, k: &Q) -> bool
