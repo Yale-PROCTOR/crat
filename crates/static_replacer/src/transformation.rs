@@ -342,13 +342,15 @@ fn find_context<'a, 'tcx>(
                     if receiver.hir_id == expr.hir_id {
                         let method = method.ident.name.as_str();
                         match method {
-                            "as_mut_ptr" | "copy_from_slice" | "fill" => {
+                            "as_ref" | "as_mut" | "as_mut_ptr" | "copy_from_slice" | "fill"
+                            | "take" => {
                                 expr = parent;
                                 mutated = true;
                             }
                             "as_ptr" => {
                                 expr = parent;
                             }
+                            "is_null" | "is_none" | "is_some" | "unwrap" | "expect" => {}
                             _ if method.starts_with("wrapping_") => {}
                             _ => panic!("{method}"),
                         }
