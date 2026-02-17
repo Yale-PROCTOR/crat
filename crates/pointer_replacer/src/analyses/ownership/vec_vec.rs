@@ -66,9 +66,7 @@ impl<I> VecVec<I> {
 
     #[inline]
     pub fn repack<U, F>(self, f: F) -> VecVec<U>
-    where
-        F: Fn(I) -> U,
-    {
+    where F: Fn(I) -> U {
         let indices = self.indices;
         let data = self.data.into_iter().map(f).collect();
         VecVec { indices, data }

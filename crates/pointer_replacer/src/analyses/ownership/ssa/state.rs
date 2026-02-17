@@ -1,15 +1,14 @@
 //! State for analysis steps
 
-use crate::analyses::ownership::assoc::AssocExt;
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::mir::{Body, Local, Location};
 
-use super::consume::Voidable;
 use super::{
-    consume::{Consume, ConsumeChain, Definitions},
+    consume::{Consume, ConsumeChain, Definitions, Voidable},
     dom::DominanceFrontier,
     join_points::{JoinPoints, PhiNode},
 };
+use crate::analyses::ownership::assoc::AssocExt;
 
 rustc_index::newtype_index! {
     #[orderable]

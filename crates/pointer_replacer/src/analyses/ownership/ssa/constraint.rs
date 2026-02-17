@@ -9,7 +9,7 @@ use rustc_middle::{
 
 use super::consume::Voidable;
 use crate::analyses::ownership::{
-    ptr::Measurable, struct_ctxt::StructCtxt, vec_vec::VecVec, CrateCtxt,
+    CrateCtxt, ptr::Measurable, struct_ctxt::StructCtxt, vec_vec::VecVec,
 };
 
 pub mod infer;

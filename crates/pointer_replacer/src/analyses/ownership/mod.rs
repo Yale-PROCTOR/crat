@@ -1,29 +1,31 @@
 pub mod infer;
-pub mod whole_program;
 pub mod solidify;
+pub mod whole_program;
 
+mod assoc;
 mod call_graph;
+mod discretization;
 mod ptr;
+pub mod ssa;
 mod struct_ctxt;
 mod vec_vec;
-mod assoc;
-mod discretization;
-pub mod ssa;
 
 use rustc_middle::mir::Body;
 use serde::{Deserialize, Serialize};
 
 use self::infer::InferCtxt;
 use crate::{
-    analyses::output_params::OutputParams,
+    analyses::{
+        output_params::OutputParams,
+        ownership::ssa::{
+            AnalysisResults,
+            constraint::{CadicalDatabase, Database, Gen, infer::Renamer},
+            consume::{Consume, Voidable, initial_definitions},
+            dom::compute_dominance_frontier,
+            state::SSAState,
+        },
+    },
     utils::rustc::RustProgram,
-};
-use crate::analyses::ownership::ssa::{
-    constraint::{infer::Renamer, CadicalDatabase, Database, Gen},
-    consume::{initial_definitions, Consume, Voidable},
-    dom::compute_dominance_frontier,
-    state::SSAState,
-    AnalysisResults,
 };
 
 pub trait OwnershipSchemes<'analysis>:
@@ -31,10 +33,8 @@ pub trait OwnershipSchemes<'analysis>:
 {
 }
 
-impl<'analysis, Results> OwnershipSchemes<'analysis> for Results where
-    Results: AnalysisResults<'analysis, Value = Ownership, Param = Param<&'analysis [Ownership]>>
-{
-}
+impl<'analysis, Results> OwnershipSchemes<'analysis> for Results where Results: AnalysisResults<'analysis, Value = Ownership, Param = Param<&'analysis [Ownership]>>
+{}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Ownership {
@@ -87,7 +87,9 @@ pub enum Param<Var> {
 
 #[cfg(not(debug_assertions))]
 const _: () = assert!(
-    std::mem::size_of::<Option<Param<std::ops::Range<crate::analyses::ownership::ssa::constraint::Var>>>>() == 16
+    std::mem::size_of::<
+        Option<Param<std::ops::Range<crate::analyses::ownership::ssa::constraint::Var>>>,
+    >() == 16
 );
 
 impl<Value> Param<Value> {
@@ -190,9 +192,10 @@ impl<'tcx> CrateCtxt<'tcx> {
 
 pub enum Modular {}
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for Modular {
-    type Results = ();
-    type InterCtxt = ();
     type DB = ();
+    type InterCtxt = ();
+    type Results = ();
+
     fn analyze(_: CrateCtxt, _: &OutputParams) -> anyhow::Result<Self::Results> {
         // TODO implement this
         anyhow::bail!("modular analysis is not implemented")
@@ -201,9 +204,10 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for Modular {
 
 pub enum IntraProcedural {}
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for IntraProcedural {
-    type Results = ();
-    type InterCtxt = ();
     type DB = CadicalDatabase;
+    type InterCtxt = ();
+    type Results = ();
+
     fn analyze(crate_ctxt: CrateCtxt, _: &OutputParams) -> anyhow::Result<Self::Results> {
         // let mut databases = Vec::with_capacity(crate_ctxt.fns().len());
         for &did in crate_ctxt.fns() {
@@ -217,11 +221,12 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for IntraProcedura
 
             let mut var_gen = Gen::new();
             let mut database = CadicalDatabase::new();
-            let global_assumptions = crate::analyses::ownership::ssa::constraint::GlobalAssumptions::new(
-                &crate_ctxt,
-                &mut var_gen,
-                &mut database,
-            );
+            let global_assumptions =
+                crate::analyses::ownership::ssa::constraint::GlobalAssumptions::new(
+                    &crate_ctxt,
+                    &mut var_gen,
+                    &mut database,
+                );
             let mut infer_cx = InferCtxt::new(
                 &crate_ctxt,
                 0,
@@ -240,8 +245,8 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for IntraProcedura
 
 pub fn total_deref_level(body: &Body) -> Precision {
     use rustc_middle::mir::{
-        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
         Place,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     };
 
     struct AccessDepthApproximation {

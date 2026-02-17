@@ -27,7 +27,7 @@
 //     }
 // }
 
-use rustc_index::{bit_set::MixedBitSet, IndexVec};
+use rustc_index::{IndexVec, bit_set::MixedBitSet};
 use rustc_middle::mir::{BasicBlock, Body};
 use smallvec::SmallVec;
 

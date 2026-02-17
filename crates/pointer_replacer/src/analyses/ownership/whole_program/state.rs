@@ -2,18 +2,20 @@ use rustc_hash::FxHashMap;
 use rustc_middle::mir::Body;
 
 use super::InterCtxt;
-use crate::analyses::ownership::{
-    call_graph::FnSig,
-    infer::FnSummary,
-    ssa::{
-        constraint::{initialize_local, Database, Gen, Z3Database},
-        consume::{initial_definitions, Consume},
-        dom::compute_dominance_frontier,
-        state::SSAState,
+use crate::analyses::{
+    output_params::OutputParams,
+    ownership::{
+        CrateCtxt, Ownership, Param, Precision,
+        call_graph::FnSig,
+        infer::FnSummary,
+        ssa::{
+            constraint::{Database, Gen, Z3Database, initialize_local},
+            consume::{Consume, initial_definitions},
+            dom::compute_dominance_frontier,
+            state::SSAState,
+        },
     },
-    CrateCtxt, Ownership, Param, Precision,
 };
-use crate::analyses::output_params::OutputParams;
 
 pub(super) fn initial_inter_ctxt(
     crate_ctxt: &CrateCtxt,
@@ -56,16 +58,18 @@ pub(super) fn initial_inter_ctxt(
                             crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
                         );
                         r#use.zip(def).map(|(r#use, def)| {
-                            database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                (),
-                                r#use.start,
-                                true,
-                            );
-                            database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                (),
-                                def.start,
-                                true,
-                            );
+                            database
+                                .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    r#use.start,
+                                    true,
+                                );
+                            database
+                                .push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    def.start,
+                                    true,
+                                );
                             Param::Output(Consume { r#use, def })
                         })
                     } else {

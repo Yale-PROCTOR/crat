@@ -1,4 +1,3 @@
-use crate::analyses::ownership::vec_vec::VecVec;
 use petgraph::{algo::TarjanScc, graph::DiGraph};
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -6,9 +5,10 @@ use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_type_ir::TyKind::Adt;
 
 use super::{
-    ptr::{decompose_ty, Measurable, Measure},
     Precision,
+    ptr::{Measurable, Measure, decompose_ty},
 };
+use crate::analyses::ownership::vec_vec::VecVec;
 
 impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
     #[inline]
@@ -261,13 +261,12 @@ impl<'tcx> StructCtxt<'tcx> {
 
 #[cfg(test)]
 mod tests {
-    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
     use rustc_middle::ty::TyCtxt;
     use utils::compilation;
 
     use super::StructCtxt;
     use crate::analyses::ownership::ptr::Measurable;
-    use rustc_hir::def_id::DefId;
 
     const TEXT1: &str = "
     struct s {
@@ -339,30 +338,12 @@ mod tests {
             }
 
             define_structs!(s, t, u, v, w, x);
-            assert_eq!(
-                struct_ctxt.field_offsets(&s, 0).unwrap(),
-                [0, 2, 3, 4]
-            );
-            assert_eq!(
-                struct_ctxt.field_offsets(&t, 0).unwrap(),
-                [0, 1, 2]
-            );
-            assert_eq!(
-                struct_ctxt.field_offsets(&u, 0).unwrap(),
-                [0, 0, 1, 1]
-            );
-            assert_eq!(
-                struct_ctxt.field_offsets(&v, 0).unwrap(),
-                [0, 0]
-            );
-            assert_eq!(
-                struct_ctxt.field_offsets(&w, 0).unwrap(),
-                [0, 1]
-            );
-            assert_eq!(
-                struct_ctxt.field_offsets(&x, 0).unwrap(),
-                [0]
-            );
+            assert_eq!(struct_ctxt.field_offsets(&s, 0).unwrap(), [0, 2, 3, 4]);
+            assert_eq!(struct_ctxt.field_offsets(&t, 0).unwrap(), [0, 1, 2]);
+            assert_eq!(struct_ctxt.field_offsets(&u, 0).unwrap(), [0, 0, 1, 1]);
+            assert_eq!(struct_ctxt.field_offsets(&v, 0).unwrap(), [0, 0]);
+            assert_eq!(struct_ctxt.field_offsets(&w, 0).unwrap(), [0, 1]);
+            assert_eq!(struct_ctxt.field_offsets(&x, 0).unwrap(), [0]);
         })
     }
 
@@ -510,11 +491,7 @@ impl<'intra, 'tcx> Measurable<'tcx> for RestrictedStructCtxt<'intra, 'tcx> {
         }
     }
 
-    fn measure_adt(
-        &self,
-        adt_def: rustc_middle::ty::AdtDef,
-        ptr_chased: u32,
-    ) -> Measure {
+    fn measure_adt(&self, adt_def: rustc_middle::ty::AdtDef, ptr_chased: u32) -> Measure {
         let allowed = self.allowed_ptr_depth as u32;
         let maximum = self.unrestricted.max_ptr_chased() as u32;
         if allowed >= maximum {

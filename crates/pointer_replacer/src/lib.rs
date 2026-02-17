@@ -27,7 +27,7 @@ mod analyses;
 mod rewriter;
 mod utils;
 
-pub use rewriter::{replace_local_borrows, Config};
+pub use rewriter::{Config, replace_local_borrows};
 
 #[cfg(test)]
 mod tests;
