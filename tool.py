@@ -84,7 +84,7 @@ TRANSFORMATIONS: Dict[str, Transformation] = {
         dir=BENCH_ROOT / "rs-extern",
         order="expand",
         analysis=None,
-        pass_="preprocess,extern",
+        pass_="extern,preprocess",
         config=CONFIG_ROOT / "extern",
     ),
     "extern-post": Transformation(

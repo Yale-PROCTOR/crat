@@ -290,6 +290,8 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     && let name = call.seg.ident.name.as_str()
                     && (name == "as_mut_ptr"
                         || name == "as_ptr"
+                        || name == "as_mut"
+                        || name == "take"
                         || name == "copy_from_slice"
                         || name == "fill")
                 {
@@ -308,7 +310,32 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
                         .any(|id| id == p.hir_id)
                 {
-                    self.introduce_borrow(expr);
+                    // Don't introduce borrows at If condition boundary when
+                    // the If is embedded in a larger expression — the Stmt
+                    // boundary will wrap the whole statement instead.
+                    // But do NOT skip for else-if: the inner If is in the
+                    // else branch and its condition is a separate scope.
+                    let parent_of_if = self.get_hir_parent(e.hir_id);
+                    let is_else_if = if let hir::Node::Expr(pe) = parent_of_if
+                        && let hir::ExprKind::If(cond, _, _) = &pe.kind
+                    {
+                        e.hir_id != cond.hir_id
+                            && !self
+                                .tcx
+                                .hir_parent_id_iter(e.hir_id)
+                                .any(|id| id == cond.hir_id)
+                    } else {
+                        false
+                    };
+                    let skip = matches!(e.kind, hir::ExprKind::If(..))
+                        && !is_else_if
+                        && !matches!(
+                            parent_of_if,
+                            hir::Node::Stmt(_) | hir::Node::LetStmt(_) | hir::Node::Block(_)
+                        );
+                    if !skip {
+                        self.introduce_borrow(expr);
+                    }
                 }
             }
             hir::Node::Stmt(_) | hir::Node::LetStmt(_) => {
@@ -342,13 +369,15 @@ fn find_context<'a, 'tcx>(
                     if receiver.hir_id == expr.hir_id {
                         let method = method.ident.name.as_str();
                         match method {
-                            "as_mut_ptr" | "copy_from_slice" | "fill" => {
+                            "as_ref" | "as_mut" | "as_mut_ptr" | "copy_from_slice" | "fill"
+                            | "take" => {
                                 expr = parent;
                                 mutated = true;
                             }
                             "as_ptr" => {
                                 expr = parent;
                             }
+                            "is_null" | "is_none" | "is_some" | "unwrap" | "expect" => {}
                             _ if method.starts_with("wrapping_") => {}
                             _ => panic!("{method}"),
                         }
@@ -678,6 +707,76 @@ unsafe fn g(x: &mut i32, y: &mut i32) { *x = 1; *y = 2; }
         run_test(
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_if_assign() {
+        let code = r#"
+static mut X: [i32; 10] = [0; 10];
+unsafe fn f() { g(X.as_mut_ptr()); X[0] = if X[1] != 0 { 1 } else { 0 }; }
+unsafe fn g(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_if_call() {
+        let code = r#"
+static mut S: [i32; 10] = [0; 10];
+unsafe fn f() {
+    h(S.as_mut_ptr());
+    g(S[0], if S[1] != 0 { 1 } else { 0 });
+}
+unsafe fn g(x: i32, y: i32) {}
+unsafe fn h(x: *mut i32) { *x = 1; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_option_methods() {
+        let code = r#"
+static mut S: Option<i32> = None;
+unsafe fn f() {
+    S = Some(1);
+    if S.as_mut().is_some() {}
+    let _x = S.take();
+}
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_else_if() {
+        let code = r#"
+static mut S: [i32; 10] = [0; 10];
+unsafe fn f(y: i32) -> i32 {
+    if y != 0 {
+        return 0
+    } else if S[0] != 0 {
+        return 1
+    }
+    return g(&mut S);
+}
+unsafe fn g(x: &mut [i32; 10]) -> i32 { x[0] }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow("],
             &["static mut"],
         );
     }
