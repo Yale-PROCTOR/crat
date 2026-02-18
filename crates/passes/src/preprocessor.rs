@@ -1435,7 +1435,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                         },
                     ) = parent
                     {
-                        if is_lhs(parent_expr, self.tcx) {
+                        if is_lhs_or_addr_of(parent_expr, self.tcx) {
                             self.ctx
                                 .array_string_literal_static_excludes
                                 .insert(local_def_id);
@@ -1449,7 +1449,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
                 if let Res::Def(DefKind::Static { .. }, def_id) = path.res
                     && let Some(local_def_id) = def_id.as_local()
-                    && is_lhs(expr, self.tcx)
+                    && is_lhs_or_addr_of(expr, self.tcx)
                 {
                     self.ctx.string_literal_static_excludes.insert(local_def_id);
                 }
@@ -1511,6 +1511,25 @@ fn is_lhs<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
             {
                 return true;
             }
+            hir::ExprKind::Field(_, _) => {}
+            hir::ExprKind::Index(l, _, _) if l.hir_id == expr.hir_id => {}
+            _ => return false,
+        }
+        expr = parent;
+    }
+    panic!()
+}
+
+fn is_lhs_or_addr_of<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    for (_, parent) in tcx.hir_parent_iter(expr.hir_id) {
+        let hir::Node::Expr(parent) = parent else { return false };
+        match parent.kind {
+            hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _)
+                if l.hir_id == expr.hir_id =>
+            {
+                return true;
+            }
+            hir::ExprKind::AddrOf(_, _, _) => return true,
             hir::ExprKind::Field(_, _) => {}
             hir::ExprKind::Index(l, _, _) if l.hir_id == expr.hir_id => {}
             _ => return false,
@@ -2317,6 +2336,42 @@ pub static mut s: [*const core::ffi::c_char; 2] = [
 #[no_mangle]
 pub unsafe extern "C" fn foo() {
     s[0 as core::ffi::c_int as usize] = b"Hi\0" as *const u8 as *const core::ffi::c_char;
+}
+            "#,
+            &["[*const core::ffi::c_char; 2]"],
+            &["[&[i8]; 2]"],
+        );
+    }
+
+    #[test]
+    fn test_string_literal_static_addr_taken() {
+        run_test(
+            r#"
+#[no_mangle]
+pub static mut s: *const core::ffi::c_char = b"Hello, World!\0" as *const u8
+    as *const core::ffi::c_char;
+#[no_mangle]
+pub unsafe extern "C" fn foo() {
+    &s;
+}
+            "#,
+            &["*const core::ffi::c_char ="],
+            &["[i8;"],
+        );
+    }
+
+    #[test]
+    fn test_array_string_literal_static_addr_taken() {
+        run_test(
+            r#"
+#[no_mangle]
+pub static mut s: [*const core::ffi::c_char; 2] = [
+    b"Hello\0" as *const u8 as *const core::ffi::c_char,
+    b"World\0" as *const u8 as *const core::ffi::c_char,
+];
+#[no_mangle]
+pub unsafe extern "C" fn foo() {
+    &s[0 as core::ffi::c_int as usize];
 }
             "#,
             &["[*const core::ffi::c_char; 2]"],
