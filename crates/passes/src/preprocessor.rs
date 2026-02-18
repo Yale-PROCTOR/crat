@@ -1254,7 +1254,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             let def_id = item.owner_id.def_id;
             let mir_ty = self.tcx.type_of(def_id).skip_binder();
             if let ty::TyKind::RawPtr(inner, ty::Mutability::Not) = mir_ty.kind()
-                && (*inner == self.tcx.types.i8 || *inner == self.tcx.types.u8)
+                && (*inner == self.tcx.types.i8)
             {
                 let body = self.tcx.hir_body(body_id);
                 if is_byte_string_init(body.value) {
@@ -1263,7 +1263,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             }
             if let ty::TyKind::Array(elem_ty, _) = mir_ty.kind()
                 && let ty::TyKind::RawPtr(inner, ty::Mutability::Not) = elem_ty.kind()
-                && (*inner == self.tcx.types.i8 || *inner == self.tcx.types.u8)
+                && (*inner == self.tcx.types.i8)
             {
                 let body = self.tcx.hir_body(body_id);
                 if is_all_byte_string_array_init(body.value) {
