@@ -632,7 +632,7 @@ pub fn analyze(
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
     }
-    println!("Main Analaysis Time: {:.3}", time as f32 / 1000.0);
+    println!("{:.3}", time as f32 / 1000.0);
 
     summaries
         .into_iter()
