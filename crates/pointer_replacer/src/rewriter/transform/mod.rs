@@ -742,15 +742,9 @@ impl<'tcx> TransformVisitor<'tcx> {
         {
             match (ctx, *rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
-                    if m != m1 {
+                    if m && !m1 {
                         let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                        let m_str = if m { "mut" } else { "const" };
-                        *ptr = utils::expr!(
-                            "{} as *{} {}",
-                            pprust::expr_to_string(ptr),
-                            m_str,
-                            inner_ty
-                        );
+                        *ptr = utils::expr!("{} as *mut {}", pprust::expr_to_string(ptr), inner_ty);
                     }
                     return PtrKind::Raw(m);
                 }
@@ -861,10 +855,9 @@ impl<'tcx> TransformVisitor<'tcx> {
         };
         match ctx {
             PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
-                if m != m1 {
+                if m && !m1 {
                     let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-                    let m_str = if m { "mut" } else { "const" };
-                    *ptr = utils::expr!("{} as *{} {}", pprust::expr_to_string(e), m_str, inner_ty);
+                    *ptr = utils::expr!("{} as *mut {}", pprust::expr_to_string(e), inner_ty);
                 }
                 PtrKind::Raw(m)
             }
