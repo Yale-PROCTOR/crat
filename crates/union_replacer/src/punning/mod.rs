@@ -1,4 +1,5 @@
 mod analysis;
+mod classify;
 mod test;
 mod transformation;
 

@@ -289,12 +289,40 @@ mod tests {
         run_test(&code, false);
     }
 
+    #[test]
+    fn log_base2() {
+        // Currently, it will not be transformed correctly because of the &= operator(AssignOp expr).
+
+        // From benchmark/rs/minimap2
+        let code = r#"
+        pub union C2RustUnnamed {
+            pub f: f32,
+            pub i: u32,
+        }
+
+        unsafe extern "C" fn mg_log2(mut x: f32) -> f32 {
+            let mut z: C2RustUnnamed = C2RustUnnamed { f: x };
+            let mut log_2: f32 =
+                (z.i >> 23 as i32 & 255 as i32 as u32).wrapping_sub(128 as i32 as u32)
+                    as f32;
+            z.i &= !((255 as i32) << 23 as i32) as u32;
+            z.i =
+                (z.i as u32).wrapping_add(((127 as i32) << 23 as i32) as u32) as u32
+                    as u32;
+            log_2 += (-0.34484843f32 * z.f + 2.02466578f32) * z.f - 0.67487759f32;
+            return log_2;
+        }
+        "#;
+
+        run_test(&code, false);
+    }
+
     // #[test]
     // fn temp() {
     //     let code = r#"
     //     "#;
 
     //     let code = format!("{BASE}\n{code}");
-    //     run_test(&code);
+    //     run_test(&code, false);
     // }
 }

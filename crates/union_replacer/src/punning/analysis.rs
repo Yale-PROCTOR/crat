@@ -1,4 +1,3 @@
-use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
@@ -11,7 +10,7 @@ use rustc_span::def_id::LocalDefId;
 pub type AnalysisMap<'a> = FxHashMap<
     Place<'a>,
     (
-        UnionUseInfo<'a>,
+        Option<UnionUseInfo<'a>>,
         FxHashMap<UnionUseInfo<'a>, (bool, FxHashSet<UnionUseInfo<'a>>)>,
     ),
 >;
@@ -123,11 +122,12 @@ impl<'a> std::fmt::Debug for UnionUseInfo<'a> {
 /// def_id -> (Place -> [UnionUseInfo])
 fn collect_union_uses_map<'a>(
     tcx: TyCtxt<'a>,
+    print_mir: bool,
 ) -> FxHashMap<LocalDefId, FxHashMap<Place<'a>, Vec<UnionUseInfo<'a>>>> {
     let mut union_uses_map: FxHashMap<LocalDefId, FxHashMap<Place<'a>, Vec<UnionUseInfo<'a>>>> =
         FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
-        if let Some(uses) = collect_union_uses(def_id, tcx) {
+        if let Some(uses) = collect_union_uses(def_id, tcx, print_mir) {
             union_uses_map.insert(def_id, uses);
         }
     }
@@ -138,18 +138,30 @@ fn collect_union_uses_map<'a>(
 fn collect_union_uses<'a>(
     def_id: LocalDefId,
     tcx: TyCtxt<'a>,
+    print_mir: bool,
 ) -> Option<FxHashMap<Place<'a>, Vec<UnionUseInfo<'a>>>> {
     let mut union_uses: FxHashMap<Place<'a>, Vec<UnionUseInfo<'a>>> = FxHashMap::default();
     if tcx.def_kind(def_id) != DefKind::Fn {
         return None;
     }
-    // println!("DEF: {def_id:?}");
+    if print_mir {
+        println!("\nDEF: {def_id:?}");
+    }
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
     let body: &Body<'_> = &body.borrow();
+    if print_mir {
+        body.args_iter().for_each(|arg| {
+            println!("\tARG: {arg:?} -> {:?}", body.local_decls[arg].ty);
+        });
+    }
     for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        // println!("\tBB: {bb:?}");
+        if print_mir {
+            println!("\tBB: {bb:?}");
+        }
         for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
-            // println!("\t\tSTMT {stmt_idx}: {stmt:?}");
+            if print_mir {
+                println!("\t\tSTMT {stmt_idx}: {stmt:?}");
+            }
             if let StatementKind::Assign(box (place, value)) = &stmt.kind {
                 // Initialize a Union Field
                 if place.ty(body, tcx).ty.is_union() {
@@ -197,6 +209,7 @@ fn collect_union_uses<'a>(
                         }
                     }
                     // Read from a Union Field (Rvalue is a Rvalue::Use of an union field)
+                    // TODO: Handle more cases of Rvalues
                     if let Rvalue::Use(operand) = value
                         && let Some(rplace) = operand.place()
                     {
@@ -222,7 +235,9 @@ fn collect_union_uses<'a>(
                 }
             }
         }
-        // println!("\t\tTERM: {:?}", bbd.terminator().kind);
+        if print_mir {
+            println!("\t\tTERM: {:?}", bbd.terminator().kind);
+        }
     }
     if union_uses.is_empty() {
         None
@@ -336,12 +351,12 @@ fn is_replacable_read<'a>(
     true
 }
 
-pub fn analyze(tcx: TyCtxt, verbose: bool) -> AnalysisResult {
-    let union_uses_map = collect_union_uses_map(tcx);
+pub fn analyze(tcx: TyCtxt, verbose: bool, print_mir: bool) -> AnalysisResult {
+    let union_uses_map = collect_union_uses_map(tcx, print_mir);
     let mut result_map = FxHashMap::default();
 
     if verbose {
-        println!("Starting Union Punning Analysis");
+        println!("\nStarting Union Punning Analysis");
     }
     for (def_id, union_uses) in union_uses_map {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
@@ -358,7 +373,6 @@ pub fn analyze(tcx: TyCtxt, verbose: bool) -> AnalysisResult {
 
             // Currently, skip cases where union type variables are not used directly.
             // Ex. Skip if union is a field of a struct
-            let init_use = some_or!(init_use, continue);
 
             let read_write_map = collect_readable_writes(uses, body);
 

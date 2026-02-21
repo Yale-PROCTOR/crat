@@ -7,12 +7,30 @@ use rustc_span::def_id::LocalDefId;
 use smallvec::SmallVec;
 use utils::ir::{AstToHir, HirToThir, ThirToMir, mir_ty_to_string};
 
-use super::analysis::AnalysisResult;
+use super::{
+    analysis::{AnalysisResult, UnionUseKind, analyze},
+    classify::TyVisitor,
+};
 
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
 
-    let analysis_result = super::analysis::analyze(tcx, verbose);
+    if verbose {
+        let ty_visitor = TyVisitor::new(tcx);
+        let (_local_types, foreign_tys) = ty_visitor.find_foreign_tys(tcx);
+
+        println!("Foreign types identified:\n\t{}", {
+            let mut for_vec = foreign_tys
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+            for_vec.sort();
+            for_vec.join("\n\t")
+        });
+    }
+
+    let print_mir = verbose; // Only for debug
+    let analysis_result = analyze(tcx, verbose, print_mir);
 
     let mut visitor = TransformVisitor::new(tcx, &mut krate, analysis_result);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -285,8 +303,10 @@ impl<'a> AnalysisResult<'a> {
         for (def_id, place_map) in self.map {
             let mut trans_info_vec = vec![];
             for (_, (init, read_map)) in place_map {
+                let init = some_or!(init, continue);
+
                 let size = match &init.kind {
-                    super::analysis::UnionUseKind::InitUnion(_, _, _, size) => *size,
+                    UnionUseKind::InitUnion(_, _, _, size) => *size,
                     _ => unreachable!(),
                 };
 
