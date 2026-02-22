@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use etrace::some_or;
@@ -179,12 +180,31 @@ enum ReturnTyItem {
     Option(Param),
 }
 
+struct Timer {
+    start: Instant,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        println!("{}", self.start.elapsed().as_millis());
+    }
+}
+
 pub fn transform(
     tcx: TyCtxt<'_>,
     dir: &Path,
     lib_name: &str,
     config: &crate::outparam_replacer::Config,
 ) {
+    let _t = Timer::new();
     let analysis_result: AnalysisResult = if let Some(file) = &config.analysis_file {
         let file = File::open(file).unwrap();
         serde_json::from_reader(file).unwrap()
