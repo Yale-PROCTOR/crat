@@ -399,7 +399,7 @@ fn ownership_analysis_runs() {
     run_ownership_case_with_box_candidates(
         "task_manager_lib",
         SOURCE,
-        &["create_task_manager#manager", "add_task#task"],
-        &[],
+        &["create_task_manager#manager"],
+        &["add_task#task"],
     );
 }

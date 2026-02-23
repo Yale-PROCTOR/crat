@@ -295,5 +295,14 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("hatch_lib", SOURCE, &["dynamic_data", "records", "temp_array"], &[]);
+    run_ownership_case_with_box_candidates(
+        "hatch_lib",
+        SOURCE,
+        &[
+            "hatch#dynamic_data",
+            "hatch#records",
+            "compute_with_dynamic_memory#temp_array",
+        ],
+        &[],
+    );
 }
