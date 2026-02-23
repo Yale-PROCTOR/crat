@@ -1,4 +1,4 @@
-use super::run_ownership_case;
+use super::run_ownership_case_with_box_candidates;
 
 const SOURCE: &str = r####"
 #![warn(mutable_transmutes)]
@@ -966,5 +966,10 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case("mutable-duplication-dag", SOURCE);
+    run_ownership_case_with_box_candidates(
+        "mutable-duplication-dag",
+        SOURCE,
+        &["create_graph#graph", "create_node#node"],
+        &[],
+    );
 }

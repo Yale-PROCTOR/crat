@@ -1,4 +1,4 @@
-use super::run_ownership_case;
+use super::run_ownership_case_with_box_candidates;
 
 const SOURCE: &str = r####"
 #![warn(mutable_transmutes)]
@@ -1237,5 +1237,5 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case("pinflate_lib", SOURCE);
+    run_ownership_case_with_box_candidates("pinflate_lib", SOURCE, &["s"], &[]);
 }
