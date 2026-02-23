@@ -1345,5 +1345,5 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("convert_pix_lib", SOURCE, &["s"], &[]);
+    run_ownership_case_with_box_candidates("convert_pix_lib", SOURCE, &["cp_inflate#s"], &[]);
 }

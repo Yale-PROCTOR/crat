@@ -1969,5 +1969,10 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("load_png_mem_lib", SOURCE, &["data", "s"], &[]);
+    run_ownership_case_with_box_candidates(
+        "load_png_mem_lib",
+        SOURCE,
+        &["load_png_mem#data", "cp_inflate#s"],
+        &[],
+    );
 }

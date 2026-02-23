@@ -969,7 +969,7 @@ fn ownership_analysis_runs() {
     run_ownership_case_with_box_candidates(
         "mutable-duplication-dag",
         SOURCE,
-        &["create_graph#graph", "create_node#node"],
+        &["create_graph#graph", "add_node#node"],
         &[],
     );
 }

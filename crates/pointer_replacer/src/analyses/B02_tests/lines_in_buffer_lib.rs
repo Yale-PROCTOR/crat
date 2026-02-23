@@ -73,7 +73,7 @@ fn ownership_analysis_runs() {
     run_ownership_case_with_box_candidates(
         "lines_in_buffer_lib",
         SOURCE,
-        &["lines_in_buffer#bufferPtrs"],
+        &["UTIL_createLinePointers#bufferPtrs"],
         &[],
     );
 }
