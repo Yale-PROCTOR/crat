@@ -6,7 +6,10 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_index::IndexVec;
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{
+    hir::nested_filter,
+    ty::{Ty as MidTy, TyCtxt},
+};
 use rustc_span::def_id::LocalDefId;
 
 rustc_index::newtype_index! {
@@ -22,6 +25,12 @@ pub struct TyVisitor<'tcx> {
     foreign_types: FxHashSet<TyId>,
     unions: FxHashSet<TyId>,
     type_graph: FxHashMap<TyId, FxHashSet<TyId>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct UnionRelatedTypes<'tcx> {
+    pub parent_types: FxHashSet<LocalDefId>,
+    pub field_types: FxHashSet<MidTy<'tcx>>,
 }
 
 impl std::fmt::Debug for TyVisitor<'_> {
@@ -70,6 +79,41 @@ pub fn collect_foreign_and_union_types<'tcx>(
     (foreign_vec, union_vec)
 }
 
+pub fn collect_union_related_types<'tcx>(
+    tcx: &TyCtxt<'tcx>,
+    union_tys: &[LocalDefId],
+    verbose: bool,
+) -> FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>> {
+    let ty_visitor = TyVisitor::new(*tcx);
+    let related_types = ty_visitor.analyze_union_related_types(*tcx, union_tys);
+
+    if verbose {
+        println!("\nUnion Related Types:");
+        let mut unions = related_types.keys().copied().collect::<Vec<_>>();
+        unions.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+        for union_ty in unions {
+            let related = related_types.get(&union_ty).expect("union key exists");
+            let mut parent_names = related
+                .parent_types
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+            parent_names.sort();
+            let mut field_names = related
+                .field_types
+                .iter()
+                .map(|ty| format!("{ty:?}"))
+                .collect::<Vec<_>>();
+            field_names.sort();
+            println!("\t{}:", tcx.def_path_str(union_ty));
+            println!("\t\tparents: {}", parent_names.join(", "));
+            println!("\t\tfields: {}", field_names.join(", "));
+        }
+    }
+
+    related_types
+}
+
 impl<'tcx> TyVisitor<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
@@ -82,6 +126,7 @@ impl<'tcx> TyVisitor<'tcx> {
         }
     }
 
+    // Return (local_types, foreign_types, union_types)
     pub fn analyse_tys(
         mut self,
         tcx: TyCtxt<'tcx>,
@@ -116,6 +161,54 @@ impl<'tcx> TyVisitor<'tcx> {
             }
         }
         (local_types, foreign_types, union_types)
+    }
+
+    /// Analyze union-related types: target union type -> (parent struct, fields)
+    pub fn analyze_union_related_types(
+        mut self,
+        tcx: TyCtxt<'tcx>,
+        union_tys: &[LocalDefId],
+    ) -> FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>> {
+        tcx.hir_visit_all_item_likes_in_crate(&mut self);
+
+        let mut reverse_graph: FxHashMap<TyId, FxHashSet<TyId>> = FxHashMap::default();
+        for (src, dsts) in &self.type_graph {
+            for dst in dsts {
+                reverse_graph.entry(*dst).or_default().insert(*src);
+            }
+        }
+
+        let mut related = FxHashMap::default();
+        // for each union type
+        for &union_ty in union_tys {
+            let mut union_related = UnionRelatedTypes::default();
+
+            let union_adt = tcx.adt_def(union_ty.to_def_id());
+
+            // fields
+            for field in union_adt.all_fields() {
+                let field_ty = tcx.type_of(field.did).instantiate_identity();
+                union_related.field_types.insert(field_ty);
+            }
+
+            // parents
+            if let Some(&union_id) = self.ty_ids.get(&union_ty)
+                && let Some(parent_tys) = reverse_graph.get(&union_id)
+            {
+                for ty_id in parent_tys {
+                    let parent = self.tys[*ty_id];
+                    
+                    // Only consider struct parents for now
+                    if matches!(tcx.def_kind(parent), DefKind::Struct) {
+                        union_related.parent_types.insert(parent);
+                    }
+                }
+            }
+
+            related.insert(union_ty, union_related);
+        }
+
+        related
     }
 
     fn ty_to_id(&mut self, ty: LocalDefId) -> TyId {
@@ -164,7 +257,7 @@ impl<'tcx> TyVisitor<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for TyVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
+    type NestedFilter = nested_filter::All;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
