@@ -197,7 +197,7 @@ impl<'tcx> TyVisitor<'tcx> {
             {
                 for ty_id in parent_tys {
                     let parent = self.tys[*ty_id];
-                    
+
                     // Only consider struct parents for now
                     if matches!(tcx.def_kind(parent), DefKind::Struct) {
                         union_related.parent_types.insert(parent);
