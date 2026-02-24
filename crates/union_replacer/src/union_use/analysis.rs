@@ -12,7 +12,7 @@ pub struct AnalysisResult {
     pub _map: FxHashMap<LocalDefId, AnalysisMap>,
 }
 
-fn collect_union_uses_map<'a>(tcx: TyCtxt<'a>, print_mir: bool) -> () {
+fn collect_union_uses_map<'a>(tcx: TyCtxt<'a>, print_mir: bool) {
     for def_id in tcx.hir_body_owners() {
         let _ = print_local_body(def_id, tcx, print_mir);
     }
@@ -120,7 +120,7 @@ fn _print_foreign_body<'a>(def_id: DefId, tcx: TyCtxt<'a>, print_mir: bool) -> O
 }
 
 pub fn analyze(tcx: TyCtxt, verbose: bool, print_mir: bool) -> AnalysisResult {
-    let _ = collect_union_uses_map(tcx, print_mir);
+    collect_union_uses_map(tcx, print_mir);
     let result_map = FxHashMap::default();
 
     if verbose {

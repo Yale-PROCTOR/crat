@@ -2,7 +2,7 @@ use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     AmbigArg, ItemKind, Node, QPath, Ty, TyKind,
-    def::Res,
+    def::{DefKind, Res},
     intravisit::{self, Visitor},
 };
 use rustc_index::IndexVec;
@@ -34,6 +34,40 @@ impl std::fmt::Debug for TyVisitor<'_> {
             .field("type_graph", &self.type_graph)
             .finish()
     }
+}
+
+pub fn collect_foreign_and_union_types<'tcx>(
+    tcx: &TyCtxt<'tcx>,
+    verbose: bool,
+) -> (Vec<LocalDefId>, Vec<LocalDefId>) {
+    let ty_visitor = TyVisitor::new(*tcx);
+    let (_local_types, foreign_tys, union_tys) = ty_visitor.analyse_tys(*tcx);
+
+    let mut foreign_vec = foreign_tys.into_iter().collect::<Vec<_>>();
+    foreign_vec.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+
+    let mut union_vec = union_tys.into_iter().collect::<Vec<_>>();
+    union_vec.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+
+    if verbose {
+        println!("Foreign types identified:\n\t{}", {
+            let names = foreign_vec
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+            names.join("\n\t")
+        });
+
+        println!("Union Types: \n\t{}", {
+            let names = union_vec
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+            names.join("\n\t")
+        });
+    }
+
+    (foreign_vec, union_vec)
 }
 
 impl<'tcx> TyVisitor<'tcx> {
@@ -99,6 +133,9 @@ impl<'tcx> TyVisitor<'tcx> {
         let Res::Def(_, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
         let id = self.ty_to_id(def_id);
+        if matches!(self.tcx.def_kind(def_id), DefKind::Union) {
+            self.unions.insert(id);
+        }
 
         let hir_id = ty.hir_id;
         for parent_id in self.tcx.hir_parent_id_iter(hir_id) {
@@ -111,19 +148,12 @@ impl<'tcx> TyVisitor<'tcx> {
                 Node::Item(item) => {
                     if matches!(
                         item.kind,
-                        ItemKind::Struct(_, _, _) // | ItemKind::TyAlias(_, _, _)
+                        ItemKind::Struct(_, _, _)
+                            | ItemKind::TyAlias(_, _, _)
+                            | ItemKind::Union(_, _, _)
                     ) {
-                        println!("Found struct: {:?}", self.tcx.def_path_str(def_id));
                         let item_id = self.ty_to_id(item.owner_id.def_id);
                         self.type_graph.entry(item_id).or_default().insert(id);
-                    } else if matches!(item.kind, ItemKind::TyAlias(_, _, _)) {
-                        println!("Found alias: {:?}", self.tcx.def_path_str(def_id));
-                        let item_id = self.ty_to_id(item.owner_id.def_id);
-                        self.type_graph.entry(item_id).or_default().insert(id);
-                    } else if matches!(item.kind, ItemKind::Union(_, _, _)) {
-                        let item_id = self.ty_to_id(item.owner_id.def_id);
-                        self.type_graph.entry(item_id).or_default().insert(id);
-                        self.unions.insert(id);
                     }
                     break;
                 }
