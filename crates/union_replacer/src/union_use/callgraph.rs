@@ -60,6 +60,7 @@ fn collect_union_ids_from_ty<'tcx>(
 pub fn collect_union_seed_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_tys: &[LocalDefId],
+    verbose: bool,
 ) -> FxHashMap<LocalDefId, Vec<LocalDefId>> {
     let union_tys: FxHashSet<_> = union_tys.iter().copied().collect();
     let mut map: FxHashMap<LocalDefId, FxHashSet<LocalDefId>> = union_tys
@@ -91,13 +92,35 @@ pub fn collect_union_seed_functions<'tcx>(
         }
     }
 
-    map.into_iter()
+    let map: FxHashMap<LocalDefId, Vec<LocalDefId>> = map
+        .into_iter()
         .map(|(union_ty, mut fn_ids)| {
             let mut fn_ids = fn_ids.drain().collect::<Vec<_>>();
             fn_ids.sort_by_key(|def_id| tcx.def_path_str(*def_id));
             (union_ty, fn_ids)
         })
-        .collect()
+        .collect();
+
+    if verbose {
+        println!("\nCallgraph Seed Functions:\n\t{}", {
+            let mut lines = map
+                .iter()
+                .map(|(ty, funcs)| {
+                    let ty_name = tcx.def_path_str(*ty);
+                    let func_names = funcs
+                        .iter()
+                        .map(|def_id| tcx.def_path_str(*def_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{ty_name}\n\t\t-> {func_names}")
+                })
+                .collect::<Vec<_>>();
+            lines.sort();
+            lines.join("\n\t")
+        });
+    }
+
+    map
 }
 
 fn is_target_seed_function(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
@@ -105,7 +128,7 @@ fn is_target_seed_function(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return false;
     }
 
-    // Skip compiler/macro-generated bodies (e.g. derive-generated Clone impl methods).
+    // Skip compiler/macro-generated bodies (ex. clone)
     if tcx.def_span(def_id).from_expansion() {
         return false;
     }

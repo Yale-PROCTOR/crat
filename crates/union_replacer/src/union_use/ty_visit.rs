@@ -50,7 +50,7 @@ pub fn collect_foreign_and_union_types<'tcx>(
     union_vec.sort_by_key(|def_id| tcx.def_path_str(*def_id));
 
     if verbose {
-        println!("Foreign types identified:\n\t{}", {
+        println!("\nForeign Types:\n\t{}", {
             let names = foreign_vec
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
@@ -58,7 +58,7 @@ pub fn collect_foreign_and_union_types<'tcx>(
             names.join("\n\t")
         });
 
-        println!("Union Types: \n\t{}", {
+        println!("Union Types:\n\t{}", {
             let names = union_vec
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
