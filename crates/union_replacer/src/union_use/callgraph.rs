@@ -13,7 +13,7 @@ use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::ty_visit::UnionRelatedTypes;
 
-// CallGraph: caller -> callee list
+/// CallGraph: caller -> list of callees
 pub type CallGraph = FxHashMap<DefId, Vec<DefId>>;
 
 #[derive(Debug, Clone)]
@@ -181,7 +181,7 @@ pub fn build_union_callgraphs<'tcx>(
     verbose: bool,
 ) -> FxHashMap<LocalDefId, CallGraph> {
     // Debug step option
-    let verbose_callgraph_steps = true;
+    let verbose_callgraph_steps = false;
 
     let mut callee_cache: FxHashMap<DefId, Vec<DirectCallee<'tcx>>> = FxHashMap::default();
     let mut union_callgraphs = FxHashMap::default();

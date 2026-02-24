@@ -15,7 +15,7 @@ use super::{
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
 
-    if verbose {
+    if true {
         let ty_visitor = TyVisitor::new(tcx);
         let (_local_types, foreign_tys) = ty_visitor.find_foreign_tys(tcx);
 

@@ -45,28 +45,16 @@ impl std::fmt::Debug for TyVisitor<'_> {
     }
 }
 
-pub fn collect_foreign_and_union_types<'tcx>(
+pub fn collect_local_union_types<'tcx>(
     tcx: &TyCtxt<'tcx>,
     verbose: bool,
-) -> (Vec<LocalDefId>, Vec<LocalDefId>) {
+) -> (Vec<LocalDefId>, TyVisitor<'tcx>) {
     let ty_visitor = TyVisitor::new(*tcx);
-    let (_local_types, foreign_tys, union_tys) = ty_visitor.analyse_tys(*tcx);
+    let (union_tys, ty_visitor) = ty_visitor.analyse_tys(*tcx);
 
-    let mut foreign_vec = foreign_tys.into_iter().collect::<Vec<_>>();
-    foreign_vec.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-
-    let mut union_vec = union_tys.into_iter().collect::<Vec<_>>();
-    union_vec.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+    let union_vec = union_tys.into_iter().collect::<Vec<_>>();
 
     if verbose {
-        println!("\nForeign Types:\n\t{}", {
-            let names = foreign_vec
-                .iter()
-                .map(|def_id| tcx.def_path_str(*def_id))
-                .collect::<Vec<_>>();
-            names.join("\n\t")
-        });
-
         println!("Union Types:\n\t{}", {
             let names = union_vec
                 .iter()
@@ -76,15 +64,15 @@ pub fn collect_foreign_and_union_types<'tcx>(
         });
     }
 
-    (foreign_vec, union_vec)
+    (union_vec, ty_visitor)
 }
 
 pub fn collect_union_related_types<'tcx>(
     tcx: &TyCtxt<'tcx>,
     union_tys: &[LocalDefId],
+    ty_visitor: &TyVisitor<'tcx>,
     verbose: bool,
 ) -> FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>> {
-    let ty_visitor = TyVisitor::new(*tcx);
     let related_types = ty_visitor.analyze_union_related_types(*tcx, union_tys);
 
     if verbose {
@@ -126,51 +114,30 @@ impl<'tcx> TyVisitor<'tcx> {
         }
     }
 
-    // Return (local_types, foreign_types, union_types)
-    pub fn analyse_tys(
-        mut self,
-        tcx: TyCtxt<'tcx>,
-    ) -> (
-        FxHashSet<LocalDefId>,
-        FxHashSet<LocalDefId>,
-        FxHashSet<LocalDefId>,
-    ) {
+    // Return (union_types, self)
+    pub fn analyse_tys(mut self, tcx: TyCtxt<'tcx>) -> (FxHashSet<LocalDefId>, Self) {
         tcx.hir_visit_all_item_likes_in_crate(&mut self);
         let ftypes: FxHashSet<_> = self
             .foreign_types
-            .into_iter()
-            .flat_map(|id| utils::graph::reachable_vertices(&self.type_graph, id))
-            .collect();
-        let unions: FxHashSet<_> = self
-            .unions
-            .into_iter()
-            .flat_map(|id| utils::graph::reachable_vertices(&self.type_graph, id))
+            .iter()
+            .flat_map(|id| utils::graph::reachable_vertices(&self.type_graph, *id))
             .collect();
 
-        let mut local_types = FxHashSet::default();
-        let mut foreign_types = FxHashSet::default();
         let mut union_types = FxHashSet::default();
         for (i, ty) in self.tys.iter_enumerated() {
-            if ftypes.contains(&i) {
-                foreign_types.insert(*ty);
-            } else {
-                if unions.contains(&i) {
-                    union_types.insert(*ty);
-                }
-                local_types.insert(*ty);
+            if !ftypes.contains(&i) && self.unions.contains(&i) {
+                union_types.insert(*ty);
             }
         }
-        (local_types, foreign_types, union_types)
+        (union_types, self)
     }
 
     /// Analyze union-related types: target union type -> (parent struct, fields)
     pub fn analyze_union_related_types(
-        mut self,
+        &self,
         tcx: TyCtxt<'tcx>,
         union_tys: &[LocalDefId],
     ) -> FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>> {
-        tcx.hir_visit_all_item_likes_in_crate(&mut self);
-
         let mut reverse_graph: FxHashMap<TyId, FxHashSet<TyId>> = FxHashMap::default();
         for (src, dsts) in &self.type_graph {
             for dst in dsts {
@@ -227,6 +194,7 @@ impl<'tcx> TyVisitor<'tcx> {
         let def_id = some_or!(def_id.as_local(), return);
         let id = self.ty_to_id(def_id);
         if matches!(self.tcx.def_kind(def_id), DefKind::Union) {
+            // println!("Found union type: {}", self.tcx.def_path_str(def_id));
             self.unions.insert(id);
         }
 
