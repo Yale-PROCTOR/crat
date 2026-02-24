@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
@@ -12,6 +12,44 @@ use rustc_middle::{
 use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::ty_visit::UnionRelatedTypes;
+
+// CallGraph: caller -> callee list
+pub type CallGraph = FxHashMap<DefId, Vec<DefId>>;
+
+#[derive(Debug, Clone)]
+pub struct SCCNode {
+    pub id: usize,
+    pub members: Vec<DefId>,
+}
+
+#[derive(Clone, Default)]
+pub struct CondensationGraph {
+    pub nodes: Vec<SCCNode>,
+    pub edges: FxHashMap<usize, FxHashSet<usize>>,
+}
+
+impl fmt::Debug for CondensationGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "CondensationGraph {{")?;
+        writeln!(f, "\tnodes:")?;
+        for node in &self.nodes {
+            writeln!(f, "\t\tSCC #{}:", node.id)?;
+            writeln!(f, "\t\t\tmembers: {:?}", node.members)?;
+        }
+
+        writeln!(f, "\tedges:")?;
+        for node in &self.nodes {
+            let scc_id = node.id;
+            let dsts = self
+                .edges
+                .get(&scc_id)
+                .map(|set| set.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            writeln!(f, "\t\t{scc_id} -> {dsts:?}")?;
+        }
+        write!(f, "}}")
+    }
+}
 
 struct BodyUnionUseCollector<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
@@ -135,12 +173,13 @@ pub fn collect_union_seed_functions<'tcx>(
     map
 }
 
+/// Build a callgraph for each target union type
 pub fn build_union_callgraphs<'tcx>(
     tcx: TyCtxt<'tcx>,
     seed_functions: &FxHashMap<LocalDefId, Vec<LocalDefId>>,
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     verbose: bool,
-) -> FxHashMap<LocalDefId, FxHashMap<DefId, Vec<DefId>>> {
+) -> FxHashMap<LocalDefId, CallGraph> {
     // Debug step option
     let verbose_callgraph_steps = true;
 
@@ -348,6 +387,128 @@ pub fn build_union_callgraphs<'tcx>(
     union_callgraphs
 }
 
+pub fn callgraph_to_condensation_graph(callgraph: &CallGraph) -> CondensationGraph {
+    struct Tarjan<'a> {
+        graph: &'a CallGraph,
+        index: usize,
+        stack: Vec<DefId>,
+        on_stack: FxHashSet<DefId>,
+        index_of: FxHashMap<DefId, usize>,
+        lowlink: FxHashMap<DefId, usize>,
+        sccs: Vec<Vec<DefId>>,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn strongconnect(&mut self, v: DefId) {
+            let v_index = self.index;
+            self.index += 1;
+            self.index_of.insert(v, v_index);
+            self.lowlink.insert(v, v_index);
+            self.stack.push(v);
+            self.on_stack.insert(v);
+
+            if let Some(succs) = self.graph.get(&v) {
+                for &w in succs {
+                    if !self.index_of.contains_key(&w) {
+                        self.strongconnect(w);
+                        let w_low = *self.lowlink.get(&w).expect("w lowlink exists");
+                        let v_low = self.lowlink.get_mut(&v).expect("v lowlink exists");
+                        if w_low < *v_low {
+                            *v_low = w_low;
+                        }
+                    } else if self.on_stack.contains(&w) {
+                        let w_idx = *self.index_of.get(&w).expect("w index exists");
+                        let v_low = self.lowlink.get_mut(&v).expect("v lowlink exists");
+                        if w_idx < *v_low {
+                            *v_low = w_idx;
+                        }
+                    }
+                }
+            }
+
+            let v_low = *self.lowlink.get(&v).expect("v lowlink exists");
+            if v_low == v_index {
+                let mut scc = Vec::new();
+                loop {
+                    let w = self.stack.pop().expect("stack not empty");
+                    self.on_stack.remove(&w);
+                    scc.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                self.sccs.push(scc);
+            }
+        }
+    }
+
+    let mut all_nodes = FxHashSet::default();
+    for (&caller, callees) in callgraph {
+        all_nodes.insert(caller);
+        for &callee in callees {
+            all_nodes.insert(callee);
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        graph: callgraph,
+        index: 0,
+        stack: Vec::new(),
+        on_stack: FxHashSet::default(),
+        index_of: FxHashMap::default(),
+        lowlink: FxHashMap::default(),
+        sccs: Vec::new(),
+    };
+
+    for &node in &all_nodes {
+        if !tarjan.index_of.contains_key(&node) {
+            tarjan.strongconnect(node);
+        }
+    }
+
+    // Tarjan emits SCCs in reverse topological order of the condensation DAG.
+    let mut nodes = Vec::with_capacity(tarjan.sccs.len());
+    let mut scc_of = FxHashMap::default();
+    for (scc_id, members) in tarjan.sccs.into_iter().enumerate() {
+        for &member in &members {
+            scc_of.insert(member, scc_id);
+        }
+        nodes.push(SCCNode {
+            id: scc_id,
+            members,
+        });
+    }
+
+    let mut edges: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+    for node in &nodes {
+        edges.entry(node.id).or_default();
+    }
+    for (&caller, callees) in callgraph {
+        let src = *scc_of
+            .get(&caller)
+            .expect("caller in graph should map to an SCC");
+        for &callee in callees {
+            let dst = *scc_of
+                .get(&callee)
+                .expect("callee in graph should map to an SCC");
+            if src != dst {
+                edges.entry(src).or_default().insert(dst);
+            }
+        }
+    }
+
+    CondensationGraph { nodes, edges }
+}
+
+pub fn callgraphs_to_condensation_graphs(
+    callgraphs: &FxHashMap<LocalDefId, CallGraph>,
+) -> FxHashMap<LocalDefId, CondensationGraph> {
+    callgraphs
+        .iter()
+        .map(|(&union_ty, graph)| (union_ty, callgraph_to_condensation_graph(graph)))
+        .collect()
+}
+
 fn collect_direct_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -460,11 +621,11 @@ fn is_expandable_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     is_callable_def(tcx, def_id) && tcx.is_mir_available(local_def_id.to_def_id())
 }
 
-/// Check if the function signature caller contains union related types
-/// - It contains the union type itself
-/// - It contains parent struct types including its pointer or reference
-/// - It contains pointer or reference of field types
-/// - It contains void pointer types
+/// Check if the function signature caller contains a union related type which is one of below:
+/// - the union type itself
+/// - parent struct types including its pointer or reference
+/// - pointer or reference of field types
+/// - void pointer types
 fn signature_related_hits<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_ty: LocalDefId,
