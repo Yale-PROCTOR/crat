@@ -1,3 +1,6 @@
 pub mod analysis;
-pub mod classify;
+pub mod callgraph;
 pub mod transform;
+pub mod ty_visit;
+
+pub use transform::replace_unions;

@@ -20,6 +20,7 @@ pub struct TyVisitor<'tcx> {
     tys: IndexVec<TyId, LocalDefId>,
     ty_ids: FxHashMap<LocalDefId, TyId>,
     foreign_types: FxHashSet<TyId>,
+    unions: FxHashSet<TyId>,
     type_graph: FxHashMap<TyId, FxHashSet<TyId>>,
 }
 
@@ -29,6 +30,7 @@ impl std::fmt::Debug for TyVisitor<'_> {
             .field("tys", &self.tys)
             .field("ty_ids", &self.ty_ids)
             .field("foreign_types", &self.foreign_types)
+            .field("unions", &self.unions)
             .field("type_graph", &self.type_graph)
             .finish()
     }
@@ -41,30 +43,45 @@ impl<'tcx> TyVisitor<'tcx> {
             tys: IndexVec::new(),
             ty_ids: FxHashMap::default(),
             foreign_types: FxHashSet::default(),
+            unions: FxHashSet::default(),
             type_graph: FxHashMap::default(),
         }
     }
 
-    pub fn find_foreign_tys(
+    pub fn analyse_tys(
         mut self,
         tcx: TyCtxt<'tcx>,
-    ) -> (FxHashSet<LocalDefId>, FxHashSet<LocalDefId>) {
+    ) -> (
+        FxHashSet<LocalDefId>,
+        FxHashSet<LocalDefId>,
+        FxHashSet<LocalDefId>,
+    ) {
         tcx.hir_visit_all_item_likes_in_crate(&mut self);
         let ftypes: FxHashSet<_> = self
             .foreign_types
             .into_iter()
             .flat_map(|id| utils::graph::reachable_vertices(&self.type_graph, id))
             .collect();
+        let unions: FxHashSet<_> = self
+            .unions
+            .into_iter()
+            .flat_map(|id| utils::graph::reachable_vertices(&self.type_graph, id))
+            .collect();
+
         let mut local_types = FxHashSet::default();
         let mut foreign_types = FxHashSet::default();
+        let mut union_types = FxHashSet::default();
         for (i, ty) in self.tys.iter_enumerated() {
             if ftypes.contains(&i) {
                 foreign_types.insert(*ty);
             } else {
+                if unions.contains(&i) {
+                    union_types.insert(*ty);
+                }
                 local_types.insert(*ty);
             }
         }
-        (local_types, foreign_types)
+        (local_types, foreign_types, union_types)
     }
 
     fn ty_to_id(&mut self, ty: LocalDefId) -> TyId {
@@ -94,12 +111,19 @@ impl<'tcx> TyVisitor<'tcx> {
                 Node::Item(item) => {
                     if matches!(
                         item.kind,
-                        ItemKind::Struct(_, _, _)
-                            | ItemKind::Union(_, _, _)
-                            | ItemKind::TyAlias(_, _, _)
+                        ItemKind::Struct(_, _, _) // | ItemKind::TyAlias(_, _, _)
                     ) {
+                        println!("Found struct: {:?}", self.tcx.def_path_str(def_id));
                         let item_id = self.ty_to_id(item.owner_id.def_id);
                         self.type_graph.entry(item_id).or_default().insert(id);
+                    } else if matches!(item.kind, ItemKind::TyAlias(_, _, _)) {
+                        println!("Found alias: {:?}", self.tcx.def_path_str(def_id));
+                        let item_id = self.ty_to_id(item.owner_id.def_id);
+                        self.type_graph.entry(item_id).or_default().insert(id);
+                    } else if matches!(item.kind, ItemKind::Union(_, _, _)) {
+                        let item_id = self.ty_to_id(item.owner_id.def_id);
+                        self.type_graph.entry(item_id).or_default().insert(id);
+                        self.unions.insert(id);
                     }
                     break;
                 }

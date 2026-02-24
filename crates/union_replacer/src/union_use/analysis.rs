@@ -7,7 +7,6 @@ use rustc_middle::{
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
-/// Union Place -> (Init Union Use, (Read Union Use -> (is_replacable, [Write Union Use readable from the Read Use])))
 pub type AnalysisMap = ();
 pub struct AnalysisResult {
     pub _map: FxHashMap<LocalDefId, AnalysisMap>,
@@ -16,22 +15,6 @@ pub struct AnalysisResult {
 fn collect_union_uses_map<'a>(tcx: TyCtxt<'a>, print_mir: bool) -> () {
     for def_id in tcx.hir_body_owners() {
         let _ = print_local_body(def_id, tcx, print_mir);
-
-        // if let Some(func_calls) = print_local_body(def_id, tcx, print_mir) {
-        //     if print_mir {
-        //         println!("\nFunction calls in {def_id:?}:");
-        //         for def_id in func_calls {
-        //             if let Some(local_def_id) = def_id.as_local() {
-        //                 println!("Local Function");
-        //                 println!("\t{local_def_id:?}");
-        //             } else {
-        //                 println!("Non-Local Function");
-        //                 _ = _print_foreign_body(def_id, tcx, print_mir);
-        //             }
-        //         }
-        //     }
-        //     println!("==============================");
-        // }
     }
 }
 
