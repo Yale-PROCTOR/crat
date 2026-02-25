@@ -1,26 +1,45 @@
 // use etrace::some_or;
-use rustc_hash::FxHashMap;
+use points_to::andersen;
+use rustc_hash::FxHashSet;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{Body, StatementKind, TerminatorKind},
     ty::TyCtxt,
 };
 use rustc_span::def_id::{DefId, LocalDefId};
+use typed_arena::Arena;
+use utils::ty_shape;
 
-pub type AnalysisMap = ();
 pub struct AnalysisResult {
-    pub _map: FxHashMap<LocalDefId, AnalysisMap>,
+    pub _map: (),
 }
 
-fn collect_union_uses_map<'a>(tcx: TyCtxt<'a>, print_mir: bool) {
-    for def_id in tcx.hir_body_owners() {
-        let _ = print_local_body(def_id, tcx, print_mir);
+pub fn analyze(tcx: TyCtxt, verbose: bool, _print_mir: bool) -> AnalysisResult {
+    let use_optimized_mir = true;
+    let arena = Arena::new();
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
+
+    let points_to_config = andersen::Config {
+        use_optimized_mir,
+        c_exposed_fns: FxHashSet::default(),
+    };
+
+    let pre = andersen::pre_analyze(&points_to_config, &tss, tcx);
+
+    let solutions = andersen::analyze(&points_to_config, &pre, &tss, tcx);
+
+    let _may_points_to = andersen::post_analyze(&points_to_config, pre, solutions, &tss, tcx);
+
+    if verbose {
+        println!("\nUnion use analysis result:");
     }
+
+    AnalysisResult { _map: () }
 }
 
 /// Print the MIR body of a local function definition.
-/// Returns a list of function DefIds called within the body.
-fn print_local_body<'a>(
+/// Return: a list of function DefIds called within the body.
+fn _print_local_body<'a>(
     def_id: LocalDefId,
     tcx: TyCtxt<'a>,
     print_mir: bool,
@@ -75,6 +94,8 @@ fn print_local_body<'a>(
     Some(func_calls)
 }
 
+/// Print the MIR body of a foreign function definition.
+/// Return: a list of function DefIds called within the body.
 fn _print_foreign_body<'a>(def_id: DefId, tcx: TyCtxt<'a>, print_mir: bool) -> Option<Vec<DefId>> {
     let mut func_calls = Vec::new();
 
@@ -117,15 +138,4 @@ fn _print_foreign_body<'a>(def_id: DefId, tcx: TyCtxt<'a>, print_mir: bool) -> O
         }
     }
     Some(func_calls)
-}
-
-pub fn analyze(tcx: TyCtxt, verbose: bool, print_mir: bool) -> AnalysisResult {
-    collect_union_uses_map(tcx, print_mir);
-    let result_map = FxHashMap::default();
-
-    if verbose {
-        println!("\nUnion use analysis result:");
-    }
-
-    AnalysisResult { _map: result_map }
 }

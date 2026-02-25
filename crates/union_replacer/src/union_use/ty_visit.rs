@@ -114,7 +114,7 @@ impl<'tcx> TyVisitor<'tcx> {
         }
     }
 
-    // Return (union_types, self)
+    // Return: (union_types, self)
     pub fn analyse_tys(mut self, tcx: TyCtxt<'tcx>) -> (FxHashSet<LocalDefId>, Self) {
         tcx.hir_visit_all_item_likes_in_crate(&mut self);
         let ftypes: FxHashSet<_> = self
