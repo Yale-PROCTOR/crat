@@ -55,7 +55,7 @@ pub fn collect_local_union_types<'tcx>(
     let union_vec = union_tys.into_iter().collect::<Vec<_>>();
 
     if verbose {
-        println!("Union Types:\n\t{}", {
+        println!("\nUnion Types:\n\t{}", {
             let names = union_vec
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
@@ -193,6 +193,7 @@ impl<'tcx> TyVisitor<'tcx> {
         let Res::Def(_, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
         let id = self.ty_to_id(def_id);
+        // println!("Visiting type: {}", self.tcx.def_path_str(def_id));
         if matches!(self.tcx.def_kind(def_id), DefKind::Union) {
             // println!("Found union type: {}", self.tcx.def_path_str(def_id));
             self.unions.insert(id);
@@ -234,5 +235,14 @@ impl<'tcx> Visitor<'tcx> for TyVisitor<'tcx> {
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx, AmbigArg>) {
         self.handle_ty(ty);
         intravisit::walk_ty(self, ty);
+    }
+
+    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
+        if matches!(item.kind, ItemKind::Union(_, _, _)) {
+            // println!("Visiting item: {}", self.tcx.def_path_str(item.owner_id.def_id));
+            let id = self.ty_to_id(item.owner_id.def_id);
+            self.unions.insert(id);
+        }
+        intravisit::walk_item(self, item);
     }
 }
