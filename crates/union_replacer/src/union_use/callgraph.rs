@@ -13,6 +13,9 @@ use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::ty_visit::UnionRelatedTypes;
 
+/// Seed functions: union type -> list of functions
+pub type SeedFuncs = FxHashMap<LocalDefId, Vec<LocalDefId>>;
+
 /// CallGraph: caller -> list of callees
 pub type CallGraph = FxHashMap<DefId, Vec<DefId>>;
 
@@ -111,7 +114,7 @@ pub fn collect_union_seed_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_tys: &[LocalDefId],
     verbose: bool,
-) -> FxHashMap<LocalDefId, Vec<LocalDefId>> {
+) -> SeedFuncs {
     let union_tys: FxHashSet<_> = union_tys.iter().copied().collect();
     let mut map: FxHashMap<LocalDefId, FxHashSet<LocalDefId>> = union_tys
         .iter()
@@ -142,7 +145,7 @@ pub fn collect_union_seed_functions<'tcx>(
         }
     }
 
-    let map: FxHashMap<LocalDefId, Vec<LocalDefId>> = map
+    let map: SeedFuncs = map
         .into_iter()
         .map(|(union_ty, mut fn_ids)| {
             let mut fn_ids = fn_ids.drain().collect::<Vec<_>>();
@@ -176,7 +179,7 @@ pub fn collect_union_seed_functions<'tcx>(
 /// Build a callgraph for each target union type
 pub fn build_union_callgraphs<'tcx>(
     tcx: TyCtxt<'tcx>,
-    seed_functions: &FxHashMap<LocalDefId, Vec<LocalDefId>>,
+    seed_functions: &SeedFuncs,
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     verbose: bool,
 ) -> FxHashMap<LocalDefId, CallGraph> {

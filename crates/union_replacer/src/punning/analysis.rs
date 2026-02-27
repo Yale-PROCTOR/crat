@@ -134,7 +134,7 @@ fn collect_union_uses_map<'a>(
     union_uses_map
 }
 
-/// Place -> [UnionUseInfo] for each def_id (function)
+/// Place -> \[UnionUseInfo\] for each def_id (function)
 fn collect_union_uses<'a>(
     def_id: LocalDefId,
     tcx: TyCtxt<'a>,

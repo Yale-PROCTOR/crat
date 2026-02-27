@@ -25,7 +25,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
         print_condensation_graphs(tcx, &condensation_graphs);
     }
 
-    analyze(tcx, verbose, false);
+    analyze(tcx, &condensation_graphs, true, false, verbose);
 
     let str = pprust::crate_to_string_for_macros(&krate);
     if false {
