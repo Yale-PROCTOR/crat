@@ -69,12 +69,32 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     };
                     let ty = utils::ir::mir_ty_to_string(fix.ty, self.tcx);
                     *param.ty = utils::ty!("*{m} {ty}");
-                    write!(
-                        call,
-                        "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1024) }}, ",
-                        if fix.mutability.is_mut() { "mut " } else { "" },
-                        if fix.mutability.is_mut() { "_mut" } else { "" },
-                    ).unwrap();
+                    match fix.kind {
+                        ParamFixKind::Slice => {
+                            write!(
+                                call,
+                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1024) }}, ",
+                                if fix.mutability.is_mut() { "mut " } else { "" },
+                                if fix.mutability.is_mut() { "_mut" } else { "" },
+                            )
+                            .unwrap();
+                        }
+                        ParamFixKind::SliceCursor => {
+                            if fix.mutability.is_mut() {
+                                write!(
+                                    call,
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts_mut({x}, 1024)) }}, ",
+                                )
+                                .unwrap();
+                            } else {
+                                write!(
+                                    call,
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorRef::empty() }} else {{ crate::slice_cursor::SliceCursorRef::new(std::slice::from_raw_parts({x}, 1024)) }}, ",
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
                 } else {
                     write!(call, "{x}, ").unwrap();
                 }
@@ -127,8 +147,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
 #[derive(Clone, Copy)]
 struct ParamFix<'tcx> {
+    kind: ParamFixKind,
     mutability: ty::Mutability,
     ty: ty::Ty<'tcx>,
+}
+
+#[derive(Clone, Copy)]
+enum ParamFixKind {
+    Slice,
+    SliceCursor,
 }
 
 struct HirVisitor<'a, 'tcx> {
@@ -154,15 +181,47 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
             let mut fixes = FxHashMap::default();
             for (i, param) in body.params.iter().enumerate() {
                 let ty = typeck.node_type(param.pat.hir_id);
-                let ty::TyKind::Ref(_, inner_ty, m) = ty.kind() else { continue };
-                let ty::TyKind::Slice(inner_ty) = inner_ty.kind() else { continue };
-                fixes.insert(
-                    i,
-                    ParamFix {
-                        mutability: *m,
-                        ty: *inner_ty,
-                    },
-                );
+
+                if let ty::TyKind::Ref(_, inner_ty, m) = ty.kind()
+                    && let ty::TyKind::Slice(inner_ty) = inner_ty.kind()
+                {
+                    fixes.insert(
+                        i,
+                        ParamFix {
+                            kind: ParamFixKind::Slice,
+                            mutability: *m,
+                            ty: *inner_ty,
+                        },
+                    );
+                    continue;
+                }
+
+                if let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() {
+                    let adt_name = adt_def
+                        .did()
+                        .as_local()
+                        .map(|def_id| self.tcx.item_name(def_id.into()));
+                    let Some(adt_name) = adt_name else { continue };
+
+                    let (kind, mutability) = if adt_name.as_str() == "SliceCursor" {
+                        (ParamFixKind::SliceCursor, ty::Mutability::Mut)
+                    } else if adt_name.as_str() == "SliceCursorRef" {
+                        (ParamFixKind::SliceCursor, ty::Mutability::Not)
+                    } else {
+                        continue;
+                    };
+
+                    let Some(inner_ty) = generic_args.types().next() else { continue };
+
+                    fixes.insert(
+                        i,
+                        ParamFix {
+                            kind,
+                            mutability,
+                            ty: inner_ty,
+                        },
+                    );
+                }
             }
             if !fixes.is_empty() {
                 let new_name = format!("{name}_internal");

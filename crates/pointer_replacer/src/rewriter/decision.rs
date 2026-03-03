@@ -15,14 +15,19 @@ pub enum PtrKind {
     OptRef(bool),
     /// raw pointer: *mut T for Raw(true), or *const T for Raw(false)
     Raw(bool),
-    /// slice: &mut [T] for Slice(true), or &[T] for Slice(false)
+    /// plain slice: &mut [T] for Slice(true), or &[T] for Slice(false)
     Slice(bool),
+    /// slice cursor with offset tracking: SliceCursor<T> for SliceCursor(true),
+    /// or SliceCursorRef<T> for SliceCursor(false)
+    SliceCursor(bool),
 }
 
 impl PtrKind {
     pub fn is_mut(&self) -> bool {
         match self {
-            PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) => *m,
+            PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) | PtrKind::SliceCursor(m) => {
+                *m
+            }
         }
     }
 }
@@ -33,6 +38,8 @@ pub struct DecisionMaker<'tcx> {
     array_pointers: IndexVec<Local, bool>,
     promoted_mut_refs: DenseBitSet<Local>,
     promoted_shared_refs: DenseBitSet<Local>,
+    /// Locals that need a SliceCursor because they are offset with potentially-negative values.
+    needs_cursor: DenseBitSet<Local>,
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
@@ -53,12 +60,23 @@ impl<'tcx> DecisionMaker<'tcx> {
             .get(&did)
             .unwrap()
             .clone();
+        let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+        let fn_offset_signs = analysis.offset_sign_result.access_signs.get(&did);
+        let mut needs_cursor = DenseBitSet::new_empty(mutable_pointers.len());
+        for (hir_id, local) in hir_to_mir.binding_to_local {
+            if fn_offset_signs
+                .is_some_and(|signs| signs.get(&hir_id).is_some_and(|s| s.needs_cursor()))
+            {
+                needs_cursor.insert(local);
+            }
+        }
         DecisionMaker {
             tcx,
             array_pointers,
             mutable_pointers,
             promoted_mut_refs,
             promoted_shared_refs,
+            needs_cursor,
         }
     }
 
@@ -79,9 +97,17 @@ impl<'tcx> DecisionMaker<'tcx> {
             Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self.array_pointers[local] {
             if self.promoted_shared_refs.contains(local) {
-                Some(PtrKind::Slice(false))
+                if self.needs_cursor.contains(local) {
+                    Some(PtrKind::SliceCursor(false))
+                } else {
+                    Some(PtrKind::Slice(false))
+                }
             } else if self.promoted_mut_refs.contains(local) {
-                Some(PtrKind::Slice(true))
+                if self.needs_cursor.contains(local) {
+                    Some(PtrKind::SliceCursor(true))
+                } else {
+                    Some(PtrKind::Slice(true))
+                }
             } else {
                 Some(PtrKind::Raw(self.mutable_pointers[local]))
             }
@@ -156,6 +182,10 @@ impl SigDecisions {
                 .take(input_len)
                 .map(|(param, param_decl)| {
                     let aliases = aliases.and_then(|aliases| aliases.get(&param));
+                    // match decision_maker.decide(param, param_decl, aliases) {
+                    //     Some(PtrKind::SliceCursor(m)) => Some(PtrKind::Slice(m)),
+                    //     other => other,
+                    // }
                     decision_maker.decide(param, param_decl, aliases)
                 })
                 .collect();

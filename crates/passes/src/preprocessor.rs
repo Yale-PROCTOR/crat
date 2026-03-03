@@ -267,7 +267,7 @@ use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{DUMMY_SP, Span, Symbol, def_id::LocalDefId, sym};
 use thin_vec::ThinVec;
 use utils::{
-    ast::{unwrap_cast_and_paren, unwrap_paren},
+    ast::{has_side_effects, unwrap_cast_and_paren, unwrap_paren},
     expr,
     ir::{AstToHir, mir_ty_to_string},
     ty,
@@ -710,6 +710,20 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         let expr_id = expr.id;
         match &mut expr.kind {
+            ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) => {
+                let mut idx_counter = 0;
+                let mut let_stmts = vec![];
+                hoist_self_ref_place_expr(l, &mut idx_counter, &mut let_stmts);
+                if !let_stmts.is_empty() {
+                    let mut new_expr = "{".to_string();
+                    for s in let_stmts {
+                        new_expr.push_str(&s);
+                    }
+                    new_expr.push_str(&pprust::expr_to_string(expr));
+                    new_expr.push('}');
+                    *expr = expr!("{new_expr}");
+                }
+            }
             ExprKind::Call(callee, args) => {
                 if let ExprKind::Path(_, path) = &callee.kind
                     && let [.., seg] = &path.segments[..]
@@ -902,6 +916,74 @@ fn expr_contains_ident(expr: &Expr, name: Symbol) -> bool {
     let mut finder = Finder { name, found: false };
     finder.visit_expr(expr);
     finder.found
+}
+
+fn is_hoistable_self_ref_arg(expr: &Expr) -> bool {
+    if !has_side_effects(expr) {
+        return true;
+    }
+    match &expr.kind {
+        ExprKind::Paren(e) | ExprKind::Cast(e, _) | ExprKind::Unary(_, e) => {
+            is_hoistable_self_ref_arg(e)
+        }
+        ExprKind::Binary(_, l, r) => is_hoistable_self_ref_arg(l) && is_hoistable_self_ref_arg(r),
+        ExprKind::Index(base, idx, _) => {
+            is_hoistable_self_ref_arg(base) && is_hoistable_self_ref_arg(idx)
+        }
+        ExprKind::MethodCall(box call)
+            if call.seg.ident.name.as_str().starts_with("wrapping_")
+                && is_hoistable_self_ref_arg(&call.receiver)
+                && call.args.iter().all(|arg| is_hoistable_self_ref_arg(arg)) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn hoist_self_ref_place_expr(
+    expr: &mut Expr,
+    idx_counter: &mut usize,
+    let_stmts: &mut Vec<String>,
+) {
+    match &mut expr.kind {
+        ExprKind::Index(base, idx, _) => {
+            hoist_self_ref_place_expr(base, idx_counter, let_stmts);
+
+            if let Some(base_name) = receiver_base_ident(base)
+                && expr_contains_ident(idx, base_name)
+                && is_hoistable_self_ref_arg(idx)
+            {
+                let idx_str = pprust::expr_to_string(idx);
+                let temp_name = format!("__idx_{}", idx_counter);
+                *idx_counter += 1;
+                let_stmts.push(format!("let {temp_name} = {idx_str};"));
+                **idx = expr!("{temp_name}");
+            }
+        }
+        ExprKind::MethodCall(box call)
+            if call.seg.ident.name.as_str() == "offset" && call.args.len() == 1 =>
+        {
+            hoist_self_ref_place_expr(&mut call.receiver, idx_counter, let_stmts);
+
+            if let Some(base_name) = receiver_base_ident(&call.receiver)
+                && expr_contains_ident(&call.args[0], base_name)
+                && is_hoistable_self_ref_arg(&call.args[0])
+            {
+                let arg_str = pprust::expr_to_string(&call.args[0]);
+                let temp_name = format!("__idx_{}", idx_counter);
+                *idx_counter += 1;
+                let_stmts.push(format!("let {temp_name} = {arg_str};"));
+                call.args[0] = P(expr!("{temp_name}"));
+            }
+        }
+        ExprKind::Unary(_, e)
+        | ExprKind::Paren(e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::AddrOf(_, _, e)
+        | ExprKind::Field(e, _) => hoist_self_ref_place_expr(e, idx_counter, let_stmts),
+        _ => {}
+    }
 }
 
 #[inline]
@@ -1706,6 +1788,47 @@ pub unsafe extern "C" fn f(mut x: libc::c_int, mut p: *mut libc::c_int) {
             "#,
             &[" = g(p, 0 as libc::c_int);"],
             &["p, g(p, 0 as libc::c_int)"],
+        );
+    }
+
+    #[test]
+    fn test_self_ref_index_assign() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut s_inc: [u8; 65]) {
+    s_inc[s_inc[64 as usize] as usize] =
+        (s_inc[s_inc[64 as usize] as usize] as core::ffi::c_int ^ 0x1f as core::ffi::c_int)
+            as u8;
+}
+            "#,
+            &["let __idx_0", "s_inc[__idx_0]"],
+            &["s_inc[s_inc[64 as usize] as usize] ="],
+        );
+    }
+
+    #[test]
+    fn test_self_ref_wrapping_index_assign() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut s_inc: [u64; 26], mut i: usize, mut x: u64) {
+    s_inc[((s_inc[25 as usize]).wrapping_add(i as u64) >> 3 as usize) as usize] = x;
+}
+            "#,
+            &["let __idx_0", "s_inc[__idx_0] = x"],
+            &["s_inc[((s_inc[25 as usize]).wrapping_add(i as u64) >> 3 as usize) as usize] = x"],
+        );
+    }
+
+    #[test]
+    fn test_self_ref_offset_assign() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut s_inc: *mut core::ffi::c_uchar) {
+    *s_inc.offset((*s_inc.offset(64 as isize) as isize) as isize) = 0 as core::ffi::c_uchar;
+}
+            "#,
+            &["let __idx_0", "s_inc.offset(__idx_0)"],
+            &["s_inc.offset((*s_inc.offset(64 as isize) as isize) as isize)"],
         );
     }
 

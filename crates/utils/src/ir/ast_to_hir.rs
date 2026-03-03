@@ -259,8 +259,8 @@ impl<'tcx> AstToHirMapper<'tcx> {
                     self.map_assoc_item_to_impl_item(item, hitem);
                 }
             }
+            ItemKind::MacroDef(..) => {}
             ItemKind::MacCall(..) => todo!(),
-            ItemKind::MacroDef(..) => todo!(),
             ItemKind::Delegation(..) => todo!(),
             ItemKind::DelegationMac(..) => todo!(),
         }

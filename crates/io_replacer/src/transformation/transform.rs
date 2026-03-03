@@ -13,7 +13,7 @@ use rustc_hir::{self as hir, HirId};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir,
-    ty::{List, TyCtxt},
+    ty::{TyCtxt, TyKind},
 };
 use rustc_span::{Span, Symbol, def_id::LocalDefId, sym};
 use serde::Deserialize;
@@ -259,7 +259,9 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
             MirLoc::Field(def_id, field) => {
                 let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                 let adt_def = tcx.adt_def(*def_id);
-                let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, List::empty());
+                let adt_ty = tcx.type_of(*def_id).instantiate_identity();
+                let TyKind::Adt(_, generic_args) = adt_ty.kind() else { continue };
+                let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, *generic_args);
                 let mut ctx = LocCtx::new(ty);
                 ctx.is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _, _));
                 (vec![HirLoc::Field(*def_id, *field)], ctx)

@@ -2,7 +2,7 @@ use super::*;
 
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
-    let (s, _) =
+    let (s, _, _) =
         ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(&config, tcx))
             .unwrap();
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);

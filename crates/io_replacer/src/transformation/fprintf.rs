@@ -122,25 +122,36 @@ impl TransformVisitor<'_, '_, '_> {
                                 .unwrap();
                             let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
                             let ty = typeck.expr_ty(hir_receiver);
-                            let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
-                                ty.peel_refs().kind()
-                            else {
-                                panic!("{arg_str} {ty}");
-                            };
+                            let peeled_ty = ty.peel_refs();
                             let receiver_str = pprust::expr_to_string(&call.receiver);
-                            if *ety == self.tcx.types.u8 {
-                                format!(
-                                    "
+                            match peeled_ty.kind() {
+                                ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety) => {
+                                    if *ety == self.tcx.types.u8 {
+                                        format!(
+                                            "
     std::ffi::CStr::from_bytes_until_nul(&({receiver_str})).unwrap()"
-                                )
-                            } else if ety.is_numeric() {
-                                self.dependencies.bytemuck.set(true);
-                                format!(
-                                    "
+                                        )
+                                    } else if ety.is_numeric() {
+                                        self.dependencies.bytemuck.set(true);
+                                        format!(
+                                            "
     std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({receiver_str}))).unwrap()"
-                                )
-                            } else {
-                                panic!("{arg_str} {ty}");
+                                        )
+                                    } else {
+                                        panic!("{arg_str} {ty}");
+                                    }
+                                }
+                                ty::TyKind::Adt(adt_def, _) => {
+                                    let item_name = self.tcx.item_name(adt_def.did());
+                                    if item_name == Symbol::intern("SliceCursor")
+                                        || item_name == Symbol::intern("SliceCursorRef")
+                                    {
+                                        format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
+                                    } else {
+                                        panic!("{arg_str} {ty}");
+                                    }
+                                }
+                                _ => panic!("{arg_str} {ty}"),
                             }
                         }
                         ExprKind::AddrOf(_, _, pointee) => {
