@@ -227,10 +227,7 @@ fn identify_union_uses(
     // - collect accesses/hints from body traversal
     for def_id in target_fns {
         if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
-            unreachable!(
-                "Expected function, got {:?}",
-                tcx.def_kind(def_id)
-            );
+            unreachable!("Expected function, got {:?}", tcx.def_kind(def_id));
         }
         if !tcx.is_mir_available(def_id.to_def_id()) {
             continue;
