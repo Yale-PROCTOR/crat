@@ -182,10 +182,6 @@ impl SigDecisions {
                 .take(input_len)
                 .map(|(param, param_decl)| {
                     let aliases = aliases.and_then(|aliases| aliases.get(&param));
-                    // match decision_maker.decide(param, param_decl, aliases) {
-                    //     Some(PtrKind::SliceCursor(m)) => Some(PtrKind::Slice(m)),
-                    //     other => other,
-                    // }
                     decision_maker.decide(param, param_decl, aliases)
                 })
                 .collect();
