@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod callgraph;
 pub mod model;
+pub mod reverse_cfg;
 pub mod transform;
 pub mod ty_visit;
 

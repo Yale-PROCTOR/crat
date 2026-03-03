@@ -7,8 +7,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        Body, Local, Location, Operand, Place, PlaceElem, StatementKind, Terminator,
-        TerminatorKind,
+        AggregateKind, Body, Local, Location, Operand, Place, PlaceElem, Rvalue, Statement,
+        StatementKind, Terminator, TerminatorKind,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MirVisitor},
     },
     ty::{TyCtxt, TyKind},
@@ -39,7 +39,7 @@ pub fn analyze(
 
     let solutions = andersen::analyze(&points_to_config, &pre, &tss, tcx);
 
-    let _may_points_to = andersen::post_analyze(&points_to_config, pre, solutions, &tss, tcx);
+    let may_points_to = andersen::post_analyze(&points_to_config, pre, solutions, &tss, tcx);
 
     // for (def_id, writes) in &_may_points_to.writes {
     //     println!("Function {def_id:?} writes:");
@@ -51,7 +51,7 @@ pub fn analyze(
     // }
 
     if print_mir {
-        _print_all_local_bodies_with_points_to(tcx, &_may_points_to, use_optimized_mir);
+        _print_all_local_bodies_with_points_to(tcx, &may_points_to, use_optimized_mir);
     }
 
     if verbose {
@@ -60,7 +60,7 @@ pub fn analyze(
 
     identify_union_uses(
         tcx,
-        _may_points_to,
+        may_points_to,
         condensation_graphs,
         use_optimized_mir,
         verbose,
@@ -224,8 +224,11 @@ fn identify_union_uses(
     // - seed instance->type from local declarations
     // - collect accesses/hints from body traversal
     for def_id in target_fns {
-        if tcx.def_kind(def_id) != DefKind::Fn {
-            unreachable!("Expected function, got {:?}", tcx.def_kind(def_id));
+        if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+            unreachable!(
+                "Expected function or assoc function, got {:?}",
+                tcx.def_kind(def_id)
+            );
         }
         if !tcx.is_mir_available(def_id.to_def_id()) {
             continue;
@@ -339,10 +342,46 @@ struct BodyUnionAccessCollector<'tcx, 'a> {
     seen: FxHashSet<DetectedAccess>,
     accesses: Vec<DetectedAccess>,
     instance_union_tys: FxHashMap<UnionMemoryInstance, DefId>,
+    init_lhs_overrides: FxHashMap<Location, Local>,
 }
 
 impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
+        if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
+            && let Some((union_ty, field)) = self.detect_union_init_field(*place, rvalue)
+        {
+            self.harvest_instance_hint(*place);
+            self.init_lhs_overrides.insert(location, place.local);
+            let site = UnionAccessSite {
+                def_id: self.def_id,
+                location,
+            };
+            self.push_access_with_override(
+                *place,
+                AccessKind::Write,
+                site,
+                0,
+                Some((union_ty, field)),
+            );
+        }
+
+        self.super_statement(statement, location);
+    }
+
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        if matches!(
+            context,
+            PlaceContext::MutatingUse(MutatingUseContext::Store | MutatingUseContext::AsmOutput)
+        ) && place.projection.is_empty()
+            && self
+                .init_lhs_overrides
+                .get(&location)
+                .is_some_and(|local| *local == place.local)
+        {
+            self.harvest_instance_hint(*place);
+            return;
+        }
+
         self.harvest_instance_hint(*place);
 
         let Some(kind) = Self::classify(context) else {
@@ -400,6 +439,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             seen: FxHashSet::default(),
             accesses: Vec::new(),
             instance_union_tys: FxHashMap::default(),
+            init_lhs_overrides: FxHashMap::default(),
         }
     }
 
@@ -568,11 +608,25 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         site: UnionAccessSite,
         implicit_deref_count: usize,
     ) {
+        self.push_access_with_override(place, kind, site, implicit_deref_count, None);
+    }
+
+    fn push_access_with_override(
+        &mut self,
+        place: Place<'tcx>,
+        kind: AccessKind,
+        site: UnionAccessSite,
+        implicit_deref_count: usize,
+        override_field: Option<(DefId, UnionAccessField)>,
+    ) {
         let instances = self.find_aliasing_union_instances(place, implicit_deref_count);
         if instances.is_empty() {
             return;
         }
-        let (resolved_union_ty, syntax_field) = self.detect_union_field_and_type(place);
+        let (resolved_union_ty, syntax_field) = match override_field {
+            Some((union_ty, field)) => (Some(union_ty), field),
+            None => self.detect_union_field_and_type(place),
+        };
         for instance in instances {
             let field = match syntax_field {
                 UnionAccessField::Top => {
@@ -593,6 +647,26 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         }
     }
 
+    fn detect_union_init_field(
+        &self,
+        place: Place<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+    ) -> Option<(DefId, UnionAccessField)> {
+        let TyKind::Adt(adt, _) = self.body.local_decls[place.local].ty.kind() else {
+            return None;
+        };
+        if !adt.is_union() || !place.projection.is_empty() {
+            return None;
+        }
+
+        let Rvalue::Aggregate(box AggregateKind::Adt(_, _, _, _, Some(field_idx)), _) = rvalue
+        else {
+            return None;
+        };
+
+        Some((adt.did(), UnionAccessField::Field(field_idx.as_usize())))
+    }
+
     fn harvest_instance_hint(&mut self, place: Place<'tcx>) {
         let (resolved_union_ty, _) = self.detect_union_field_and_type(place);
         let Some(resolved_union_ty) = resolved_union_ty else {
@@ -606,30 +680,36 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
     }
 
     fn detect_union_field_and_type(&self, place: Place<'tcx>) -> (Option<DefId>, UnionAccessField) {
-        if !place.projection.is_empty() {
-            for i in 0..(place.projection.len() - 1) {
-                let ty = Place::ty_from(
+        for i in 0..place.projection.len() {
+            let ty = if i == 0 {
+                self.body.local_decls[place.local].ty
+            } else {
+                Place::ty_from(
                     place.local,
-                    &place.projection[..=i],
+                    &place.projection[..i],
                     &self.body.local_decls,
                     self.tcx,
                 )
-                .ty;
-                let TyKind::Adt(adt, _) = ty.kind() else {
-                    continue;
-                };
-                if !adt.is_union() {
-                    continue;
-                }
-                if let PlaceElem::Field(field_idx, _) = place.projection[i + 1] {
-                    return (
-                        Some(adt.did()),
-                        UnionAccessField::Field(field_idx.as_usize()),
-                    );
-                }
-                return (Some(adt.did()), UnionAccessField::Top);
+                .ty
+            };
+
+            let TyKind::Adt(adt, _) = ty.kind() else {
+                continue;
+            };
+            if !adt.is_union() {
+                continue;
             }
+
+            if let PlaceElem::Field(field_idx, _) = place.projection[i] {
+                return (
+                    Some(adt.did()),
+                    UnionAccessField::Field(field_idx.as_usize()),
+                );
+            }
+
+            return (Some(adt.did()), UnionAccessField::Top);
         }
+
         let ty = place.ty(self.body, self.tcx).ty;
         if let TyKind::Adt(adt, _) = ty.kind()
             && adt.is_union()
