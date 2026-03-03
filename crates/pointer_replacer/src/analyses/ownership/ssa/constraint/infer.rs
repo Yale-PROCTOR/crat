@@ -1,6 +1,5 @@
 use std::borrow::BorrowMut;
 
-use rustc_ast::Mutability;
 use rustc_data_structures::graph::Successors;
 use rustc_index::IndexVec;
 use rustc_middle::{
@@ -581,11 +580,9 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
 
             Rvalue::CopyForDeref(rhs) => {
-                // dest of deref_copy is never interpretted
-                let _ = self.state.try_consume_at(lhs.local, location);
-                // let lhs_consume =
-                // consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
-                // assert!(lhs_consume.is_none(), "{:?}", lhs_consume.unwrap());
+                // Keep fn-body signatures aligned with SSA versions produced while
+                // consuming the deref-copy destination.
+                let _ = consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
                 Infer::copy_for_deref(infer_cx, rhs_consume);
