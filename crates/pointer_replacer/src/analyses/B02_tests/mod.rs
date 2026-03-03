@@ -2,12 +2,13 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    path::Path,
+    env, fs,
+    path::{Path, PathBuf},
     sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex, OnceLock,
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -17,6 +18,7 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_span::def_id::LocalDefId;
+use similar::TextDiff;
 
 use crate::{
     analyses::{
@@ -129,8 +131,10 @@ pub(super) fn run_ownership_case_with_assertions(case_name: &str, code: &str) {
                 case_name
             );
 
-            for (slot_idx, (observed_slot, expected_ty)) in
-                observed.into_iter().zip(expected_tys.into_iter()).enumerate()
+            for (slot_idx, (observed_slot, expected_ty)) in observed
+                .into_iter()
+                .zip(expected_tys.into_iter())
+                .enumerate()
             {
                 let is_pointer_like =
                     expected_ty.is_raw_ptr() || expected_ty.is_ref() || expected_ty.is_box();
@@ -451,27 +455,27 @@ fn is_simple_ident(name: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn has_allocator_call(text: &str) -> bool {
-    fn is_ident_char(b: u8) -> bool {
-        b == b'_' || b.is_ascii_alphanumeric()
-    }
+fn is_ident_char_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
 
-    fn contains_direct_call(text: &str, callee: &str) -> bool {
-        let pattern = format!("{callee}(");
-        let mut offset = 0usize;
-        let bytes = text.as_bytes();
+fn contains_direct_call(text: &str, callee: &str) -> bool {
+    let pattern = format!("{callee}(");
+    let mut offset = 0usize;
+    let bytes = text.as_bytes();
 
-        while let Some(pos) = text[offset..].find(&pattern) {
-            let idx = offset + pos;
-            let has_ident_prefix = idx > 0 && is_ident_char(bytes[idx - 1]);
-            if !has_ident_prefix {
-                return true;
-            }
-            offset = idx + 1;
+    while let Some(pos) = text[offset..].find(&pattern) {
+        let idx = offset + pos;
+        let has_ident_prefix = idx > 0 && is_ident_char_byte(bytes[idx - 1]);
+        if !has_ident_prefix {
+            return true;
         }
-        false
+        offset = idx + 1;
     }
+    false
+}
 
+fn has_allocator_call(text: &str) -> bool {
     ["malloc", "calloc", "realloc", "strdup"]
         .iter()
         .any(|callee| contains_direct_call(text, callee))
@@ -591,6 +595,241 @@ fn extract_allocator_related_ptr_locals(code: &str) -> Vec<(String, String)> {
     out
 }
 
+#[derive(Debug, Clone)]
+struct AllocatorOriginRewrite {
+    function: String,
+    local: String,
+    allocator: String,
+    before_stmt: String,
+    after_stmt: Option<String>,
+    rewrite_kind: String,
+}
+
+fn normalize_stmt(stmt: &str) -> String {
+    stmt.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_decl_local_name(stmt: &str) -> Option<String> {
+    let stmt = stmt.trim_start();
+    for (idx, _) in stmt.rmatch_indices("let ") {
+        let has_ident_prefix = idx > 0 && is_ident_char_byte(stmt.as_bytes()[idx - 1]);
+        if has_ident_prefix {
+            continue;
+        }
+        let rest = &stmt[idx + "let ".len()..];
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let end = rest
+            .find(|c: char| c == ':' || c.is_whitespace() || c == '=')
+            .unwrap_or(rest.len());
+        let name = rest[..end].trim();
+        if is_simple_ident(name) {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+fn parse_assignment_lhs_name(stmt: &str) -> Option<String> {
+    let eq_idx = find_assignment_eq(stmt)?;
+    let lhs = stmt[..eq_idx].trim();
+    let lhs = lhs.trim_start_matches(|c: char| c == '}' || c.is_whitespace());
+    let lhs = lhs
+        .rsplit(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .next()
+        .unwrap_or(lhs)
+        .trim();
+    if lhs.starts_with("let ") || !is_simple_ident(lhs) {
+        return None;
+    }
+    Some(lhs.to_owned())
+}
+
+fn parse_assigned_local_name(stmt: &str) -> Option<String> {
+    parse_decl_local_name(stmt).or_else(|| parse_assignment_lhs_name(stmt))
+}
+
+fn extract_allocator_callee(stmt: &str) -> Option<&'static str> {
+    ["malloc", "calloc", "realloc", "strdup"]
+        .iter()
+        .copied()
+        .find(|callee| contains_direct_call(stmt, callee))
+}
+
+fn collect_fn_statements(code: &str) -> Vec<(String, String)> {
+    let mut statements = Vec::new();
+
+    let mut brace_depth: i32 = 0;
+    let mut current_fn: Option<String> = None;
+    let mut fn_start_depth: i32 = 0;
+    let mut fn_body_started = false;
+    let mut stmt_buf = String::new();
+
+    let mut push_stmt = |fn_name: &str, stmt: &str| {
+        let normalized = normalize_stmt(stmt);
+        if !normalized.is_empty() {
+            statements.push((fn_name.to_owned(), normalized));
+        }
+    };
+
+    for line in code.lines() {
+        if current_fn.is_none() {
+            if let Some(fn_name) = parse_fn_name(line) {
+                current_fn = Some(fn_name);
+                fn_start_depth = brace_depth;
+                fn_body_started = false;
+                stmt_buf.clear();
+            }
+        }
+
+        if let Some(fn_name) = current_fn.as_ref() {
+            stmt_buf.push_str(line);
+            stmt_buf.push('\n');
+            while let Some(semi_idx) = stmt_buf.find(';') {
+                let stmt = stmt_buf[..semi_idx].to_owned();
+                push_stmt(fn_name, &stmt);
+                stmt_buf = stmt_buf[semi_idx + 1..].to_owned();
+            }
+        }
+
+        for c in line.chars() {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+
+        if current_fn.is_some() && !fn_body_started && line.trim_end().ends_with(';') {
+            stmt_buf.clear();
+            current_fn = None;
+            fn_body_started = false;
+            continue;
+        }
+
+        if current_fn.is_some() && !fn_body_started && brace_depth > fn_start_depth {
+            fn_body_started = true;
+        }
+
+        if current_fn.is_some() && fn_body_started && brace_depth <= fn_start_depth {
+            if let Some(fn_name) = current_fn.as_ref() {
+                if !stmt_buf.trim().is_empty() {
+                    push_stmt(fn_name, &stmt_buf);
+                }
+            }
+            stmt_buf.clear();
+            current_fn = None;
+            fn_body_started = false;
+        }
+    }
+
+    statements
+}
+
+fn classify_allocator_origin_rewrite(after_stmt: Option<&str>) -> &'static str {
+    let Some(stmt) = after_stmt else {
+        return "missing_after_assignment";
+    };
+    if contains_direct_call(stmt, "malloc")
+        || contains_direct_call(stmt, "calloc")
+        || contains_direct_call(stmt, "realloc")
+        || contains_direct_call(stmt, "strdup")
+    {
+        return "allocator_call_preserved";
+    }
+    if contains_direct_call(stmt, "Box::new") {
+        return "rewritten_to_box_new";
+    }
+    if contains_direct_call(stmt, "Box::from_raw") {
+        return "rewritten_to_box_from_raw";
+    }
+    if contains_direct_call(stmt, "Box::into_raw") {
+        return "rewritten_to_box_into_raw";
+    }
+    "rewritten_other"
+}
+
+fn collect_allocator_origin_rewrites(
+    before_code: &str,
+    after_code: &str,
+) -> Vec<AllocatorOriginRewrite> {
+    let before_statements = collect_fn_statements(before_code);
+    let after_statements = collect_fn_statements(after_code);
+
+    let mut after_index: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (function, stmt) in after_statements {
+        let Some(local) = parse_assigned_local_name(&stmt) else {
+            continue;
+        };
+        after_index.entry((function, local)).or_insert(stmt);
+    }
+
+    let mut rewrites = Vec::new();
+    for (function, stmt) in before_statements {
+        let Some(allocator) = extract_allocator_callee(&stmt) else {
+            continue;
+        };
+        let Some(local) = parse_assigned_local_name(&stmt) else {
+            continue;
+        };
+        let after_stmt = after_index.get(&(function.clone(), local.clone())).cloned();
+        let rewrite_kind = classify_allocator_origin_rewrite(after_stmt.as_deref()).to_owned();
+        rewrites.push(AllocatorOriginRewrite {
+            function,
+            local,
+            allocator: allocator.to_owned(),
+            before_stmt: stmt,
+            after_stmt,
+            rewrite_kind,
+        });
+    }
+
+    rewrites.sort_by(|lhs, rhs| {
+        lhs.function
+            .cmp(&rhs.function)
+            .then(lhs.local.cmp(&rhs.local))
+            .then(lhs.allocator.cmp(&rhs.allocator))
+            .then(lhs.before_stmt.cmp(&rhs.before_stmt))
+    });
+    rewrites
+}
+
+fn filter_allocator_origin_rewrites_for_dump(
+    rewrites: Vec<AllocatorOriginRewrite>,
+) -> Vec<AllocatorOriginRewrite> {
+    rewrites
+        .into_iter()
+        .filter(|rewrite| {
+            ALLOCATOR_ORIGIN_DUMP_FILTER
+                .iter()
+                .any(|callee| rewrite.allocator == *callee)
+        })
+        .collect()
+}
+
+fn render_allocator_origin_rewrites(
+    case_name: &str,
+    rewrites: &[AllocatorOriginRewrite],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("case={case_name}\n"));
+    out.push_str(&format!("allocator_origin_sites={}\n", rewrites.len()));
+
+    for (idx, rewrite) in rewrites.iter().enumerate() {
+        out.push_str(&format!(
+            "\n[{idx}] fn={} local={} allocator={} rewrite={}\n",
+            rewrite.function, rewrite.local, rewrite.allocator, rewrite.rewrite_kind
+        ));
+        out.push_str(&format!("before: {}\n", rewrite.before_stmt));
+        out.push_str(&format!(
+            "after: {}\n",
+            rewrite.after_stmt.as_deref().unwrap_or("<missing>")
+        ));
+    }
+
+    out
+}
+
 fn extract_b02_source_from_file(path: &Path) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     let start_marker = "const SOURCE: &str = r####\"";
@@ -606,6 +845,18 @@ fn merge_count_maps(dst: &mut BTreeMap<String, usize>, src: &BTreeMap<String, us
     }
 }
 
+fn merge_nested_count_maps(
+    dst: &mut BTreeMap<String, BTreeMap<String, usize>>,
+    src: &BTreeMap<String, BTreeMap<String, usize>>,
+) {
+    for (outer, inner_map) in src {
+        let dst_inner = dst.entry(outer.clone()).or_default();
+        for (inner, count) in inner_map {
+            *dst_inner.entry(inner.clone()).or_default() += *count;
+        }
+    }
+}
+
 fn sum_count_map(map: &BTreeMap<String, usize>) -> usize {
     map.values().sum()
 }
@@ -613,7 +864,11 @@ fn sum_count_map(map: &BTreeMap<String, usize>) -> usize {
 fn format_counts_by_callee(map: &BTreeMap<String, usize>, fixed_order: &[&str]) -> String {
     let mut parts = Vec::new();
     for &callee in fixed_order {
-        parts.push(format!("{}={}", callee, map.get(callee).copied().unwrap_or(0)));
+        parts.push(format!(
+            "{}={}",
+            callee,
+            map.get(callee).copied().unwrap_or(0)
+        ));
     }
     for (callee, count) in map {
         if !fixed_order.iter().any(|known| *known == callee.as_str()) {
@@ -623,12 +878,41 @@ fn format_counts_by_callee(map: &BTreeMap<String, usize>, fixed_order: &[&str]) 
     parts.join(", ")
 }
 
+fn format_counts(map: &BTreeMap<String, usize>) -> String {
+    map.iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn allocator_origin_filter_label() -> String {
+    ALLOCATOR_ORIGIN_DUMP_FILTER.join(",")
+}
+
 fn ratio_percent(numer: usize, denom: usize) -> f64 {
     if denom == 0 {
         0.0
     } else {
         numer as f64 * 100.0 / denom as f64
     }
+}
+
+fn sum_selected_callees(map: &BTreeMap<String, usize>, callees: &[&str]) -> usize {
+    callees
+        .iter()
+        .map(|callee| map.get(*callee).copied().unwrap_or(0))
+        .sum()
+}
+
+const B02_DUMP_ENV: &str = "POINTER_REPLACER_B02_DUMP";
+const B02_DUMP_RUN_ID_ENV: &str = "POINTER_REPLACER_B02_DUMP_RUN_ID";
+const ALLOCATOR_ORIGIN_DUMP_FILTER: [&str; 2] = ["malloc", "calloc"];
+const BOX_UNSAFE_CALLEES: [&str; 2] = ["Box::from_raw", "Box::into_raw"];
+
+#[derive(Debug, Clone)]
+struct B02DumpConfig {
+    run_id: String,
+    root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -640,10 +924,193 @@ struct CaseRewriteStats {
     box_new_after: usize,
     raw_unsafe_before: usize,
     raw_unsafe_after: usize,
+    box_unsafe_before: usize,
+    box_unsafe_after: usize,
+    spec_call240_applied: usize,
+    spec_call250_non_move_required: usize,
+    spec_call240_compile_risk_default_missing: usize,
+    rewrite_ok: bool,
+    compile_ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CaseFailure {
+    case_name: String,
+    stage: &'static str,
+    message: String,
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
+        _ => None,
+    }
+}
+
+fn b02_dump_config_from_env() -> Option<B02DumpConfig> {
+    let enabled = env::var(B02_DUMP_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let run_id = env::var(B02_DUMP_RUN_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| sanitize_dump_component(value.trim()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_dump_run_id);
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("spec/rewrite_dumps")
+        .join(&run_id);
+    Some(B02DumpConfig { run_id, root })
+}
+
+fn sanitize_dump_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn default_dump_run_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("b02-{}-{}", now.as_secs(), std::process::id())
+}
+
+fn init_dump_root(config: &B02DumpConfig) {
+    if config.root.exists() {
+        fs::remove_dir_all(&config.root).unwrap_or_else(|e| {
+            panic!("failed to clear dump root `{}`: {e}", config.root.display())
+        });
+    }
+    fs::create_dir_all(config.root.join("cases")).unwrap_or_else(|e| {
+        panic!(
+            "failed to create dump root `{}`: {e}",
+            config.root.display()
+        )
+    });
+}
+
+fn write_text_file(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            panic!(
+                "failed to create parent dir `{}` for dump artifact: {e}",
+                parent.display()
+            )
+        });
+    }
+    fs::write(path, text)
+        .unwrap_or_else(|e| panic!("failed to write dump artifact `{}`: {e}", path.display()));
+}
+
+fn render_unified_diff(before: &str, after: &str) -> String {
+    TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header("before.rs", "after.rs")
+        .to_string()
+}
+
+fn case_dump_dir(root: &Path, case_name: &str) -> PathBuf {
+    root.join("cases").join(case_name)
+}
+
+fn validate_case_rewrite_stats(
+    case_name: &str,
+    stats: &crate::rewriter::stats::RewriteStats,
+) -> Result<(), String> {
+    if stats.alloc_unsafe.before_total != sum_count_map(&stats.alloc_unsafe.before_by_callee) {
+        return Err(format!(
+            "allocator before-total mismatch in case `{case_name}`"
+        ));
+    }
+    if stats.alloc_unsafe.after_total != sum_count_map(&stats.alloc_unsafe.after_by_callee) {
+        return Err(format!(
+            "allocator after-total mismatch in case `{case_name}`"
+        ));
+    }
+    if stats.box_new.before_total != sum_count_map(&stats.box_new.before_by_callee) {
+        return Err(format!(
+            "Box::new before-total mismatch in case `{case_name}`"
+        ));
+    }
+    if stats.box_new.after_total != sum_count_map(&stats.box_new.after_by_callee) {
+        return Err(format!(
+            "Box::new after-total mismatch in case `{case_name}`"
+        ));
+    }
+    if stats.raw_constructor_unsafe.before_total
+        != sum_count_map(&stats.raw_constructor_unsafe.before_by_callee)
+    {
+        return Err(format!(
+            "raw-constructor before-total mismatch in case `{case_name}`"
+        ));
+    }
+    if stats.raw_constructor_unsafe.after_total
+        != sum_count_map(&stats.raw_constructor_unsafe.after_by_callee)
+    {
+        return Err(format!(
+            "raw-constructor after-total mismatch in case `{case_name}`"
+        ));
+    }
+    Ok(())
+}
+
+fn render_case_stats_file(row: &CaseRewriteStats) -> String {
+    let alloc_removed = row.alloc_before.saturating_sub(row.alloc_after);
+    let box_new_added = row.box_new_after.saturating_sub(row.box_new_before);
+    let raw_unsafe_added = row.raw_unsafe_after.saturating_sub(row.raw_unsafe_before);
+    let box_unsafe_added = row.box_unsafe_after.saturating_sub(row.box_unsafe_before);
+    format!(
+        "case={}\nrewrite_ok={}\ncompile_ok={}\nalloc_before={}\nalloc_after={}\nalloc_removed={}\nbox_new_before={}\nbox_new_after={}\nbox_new_added={}\nraw_unsafe_before={}\nraw_unsafe_after={}\nraw_unsafe_added={}\nbox_unsafe_before={}\nbox_unsafe_after={}\nbox_unsafe_added={}\nspec_call240_applied={}\nspec_call250_non_move_required={}\nspec_call240_compile_risk_default_missing={}\n",
+        row.case_name,
+        row.rewrite_ok,
+        row.compile_ok,
+        row.alloc_before,
+        row.alloc_after,
+        alloc_removed,
+        row.box_new_before,
+        row.box_new_after,
+        box_new_added,
+        row.raw_unsafe_before,
+        row.raw_unsafe_after,
+        raw_unsafe_added,
+        row.box_unsafe_before,
+        row.box_unsafe_after,
+        box_unsafe_added,
+        row.spec_call240_applied,
+        row.spec_call250_non_move_required,
+        row.spec_call240_compile_risk_default_missing,
+    )
 }
 
 #[test]
 fn rewriter_transformed_b02_cases_compile() {
+    let dump_config = b02_dump_config_from_env();
+    let dump_enabled = dump_config.is_some();
+    if let Some(config) = &dump_config {
+        init_dump_root(config);
+        println!(
+            "B02 rewrite dump enabled: run_id={} root={}",
+            config.run_id,
+            config.root.display()
+        );
+    }
+
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/B02_tests");
     let mut files = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("failed to read B02 dir `{}`: {e}", dir.display()))
@@ -674,8 +1141,11 @@ fn rewriter_transformed_b02_cases_compile() {
         "expected 86 B02 SOURCE cases to compile-sweep"
     );
 
-    let config = crate::Config::default();
+    let mut config = crate::Config::default();
+    config.force_box = true;
     let mut case_rows = Vec::with_capacity(source_cases.len());
+    let mut failures = Vec::<CaseFailure>::new();
+    let mut allocator_origin_global = Vec::<(String, AllocatorOriginRewrite)>::new();
 
     let mut alloc_before_total = 0usize;
     let mut alloc_after_total = 0usize;
@@ -683,6 +1153,10 @@ fn rewriter_transformed_b02_cases_compile() {
     let mut box_new_after_total = 0usize;
     let mut raw_unsafe_before_total = 0usize;
     let mut raw_unsafe_after_total = 0usize;
+    let mut box_unsafe_before_total = 0usize;
+    let mut box_unsafe_after_total = 0usize;
+    let mut spec_reason_total: BTreeMap<String, usize> = BTreeMap::new();
+    let mut spec_reason_by_allocator: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
 
     let mut alloc_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
     let mut alloc_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
@@ -690,94 +1164,223 @@ fn rewriter_transformed_b02_cases_compile() {
     let mut box_new_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
     let mut raw_unsafe_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
     let mut raw_unsafe_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut box_unsafe_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut box_unsafe_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
 
     for (case_name, source) in source_cases {
-        let output =
-            ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-                crate::rewriter::replace_local_borrows_with_stats(&config, tcx)
-            })
-            .unwrap_or_else(|e| {
-                panic!("rewriter crashed for B02 case `{case_name}`: {e:?}");
-            });
-        let rewritten = output.code;
-        let stats = output.rewrite_stats;
+        let mut row = CaseRewriteStats {
+            case_name: case_name.clone(),
+            alloc_before: 0,
+            alloc_after: 0,
+            box_new_before: 0,
+            box_new_after: 0,
+            raw_unsafe_before: 0,
+            raw_unsafe_after: 0,
+            box_unsafe_before: 0,
+            box_unsafe_after: 0,
+            spec_call240_applied: 0,
+            spec_call250_non_move_required: 0,
+            spec_call240_compile_risk_default_missing: 0,
+            rewrite_ok: false,
+            compile_ok: false,
+        };
 
-        assert_eq!(
-            stats.alloc_unsafe.before_total,
-            sum_count_map(&stats.alloc_unsafe.before_by_callee),
-            "allocator before-total mismatch in case `{case_name}`"
-        );
-        assert_eq!(
-            stats.alloc_unsafe.after_total,
-            sum_count_map(&stats.alloc_unsafe.after_by_callee),
-            "allocator after-total mismatch in case `{case_name}`"
-        );
-        assert_eq!(
-            stats.box_new.before_total,
-            sum_count_map(&stats.box_new.before_by_callee),
-            "Box::new before-total mismatch in case `{case_name}`"
-        );
-        assert_eq!(
-            stats.box_new.after_total,
-            sum_count_map(&stats.box_new.after_by_callee),
-            "Box::new after-total mismatch in case `{case_name}`"
-        );
-        assert_eq!(
-            stats.raw_constructor_unsafe.before_total,
-            sum_count_map(&stats.raw_constructor_unsafe.before_by_callee),
-            "raw-constructor before-total mismatch in case `{case_name}`"
-        );
-        assert_eq!(
-            stats.raw_constructor_unsafe.after_total,
-            sum_count_map(&stats.raw_constructor_unsafe.after_by_callee),
-            "raw-constructor after-total mismatch in case `{case_name}`"
-        );
-
-        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).unwrap_or_else(
-            |_| {
-                panic!(
-                    "transformed code does not compile for B02 case `{case_name}`.\nTransformed:\n{}",
-                    rewritten
-                );
-            },
-        );
-
-        alloc_before_total += stats.alloc_unsafe.before_total;
-        alloc_after_total += stats.alloc_unsafe.after_total;
-        box_new_before_total += stats.box_new.before_total;
-        box_new_after_total += stats.box_new.after_total;
-        raw_unsafe_before_total += stats.raw_constructor_unsafe.before_total;
-        raw_unsafe_after_total += stats.raw_constructor_unsafe.after_total;
-
-        merge_count_maps(&mut alloc_before_by_callee, &stats.alloc_unsafe.before_by_callee);
-        merge_count_maps(&mut alloc_after_by_callee, &stats.alloc_unsafe.after_by_callee);
-        merge_count_maps(&mut box_new_before_by_callee, &stats.box_new.before_by_callee);
-        merge_count_maps(&mut box_new_after_by_callee, &stats.box_new.after_by_callee);
-        merge_count_maps(
-            &mut raw_unsafe_before_by_callee,
-            &stats.raw_constructor_unsafe.before_by_callee,
-        );
-        merge_count_maps(
-            &mut raw_unsafe_after_by_callee,
-            &stats.raw_constructor_unsafe.after_by_callee,
-        );
-
-        case_rows.push(CaseRewriteStats {
-            case_name,
-            alloc_before: stats.alloc_unsafe.before_total,
-            alloc_after: stats.alloc_unsafe.after_total,
-            box_new_before: stats.box_new.before_total,
-            box_new_after: stats.box_new.after_total,
-            raw_unsafe_before: stats.raw_constructor_unsafe.before_total,
-            raw_unsafe_after: stats.raw_constructor_unsafe.after_total,
+        let case_dir = dump_config
+            .as_ref()
+            .map(|config| case_dump_dir(&config.root, &case_name));
+        let rewrite_result = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            crate::rewriter::replace_local_borrows_with_stats(&config, tcx)
         });
+
+        match rewrite_result {
+            Err(e) => {
+                let error_message = format!("rewriter crashed for B02 case `{case_name}`: {e:?}");
+                failures.push(CaseFailure {
+                    case_name: case_name.clone(),
+                    stage: "rewrite",
+                    message: error_message.clone(),
+                });
+                if let Some(case_dir) = &case_dir {
+                    write_text_file(&case_dir.join("before.rs"), &source);
+                    write_text_file(&case_dir.join("stats.txt"), &render_case_stats_file(&row));
+                    write_text_file(&case_dir.join("error.txt"), &error_message);
+                }
+                if !dump_enabled {
+                    panic!("{error_message}");
+                }
+                case_rows.push(row);
+                continue;
+            }
+            Ok(output) => {
+                row.rewrite_ok = true;
+                let rewritten = output.code.clone();
+                let stats = output.rewrite_stats.clone();
+                let allocator_reason_stats = output.allocator_reason_stats.clone();
+                let allocator_origin_rewrites = if dump_enabled {
+                    let rewrites = filter_allocator_origin_rewrites_for_dump(
+                        collect_allocator_origin_rewrites(
+                            &output.before_code,
+                            &output.after_core_code,
+                        ),
+                    );
+                    for rewrite in &rewrites {
+                        allocator_origin_global.push((case_name.clone(), rewrite.clone()));
+                    }
+                    Some(rewrites)
+                } else {
+                    None
+                };
+
+                row.alloc_before = stats.alloc_unsafe.before_total;
+                row.alloc_after = stats.alloc_unsafe.after_total;
+                row.box_new_before = stats.box_new.before_total;
+                row.box_new_after = stats.box_new.after_total;
+                row.raw_unsafe_before = stats.raw_constructor_unsafe.before_total;
+                row.raw_unsafe_after = stats.raw_constructor_unsafe.after_total;
+                row.box_unsafe_before =
+                    sum_selected_callees(&stats.raw_constructor_unsafe.before_by_callee, &BOX_UNSAFE_CALLEES);
+                row.box_unsafe_after =
+                    sum_selected_callees(&stats.raw_constructor_unsafe.after_by_callee, &BOX_UNSAFE_CALLEES);
+                row.spec_call240_applied = allocator_reason_stats
+                    .reason_count(crate::rewriter::stats::AllocatorReason::Call240Applied);
+                row.spec_call250_non_move_required = allocator_reason_stats
+                    .reason_count(crate::rewriter::stats::AllocatorReason::Call250NonMoveRequired);
+                row.spec_call240_compile_risk_default_missing = allocator_reason_stats
+                    .reason_count(
+                        crate::rewriter::stats::AllocatorReason::Call240CompileRiskDefaultMissing,
+                    );
+
+                let stats_validation_error = validate_case_rewrite_stats(&case_name, &stats).err();
+                if let Some(message) = &stats_validation_error {
+                    failures.push(CaseFailure {
+                        case_name: case_name.clone(),
+                        stage: "stats",
+                        message: message.clone(),
+                    });
+                    if !dump_enabled {
+                        panic!("{message}");
+                    }
+                } else {
+                    alloc_before_total += stats.alloc_unsafe.before_total;
+                    alloc_after_total += stats.alloc_unsafe.after_total;
+                    box_new_before_total += stats.box_new.before_total;
+                    box_new_after_total += stats.box_new.after_total;
+                    raw_unsafe_before_total += stats.raw_constructor_unsafe.before_total;
+                    raw_unsafe_after_total += stats.raw_constructor_unsafe.after_total;
+                    box_unsafe_before_total += row.box_unsafe_before;
+                    box_unsafe_after_total += row.box_unsafe_after;
+
+                    merge_count_maps(
+                        &mut alloc_before_by_callee,
+                        &stats.alloc_unsafe.before_by_callee,
+                    );
+                    merge_count_maps(
+                        &mut alloc_after_by_callee,
+                        &stats.alloc_unsafe.after_by_callee,
+                    );
+                    merge_count_maps(
+                        &mut box_new_before_by_callee,
+                        &stats.box_new.before_by_callee,
+                    );
+                    merge_count_maps(&mut box_new_after_by_callee, &stats.box_new.after_by_callee);
+                    merge_count_maps(
+                        &mut raw_unsafe_before_by_callee,
+                        &stats.raw_constructor_unsafe.before_by_callee,
+                    );
+                    merge_count_maps(
+                        &mut raw_unsafe_after_by_callee,
+                        &stats.raw_constructor_unsafe.after_by_callee,
+                    );
+                    for callee in BOX_UNSAFE_CALLEES {
+                        let before = stats
+                            .raw_constructor_unsafe
+                            .before_by_callee
+                            .get(callee)
+                            .copied()
+                            .unwrap_or(0);
+                        let after = stats
+                            .raw_constructor_unsafe
+                            .after_by_callee
+                            .get(callee)
+                            .copied()
+                            .unwrap_or(0);
+                        *box_unsafe_before_by_callee
+                            .entry(callee.to_owned())
+                            .or_default() += before;
+                        *box_unsafe_after_by_callee.entry(callee.to_owned()).or_default() +=
+                            after;
+                    }
+                    merge_count_maps(&mut spec_reason_total, &allocator_reason_stats.by_reason);
+                    merge_nested_count_maps(
+                        &mut spec_reason_by_allocator,
+                        &allocator_reason_stats.by_allocator,
+                    );
+                }
+
+                let compile_error = ::utils::compilation::run_compiler_on_str(
+                    &rewritten,
+                    ::utils::type_check,
+                )
+                .err()
+                .map(|_| {
+                    format!(
+                        "transformed code does not compile for B02 case `{case_name}`.\nTransformed:\n{}",
+                        rewritten
+                    )
+                });
+                row.compile_ok = compile_error.is_none();
+
+                if let Some(message) = &compile_error {
+                    failures.push(CaseFailure {
+                        case_name: case_name.clone(),
+                        stage: "compile",
+                        message: message.clone(),
+                    });
+                    if !dump_enabled {
+                        panic!("{message}");
+                    }
+                }
+
+                if let Some(case_dir) = &case_dir {
+                    write_text_file(&case_dir.join("before.rs"), &output.before_code);
+                    write_text_file(&case_dir.join("after.rs"), &output.after_core_code);
+                    write_text_file(&case_dir.join("after_full.rs"), &output.code);
+                    if let Some(rewrites) = allocator_origin_rewrites.as_ref() {
+                        write_text_file(
+                            &case_dir.join("allocator_origin_rewrites.txt"),
+                            &render_allocator_origin_rewrites(&case_name, rewrites),
+                        );
+                    }
+                    write_text_file(
+                        &case_dir.join("diff.patch"),
+                        &render_unified_diff(&output.before_code, &output.after_core_code),
+                    );
+                    write_text_file(&case_dir.join("stats.txt"), &render_case_stats_file(&row));
+                    if stats_validation_error.is_some() || compile_error.is_some() {
+                        let mut errors = Vec::new();
+                        if let Some(message) = stats_validation_error {
+                            errors.push(message);
+                        }
+                        if let Some(message) = compile_error {
+                            errors.push(message);
+                        }
+                        write_text_file(&case_dir.join("error.txt"), &errors.join("\n\n"));
+                    }
+                }
+
+                case_rows.push(row);
+            }
+        }
     }
 
     case_rows.sort_by(|a, b| a.case_name.cmp(&b.case_name));
 
     let alloc_before_cases_sum = case_rows.iter().map(|row| row.alloc_before).sum::<usize>();
     let alloc_after_cases_sum = case_rows.iter().map(|row| row.alloc_after).sum::<usize>();
-    let box_new_before_cases_sum = case_rows.iter().map(|row| row.box_new_before).sum::<usize>();
+    let box_new_before_cases_sum = case_rows
+        .iter()
+        .map(|row| row.box_new_before)
+        .sum::<usize>();
     let box_new_after_cases_sum = case_rows.iter().map(|row| row.box_new_after).sum::<usize>();
     let raw_unsafe_before_cases_sum = case_rows
         .iter()
@@ -787,33 +1390,269 @@ fn rewriter_transformed_b02_cases_compile() {
         .iter()
         .map(|row| row.raw_unsafe_after)
         .sum::<usize>();
+    let box_unsafe_before_cases_sum = case_rows
+        .iter()
+        .map(|row| row.box_unsafe_before)
+        .sum::<usize>();
+    let box_unsafe_after_cases_sum = case_rows
+        .iter()
+        .map(|row| row.box_unsafe_after)
+        .sum::<usize>();
 
-    assert_eq!(alloc_before_total, alloc_before_cases_sum);
-    assert_eq!(alloc_after_total, alloc_after_cases_sum);
-    assert_eq!(box_new_before_total, box_new_before_cases_sum);
-    assert_eq!(box_new_after_total, box_new_after_cases_sum);
-    assert_eq!(raw_unsafe_before_total, raw_unsafe_before_cases_sum);
-    assert_eq!(raw_unsafe_after_total, raw_unsafe_after_cases_sum);
+    if alloc_before_total != alloc_before_cases_sum {
+        let message = format!(
+            "allocator before total mismatch: aggregate={alloc_before_total} case_sum={alloc_before_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if alloc_after_total != alloc_after_cases_sum {
+        let message = format!(
+            "allocator after total mismatch: aggregate={alloc_after_total} case_sum={alloc_after_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_new_before_total != box_new_before_cases_sum {
+        let message = format!(
+            "Box::new before total mismatch: aggregate={box_new_before_total} case_sum={box_new_before_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_new_after_total != box_new_after_cases_sum {
+        let message = format!(
+            "Box::new after total mismatch: aggregate={box_new_after_total} case_sum={box_new_after_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if raw_unsafe_before_total != raw_unsafe_before_cases_sum {
+        let message = format!(
+            "raw-constructor before total mismatch: aggregate={raw_unsafe_before_total} case_sum={raw_unsafe_before_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if raw_unsafe_after_total != raw_unsafe_after_cases_sum {
+        let message = format!(
+            "raw-constructor after total mismatch: aggregate={raw_unsafe_after_total} case_sum={raw_unsafe_after_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_unsafe_before_total != box_unsafe_before_cases_sum {
+        let message = format!(
+            "box-unsafe before total mismatch: aggregate={box_unsafe_before_total} case_sum={box_unsafe_before_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_unsafe_after_total != box_unsafe_after_cases_sum {
+        let message = format!(
+            "box-unsafe after total mismatch: aggregate={box_unsafe_after_total} case_sum={box_unsafe_after_cases_sum}"
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
 
-    assert_eq!(alloc_before_total, sum_count_map(&alloc_before_by_callee));
-    assert_eq!(alloc_after_total, sum_count_map(&alloc_after_by_callee));
-    assert_eq!(box_new_before_total, sum_count_map(&box_new_before_by_callee));
-    assert_eq!(box_new_after_total, sum_count_map(&box_new_after_by_callee));
-    assert_eq!(raw_unsafe_before_total, sum_count_map(&raw_unsafe_before_by_callee));
-    assert_eq!(raw_unsafe_after_total, sum_count_map(&raw_unsafe_after_by_callee));
+    if alloc_before_total != sum_count_map(&alloc_before_by_callee) {
+        let message = "allocator before per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if alloc_after_total != sum_count_map(&alloc_after_by_callee) {
+        let message = "allocator after per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_new_before_total != sum_count_map(&box_new_before_by_callee) {
+        let message = "Box::new before per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_new_after_total != sum_count_map(&box_new_after_by_callee) {
+        let message = "Box::new after per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if raw_unsafe_before_total != sum_count_map(&raw_unsafe_before_by_callee) {
+        let message = "raw-constructor before per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if raw_unsafe_after_total != sum_count_map(&raw_unsafe_after_by_callee) {
+        let message = "raw-constructor after per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_unsafe_before_total != sum_count_map(&box_unsafe_before_by_callee) {
+        let message = "box-unsafe before per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if box_unsafe_after_total != sum_count_map(&box_unsafe_after_by_callee) {
+        let message = "box-unsafe after per-callee sum mismatch".to_owned();
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+
+    let call240_applied_total = spec_reason_total
+        .get("call240_applied")
+        .copied()
+        .unwrap_or(0);
+    let call250_non_move_required_total = spec_reason_total
+        .get("call250_non_move_required")
+        .copied()
+        .unwrap_or(0);
+    let call240_scope_allocator_before_total =
+        alloc_before_by_callee.get("malloc").copied().unwrap_or(0)
+            + alloc_before_by_callee.get("calloc").copied().unwrap_or(0);
+
+    if call240_applied_total > call240_scope_allocator_before_total {
+        let message = format!(
+            "spec reason invariant failed: call240_applied={} exceeds call240 scope before total={}",
+            call240_applied_total, call240_scope_allocator_before_total
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
+    if call240_applied_total + call250_non_move_required_total
+        > call240_scope_allocator_before_total
+    {
+        let message = format!(
+            "spec reason invariant failed: call240_applied + call250_non_move_required = {} exceeds call240 scope before total={}",
+            call240_applied_total + call250_non_move_required_total,
+            call240_scope_allocator_before_total
+        );
+        failures.push(CaseFailure {
+            case_name: "<aggregate>".to_owned(),
+            stage: "invariant",
+            message: message.clone(),
+        });
+        if !dump_enabled {
+            panic!("{message}");
+        }
+    }
 
     let alloc_removed_total = alloc_before_total.saturating_sub(alloc_after_total);
     let box_new_added_total = box_new_after_total.saturating_sub(box_new_before_total);
     let raw_unsafe_added_total = raw_unsafe_after_total.saturating_sub(raw_unsafe_before_total);
+    let box_unsafe_added_total = box_unsafe_after_total.saturating_sub(box_unsafe_before_total);
 
     println!("== B02 rewriter case-wise stats ==");
     for row in &case_rows {
         let alloc_removed = row.alloc_before.saturating_sub(row.alloc_after);
         let box_new_added = row.box_new_after.saturating_sub(row.box_new_before);
         let raw_unsafe_added = row.raw_unsafe_after.saturating_sub(row.raw_unsafe_before);
+        let box_unsafe_added = row.box_unsafe_after.saturating_sub(row.box_unsafe_before);
         println!(
-            "case={} alloc_before={} alloc_after={} alloc_removed={} box_new_before={} box_new_after={} box_new_added={} raw_unsafe_before={} raw_unsafe_after={} raw_unsafe_added={}",
+            "case={} rewrite_ok={} compile_ok={} alloc_before={} alloc_after={} alloc_removed={} box_new_before={} box_new_after={} box_new_added={} raw_unsafe_before={} raw_unsafe_after={} raw_unsafe_added={} box_unsafe_before={} box_unsafe_after={} box_unsafe_added={} spec_call240_applied={} spec_call250_non_move_required={} spec_call240_compile_risk_default_missing={}",
             row.case_name,
+            row.rewrite_ok,
+            row.compile_ok,
             row.alloc_before,
             row.alloc_after,
             alloc_removed,
@@ -823,6 +1662,12 @@ fn rewriter_transformed_b02_cases_compile() {
             row.raw_unsafe_before,
             row.raw_unsafe_after,
             raw_unsafe_added,
+            row.box_unsafe_before,
+            row.box_unsafe_after,
+            box_unsafe_added,
+            row.spec_call240_applied,
+            row.spec_call250_non_move_required,
+            row.spec_call240_compile_risk_default_missing,
         );
     }
 
@@ -855,6 +1700,25 @@ fn rewriter_transformed_b02_cases_compile() {
     println!(
         "raw_constructor_unsafe_before_total={raw_unsafe_before_total} raw_constructor_unsafe_after_total={raw_unsafe_after_total} raw_constructor_unsafe_added_total={raw_unsafe_added_total}"
     );
+    println!(
+        "box_unsafe_before_total={box_unsafe_before_total} box_unsafe_after_total={box_unsafe_after_total} box_unsafe_added_total={box_unsafe_added_total}"
+    );
+    println!(
+        "spec_reason_counts_total: {}",
+        format_counts_by_callee(
+            &spec_reason_total,
+            &crate::rewriter::stats::ALLOCATOR_REASON_KEYS
+        )
+    );
+    for (allocator, reason_counts) in &spec_reason_by_allocator {
+        println!(
+            "spec_reason_counts_by_allocator[{allocator}]: {}",
+            format_counts_by_callee(
+                reason_counts,
+                &crate::rewriter::stats::ALLOCATOR_REASON_KEYS
+            )
+        );
+    }
     println!(
         "allocator_removal_rate={alloc_removal_rate:.2}% box_new_growth_rate={box_new_growth_rate:.2}% raw_unsafe_growth_rate={raw_unsafe_growth_rate:.2}%"
     );
@@ -900,6 +1764,244 @@ fn rewriter_transformed_b02_cases_compile() {
             &crate::rewriter::stats::RAW_CONSTRUCTOR_UNSAFE_CALLEES,
         )
     );
+    println!(
+        "box_unsafe_before_by_callee: {}",
+        format_counts_by_callee(&box_unsafe_before_by_callee, &BOX_UNSAFE_CALLEES)
+    );
+    println!(
+        "box_unsafe_after_by_callee: {}",
+        format_counts_by_callee(&box_unsafe_after_by_callee, &BOX_UNSAFE_CALLEES)
+    );
+
+    if let Some(config) = &dump_config {
+        let mut origin_sites = allocator_origin_global.clone();
+        origin_sites.sort_by(|lhs, rhs| {
+            lhs.0
+                .cmp(&rhs.0)
+                .then(lhs.1.function.cmp(&rhs.1.function))
+                .then(lhs.1.local.cmp(&rhs.1.local))
+                .then(lhs.1.allocator.cmp(&rhs.1.allocator))
+                .then(lhs.1.before_stmt.cmp(&rhs.1.before_stmt))
+        });
+        let mut origin_rewrite_kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut origin_allocator_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, rewrite) in &origin_sites {
+            *origin_rewrite_kind_counts
+                .entry(rewrite.rewrite_kind.clone())
+                .or_default() += 1;
+            *origin_allocator_counts
+                .entry(rewrite.allocator.clone())
+                .or_default() += 1;
+        }
+        let mut origin_index = String::new();
+        origin_index.push_str(&format!(
+            "allocator_filter={}\n",
+            allocator_origin_filter_label()
+        ));
+        origin_index.push_str(&format!("allocator_origin_sites={}\n", origin_sites.len()));
+        origin_index.push_str(&format!(
+            "legacy_shape_counters_rewrite_kind_counts: {}\n",
+            format_counts(&origin_rewrite_kind_counts)
+        ));
+        origin_index.push_str(&format!(
+            "legacy_shape_counters_allocator_counts: {}\n",
+            format_counts(&origin_allocator_counts)
+        ));
+        for (idx, (case_name, rewrite)) in origin_sites.iter().enumerate() {
+            origin_index.push_str(&format!(
+                "\n[{idx}] case={} fn={} local={} allocator={} rewrite={}\n",
+                case_name, rewrite.function, rewrite.local, rewrite.allocator, rewrite.rewrite_kind
+            ));
+            origin_index.push_str(&format!("before: {}\n", rewrite.before_stmt));
+            origin_index.push_str(&format!(
+                "after: {}\n",
+                rewrite.after_stmt.as_deref().unwrap_or("<missing>")
+            ));
+        }
+        write_text_file(
+            &config.root.join("allocator_origin_rewrites.txt"),
+            &origin_index,
+        );
+
+        let passed_cases = case_rows
+            .iter()
+            .filter(|row| row.rewrite_ok && row.compile_ok)
+            .count();
+        let failed_cases = case_rows.len().saturating_sub(passed_cases);
+        let mut summary = String::new();
+        summary.push_str("== B02 rewriter dump summary ==\n");
+        summary.push_str(&format!("run_id={}\n", config.run_id));
+        summary.push_str(&format!("cases={}\n", case_rows.len()));
+        summary.push_str(&format!("passed_cases={passed_cases}\n"));
+        summary.push_str(&format!("failed_cases={failed_cases}\n"));
+        summary.push_str(&format!(
+            "allocator_unsafe_before_total={alloc_before_total} allocator_unsafe_after_total={alloc_after_total} allocator_unsafe_removed_total={alloc_removed_total}\n"
+        ));
+        summary.push_str(&format!(
+            "box_new_before_total={box_new_before_total} box_new_after_total={box_new_after_total} box_new_added_total={box_new_added_total}\n"
+        ));
+        summary.push_str(&format!(
+            "raw_constructor_unsafe_before_total={raw_unsafe_before_total} raw_constructor_unsafe_after_total={raw_unsafe_after_total} raw_constructor_unsafe_added_total={raw_unsafe_added_total}\n"
+        ));
+        summary.push_str(&format!(
+            "box_unsafe_before_total={box_unsafe_before_total} box_unsafe_after_total={box_unsafe_after_total} box_unsafe_added_total={box_unsafe_added_total}\n"
+        ));
+        summary.push_str(&format!(
+            "spec_reason_counts_total: {}\n",
+            format_counts_by_callee(
+                &spec_reason_total,
+                &crate::rewriter::stats::ALLOCATOR_REASON_KEYS
+            )
+        ));
+        for (allocator, reason_counts) in &spec_reason_by_allocator {
+            summary.push_str(&format!(
+                "spec_reason_counts_by_allocator[{allocator}]: {}\n",
+                format_counts_by_callee(
+                    reason_counts,
+                    &crate::rewriter::stats::ALLOCATOR_REASON_KEYS
+                )
+            ));
+        }
+        summary.push_str(&format!(
+            "allocator_removal_rate={alloc_removal_rate:.2}% box_new_growth_rate={box_new_growth_rate:.2}% raw_unsafe_growth_rate={raw_unsafe_growth_rate:.2}%\n"
+        ));
+        summary.push_str(&format!(
+            "allocator_unsafe_before_by_callee: {}\n",
+            format_counts_by_callee(
+                &alloc_before_by_callee,
+                &crate::rewriter::stats::ALLOC_UNSAFE_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "allocator_unsafe_after_by_callee: {}\n",
+            format_counts_by_callee(
+                &alloc_after_by_callee,
+                &crate::rewriter::stats::ALLOC_UNSAFE_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "box_new_before_by_callee: {}\n",
+            format_counts_by_callee(
+                &box_new_before_by_callee,
+                &crate::rewriter::stats::BOX_NEW_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "box_new_after_by_callee: {}\n",
+            format_counts_by_callee(
+                &box_new_after_by_callee,
+                &crate::rewriter::stats::BOX_NEW_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "raw_constructor_unsafe_before_by_callee: {}\n",
+            format_counts_by_callee(
+                &raw_unsafe_before_by_callee,
+                &crate::rewriter::stats::RAW_CONSTRUCTOR_UNSAFE_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "raw_constructor_unsafe_after_by_callee: {}\n",
+            format_counts_by_callee(
+                &raw_unsafe_after_by_callee,
+                &crate::rewriter::stats::RAW_CONSTRUCTOR_UNSAFE_CALLEES,
+            )
+        ));
+        summary.push_str(&format!(
+            "box_unsafe_before_by_callee: {}\n",
+            format_counts_by_callee(&box_unsafe_before_by_callee, &BOX_UNSAFE_CALLEES)
+        ));
+        summary.push_str(&format!(
+            "box_unsafe_after_by_callee: {}\n",
+            format_counts_by_callee(&box_unsafe_after_by_callee, &BOX_UNSAFE_CALLEES)
+        ));
+        summary.push_str(&format!(
+            "allocator_origin_sites_total={}\n",
+            origin_sites.len()
+        ));
+        summary.push_str(&format!(
+            "allocator_origin_filter={}\n",
+            allocator_origin_filter_label()
+        ));
+        summary.push_str(&format!(
+            "legacy_shape_counters_rewrite_kind_counts: {}\n",
+            format_counts(&origin_rewrite_kind_counts)
+        ));
+        summary.push_str(&format!(
+            "legacy_shape_counters_by_allocator: {}\n",
+            format_counts(&origin_allocator_counts)
+        ));
+        summary.push_str("allocator_origin_index_file=allocator_origin_rewrites.txt\n");
+        if failures.is_empty() {
+            summary.push_str("failed_case_details: <none>\n");
+        } else {
+            summary.push_str("failed_case_details:\n");
+            for failure in &failures {
+                summary.push_str(&format!(
+                    "case={} stage={} message={}\n",
+                    failure.case_name, failure.stage, failure.message
+                ));
+            }
+        }
+
+        write_text_file(&config.root.join("summary.txt"), &summary);
+        println!("B02 rewrite dump root={}", config.root.display());
+    }
+
+    if !failures.is_empty() {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "B02 rewrite sweep completed with {} failure(s)",
+            failures.len()
+        ));
+        for failure in failures {
+            lines.push(format!(
+                "case={} stage={} message={}",
+                failure.case_name, failure.stage, failure.message
+            ));
+        }
+        panic!("{}", lines.join("\n"));
+    }
+}
+
+#[test]
+fn b02_dump_env_parser_handles_common_flags() {
+    assert_eq!(parse_env_bool("1"), Some(true));
+    assert_eq!(parse_env_bool("true"), Some(true));
+    assert_eq!(parse_env_bool("TRUE"), Some(true));
+    assert_eq!(parse_env_bool("0"), Some(false));
+    assert_eq!(parse_env_bool("false"), Some(false));
+    assert_eq!(parse_env_bool("FALSE"), Some(false));
+    assert_eq!(parse_env_bool("  "), Some(false));
+    assert_eq!(parse_env_bool("maybe"), None);
+}
+
+#[test]
+fn b02_dump_unified_diff_has_expected_markers() {
+    let diff = render_unified_diff("fn before() {}\n", "fn after() {}\n");
+    assert!(diff.contains("--- before.rs"));
+    assert!(diff.contains("+++ after.rs"));
+    assert!(diff.contains("@@"));
+}
+
+#[test]
+fn allocator_origin_rewrite_tracker_matches_locals() {
+    let before = r#"
+        fn f() {
+            let ptr: *mut i32 = malloc(4usize) as *mut i32;
+        }
+    "#;
+    let after = r#"
+        fn f() {
+            let mut ptr: Option<Box<i32>> = Some(Box::new(<i32 as Default>::default()));
+        }
+    "#;
+    let rewrites = collect_allocator_origin_rewrites(before, after);
+    assert_eq!(rewrites.len(), 1);
+    assert_eq!(rewrites[0].function, "f");
+    assert_eq!(rewrites[0].local, "ptr");
+    assert_eq!(rewrites[0].allocator, "malloc");
+    assert_eq!(rewrites[0].rewrite_kind, "rewritten_to_box_new");
 }
 
 pub(super) fn run_ownership_case_with_box_candidates(
@@ -952,7 +2054,7 @@ pub(super) fn run_ownership_case_with_box_candidates(
                 .collect::<Vec<_>>();
             matches.sort();
             matches.dedup();
-                matches
+            matches
         };
 
         let extracted_allocator_related = extract_allocator_related_ptr_locals(code);
@@ -972,13 +2074,17 @@ pub(super) fn run_ownership_case_with_box_candidates(
         }
         malloc_related_candidates.sort();
         malloc_related_candidates.dedup();
-        let mut effective_expected_box_candidates =
-            expected_box_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut effective_expected_box_candidates = expected_box_candidates
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
         effective_expected_box_candidates.extend(malloc_related_candidates.iter().cloned());
         effective_expected_box_candidates.sort();
         effective_expected_box_candidates.dedup();
-        let mut effective_expected_non_candidates =
-            expected_non_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut effective_expected_non_candidates = expected_non_candidates
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
         effective_expected_non_candidates.sort();
         effective_expected_non_candidates.dedup();
 

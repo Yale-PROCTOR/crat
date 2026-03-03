@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 
 use etrace::some_or;
 use points_to::andersen;
@@ -15,13 +18,12 @@ use crate::{
     analyses::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
+        offset_sign::OffsetSignResult,
         output_params::compute_output_params,
         ownership::{
-            AnalysisKind, CrateCtxt,
-            solidify::SolidifiedOwnershipSchemes,
+            AnalysisKind, CrateCtxt, solidify::SolidifiedOwnershipSchemes,
             whole_program::WholeProgramAnalysis,
         },
-        offset_sign::OffsetSignResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -34,8 +36,7 @@ mod transform;
 
 #[cfg(test)]
 pub(crate) use decision::{
-    DecisionConflict, PtrKind, SpecPtrClass, merge_conflict_log,
-    ownership_priority_choice_for_test,
+    DecisionConflict, PtrKind, SpecPtrClass, merge_conflict_log, ownership_priority_choice_for_test,
 };
 
 pub struct Analysis {
@@ -50,12 +51,30 @@ pub struct Analysis {
     offset_sign_result: OffsetSignResult,
 }
 
+pub(crate) fn catch_unwind_silent<T, F>(f: F) -> Option<T>
+where F: FnOnce() -> T + std::panic::UnwindSafe {
+    static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let panic_hook_lock = PANIC_HOOK_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = panic_hook_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f).ok();
+    std::panic::set_hook(prev_hook);
+    result
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RewriteOutput {
+    pub before_code: String,
+    pub after_core_code: String,
     pub code: String,
     pub bytemuck: bool,
     pub slice_cursor: bool,
     pub rewrite_stats: stats::RewriteStats,
+    pub allocator_reason_stats: stats::AllocatorReasonStats,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,14 +117,12 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
     (output.code, output.bytemuck, output.slice_cursor)
 }
 
-pub(crate) fn replace_local_borrows_with_stats(
-    config: &Config,
-    tcx: TyCtxt<'_>,
-) -> RewriteOutput {
+pub(crate) fn replace_local_borrows_with_stats(config: &Config, tcx: TyCtxt<'_>) -> RewriteOutput {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
     let before_metrics = stats::collect_call_metrics(&mut krate);
+    let before_code = pprust::crate_to_string_for_macros(&krate);
 
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
@@ -174,8 +191,11 @@ pub(crate) fn replace_local_borrows_with_stats(
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
+    visitor.synthesize_ty140_defaults(&mut krate, !config.no_box);
     let after_metrics = stats::collect_call_metrics(&mut krate);
+    let after_core_code = pprust::crate_to_string_for_macros(&krate);
     let rewrite_stats = stats::build_rewrite_stats(before_metrics, after_metrics);
+    let allocator_reason_stats = visitor.take_allocator_reason_stats();
     let conflicts = visitor.take_conflicts();
     let conflicts_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/conflicts.md");
     if let Err(err) = decision::append_conflicts_to_file(&conflicts_path, &conflicts) {
@@ -184,17 +204,20 @@ pub(crate) fn replace_local_borrows_with_stats(
 
     // add SliceCursor module to the crate if it was used
     let slice_cursor_used = visitor.slice_cursor.get();
-    let mut code = pprust::crate_to_string_for_macros(&krate);
+    let mut code = after_core_code.clone();
     if slice_cursor_used {
         code.push('\n');
         code.push_str(slice_cursor_mod_str());
     }
 
     RewriteOutput {
+        before_code,
+        after_core_code,
         code,
         bytemuck: visitor.bytemuck.get(),
         slice_cursor: slice_cursor_used,
         rewrite_stats,
+        allocator_reason_stats,
     }
 }
 

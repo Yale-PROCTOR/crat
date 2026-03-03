@@ -3830,7 +3830,11 @@ fn ownership_analysis_runs() {
     run_ownership_case_with_box_candidates(
         "hashmap-tree",
         SOURCE,
-        &["hashmap_create#map", "tree_add_node#node", "tree_create#tree"],
+        &[
+            "hashmap_create#map",
+            "tree_add_node#node",
+            "tree_create#tree",
+        ],
         &[],
     );
 }

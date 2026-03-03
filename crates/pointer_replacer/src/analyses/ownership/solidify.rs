@@ -4,12 +4,14 @@ use either::Either::Left;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
-use rustc_middle::mir::{
-    Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind,
-    TerminatorKind, VarDebugInfoContents, RETURN_PLACE,
-    visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+use rustc_middle::{
+    mir::{
+        Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, RETURN_PLACE, Rvalue,
+        StatementKind, TerminatorKind, VarDebugInfoContents,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+    },
+    ty::TyKind,
 };
-use rustc_middle::ty::TyKind;
 
 use super::{Ownership, whole_program::WholeProgramResults};
 use crate::{
@@ -177,6 +179,9 @@ impl<'me, Domain> FnResult<'me, Domain> {
     }
 
     pub fn local_result(self, local: Local) -> &'me [Domain] {
+        if local.index() + 1 >= self.locals.len() {
+            return &[];
+        }
         let (start, end) = (self.locals[local.index()], self.locals[local.index() + 1]);
         &self.model.raw[start.index()..end.index()]
     }
@@ -483,9 +488,7 @@ fn apply_allocator_owner_fallback<'tcx>(
                 continue;
             };
             let TerminatorKind::Call {
-                func,
-                destination,
-                ..
+                func, destination, ..
             } = &terminator.kind
             else {
                 continue;

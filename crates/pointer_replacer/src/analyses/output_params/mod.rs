@@ -123,7 +123,9 @@ fn conservative<'tcx>(
                         let def_path_str = tcx.def_path_str(body_did);
                         #[cfg(debug_assertions)]
                         if crate::analyses::logging::ownership_verbose() {
-                            eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
+                            eprintln!(
+                                "@{def_path_str}: {arg:?} removed because it aliases {local:?}"
+                            );
                         }
                         output_params.remove(arg);
                         break;

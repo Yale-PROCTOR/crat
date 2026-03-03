@@ -259,5 +259,10 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("dataentry_lib", SOURCE, &["create_entries#entries"], &[]);
+    run_ownership_case_with_box_candidates(
+        "dataentry_lib",
+        SOURCE,
+        &["create_entries#entries"],
+        &[],
+    );
 }

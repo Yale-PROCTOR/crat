@@ -6,7 +6,13 @@ use rustc_ast::{
 };
 
 pub(crate) const ALLOC_UNSAFE_CALLEES: [&str; 4] = ["malloc", "calloc", "realloc", "strdup"];
+pub(crate) const CALL240_ALLOCATOR_CALLEES: [&str; 2] = ["malloc", "calloc"];
 pub(crate) const BOX_NEW_CALLEES: [&str; 1] = ["Box::new"];
+pub(crate) const ALLOCATOR_REASON_KEYS: [&str; 3] = [
+    "call240_applied",
+    "call250_non_move_required",
+    "call240_compile_risk_default_missing",
+];
 pub(crate) const RAW_CONSTRUCTOR_UNSAFE_CALLEES: [&str; 7] = [
     "Box::from_raw",
     "Box::into_raw",
@@ -30,6 +36,71 @@ pub(crate) struct RewriteStats {
     pub alloc_unsafe: BeforeAfterCounts,
     pub box_new: BeforeAfterCounts,
     pub raw_constructor_unsafe: BeforeAfterCounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum AllocatorReason {
+    Call240Applied,
+    Call250NonMoveRequired,
+    Call240CompileRiskDefaultMissing,
+}
+
+impl AllocatorReason {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            AllocatorReason::Call240Applied => "call240_applied",
+            AllocatorReason::Call250NonMoveRequired => "call250_non_move_required",
+            AllocatorReason::Call240CompileRiskDefaultMissing => {
+                "call240_compile_risk_default_missing"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AllocatorReasonStats {
+    pub by_reason: BTreeMap<String, usize>,
+    pub by_allocator: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+impl AllocatorReasonStats {
+    pub(crate) fn record(&mut self, reason: AllocatorReason, allocator: &'static str) {
+        *self.by_reason.entry(reason.key().to_owned()).or_default() += 1;
+        *self
+            .by_allocator
+            .entry(allocator.to_owned())
+            .or_default()
+            .entry(reason.key().to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn merge_from(&mut self, other: &AllocatorReasonStats) {
+        for (reason, count) in &other.by_reason {
+            *self.by_reason.entry(reason.clone()).or_default() += *count;
+        }
+        for (allocator, by_reason) in &other.by_allocator {
+            let dst = self.by_allocator.entry(allocator.clone()).or_default();
+            for (reason, count) in by_reason {
+                *dst.entry(reason.clone()).or_default() += *count;
+            }
+        }
+    }
+
+    pub(crate) fn reason_count(&self, reason: AllocatorReason) -> usize {
+        self.by_reason.get(reason.key()).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn reason_count_for_allocator(
+        &self,
+        allocator: &str,
+        reason: AllocatorReason,
+    ) -> usize {
+        self.by_allocator
+            .get(allocator)
+            .and_then(|counts| counts.get(reason.key()))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,10 +171,41 @@ impl MutVisitor for DirectCallCollector {
 }
 
 fn classify_direct_call(expr: &Expr) -> Option<(MetricFamily, &'static str)> {
-    match &expr.kind {
-        ExprKind::Paren(inner) => classify_direct_call(inner),
+    match &strip_paren_and_cast(expr).kind {
         ExprKind::Path(_, path) => classify_path(path),
         _ => None,
+    }
+}
+
+pub(crate) fn classify_call240_allocator_source_expr(expr: &Expr) -> Option<&'static str> {
+    let ExprKind::Call(callee, _) = &strip_paren_and_cast(expr).kind else {
+        return None;
+    };
+    let ExprKind::Path(_, path) = &strip_paren_and_cast(callee).kind else {
+        return None;
+    };
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.name.as_str())
+        .collect::<Vec<_>>();
+    if path_ends_with(&segments, &["malloc"]) {
+        return Some("malloc");
+    }
+    if path_ends_with(&segments, &["calloc"]) {
+        return Some("calloc");
+    }
+    None
+}
+
+fn strip_paren_and_cast(mut expr: &Expr) -> &Expr {
+    loop {
+        match &expr.kind {
+            ExprKind::Paren(inner) | ExprKind::Cast(inner, _) => {
+                expr = inner;
+            }
+            _ => return expr,
+        }
     }
 }
 
@@ -304,5 +406,29 @@ mod tests {
             );
         }
         assert_eq!(metrics.raw_constructor_unsafe.values().sum::<usize>(), 7);
+    }
+
+    #[test]
+    fn allocator_reason_stats_merge_and_lookup() {
+        let mut lhs = AllocatorReasonStats::default();
+        lhs.record(AllocatorReason::Call240Applied, "malloc");
+        lhs.record(AllocatorReason::Call240CompileRiskDefaultMissing, "malloc");
+
+        let mut rhs = AllocatorReasonStats::default();
+        rhs.record(AllocatorReason::Call250NonMoveRequired, "calloc");
+        rhs.record(AllocatorReason::Call240Applied, "malloc");
+
+        lhs.merge_from(&rhs);
+
+        assert_eq!(lhs.reason_count(AllocatorReason::Call240Applied), 2);
+        assert_eq!(lhs.reason_count(AllocatorReason::Call250NonMoveRequired), 1);
+        assert_eq!(
+            lhs.reason_count_for_allocator("malloc", AllocatorReason::Call240Applied),
+            2
+        );
+        assert_eq!(
+            lhs.reason_count_for_allocator("calloc", AllocatorReason::Call250NonMoveRequired),
+            1
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use etrace::some_or;
 use rustc_ast::{
@@ -7,10 +7,16 @@ use rustc_ast::{
     *,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
-use rustc_hir::{self as hir, HirId, def::Res, def_id::LocalDefId};
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    self as hir, HirId,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
+use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
     ir::{AstToHir, mir_ty_to_string},
@@ -19,7 +25,8 @@ use utils::{
 use super::{
     Analysis,
     collector::collect_diffs,
-    decision::{DecisionConflict, PtrKind, SigDecisions},
+    decision::{DecisionConflict, PtrKind, SigDecisions, SpecPtrClass},
+    stats::{AllocatorReason, AllocatorReasonStats, classify_call240_allocator_source_expr},
 };
 use crate::utils::rustc::RustProgram;
 
@@ -28,7 +35,10 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     ast_to_hir: AstToHir,
-    conflicts: Vec<DecisionConflict>,
+    conflicts: RefCell<Vec<DecisionConflict>>,
+    allocator_reason_stats: RefCell<AllocatorReasonStats>,
+    allocator_reason_seen: RefCell<FxHashSet<String>>,
+    enable_box_rewrite: bool,
     raw_mutability: bool,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
@@ -41,25 +51,21 @@ impl MutVisitor for TransformVisitor<'_> {
             ItemKind::Impl(_) => return,
             ItemKind::Fn(box fn_item) => {
                 let def_id = self.ast_to_hir.global_map[&node_id];
-                let mir_body = self.tcx.mir_drops_elaborated_and_const_checked(def_id);
-                let mir_body = mir_body.borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
+                let fn_sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
 
-                for ((local_decl, input_dec), param) in mir_body
-                    .local_decls
+                for ((input_ty, input_dec), param) in fn_sig
+                    .inputs()
                     .iter()
-                    .skip(1)
+                    .copied()
                     .zip(&sig_dec.input_decs)
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
                     let Some(input_dec) = *input_dec else { continue };
                     let (inner_ty, orig_m) =
-                        unwrap_ptr_from_mir_ty(local_decl.ty).unwrap_or_else(|| {
-                        panic!(
-                            "Expected pointer type, got {ty:?} in {local_decl:?}",
-                            ty = local_decl.ty
-                        )
-                    });
+                        unwrap_ptr_from_mir_ty(input_ty).unwrap_or_else(|| {
+                            panic!("Expected pointer type, got {ty:?}", ty = input_ty)
+                        });
                     let mut mapped_dec = self.normalize_slice_kind(input_dec, inner_ty);
                     if !orig_m.is_mut() {
                         mapped_dec = mapped_dec.with_mut(false);
@@ -82,9 +88,7 @@ impl MutVisitor for TransformVisitor<'_> {
                         }
                         PtrKind::Slice(m) => {
                             *param.ty = mk_slice_ty(inner_ty, m, self.tcx);
-                            if m
-                                && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind
-                            {
+                            if m && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
                                 binding_mode.1 = Mutability::Mut;
                             }
                         }
@@ -94,9 +98,7 @@ impl MutVisitor for TransformVisitor<'_> {
                         PtrKind::SliceCursor(m) => {
                             *param.ty = mk_cursor_ty(inner_ty, m, self.tcx);
                             self.slice_cursor.set(true);
-                            if m
-                                && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind
-                            {
+                            if m && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
                                 binding_mode.1 = Mutability::Mut;
                             }
                         }
@@ -110,12 +112,12 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
 
                 if let Some(output_dec) = sig_dec.output_dec {
-                    let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
-                    if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty)
+                    let output_ty = fn_sig.output();
+                    if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(output_ty)
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
                         let mut output_dec = output_dec;
-                        if let Some((_, orig_m)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
+                        if let Some((_, orig_m)) = unwrap_ptr_from_mir_ty(output_ty) {
                             if !orig_m.is_mut() {
                                 output_dec = output_dec.with_mut(false);
                             } else if !self.raw_mutability {
@@ -133,7 +135,8 @@ impl MutVisitor for TransformVisitor<'_> {
                             && let Some(last_stmt) = body.stmts.last_mut()
                             && let StmtKind::Expr(tail_expr) = &mut last_stmt.kind
                             && !matches!(tail_expr.kind, ExprKind::Ret(_))
-                            && let Some(hir_tail_expr) = self.ast_to_hir.get_expr(tail_expr.id, self.tcx)
+                            && let Some(hir_tail_expr) =
+                                self.ast_to_hir.get_expr(tail_expr.id, self.tcx)
                         {
                             self.transform_rhs(tail_expr.as_mut(), hir_tail_expr, output_dec);
                         }
@@ -183,11 +186,36 @@ impl MutVisitor for TransformVisitor<'_> {
 
         if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-            && let Some(mut lhs_kind) = self.ptr_kinds.get(&hir_id).copied()
         {
             let typeck = self.tcx.typeck(hir_id.owner);
             let lhs_ty = typeck.node_type(hir_id);
-            let (lhs_inner_ty, orig_m) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+            let Some((lhs_inner_ty, orig_m)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                return;
+            };
+            let mut lhs_kind = self.ptr_kinds.get(&hir_id).copied();
+            if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &local.kind {
+                let rhs_source = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
+                if self.can_force_call240_move(hir_id, rhs_source)
+                    && matches!(lhs_kind, None | Some(PtrKind::Raw(_)))
+                {
+                    lhs_kind = Some(PtrKind::Move(orig_m.is_mut()));
+                }
+            }
+            let Some(mut lhs_kind) = lhs_kind else {
+                if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &local.kind {
+                    let rhs_source = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
+                    if let Some(allocator) = classify_call240_allocator_source_expr(rhs_source)
+                        && let Some(hir_rhs) = let_stmt.init
+                    {
+                        self.record_allocator_reason(
+                            hir_rhs,
+                            allocator,
+                            AllocatorReason::Call250NonMoveRequired,
+                        );
+                    }
+                }
+                return;
+            };
             lhs_kind = self.normalize_slice_kind(lhs_kind, lhs_inner_ty);
             if !orig_m.is_mut() {
                 lhs_kind = lhs_kind.with_mut(false);
@@ -221,8 +249,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     | PtrKind::OptRef(_)
                     | PtrKind::Slice(true)
                     | PtrKind::SliceCursor(true)
-            )
-                && let PatKind::Ident(binding_mode, ..) = &mut local.pat.kind
+            ) && let PatKind::Ident(binding_mode, ..) = &mut local.pat.kind
             {
                 // Rewritten mutable pointer forms use mutable receiver methods.
                 binding_mode.1 = Mutability::Mut;
@@ -249,7 +276,10 @@ impl MutVisitor for TransformVisitor<'_> {
                 let lhs_kind = if let ExprKind::Path(_, _) = lhs.kind
                     && let Some(hir_id) = self.hir_id_of_path(lhs.id)
                 {
-                    self.ptr_kinds[&hir_id]
+                    self.ptr_kinds
+                        .get(&hir_id)
+                        .copied()
+                        .unwrap_or(PtrKind::Raw(m.is_mut()))
                 } else {
                     PtrKind::Raw(m.is_mut())
                 };
@@ -530,7 +560,10 @@ impl<'tcx> TransformVisitor<'tcx> {
             sig_decs,
             ptr_kinds: collect_result.ptr_kinds,
             ast_to_hir,
-            conflicts,
+            conflicts: RefCell::new(conflicts),
+            allocator_reason_stats: RefCell::new(AllocatorReasonStats::default()),
+            allocator_reason_seen: RefCell::new(FxHashSet::default()),
+            enable_box_rewrite: analysis.enable_box_rewrite,
             raw_mutability: analysis.raw_mutability,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
@@ -538,7 +571,298 @@ impl<'tcx> TransformVisitor<'tcx> {
     }
 
     pub fn take_conflicts(&mut self) -> Vec<DecisionConflict> {
-        std::mem::take(&mut self.conflicts)
+        std::mem::take(&mut *self.conflicts.borrow_mut())
+    }
+
+    pub fn take_allocator_reason_stats(&mut self) -> AllocatorReasonStats {
+        std::mem::take(&mut *self.allocator_reason_stats.borrow_mut())
+    }
+
+    pub fn synthesize_ty140_defaults(&mut self, krate: &mut Crate, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        self.synthesize_ty140_in_items(&mut krate.items);
+    }
+
+    fn call240_site(&self, hir_expr: &hir::Expr<'tcx>) -> String {
+        let file = self
+            .tcx
+            .sess
+            .source_map()
+            .span_to_filename(hir_expr.span)
+            .prefer_local()
+            .to_string();
+        let file = file.rsplit(['/', '\\']).next().unwrap_or(&file).to_owned();
+        let line = self
+            .tcx
+            .sess
+            .source_map()
+            .lookup_char_pos(hir_expr.span.lo())
+            .line;
+        let fn_path = self
+            .tcx
+            .def_path_str(hir_expr.hir_id.owner.def_id.to_def_id());
+        format!(
+            "{}|{}|hir{:?}|line{}",
+            file, fn_path, hir_expr.hir_id.local_id, line
+        )
+    }
+
+    fn item_site(&self, item: &Item) -> String {
+        let file = self
+            .tcx
+            .sess
+            .source_map()
+            .span_to_filename(item.span)
+            .prefer_local()
+            .to_string();
+        let file = file.rsplit(['/', '\\']).next().unwrap_or(&file).to_owned();
+        let line = self
+            .tcx
+            .sess
+            .source_map()
+            .lookup_char_pos(item.span.lo())
+            .line;
+        let item_path = self
+            .ast_to_hir
+            .global_map
+            .get(&item.id)
+            .map(|did| self.tcx.def_path_str(did.to_def_id()))
+            .unwrap_or_else(|| "<unmapped-item>".to_owned());
+        format!("{}|{}|item{:?}|line{}", file, item_path, item.id, line)
+    }
+
+    fn record_allocator_reason(
+        &self,
+        hir_expr: &hir::Expr<'tcx>,
+        allocator: &'static str,
+        reason: AllocatorReason,
+    ) {
+        let key = format!(
+            "{}|{}|{}",
+            reason.key(),
+            allocator,
+            self.call240_site(hir_expr)
+        );
+        if self.allocator_reason_seen.borrow_mut().insert(key) {
+            self.allocator_reason_stats
+                .borrow_mut()
+                .record(reason, allocator);
+        }
+    }
+
+    fn push_ty140_skip_conflict(&self, item: &Item, note: String) {
+        self.conflicts.borrow_mut().push(DecisionConflict {
+            rule_id: "TY-140",
+            site: self.item_site(item),
+            legacy_decision: SpecPtrClass::RawConst,
+            spec_decision: SpecPtrClass::Move,
+            chosen: SpecPtrClass::RawConst,
+            note,
+        });
+    }
+
+    fn is_low_risk_default_type_for_call240(&self, ty: ty::Ty<'tcx>) -> bool {
+        match ty.kind() {
+            ty::TyKind::Bool
+            | ty::TyKind::Char
+            | ty::TyKind::Int(_)
+            | ty::TyKind::Uint(_)
+            | ty::TyKind::Float(_)
+            | ty::TyKind::RawPtr(..)
+            | ty::TyKind::Ref(..)
+            | ty::TyKind::FnPtr(..) => true,
+            ty::TyKind::Array(elem, _) => self.is_low_risk_default_type_for_call240(*elem),
+            ty::TyKind::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.is_low_risk_default_type_for_call240(elem)),
+            _ => false,
+        }
+    }
+
+    fn synthesize_ty140_in_items(&self, items: &mut ThinVec<P<Item>>) {
+        for item in items.iter_mut() {
+            if let ItemKind::Mod(_, _, ModKind::Loaded(inner, _, _, _)) = &mut item.kind {
+                self.synthesize_ty140_in_items(inner);
+            }
+        }
+
+        let mut existing_default_impls: FxHashSet<String> = FxHashSet::default();
+        for item in items.iter() {
+            let ItemKind::Impl(box Impl {
+                of_trait: Some(of_trait),
+                self_ty,
+                ..
+            }) = &item.kind
+            else {
+                continue;
+            };
+            if !Self::trait_ref_is_default(&of_trait) {
+                continue;
+            }
+            let Some(self_name) = Self::self_ty_name(&self_ty) else {
+                continue;
+            };
+            existing_default_impls.insert(self_name);
+        }
+
+        let mut impls_to_append = Vec::new();
+        for item in items.iter() {
+            let ItemKind::Struct(ident, generics, data) = &item.kind else {
+                continue;
+            };
+
+            let struct_name = ident.name.as_str().to_owned();
+            if existing_default_impls.contains(&struct_name) || Self::has_derive_default(item) {
+                continue;
+            }
+            if !generics.params.is_empty() {
+                self.push_ty140_skip_conflict(
+                    item,
+                    format!(
+                        "TY-140 default synthesis skipped for generic struct `{}` (non-generic scope in this patch).",
+                        struct_name
+                    ),
+                );
+                continue;
+            }
+            if let Some(reason) = self.ty140_unsupported_struct_reason(item) {
+                self.push_ty140_skip_conflict(item, reason);
+                continue;
+            }
+
+            let Some(default_body) = Self::ty140_default_body(&data) else {
+                self.push_ty140_skip_conflict(
+                    item,
+                    format!(
+                        "TY-140 default synthesis skipped for unsupported struct shape `{}`.",
+                        struct_name
+                    ),
+                );
+                continue;
+            };
+
+            let impl_item = utils::item!(
+                "impl Default for {} {{ fn default() -> Self {{ {} }} }}",
+                struct_name,
+                default_body
+            );
+            existing_default_impls.insert(struct_name);
+            impls_to_append.push(P(impl_item));
+        }
+
+        items.extend(impls_to_append);
+    }
+
+    fn trait_ref_is_default(trait_ref: &TraitRef) -> bool {
+        trait_ref
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident.name.as_str() == "Default")
+    }
+
+    fn self_ty_name(ty: &Ty) -> Option<String> {
+        let TyKind::Path(None, path) = &ty.kind else {
+            return None;
+        };
+        Some(path.segments.last()?.ident.name.as_str().to_owned())
+    }
+
+    fn has_derive_default(item: &Item) -> bool {
+        let item_text = pprust::item_to_string(item);
+        item_text.contains("derive") && item_text.contains("Default")
+    }
+
+    fn ty140_unsupported_struct_reason(&self, item: &Item) -> Option<String> {
+        let ItemKind::Struct(ident, _, _) = &item.kind else {
+            return None;
+        };
+        let def_id = self.ast_to_hir.global_map.get(&item.id)?;
+        let adt_def = self.tcx.adt_def(def_id.to_def_id());
+        for field in adt_def.non_enum_variant().fields.iter() {
+            let field_ty = self.tcx.type_of(field.did).instantiate_identity();
+            if let Some(reason) = Self::ty140_unsupported_field_kind(field_ty) {
+                return Some(format!(
+                    "TY-140 default synthesis skipped for `{}`: field `{}` is unsupported ({}).",
+                    ident.name.as_str(),
+                    field.name,
+                    reason
+                ));
+            }
+        }
+        None
+    }
+
+    fn ty140_unsupported_field_kind(ty: ty::Ty<'tcx>) -> Option<&'static str> {
+        match ty.kind() {
+            ty::TyKind::Adt(adt, _) => {
+                if adt.is_union() {
+                    Some("union field type")
+                } else {
+                    None
+                }
+            }
+            ty::TyKind::RawPtr(inner_ty, _) => {
+                if matches!(
+                    inner_ty.kind(),
+                    ty::TyKind::Foreign(..)
+                        | ty::TyKind::Slice(..)
+                        | ty::TyKind::Str
+                        | ty::TyKind::Dynamic(..)
+                ) {
+                    Some("raw pointer to unsized/foreign pointee")
+                } else {
+                    None
+                }
+            }
+            ty::TyKind::Ref(..) => Some("reference field type"),
+            ty::TyKind::Array(elem, _) => Self::ty140_unsupported_field_kind(*elem),
+            ty::TyKind::Tuple(elems) => elems
+                .iter()
+                .find_map(|elem| Self::ty140_unsupported_field_kind(elem)),
+            ty::TyKind::Foreign(..) => Some("foreign extern field type"),
+            ty::TyKind::Slice(..) | ty::TyKind::Str | ty::TyKind::Dynamic(..) => {
+                Some("unsized field type")
+            }
+            _ => None,
+        }
+    }
+
+    fn ty140_default_body(data: &VariantData) -> Option<String> {
+        match data {
+            VariantData::Struct { fields, .. } => {
+                let mut field_defaults = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let field_name = field.ident.as_ref()?.name.as_str();
+                    field_defaults.push(format!(
+                        "{field_name}: {}",
+                        Self::ty140_default_expr(&field.ty)
+                    ));
+                }
+                Some(format!("Self {{ {} }}", field_defaults.join(", ")))
+            }
+            VariantData::Tuple(fields, _) => {
+                let tuple_defaults = fields
+                    .iter()
+                    .map(|field| Self::ty140_default_expr(&field.ty))
+                    .collect::<Vec<_>>();
+                Some(format!("Self({})", tuple_defaults.join(", ")))
+            }
+            VariantData::Unit(_) => Some("Self".to_owned()),
+        }
+    }
+
+    fn ty140_default_expr(ty: &Ty) -> String {
+        match &ty.kind {
+            TyKind::Array(elem, len) => format!(
+                "[{}; {}]",
+                Self::ty140_default_expr(elem),
+                pprust::expr_to_string(&len.value)
+            ),
+            _ => "Default::default()".to_owned(),
+        }
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -546,6 +870,70 @@ impl<'tcx> TransformVisitor<'tcx> {
         let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_rhs.kind else { return None };
         let Res::Local(hir_id) = path.res else { return None };
         Some(hir_id)
+    }
+
+    fn owner_returns_raw_pointer(&self, owner: LocalDefId) -> bool {
+        let sig = self.tcx.fn_sig(owner).skip_binder().skip_binder();
+        matches!(sig.output().kind(), ty::TyKind::RawPtr(..))
+    }
+
+    fn can_force_call240_move(&self, local_hir_id: HirId, rhs_source: &Expr) -> bool {
+        if !self.enable_box_rewrite {
+            return false;
+        }
+        if self.owner_returns_raw_pointer(local_hir_id.owner.def_id) {
+            return false;
+        }
+        if classify_call240_allocator_source_expr(rhs_source).is_none() {
+            return false;
+        }
+        !self.local_has_call240_blocking_use(local_hir_id)
+    }
+
+    fn local_has_call240_blocking_use(&self, local_hir_id: HirId) -> bool {
+        fn is_target_local(expr: &hir::Expr<'_>, target: HirId) -> bool {
+            let expr = hir_unwrap_addr_of_deref(hir_unwrap_cast(expr));
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind
+                && let Res::Local(hir_id) = path.res
+            {
+                hir_id == target
+            } else {
+                false
+            }
+        }
+
+        struct BlockingUseFinder {
+            target: HirId,
+            found: bool,
+        }
+
+        impl<'tcx> Visitor<'tcx> for BlockingUseFinder {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                if self.found {
+                    return;
+                }
+                if let hir::ExprKind::MethodCall(seg, receiver, _, _) = expr.kind {
+                    let name = seg.ident.name.as_str();
+                    if matches!(
+                        name,
+                        "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" | "byte_offset"
+                    ) && is_target_local(receiver, self.target)
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(local_hir_id.owner.def_id);
+        let mut finder = BlockingUseFinder {
+            target: local_hir_id,
+            found: false,
+        };
+        finder.visit_body(body);
+        finder.found
     }
 
     fn non_raw_null_cmp_rewrite(&self, ptr_expr: &Expr, is_eq: bool) -> Option<Expr> {
@@ -584,9 +972,7 @@ impl<'tcx> TransformVisitor<'tcx> {
     fn normalize_slice_kind(&self, kind: PtrKind, inner_ty: ty::Ty<'tcx>) -> PtrKind {
         match kind {
             PtrKind::SliceCursor(m) => PtrKind::Raw(m),
-            PtrKind::Slice(m) if Self::prefer_raw_over_slice(inner_ty) => {
-                PtrKind::Raw(m)
-            }
+            PtrKind::Slice(m) if Self::prefer_raw_over_slice(inner_ty) => PtrKind::Raw(m),
             other => other,
         }
     }
@@ -601,6 +987,16 @@ impl<'tcx> TransformVisitor<'tcx> {
         hir_rhs: &hir::Expr<'tcx>,
         lhs_kind: PtrKind,
     ) -> PtrKind {
+        if !matches!(lhs_kind, PtrKind::Move(_)) {
+            let rhs_source = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
+            if let Some(allocator) = classify_call240_allocator_source_expr(rhs_source) {
+                self.record_allocator_reason(
+                    hir_rhs,
+                    allocator,
+                    AllocatorReason::Call250NonMoveRequired,
+                );
+            }
+        }
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
     }
 
@@ -728,6 +1124,17 @@ impl<'tcx> TransformVisitor<'tcx> {
         let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
             .unwrap_or_else(|| panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr)));
         let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let allocator_source = classify_call240_allocator_source_expr(e);
+        if let Some(allocator) = allocator_source
+            && let PtrCtx::Rhs(required_kind) = ctx
+            && !matches!(required_kind, PtrKind::Move(_))
+        {
+            self.record_allocator_reason(
+                hir_ptr,
+                allocator,
+                AllocatorReason::Call250NonMoveRequired,
+            );
+        }
 
         let def_id = hir_ptr.hir_id.owner.def_id;
 
@@ -1101,7 +1508,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         {
             match (ctx, *rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Move(m)), PtrKind::Raw(m1)) => {
-                    *ptr = self.move_from_raw(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    *ptr = self.move_from_raw(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, hir_ptr);
                     return PtrKind::Move(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Move(m)), PtrKind::Move(_m1)) => {
@@ -1142,13 +1549,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let raw_base =
                             self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
                         let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
-                        *ptr = self.coerce_raw_expr(
-                            &raw_projected,
-                            m,
-                            m1,
-                            lhs_inner_ty,
-                            rhs_inner_ty,
-                        );
+                        *ptr =
+                            self.coerce_raw_expr(&raw_projected, m, m1, lhs_inner_ty, rhs_inner_ty);
                     }
                     return PtrKind::Raw(m);
                 }
@@ -1191,8 +1593,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let raw_base =
                             self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
                         let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
-                        *ptr =
-                            self.opt_ref_from_raw(&raw_projected, m, m1, lhs_inner_ty, rhs_inner_ty);
+                        *ptr = self.opt_ref_from_raw(
+                            &raw_projected,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
                     }
                     return PtrKind::OptRef(m);
                 }
@@ -1212,8 +1619,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let raw_base =
                             self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
                         let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
-                        *ptr =
-                            self.opt_ref_from_raw(&raw_projected, m, m1, lhs_inner_ty, rhs_inner_ty);
+                        *ptr = self.opt_ref_from_raw(
+                            &raw_projected,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
                     }
                     return PtrKind::OptRef(m);
                 }
@@ -1430,7 +1842,12 @@ impl<'tcx> TransformVisitor<'tcx> {
             ty::TyKind::RawPtr(_, m) => m.is_mut(),
             ty::TyKind::Array(_, _) => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
-                PathOrDeref::Deref(hir_id) => self.ptr_kinds[&hir_id].is_mut(),
+                PathOrDeref::Deref(hir_id) => self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .copied()
+                    .map(|k| k.is_mut())
+                    .unwrap_or(true),
                 PathOrDeref::Other => {
                     panic!("{}", pprust::expr_to_string(pe.base))
                 }
@@ -1445,12 +1862,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Some(PtrKind::Raw(m)) =
                 self.sig_decs.data.get(&def_id).and_then(|sd| sd.output_dec)
         {
-            let output_ty = self
-                .tcx
-                .fn_sig(def_id)
-                .skip_binder()
-                .skip_binder()
-                .output();
+            let output_ty = self.tcx.fn_sig(def_id).skip_binder().skip_binder().output();
             if let ty::TyKind::RawPtr(_, out_m) = output_ty.kind() {
                 if !out_m.is_mut() {
                     false
@@ -1478,7 +1890,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrKind::OptRef(m)
             }
             PtrCtx::Rhs(PtrKind::Move(m)) => {
-                *ptr = self.move_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                *ptr = self.move_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty, hir_ptr);
                 PtrKind::Move(m)
             }
             PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
@@ -1590,8 +2002,25 @@ impl<'tcx> TransformVisitor<'tcx> {
         m1: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
+        hir_ptr: &hir::Expr<'tcx>,
     ) -> Expr {
+        if let Some(callee) = classify_call240_allocator_source_expr(e) {
+            self.record_allocator_reason(hir_ptr, callee, AllocatorReason::Call240Applied);
+            if !self.is_low_risk_default_type_for_call240(lhs_inner_ty) {
+                self.record_allocator_reason(
+                    hir_ptr,
+                    callee,
+                    AllocatorReason::Call240CompileRiskDefaultMissing,
+                );
+            }
+            return utils::expr!(
+                "Some(Box::new(<{} as Default>::default()))",
+                mir_ty_to_string(lhs_inner_ty, self.tcx)
+            );
+        }
+
         let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let lhs_inner_ty_str = mir_ty_to_string(lhs_inner_ty, self.tcx);
         let mut ptr_expr = if !need_cast {
             pprust::expr_to_string(e)
         } else {
@@ -1599,20 +2028,28 @@ impl<'tcx> TransformVisitor<'tcx> {
                 "({}) as *{} {}",
                 pprust::expr_to_string(e),
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                lhs_inner_ty_str,
             )
         };
         if !m1 {
-            ptr_expr = format!("({ptr_expr}) as *mut {}", mir_ty_to_string(lhs_inner_ty, self.tcx));
+            ptr_expr = format!("({ptr_expr}) as *mut {lhs_inner_ty_str}");
         }
+        let boxed_ptr_expr = if m {
+            ptr_expr.clone()
+        } else {
+            format!("({ptr_expr}) as *mut {lhs_inner_ty_str}")
+        };
         utils::expr!(
-            "if ({}).is_null() {{
-                None
-            }} else {{
-                Some(Box::from_raw({}))
+            "{{
+                let __ptr_rewriter_raw: *mut {} = {};
+                if (__ptr_rewriter_raw).is_null() {{
+                    None
+                }} else {{
+                    Some(Box::from_raw(__ptr_rewriter_raw))
+                }}
             }}",
-            pprust::expr_to_string(e),
-            if m { ptr_expr } else { format!("({ptr_expr}) as *mut {}", mir_ty_to_string(lhs_inner_ty, self.tcx)) },
+            lhs_inner_ty_str,
+            boxed_ptr_expr,
         )
     }
 
@@ -1766,7 +2203,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
         if is_null_ptr_call_expr(e) {
-            return if m { utils::expr!("&mut []") } else { utils::expr!("&[]") };
+            return if m {
+                utils::expr!("&mut []")
+            } else {
+                utils::expr!("&[]")
+            };
         }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
@@ -2384,24 +2825,19 @@ impl<'tcx> TransformVisitor<'tcx> {
             PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca | PtrExprBaseKind::Array => true,
             PtrExprBaseKind::Other => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
-                PathOrDeref::Deref(hir_id) => {
+                PathOrDeref::Deref(hir_id) => self.ptr_kinds.get(&hir_id).is_some_and(|kind| {
                     matches!(
-                        self.ptr_kinds[&hir_id],
+                        kind,
                         PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
                     )
-                }
+                }),
                 PathOrDeref::Other => pe.base_ty.is_array(),
             },
             _ => false,
         }
     }
 
-    fn apply_raw_projections(
-        &self,
-        mut e: Expr,
-        projs: &[PtrExprProj<'_, 'tcx>],
-        m: bool,
-    ) -> Expr {
+    fn apply_raw_projections(&self, mut e: Expr, projs: &[PtrExprProj<'_, 'tcx>], m: bool) -> Expr {
         for proj in projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
@@ -2461,7 +2897,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let inner = unwrap_paren(inner);
                 if matches!(inner.kind, ExprKind::Path(_, _))
                     && let Some(hir_id) = self.hir_id_of_path(inner.id)
-                    && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::OptRef(_) | PtrKind::Move(_)))
+                    && matches!(
+                        self.ptr_kinds.get(&hir_id),
+                        Some(PtrKind::OptRef(_) | PtrKind::Move(_))
+                    )
                 {
                     return format!(
                         "(*({}).as_deref().unwrap()).{}",
@@ -2919,7 +3358,9 @@ fn is_range_index_expr(expr: &Expr) -> bool {
 
 fn is_zero_literal_expr(expr: &Expr) -> bool {
     match &unwrap_cast_and_paren(expr).kind {
-        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer) && lit.symbol.as_str() == "0",
+        ExprKind::Lit(lit) => {
+            matches!(lit.kind, token::LitKind::Integer) && lit.symbol.as_str() == "0"
+        }
         _ => false,
     }
 }
@@ -3009,7 +3450,10 @@ fn hoist_mut_call_arg_conflicts(expr: &mut Expr) {
         if !grouped.contains_key(&info.base) {
             base_order.push(info.base.clone());
         }
-        grouped.entry(info.base.clone()).or_default().push((idx, info));
+        grouped
+            .entry(info.base.clone())
+            .or_default()
+            .push((idx, info));
     }
 
     let mut lets = String::new();
@@ -3051,7 +3495,8 @@ fn hoist_mut_call_arg_conflicts(expr: &mut Expr) {
     let Some(first_arg) = args.first() else {
         return;
     };
-    let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, inner) = &unwrap_paren(first_arg).kind else {
+    let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, inner) = &unwrap_paren(first_arg).kind
+    else {
         return;
     };
     let inner = unwrap_paren(inner);
@@ -3080,11 +3525,7 @@ fn hoist_mut_call_arg_conflicts(expr: &mut Expr) {
         return;
     }
 
-    let call = format!(
-        "{}({})",
-        pprust::expr_to_string(func),
-        new_args.join(", ")
-    );
+    let call = format!("{}({})", pprust::expr_to_string(func), new_args.join(", "));
     *expr = utils::expr!("{{ {lets} {call} }}");
 }
 

@@ -1,9 +1,8 @@
 use super::*;
 
-fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
-    let config = Config::default();
+fn run_test_with_config(code: &str, config: &Config, includes: &[&str], excludes: &[&str]) {
     let (s, _, _) =
-        ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(&config, tcx))
+        ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(config, tcx))
             .unwrap();
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     for include in includes {
@@ -15,6 +14,11 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
             "Expected not to find `{exclude}` in:\n{s}",
         );
     }
+}
+
+fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let config = Config::default();
+    run_test_with_config(code, &config, includes, excludes);
 }
 
 mod decision_spec_integration {
@@ -70,6 +74,247 @@ mod decision_spec_integration {
         let merged_again = merge_conflict_log(&merged, &[conflict]);
         assert_eq!(merged_again.matches(key_line).count(), 1);
     }
+}
+
+#[test]
+fn test_call240_malloc_rewrites_to_box_new() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut p: *mut libc::c_int = malloc(4 as libc::size_t) as *mut libc::c_int;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    *p = 7 as libc::c_int;
+    *p
+}
+"#,
+        &config,
+        &["Box::new(<", "as Default>::default()))"],
+        &["malloc(4 as libc::size_t)", "as *mut libc::c_int"],
+    );
+}
+
+#[test]
+fn test_call240_calloc_rewrites_to_box_new() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn calloc(nmemb: libc::size_t, size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut p: *mut libc::c_int = calloc(1 as libc::size_t, 4 as libc::size_t) as *mut libc::c_int;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    *p = 9 as libc::c_int;
+    *p
+}
+"#,
+        &config,
+        &["Box::new(<", "as Default>::default()))"],
+        &["calloc(1 as libc::size_t, 4 as libc::size_t)"],
+    );
+}
+
+#[test]
+fn test_call240_does_not_rewrite_realloc() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn realloc(ptr: *mut libc::c_void, size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut p: *mut libc::c_int = realloc(std::ptr::null_mut(), 4 as libc::size_t) as *mut libc::c_int;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    *p
+}
+"#,
+        &config,
+        &["realloc("],
+        &["Box::new(<"],
+    );
+}
+
+#[test]
+fn test_call240_does_not_rewrite_strdup() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn strdup(s: *const libc::c_char) -> *mut libc::c_char;
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut p: *mut libc::c_char = strdup(b"x\0".as_ptr() as *const libc::c_char);
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    *p as libc::c_int
+}
+"#,
+        &config,
+        &["strdup("],
+        &["Box::new(<"],
+    );
+}
+
+#[test]
+fn test_call240_rewrites_struct_target_with_ty140_default_impl() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Opaque {
+    pub ptr: *mut libc::c_void,
+}
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut p: *mut Opaque = malloc(core::mem::size_of::<Opaque>() as libc::size_t) as *mut Opaque;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    (*p).ptr = std::ptr::null_mut();
+    (*p).ptr.is_null() as libc::c_int
+}
+"#,
+        &config,
+        &[
+            "Box::new(<crate::Opaque as Default>::default())",
+            "impl Default for Opaque",
+        ],
+        &["Box::from_raw"],
+    );
+}
+
+#[test]
+fn test_call240_rewrites_without_shape_gate() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo(count: libc::size_t) -> libc::c_int {
+    let mut p: *mut libc::c_int =
+        malloc(count.wrapping_mul(core::mem::size_of::<libc::c_int>() as libc::size_t))
+            as *mut libc::c_int;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    *p = 3 as libc::c_int;
+    *p
+}
+"#,
+        &config,
+        &["Box::new(<", "as Default>::default()))"],
+        &["Box::from_raw(__ptr_rewriter_raw)"],
+    );
+}
+
+#[test]
+fn test_call250_non_move_required_reason_recorded() {
+    let mut config = Config::default();
+    config.force_box = true;
+    let output = ::utils::compilation::run_compiler_on_str(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+}
+pub unsafe extern "C" fn foo() -> *mut libc::c_int {
+    let p: *mut libc::c_int = malloc(core::mem::size_of::<libc::c_int>() as libc::size_t) as *mut libc::c_int;
+    p
+}
+"#,
+        |tcx| crate::rewriter::replace_local_borrows_with_stats(&config, tcx),
+    )
+    .unwrap();
+    ::utils::compilation::run_compiler_on_str(&output.code, ::utils::type_check)
+        .expect(&output.code);
+    assert!(output.code.contains("malloc("));
+    assert_eq!(
+        output
+            .allocator_reason_stats
+            .reason_count(crate::rewriter::stats::AllocatorReason::Call250NonMoveRequired),
+        1
+    );
+}
+
+#[test]
+fn test_ty140_synthesizes_named_tuple_and_unit_defaults_without_duplicates() {
+    let config = Config::default();
+    let output = ::utils::compilation::run_compiler_on_str(
+        r#"
+#[repr(C)]
+pub struct Named {
+    pub x: i32,
+    pub arr: [u8; 4],
+}
+
+#[repr(C)]
+pub struct Tuple(pub i32, pub [u16; 2]);
+
+#[repr(C)]
+pub struct Unit;
+
+#[derive(Default)]
+pub struct DerivedDefault {
+    pub x: i32,
+}
+
+pub struct ManualDefault {
+    pub x: i32,
+}
+impl Default for ManualDefault {
+    fn default() -> Self {
+        Self { x: 7 }
+    }
+}
+"#,
+        |tcx| crate::rewriter::replace_local_borrows_with_stats(&config, tcx),
+    )
+    .unwrap();
+    ::utils::compilation::run_compiler_on_str(&output.code, ::utils::type_check)
+        .expect(&output.code);
+    assert!(output.code.contains("impl Default for Named"));
+    assert!(output.code.contains("impl Default for Tuple"));
+    assert!(output.code.contains("impl Default for Unit"));
+    assert_eq!(
+        output
+            .code
+            .matches("impl Default for DerivedDefault")
+            .count(),
+        0
+    );
+    assert_eq!(
+        output
+            .code
+            .matches("impl Default for ManualDefault")
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -9,10 +9,7 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, collector::collect_fn_ptrs};
-use crate::{
-    analyses::ownership::Ownership,
-    utils::rustc::RustProgram,
-};
+use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
@@ -131,7 +128,12 @@ fn conflict_markdown_entry(conflict: &DecisionConflict) -> String {
         conflict.legacy_decision
     )
     .unwrap();
-    writeln!(&mut entry, "  - spec_decision: `{}`", conflict.spec_decision).unwrap();
+    writeln!(
+        &mut entry,
+        "  - spec_decision: `{}`",
+        conflict.spec_decision
+    )
+    .unwrap();
     writeln!(&mut entry, "  - chosen: `{}`", conflict.chosen).unwrap();
     writeln!(&mut entry, "  - chosen_behavior: `{}`", conflict.chosen).unwrap();
     writeln!(&mut entry, "  - minimal_repro: `<pending capture>`").unwrap();
@@ -171,7 +173,10 @@ pub(crate) fn merge_conflict_log(existing: &str, conflicts: &[DecisionConflict])
     merged
 }
 
-pub(crate) fn append_conflicts_to_file(path: &Path, conflicts: &[DecisionConflict]) -> io::Result<()> {
+pub(crate) fn append_conflicts_to_file(
+    path: &Path,
+    conflicts: &[DecisionConflict],
+) -> io::Result<()> {
     if conflicts.is_empty() {
         return Ok(());
     }
@@ -234,20 +239,15 @@ pub struct DecisionMaker<'tcx> {
 
 impl<'tcx> DecisionMaker<'tcx> {
     pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
-        let mir_body = tcx.mir_drops_elaborated_and_const_checked(did);
-        let body = mir_body.borrow();
         let mutable_pointers = analysis
             .mutability_result
             .function_body_facts(did)
             .map(|mutabilities| mutabilities.iter().any(|m| m.is_mutable()))
             .collect::<IndexVec<Local, _>>();
-        let mut owning_pointers = IndexVec::from_elem_n(false, body.local_decls.len());
+        let mut owning_pointers = IndexVec::from_elem_n(false, mutable_pointers.len());
         if let Some(owning_results) = analysis.ownership_result.as_ref() {
             let owning_results = owning_results.fn_results(&did.to_def_id());
-            for (local, decl) in body.local_decls.iter_enumerated() {
-                if !decl.ty.is_raw_ptr() {
-                    continue;
-                }
+            for local in owning_pointers.indices() {
                 let is_owning = owning_results
                     .local_result(local)
                     .first()
@@ -266,16 +266,9 @@ impl<'tcx> DecisionMaker<'tcx> {
             .get(&did)
             .unwrap()
             .clone();
-        let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
         let fn_offset_signs = analysis.offset_sign_result.access_signs.get(&did);
-        let mut needs_cursor = DenseBitSet::new_empty(mutable_pointers.len());
-        for (hir_id, local) in hir_to_mir.binding_to_local {
-            if fn_offset_signs
-                .is_some_and(|signs| signs.get(&hir_id).is_some_and(|s| s.needs_cursor()))
-            {
-                needs_cursor.insert(local);
-            }
-        }
+        let needs_cursor = DenseBitSet::new_empty(mutable_pointers.len());
+        let _ = fn_offset_signs;
         DecisionMaker {
             tcx,
             file_label: {
@@ -347,11 +340,7 @@ impl<'tcx> DecisionMaker<'tcx> {
         aliases: Option<&FxHashSet<Local>>,
     ) -> (Option<PtrKind>, Option<DecisionConflict>) {
         let legacy = self.decide_legacy(local, decl, aliases);
-        let owning = self
-            .owning_pointers
-            .get(local)
-            .copied()
-            .unwrap_or(false);
+        let owning = self.owning_pointers.get(local).copied().unwrap_or(false);
         let Some(legacy_kind) = legacy else {
             return (None, None);
         };
@@ -405,6 +394,7 @@ impl SigDecisions {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());
         let mut conflicts = Vec::new();
+        let mut local_decls_unavailable = false;
 
         // do not change function signatures that are used as function pointers
         let fn_ptrs = collect_fn_ptrs(rust_program);
@@ -431,16 +421,35 @@ impl SigDecisions {
             }
             let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
-            let mir_body = rust_program.tcx.mir_drops_elaborated_and_const_checked(*did);
-            let body = mir_body.borrow();
-
             let sig = rust_program.tcx.fn_sig(*did).skip_binder();
             let input_len = sig.inputs().skip_binder().len();
+            let local_decls = if local_decls_unavailable {
+                None
+            } else {
+                super::catch_unwind_silent(std::panic::AssertUnwindSafe(|| {
+                    rust_program
+                        .tcx
+                        .mir_drops_elaborated_and_const_checked(*did)
+                        .borrow()
+                        .local_decls
+                        .clone()
+                }))
+            };
+            let Some(local_decls) = local_decls else {
+                local_decls_unavailable = true;
+                data.insert(
+                    *did,
+                    SigDecision {
+                        input_decs: vec![None; input_len],
+                        output_dec: None,
+                    },
+                );
+                continue;
+            };
 
             let aliases = analysis.aliases.get(did);
 
-            let input_decs = body
-                .local_decls
+            let input_decs = local_decls
                 .iter_enumerated()
                 .skip(1)
                 .take(input_len)
@@ -455,7 +464,7 @@ impl SigDecisions {
                 .collect();
 
             let return_local = Local::from_u32(0);
-            let return_decl = &body.local_decls[return_local];
+            let return_decl = &local_decls[return_local];
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
             let (output_dec, output_conflict) =
                 decision_maker.decide(return_local, return_decl, return_aliases);

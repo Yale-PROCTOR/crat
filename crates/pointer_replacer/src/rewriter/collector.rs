@@ -24,6 +24,8 @@ pub fn collect_diffs<'tcx>(
 ) -> CollectDiffsResult {
     let mut ptr_kinds = FxHashMap::default();
     let mut conflicts = Vec::new();
+    let mut map_unavailable = false;
+    let mut local_decls_unavailable = false;
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
 
@@ -32,15 +34,39 @@ pub fn collect_diffs<'tcx>(
         let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
         // Assume every mir local has one or less corresponding hir id
-        let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
+        let hir_to_mir = if map_unavailable {
+            None
+        } else {
+            super::catch_unwind_silent(std::panic::AssertUnwindSafe(|| {
+                utils::ir::map_thir_to_mir(*did, false, rust_program.tcx)
+            }))
+        };
+        let Some(hir_to_mir) = hir_to_mir else {
+            map_unavailable = true;
+            continue;
+        };
         let local_to_binding: FxHashMap<Local, HirId> = hir_to_mir
             .binding_to_local
             .into_iter()
             .map(|(k, v)| (v, k))
             .collect();
 
-        let mir_body = rust_program.tcx.mir_drops_elaborated_and_const_checked(*did);
-        let body = mir_body.borrow();
+        let local_decls = if local_decls_unavailable {
+            None
+        } else {
+            super::catch_unwind_silent(std::panic::AssertUnwindSafe(|| {
+                rust_program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(*did)
+                    .borrow()
+                    .local_decls
+                    .clone()
+            }))
+        };
+        let Some(local_decls) = local_decls else {
+            local_decls_unavailable = true;
+            continue;
+        };
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
         let input_skip_len = rust_program
@@ -53,8 +79,7 @@ pub fn collect_diffs<'tcx>(
 
         let aliases = analysis.aliases.get(did);
 
-        for (local, decl) in body
-            .local_decls
+        for (local, decl) in local_decls
             .iter_enumerated()
             .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
         // skip inputs if used as fn ptr

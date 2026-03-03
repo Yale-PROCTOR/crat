@@ -501,7 +501,10 @@ fn ownership_analysis_runs() {
     run_ownership_case_with_box_candidates(
         "matrix_mult_lib",
         SOURCE,
-        &["initialize_matrix_from_string#input_copy", "allocate_matrix#mat"],
+        &[
+            "initialize_matrix_from_string#input_copy",
+            "allocate_matrix#mat",
+        ],
         &[],
     );
 }

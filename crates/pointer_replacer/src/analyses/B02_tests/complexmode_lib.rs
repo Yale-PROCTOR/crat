@@ -285,5 +285,10 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("complexmode_lib", SOURCE, &["dest", "res_tracker"], &[]);
+    run_ownership_case_with_box_candidates(
+        "complexmode_lib",
+        SOURCE,
+        &["dest", "res_tracker"],
+        &[],
+    );
 }
