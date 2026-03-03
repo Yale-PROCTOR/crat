@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     sync::{
@@ -599,6 +600,48 @@ fn extract_b02_source_from_file(path: &Path) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
+fn merge_count_maps(dst: &mut BTreeMap<String, usize>, src: &BTreeMap<String, usize>) {
+    for (callee, count) in src {
+        *dst.entry(callee.clone()).or_default() += *count;
+    }
+}
+
+fn sum_count_map(map: &BTreeMap<String, usize>) -> usize {
+    map.values().sum()
+}
+
+fn format_counts_by_callee(map: &BTreeMap<String, usize>, fixed_order: &[&str]) -> String {
+    let mut parts = Vec::new();
+    for &callee in fixed_order {
+        parts.push(format!("{}={}", callee, map.get(callee).copied().unwrap_or(0)));
+    }
+    for (callee, count) in map {
+        if !fixed_order.iter().any(|known| *known == callee.as_str()) {
+            parts.push(format!("{callee}={count}"));
+        }
+    }
+    parts.join(", ")
+}
+
+fn ratio_percent(numer: usize, denom: usize) -> f64 {
+    if denom == 0 {
+        0.0
+    } else {
+        numer as f64 * 100.0 / denom as f64
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CaseRewriteStats {
+    case_name: String,
+    alloc_before: usize,
+    alloc_after: usize,
+    box_new_before: usize,
+    box_new_after: usize,
+    raw_unsafe_before: usize,
+    raw_unsafe_after: usize,
+}
+
 #[test]
 fn rewriter_transformed_b02_cases_compile() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/B02_tests");
@@ -632,14 +675,63 @@ fn rewriter_transformed_b02_cases_compile() {
     );
 
     let config = crate::Config::default();
+    let mut case_rows = Vec::with_capacity(source_cases.len());
+
+    let mut alloc_before_total = 0usize;
+    let mut alloc_after_total = 0usize;
+    let mut box_new_before_total = 0usize;
+    let mut box_new_after_total = 0usize;
+    let mut raw_unsafe_before_total = 0usize;
+    let mut raw_unsafe_after_total = 0usize;
+
+    let mut alloc_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut alloc_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut box_new_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut box_new_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut raw_unsafe_before_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+    let mut raw_unsafe_after_by_callee: BTreeMap<String, usize> = BTreeMap::new();
+
     for (case_name, source) in source_cases {
-        let (rewritten, _bytemuck, _slice_cursor) =
+        let output =
             ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-                crate::replace_local_borrows(&config, tcx)
+                crate::rewriter::replace_local_borrows_with_stats(&config, tcx)
             })
             .unwrap_or_else(|e| {
                 panic!("rewriter crashed for B02 case `{case_name}`: {e:?}");
             });
+        let rewritten = output.code;
+        let stats = output.rewrite_stats;
+
+        assert_eq!(
+            stats.alloc_unsafe.before_total,
+            sum_count_map(&stats.alloc_unsafe.before_by_callee),
+            "allocator before-total mismatch in case `{case_name}`"
+        );
+        assert_eq!(
+            stats.alloc_unsafe.after_total,
+            sum_count_map(&stats.alloc_unsafe.after_by_callee),
+            "allocator after-total mismatch in case `{case_name}`"
+        );
+        assert_eq!(
+            stats.box_new.before_total,
+            sum_count_map(&stats.box_new.before_by_callee),
+            "Box::new before-total mismatch in case `{case_name}`"
+        );
+        assert_eq!(
+            stats.box_new.after_total,
+            sum_count_map(&stats.box_new.after_by_callee),
+            "Box::new after-total mismatch in case `{case_name}`"
+        );
+        assert_eq!(
+            stats.raw_constructor_unsafe.before_total,
+            sum_count_map(&stats.raw_constructor_unsafe.before_by_callee),
+            "raw-constructor before-total mismatch in case `{case_name}`"
+        );
+        assert_eq!(
+            stats.raw_constructor_unsafe.after_total,
+            sum_count_map(&stats.raw_constructor_unsafe.after_by_callee),
+            "raw-constructor after-total mismatch in case `{case_name}`"
+        );
 
         ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).unwrap_or_else(
             |_| {
@@ -649,7 +741,165 @@ fn rewriter_transformed_b02_cases_compile() {
                 );
             },
         );
+
+        alloc_before_total += stats.alloc_unsafe.before_total;
+        alloc_after_total += stats.alloc_unsafe.after_total;
+        box_new_before_total += stats.box_new.before_total;
+        box_new_after_total += stats.box_new.after_total;
+        raw_unsafe_before_total += stats.raw_constructor_unsafe.before_total;
+        raw_unsafe_after_total += stats.raw_constructor_unsafe.after_total;
+
+        merge_count_maps(&mut alloc_before_by_callee, &stats.alloc_unsafe.before_by_callee);
+        merge_count_maps(&mut alloc_after_by_callee, &stats.alloc_unsafe.after_by_callee);
+        merge_count_maps(&mut box_new_before_by_callee, &stats.box_new.before_by_callee);
+        merge_count_maps(&mut box_new_after_by_callee, &stats.box_new.after_by_callee);
+        merge_count_maps(
+            &mut raw_unsafe_before_by_callee,
+            &stats.raw_constructor_unsafe.before_by_callee,
+        );
+        merge_count_maps(
+            &mut raw_unsafe_after_by_callee,
+            &stats.raw_constructor_unsafe.after_by_callee,
+        );
+
+        case_rows.push(CaseRewriteStats {
+            case_name,
+            alloc_before: stats.alloc_unsafe.before_total,
+            alloc_after: stats.alloc_unsafe.after_total,
+            box_new_before: stats.box_new.before_total,
+            box_new_after: stats.box_new.after_total,
+            raw_unsafe_before: stats.raw_constructor_unsafe.before_total,
+            raw_unsafe_after: stats.raw_constructor_unsafe.after_total,
+        });
     }
+
+    case_rows.sort_by(|a, b| a.case_name.cmp(&b.case_name));
+
+    let alloc_before_cases_sum = case_rows.iter().map(|row| row.alloc_before).sum::<usize>();
+    let alloc_after_cases_sum = case_rows.iter().map(|row| row.alloc_after).sum::<usize>();
+    let box_new_before_cases_sum = case_rows.iter().map(|row| row.box_new_before).sum::<usize>();
+    let box_new_after_cases_sum = case_rows.iter().map(|row| row.box_new_after).sum::<usize>();
+    let raw_unsafe_before_cases_sum = case_rows
+        .iter()
+        .map(|row| row.raw_unsafe_before)
+        .sum::<usize>();
+    let raw_unsafe_after_cases_sum = case_rows
+        .iter()
+        .map(|row| row.raw_unsafe_after)
+        .sum::<usize>();
+
+    assert_eq!(alloc_before_total, alloc_before_cases_sum);
+    assert_eq!(alloc_after_total, alloc_after_cases_sum);
+    assert_eq!(box_new_before_total, box_new_before_cases_sum);
+    assert_eq!(box_new_after_total, box_new_after_cases_sum);
+    assert_eq!(raw_unsafe_before_total, raw_unsafe_before_cases_sum);
+    assert_eq!(raw_unsafe_after_total, raw_unsafe_after_cases_sum);
+
+    assert_eq!(alloc_before_total, sum_count_map(&alloc_before_by_callee));
+    assert_eq!(alloc_after_total, sum_count_map(&alloc_after_by_callee));
+    assert_eq!(box_new_before_total, sum_count_map(&box_new_before_by_callee));
+    assert_eq!(box_new_after_total, sum_count_map(&box_new_after_by_callee));
+    assert_eq!(raw_unsafe_before_total, sum_count_map(&raw_unsafe_before_by_callee));
+    assert_eq!(raw_unsafe_after_total, sum_count_map(&raw_unsafe_after_by_callee));
+
+    let alloc_removed_total = alloc_before_total.saturating_sub(alloc_after_total);
+    let box_new_added_total = box_new_after_total.saturating_sub(box_new_before_total);
+    let raw_unsafe_added_total = raw_unsafe_after_total.saturating_sub(raw_unsafe_before_total);
+
+    println!("== B02 rewriter case-wise stats ==");
+    for row in &case_rows {
+        let alloc_removed = row.alloc_before.saturating_sub(row.alloc_after);
+        let box_new_added = row.box_new_after.saturating_sub(row.box_new_before);
+        let raw_unsafe_added = row.raw_unsafe_after.saturating_sub(row.raw_unsafe_before);
+        println!(
+            "case={} alloc_before={} alloc_after={} alloc_removed={} box_new_before={} box_new_after={} box_new_added={} raw_unsafe_before={} raw_unsafe_after={} raw_unsafe_added={}",
+            row.case_name,
+            row.alloc_before,
+            row.alloc_after,
+            alloc_removed,
+            row.box_new_before,
+            row.box_new_after,
+            box_new_added,
+            row.raw_unsafe_before,
+            row.raw_unsafe_after,
+            raw_unsafe_added,
+        );
+    }
+
+    let alloc_removal_rate = ratio_percent(alloc_removed_total, alloc_before_total);
+    let box_new_growth_rate = if box_new_before_total == 0 {
+        if box_new_after_total == 0 { 0.0 } else { 100.0 }
+    } else {
+        (box_new_after_total as f64 - box_new_before_total as f64) * 100.0
+            / box_new_before_total as f64
+    };
+    let raw_unsafe_growth_rate = if raw_unsafe_before_total == 0 {
+        if raw_unsafe_after_total == 0 {
+            0.0
+        } else {
+            100.0
+        }
+    } else {
+        (raw_unsafe_after_total as f64 - raw_unsafe_before_total as f64) * 100.0
+            / raw_unsafe_before_total as f64
+    };
+
+    println!("== B02 rewriter totals ==");
+    println!("cases={}", case_rows.len());
+    println!(
+        "allocator_unsafe_before_total={alloc_before_total} allocator_unsafe_after_total={alloc_after_total} allocator_unsafe_removed_total={alloc_removed_total}"
+    );
+    println!(
+        "box_new_before_total={box_new_before_total} box_new_after_total={box_new_after_total} box_new_added_total={box_new_added_total}"
+    );
+    println!(
+        "raw_constructor_unsafe_before_total={raw_unsafe_before_total} raw_constructor_unsafe_after_total={raw_unsafe_after_total} raw_constructor_unsafe_added_total={raw_unsafe_added_total}"
+    );
+    println!(
+        "allocator_removal_rate={alloc_removal_rate:.2}% box_new_growth_rate={box_new_growth_rate:.2}% raw_unsafe_growth_rate={raw_unsafe_growth_rate:.2}%"
+    );
+    println!(
+        "allocator_unsafe_before_by_callee: {}",
+        format_counts_by_callee(
+            &alloc_before_by_callee,
+            &crate::rewriter::stats::ALLOC_UNSAFE_CALLEES,
+        )
+    );
+    println!(
+        "allocator_unsafe_after_by_callee: {}",
+        format_counts_by_callee(
+            &alloc_after_by_callee,
+            &crate::rewriter::stats::ALLOC_UNSAFE_CALLEES,
+        )
+    );
+    println!(
+        "box_new_before_by_callee: {}",
+        format_counts_by_callee(
+            &box_new_before_by_callee,
+            &crate::rewriter::stats::BOX_NEW_CALLEES,
+        )
+    );
+    println!(
+        "box_new_after_by_callee: {}",
+        format_counts_by_callee(
+            &box_new_after_by_callee,
+            &crate::rewriter::stats::BOX_NEW_CALLEES,
+        )
+    );
+    println!(
+        "raw_constructor_unsafe_before_by_callee: {}",
+        format_counts_by_callee(
+            &raw_unsafe_before_by_callee,
+            &crate::rewriter::stats::RAW_CONSTRUCTOR_UNSAFE_CALLEES,
+        )
+    );
+    println!(
+        "raw_constructor_unsafe_after_by_callee: {}",
+        format_counts_by_callee(
+            &raw_unsafe_after_by_callee,
+            &crate::rewriter::stats::RAW_CONSTRUCTOR_UNSAFE_CALLEES,
+        )
+    );
 }
 
 pub(super) fn run_ownership_case_with_box_candidates(

@@ -29,6 +29,7 @@ use crate::{
 
 mod collector;
 mod decision;
+pub(crate) mod stats;
 mod transform;
 
 #[cfg(test)]
@@ -47,6 +48,14 @@ pub struct Analysis {
     raw_mutability: bool,
     aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     offset_sign_result: OffsetSignResult,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RewriteOutput {
+    pub code: String,
+    pub bytemuck: bool,
+    pub slice_cursor: bool,
+    pub rewrite_stats: stats::RewriteStats,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,9 +94,18 @@ impl Default for Config {
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool, bool) {
+    let output = replace_local_borrows_with_stats(config, tcx);
+    (output.code, output.bytemuck, output.slice_cursor)
+}
+
+pub(crate) fn replace_local_borrows_with_stats(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+) -> RewriteOutput {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+    let before_metrics = stats::collect_call_metrics(&mut krate);
 
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
@@ -156,6 +174,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
+    let after_metrics = stats::collect_call_metrics(&mut krate);
+    let rewrite_stats = stats::build_rewrite_stats(before_metrics, after_metrics);
     let conflicts = visitor.take_conflicts();
     let conflicts_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/conflicts.md");
     if let Err(err) = decision::append_conflicts_to_file(&conflicts_path, &conflicts) {
@@ -170,7 +190,12 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         code.push_str(slice_cursor_mod_str());
     }
 
-    (code, visitor.bytemuck.get(), slice_cursor_used)
+    RewriteOutput {
+        code,
+        bytemuck: visitor.bytemuck.get(),
+        slice_cursor: slice_cursor_used,
+        rewrite_stats,
+    }
 }
 
 fn find_param_aliases<'tcx>(
