@@ -122,7 +122,9 @@ fn conservative<'tcx>(
                     if !body.args_iter().any(|a| a == local) {
                         let def_path_str = tcx.def_path_str(body_did);
                         #[cfg(debug_assertions)]
-                        eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
+                        if crate::analyses::logging::ownership_verbose() {
+                            eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
+                        }
                         output_params.remove(arg);
                         break;
                     }
@@ -176,9 +178,11 @@ fn iterate<'tcx>(
         if !aliases_non_params {
             let def_path_str = tcx.def_path_str(body_did);
             #[cfg(debug_assertions)]
-            eprintln!(
-                "@{def_path_str}: {arg:?} added because it aliases a transitive output position temporary"
-            );
+            if crate::analyses::logging::ownership_verbose() {
+                eprintln!(
+                    "@{def_path_str}: {arg:?} added because it aliases a transitive output position temporary"
+                );
+            }
             changed = changed || output_params.insert(arg);
         }
     }

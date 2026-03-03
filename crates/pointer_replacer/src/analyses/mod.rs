@@ -5,6 +5,7 @@ pub mod B02_tests;
 mod encoding;
 mod lattice;
 mod liveness;
+pub(crate) mod logging;
 mod mir;
 pub mod mir_variable_grouping;
 pub mod offset_sign;

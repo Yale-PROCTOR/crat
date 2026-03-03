@@ -14,6 +14,7 @@ use rustc_middle::{
 use self::state::{initial_inter_ctxt, initial_ssa_state, refine_state};
 use super::{AnalysisKind, Ownership, Precision, total_deref_level};
 use crate::analyses::{
+    logging::ownership_verbose,
     output_params::OutputParams,
     ownership::{
         CrateCtxt, Param,
@@ -155,11 +156,13 @@ fn solve_body<'tcx>(
 
     let mut rn = Renamer::new(body, ssa_state, crate_ctxt.tcx);
 
-    print!(
-        "Solving {} with precision {}... ",
-        crate_ctxt.tcx.def_path_str(body.source.def_id()),
-        std::cmp::min(precision, crate_ctxt.struct_ctxt.max_ptr_chased()),
-    );
+    if ownership_verbose() {
+        print!(
+            "Solving {} with precision {}... ",
+            crate_ctxt.tcx.def_path_str(body.source.def_id()),
+            std::cmp::min(precision, crate_ctxt.struct_ctxt.max_ptr_chased()),
+        );
+    }
 
     let mut infer_cx = InferCtxt::new(
         crate_ctxt,
@@ -177,13 +180,17 @@ fn solve_body<'tcx>(
 
     match database.solver.check() {
         z3::SatResult::Unsat => {
-            println!("\u{274C}");
+            if ownership_verbose() {
+                println!("\u{274C}");
+            }
             database.solver.pop(1);
             Ok((results, precision - 1))
         }
         z3::SatResult::Unknown => bail!("z3 status: unknown"),
         z3::SatResult::Sat => {
-            println!("\u{2705}");
+            if ownership_verbose() {
+                println!("\u{2705}");
+            }
             Ok((results, precision))
         }
     }
@@ -257,12 +264,14 @@ fn solve_crate(
     };
 
     let intermediate_results = (model, fn_locals, global_assumptions);
-    show_fn_sigs(
-        &intermediate_results.0,
-        &intermediate_results.1,
-        crate_ctxt.tcx,
-        crate_ctxt.fns(),
-    );
+    if ownership_verbose() {
+        show_fn_sigs(
+            &intermediate_results.0,
+            &intermediate_results.1,
+            crate_ctxt.tcx,
+            crate_ctxt.fns(),
+        );
+    }
 
     Ok(intermediate_results)
 }
