@@ -198,7 +198,7 @@ fn identify_union_uses(
     let mut union_uses: FxHashMap<DefId, UnionTypeUses> = FxHashMap::default();
     let mut instance_to_union_ty: FxHashMap<UnionMemoryInstance, DefId> = FxHashMap::default();
     let mut all_accesses: Vec<DetectedAccess> = Vec::new();
-    let union_instances: Vec<_> = result
+    let union_instances: Vec<UnionMemoryInstance> = result
         .union_offsets
         .keys()
         .copied()
@@ -223,12 +223,12 @@ fn identify_union_uses(
     }
 
     // Collect stage:
-    // - seed instance->type from local declarations
+    // - (union instance at seed function) -> type from local declarations
     // - collect accesses/hints from body traversal
     for def_id in target_fns {
         if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
             unreachable!(
-                "Expected function or assoc function, got {:?}",
+                "Expected function, got {:?}",
                 tcx.def_kind(def_id)
             );
         }
@@ -236,7 +236,7 @@ fn identify_union_uses(
             continue;
         }
 
-        _with_body(tcx, def_id, use_optimized_mir, |body| {
+        with_body(tcx, def_id, use_optimized_mir, |body| {
             for (local, decl) in body.local_decls.iter_enumerated() {
                 let Some(node) = result.var_nodes.get(&(def_id, local)) else {
                     continue;
@@ -255,7 +255,7 @@ fn identify_union_uses(
             }
         });
 
-        let (accesses, hints) = _with_body(tcx, def_id, use_optimized_mir, |body| {
+        let (accesses, hints) = with_body(tcx, def_id, use_optimized_mir, |body| {
             let mut collector =
                 BodyUnionAccessCollector::new(tcx, body, def_id, &result, &union_instances);
             collector.visit_body(body);
@@ -351,6 +351,7 @@ struct BodyUnionAccessCollector<'tcx, 'a> {
 
 impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
+        // to handle union init statement
         if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
             && let Some((union_ty, field)) = self.detect_union_init_field(*place, rvalue)
         {
@@ -737,7 +738,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
     }
 }
 
-fn _with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
+fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     use_optimized_mir: bool,
