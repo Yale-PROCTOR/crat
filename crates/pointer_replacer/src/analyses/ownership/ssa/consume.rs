@@ -3,7 +3,7 @@ use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
         BasicBlock, BasicBlockData, Body, CastKind, ClearCrossCrate, Local, LocalInfo, Location,
-        Place, ProjectionElem, Rvalue, TerminatorKind,
+        Place, ProjectionElem, Rvalue, TerminatorKind, VarDebugInfoContents,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     },
     ty::TyCtxt,
@@ -219,7 +219,31 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
         &body.local_decls,
     );
 
+    let mut user_visible_locals: SsoHashSet<Local> = SsoHashSet::default();
+    user_visible_locals.extend(body.var_debug_info.iter().filter_map(|info| {
+        let VarDebugInfoContents::Place(place) = &info.value else {
+            return None;
+        };
+        place.as_local()
+    }));
+
     let mut call_arg_temps: SsoHashSet<Local> = SsoHashSet::default();
+    let is_proxy_call_arg_local = |local: Local| {
+        // Exclude return place and formal parameters.
+        if local.index() <= body.arg_count {
+            return false;
+        }
+        // Exclude user-visible locals.
+        if user_visible_locals.contains(&local) {
+            return false;
+        }
+        // Exclude user bindings; only compiler-generated temporaries should be
+        // treated as call-arg proxies.
+        !matches!(
+            body.local_decls[local].local_info.as_ref(),
+            ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::User(_))
+        )
+    };
     for bb_data in body.basic_blocks.iter() {
         let Some(terminator) = &bb_data.terminator else {
             continue;
@@ -227,7 +251,8 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
         if let TerminatorKind::Call { args, .. } = &terminator.kind {
             call_arg_temps.extend(
                 args.iter()
-                    .filter_map(|arg| arg.node.place().and_then(|arg| arg.as_local())),
+                    .filter_map(|arg| arg.node.place().and_then(|arg| arg.as_local()))
+                    .filter(|&local| is_proxy_call_arg_local(local)),
             )
         }
     }

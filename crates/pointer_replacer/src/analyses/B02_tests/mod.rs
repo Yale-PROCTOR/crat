@@ -1,5 +1,10 @@
 #![allow(non_snake_case)]
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex, OnceLock,
+};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
 use rustc_middle::{
@@ -14,7 +19,7 @@ use crate::{
         ownership::{
             AnalysisKind, CrateCtxt, Ownership, Param,
             ssa::AnalysisResults,
-            whole_program::WholeProgramAnalysis,
+            whole_program::{WholeProgramAnalysis, WholeProgramResults},
         },
         type_qualifier::foster::mutability::mutability_analysis,
     },
@@ -51,9 +56,7 @@ fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     }
 }
 
-fn analyze_program<'tcx>(
-    program: &RustProgram<'tcx>,
-) -> crate::analyses::ownership::whole_program::WholeProgramResults<'tcx> {
+fn analyze_program<'tcx>(program: &RustProgram<'tcx>) -> WholeProgramResults<'tcx> {
     let mutability_result = mutability_analysis(program);
     let aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>> = FxHashMap::default();
     let output_params = compute_output_params(program, &mutability_result, &aliases);
@@ -245,7 +248,7 @@ pub(super) fn run_ownership_case_with_assertions(case_name: &str, code: &str) {
 
 fn collect_raw_ptr_local_ownership<'tcx>(
     program: &RustProgram<'tcx>,
-    results: &crate::analyses::ownership::whole_program::WholeProgramResults<'tcx>,
+    results: &WholeProgramResults<'tcx>,
 ) -> FxHashMap<(String, String), bool> {
     let mut by_scoped_name: FxHashMap<(String, String), bool> = FxHashMap::default();
     let solidified = results.solidify(program);
@@ -279,6 +282,308 @@ fn collect_raw_ptr_local_ownership<'tcx>(
     }
 
     by_scoped_name
+}
+
+#[derive(Default)]
+struct TotalB02Stats {
+    case_count: usize,
+    fn_count: usize,
+    precision_sum: usize,
+    precision_samples: usize,
+    precision_min: Option<u8>,
+    precision_max: Option<u8>,
+    raw_ptr_total: usize,
+    raw_ptr_owning: usize,
+    allocator_related_total: usize,
+    allocator_related_owning: usize,
+    checks_pos: usize,
+    checks_neg: usize,
+}
+
+const EXPECTED_B02_CASES: usize = 86;
+static B02_CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_B02_STATS: OnceLock<Mutex<TotalB02Stats>> = OnceLock::new();
+
+fn record_total_analysis_stats(
+    program: &RustProgram<'_>,
+    results: &WholeProgramResults<'_>,
+    by_scoped_name: &FxHashMap<(String, String), bool>,
+    owning_names: &[String],
+    allocator_related_candidates: &[String],
+    expected_box_candidates: &[String],
+    expected_non_candidates: &[String],
+) {
+    let precisions = program
+        .functions
+        .iter()
+        .map(|did| results.precision(&did.to_def_id()))
+        .collect::<Vec<_>>();
+    let fn_count = precisions.len();
+    let precision_sum = precisions.iter().map(|&p| p as usize).sum::<usize>();
+    let (precision_min, precision_max) = if precisions.is_empty() {
+        (0u8, 0u8)
+    } else {
+        let min = *precisions.iter().min().unwrap();
+        let max = *precisions.iter().max().unwrap();
+        (min, max)
+    };
+
+    let raw_ptr_total = by_scoped_name.len();
+    let raw_ptr_owning = owning_names.len();
+
+    let owning_set: FxHashSet<&str> = owning_names.iter().map(String::as_str).collect();
+    let alloc_total = allocator_related_candidates.len();
+    let alloc_owning = allocator_related_candidates
+        .iter()
+        .filter(|name| owning_set.contains(name.as_str()))
+        .count();
+
+    let stats_lock = TOTAL_B02_STATS.get_or_init(|| Mutex::new(TotalB02Stats::default()));
+    let mut stats = stats_lock.lock().expect("global B02 stats mutex poisoned");
+
+    stats.case_count += 1;
+    stats.fn_count += fn_count;
+    stats.precision_sum += precision_sum;
+    stats.precision_samples += fn_count;
+    if fn_count > 0 {
+        stats.precision_min = Some(match stats.precision_min {
+            Some(v) => v.min(precision_min),
+            None => precision_min,
+        });
+        stats.precision_max = Some(match stats.precision_max {
+            Some(v) => v.max(precision_max),
+            None => precision_max,
+        });
+    }
+    stats.raw_ptr_total += raw_ptr_total;
+    stats.raw_ptr_owning += raw_ptr_owning;
+    stats.allocator_related_total += alloc_total;
+    stats.allocator_related_owning += alloc_owning;
+    stats.checks_pos += expected_box_candidates.len();
+    stats.checks_neg += expected_non_candidates.len();
+
+    let processed = B02_CASE_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    if processed == EXPECTED_B02_CASES {
+        let precision_avg = if stats.precision_samples == 0 {
+            0.0
+        } else {
+            stats.precision_sum as f64 / stats.precision_samples as f64
+        };
+        println!(
+            "== B02 total stats == cases={}, fns={}, precision[min/avg/max]={}/{:.2}/{}, raw_ptrs[owning/total]={}/{}, allocator_related[owning/total]={}/{}, checks[pos/neg]={}/{}",
+            stats.case_count,
+            stats.fn_count,
+            stats.precision_min.unwrap_or(0),
+            precision_avg,
+            stats.precision_max.unwrap_or(0),
+            stats.raw_ptr_owning,
+            stats.raw_ptr_total,
+            stats.allocator_related_owning,
+            stats.allocator_related_total,
+            stats.checks_pos,
+            stats.checks_neg,
+        );
+    }
+}
+
+fn find_assignment_eq(stmt: &str) -> Option<usize> {
+    let bytes = stmt.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'=' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|idx| bytes[idx]);
+        let next = bytes.get(i + 1).copied();
+        let is_cmp = matches!(prev, Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>'))
+            || matches!(next, Some(b'='));
+        if !is_cmp {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_fn_name(line: &str) -> Option<String> {
+    let fn_idx = line.find("fn ")?;
+    let rest = &line[fn_idx + 3..];
+    let end = rest.find('(')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+fn parse_ptr_local_decl_name(stmt: &str) -> Option<String> {
+    let stmt = stmt.trim_start();
+    let rest = stmt.strip_prefix("let ")?;
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+
+    if !(rest.contains(": *mut") || rest.contains(":*mut")) {
+        return None;
+    }
+
+    let end = rest
+        .find(|c: char| c == ':' || c.is_whitespace() || c == '=')
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+fn is_simple_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn has_allocator_call(text: &str) -> bool {
+    fn is_ident_char(b: u8) -> bool {
+        b == b'_' || b.is_ascii_alphanumeric()
+    }
+
+    fn contains_direct_call(text: &str, callee: &str) -> bool {
+        let pattern = format!("{callee}(");
+        let mut offset = 0usize;
+        let bytes = text.as_bytes();
+
+        while let Some(pos) = text[offset..].find(&pattern) {
+            let idx = offset + pos;
+            let has_ident_prefix = idx > 0 && is_ident_char(bytes[idx - 1]);
+            if !has_ident_prefix {
+                return true;
+            }
+            offset = idx + 1;
+        }
+        false
+    }
+
+    ["malloc", "calloc", "realloc", "strdup"]
+        .iter()
+        .any(|callee| contains_direct_call(text, callee))
+}
+
+fn extract_allocator_related_ptr_locals(code: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    let mut brace_depth: i32 = 0;
+    let mut current_fn: Option<String> = None;
+    let mut fn_start_depth: i32 = 0;
+    let mut fn_body_started = false;
+
+    let mut ptr_locals_in_fn: FxHashSet<String> = FxHashSet::default();
+    let mut stmt_buf = String::new();
+
+    let flush_statement = |stmt: &str,
+                           current_fn: &Option<String>,
+                           ptr_locals_in_fn: &mut FxHashSet<String>,
+                           out: &mut Vec<(String, String)>| {
+        let stmt = stmt.replace('\n', " ");
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            return;
+        }
+
+        if let Some(local) = parse_ptr_local_decl_name(stmt) {
+            ptr_locals_in_fn.insert(local.clone());
+            if has_allocator_call(stmt) {
+                if let Some(fn_name) = current_fn {
+                    out.push((fn_name.clone(), local));
+                }
+            }
+        }
+
+        if !has_allocator_call(stmt) {
+            return;
+        }
+
+        let Some(eq_idx) = find_assignment_eq(stmt) else {
+            return;
+        };
+        let lhs = stmt[..eq_idx].trim();
+        let lhs = lhs.trim_start_matches(|c: char| c == '}' || c.is_whitespace());
+        let lhs = lhs
+            .rsplit(|c: char| c.is_whitespace() || c == '{' || c == '}')
+            .next()
+            .unwrap_or(lhs)
+            .trim();
+        if lhs.starts_with("let ") {
+            return;
+        }
+        if !is_simple_ident(lhs) {
+            return;
+        }
+        if let Some(fn_name) = current_fn {
+            out.push((fn_name.clone(), lhs.to_owned()));
+        }
+    };
+
+    for line in code.lines() {
+        if current_fn.is_none() {
+            if let Some(fn_name) = parse_fn_name(line) {
+                current_fn = Some(fn_name);
+                fn_start_depth = brace_depth;
+                fn_body_started = false;
+                ptr_locals_in_fn.clear();
+                stmt_buf.clear();
+            }
+        }
+
+        if current_fn.is_some() {
+            stmt_buf.push_str(line);
+            stmt_buf.push('\n');
+
+            while let Some(semi_idx) = stmt_buf.find(';') {
+                let stmt = stmt_buf[..semi_idx].to_owned();
+                flush_statement(&stmt, &current_fn, &mut ptr_locals_in_fn, &mut out);
+                let remainder = stmt_buf[semi_idx + 1..].to_owned();
+                stmt_buf = remainder;
+            }
+        }
+
+        for c in line.chars() {
+            match c {
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                _ => {}
+            }
+        }
+
+        if current_fn.is_some() && !fn_body_started && line.trim_end().ends_with(';') {
+            stmt_buf.clear();
+            ptr_locals_in_fn.clear();
+            current_fn = None;
+            fn_body_started = false;
+            continue;
+        }
+
+        if current_fn.is_some() && !fn_body_started && brace_depth > fn_start_depth {
+            fn_body_started = true;
+        }
+
+        if current_fn.is_some() && fn_body_started && brace_depth <= fn_start_depth {
+            if !stmt_buf.trim().is_empty() {
+                flush_statement(&stmt_buf, &current_fn, &mut ptr_locals_in_fn, &mut out);
+            }
+            stmt_buf.clear();
+            ptr_locals_in_fn.clear();
+            current_fn = None;
+            fn_body_started = false;
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub(super) fn run_ownership_case_with_box_candidates(
@@ -331,10 +636,48 @@ pub(super) fn run_ownership_case_with_box_candidates(
                 .collect::<Vec<_>>();
             matches.sort();
             matches.dedup();
-            matches
+                matches
         };
 
-        for &spec in expected_box_candidates {
+        let extracted_allocator_related = extract_allocator_related_ptr_locals(code);
+
+        let mut malloc_related_candidates = Vec::new();
+        for (fn_hint, local) in extracted_allocator_related {
+            let mut resolved = by_scoped_name
+                .keys()
+                .filter_map(|(function, candidate_local)| {
+                    (candidate_local == &local && function.ends_with(&fn_hint))
+                        .then_some(format!("{function}#{candidate_local}"))
+                })
+                .collect::<Vec<_>>();
+            resolved.sort();
+            resolved.dedup();
+            malloc_related_candidates.extend(resolved);
+        }
+        malloc_related_candidates.sort();
+        malloc_related_candidates.dedup();
+        let mut effective_expected_box_candidates =
+            expected_box_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        effective_expected_box_candidates.extend(malloc_related_candidates.iter().cloned());
+        effective_expected_box_candidates.sort();
+        effective_expected_box_candidates.dedup();
+        let mut effective_expected_non_candidates =
+            expected_non_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        effective_expected_non_candidates.sort();
+        effective_expected_non_candidates.dedup();
+
+        record_total_analysis_stats(
+            &program,
+            &results,
+            &by_scoped_name,
+            &owning_names,
+            &malloc_related_candidates,
+            &effective_expected_box_candidates,
+            &effective_expected_non_candidates,
+        );
+
+        for spec in &effective_expected_box_candidates {
+            let spec = spec.as_str();
             let matches = resolve_spec(spec);
             let is_scoped = spec.contains('#');
             if !is_scoped && matches.len() > 1 {
@@ -367,7 +710,8 @@ pub(super) fn run_ownership_case_with_box_candidates(
             }
         }
 
-        for &spec in expected_non_candidates {
+        for spec in &effective_expected_non_candidates {
+            let spec = spec.as_str();
             let matches = resolve_spec(spec);
             let is_scoped = spec.contains('#');
             if !is_scoped && matches.len() > 1 {

@@ -6,9 +6,10 @@ use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::{
     Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind,
-    TerminatorKind,
+    TerminatorKind, VarDebugInfoContents, RETURN_PLACE,
     visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
 };
+use rustc_middle::ty::TyKind;
 
 use super::{Ownership, whole_program::WholeProgramResults};
 use crate::{
@@ -374,6 +375,10 @@ impl<'tcx> WholeProgramResults<'tcx> {
                 }
             }
 
+            // Fallback: if a user-visible raw-pointer local is derived from allocator
+            // results and the allocation root is either freed or returned, treat it as owning.
+            apply_allocator_owner_fallback(body, program.tcx, &mut locals);
+
             for local in locals {
                 vars.push_inner(next);
                 next = next + local.len();
@@ -394,6 +399,223 @@ impl<'tcx> WholeProgramResults<'tcx> {
         sanity_check(self, &solidified, program, &fns);
 
         solidified
+    }
+}
+
+fn rhs_local_from_rvalue<'tcx>(rvalue: &Rvalue<'tcx>) -> Option<Local> {
+    match rvalue {
+        Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+        | Rvalue::WrapUnsafeBinder(Operand::Copy(place) | Operand::Move(place), _) => {
+            place.as_local()
+        }
+        Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => place.as_local(),
+        Rvalue::CopyForDeref(place) => place.as_local(),
+        _ => None,
+    }
+}
+
+fn allocator_kind<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    func: &Operand<'tcx>,
+) -> Option<AllocatorCallKind> {
+    let func = func.constant()?;
+    let TyKind::FnDef(def_id, _) = func.ty().kind() else {
+        return None;
+    };
+    let symbol = tcx.item_name(*def_id);
+    match symbol.as_str() {
+        "malloc" | "calloc" | "realloc" | "strdup" => Some(AllocatorCallKind::Alloc),
+        "free" => Some(AllocatorCallKind::Free),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AllocatorCallKind {
+    Alloc,
+    Free,
+}
+
+fn apply_allocator_owner_fallback<'tcx>(
+    body: &Body<'tcx>,
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    locals: &mut [smallvec::SmallVec<[Ownership; 3]>],
+) {
+    let mut user_visible_locals: FxHashSet<Local> = FxHashSet::default();
+    user_visible_locals.extend(body.var_debug_info.iter().filter_map(|info| {
+        let VarDebugInfoContents::Place(place) = &info.value else {
+            return None;
+        };
+        place.as_local()
+    }));
+
+    let mut origins = IndexVec::from_elem_n(FxHashSet::<Local>::default(), body.local_decls.len());
+
+    // Grow allocator-root provenance through local copy/cast chains.
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for bb_data in body.basic_blocks.iter() {
+            for statement in &bb_data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let Some(lhs_local) = lhs.as_local() else {
+                    continue;
+                };
+
+                let Some(rhs_local) = rhs_local_from_rvalue(rvalue) else {
+                    continue;
+                };
+
+                let rhs_roots = origins[rhs_local].clone();
+                if !rhs_roots.is_empty() {
+                    let before = origins[lhs_local].len();
+                    origins[lhs_local].extend(rhs_roots);
+                    if origins[lhs_local].len() != before {
+                        changed = true;
+                    }
+                }
+            }
+
+            let Some(terminator) = &bb_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                func,
+                destination,
+                ..
+            } = &terminator.kind
+            else {
+                continue;
+            };
+            if !matches!(allocator_kind(tcx, func), Some(AllocatorCallKind::Alloc)) {
+                continue;
+            }
+            let Some(dest_local) = destination.as_local() else {
+                continue;
+            };
+            if origins[dest_local].insert(dest_local) {
+                changed = true;
+            }
+        }
+    }
+
+    // Track locals that can receive pointer values with no allocator-root provenance.
+    // If such flow reaches a local, do not promote it via fallback.
+    let mut has_non_root_flow = IndexVec::from_elem_n(false, body.local_decls.len());
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb_data in body.basic_blocks.iter() {
+            for statement in &bb_data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let Some(lhs_local) = lhs.as_local() else {
+                    continue;
+                };
+                if !body.local_decls[lhs_local].ty.is_raw_ptr() {
+                    continue;
+                }
+
+                let Some(rhs_local) = rhs_local_from_rvalue(rvalue) else {
+                    continue;
+                };
+
+                let rhs_is_external_provenance = rhs_local.index() <= body.arg_count
+                    || user_visible_locals.contains(&rhs_local)
+                    || matches!(
+                        body.local_decls[rhs_local].local_info.as_ref(),
+                        ClearCrossCrate::Set(local_info)
+                            if matches!(local_info.as_ref(), LocalInfo::User(_))
+                    );
+
+                let rhs_non_root = has_non_root_flow[rhs_local]
+                    || (origins[rhs_local].is_empty() && rhs_is_external_provenance);
+                if rhs_non_root && !has_non_root_flow[lhs_local] {
+                    has_non_root_flow[lhs_local] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    let mut promoted_roots: FxHashSet<Local> = FxHashSet::default();
+
+    for bb_data in body.basic_blocks.iter() {
+        let Some(terminator) = &bb_data.terminator else {
+            continue;
+        };
+
+        match &terminator.kind {
+            TerminatorKind::Call { func, args, .. } => {
+                let is_allocator_free =
+                    matches!(allocator_kind(tcx, func), Some(AllocatorCallKind::Free));
+
+                let is_sink_like_wrapper = if let Some(func_const) = func.constant() {
+                    if let TyKind::FnDef(def_id, _) = func_const.ty().kind() {
+                        let symbol = tcx.item_name(*def_id);
+                        let name = symbol.as_str();
+                        name.contains("free")
+                            || name.contains("destroy")
+                            || name.contains("cleanup")
+                            || name.contains("dealloc")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !(is_allocator_free || is_sink_like_wrapper) {
+                    continue;
+                }
+
+                if let Some(arg_local) = args
+                    .first()
+                    .and_then(|arg| arg.node.place())
+                    .and_then(|place| place.as_local())
+                {
+                    promoted_roots.extend(origins[arg_local].iter().copied());
+                }
+            }
+            TerminatorKind::Return => {
+                promoted_roots.extend(origins[RETURN_PLACE].iter().copied());
+            }
+            _ => {}
+        }
+    }
+
+    if promoted_roots.is_empty() {
+        return;
+    }
+
+    for (local, local_decl) in body.local_decls.iter_enumerated() {
+        if !local_decl.ty.is_raw_ptr() {
+            continue;
+        }
+        if !user_visible_locals.contains(&local)
+            && !matches!(
+                local_decl.local_info.as_ref(),
+                ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::User(_))
+            )
+        {
+            continue;
+        }
+        if locals[local.index()].is_empty() {
+            continue;
+        }
+        if has_non_root_flow[local] {
+            continue;
+        }
+        if origins[local]
+            .iter()
+            .any(|root| promoted_roots.contains(root))
+        {
+            locals[local.index()][0] = Ownership::Owning;
+        }
     }
 }
 

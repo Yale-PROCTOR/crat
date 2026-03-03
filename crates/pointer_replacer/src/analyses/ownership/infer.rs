@@ -64,17 +64,59 @@ impl<'a> FnResults<'a> for FnSummary {
         let consume_chain = &self.ssa_state.consume_chain;
         let consumes = consume_chain.of_location(location);
         let consume = consumes.get_by_key(&local)?;
-        Some(consume.map_valid(|ssa_idx| self.fn_body_sig[local][ssa_idx].clone()))
+        Some(consume.map_valid(|ssa_idx| {
+            self.fn_body_sig[local]
+                .get(ssa_idx)
+                .cloned()
+                .or_else(|| {
+                    tracing::debug!(
+                        "missing local sig for {:?} at {:?} with ssa {:?}; falling back to last known sig",
+                        local,
+                        location,
+                        ssa_idx
+                    );
+                    self.fn_body_sig[local].raw.last().cloned()
+                })
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        "missing all local sigs for {:?} at {:?}; returning empty fallback range",
+                        local,
+                        location
+                    );
+                    Var::MIN..Var::MIN
+                })
+        }))
     }
 
     #[inline]
     fn location_results(&'a self, location: Location) -> Self::LocationResults {
         let consume_chain = &self.ssa_state.consume_chain;
         let consumes = consume_chain.of_location(location);
-        consumes.iter().map(|(local, consume)| {
+        consumes.iter().map(move |(local, consume)| {
             (
                 *local,
-                consume.map_valid(|ssa_idx| self.fn_body_sig[*local][ssa_idx].clone()),
+                consume.map_valid(|ssa_idx| {
+                    self.fn_body_sig[*local]
+                        .get(ssa_idx)
+                        .cloned()
+                        .or_else(|| {
+                            tracing::debug!(
+                                "missing local sig for {:?} at {:?} with ssa {:?}; falling back to last known sig",
+                                local,
+                                location,
+                                ssa_idx
+                            );
+                            self.fn_body_sig[*local].raw.last().cloned()
+                        })
+                        .unwrap_or_else(|| {
+                            tracing::debug!(
+                                "missing all local sigs for {:?} at {:?}; returning empty fallback range",
+                                local,
+                                location
+                            );
+                            Var::MIN..Var::MIN
+                        })
+                }),
             )
         })
     }
@@ -370,7 +412,11 @@ where
         arg: Consume<Self::LocalSig>,
         is_ref: bool,
     ) {
-        infer_cx.call_args.push((temp, (arg, is_ref)))
+        if let Some(existing) = infer_cx.call_args.get_by_key_mut(&temp) {
+            *existing = (arg, is_ref);
+        } else {
+            infer_cx.call_args.push((temp, (arg, is_ref)));
+        }
     }
 
     #[inline]

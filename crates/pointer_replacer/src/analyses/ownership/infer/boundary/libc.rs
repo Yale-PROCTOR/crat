@@ -28,6 +28,7 @@ where
             "malloc" => return self.call_malloc(destination),
             "realloc" => return self.call_realloc(destination, args),
             "calloc" => return self.call_calloc(destination),
+            "strdup" => return self.call_strdup(destination),
             "free" => return self.call_free(args),
             "memset" => return self.call_memset(destination, args, callee),
             _ => {}
@@ -42,6 +43,11 @@ where
     }
 
     fn call_calloc(&mut self, destination: Option<Consume<Range<Var>>>) {
+        let Some(destination) = destination else { return };
+        <Analysis as InferMode>::source(self, destination);
+    }
+
+    fn call_strdup(&mut self, destination: Option<Consume<Range<Var>>>) {
         let Some(destination) = destination else { return };
         <Analysis as InferMode>::source(self, destination);
     }
