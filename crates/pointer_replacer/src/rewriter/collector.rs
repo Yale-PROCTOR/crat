@@ -7,14 +7,23 @@ use rustc_hir::{
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
-use super::{Analysis, decision::PtrKind};
-use crate::{rewriter::decision::DecisionMaker, utils::rustc::RustProgram};
+use super::{
+    Analysis,
+    decision::{DecisionConflict, DecisionMaker, PtrKind},
+};
+use crate::utils::rustc::RustProgram;
+
+pub struct CollectDiffsResult {
+    pub ptr_kinds: FxHashMap<HirId, PtrKind>,
+    pub conflicts: Vec<DecisionConflict>,
+}
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
-) -> FxHashMap<HirId, PtrKind> {
+) -> CollectDiffsResult {
     let mut ptr_kinds = FxHashMap::default();
+    let mut conflicts = Vec::new();
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
 
@@ -30,10 +39,8 @@ pub fn collect_diffs<'tcx>(
             .map(|(k, v)| (v, k))
             .collect();
 
-        let body = &*rust_program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(did)
-            .borrow();
+        let mir_body = rust_program.tcx.mir_drops_elaborated_and_const_checked(*did);
+        let body = mir_body.borrow();
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
         let input_skip_len = rust_program
@@ -53,7 +60,11 @@ pub fn collect_diffs<'tcx>(
         // skip inputs if used as fn ptr
         {
             let aliases = aliases.and_then(|aliases| aliases.get(&local));
-            if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
+            let (kind, conflict) = decision_maker.decide(local, decl, aliases);
+            if let Some(conflict) = conflict {
+                conflicts.push(conflict);
+            }
+            if let Some(ptr_kind) = kind
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
                 // Future policy knob (Step 2): selectively downgrade cursor params.
@@ -67,7 +78,10 @@ pub fn collect_diffs<'tcx>(
         }
     }
 
-    ptr_kinds
+    CollectDiffsResult {
+        ptr_kinds,
+        conflicts,
+    }
 }
 
 pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {

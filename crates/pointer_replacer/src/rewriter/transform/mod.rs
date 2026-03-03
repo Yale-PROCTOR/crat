@@ -19,7 +19,7 @@ use utils::{
 use super::{
     Analysis,
     collector::collect_diffs,
-    decision::{PtrKind, SigDecisions},
+    decision::{DecisionConflict, PtrKind, SigDecisions},
 };
 use crate::utils::rustc::RustProgram;
 
@@ -28,6 +28,8 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     ast_to_hir: AstToHir,
+    conflicts: Vec<DecisionConflict>,
+    raw_mutability: bool,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
 }
@@ -39,10 +41,8 @@ impl MutVisitor for TransformVisitor<'_> {
             ItemKind::Impl(_) => return,
             ItemKind::Fn(box fn_item) => {
                 let def_id = self.ast_to_hir.global_map[&node_id];
-                let mir_body = self
-                    .tcx
-                    .mir_drops_elaborated_and_const_checked(def_id)
-                    .borrow();
+                let mir_body = self.tcx.mir_drops_elaborated_and_const_checked(def_id);
+                let mir_body = mir_body.borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
                 for ((local_decl, input_dec), param) in mir_body
@@ -52,61 +52,91 @@ impl MutVisitor for TransformVisitor<'_> {
                     .zip(&sig_dec.input_decs)
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
-                    match input_dec {
-                        Some(PtrKind::OptRef(m)) => {
-                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
-                                        ty = local_decl.ty
-                                    )
-                                });
-                            *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
+                    let Some(input_dec) = *input_dec else { continue };
+                    let (inner_ty, orig_m) =
+                        unwrap_ptr_from_mir_ty(local_decl.ty).unwrap_or_else(|| {
+                        panic!(
+                            "Expected pointer type, got {ty:?} in {local_decl:?}",
+                            ty = local_decl.ty
+                        )
+                    });
+                    let mut mapped_dec = self.normalize_slice_kind(input_dec, inner_ty);
+                    if !orig_m.is_mut() {
+                        mapped_dec = mapped_dec.with_mut(false);
+                    } else if !self.raw_mutability {
+                        mapped_dec = mapped_dec.with_mut(orig_m.is_mut());
+                    }
+
+                    match mapped_dec {
+                        PtrKind::Move(_) => {
+                            *param.ty = mk_move_ty(inner_ty, self.tcx);
                             if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
-                                binding_mode.1 = Mutability::Mut; // TODO: is this precise?
+                                binding_mode.1 = Mutability::Mut;
                             }
                         }
-                        Some(PtrKind::Slice(m)) => {
-                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
-                                        ty = local_decl.ty
-                                    )
-                                });
-                            *param.ty = mk_slice_ty(inner_ty, *m, self.tcx);
+                        PtrKind::OptRef(m) => {
+                            *param.ty = mk_opt_ref_ty(inner_ty, m, self.tcx);
+                            if let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind {
+                                binding_mode.1 = Mutability::Mut;
+                            }
                         }
-                        Some(PtrKind::Raw(m)) => {
-                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
-                                        ty = local_decl.ty
-                                    )
-                                });
-                            *param.ty = mk_raw_ptr_ty(inner_ty, *m, self.tcx);
+                        PtrKind::Slice(m) => {
+                            *param.ty = mk_slice_ty(inner_ty, m, self.tcx);
+                            if m
+                                && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind
+                            {
+                                binding_mode.1 = Mutability::Mut;
+                            }
                         }
-                        Some(PtrKind::SliceCursor(m)) => {
-                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
-                                        ty = local_decl.ty
-                                    )
-                                });
-                            *param.ty = mk_cursor_ty(inner_ty, *m, self.tcx);
+                        PtrKind::Raw(m) => {
+                            *param.ty = mk_raw_ptr_ty(inner_ty, m, self.tcx);
+                        }
+                        PtrKind::SliceCursor(m) => {
+                            *param.ty = mk_cursor_ty(inner_ty, m, self.tcx);
                             self.slice_cursor.set(true);
+                            if m
+                                && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind
+                            {
+                                binding_mode.1 = Mutability::Mut;
+                            }
                         }
-                        None => continue,
+                    }
+
+                    if let Some(hir_param) = self.ast_to_hir.get_param(param.id, self.tcx)
+                        && let hir::PatKind::Binding(_, hir_id, _, _) = hir_param.pat.kind
+                    {
+                        self.ptr_kinds.insert(hir_id, mapped_dec);
                     }
                 }
 
-                if let Some(PtrKind::Raw(m)) = sig_dec.output_dec {
+                if let Some(output_dec) = sig_dec.output_dec {
                     let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
                     if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty)
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
-                        *ret_ty = P(mk_raw_ptr_ty(inner_ty, m, self.tcx));
+                        let mut output_dec = output_dec;
+                        if let Some((_, orig_m)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
+                            if !orig_m.is_mut() {
+                                output_dec = output_dec.with_mut(false);
+                            } else if !self.raw_mutability {
+                                output_dec = output_dec.with_mut(orig_m.is_mut());
+                            }
+                        }
+
+                        *ret_ty = P(match output_dec {
+                            PtrKind::Move(_) => mk_move_ty(inner_ty, self.tcx),
+                            PtrKind::Raw(m) => mk_raw_ptr_ty(inner_ty, m, self.tcx),
+                            _ => (**ret_ty).clone(),
+                        });
+
+                        if let Some(body) = fn_item.body.as_mut()
+                            && let Some(last_stmt) = body.stmts.last_mut()
+                            && let StmtKind::Expr(tail_expr) = &mut last_stmt.kind
+                            && !matches!(tail_expr.kind, ExprKind::Ret(_))
+                            && let Some(hir_tail_expr) = self.ast_to_hir.get_expr(tail_expr.id, self.tcx)
+                        {
+                            self.transform_rhs(tail_expr.as_mut(), hir_tail_expr, output_dec);
+                        }
                     }
                 }
             }
@@ -153,13 +183,23 @@ impl MutVisitor for TransformVisitor<'_> {
 
         if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-            && let Some(lhs_kind) = self.ptr_kinds.get(&hir_id).copied()
+            && let Some(mut lhs_kind) = self.ptr_kinds.get(&hir_id).copied()
         {
             let typeck = self.tcx.typeck(hir_id.owner);
             let lhs_ty = typeck.node_type(hir_id);
-            let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+            let (lhs_inner_ty, orig_m) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+            lhs_kind = self.normalize_slice_kind(lhs_kind, lhs_inner_ty);
+            if !orig_m.is_mut() {
+                lhs_kind = lhs_kind.with_mut(false);
+            } else if !self.raw_mutability {
+                lhs_kind = lhs_kind.with_mut(orig_m.is_mut());
+            }
+            self.ptr_kinds.insert(hir_id, lhs_kind);
 
             match lhs_kind {
+                PtrKind::Move(_) => {
+                    local.ty = Some(P(mk_move_ty(lhs_inner_ty, self.tcx)));
+                }
                 PtrKind::OptRef(m) => {
                     local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
                 }
@@ -173,6 +213,19 @@ impl MutVisitor for TransformVisitor<'_> {
                     local.ty = Some(P(mk_cursor_ty(lhs_inner_ty, m, self.tcx)));
                     self.slice_cursor.set(true);
                 }
+            }
+
+            if matches!(
+                lhs_kind,
+                PtrKind::Move(_)
+                    | PtrKind::OptRef(_)
+                    | PtrKind::Slice(true)
+                    | PtrKind::SliceCursor(true)
+            )
+                && let PatKind::Ident(binding_mode, ..) = &mut local.pat.kind
+            {
+                // Rewritten mutable pointer forms use mutable receiver methods.
+                binding_mode.1 = Mutability::Mut;
             }
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
@@ -226,7 +279,7 @@ impl MutVisitor for TransformVisitor<'_> {
                         }
                         self.transform_rhs(rhs, hir_rhs, lhs_kind);
                     }
-                    PtrKind::Slice(_) | PtrKind::OptRef(_) | PtrKind::Raw(_) => {
+                    PtrKind::Slice(_) | PtrKind::OptRef(_) | PtrKind::Raw(_) | PtrKind::Move(_) => {
                         self.transform_rhs(rhs, hir_rhs, lhs_kind);
                     }
                 }
@@ -247,6 +300,28 @@ impl MutVisitor for TransformVisitor<'_> {
                 let hir::ExprKind::Binary(_, hir_l, hir_r) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
+
+                // Null-style comparisons on rewritten non-raw pointers become
+                // `is_none` / `is_empty` checks.
+                if matches!(bin_op.node, BinOpKind::Eq | BinOpKind::Ne) {
+                    let is_eq = matches!(bin_op.node, BinOpKind::Eq);
+                    let replacement = {
+                        let l_is_zero = is_zero_literal_expr(l);
+                        let r_is_zero = is_zero_literal_expr(r);
+                        if l_is_zero {
+                            self.non_raw_null_cmp_rewrite(r, is_eq)
+                        } else if r_is_zero {
+                            self.non_raw_null_cmp_rewrite(l, is_eq)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(new_expr) = replacement {
+                        *expr = new_expr;
+                        return;
+                    }
+                }
+
                 let ty = typeck.expr_ty(hir_l);
                 if let Some((_, m)) = unwrap_ptr_from_mir_ty(ty) {
                     let kind = PtrKind::Raw(m.is_mut());
@@ -255,7 +330,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
             }
             ExprKind::Call(_, args) => {
-                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+                    return;
+                };
                 let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
@@ -278,11 +355,25 @@ impl MutVisitor for TransformVisitor<'_> {
                         .unwrap_or(PtrKind::Raw(
                             self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
                         ));
+                    let param_kind = match param_kind {
+                        PtrKind::Move(_) => PtrKind::Raw(m.is_mut()),
+                        other => other,
+                    };
+                    let param_kind = if !m.is_mut() {
+                        param_kind.with_mut(false)
+                    } else if self.raw_mutability {
+                        param_kind
+                    } else {
+                        param_kind.with_mut(m.is_mut())
+                    };
+                    let (inner_ty, _) = some_or!(unwrap_ptr_from_mir_ty(ty), continue);
+                    let param_kind = self.normalize_slice_kind(param_kind, inner_ty);
 
                     self.transform_rhs(arg, harg, param_kind);
                 }
 
                 hoist_opt_ref_borrow(expr);
+                hoist_mut_call_arg_conflicts(expr);
             }
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "is_null" =>
@@ -292,7 +383,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     && let Some(ptr_kind) = self.ptr_kinds.get(&hir_id)
                 {
                     match ptr_kind {
-                        PtrKind::OptRef(_) => {
+                        PtrKind::Move(_) | PtrKind::OptRef(_) => {
                             seg.ident.name = Symbol::intern("is_none");
                         }
                         PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
@@ -309,10 +400,17 @@ impl MutVisitor for TransformVisitor<'_> {
                 ..
             }) if seg.ident.name.as_str() == "offset_from" => {
                 let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx).unwrap();
-                self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(true)));
+                let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+                let recv_mut = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_receiver))
+                    .map(|(_, m)| m.is_mut())
+                    .unwrap_or(true);
+                self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(recv_mut)));
                 let [arg] = &mut args[..] else { panic!() };
                 let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx).unwrap();
-                self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
+                let arg_mut = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_arg))
+                    .map(|(_, m)| m.is_mut())
+                    .unwrap_or(true);
+                self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(arg_mut)));
             }
             ExprKind::Ret(Some(ret)) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
@@ -326,17 +424,24 @@ impl MutVisitor for TransformVisitor<'_> {
                     .skip_binder();
                 if let ty::TyKind::RawPtr(_, m) = sig.output().kind() {
                     let owner_did = hir_ret.hir_id.owner.def_id;
-                    let kind = self
+                    let mut kind = self
                         .sig_decs
                         .data
                         .get(&owner_did)
                         .and_then(|sd| sd.output_dec)
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
+                    if !m.is_mut() {
+                        kind = kind.with_mut(false);
+                    } else if !self.raw_mutability {
+                        kind = kind.with_mut(m.is_mut());
+                    }
                     self.transform_rhs(ret, hir_ret, kind);
                 }
             }
             ExprKind::Unary(UnOp::Deref, e) => {
-                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+                    return;
+                };
                 let hir::ExprKind::Unary(UnOp::Deref, hir_e) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
@@ -366,11 +471,30 @@ impl MutVisitor for TransformVisitor<'_> {
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
-                            PtrKind::OptRef(_) => {
+                            PtrKind::Move(_) | PtrKind::OptRef(_) => {
                                 **e = utils::expr!("{}.unwrap()", pprust::expr_to_string(e));
                             }
                             PtrKind::Slice(_) => {
-                                *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
+                                let e_no_cast = unwrap_cast_and_paren(e);
+                                if let ExprKind::AddrOf(BorrowKind::Ref, _, inner) = &e_no_cast.kind
+                                    && {
+                                        let inner_unparen = unwrap_paren(inner);
+                                        !(matches!(inner_unparen.kind, ExprKind::Path(_, _))
+                                            && self.hir_id_of_path(inner_unparen.id).is_none())
+                                    }
+                                    && !is_range_index_expr(unwrap_paren(inner))
+                                    && !self
+                                        .hir_id_of_path(unwrap_paren(inner).id)
+                                        .and_then(|hir_id| self.ptr_kinds.get(&hir_id).copied())
+                                        .is_some_and(|k| {
+                                            matches!(k, PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                                        })
+                                {
+                                    // `*(&mut x)` / `*(&x)` => `x`
+                                    *expr = (*unwrap_paren(inner)).clone();
+                                } else {
+                                    *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
+                                }
                             }
                             PtrKind::SliceCursor(_) => {
                                 *expr = utils::expr!("({})[0 as usize]", pprust::expr_to_string(e));
@@ -397,16 +521,24 @@ impl<'tcx> TransformVisitor<'tcx> {
         ast_to_hir: AstToHir,
     ) -> TransformVisitor<'tcx> {
         let sig_decs = SigDecisions::new(rust_program, analysis); // TODO: Move outside
-        let ptr_kinds = collect_diffs(rust_program, analysis); // TODO: Move outside
+        let mut conflicts = sig_decs.conflicts.clone();
+        let collect_result = collect_diffs(rust_program, analysis); // TODO: Move outside
+        conflicts.extend(collect_result.conflicts);
 
         TransformVisitor {
             tcx: rust_program.tcx,
             sig_decs,
-            ptr_kinds,
+            ptr_kinds: collect_result.ptr_kinds,
             ast_to_hir,
+            conflicts,
+            raw_mutability: analysis.raw_mutability,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
+    }
+
+    pub fn take_conflicts(&mut self) -> Vec<DecisionConflict> {
+        std::mem::take(&mut self.conflicts)
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -414,6 +546,53 @@ impl<'tcx> TransformVisitor<'tcx> {
         let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_rhs.kind else { return None };
         let Res::Local(hir_id) = path.res else { return None };
         Some(hir_id)
+    }
+
+    fn non_raw_null_cmp_rewrite(&self, ptr_expr: &Expr, is_eq: bool) -> Option<Expr> {
+        let ptr_expr = unwrap_cast_and_paren(ptr_expr);
+        let hir_id = match self.hir_id_of_path(ptr_expr.id) {
+            Some(hir_id) => hir_id,
+            None => {
+                // Some transformed path nodes no longer map to HIR; keep this narrow.
+                if let ExprKind::Path(_, _) = ptr_expr.kind
+                    && pprust::expr_to_string(ptr_expr) == "str"
+                {
+                    let pred = format!("({}).is_empty()", pprust::expr_to_string(ptr_expr));
+                    let rewritten = if is_eq { pred } else { format!("!({pred})") };
+                    return Some(utils::expr!("{}", rewritten));
+                }
+                return None;
+            }
+        };
+        let ptr_kind = match self.ptr_kinds.get(&hir_id).copied() {
+            Some(kind) => kind,
+            None => return None,
+        };
+        let pred = match ptr_kind {
+            PtrKind::Move(_) | PtrKind::OptRef(_) => {
+                format!("({}).is_none()", pprust::expr_to_string(ptr_expr))
+            }
+            PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                format!("({}).is_empty()", pprust::expr_to_string(ptr_expr))
+            }
+            PtrKind::Raw(_) => return None,
+        };
+        let rewritten = if is_eq { pred } else { format!("!({pred})") };
+        Some(utils::expr!("{}", rewritten))
+    }
+
+    fn normalize_slice_kind(&self, kind: PtrKind, inner_ty: ty::Ty<'tcx>) -> PtrKind {
+        match kind {
+            PtrKind::SliceCursor(m) => PtrKind::Raw(m),
+            PtrKind::Slice(m) if Self::prefer_raw_over_slice(inner_ty) => {
+                PtrKind::Raw(m)
+            }
+            other => other,
+        }
+    }
+
+    fn prefer_raw_over_slice(inner_ty: ty::Ty<'tcx>) -> bool {
+        matches!(inner_ty.kind(), ty::TyKind::Foreign(..))
     }
 
     fn transform_rhs(
@@ -426,6 +605,7 @@ impl<'tcx> TransformVisitor<'tcx> {
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
+        let had_cast_or_paren = matches!(ptr.kind, ExprKind::Cast(..) | ExprKind::Paren(_));
         let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
         let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_ptr));
 
@@ -453,6 +633,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 self.transform_ptr(f, hir_f, ctx)
             };
             assert_eq!(kind1, kind2);
+            if !matches!(kind1, PtrKind::Raw(_)) && had_cast_or_paren {
+                *ptr = (*e).clone();
+            }
             return kind1;
         }
 
@@ -463,13 +646,20 @@ impl<'tcx> TransformVisitor<'tcx> {
             let StmtKind::Expr(inner) = &mut block.stmts.last_mut().unwrap().kind else {
                 panic!("{}", pprust::expr_to_string(e));
             };
-            return self.transform_ptr(inner, hir_block.expr.unwrap(), ctx);
+            let kind = self.transform_ptr(inner, hir_block.expr.unwrap(), ctx);
+            if !matches!(kind, PtrKind::Raw(_)) && had_cast_or_paren {
+                *ptr = (*e).clone();
+            }
+            return kind;
         }
 
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
-        let mut pe = self
-            .ptr_expr(e, hir_e)
-            .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+        let Some(mut pe) = self.ptr_expr(e, hir_e) else {
+            return match ctx {
+                PtrCtx::Rhs(kind) => kind,
+                PtrCtx::Deref(m) => PtrKind::Raw(m),
+            };
+        };
 
         if pe.is_zero() {
             // rhs_ty will be `usize`, not a pointer, so we early return here
@@ -494,6 +684,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                     *ptr = utils::expr!("None");
                     return PtrKind::OptRef(m);
+                }
+                PtrCtx::Rhs(PtrKind::Move(m)) => {
+                    *ptr = utils::expr!("None");
+                    return PtrKind::Move(m);
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     *ptr = utils::expr!("std::ptr::null{}()", if m { "_mut" } else { "" });
@@ -566,6 +760,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let m = match ctx {
                     PtrCtx::Rhs(PtrKind::Raw(m))
                     | PtrCtx::Rhs(PtrKind::OptRef(m))
+                    | PtrCtx::Rhs(PtrKind::Move(m))
                     | PtrCtx::Rhs(PtrKind::Slice(m))
                     | PtrCtx::Rhs(PtrKind::SliceCursor(m))
                     | PtrCtx::Deref(m) => m,
@@ -593,11 +788,23 @@ impl<'tcx> TransformVisitor<'tcx> {
                             from_ty = to_ty;
                         }
                         PtrExprProj::Offset(offset) => {
-                            result = utils::expr!(
-                                "({})[({}) as usize..]",
-                                pprust::expr_to_string(&result),
-                                pprust::expr_to_string(offset),
-                            );
+                            result = if matches!(
+                                ctx,
+                                PtrCtx::Rhs(PtrKind::Slice(_))
+                                    | PtrCtx::Rhs(PtrKind::SliceCursor(_))
+                            ) {
+                                utils::expr!(
+                                    "({})[({}) as usize..]",
+                                    pprust::expr_to_string(&result),
+                                    pprust::expr_to_string(offset),
+                                )
+                            } else {
+                                utils::expr!(
+                                    "({})[({}) as usize]",
+                                    pprust::expr_to_string(&result),
+                                    pprust::expr_to_string(offset),
+                                )
+                            };
                         }
                         // Complex arithmetic or cast-to-usize: leave as raw
                         _ => return PtrKind::Raw(m),
@@ -638,6 +845,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                             def_id,
                         );
                         return PtrKind::OptRef(m);
+                    }
+                    PtrCtx::Rhs(PtrKind::Move(_m)) => {
+                        // iteration-1: preserve raw/slice semantics in projected addr_of paths
+                        let (_, m_lhs) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+                        *ptr = self.raw_from_slice_or_cursor(
+                            &result,
+                            true,
+                            m_lhs.is_mut(),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::Raw(true);
                     }
                     PtrCtx::Rhs(PtrKind::Raw(m)) => {
                         let (_, m_lhs) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
@@ -703,6 +922,16 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                     }
                     return PtrKind::OptRef(m);
+                }
+                PtrCtx::Rhs(PtrKind::Move(_m)) => {
+                    // Avoid introducing unsound conversions from references to owned boxes.
+                    // Keep expression as raw pointer for this path in iteration-1.
+                    *ptr = utils::expr!(
+                        "&raw mut ({}) as *mut {}",
+                        pprust::expr_to_string(e),
+                        mir_ty_to_string(lhs_inner_ty, self.tcx),
+                    );
+                    return PtrKind::Raw(true);
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     // ref -> cursor
@@ -793,6 +1022,11 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         if pe.as_ptr && self.is_base_not_a_raw_ptr(&pe) {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Move(m)) => {
+                    let base = self.projected_expr(&pe, m, false);
+                    *ptr = self.raw_from_slice_or_cursor(&base, m, m, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     let base = self.projected_expr(&pe, m, false);
                     if !need_cast {
@@ -866,6 +1100,34 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Some(rhs_kind) = self.ptr_kinds.get(&hir_id)
         {
             match (ctx, *rhs_kind) {
+                (PtrCtx::Rhs(PtrKind::Move(m)), PtrKind::Raw(m1)) => {
+                    *ptr = self.move_from_raw(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Move(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Move(m)), PtrKind::Move(_m1)) => {
+                    return PtrKind::Move(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Move(m1)) => {
+                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
+                }
+                (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::Move(m1)) => {
+                    *ptr = self.opt_ref_from_opt_ref(
+                        pe.base,
+                        m,
+                        m1,
+                        lhs_inner_ty,
+                        rhs_inner_ty,
+                        def_id,
+                    );
+                    return PtrKind::OptRef(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::Move(_)) => {
+                    return PtrKind::Slice(m);
+                }
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Move(_)) => {
+                    return PtrKind::SliceCursor(m);
+                }
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
                     if m && !m1 {
                         let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
@@ -874,8 +1136,20 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    if pe.projs.is_empty() {
+                        *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    } else {
+                        let raw_base =
+                            self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
+                        let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
+                        *ptr = self.coerce_raw_expr(
+                            &raw_projected,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                    }
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Slice(m1)) => {
@@ -894,17 +1168,53 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::OptRef(m);
                 }
-                (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    // can be used for deref, so type must be specified
-                    *ptr = self.opt_ref_from_opt_ref(
-                        pe.base,
-                        m,
-                        m1,
-                        lhs_inner_ty,
-                        rhs_inner_ty,
-                        def_id,
-                    );
+                (PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
+                    if pe.projs.is_empty() {
+                        if m == m1 {
+                            *ptr = utils::expr!(
+                                "({}).as_deref{}()",
+                                pprust::expr_to_string(pe.base),
+                                if m { "_mut" } else { "" },
+                            );
+                        } else {
+                            *ptr = self.opt_ref_from_opt_ref(
+                                pe.base,
+                                m,
+                                m1,
+                                lhs_inner_ty,
+                                rhs_inner_ty,
+                                def_id,
+                            );
+                        }
+                    } else {
+                        // Project through a raw-pointer view first, then rebuild Option.
+                        let raw_base =
+                            self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
+                        let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
+                        *ptr =
+                            self.opt_ref_from_raw(&raw_projected, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    }
+                    return PtrKind::OptRef(m);
+                }
+                (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::OptRef(m1)) => {
+                    if pe.projs.is_empty() {
+                        // can be used for deref, so type must be specified
+                        *ptr = self.opt_ref_from_opt_ref(
+                            pe.base,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                            def_id,
+                        );
+                    } else {
+                        // Project through a raw-pointer view first, then rebuild Option.
+                        let raw_base =
+                            self.raw_from_opt_ref(pe.base, m1, m1, rhs_inner_ty, rhs_inner_ty);
+                        let raw_projected = self.apply_raw_projections(raw_base, &pe.projs, m1);
+                        *ptr =
+                            self.opt_ref_from_raw(&raw_projected, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    }
                     return PtrKind::OptRef(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::Slice(_)) => {
@@ -1030,17 +1340,36 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Rhs(PtrKind::SliceCursor(_) | PtrKind::Slice(_)), PtrKind::OptRef(_)) => {
                     panic!()
                 }
+                (PtrCtx::Rhs(PtrKind::Move(m)), _) => {
+                    return PtrKind::Move(m);
+                }
             }
         }
 
         if pe.base_kind == PtrExprBaseKind::ByteStr {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Move(_)) => {
+                    return PtrKind::Raw(false);
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                    if m {
+                        *ptr = utils::expr!(
+                            "({}) as *const _ as *mut {}",
+                            pprust::expr_to_string(e),
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                        );
+                    }
                     return PtrKind::Raw(m);
                 }
                 PtrCtx::Rhs(PtrKind::OptRef(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let raw = utils::expr!(
+                            "({}) as *const _ as *mut {}",
+                            pprust::expr_to_string(e),
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                        );
+                        *ptr = self.opt_ref_from_raw(&raw, true, true, lhs_inner_ty, lhs_inner_ty);
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
@@ -1053,9 +1382,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::OptRef(m);
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
                     self.slice_cursor.set(true);
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let raw = utils::expr!(
+                            "({}) as *const _ as *mut {}",
+                            pprust::expr_to_string(e),
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                        );
+                        *ptr = self.cursor_from_raw(&raw, true, true, lhs_inner_ty, lhs_inner_ty);
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!(
                             "crate::slice_cursor::SliceCursorRef::new({})",
                             pprust::expr_to_string(e)
@@ -1071,8 +1406,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::SliceCursor(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let raw = utils::expr!(
+                            "({}) as *const _ as *mut {}",
+                            pprust::expr_to_string(e),
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                        );
+                        *ptr = self.slice_from_raw(&raw, true, true, lhs_inner_ty, lhs_inner_ty);
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = e.clone();
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
@@ -1104,7 +1445,23 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Some(PtrKind::Raw(m)) =
                 self.sig_decs.data.get(&def_id).and_then(|sd| sd.output_dec)
         {
-            m
+            let output_ty = self
+                .tcx
+                .fn_sig(def_id)
+                .skip_binder()
+                .skip_binder()
+                .output();
+            if let ty::TyKind::RawPtr(_, out_m) = output_ty.kind() {
+                if !out_m.is_mut() {
+                    false
+                } else if self.raw_mutability {
+                    m
+                } else {
+                    out_m.is_mut()
+                }
+            } else {
+                m
+            }
         } else {
             m1
         };
@@ -1119,6 +1476,10 @@ impl<'tcx> TransformVisitor<'tcx> {
             PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                 *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                 PtrKind::OptRef(m)
+            }
+            PtrCtx::Rhs(PtrKind::Move(m)) => {
+                *ptr = self.move_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                PtrKind::Move(m)
             }
             PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                 self.slice_cursor.set(true);
@@ -1199,6 +1560,62 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn coerce_raw_expr(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
+        if !need_cast {
+            utils::expr!("({}){}", pprust::expr_to_string(e), cast_mut)
+        } else {
+            utils::expr!(
+                "({}){} as *{} {}",
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
+        }
+    }
+
+    fn move_from_raw(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let mut ptr_expr = if !need_cast {
+            pprust::expr_to_string(e)
+        } else {
+            format!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(e),
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
+        };
+        if !m1 {
+            ptr_expr = format!("({ptr_expr}) as *mut {}", mir_ty_to_string(lhs_inner_ty, self.tcx));
+        }
+        utils::expr!(
+            "if ({}).is_null() {{
+                None
+            }} else {{
+                Some(Box::from_raw({}))
+            }}",
+            pprust::expr_to_string(e),
+            if m { ptr_expr } else { format!("({ptr_expr}) as *mut {}", mir_ty_to_string(lhs_inner_ty, self.tcx)) },
+        )
+    }
+
     fn raw_from_slice_or_cursor(
         &self,
         e: &Expr,
@@ -1267,11 +1684,16 @@ impl<'tcx> TransformVisitor<'tcx> {
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         if !need_cast {
-            utils::expr!(
-                "({}).as_deref{}()",
-                pprust::expr_to_string(e),
-                if m && m1 { "_mut" } else { "" },
-            )
+            if m == m1 {
+                let raw = self.raw_from_opt_ref(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                self.opt_ref_from_raw(&raw, m, m1, lhs_inner_ty, rhs_inner_ty)
+            } else {
+                utils::expr!(
+                    "({}).as_deref{}()",
+                    pprust::expr_to_string(e),
+                    if m && m1 { "_mut" } else { "" },
+                )
+            }
         } else if lhs_inner_ty.is_numeric()
             && rhs_inner_ty.is_numeric()
             && self.same_size(lhs_inner_ty, rhs_inner_ty, def_id)
@@ -1343,6 +1765,9 @@ impl<'tcx> TransformVisitor<'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
+        if is_null_ptr_call_expr(e) {
+            return if m { utils::expr!("&mut []") } else { utils::expr!("&[]") };
+        }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         if let Some(name) = method_call_name(e)
@@ -1435,6 +1860,14 @@ impl<'tcx> TransformVisitor<'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
+        if is_null_ptr_call_expr(e) {
+            let cursor_ty = if m {
+                "crate::slice_cursor::SliceCursor"
+            } else {
+                "crate::slice_cursor::SliceCursorRef"
+            };
+            return utils::expr!("{}::empty()", cursor_ty);
+        }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         let cursor_ty = if m {
@@ -1539,6 +1972,14 @@ impl<'tcx> TransformVisitor<'tcx> {
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let base_is_slice_like_local = matches!(
+            pe.base_kind,
+            PtrExprBaseKind::Path(Res::Local(hir_id))
+                if matches!(
+                    self.ptr_kinds.get(&hir_id),
+                    Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                )
+        );
         let get_reference = |use_ref| {
             if use_ref {
                 if m { "&mut " } else { "&" }
@@ -1547,12 +1988,15 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         };
         if !need_cast {
-            let reference = get_reference(pe.base_kind != PtrExprBaseKind::Alloca);
+            let reference =
+                get_reference(pe.base_kind != PtrExprBaseKind::Alloca && !base_is_slice_like_local);
             utils::expr!("{}({})", reference, pprust::expr_to_string(e),)
         } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
             self.bytemuck.set(true);
             let reference = get_reference(
-                !matches!(e.kind, ExprKind::Index(..)) && pe.base_kind != PtrExprBaseKind::Alloca,
+                !matches!(e.kind, ExprKind::Index(..))
+                    && pe.base_kind != PtrExprBaseKind::Alloca
+                    && !base_is_slice_like_local,
             );
             // can be used for deref, so type must be specified
             utils::expr!(
@@ -1714,7 +2158,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         loop {
             match &curr_expr.kind {
                 hir::ExprKind::MethodCall(seg, receiver, ..)
-                    if seg.ident.name.as_str() == "offset" =>
+                    if matches!(seg.ident.name.as_str(), "offset" | "add") =>
                 {
                     curr_expr = receiver;
                 }
@@ -1725,6 +2169,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Res::Local(hir_id) = path.res
         {
             match self.ptr_kinds.get(&hir_id) {
+                Some(PtrKind::Move(m)) => Some(*m),
                 Some(PtrKind::OptRef(m)) => Some(*m),
                 Some(PtrKind::Slice(m)) | Some(PtrKind::SliceCursor(m)) => Some(*m),
                 Some(PtrKind::Raw(m)) => Some(*m),
@@ -1747,7 +2192,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         match &expr.kind {
             ExprKind::Path(_, _) => {
                 let hir::ExprKind::Path(hir::QPath::Resolved(_, hpath)) = hir_expr.kind else {
-                    panic!()
+                    return None;
                 };
                 Some(PtrExpr::new(
                     expr,
@@ -1817,7 +2262,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     panic!()
                 };
                 let name = seg.ident.name.as_str();
-                if name == "offset" {
+                if name == "offset" || name == "add" {
                     let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;
                     ptr_expr.push_offset(&call.args[0]);
                     Some(ptr_expr)
@@ -1951,6 +2396,84 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn apply_raw_projections(
+        &self,
+        mut e: Expr,
+        projs: &[PtrExprProj<'_, 'tcx>],
+        m: bool,
+    ) -> Expr {
+        for proj in projs {
+            match proj {
+                PtrExprProj::Offset(offset) => {
+                    e = utils::expr!(
+                        "({}).offset(({}) as isize)",
+                        pprust::expr_to_string(&e),
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    e = utils::expr!("({}) as usize", pprust::expr_to_string(&e));
+                }
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
+                    e = utils::expr!(
+                        "({}) as *{} {}",
+                        pprust::expr_to_string(&e),
+                        if m { "mut" } else { "const" },
+                        mir_ty_to_string(to_ty, self.tcx),
+                    );
+                }
+                PtrExprProj::IntegerOp(expr, op) => {
+                    let method = match op {
+                        OpKind::WrappingAdd => "wrapping_add",
+                        OpKind::WrappingSub => "wrapping_sub",
+                    };
+                    e = utils::expr!(
+                        "({}).{}({})",
+                        pprust::expr_to_string(&e),
+                        method,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+                PtrExprProj::IntegerBinOp(expr, op) => {
+                    let op_str = match op {
+                        BinOpKind::BitAnd => "&",
+                        BinOpKind::BitOr => "|",
+                        _ => panic!(),
+                    };
+                    e = utils::expr!(
+                        "({}) {} ({})",
+                        pprust::expr_to_string(&e),
+                        op_str,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+            }
+        }
+        e
+    }
+
+    fn render_offset_expr(&self, offset: &Expr) -> String {
+        let offset_expr = unwrap_paren(offset);
+        if let ExprKind::Field(base, ident) = &offset_expr.kind {
+            let base = unwrap_paren(base);
+            if let ExprKind::Unary(UnOp::Deref, inner) = &base.kind {
+                let inner = unwrap_paren(inner);
+                if matches!(inner.kind, ExprKind::Path(_, _))
+                    && let Some(hir_id) = self.hir_id_of_path(inner.id)
+                    && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::OptRef(_) | PtrKind::Move(_)))
+                {
+                    return format!(
+                        "(*({}).as_deref().unwrap()).{}",
+                        pprust::expr_to_string(inner),
+                        ident.name,
+                    );
+                }
+            }
+        }
+        pprust::expr_to_string(offset)
+    }
+
     fn projected_expr(&self, pe: &PtrExpr<'_, 'tcx>, m: bool, mut is_raw: bool) -> Expr {
         let mut is_plain_slice = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
             matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Slice(_)))
@@ -1973,24 +2496,56 @@ impl<'tcx> TransformVisitor<'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
+                    let offset_str = self.render_offset_expr(offset);
                     if is_raw {
                         e = utils::expr!(
-                            "({}).offset({})",
+                            "({}).offset(({}) as isize)",
                             pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
+                            offset_str,
                         );
                     } else if is_data_container || is_plain_slice {
                         // Base is a data container (Vec, array) — return a re-sliced expression.
-                        e = utils::expr!(
-                            "({})[({}) as usize..]",
-                            pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
-                        );
+                        let base_for_offset = if is_plain_slice {
+                            if let ExprKind::AddrOf(BorrowKind::Ref, _, inner) =
+                                &unwrap_paren(&e).kind
+                            {
+                                unwrap_paren(inner)
+                            } else {
+                                &e
+                            }
+                        } else {
+                            &e
+                        };
+                        let base_str = pprust::expr_to_string(base_for_offset);
+                        let needs_explicit_borrow = !is_plain_slice
+                            && if let ExprKind::Field(base, _) = &unwrap_paren(&e).kind {
+                                matches!(unwrap_paren(base).kind, ExprKind::Unary(UnOp::Deref, _))
+                            } else {
+                                false
+                            };
+                        e = if is_plain_slice {
+                            utils::expr!(
+                                "&{}(({})[({}) as usize..])",
+                                if m { "mut " } else { "" },
+                                base_str,
+                                offset_str,
+                            )
+                        } else if needs_explicit_borrow {
+                            utils::expr!(
+                                "&{}(((&{}({}))[({}) as usize..]))",
+                                if m { "mut " } else { "" },
+                                if m { "mut " } else { "" },
+                                base_str,
+                                offset_str,
+                            )
+                        } else {
+                            utils::expr!("({})[({}) as usize..]", base_str, offset_str)
+                        };
                     } else {
                         e = utils::expr!(
                             "{{ let mut _c = ({}).fork(); _c.seek(({}) as isize); _c }}",
                             pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
+                            offset_str,
                         );
                     }
                 }
@@ -2108,6 +2663,12 @@ fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) ->
     let ty = mir_ty_to_string(ty, tcx);
     let m = if mutability { "mut " } else { "" };
     utils::ty!("Option<&{m}{ty}>")
+}
+
+#[inline]
+fn mk_move_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    utils::ty!("Option<Box<{ty}>>")
 }
 
 #[inline]
@@ -2346,6 +2907,185 @@ fn is_plain_slice_expr(expr: &Expr) -> bool {
         return true;
     }
     false
+}
+
+fn is_range_index_expr(expr: &Expr) -> bool {
+    if let ExprKind::Index(_, idx, _) = &unwrap_paren(expr).kind {
+        matches!(unwrap_paren(idx).kind, ExprKind::Range(..))
+    } else {
+        false
+    }
+}
+
+fn is_zero_literal_expr(expr: &Expr) -> bool {
+    match &unwrap_cast_and_paren(expr).kind {
+        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer) && lit.symbol.as_str() == "0",
+        _ => false,
+    }
+}
+
+fn is_null_ptr_call_expr(expr: &Expr) -> bool {
+    let expr = unwrap_cast_and_paren(expr);
+    if let ExprKind::Call(func, _) = &expr.kind {
+        if let ExprKind::Path(_, path) = &unwrap_paren(func).kind
+            && let Some(seg) = path.segments.last()
+        {
+            matches!(seg.ident.name.as_str(), "null" | "null_mut")
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SliceElemBorrowArg {
+    base: String,
+    offset: String,
+    is_mut: bool,
+}
+
+fn extract_slice_elem_borrow_arg(arg: &Expr) -> Option<SliceElemBorrowArg> {
+    let ExprKind::AddrOf(BorrowKind::Ref, mutability, inner) = &unwrap_paren(arg).kind else {
+        return None;
+    };
+    let (base, offset) = extract_slice_elem_projection(inner)?;
+    if utils::ast::has_side_effects(base) {
+        return None;
+    }
+    Some(SliceElemBorrowArg {
+        base: pprust::expr_to_string(base),
+        offset: pprust::expr_to_string(offset),
+        is_mut: mutability.is_mut(),
+    })
+}
+
+fn extract_slice_elem_projection(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let expr = unwrap_paren(expr);
+    let ExprKind::Index(base, idx, _) = &expr.kind else {
+        return None;
+    };
+    let base = unwrap_paren(base);
+    let idx = unwrap_paren(idx);
+
+    if is_zero_literal_expr(idx)
+        && let ExprKind::AddrOf(BorrowKind::Ref, _, inner) = &base.kind
+    {
+        return extract_slice_offset_projection(inner);
+    }
+
+    Some((base, idx))
+}
+
+fn extract_slice_offset_projection(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let expr = unwrap_paren(expr);
+    let ExprKind::Index(base, idx, _) = &expr.kind else {
+        return None;
+    };
+    let base = unwrap_paren(base);
+    let idx = unwrap_paren(idx);
+
+    if let ExprKind::Range(Some(start), None, RangeLimits::HalfOpen) = &idx.kind {
+        Some((base, unwrap_paren(start)))
+    } else if is_zero_literal_expr(idx) {
+        Some((base, idx))
+    } else {
+        None
+    }
+}
+
+fn hoist_mut_call_arg_conflicts(expr: &mut Expr) {
+    let ExprKind::Call(func, args) = &expr.kind else {
+        return;
+    };
+
+    let mut grouped: FxHashMap<String, Vec<(usize, SliceElemBorrowArg)>> = FxHashMap::default();
+    let mut base_order = Vec::<String>::new();
+    for (idx, arg) in args.iter().enumerate() {
+        let Some(info) = extract_slice_elem_borrow_arg(arg) else {
+            continue;
+        };
+        if !grouped.contains_key(&info.base) {
+            base_order.push(info.base.clone());
+        }
+        grouped.entry(info.base.clone()).or_default().push((idx, info));
+    }
+
+    let mut lets = String::new();
+    let mut new_args = args
+        .iter()
+        .map(|arg| pprust::expr_to_string(arg))
+        .collect::<Vec<_>>();
+    let mut conflict_group_count = 0usize;
+    for base in &base_order {
+        let Some(group) = grouped.get(base) else {
+            continue;
+        };
+        if group.len() <= 1 || !group.iter().any(|(_, arg)| arg.is_mut) {
+            continue;
+        }
+
+        use std::fmt::Write as _;
+        let base_tmp = format!("_pr_base_{conflict_group_count}");
+        write!(&mut lets, "let {base_tmp} = ({base}).as_mut_ptr();").unwrap();
+        for (arg_idx, info) in group {
+            let tmp = format!("_pr_arg_{arg_idx}");
+            let ptr = format!("({base_tmp}).add(({}) as usize)", info.offset);
+            if info.is_mut {
+                write!(&mut lets, "let {tmp}: &mut _ = unsafe {{ &mut *({ptr}) }};").unwrap();
+            } else {
+                write!(&mut lets, "let {tmp}: &_ = unsafe {{ &*({ptr}) }};").unwrap();
+            }
+            new_args[*arg_idx] = tmp;
+        }
+        conflict_group_count += 1;
+    }
+
+    if conflict_group_count > 0 {
+        let call = format!("{}({})", pprust::expr_to_string(func), new_args.join(", "));
+        *expr = utils::expr!("{{ {lets} {call} }}");
+        return;
+    }
+
+    let Some(first_arg) = args.first() else {
+        return;
+    };
+    let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, inner) = &unwrap_paren(first_arg).kind else {
+        return;
+    };
+    let inner = unwrap_paren(inner);
+    if !matches!(inner.kind, ExprKind::Path(_, _)) {
+        return;
+    }
+    let borrowed_name = pprust::expr_to_string(inner);
+
+    let mut lets = String::new();
+    let mut new_args = Vec::with_capacity(args.len());
+    new_args.push(pprust::expr_to_string(first_arg));
+
+    for (idx, arg) in args.iter().enumerate().skip(1) {
+        let arg_s = pprust::expr_to_string(arg);
+        if arg_s.contains(&borrowed_name) {
+            let tmp = format!("_pr_arg_{idx}");
+            use std::fmt::Write as _;
+            write!(&mut lets, "let {tmp} = {arg_s};").unwrap();
+            new_args.push(tmp);
+        } else {
+            new_args.push(arg_s);
+        }
+    }
+
+    if lets.is_empty() {
+        return;
+    }
+
+    let call = format!(
+        "{}({})",
+        pprust::expr_to_string(func),
+        new_args.join(", ")
+    );
+    *expr = utils::expr!("{{ {lets} {call} }}");
 }
 
 fn hoist_opt_ref_borrow(expr: &mut Expr) {

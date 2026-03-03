@@ -1,8 +1,12 @@
 #![allow(non_snake_case)]
 
-use std::sync::{
+use std::{
+    fs,
+    path::Path,
+    sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex, OnceLock,
+    },
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -584,6 +588,68 @@ fn extract_allocator_related_ptr_locals(code: &str) -> Vec<(String, String)> {
     out.sort();
     out.dedup();
     out
+}
+
+fn extract_b02_source_from_file(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let start_marker = "const SOURCE: &str = r####\"";
+    let start = content.find(start_marker)?;
+    let rest = &content[start + start_marker.len()..];
+    let end = rest.find("\"####;")?;
+    Some(rest[..end].to_owned())
+}
+
+#[test]
+fn rewriter_transformed_b02_cases_compile() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/B02_tests");
+    let mut files = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("failed to read B02 dir `{}`: {e}", dir.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "mod.rs")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+
+    let mut source_cases = Vec::new();
+    for path in files {
+        let Some(source) = extract_b02_source_from_file(&path) else {
+            continue;
+        };
+        let case_name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("<unknown>")
+            .to_owned();
+        source_cases.push((case_name, source));
+    }
+
+    assert_eq!(
+        source_cases.len(),
+        86,
+        "expected 86 B02 SOURCE cases to compile-sweep"
+    );
+
+    let config = crate::Config::default();
+    for (case_name, source) in source_cases {
+        let (rewritten, _bytemuck, _slice_cursor) =
+            ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+                crate::replace_local_borrows(&config, tcx)
+            })
+            .unwrap_or_else(|e| {
+                panic!("rewriter crashed for B02 case `{case_name}`: {e:?}");
+            });
+
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check).unwrap_or_else(
+            |_| {
+                panic!(
+                    "transformed code does not compile for B02 case `{case_name}`.\nTransformed:\n{}",
+                    rewritten
+                );
+            },
+        );
+    }
 }
 
 pub(super) fn run_ownership_case_with_box_candidates(

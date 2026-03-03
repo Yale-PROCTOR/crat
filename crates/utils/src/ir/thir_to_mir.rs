@@ -265,7 +265,7 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                 };
                 let true_target = find_target(&true_targets);
                 let false_target = find_target(&false_targets);
-                assert_ne!(true_target, false_target);
+                let merged_if_targets = true_target == false_target;
                 let if_blocks = IfBlocks {
                     true_entry: true_target,
                     false_entry: false_target,
@@ -274,7 +274,9 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                 };
                 ctx.thir_to_mir.if_to_bbs.insert(expr_id, if_blocks);
 
-                if let Some(continue_id) = unique_continue_of_block(then, &thir) {
+                if !merged_if_targets
+                    && let Some(continue_id) = unique_continue_of_block(then, &thir)
+                {
                     let bb = &body.basic_blocks[true_target];
                     let term = bb.terminator();
                     assert!(matches!(term.kind, TerminatorKind::Goto { .. }));
@@ -624,13 +626,15 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                         let if_blocks = ctx.thir_to_mir.if_to_bbs.get_mut(&expr_id).unwrap();
                         if_blocks.false_blocks = bbs;
                         if_blocks.false_blocks.insert(if_blocks.false_entry);
-                        debug_assert_eq!(
-                            if_blocks
-                                .true_blocks
-                                .intersection(&if_blocks.false_blocks)
-                                .count(),
-                            0
-                        );
+                        if if_blocks.true_entry != if_blocks.false_entry {
+                            debug_assert_eq!(
+                                if_blocks
+                                    .true_blocks
+                                    .intersection(&if_blocks.false_blocks)
+                                    .count(),
+                                0
+                            );
+                        }
                     } else {
                         ctx.print_debug("If else", thir[els].span.into());
                     }

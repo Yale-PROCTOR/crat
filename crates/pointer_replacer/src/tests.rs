@@ -17,6 +17,61 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     }
 }
 
+mod decision_spec_integration {
+    use crate::rewriter::{
+        DecisionConflict, PtrKind, SpecPtrClass, merge_conflict_log,
+        ownership_priority_choice_for_test,
+    };
+
+    #[test]
+    fn ownership_priority_prefers_move_for_raw_pointer_sites() {
+        let (chosen, conflict) = ownership_priority_choice_for_test(
+            PtrKind::Raw(true),
+            true,
+            true,
+            true,
+            "test::foo::local1",
+        );
+        assert_eq!(chosen, PtrKind::Move(true));
+        let conflict = conflict.expect("expected a recorded conflict");
+        assert_eq!(conflict.spec_decision, SpecPtrClass::Move);
+        assert_eq!(conflict.chosen, SpecPtrClass::Move);
+    }
+
+    #[test]
+    fn ownership_priority_prefers_move_for_ref_conflicts() {
+        let (chosen, conflict) = ownership_priority_choice_for_test(
+            PtrKind::OptRef(true),
+            true,
+            true,
+            true,
+            "test::foo::local2",
+        );
+        assert_eq!(chosen, PtrKind::Move(true));
+        let conflict = conflict.expect("expected a recorded conflict");
+        assert_eq!(conflict.spec_decision, SpecPtrClass::Move);
+        assert_eq!(conflict.chosen, SpecPtrClass::Move);
+    }
+
+    #[test]
+    fn conflict_log_deduplicates_stable_keys() {
+        let conflict = DecisionConflict {
+            rule_id: "TY-100",
+            site: "crate::f::local1".to_owned(),
+            legacy_decision: SpecPtrClass::RawMut,
+            spec_decision: SpecPtrClass::Move,
+            chosen: SpecPtrClass::Move,
+            note: "demo".to_owned(),
+        };
+        let merged = merge_conflict_log("", &[conflict.clone(), conflict.clone()]);
+        let key_line = "- KEY: `TY-100|crate::f::local1`";
+        assert_eq!(merged.matches(key_line).count(), 1);
+
+        let merged_again = merge_conflict_log(&merged, &[conflict]);
+        assert_eq!(merged_again.matches(key_line).count(), 1);
+    }
+}
+
 #[test]
 fn test_local_ptr_to_ref() {
     run_test(

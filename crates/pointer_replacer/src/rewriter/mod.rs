@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use etrace::some_or;
 use points_to::andersen;
 use rustc_ast::mut_visit::MutVisitor;
@@ -13,6 +15,12 @@ use crate::{
     analyses::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
+        output_params::compute_output_params,
+        ownership::{
+            AnalysisKind, CrateCtxt,
+            solidify::SolidifiedOwnershipSchemes,
+            whole_program::WholeProgramAnalysis,
+        },
         offset_sign::OffsetSignResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
@@ -23,18 +31,57 @@ mod collector;
 mod decision;
 mod transform;
 
+#[cfg(test)]
+pub(crate) use decision::{
+    DecisionConflict, PtrKind, SpecPtrClass, merge_conflict_log,
+    ownership_priority_choice_for_test,
+};
+
 pub struct Analysis {
     promoted_mut_ref_result: PromotedMutRefResult,
     promoted_shared_ref_result: PromotedMutRefResult,
     mutability_result: MutabilityResult,
     fatness_result: FatnessResult,
+    ownership_result: Option<SolidifiedOwnershipSchemes>,
+    enable_box_rewrite: bool,
+    raw_mutability: bool,
     aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     offset_sign_result: OffsetSignResult,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub c_exposed_fns: FxHashSet<String>,
+    #[serde(default)]
+    pub type_only: bool,
+    #[serde(default)]
+    pub const_reference: bool,
+    #[serde(default)]
+    pub type_reconstruction: bool,
+    #[serde(default)]
+    pub no_box: bool,
+    #[serde(default)]
+    pub force_box: bool,
+    #[serde(default)]
+    pub raw_mutability: bool,
+    #[serde(default)]
+    pub no_attempt: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            c_exposed_fns: FxHashSet::default(),
+            type_only: false,
+            const_reference: false,
+            type_reconstruction: false,
+            no_box: false,
+            force_box: false,
+            raw_mutability: true,
+            no_attempt: None,
+        }
+    }
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool, bool) {
@@ -85,17 +132,35 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         source_var_groups.postprocess_promoted_mut_refs(shared_references);
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let offset_sign_result = analyses::offset_sign::offset_sign_analysis(&input);
+    let ownership_result = if config.force_box {
+        let output_params = compute_output_params(&input, &mutability_result, &aliases);
+        let crate_ctxt = CrateCtxt::new(&input);
+        let ownership_analysis =
+            <WholeProgramAnalysis as AnalysisKind>::analyze(crate_ctxt, &output_params)
+                .expect("ownership analysis should succeed for pointer rewriter");
+        Some(ownership_analysis.solidify(&input))
+    } else {
+        None
+    };
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
         mutability_result,
         fatness_result,
+        ownership_result,
+        enable_box_rewrite: config.force_box,
+        raw_mutability: config.raw_mutability,
         aliases,
         offset_sign_result,
     };
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
+    let conflicts = visitor.take_conflicts();
+    let conflicts_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/conflicts.md");
+    if let Err(err) = decision::append_conflicts_to_file(&conflicts_path, &conflicts) {
+        tracing::warn!("failed to append pointer rewriter conflicts: {err}");
+    }
 
     // add SliceCursor module to the crate if it was used
     let slice_cursor_used = visitor.slice_cursor.get();
@@ -180,8 +245,8 @@ fn slice_cursor_mod_str() -> &'static str {
             Self { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: 0 }
         }
 
-        pub fn fork(&mut self) -> SliceCursor<'a, T> {
-            let ptr = self.base.as_mut_ptr();
+        pub fn fork(&self) -> SliceCursor<'a, T> {
+            let ptr = self.base.as_ptr() as *mut T;
             let len = self.base.len();
             SliceCursor { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: self.pos }
         }
