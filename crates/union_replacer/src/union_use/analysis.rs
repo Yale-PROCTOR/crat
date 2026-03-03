@@ -207,7 +207,9 @@ fn identify_union_uses(
             end: result.ends[root],
         })
         .collect();
-    println!("Union Instances: {union_instances:?}");
+    // if verbose {
+    //     println!("Union Instances: {union_instances:?}");
+    // }
 
     let mut target_fns: FxHashSet<LocalDefId> = FxHashSet::default();
     for graph in condensation_graphs.values() {
@@ -266,7 +268,9 @@ fn identify_union_uses(
         all_accesses.extend(accesses);
     }
 
-    println!("instance->type map: {instance_to_union_ty:?}");
+    // if verbose {
+    //     println!("instance->type map: {instance_to_union_ty:?}");
+    // }
 
     // Merge stage:
     // - assign union types to accesses based on hints and instance->type map

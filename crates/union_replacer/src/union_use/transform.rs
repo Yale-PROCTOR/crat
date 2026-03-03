@@ -17,6 +17,7 @@ use super::{
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let krate = utils::ast::expanded_ast(tcx);
     let use_optimized_mir = false;
+    let print_mir = true;
 
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
     let related_types_map = collect_union_related_types(&tcx, &union_tys, &ty_visitor, verbose);
@@ -28,7 +29,13 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
         print_condensation_graphs(tcx, &condensation_graphs);
     }
 
-    let union_uses = analyze(tcx, &condensation_graphs, true, use_optimized_mir, verbose);
+    let union_uses = analyze(
+        tcx,
+        &condensation_graphs,
+        print_mir,
+        use_optimized_mir,
+        verbose,
+    );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &callgraphs, use_optimized_mir);
 
     if verbose {
