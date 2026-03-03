@@ -369,8 +369,11 @@ impl MutVisitor for TransformVisitor<'_> {
                             PtrKind::OptRef(_) => {
                                 **e = utils::expr!("{}.unwrap()", pprust::expr_to_string(e));
                             }
-                            PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
-                                *expr = utils::expr!("({})[0usize]", pprust::expr_to_string(e));
+                            PtrKind::Slice(_) => {
+                                *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
+                            }
+                            PtrKind::SliceCursor(_) => {
+                                *expr = utils::expr!("({})[0 as usize]", pprust::expr_to_string(e));
                             }
                         }
                     }
@@ -1548,7 +1551,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             utils::expr!("{}({})", reference, pprust::expr_to_string(e),)
         } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
             self.bytemuck.set(true);
-            let reference = get_reference(!matches!(e.kind, ExprKind::Index(..)) && pe.base_kind != PtrExprBaseKind::Alloca);
+            let reference = get_reference(
+                !matches!(e.kind, ExprKind::Index(..)) && pe.base_kind != PtrExprBaseKind::Alloca,
+            );
             // can be used for deref, so type must be specified
             utils::expr!(
                 "bytemuck::cast_slice{}::<_, {}>({}({}))",
@@ -1677,27 +1682,25 @@ impl<'tcx> TransformVisitor<'tcx> {
                     pprust::expr_to_string(e),
                 )
             }
+        } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
+            self.bytemuck.set(true);
+            utils::expr!(
+                "{}::new(bytemuck::cast_slice{}::<_, {}>(({}).as_slice{}()))",
+                cursor_ty,
+                if m { "_mut" } else { "" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                pprust::expr_to_string(e),
+                if m { "_mut" } else { "" },
+            )
         } else {
-            if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
-                self.bytemuck.set(true);
-                utils::expr!(
-                    "{}::new(bytemuck::cast_slice{}::<_, {}>(({}).as_slice{}()))",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
-                    pprust::expr_to_string(e),
-                    if m { "_mut" } else { "" },
-                )
-            } else {
-                utils::expr!(
-                    "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 100000)",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    if m { "mut" } else { "const" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
-                )
-            }
+            utils::expr!(
+                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 100000)",
+                cursor_ty,
+                if m { "_mut" } else { "" },
+                pprust::expr_to_string(e),
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
         }
     }
 
