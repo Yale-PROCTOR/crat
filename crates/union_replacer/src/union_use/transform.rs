@@ -5,7 +5,7 @@ use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
-    analysis::{UnionAccessField, UnionRead, UnionUses, UnionWrite, analyze},
+    analysis::{UnionAccessField, UnionRead, UnionUseResult, UnionWrite, analyze},
     callgraph::{
         CondensationGraph, build_union_callgraphs, callgraphs_to_condensation_graphs,
         collect_union_seed_functions,
@@ -63,7 +63,11 @@ fn print_condensation_graphs(
     }
 }
 
-fn print_reaching_writes(tcx: TyCtxt<'_>, union_uses: &UnionUses, analysis: &ReverseCfgAnalysis) {
+fn print_reaching_writes(
+    tcx: TyCtxt<'_>,
+    union_uses: &UnionUseResult,
+    analysis: &ReverseCfgAnalysis,
+) {
     println!("\nReaching Writes:");
     let mut union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
     union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));

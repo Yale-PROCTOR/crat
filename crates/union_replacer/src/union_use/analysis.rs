@@ -26,7 +26,7 @@ pub fn analyze(
     print_mir: bool,
     use_optimized_mir: bool,
     verbose: bool,
-) -> UnionUses {
+) -> UnionUseResult {
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
 
@@ -110,14 +110,14 @@ pub struct UnionInstanceUses {
 }
 
 #[derive(Default)]
-pub struct UnionTypeUses {
+pub struct UnionInstanceMap {
     /// Memory-instance-level summary for this union type.
     pub instances: FxHashMap<UnionMemoryInstance, UnionInstanceUses>,
 }
 
-pub struct UnionUses {
+pub struct UnionUseResult {
     /// `union type def_id -> per-instance uses`.
-    pub uses: FxHashMap<DefId, UnionTypeUses>,
+    pub uses: FxHashMap<DefId, UnionInstanceMap>,
 }
 
 impl std::fmt::Debug for UnionInstanceUses {
@@ -149,7 +149,7 @@ impl std::fmt::Debug for UnionInstanceUses {
     }
 }
 
-impl std::fmt::Debug for UnionTypeUses {
+impl std::fmt::Debug for UnionInstanceMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut instances = self.instances.iter().collect::<Vec<_>>();
         instances.sort_by_key(|(instance, _)| instance.root.index());
@@ -169,7 +169,7 @@ impl std::fmt::Debug for UnionTypeUses {
     }
 }
 
-impl std::fmt::Debug for UnionUses {
+impl std::fmt::Debug for UnionUseResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut entries = self.uses.iter().collect::<Vec<_>>();
         entries.sort_by_key(|(def_id, _)| format!("{def_id:?}"));
@@ -194,10 +194,7 @@ fn identify_union_uses(
     condensation_graphs: &FxHashMap<LocalDefId, CondensationGraph>,
     use_optimized_mir: bool,
     verbose: bool,
-) -> UnionUses {
-    let mut union_uses: FxHashMap<DefId, UnionTypeUses> = FxHashMap::default();
-    let mut instance_to_union_ty: FxHashMap<UnionMemoryInstance, DefId> = FxHashMap::default();
-    let mut all_accesses: Vec<DetectedAccess> = Vec::new();
+) -> UnionUseResult {
     let union_instances: Vec<UnionMemoryInstance> = result
         .union_offsets
         .keys()
@@ -222,10 +219,12 @@ fn identify_union_uses(
         }
     }
 
-    // Collect stage:
-    // - (union instance at seed function) -> type from local declarations
-    // - collect accesses/hints from body traversal
-    for def_id in target_fns {
+    // Pass 1
+    // Collect types of union instances
+    // - construct `(union instance) -> union type` from local declarations
+    let mut instance_to_union_ty: FxHashMap<UnionMemoryInstance, DefId> = FxHashMap::default();
+
+    for &def_id in &target_fns {
         if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
             unreachable!("Expected function, got {:?}", tcx.def_kind(def_id));
         }
@@ -238,59 +237,70 @@ fn identify_union_uses(
                 let Some(node) = result.var_nodes.get(&(def_id, local)) else {
                     continue;
                 };
-                if let TyKind::Adt(adt, _) = decl.ty.kind()
+
+                let instance = UnionMemoryInstance {
+                    root: node.index,
+                    end: result.ends[node.index],
+                };
+                if union_instances.contains(&instance)
+                    && let TyKind::Adt(adt, _) = decl.ty.kind()
                     && adt.is_union()
                 {
-                    let instance = UnionMemoryInstance {
-                        root: node.index,
-                        end: result.ends[node.index],
-                    };
-                    if result.union_offsets.contains_key(&instance.root) {
-                        instance_to_union_ty.entry(instance).or_insert(adt.did());
-                    }
+                    instance_to_union_ty.entry(instance).or_insert(adt.did());
                 }
             }
         });
+    }
 
-        let (accesses, hints) = with_body(tcx, def_id, use_optimized_mir, |body| {
-            let mut collector =
-                BodyUnionAccessCollector::new(tcx, body, def_id, &result, &union_instances);
-            collector.visit_body(body);
-            (collector.accesses, collector.instance_union_tys)
-        });
+    // Pass 2
+    // Collect union instance accesses and classify them
+    // - collect accesses using the finalized instance-to-type map
+    let mut all_accesses: Vec<DetectedAccess> = Vec::new();
 
-        for (instance, union_ty) in hints {
-            instance_to_union_ty.entry(instance).or_insert(union_ty);
+    for &def_id in &target_fns {
+        if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+            unreachable!("Expected function, got {:?}", tcx.def_kind(def_id));
         }
+        if !tcx.is_mir_available(def_id.to_def_id()) {
+            continue;
+        }
+
+        let accesses = with_body(tcx, def_id, use_optimized_mir, |body| {
+            let mut collector = BodyUnionAccessCollector::new(
+                tcx,
+                body,
+                def_id,
+                &result,
+                &union_instances,
+                &instance_to_union_ty,
+            );
+            collector.visit_body(body);
+            collector.accesses
+        });
         all_accesses.extend(accesses);
     }
 
-    // if verbose {
-    //     println!("instance->type map: {instance_to_union_ty:?}");
-    // }
+    // Pass 3
+    // Merge stage
+    // - Refine results to a map: type -> instance -> accesses
+    let mut union_uses: FxHashMap<DefId, UnionInstanceMap> = FxHashMap::default();
 
-    // Merge stage:
-    // - assign union types to accesses based on hints and instance->type map
-    for access in &all_accesses {
-        if let Some(union_ty) = access.resolved_union_ty {
-            instance_to_union_ty
-                .entry(access.instance)
-                .or_insert(union_ty);
-        }
-    }
-    for access in all_accesses {
-        let union_ty = access
-            .resolved_union_ty
-            .or_else(|| instance_to_union_ty.get(&access.instance).copied());
-        let Some(union_ty) = union_ty else {
-            continue;
-        };
-        let uses = union_uses
-            .entry(union_ty)
+    for (instance, union_ty) in &instance_to_union_ty {
+        union_uses
+            .entry(*union_ty)
             .or_default()
             .instances
-            .entry(access.instance)
+            .entry(*instance)
             .or_default();
+    }
+
+    for access in all_accesses {
+        let uses = union_uses
+            .get_mut(&access.resolved_union_ty)
+            .unwrap()
+            .instances
+            .get_mut(&access.instance)
+            .unwrap();
         match access.kind {
             AccessKind::Read => uses
                 .reads
@@ -312,7 +322,7 @@ fn identify_union_uses(
         }
     }
 
-    let res = UnionUses { uses: union_uses };
+    let res = UnionUseResult { uses: union_uses };
     if verbose {
         println!("{res:?}");
     }
@@ -331,74 +341,73 @@ struct DetectedAccess {
     site: UnionAccessSite,
     field: UnionAccessField,
     instance: UnionMemoryInstance,
-    resolved_union_ty: Option<DefId>,
+    resolved_union_ty: DefId,
 }
 
+/// Collect union accesses and classify them
 struct BodyUnionAccessCollector<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     def_id: LocalDefId,
     result: &'a andersen::AnalysisResult,
     union_instances: &'a [UnionMemoryInstance],
+    instance_to_union_ty: &'a FxHashMap<UnionMemoryInstance, DefId>,
     seen: FxHashSet<DetectedAccess>,
     accesses: Vec<DetectedAccess>,
-    instance_union_tys: FxHashMap<UnionMemoryInstance, DefId>,
-    init_lhs_overrides: FxHashMap<Location, Local>,
+    init_lhs: FxHashMap<Location, Local>,
 }
 
 impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
-        // to handle union init statement
+        // Handle union init statement
+        // i.e. let x = UnionType { field: ... };
         if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
-            && let Some((union_ty, field)) = self.detect_union_init_field(*place, rvalue)
+            && let Some((union_ty, field)) = self.is_union_init(*place, rvalue)
         {
-            self.harvest_instance_hint(*place);
-            self.init_lhs_overrides.insert(location, place.local);
+            self.init_lhs.insert(location, place.local);
             let site = UnionAccessSite {
                 def_id: self.def_id,
                 location,
             };
-            self.push_access_with_override(
-                *place,
-                AccessKind::Write,
-                site,
-                0,
-                Some((union_ty, field)),
-            );
+            self.push_access(*place, AccessKind::Write, site, 0, Some((union_ty, field)));
         }
 
         self.super_statement(statement, location);
     }
 
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
-        if matches!(
-            context,
-            PlaceContext::MutatingUse(MutatingUseContext::Store | MutatingUseContext::AsmOutput)
-        ) && place.projection.is_empty()
-            && self
-                .init_lhs_overrides
-                .get(&location)
-                .is_some_and(|local| *local == place.local)
+        // Ignore lhs of union init (already handled in visit_statement)
+        if self
+            .init_lhs
+            .get(&location)
+            .is_some_and(|local| *local == place.local)
+            && matches!(
+                context,
+                PlaceContext::MutatingUse(
+                    MutatingUseContext::Store | MutatingUseContext::AsmOutput
+                )
+            )
+            && place.projection.is_empty()
         {
-            self.harvest_instance_hint(*place);
             return;
         }
 
-        self.harvest_instance_hint(*place);
-
-        let Some(kind) = Self::classify(context) else {
+        // Classify read/write
+        let Some(kind) = classify_access(context) else {
             return;
         };
+
         let site = UnionAccessSite {
             def_id: self.def_id,
             location,
         };
-        self.push_access(*place, kind, site, 0);
+        self.push_access(*place, kind, site, 0, None);
     }
 
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        // Handle modelled functions
         if let TerminatorKind::Call { func, args, .. } = &terminator.kind
-            && let Some(callee) = self.resolve_call_callee(func)
+            && let Some(callee) = self.resolve_callee(func)
             && !self.tcx.is_mir_available(callee)
             && let Some(fn_model) = model::lookup_fn_model(self.tcx, callee)
         {
@@ -417,7 +426,7 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
                     def_id: self.def_id,
                     location,
                 };
-                self.push_access(place, kind, site, effect.deref_count);
+                self.push_access(place, kind, site, effect.deref_count, None);
             }
         }
         self.super_terminator(terminator, location);
@@ -431,6 +440,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         def_id: LocalDefId,
         result: &'a andersen::AnalysisResult,
         union_instances: &'a [UnionMemoryInstance],
+        instance_to_union_ty: &'a FxHashMap<UnionMemoryInstance, DefId>,
     ) -> Self {
         Self {
             tcx,
@@ -438,39 +448,14 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             def_id,
             result,
             union_instances,
+            instance_to_union_ty,
             seen: FxHashSet::default(),
             accesses: Vec::new(),
-            instance_union_tys: FxHashMap::default(),
-            init_lhs_overrides: FxHashMap::default(),
+            init_lhs: FxHashMap::default(),
         }
     }
 
-    fn classify(context: PlaceContext) -> Option<AccessKind> {
-        match context {
-            PlaceContext::NonUse(_) => None,
-            PlaceContext::MutatingUse(
-                MutatingUseContext::Store | MutatingUseContext::AsmOutput,
-            ) => Some(AccessKind::Write),
-            PlaceContext::MutatingUse(MutatingUseContext::Projection)
-            | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection) => None,
-            PlaceContext::NonMutatingUse(
-                NonMutatingUseContext::Copy
-                | NonMutatingUseContext::Inspect
-                | NonMutatingUseContext::Move,
-            ) => Some(AccessKind::Read),
-            _ => None,
-        }
-    }
-
-    fn ranges_overlap(
-        a_start: andersen::Loc,
-        a_end: andersen::Loc,
-        b_start: andersen::Loc,
-        b_end: andersen::Loc,
-    ) -> bool {
-        a_start <= b_end && b_start <= a_end
-    }
-
+    /// Apply a projection on each node
     fn project_nodes(&self, nodes: Vec<LocNode>, elem: PlaceElem<'tcx>) -> Vec<LocNode> {
         let mut next = Vec::new();
         match elem {
@@ -509,6 +494,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
                 next = nodes;
             }
         }
+
         next.sort_by_key(|n| (n.index.index(), n.prefix));
         next.dedup();
         next
@@ -523,18 +509,22 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             return vec![];
         };
         let mut frontier = vec![*start];
-        for _ in 0..implicit_deref_count {
-            frontier = self.project_nodes(frontier, PlaceElem::Deref);
-            if frontier.is_empty() {
-                return vec![];
-            }
-        }
+
         for elem in place.projection.iter() {
             frontier = self.project_nodes(frontier, elem);
             if frontier.is_empty() {
                 return vec![];
             }
         }
+
+        // handle implicit deref at modelled functions
+        for _ in 0..implicit_deref_count {
+            frontier = self.project_nodes(frontier, PlaceElem::Deref);
+            if frontier.is_empty() {
+                return vec![];
+            }
+        }
+
         let mut out: Vec<_> = frontier.into_iter().map(|n| n.index).collect();
         out.sort_by_key(|l| l.index());
         out.dedup();
@@ -550,11 +540,12 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         for target in self.alias_target_locs(place, implicit_deref_count) {
             let target_end = self.result.ends[target];
             for instance in self.union_instances {
-                if Self::ranges_overlap(target, target_end, instance.root, instance.end) {
+                if ranges_overlap(target, target_end, instance.root, instance.end) {
                     out.push(*instance);
                 }
             }
         }
+
         out.sort_by_key(|i| i.root.index());
         out.dedup();
         out
@@ -570,118 +561,11 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         (0..(offsets.len() - 1)).find(|&i| offsets[i] <= offset && offset < offsets[i + 1])
     }
 
-    fn detect_field_from_points_to(
+    fn detect_field_from_syntax(
         &self,
         place: Place<'tcx>,
-        instance: UnionMemoryInstance,
-        implicit_deref_count: usize,
-    ) -> UnionAccessField {
-        let Some(offsets) = self.result.union_offsets.get(&instance.root) else {
-            return UnionAccessField::Top;
-        };
-        let mut found: Option<usize> = None;
-        for target in self.alias_target_locs(place, implicit_deref_count) {
-            let target_end = self.result.ends[target];
-            if !Self::ranges_overlap(target, target_end, instance.root, instance.end) {
-                continue;
-            }
-            let start =
-                std::cmp::max(target.index(), instance.root.index()) - instance.root.index();
-            let end =
-                std::cmp::min(target_end.index(), instance.end.index()) - instance.root.index();
-            for off in start..=end {
-                let Some(field) = Self::field_for_offset(off, offsets) else {
-                    return UnionAccessField::Top;
-                };
-                match found {
-                    None => found = Some(field),
-                    Some(prev) if prev == field => {}
-                    Some(_) => return UnionAccessField::Top,
-                }
-            }
-        }
-        found.map_or(UnionAccessField::Top, UnionAccessField::Field)
-    }
-
-    fn push_access(
-        &mut self,
-        place: Place<'tcx>,
-        kind: AccessKind,
-        site: UnionAccessSite,
-        implicit_deref_count: usize,
-    ) {
-        self.push_access_with_override(place, kind, site, implicit_deref_count, None);
-    }
-
-    fn push_access_with_override(
-        &mut self,
-        place: Place<'tcx>,
-        kind: AccessKind,
-        site: UnionAccessSite,
-        implicit_deref_count: usize,
-        override_field: Option<(DefId, UnionAccessField)>,
-    ) {
-        let instances = self.find_aliasing_union_instances(place, implicit_deref_count);
-        if instances.is_empty() {
-            return;
-        }
-        let (resolved_union_ty, syntax_field) = match override_field {
-            Some((union_ty, field)) => (Some(union_ty), field),
-            None => self.detect_union_field_and_type(place),
-        };
-        for instance in instances {
-            let field = match syntax_field {
-                UnionAccessField::Top => {
-                    self.detect_field_from_points_to(place, instance, implicit_deref_count)
-                }
-                UnionAccessField::Field(_) => syntax_field,
-            };
-            let access = DetectedAccess {
-                kind,
-                site,
-                field,
-                instance,
-                resolved_union_ty,
-            };
-            if self.seen.insert(access) {
-                self.accesses.push(access);
-            }
-        }
-    }
-
-    fn detect_union_init_field(
-        &self,
-        place: Place<'tcx>,
-        rvalue: &Rvalue<'tcx>,
-    ) -> Option<(DefId, UnionAccessField)> {
-        let TyKind::Adt(adt, _) = self.body.local_decls[place.local].ty.kind() else {
-            return None;
-        };
-        if !adt.is_union() || !place.projection.is_empty() {
-            return None;
-        }
-
-        let Rvalue::Aggregate(box AggregateKind::Adt(_, _, _, _, Some(field_idx)), _) = rvalue
-        else {
-            return None;
-        };
-
-        Some((adt.did(), UnionAccessField::Field(field_idx.as_usize())))
-    }
-
-    fn harvest_instance_hint(&mut self, place: Place<'tcx>) {
-        let (resolved_union_ty, _) = self.detect_union_field_and_type(place);
-        let Some(resolved_union_ty) = resolved_union_ty else {
-            return;
-        };
-        for instance in self.find_aliasing_union_instances(place, 0) {
-            self.instance_union_tys
-                .entry(instance)
-                .or_insert(resolved_union_ty);
-        }
-    }
-
-    fn detect_union_field_and_type(&self, place: Place<'tcx>) -> (Option<DefId>, UnionAccessField) {
+        union_ty: Option<DefId>,
+    ) -> Option<UnionAccessField> {
         for i in 0..place.projection.len() {
             let ty = if i == 0 {
                 self.body.local_decls[place.local].ty
@@ -701,27 +585,150 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             if !adt.is_union() {
                 continue;
             }
-
-            if let PlaceElem::Field(field_idx, _) = place.projection[i] {
-                return (
-                    Some(adt.did()),
-                    UnionAccessField::Field(field_idx.as_usize()),
-                );
+            if union_ty.is_some_and(|union_ty| union_ty != adt.did()) {
+                return None;
             }
 
-            return (Some(adt.did()), UnionAccessField::Top);
+            if let PlaceElem::Field(field_idx, _) = place.projection[i] {
+                return Some(UnionAccessField::Field(field_idx.as_usize()));
+            }
+
+            return Some(UnionAccessField::Top);
         }
 
         let ty = place.ty(self.body, self.tcx).ty;
         if let TyKind::Adt(adt, _) = ty.kind()
             && adt.is_union()
         {
-            return (Some(adt.did()), UnionAccessField::Top);
+            if union_ty.is_some_and(|union_ty| union_ty != adt.did()) {
+                return None;
+            }
+            return Some(UnionAccessField::Top);
         }
-        (None, UnionAccessField::Top)
+        None
     }
 
-    fn resolve_call_callee(&self, func: &Operand<'tcx>) -> Option<DefId> {
+    fn detect_field_from_points_to(
+        &self,
+        place: Place<'tcx>,
+        instance: UnionMemoryInstance,
+        implicit_deref_count: usize,
+    ) -> UnionAccessField {
+        let Some(offsets) = self.result.union_offsets.get(&instance.root) else {
+            unreachable!("Expected union instance to have offsets");
+            // return UnionAccessField::Top;
+        };
+
+        let mut found: Option<usize> = None;
+        for target in self.alias_target_locs(place, implicit_deref_count) {
+            let target_end = self.result.ends[target];
+            if !ranges_overlap(target, target_end, instance.root, instance.end) {
+                continue;
+            }
+            let start =
+                std::cmp::max(target.index(), instance.root.index()) - instance.root.index();
+            let end =
+                std::cmp::min(target_end.index(), instance.end.index()) - instance.root.index();
+            for off in start..=end {
+                let Some(field) = Self::field_for_offset(off, offsets) else {
+                    return UnionAccessField::Top;
+                };
+                match found {
+                    None => found = Some(field),
+                    Some(prev) if prev == field => {}
+                    Some(_) => return UnionAccessField::Top,
+                }
+            }
+        }
+        println!(
+            "Detecting field for access at {place:?} of field {found:?} in function {:?}:",
+            self.def_id
+        );
+        found.map_or(UnionAccessField::Top, UnionAccessField::Field)
+    }
+
+    fn detect_field(
+        &self,
+        place: Place<'tcx>,
+        instance: UnionMemoryInstance,
+        implicit_deref_count: usize,
+    ) -> Option<(DefId, UnionAccessField)> {
+        let instance_union_ty = self.instance_to_union_ty.get(&instance).copied();
+        let union_ty = instance_union_ty?;
+        if let Some(syntax_field) = self.detect_field_from_syntax(place, instance_union_ty)
+            && let UnionAccessField::Field(_) = syntax_field
+        {
+            return Some((union_ty, syntax_field));
+        }
+        Some((
+            union_ty,
+            self.detect_field_from_points_to(place, instance, implicit_deref_count),
+        ))
+    }
+
+    /// Push an access to the collector
+    /// - If field is none, it trys to detect the accessed field
+    fn push_access(
+        &mut self,
+        place: Place<'tcx>,
+        kind: AccessKind,
+        site: UnionAccessSite,
+        implicit_deref_count: usize,
+        type_field: Option<(DefId, UnionAccessField)>,
+    ) {
+        let instances = self.find_aliasing_union_instances(place, implicit_deref_count);
+        if instances.is_empty() {
+            return;
+        }
+
+        for instance in instances {
+            let (union_ty, field) = match type_field {
+                Some((union_ty, field)) => (Some(union_ty), field),
+                None => {
+                    let Some((union_ty, field)) =
+                        self.detect_field(place, instance, implicit_deref_count)
+                    else {
+                        continue;
+                    };
+                    (Some(union_ty), field)
+                }
+            };
+
+            let access = DetectedAccess {
+                kind,
+                site,
+                field,
+                instance,
+                resolved_union_ty: union_ty
+                    .expect("union type should be resolved before pushing access"),
+            };
+            if self.seen.insert(access) {
+                self.accesses.push(access);
+            }
+        }
+    }
+
+    fn is_union_init(
+        &self,
+        place: Place<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+    ) -> Option<(DefId, UnionAccessField)> {
+        let TyKind::Adt(adt, _) = self.body.local_decls[place.local].ty.kind() else {
+            return None;
+        };
+        if !adt.is_union() || !place.projection.is_empty() {
+            return None;
+        }
+
+        let Rvalue::Aggregate(box AggregateKind::Adt(_, _, _, _, Some(field_idx)), _) = rvalue
+        else {
+            return None;
+        };
+
+        Some((adt.did(), UnionAccessField::Field(field_idx.as_usize())))
+    }
+
+    fn resolve_callee(&self, func: &Operand<'tcx>) -> Option<DefId> {
         if let Some((callee, _)) = func.const_fn_def() {
             return Some(callee);
         }
@@ -733,6 +740,32 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             None
         }
     }
+}
+
+fn classify_access(context: PlaceContext) -> Option<AccessKind> {
+    match context {
+        PlaceContext::NonUse(_) => None,
+        PlaceContext::MutatingUse(MutatingUseContext::Store | MutatingUseContext::AsmOutput) => {
+            Some(AccessKind::Write)
+        }
+        PlaceContext::MutatingUse(MutatingUseContext::Projection)
+        | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection) => None,
+        PlaceContext::NonMutatingUse(
+            NonMutatingUseContext::Copy
+            | NonMutatingUseContext::Inspect
+            | NonMutatingUseContext::Move,
+        ) => Some(AccessKind::Read),
+        _ => None,
+    }
+}
+
+fn ranges_overlap(
+    a_start: andersen::Loc,
+    a_end: andersen::Loc,
+    b_start: andersen::Loc,
+    b_end: andersen::Loc,
+) -> bool {
+    a_start <= b_end && b_start <= a_end
 }
 
 fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(

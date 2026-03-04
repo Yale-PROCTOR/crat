@@ -8,7 +8,7 @@ use rustc_middle::{
 use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
-    analysis::{UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUses, UnionWrite},
+    analysis::{UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUseResult, UnionWrite},
     callgraph::CallGraph,
 };
 
@@ -25,7 +25,7 @@ pub struct ReverseCfgTypeResult {
 
 pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
-    union_uses: &UnionUses,
+    union_uses: &UnionUseResult,
     callgraphs: &FxHashMap<LocalDefId, CallGraph>,
     use_optimized_mir: bool,
 ) -> ReverseCfgAnalysis {
