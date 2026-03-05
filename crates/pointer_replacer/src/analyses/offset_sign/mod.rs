@@ -23,6 +23,7 @@ use crate::utils::rustc::RustProgram;
 
 /// 7-element sign lattice:
 ///
+/// ```text
 ///               ⊤
 ///            /  |  \
 ///         NonNeg | NonPos
@@ -30,6 +31,7 @@ use crate::utils::rustc::RustProgram;
 ///        Pos  Zero  Neg
 ///               |
 ///               ⊥
+/// ```
 /// - Slice:              `{ Bottom, Zero, Pos, NonNeg }`
 /// - SliceCursor: `{ Neg, NonPos, Top }`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

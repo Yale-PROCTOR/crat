@@ -1412,7 +1412,7 @@ pub unsafe extern "C" fn foo() {
         .offset(1 as libc::c_int as isize) = 0 as libc::c_char;
 }
 "#,
-        &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize]"],
+        &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize..]"],
         &["*mut", "as *mut"],
     );
 }
