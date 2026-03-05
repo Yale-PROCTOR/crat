@@ -1503,7 +1503,7 @@ pub unsafe extern "C" fn bar() {
 
 mod ownership_analysis {
     use rustc_hash::{FxHashMap, FxHashSet};
-    use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
+    use rustc_hir::{def_id::DefId, ItemKind, OwnerNode};
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
 
@@ -1511,13 +1511,15 @@ mod ownership_analysis {
         analyses::{
             output_params::compute_output_params,
             ownership::{
-                AnalysisKind, CrateCtxt, Ownership, Param,
-                ssa::{AnalysisResults, consume::Consume},
+                ssa::{consume::Consume, AnalysisResults},
                 whole_program::WholeProgramAnalysis,
+                AnalysisKind, CrateCtxt, Ownership, Param,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         },
+        rewriter::build_analysis_artifacts_for_test,
         utils::rustc::RustProgram,
+        Config,
     };
 
     fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
@@ -1898,6 +1900,55 @@ pub unsafe fn make_holder() -> Holder {
                 let fields = solidified.struct_results(&holder).collect::<Vec<_>>();
                 assert_eq!(fields.len(), 1);
                 assert_eq!(fields[0].len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn rewriter_analysis_artifacts_cover_all_rewritten_functions() {
+        run_compiler(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    malloc(4)
+}
+
+pub unsafe fn passthrough(p: *mut i32) -> *mut i32 {
+    p
+}
+"#,
+            |tcx| {
+                let config = Config::default();
+                let (program, output_params, ownership_schemes, ownership_solidified) =
+                    build_analysis_artifacts_for_test(&config, tcx);
+
+                assert!(
+                    !program.functions.is_empty(),
+                    "expected at least one rewritten function"
+                );
+
+                for local_did in &program.functions {
+                    let did = local_did.to_def_id();
+                    let fn_path = program.tcx.def_path_str(did);
+                    assert!(
+                        output_params.contains_key(local_did),
+                        "missing output-params entry for `{fn_path}`",
+                    );
+                    assert!(
+                        ownership_schemes.fn_results(did).is_some(),
+                        "missing ownership scheme results for `{fn_path}`",
+                    );
+
+                    let local_count = program.tcx.optimized_mir(did).local_decls.len();
+                    let observed_locals = ownership_solidified.fn_results(&did).results().count();
+                    assert_eq!(
+                        observed_locals, local_count,
+                        "solidified ownership local count mismatch for `{fn_path}`",
+                    );
+                }
             },
         );
     }

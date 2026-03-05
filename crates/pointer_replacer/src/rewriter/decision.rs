@@ -1,12 +1,12 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::{IndexVec, bit_set::DenseBitSet};
+use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::{
     mir::{Local, LocalDecl},
     ty::TyCtxt,
 };
 use rustc_span::def_id::LocalDefId;
 
-use super::{Analysis, collector::collect_fn_ptrs};
+use super::{collector::collect_fn_ptrs, Analysis};
 use crate::utils::rustc::RustProgram;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,7 +43,7 @@ pub struct DecisionMaker<'tcx> {
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
-    pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
+    pub fn new(analysis: &Analysis<'tcx>, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
         let mutable_pointers = analysis
             .mutability_result
             .function_body_facts(did)
@@ -136,7 +136,7 @@ pub struct SigDecisions {
 }
 
 impl SigDecisions {
-    pub fn new(rust_program: &RustProgram, analysis: &Analysis) -> Self {
+    pub fn new<'tcx>(rust_program: &RustProgram<'tcx>, analysis: &Analysis<'tcx>) -> Self {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());
 

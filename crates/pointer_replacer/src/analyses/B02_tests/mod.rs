@@ -1,12 +1,16 @@
 #![allow(non_snake_case)]
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex, OnceLock,
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
+use rustc_hir::{def_id::DefId, ItemKind, OwnerNode};
 use rustc_middle::{
     mir::{Local, VarDebugInfoContents},
     ty::TyCtxt,
@@ -17,13 +21,15 @@ use crate::{
     analyses::{
         output_params::compute_output_params,
         ownership::{
-            AnalysisKind, CrateCtxt, Ownership, Param,
             ssa::AnalysisResults,
             whole_program::{WholeProgramAnalysis, WholeProgramResults},
+            AnalysisKind, CrateCtxt, Ownership, Param,
         },
         type_qualifier::foster::mutability::mutability_analysis,
     },
+    replace_local_borrows,
     utils::rustc::RustProgram,
+    Config,
 };
 
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
@@ -124,8 +130,10 @@ pub(super) fn run_ownership_case_with_assertions(case_name: &str, code: &str) {
                 case_name
             );
 
-            for (slot_idx, (observed_slot, expected_ty)) in
-                observed.into_iter().zip(expected_tys.into_iter()).enumerate()
+            for (slot_idx, (observed_slot, expected_ty)) in observed
+                .into_iter()
+                .zip(expected_tys.into_iter())
+                .enumerate()
             {
                 let is_pointer_like =
                     expected_ty.is_raw_ptr() || expected_ty.is_ref() || expected_ty.is_box();
@@ -303,6 +311,51 @@ struct TotalB02Stats {
 const EXPECTED_B02_CASES: usize = 86;
 static B02_CASE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_B02_STATS: OnceLock<Mutex<TotalB02Stats>> = OnceLock::new();
+static B02_REWRITE_ARTIFACTS: OnceLock<Mutex<FxHashMap<String, String>>> = OnceLock::new();
+static B02_REWRITE_ARTIFACT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn rewrite_artifact_path() -> Option<&'static PathBuf> {
+    B02_REWRITE_ARTIFACT_PATH
+        .get_or_init(|| env::var_os("B02_REWRITE_ARTIFACT_PATH").map(PathBuf::from))
+        .as_ref()
+}
+
+fn rewrite_artifact_only_mode() -> bool {
+    env::var_os("B02_REWRITE_ARTIFACT_ONLY").is_some()
+}
+
+fn maybe_record_rewrite_artifact(case_name: &str, rewritten: &str) {
+    let Some(path) = rewrite_artifact_path() else {
+        return;
+    };
+
+    let lock = B02_REWRITE_ARTIFACTS.get_or_init(|| Mutex::new(FxHashMap::default()));
+    let mut artifacts = lock
+        .lock()
+        .expect("B02 rewrite artifact map mutex should not be poisoned");
+    artifacts.insert(case_name.to_owned(), rewritten.to_owned());
+
+    let mut entries = artifacts.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut output = String::new();
+    for (case, source) in entries {
+        output.push_str("=== ");
+        output.push_str(case);
+        output.push_str(" ===\n");
+        output.push_str(source);
+        if !source.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    fs::write(path, output).unwrap_or_else(|err| {
+        panic!(
+            "failed to write B02 rewrite artifact `{}`: {err}",
+            path.display()
+        )
+    });
+}
 
 fn record_total_analysis_stats(
     program: &RustProgram<'_>,
@@ -593,6 +646,19 @@ pub(super) fn run_ownership_case_with_box_candidates(
     expected_non_candidates: &[&str],
 ) {
     run_compiler(code, |tcx| {
+        if rewrite_artifact_path().is_some() {
+            let config = Config::default();
+            let rewritten = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                replace_local_borrows(&config, tcx)
+            }))
+            .map(|(source, _, _)| source)
+            .unwrap_or_else(|_| "<REWRITE_PANIC>".to_owned());
+            maybe_record_rewrite_artifact(case_name, &rewritten);
+        }
+        if rewrite_artifact_only_mode() {
+            return;
+        }
+
         let program = collect_program(tcx);
         let results = analyze_program(&program);
         let by_scoped_name = collect_raw_ptr_local_ownership(&program, &results);
@@ -636,7 +702,7 @@ pub(super) fn run_ownership_case_with_box_candidates(
                 .collect::<Vec<_>>();
             matches.sort();
             matches.dedup();
-                matches
+            matches
         };
 
         let extracted_allocator_related = extract_allocator_related_ptr_locals(code);
@@ -656,13 +722,17 @@ pub(super) fn run_ownership_case_with_box_candidates(
         }
         malloc_related_candidates.sort();
         malloc_related_candidates.dedup();
-        let mut effective_expected_box_candidates =
-            expected_box_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut effective_expected_box_candidates = expected_box_candidates
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
         effective_expected_box_candidates.extend(malloc_related_candidates.iter().cloned());
         effective_expected_box_candidates.sort();
         effective_expected_box_candidates.dedup();
-        let mut effective_expected_non_candidates =
-            expected_non_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut effective_expected_non_candidates = expected_non_candidates
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
         effective_expected_non_candidates.sort();
         effective_expected_non_candidates.dedup();
 

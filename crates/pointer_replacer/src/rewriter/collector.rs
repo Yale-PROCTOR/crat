@@ -1,18 +1,18 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    ExprKind, HirId, QPath, TyKind,
     def::{DefKind, Res},
-    intravisit::{Visitor, walk_expr},
+    intravisit::{walk_expr, Visitor},
+    ExprKind, HirId, QPath, TyKind,
 };
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
-use super::{Analysis, decision::PtrKind};
+use super::{decision::PtrKind, Analysis};
 use crate::{rewriter::decision::DecisionMaker, utils::rustc::RustProgram};
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
-    analysis: &Analysis,
+    analysis: &Analysis<'tcx>,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
 

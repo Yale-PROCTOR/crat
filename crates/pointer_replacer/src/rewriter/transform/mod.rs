@@ -8,18 +8,18 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
-use rustc_hir::{self as hir, HirId, def::Res, def_id::LocalDefId};
+use rustc_hir::{self as hir, def::Res, def_id::LocalDefId, HirId};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
-    ir::{AstToHir, mir_ty_to_string},
+    ir::{mir_ty_to_string, AstToHir},
 };
 
 use super::{
-    Analysis,
     collector::collect_diffs,
     decision::{PtrKind, SigDecisions},
+    Analysis,
 };
 use crate::utils::rustc::RustProgram;
 
@@ -393,7 +393,7 @@ enum PtrCtx {
 impl<'tcx> TransformVisitor<'tcx> {
     pub fn new(
         rust_program: &RustProgram<'tcx>,
-        analysis: &Analysis,
+        analysis: &Analysis<'tcx>,
         ast_to_hir: AstToHir,
     ) -> TransformVisitor<'tcx> {
         let sig_decs = SigDecisions::new(rust_program, analysis); // TODO: Move outside
@@ -1539,7 +1539,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let get_reference = |use_ref| {
             if use_ref {
-                if m { "&mut " } else { "&" }
+                if m {
+                    "&mut "
+                } else {
+                    "&"
+                }
             } else {
                 ""
             }
@@ -1584,7 +1588,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let get_reference = |use_ref| {
             if use_ref {
-                if m { "&mut " } else { "&" }
+                if m {
+                    "&mut "
+                } else {
+                    "&"
+                }
             } else {
                 ""
             }

@@ -9,6 +9,11 @@
   - `crates/pointer_replacer/src/rewriter/transform/mod.rs`
 - It does **not** describe planned behavior that is not implemented.
 
+### M1 Non-Goals (Checked-In)
+- Ownership/output-parameter facts are plumbed into rewriter analysis artifacts but **must not** change `PtrKind` decisions in M1.
+- No new ownership/output-parameter branches are used in `decision.rs` in M1.
+- Rewrite emission is unchanged by M1 plumbing; ownership analysis failures are treated as non-fatal and do not alter rewrite decisions.
+
 ## 1) Module and Function Responsibilities
 
 ### `mod.rs`
@@ -20,10 +25,13 @@
     - fatness analysis result
     - Andersen-derived param alias map
     - offset-sign result
+    - output-parameter map
+    - ownership schemes (optional, non-fatal plumbing in M1)
+    - solidified ownership schemes (optional, non-fatal plumbing in M1)
 - `Config`
   - `c_exposed_fns` only; passed through to Andersen configuration.
 - `replace_local_borrows(config, tcx) -> (String, bool, bool)`
-  - End-to-end driver: build AST, run analyses, construct `TransformVisitor`, mutate AST, render source, optionally append `slice_cursor` module, return feature flags.
+  - End-to-end driver: build AST, run analyses, construct `TransformVisitor`, mutate AST, compute ownership plumbing artifacts (non-fatal, post-rewrite setup), render source, optionally append `slice_cursor` module, return feature flags.
 - `find_param_aliases(pre, points_to, tcx)`
   - Builds per-function param alias clusters by intersecting points-to sets across call-argument pairs.
 - `slice_cursor_mod_str()`
@@ -83,14 +91,19 @@
    - promoted mutable/shared reference extraction
    - fatness analysis
    - offset-sign analysis
-7. Build `Analysis` with the six fields listed in Section 1.
+   - output-parameter analysis
+7. Build `Analysis` with the fields listed in Section 1, including ownership/output-parameter plumbing slots.
 8. Construct `TransformVisitor::new(&input, &analysis_results, ast_to_hir)`:
    - computes `sig_decs = SigDecisions::new(...)`
    - computes `ptr_kinds = collect_diffs(...)`
 9. Mutate AST (`visitor.visit_crate(&mut krate)`).
-10. Render rewritten crate (`pprust::crate_to_string_for_macros`).
-11. If `visitor.slice_cursor` is true, append `slice_cursor_mod_str()`.
-12. Return `(rewritten_code, visitor.bytemuck.get(), slice_cursor_used)`.
+10. Compute ownership plumbing artifacts from output-parameter facts:
+   - whole-program ownership schemes
+   - solidified ownership schemes
+   - this step is non-fatal in M1 and does not affect rewrite decisions
+11. Render rewritten crate (`pprust::crate_to_string_for_macros`).
+12. If `visitor.slice_cursor` is true, append `slice_cursor_mod_str()`.
+13. Return `(rewritten_code, visitor.bytemuck.get(), slice_cursor_used)`.
 
 ## 3) Decision Logic (`decision.rs`)
 
@@ -104,6 +117,9 @@ For one function (`did`), `DecisionMaker::new` computes:
   - dense bitsets keyed by MIR `Local`.
 - `needs_cursor`:
   - local requires cursor when offset-sign facts for its HIR binding report `needs_cursor()`.
+
+M1 note:
+- `output_params`, `ownership_schemes`, and `ownership_solidified` are currently **not consumed** by `DecisionMaker::new` and do not participate in branch selection.
 
 ### 3.2 Branch-Ordered Precedence (`DecisionMaker::decide`)
 The following table is exact branch order.
@@ -143,6 +159,7 @@ Current consequence: non-raw return signature rewrites are intentionally disable
 
 ## 4) `SigDecisions` and `collect_diffs` Interaction
 - `TransformVisitor::new` computes both from the same `Analysis` snapshot.
+- The snapshot now carries output/ownership plumbing fields, but `SigDecisions`/`collect_diffs` still consume only mutability/fatness/promoted-ref/alias/offset-sign facts in M1.
 - `SigDecisions` drives:
   - function signature parameter/return type rewriting (`visit_item`)
   - call-argument target kind selection (`visit_expr` call branch)

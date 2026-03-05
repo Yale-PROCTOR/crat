@@ -14,6 +14,12 @@ use crate::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
         offset_sign::OffsetSignResult,
+        output_params::OutputParams,
+        ownership::{
+            solidify::SolidifiedOwnershipSchemes,
+            whole_program::{WholeProgramAnalysis, WholeProgramResults},
+            AnalysisKind, CrateCtxt,
+        },
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -23,13 +29,16 @@ mod collector;
 mod decision;
 mod transform;
 
-pub struct Analysis {
+pub struct Analysis<'tcx> {
     promoted_mut_ref_result: PromotedMutRefResult,
     promoted_shared_ref_result: PromotedMutRefResult,
     mutability_result: MutabilityResult,
     fatness_result: FatnessResult,
     aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     offset_sign_result: OffsetSignResult,
+    output_params: OutputParams,
+    ownership_schemes: Option<WholeProgramResults<'tcx>>,
+    ownership_solidified: Option<SolidifiedOwnershipSchemes>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -42,6 +51,30 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
+    let (input, mut analysis_results) = build_rewriter_input(config, tcx);
+
+    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
+    visitor.visit_crate(&mut krate);
+    let (ownership_schemes, ownership_solidified) =
+        compute_ownership_artifacts(&input, &analysis_results.output_params);
+    analysis_results.ownership_schemes = ownership_schemes;
+    analysis_results.ownership_solidified = ownership_solidified;
+
+    // add SliceCursor module to the crate if it was used
+    let slice_cursor_used = visitor.slice_cursor.get();
+    let mut code = pprust::crate_to_string_for_macros(&krate);
+    if slice_cursor_used {
+        code.push('\n');
+        code.push_str(slice_cursor_mod_str());
+    }
+
+    (code, visitor.bytemuck.get(), slice_cursor_used)
+}
+
+fn build_rewriter_input<'tcx>(
+    config: &Config,
+    tcx: TyCtxt<'tcx>,
+) -> (RustProgram<'tcx>, Analysis<'tcx>) {
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
@@ -85,6 +118,9 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         source_var_groups.postprocess_promoted_mut_refs(shared_references);
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let offset_sign_result = analyses::offset_sign::offset_sign_analysis(&input);
+    let output_params =
+        analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
@@ -92,20 +128,68 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         fatness_result,
         aliases,
         offset_sign_result,
+        output_params,
+        ownership_schemes: None,
+        ownership_solidified: None,
     };
 
-    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
-    visitor.visit_crate(&mut krate);
+    (input, analysis_results)
+}
 
-    // add SliceCursor module to the crate if it was used
-    let slice_cursor_used = visitor.slice_cursor.get();
-    let mut code = pprust::crate_to_string_for_macros(&krate);
-    if slice_cursor_used {
-        code.push('\n');
-        code.push_str(slice_cursor_mod_str());
+#[cfg(test)]
+pub(crate) fn build_analysis_artifacts_for_test<'tcx>(
+    config: &Config,
+    tcx: TyCtxt<'tcx>,
+) -> (
+    RustProgram<'tcx>,
+    OutputParams,
+    WholeProgramResults<'tcx>,
+    SolidifiedOwnershipSchemes,
+) {
+    let (input, mut analysis) = build_rewriter_input(config, tcx);
+    let (ownership_schemes, ownership_solidified) =
+        compute_ownership_artifacts(&input, &analysis.output_params);
+    analysis.ownership_schemes = ownership_schemes;
+    analysis.ownership_solidified = ownership_solidified;
+    let Analysis {
+        output_params,
+        ownership_schemes,
+        ownership_solidified,
+        ..
+    } = analysis;
+    let ownership_schemes =
+        ownership_schemes.expect("expected ownership schemes for test analysis artifacts");
+    let ownership_solidified =
+        ownership_solidified.expect("expected solidified ownership for test analysis artifacts");
+    (
+        input,
+        output_params,
+        ownership_schemes,
+        ownership_solidified,
+    )
+}
+
+fn compute_ownership_artifacts<'tcx>(
+    input: &RustProgram<'tcx>,
+    output_params: &OutputParams,
+) -> (
+    Option<WholeProgramResults<'tcx>>,
+    Option<SolidifiedOwnershipSchemes>,
+) {
+    let crate_ctxt = CrateCtxt::new(input);
+    match <WholeProgramAnalysis as AnalysisKind>::analyze(crate_ctxt, output_params) {
+        Ok(ownership_schemes) => {
+            let ownership_solidified = ownership_schemes.solidify(input);
+            (Some(ownership_schemes), Some(ownership_solidified))
+        }
+        Err(err) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "rewriter ownership analysis failed; continuing without ownership facts: {err}"
+            );
+            (None, None)
+        }
     }
-
-    (code, visitor.bytemuck.get(), slice_cursor_used)
 }
 
 fn find_param_aliases<'tcx>(
