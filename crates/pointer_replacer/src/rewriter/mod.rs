@@ -186,6 +186,15 @@ fn slice_cursor_mod_str() -> &'static str {
             SliceCursor { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: self.pos }
         }
 
+        pub fn to_ref_cursor(&self) -> SliceCursorRef<'a, T> {
+            let ptr = self.base.as_ptr();
+            let len = self.base.len();
+            SliceCursorRef {
+                base: unsafe { std::slice::from_raw_parts(ptr, len) },
+                pos: self.pos,
+            }
+        }
+
         pub fn seek(&mut self, offset: isize) {
             self.pos = (self.pos as isize + offset) as usize;
         }

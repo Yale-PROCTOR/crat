@@ -1015,10 +1015,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, m, lhs_inner_ty, rhs_inner_ty);
                     if !m && m1 {
-                        result = utils::expr!(
-                            "crate::slice_cursor::SliceCursorRef::new(({}).as_slice())",
-                            pprust::expr_to_string(&result),
-                        );
+                        result =
+                            utils::expr!("({}).to_ref_cursor()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
                     if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && !(m1 && !m) {
