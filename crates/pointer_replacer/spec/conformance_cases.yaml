@@ -1,0 +1,626 @@
+schema_version: 1
+cases:
+  - id: TY-100-MOVE
+    category: TY
+    preconditions:
+      - decision depth-0 is Move
+    input_pattern: "type '*mut T' in signature/field"
+    expected_rewrite:
+      - "Option<Box<T>>"
+    notes: "Safe owning pointer type mapping"
+    compatibility_note: null
+
+  - id: TY-100-MUT
+    category: TY
+    preconditions:
+      - decision depth-0 is Mut
+    input_pattern: "type '*mut T' in signature/field"
+    expected_rewrite:
+      - "Option<&mut T>"
+    notes: "Output-param owning downgrade path"
+    compatibility_note: null
+
+  - id: TY-100-CONST
+    category: TY
+    preconditions:
+      - decision depth-0 is Const
+    input_pattern: "type '*const T' in signature/field"
+    expected_rewrite:
+      - "Option<&T>"
+    notes: "Const-reference mode"
+    compatibility_note: null
+
+  - id: TY-110-RAW
+    category: TY
+    preconditions:
+      - decision depth-0 is Raw(Const|Mut|Move)
+    input_pattern: "raw pointer type"
+    expected_rewrite:
+      - "Raw(Const) => *const T"
+      - "Raw(Mut) => *mut T"
+      - "Raw(Move) => *mut /* owning */ T"
+    notes: "Raw families"
+    compatibility_note: null
+
+  - id: TY-120-RETYPE
+    category: TY
+    preconditions:
+      - option type_reconstruction=true
+    input_pattern: "nested type alias/array/pointer"
+    expected_rewrite:
+      - "whole type replaced by reconstructed string"
+    notes: "Full recursive reconstruction"
+    compatibility_note: null
+
+  - id: TY-130-OUTERMOST
+    category: TY
+    preconditions:
+      - option type_reconstruction=false
+    input_pattern: "nested pointer chain"
+    expected_rewrite:
+      - "outermost pointer qualifiers rewritten by depth"
+    notes: "Span-conservative mode"
+    compatibility_note: null
+
+  - id: TY-140-DEFAULT-IMPL
+    category: TY
+    preconditions:
+      - effective no_box=false
+    input_pattern: "struct item"
+    expected_rewrite:
+      - "append impl Default for Struct"
+    notes: "Default generation"
+    compatibility_note: null
+
+  - id: TY-150-OWNING-STRUCT
+    category: TY
+    preconditions:
+      - struct_decision.is_owning=true
+    input_pattern: "struct item"
+    expected_rewrite:
+      - "prepend struct ErasedByRefactorerN;"
+      - "prepend #[repr(C)]"
+      - "append take(&mut self) using core::mem::take"
+    notes: "Owning struct scaffolding"
+    compatibility_note: null
+
+  - id: TY-160-DEFAULT-FIELDS
+    category: TY
+    preconditions:
+      - struct has pointer and array fields
+    input_pattern: "field declarations"
+    expected_rewrite:
+      - "raw ptr fields default to null/null_mut"
+      - "safe ptr fields default to None"
+      - "arrays default recursively"
+    notes: "Default initializer policy"
+    compatibility_note: null
+
+  - id: TY-170-DEALIAS
+    category: TY
+    preconditions:
+      - local type alias exists
+    input_pattern: "field/signature alias"
+    expected_rewrite:
+      - "decision applied through dealiased type"
+    notes: "Alias peeling"
+    compatibility_note: null
+
+  - id: TY-180-NO-BOX
+    category: TY
+    preconditions:
+      - effective no_box=true
+    input_pattern: "struct item"
+    expected_rewrite:
+      - "no impl Default insertion"
+    notes: "No-box suppresses generated defaults"
+    compatibility_note: null
+
+  - id: SIG-100-RET
+    category: SIG
+    preconditions:
+      - function has return pointer type
+    input_pattern: "fn ret type"
+    expected_rewrite:
+      - "rewrite by decision[0]"
+    notes: "Return rule"
+    compatibility_note: null
+
+  - id: SIG-110-ARGS
+    category: SIG
+    preconditions:
+      - function has pointer args
+    input_pattern: "fn input types"
+    expected_rewrite:
+      - "rewrite by decision[1..]"
+    notes: "Parameter type rule"
+    compatibility_note: null
+
+  - id: SIG-120-MUT-BINDING
+    category: SIG
+    preconditions:
+      - parameter binding not mutable
+    input_pattern: "fn body param pattern"
+    expected_rewrite:
+      - "insert 'mut ' prefix"
+    notes: "Binding mutability normalization"
+    compatibility_note: null
+
+  - id: SIG-130-TYPE-ONLY
+    category: SIG
+    preconditions:
+      - option type_only=true
+    input_pattern: "function with body"
+    expected_rewrite:
+      - "signature rewritten"
+      - "body unchanged"
+    notes: "Type-only gate"
+    compatibility_note: null
+
+  - id: SIG-140-C-VARIADIC
+    category: SIG
+    preconditions:
+      - function is c_variadic
+    input_pattern: "extern variadic function"
+    expected_rewrite:
+      - "signature rewritten"
+      - "body rewrite skipped"
+    notes: "Variadic safety gate"
+    compatibility_note: null
+
+  - id: MIR-100-ASSIGN-ELIGIBILITY
+    category: MIR
+    preconditions:
+      - assignment destination local meets eligibility
+    input_pattern: "StatementKind::Assign"
+    expected_rewrite:
+      - "apply lhs and/or rhs rewrite"
+    notes: "Eligibility matrix"
+    compatibility_note: null
+
+  - id: MIR-110-ASSIGN-SPLIT
+    category: MIR
+    preconditions:
+      - parsed statement is simple assignment
+    input_pattern: "lhs = rhs"
+    expected_rewrite:
+      - "lhs span rewritten by place-store"
+      - "rhs rewritten independently"
+    notes: "Operator position split"
+    compatibility_note: null
+
+  - id: MIR-120-ASSUME
+    category: MIR
+    preconditions:
+      - StatementKind::Intrinsic Assume
+    input_pattern: "assume(cond)"
+    expected_rewrite:
+      - "()"
+    notes: "Assume erased"
+    compatibility_note: null
+
+  - id: MIR-130-SWITCHINT
+    category: MIR
+    preconditions:
+      - TerminatorKind::SwitchInt
+    input_pattern: "if/match discriminator"
+    expected_rewrite:
+      - "discriminator place rewritten in by-value mode"
+      - "match prefix normalized to 'match ' when needed"
+    notes: "Control-flow expression load"
+    compatibility_note: null
+
+  - id: MIR-140-RETURN
+    category: MIR
+    preconditions:
+      - RETURN_PLACE not user variable and has def
+    input_pattern: "TerminatorKind::Return"
+    expected_rewrite:
+      - "rewrite return temporary"
+    notes: "Synthetic return temp handling"
+    compatibility_note: null
+
+  - id: MIR-150-PLACE-STORE
+    category: MIR
+    preconditions:
+      - assign lhs place with deref/field/index chain
+    input_pattern: "place store path"
+    expected_rewrite:
+      - "safe deref uses .as_deref_mut().unwrap()"
+      - "raw deref uses *expr"
+      - "field/index projections preserved"
+    notes: "Store projection synthesis"
+    compatibility_note: null
+
+  - id: MIR-160-PLACE-LOAD-VALUE
+    category: MIR
+    preconditions:
+      - operand place load by value
+    input_pattern: "Operand::Copy/Move"
+    expected_rewrite:
+      - "projected load expression emitted"
+      - "followed by ADAPT rules"
+    notes: "Load then adapt"
+    compatibility_note: null
+
+  - id: MIR-170-PLACE-LOAD-REF
+    category: MIR
+    preconditions:
+      - Rvalue::Ref with mutable borrow
+    input_pattern: "&mut place"
+    expected_rewrite:
+      - "append .as_mut_ptr() for as_mut_ptr pattern"
+      - "append .as_va_list() for as_va_list pattern"
+    notes: "By-ref specialized paths"
+    compatibility_note: null
+
+  - id: MIR-180-PLACE-LOAD-ADDR
+    category: MIR
+    preconditions:
+      - Rvalue::AddressOf mut
+    input_pattern: "addr_of mut place"
+    expected_rewrite:
+      - "Some(&mut expr) | Some(&expr) | core::ptr::addr_of!(expr) | core::ptr::addr_of_mut!(expr)"
+    notes: "Address-taking normalization"
+    compatibility_note: null
+
+  - id: MIR-190-TEMPORARY
+    category: MIR
+    preconditions:
+      - temporary local used
+    input_pattern: "def-use chain resolution"
+    expected_rewrite:
+      - "phi defs rewritten"
+      - "assign def rewritten"
+      - "deinit ignored"
+    notes: "Temporary recursion behavior"
+    compatibility_note: null
+
+  - id: MIR-200-INDEX-SPLIT
+    category: MIR
+    preconditions:
+      - replacement contains one or more index placeholders
+    input_pattern: "indexed place"
+    expected_rewrite:
+      - "split replacement around index spans"
+    notes: "Sentinel-based segmented replacement"
+    compatibility_note: null
+
+  - id: MIR-210-PARTIAL-PROJECTION
+    category: MIR
+    preconditions:
+      - tuple-like field projection in checked-add or union field path
+    input_pattern: "projection walk"
+    expected_rewrite:
+      - "skip unsupported step while preserving source"
+    notes: "Known partial handling"
+    compatibility_note: null
+
+  - id: MIR-220-UNSUPPORTED
+    category: MIR
+    preconditions:
+      - unsupported rvalue or terminator kind
+    input_pattern: "unhandled MIR construct"
+    expected_rewrite:
+      - "left unchanged with logging"
+    notes: "Graceful unsupported behavior"
+    compatibility_note: null
+
+  - id: MIR-230-DEREF-TEMP
+    category: MIR
+    preconditions:
+      - local is LocalInfo::DerefTemp chain
+    input_pattern: "CopyForDeref links"
+    expected_rewrite:
+      - "collapse chain to base place before rewrite"
+    notes: "Deref-temp accumulation"
+    compatibility_note: null
+
+  - id: ADAPT-100-MOVE-REQUIRED
+    category: ADAPT
+    preconditions:
+      - required is rustc move object
+    input_pattern: "adapt_usage call"
+    expected_rewrite:
+      - "indirect move->move appends .take()"
+      - "raw produced wraps Some(Box::from_raw(expr))"
+    notes: "Move destination adaptation"
+    compatibility_note: null
+
+  - id: ADAPT-110-RAW-MOVE-REQUIRED
+    category: ADAPT
+    preconditions:
+      - required is raw move pointer
+    input_pattern: "adapt_usage raw move branch"
+    expected_rewrite:
+      - "safe move produced appends .map(Box::into_raw).unwrap_or(null_mut())"
+    notes: "Move-to-raw conversion"
+    compatibility_note: null
+
+  - id: ADAPT-120-RAW-POINTER
+    category: ADAPT
+    preconditions:
+      - required is raw const or raw mut
+    input_pattern: "adapt_usage raw ptr branch"
+    expected_rewrite:
+      - "safe const/mut pointers mapped and cast with null fallback"
+      - "raw mut to raw const adds explicit cast"
+    notes: "Raw pointer coercions"
+    compatibility_note: null
+
+  - id: ADAPT-130-SAFE-CONST
+    category: ADAPT
+    preconditions:
+      - required is safe const/copy pointer
+    input_pattern: "adapt_usage safe const branch"
+    expected_rewrite:
+      - "raw produced => .as_ref()"
+      - "safe move-like => .as_deref()"
+      - "safe copy-like => .clone()"
+    notes: "Safe const adaptation"
+    compatibility_note: null
+
+  - id: ADAPT-140-IRRELEVANT
+    category: ADAPT
+    preconditions:
+      - required context is irrelevant and produced safe pointer
+    input_pattern: "comparison/address contexts"
+    expected_rewrite:
+      - ".as_deref().map(|r| r as *const _).unwrap_or(std::ptr::null())"
+    notes: "Irrelevant-context cast"
+    compatibility_note: null
+
+  - id: ADAPT-150-SAFE-MUT
+    category: ADAPT
+    preconditions:
+      - required is mutable safe pointer
+    input_pattern: "adapt_usage mutable branch"
+    expected_rewrite:
+      - "raw produced => .as_mut()"
+      - "safe produced => .as_deref_mut()"
+    notes: "Mutable adaptation"
+    compatibility_note: null
+
+  - id: ADAPT-160-RAW-MUT-CORRECTED
+    category: ADAPT
+    preconditions:
+      - produced pointer class is Raw(Mut)
+      - required pointer class is Raw(Const)
+    input_pattern: "adapt_usage raw mut -> raw const branch"
+    expected_rewrite:
+      - "append explicit cast to *const PointeeType"
+      - "branch selected only when produced is Raw(Mut)"
+    notes: "Corrected-intended raw_mut predicate semantics"
+    compatibility_note: "Current span implementation checks Raw(Move) in is_raw_mut helper; compatibility mode may reproduce that bug."
+
+  - id: CONST-100-NULL-TO-NONE
+    category: CONST
+    preconditions:
+      - scalar literal is null
+      - required context is safe pointer
+    input_pattern: "constant null in operand"
+    expected_rewrite:
+      - "None"
+    notes: "Safe nullable conversion"
+    compatibility_note: null
+
+  - id: CONST-110-NON-NULL
+    category: CONST
+    preconditions:
+      - scalar literal is non-null
+    input_pattern: "constant literal"
+    expected_rewrite:
+      - "unchanged"
+    notes: "No-op for non-null constants"
+    compatibility_note: null
+
+  - id: CONST-120-RAW-NULL
+    category: CONST
+    preconditions:
+      - scalar null but required raw pointer context
+    input_pattern: "constant null in raw context"
+    expected_rewrite:
+      - "unchanged raw null form"
+    notes: "Raw null preserved"
+    compatibility_note: null
+
+  - id: CALL-100-BOUNDARY-ARGS
+    category: CALL
+    preconditions:
+      - callee is local item function
+    input_pattern: "TerminatorKind::Call local callee"
+    expected_rewrite:
+      - "each pointer arg rewritten using callee parameter decision"
+    notes: "Boundary arg contract"
+    compatibility_note: null
+
+  - id: CALL-110-BOUNDARY-RET
+    category: CALL
+    preconditions:
+      - callee is local item function
+    input_pattern: "destination place and callee ret decision"
+    expected_rewrite:
+      - "destination adapted via ADAPT matrix"
+    notes: "Boundary return adaptation"
+    compatibility_note: null
+
+  - id: CALL-120-BOUNDARY-AS-MUT-HACK
+    category: CALL
+    preconditions:
+      - required arg class is Mut and arg local is call destination def
+    input_pattern: "boundary arg rewriting"
+    expected_rewrite:
+      - "append .as_mut() at arg def span end"
+    notes: "Current implementation hack"
+    compatibility_note: "May fail for certain no_box off combinations."
+
+  - id: CALL-130-PRECISION-LEAK
+    category: CALL
+    preconditions:
+      - precision==0 and produced move but required copy
+    input_pattern: "boundary return adaptation"
+    expected_rewrite:
+      - "required degraded to Raw(Move) leak path"
+    notes: "Low-precision fallback"
+    compatibility_note: null
+
+  - id: CALL-200-MALLOC-NO-DIRECT
+    category: CALL
+    preconditions:
+      - libc callee is malloc
+    input_pattern: "direct malloc call terminator"
+    expected_rewrite:
+      - "no immediate fn-span replacement"
+    notes: "Handled indirectly via cast path"
+    compatibility_note: null
+
+  - id: CALL-210-FREE-OWNING
+    category: CALL
+    preconditions:
+      - libc callee is free
+      - arg local decision depth-0 is Move
+    input_pattern: "free(arg)"
+    expected_rewrite:
+      - "callee span replaced with ()"
+    notes: "Safe owning deallocation elision"
+    compatibility_note: null
+
+  - id: CALL-220-FREE-NONOWNING
+    category: CALL
+    preconditions:
+      - libc callee is free
+      - arg local decision depth-0 is not Move
+    input_pattern: "free(arg)"
+    expected_rewrite:
+      - "rewrite arg-def rvalue under Raw(Mut) requirement"
+    notes: "Conservative free handling"
+    compatibility_note: null
+
+  - id: CALL-230-PRINTF
+    category: CALL
+    preconditions:
+      - libc callee is printf
+    input_pattern: "printf(fmt, arg1, arg2, ...)"
+    expected_rewrite:
+      - "args after fmt rewritten under Raw(Const) when pointer typed"
+    notes: "Vararg pointer safety"
+    compatibility_note: null
+
+  - id: CALL-240-ALLOC-TO-BOX
+    category: CALL
+    preconditions:
+      - cast operand def is malloc/calloc call
+      - required return context is rustc move object
+    input_pattern: "Rvalue::Cast from alloc result"
+    expected_rewrite:
+      - "Some(Box::new(<crate::T as Default>::default()))"
+      - "erase trailing cast text"
+    notes: "Owning allocator canonicalization"
+    compatibility_note: null
+
+  - id: CALL-250-ALLOC-NONOWNING
+    category: CALL
+    preconditions:
+      - cast operand def is malloc/calloc call
+      - required return context is not rustc move object
+    input_pattern: "Rvalue::Cast from alloc result"
+    expected_rewrite:
+      - "fallback to default call-arg rewrite"
+    notes: "Non-owning alloc path"
+    compatibility_note: null
+
+  - id: CALL-300-SLICE-AS-MUT-PTR
+    category: CALL
+    preconditions:
+      - callee path matches core::slice::*::as_mut_ptr
+    input_pattern: "library call"
+    expected_rewrite:
+      - "arg rewritten with required Raw(Mut) pointer context"
+    notes: "slice::as_mut_ptr specialization"
+    compatibility_note: null
+
+  - id: CALL-310-OPTION-IS-SOME-NONE
+    category: CALL
+    preconditions:
+      - callee path matches core::option::Option::{is_some,is_none}
+      - MIR temp def pattern is Ref(place)
+    input_pattern: "library call"
+    expected_rewrite:
+      - "receiver place rewritten and dot-joined"
+    notes: "Option predicate specialization"
+    compatibility_note: null
+
+  - id: CALL-320-PTR-IS-NULL-SAFE
+    category: CALL
+    preconditions:
+      - callee path matches core::ptr::*::is_null
+      - produced arg context is safe pointer
+    input_pattern: "library call"
+    expected_rewrite:
+      - "callee token becomes is_none()"
+      - "arg rewritten in safe const context"
+    notes: "Null check on option-like pointers"
+    compatibility_note: null
+
+  - id: CALL-330-PTR-IS-NULL-RAW
+    category: CALL
+    preconditions:
+      - callee path matches core::ptr::*::is_null
+      - produced arg context is raw pointer
+    input_pattern: "library call"
+    expected_rewrite:
+      - "arg rewritten under Raw(Const|Mut) by mutability"
+    notes: "Raw null-check path"
+    compatibility_note: null
+
+  - id: CALL-340-PTR-ADDR
+    category: CALL
+    preconditions:
+      - callee path matches core::ptr::*::addr
+    input_pattern: "library call"
+    expected_rewrite:
+      - "unchanged"
+    notes: "Explicit no-op specialization"
+    compatibility_note: null
+
+  - id: CALL-350-LIB-DEFAULT
+    category: CALL
+    preconditions:
+      - library call does not match any specialization
+    input_pattern: "library call"
+    expected_rewrite:
+      - "default pointer-arg rewrite"
+    notes: "Library fallback"
+    compatibility_note: null
+
+  - id: CALL-400-CLOSURE-FNPTR
+    category: CALL
+    preconditions:
+      - call func operand is non-constant
+    input_pattern: "closure/fn pointer call"
+    expected_rewrite:
+      - "unsafe ptr args use Raw(Const|Mut)"
+      - "region ptr args use Const|Mut"
+    notes: "Non-def-id fallback"
+    compatibility_note: null
+
+  - id: CALL-410-CALL-DEFAULT
+    category: CALL
+    preconditions:
+      - known callee but no special libc/library boundary case
+    input_pattern: "default call rewrite"
+    expected_rewrite:
+      - "pointer args rewritten by declared arg type class"
+    notes: "Generic call fallback"
+    compatibility_note: null
+
+  - id: COMPAT-C02-AST-EQUIV
+    category: COMPAT
+    preconditions:
+      - rewrite engine is AST-based (not span-based)
+      - transformed output is compared modulo alpha-equivalent formatting
+    input_pattern: "same input crate, two rewrite implementations"
+    expected_rewrite:
+      - "output programs are semantically and structurally equivalent under canonical conformance cases"
+    notes: "Maps spec compatibility note C-02 (method independence with same outcome)"
+    compatibility_note: "Equivalent output is mandatory; internal transformation strategy may differ."

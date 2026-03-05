@@ -366,6 +366,28 @@ impl MutVisitor for TransformVisitor<'_> {
                 let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
+                if self.is_free_call(func) {
+                    let rewritten = {
+                        let Some((arg, harg)) = args.iter_mut().zip(hargs.iter()).next() else {
+                            return;
+                        };
+                        let move_arg = self
+                            .local_hir_id_from_expr(harg)
+                            .and_then(|hir_id| self.ptr_kinds.get(&hir_id).copied())
+                            .is_some_and(|kind| matches!(kind, PtrKind::Move(_)));
+                        if move_arg {
+                            let drop_target = unwrap_addr_of_deref(unwrap_cast_and_paren(arg));
+                            Some(utils::expr!("drop({})", pprust::expr_to_string(drop_target)))
+                        } else {
+                            self.transform_rhs(arg, harg, PtrKind::Raw(true));
+                            None
+                        }
+                    };
+                    if let Some(rewritten) = rewritten {
+                        *expr = rewritten;
+                    }
+                    return;
+                }
                 let sig_dec = if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
                     && let Res::Def(_, def_id) = path.res
                     && let Some(def_id) = def_id.as_local()
@@ -977,6 +999,27 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn is_free_call(&self, hir_func: &hir::Expr<'tcx>) -> bool {
+        let hir_func = hir_unwrap_cast(hir_func);
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_func.kind else {
+            return false;
+        };
+        path.segments
+            .last()
+            .is_some_and(|seg| seg.ident.name.as_str() == "free")
+    }
+
+    fn local_hir_id_from_expr(&self, hir_expr: &hir::Expr<'tcx>) -> Option<HirId> {
+        let hir_expr = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_expr));
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind else {
+            return None;
+        };
+        let Res::Local(hir_id) = path.res else {
+            return None;
+        };
+        Some(hir_id)
+    }
+
     fn prefer_raw_over_slice(inner_ty: ty::Ty<'tcx>) -> bool {
         matches!(inner_ty.kind(), ty::TyKind::Foreign(..))
     }
@@ -1514,8 +1557,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Rhs(PtrKind::Move(m)), PtrKind::Move(_m1)) => {
                     return PtrKind::Move(m);
                 }
-                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Move(m1)) => {
-                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Move(_m1)) => {
+                    *ptr = self.raw_from_move(pe.base, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::Move(m1)) => {
@@ -1968,6 +2011,36 @@ impl<'tcx> TransformVisitor<'tcx> {
                 mir_ty_to_string(lhs_inner_ty, self.tcx),
                 if m && m1 { "mut" } else { "const" },
                 cast_mut,
+            )
+        }
+    }
+
+    fn raw_from_move(
+        &self,
+        e: &Expr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let into_raw_expr = format!(
+            "({}).take().map(|_x| Box::into_raw(_x)).unwrap_or(std::ptr::null_mut())",
+            pprust::expr_to_string(e)
+        );
+        if need_cast {
+            utils::expr!(
+                "({}) as *{} {}",
+                into_raw_expr,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
+        } else if m {
+            utils::expr!("{}", into_raw_expr)
+        } else {
+            utils::expr!(
+                "({}) as *const {}",
+                into_raw_expr,
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
             )
         }
     }

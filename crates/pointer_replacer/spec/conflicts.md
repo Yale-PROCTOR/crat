@@ -1,0 +1,5499 @@
+# Pointer Rewriter Conflicts
+
+## Recorded Conflicts
+
+- KEY: `TY-100|<main.rs>|src::lib::c22|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c22|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c23|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c23|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2BBVerts|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2BBVerts|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2GJK|local10`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2GJK|local10`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2GJK|local11`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2GJK|local11`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2GJK|local7`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2GJK|local7`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2GJK|local8`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2GJK|local8`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2MakeProxy|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2MakeProxy|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Witness|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Witness|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Witness|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Witness|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+- KEY: `CALL-240|<main.rs>|foo|hir6|line11`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|foo|hir6|line11`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::Opaque` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::allocate_block|hir10|line87`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::allocate_block|hir10|line87`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::lib::MemoryBlock` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::checkshift|hir52|line253`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::checkshift|hir52|line253`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::lib::ComputeState` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::complexmode|hir57|line178`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::complexmode|hir57|line178`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::lib::Result_0` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::cp_inflate|hir19|line1187`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::cp_inflate|hir19|line1187`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `calloc` skipped: target type `crate::src::lib::cp_state_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::allocate_and_compute|hir10|line137`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::allocate_and_compute|hir10|line137`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::lib::DataPoint` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_double_append|hir28|line746`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_double_append|hir28|line746`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_double` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_double_prepend|hir28|line715`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_double_prepend|hir28|line715`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_double` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_int_append|hir28|line662`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_int_append|hir28|line662`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_int` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_int_prepend|hir28|line605`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_int_prepend|hir28|line605`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_int` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_item_t_append|hir28|line868`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_item_t_append|hir28|line868`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_item_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_item_t_prepend|hir28|line810`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_item_t_prepend|hir28|line810`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_item_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_order_t_append|hir28|line919`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_order_t_append|hir28|line919`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_order_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::inventory::list_order_t_prepend|hir28|line945`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::inventory::list_order_t_prepend|hir28|line945`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::inventory::list_node_order_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::tree::tree_add_node|hir74|line3532`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::tree::tree_add_node|hir74|line3532`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `malloc` skipped: target type `crate::src::main::tree_node` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::cp_inflate|hir19|line1231`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::cp_inflate|hir19|line1231`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `calloc` skipped: target type `crate::src::lib::cp_state_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::pinflate|hir19|line1139`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::pinflate|hir19|line1139`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `calloc` skipped: target type `crate::src::lib::cp_state_t` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::luggage::main_0|hir356|line289`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::luggage::main_0|hir356|line289`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `calloc` skipped: target type `crate::src::luggage::RoutingDirective` is not defaultable under guarded policy.
+
+- KEY: `CALL-240|<main.rs>|src::lib::cp_inflate|hir19|line1140`
+  - rule_id: `CALL-240`
+  - site: `<main.rs>|src::lib::cp_inflate|hir19|line1140`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Mut)`
+  - chosen_behavior: `Raw(Mut)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: CALL-240 candidate from `calloc` skipped: target type `crate::src::lib::cp_state_t` is not defaultable under guarded policy.
+
+- KEY: `TY-100|<main.rs>|src::lib::cn_rnd_next|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cn_rnd_next|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::f11|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::f11|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::f12|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::f12|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::f13|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::f13|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::f4|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::f4|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::init_matrix|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::init_matrix|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::shift_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::shift_array|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_hash_bytes|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_hash_bytes|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_hm_find_slot|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_hm_find_slot|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_hm_find_slot|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_hm_find_slot|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_hmget_key|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_hmget_key|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_hmget_key|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_hmget_key|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_is_key_equal|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_is_key_equal|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_make_hash_index|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_make_hash_index|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_siphash_bytes|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_siphash_bytes|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::stbds_stralloc|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::stbds_stralloc|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::init_result_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::init_result_array|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_with_foreach|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_with_foreach|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::append_to_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::append_to_buffer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::add_item_to_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::add_item_to_array|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::add_item_to_array|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::add_item_to_array|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::add_item_to_object|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::add_item_to_object|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::add_item_to_object|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::add_item_to_object|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::add_item_to_object|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::add_item_to_object|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::buffer_skip_whitespace|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::buffer_skip_whitespace|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddArrayToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddArrayToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddArrayToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddArrayToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddBoolToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddBoolToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddBoolToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddBoolToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddFalseToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddFalseToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddFalseToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddFalseToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemReferenceToArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemReferenceToArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemReferenceToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemReferenceToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemReferenceToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemReferenceToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToArray|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToArray|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObjectCS|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddItemToObject|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddItemToObject|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddNullToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddNullToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddNullToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddNullToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddNumberToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddNumberToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddNumberToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddNumberToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddObjectToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddObjectToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddObjectToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddObjectToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddRawToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddRawToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddRawToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddRawToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddStringToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddStringToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddStringToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddStringToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddTrueToObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddTrueToObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_AddTrueToObject|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_AddTrueToObject|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_CreateArrayReference|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_CreateArrayReference|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_CreateObjectReference|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_CreateObjectReference|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_CreateStringReference|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_CreateStringReference|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DeleteItemFromArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DeleteItemFromArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DeleteItemFromObjectCaseSensitive|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DeleteItemFromObjectCaseSensitive|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DeleteItemFromObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DeleteItemFromObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_Delete|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_Delete|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DetachItemFromArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DetachItemFromArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DetachItemFromObjectCaseSensitive|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DetachItemFromObjectCaseSensitive|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DetachItemFromObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DetachItemFromObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DetachItemViaPointer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DetachItemViaPointer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_DetachItemViaPointer|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_DetachItemViaPointer|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_Duplicate|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_Duplicate|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_GetArrayItem|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_GetArrayItem|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_GetArraySize|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_GetArraySize|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_GetObjectItemCaseSensitive|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_GetObjectItemCaseSensitive|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_GetObjectItem|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_GetObjectItem|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_GetStringValue|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_GetStringValue|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_HasObjectItem|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_HasObjectItem|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_InsertItemInArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_InsertItemInArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_InsertItemInArray|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_InsertItemInArray|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ParseWithLength|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ParseWithLength|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ParseWithOpts|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ParseWithOpts|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ParseWithOpts|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ParseWithOpts|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_Parse|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_Parse|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_PrintBuffered|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_PrintBuffered|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_PrintPreallocated|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_PrintPreallocated|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_PrintPreallocated|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_PrintPreallocated|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_PrintUnformatted|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_PrintUnformatted|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInArray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInArray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInArray|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInArray|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInObjectCaseSensitive|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInObjectCaseSensitive|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInObjectCaseSensitive|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInObjectCaseSensitive|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInObject|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInObject|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemInObject|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemInObject|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_ReplaceItemViaPointer|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_SetNumberHelper|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_SetNumberHelper|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cJSON_free|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cJSON_free|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::cast_away_const|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::cast_away_const|local1`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::ensure|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::ensure|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::get_array_item|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::get_array_item|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::get_object_item|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::get_object_item|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::minify_string|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::minify_string|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::minify_string|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::minify_string|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::parse_hex4|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::parse_hex4|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::parse_number|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::parse_number|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::parse_number|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::parse_number|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::parse_value|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::parse_value|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::parse_value|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::parse_value|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print_number|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print_number|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print_string_ptr|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print_string_ptr|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print_string_ptr|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print_string_ptr|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print_value|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print_value|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print_value|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print_value|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::print|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::print|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::skip_multiline_comment|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::skip_multiline_comment|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::skip_oneline_comment|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::skip_oneline_comment|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::skip_utf8_bom|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::skip_utf8_bom|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::suffix_object|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::suffix_object|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::suffix_object|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::suffix_object|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::update_offset|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::update_offset|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::utf16_literal_to_utf8|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::utf16_literal_to_utf8|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::cJSON::utf16_literal_to_utf8|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::cJSON::utf16_literal_to_utf8|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::test::driver|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::test::driver|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::test::driver|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::test::driver|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::test::driver|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::test::driver|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::test::print_preallocated|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::test::print_preallocated|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::configure_flags|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::configure_flags|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_decisions|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_decisions|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::validate_sequence|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::validate_sequence|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_char_in_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_char_in_buffer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::apply_operation|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::apply_operation|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::init_state|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::init_state|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::multiply_with_log|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::multiply_with_log|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::confuse_types|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::confuse_types|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_buffer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::update_flags|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::update_flags|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_build|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_build|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_build|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_build|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_consume_bits|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_consume_bits|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_decode|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_decode|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_inflate|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_inflate|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_inflate|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_inflate|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_peak_bits|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_peak_bits|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_ptr|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_ptr|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_read_bits|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_read_bits|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::calculate_lookup|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::calculate_lookup|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_entry|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_entry|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::modify_entries|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::modify_entries|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_name|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_name|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::create_numeric_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::create_numeric_buffer|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_value_in_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_value_in_buffer|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::apply_bit_operations|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::apply_bit_operations|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::init_config_from_env|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::init_config_from_env|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::perform_operation|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::perform_operation|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::file_queue::GetFile_Queue|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::file_queue::GetFile_Queue|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::file_queue::Handle_Queue|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::file_queue::Handle_Queue|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::file_queue::Read_FileMon|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::file_queue::Read_FileMon|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::read_alert::os_calloc|local0`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::read_alert::os_calloc|local0`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::read_alert::os_realloc|local0`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::read_alert::os_realloc|local0`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::read_alert::os_strdup|local0`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::read_alert::os_strdup|local0`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_and_replace_char|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_and_replace_char|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_octal_string|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_octal_string|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CastRay|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CastRay|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2RaytoAABB|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2RaytoAABB|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2RaytoCapsule|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2RaytoCapsule|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2RaytoCircle|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2RaytoCircle|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::gen_ray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::gen_ray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::gen_ray|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::gen_ray|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::gen_ray|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::gen_ray|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_double_clear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_double_clear|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_double_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_double_get|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_double_push|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_double_push|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_int_clear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_int_clear|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_int_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_int_get|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_int_push|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_int_push|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_item_t_clear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_item_t_clear|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_item_t_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_item_t_get|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_item_t_push|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_item_t_push|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_order_t_clear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_order_t_clear|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_order_t_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_order_t_get|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::array_order_t_push|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::array_order_t_push|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::calculate_inventory_stats|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::calculate_inventory_stats|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::find_items_by_category|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::find_items_by_category|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_double_append|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_double_append|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_double_prepend|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_double_prepend|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_int_append|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_int_append|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_int_prepend|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_int_prepend|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_item_t_append|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_item_t_append|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_item_t_prepend|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_item_t_prepend|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_order_t_append|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_order_t_append|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::inventory::list_order_t_prepend|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::inventory::list_order_t_prepend|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::gjk|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::gjk|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::gjk|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::gjk|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_clear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_clear|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_contains|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_contains|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_get|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_put|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_put|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_put|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_put|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_remove|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_remove|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::hashmap::hashmap_resize|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::hashmap::hashmap_resize|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_contains|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_contains|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_count_descendants|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_count_descendants|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_find_path|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_find_path|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_find_path|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_find_path|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_get_depth|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_get_depth|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_get_height|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_get_height|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_get_node|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_get_node|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_print_helper|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_print_helper|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_remove_node|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_remove_node|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::tree::tree_remove_subtree|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::tree::tree_remove_subtree|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::manipulate_records|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::manipulate_records|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::shift_array_data|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::shift_array_data|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_backward|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_backward|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::UTIL_createLinePointers|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::UTIL_createLinePointers|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_chunk|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_chunk|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::cp_find|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::cp_find|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::allocate_results|local0`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::allocate_results|local0`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::perform_computation_with_history|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::perform_computation_with_history|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::perform_computation_with_history|local5`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::perform_computation_with_history|local5`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::add_element|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::add_element|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::expand_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::expand_array|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::complex_iteration|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::complex_iteration|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::count_occurrences|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::count_occurrences|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::memchra|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::memchra|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::safe_sum_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::safe_sum_array|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_conditional_copy|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_conditional_copy|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_conditional_copy|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_conditional_copy|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_copy_strided|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_copy_strided|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_copy_strided|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_copy_strided|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_copy|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_copy|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_copy|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_copy|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_interleave|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_interleave|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_interleave|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_interleave|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_interleave|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_interleave|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_merge|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_merge|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_merge|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_merge|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_merge|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_merge|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_reverse|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_reverse|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_rotate|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_rotate|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_split|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_split|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_split|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_split|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::buffer_split|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::buffer_split|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::calculate_checksum|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::calculate_checksum|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::process_buffer_array|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::process_buffer_array|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::read_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::read_buffer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::validate_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::validate_buffer|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::compact_runs|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::compact_runs|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::interleave_halves|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::interleave_halves|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::remove_duplicates|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::remove_duplicates|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::reverse_segments|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::reverse_segments|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::rotate_buffer|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::rotate_buffer|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::add_edge|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::add_edge|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::add_edge|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::add_edge|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::add_node|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::add_node|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_shortest_path|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_shortest_path|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_shortest_path|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_shortest_path|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_shortest_path|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_shortest_path|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::get_node_by_name|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::get_node_by_name|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::increment_refs_recursive|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::increment_refs_recursive|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::increment_refs_recursive|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::increment_refs_recursive|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::increment_refs_recursive|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::increment_refs_recursive|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::print_graph|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::print_graph|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::print_node|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::print_node|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::shallow_copy|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::shallow_copy|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::ptr_from_parts|local0`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::ptr_from_parts|local0`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2AABBtoAABBManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2AABBtoAABBManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2AABBtoCapsuleManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2AABBtoCapsuleManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CapsuletoCapsuleManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CapsuletoCapsuleManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CapsuletoPolyManifold|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CapsuletoPolyManifold|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CapsuletoPolyManifold|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CapsuletoPolyManifold|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CircletoAABBManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CircletoAABBManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CircletoCapsuleManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CircletoCapsuleManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CircletoCircleManifold|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CircletoCircleManifold|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Clip|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Clip|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Collide|local5`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Collide|local5`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Incident|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Incident|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2KeepDeep|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2KeepDeep|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2Norms|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2Norms|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2SidePlanesFromPoly|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2SidePlanesFromPoly|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2SidePlanesFromPoly|local5`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2SidePlanesFromPoly|local5`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2SidePlanes|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2SidePlanes|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2SidePlanes|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2SidePlanes|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::copy_data_block|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::copy_data_block|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::pinflate|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::pinflate|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::pinflate|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::pinflate|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::scene::scene_add_shape|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::scene::scene_add_shape|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::scene::scene_add_shape|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::scene::scene_add_shape|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::scene::scene_list_shapes|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::scene::scene_list_shapes|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::scene::scene_remove_shape|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::scene::scene_remove_shape|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::scene::scene_save|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::scene::scene_save|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_car|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_car|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_cloud|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_cloud|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_flower|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_flower|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_heart|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_heart|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_house|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_house|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_rainbow|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_rainbow|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_star|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_star|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_sun|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_sun|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_tractor|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_tractor|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::init_tree|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::init_tree|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::shape::shape_print|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::shape::shape_print|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2CastRay|local5`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2CastRay|local5`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::c2RaytoPoly|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::c2RaytoPoly|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::poly_ray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::poly_ray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::poly_ray|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::poly_ray|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::VectorNormalizeFast|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::VectorNormalizeFast|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AddPointToBounds|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AddPointToBounds|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AddPointToBounds|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AddPointToBounds|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AngleVectors|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AngleVectors|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AngleVectors|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AngleVectors|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AngleVectors|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AngleVectors|local4`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AnglesSubtract|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AnglesSubtract|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AnglesToAxis|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AnglesToAxis|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AxisClear|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AxisClear|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::AxisCopy|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::AxisCopy|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::ByteToDir|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::ByteToDir|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::ClearBounds|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::ClearBounds|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::ClearBounds|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::ClearBounds|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::CrossProduct|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::CrossProduct|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::MakeNormalVectors|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::MakeNormalVectors|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::MakeNormalVectors|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::MakeNormalVectors|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::MatrixMultiply|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::MatrixMultiply|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::NormalizeColor|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::NormalizeColor|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::PerpendicularVector|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::PerpendicularVector|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::PlaneFromPoints|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::PlaneFromPoints|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::ProjectPointOnPlane|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::ProjectPointOnPlane|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::Q_crandom|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::Q_crandom|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::Q_random|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::Q_random|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::Q_rand|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::Q_rand|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::RotateAroundDirection|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::RotateAroundDirection|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::RotatePointAroundVector|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::RotatePointAroundVector|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::SetPlaneSignbits|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::SetPlaneSignbits|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::Vector4Scale|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::Vector4Scale|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::VectorNormalize2|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::VectorNormalize2|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::VectorNormalize|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::VectorNormalize|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::VectorRotate|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::VectorRotate|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::_VectorAdd|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::_VectorAdd|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::_VectorCopy|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::_VectorCopy|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::_VectorMA|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::_VectorMA|local4`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::_VectorScale|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::_VectorScale|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::_VectorSubtract|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::_VectorSubtract|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::q_math::vectoangles|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::q_math::vectoangles|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::FIO_createFilename_fromOutDir|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::FIO_createFilename_fromOutDir|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::FIO_createFilename_fromOutDir|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::FIO_createFilename_fromOutDir|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::extractFilename|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::extractFilename|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::spec_ray|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::spec_ray|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::analyzer::analyze_text|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::analyzer::analyze_text|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_adduser|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_adduser|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_compareN|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_compareN|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_compare|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_compare|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_createfile|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_createfile|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_debug|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_debug|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_deletefile|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_deletefile|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_get|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_get|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_login|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_login|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_match|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_match|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_readfile|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_readfile|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_set|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_set|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_startswith|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_startswith|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_unset|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_unset|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_verbose|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_verbose|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::cmd_writefile|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::cmd_writefile|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::parse_command|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::parse_command|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::parse_command|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::parse_command|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::parse_command|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::parse_command|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::find_delimiter|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::find_delimiter|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::match_pattern|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::match_pattern|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::match_pattern|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::match_pattern|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::parse_command|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::parse_command|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_strings|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_strings|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::lib::process_strings|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::lib::process_strings|local3`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::task_manager::add_task|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::task_manager::add_task|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::task_manager::destroy_task_manager|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::task_manager::destroy_task_manager|local1`
+  - legacy_decision: `Const`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::task_manager::print_tasks|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::task_manager::print_tasks|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::a::process_a_stream|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::a::process_a_stream|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::b::process_b_stream|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::b::process_b_stream|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::engine::process_stream|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::engine::process_stream|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::engine::run_engine|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::engine::run_engine|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::engine::run_engine|local4`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::engine::run_engine|local4`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::main::read_stdin|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::main::read_stdin|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_free|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_free|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_init|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_init|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_peek|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_peek|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_pop|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_pop|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_pop|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_pop|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::iv_reserve|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::iv_reserve|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::prog_fetch|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::prog_fetch|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::prog_fetch|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::prog_fetch|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::prog_init|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::prog_init|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::prog_init|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::prog_init|local2`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::vm_free|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::vm_free|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::vm_init|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::vm_init|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::vm_print|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::vm_print|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::vm_print|local3`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::vm_print|local3`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::util::vm_trace|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::util::vm_trace|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::luggage::addRoutingDirectiveToList|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::luggage::addRoutingDirectiveToList|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::luggage::addRoutingDirectiveToList|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::luggage::addRoutingDirectiveToList|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::luggage::superseded|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::luggage::superseded|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::luggage::supersedes|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::luggage::supersedes|local1`
+  - legacy_decision: `Mut`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::r#match::differentiate|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::r#match::differentiate|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::r#match::preprocess|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::r#match::preprocess|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::r#match::smoothen|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::r#match::smoothen|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::spectral_contrast::normalize|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::spectral_contrast::normalize|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::spectral_contrast::spectral_contrast|local1`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::spectral_contrast::spectral_contrast|local1`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-100|<main.rs>|src::spectral_contrast::spectral_contrast|local2`
+  - rule_id: `TY-100`
+  - site: `<main.rs>|src::spectral_contrast::spectral_contrast|local2`
+  - legacy_decision: `Raw(Mut)`
+  - spec_decision: `Move`
+  - chosen: `Move`
+  - chosen_behavior: `Move`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: Ownership analysis marks this pointer as owning; ownership-first box-class rewrite applied.
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(2609)|line396`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(2609)|line396`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` contains raw pointer to foreign extern type.
+
+- KEY: `TY-140|<main.rs>|src::cJSON::cJSON_Hooks|itemNodeId(900)|line154`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::cJSON::cJSON_Hooks|itemNodeId(900)|line154`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `cJSON_Hooks`: field `malloc_fn` is unsupported (enum field type).
+
+- KEY: `TY-140|<main.rs>|src::cJSON::internal_hooks|itemNodeId(1002)|line175`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::cJSON::internal_hooks|itemNodeId(1002)|line175`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `internal_hooks`: field `allocate` is unsupported (enum field type).
+
+- KEY: `TY-140|<main.rs>|src::lib::ProcessState|itemNodeId(919)|line179`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::ProcessState|itemNodeId(919)|line179`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `ProcessState`: field `data` is unsupported (union field type).
+
+- KEY: `TY-140|<main.rs>|src::lib::_IO_FILE|itemNodeId(179)|line54`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::_IO_FILE|itemNodeId(179)|line54`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::driver::_IO_FILE|itemNodeId(158)|line51`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::driver::_IO_FILE|itemNodeId(158)|line51`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(7460)|line1334`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(7460)|line1334`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::goto::_IO_FILE|itemNodeId(142)|line45`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::goto::_IO_FILE|itemNodeId(142)|line45`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::tree::_IO_FILE|itemNodeId(30404)|line3398`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::tree::_IO_FILE|itemNodeId(30404)|line3398`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::mdmain::_IO_FILE|itemNodeId(854)|line171`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::mdmain::_IO_FILE|itemNodeId(854)|line171`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::mdmain::_IO_FILE|itemNodeId(1019)|line170`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::mdmain::_IO_FILE|itemNodeId(1019)|line170`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::mdmain::_IO_FILE|itemNodeId(864)|line172`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::mdmain::_IO_FILE|itemNodeId(864)|line172`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::matrix::_IO_FILE|itemNodeId(658)|line139`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::matrix::_IO_FILE|itemNodeId(658)|line139`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(143)|line44`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(143)|line44`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(2633)|line626`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(2633)|line626`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::lib::_IO_FILE|itemNodeId(141)|line45`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::_IO_FILE|itemNodeId(141)|line45`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::lib::_IO_FILE|itemNodeId(1325)|line264`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::_IO_FILE|itemNodeId(1325)|line264`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::lib::re_pattern_buffer|itemNodeId(470)|line109`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::re_pattern_buffer|itemNodeId(470)|line109`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `re_pattern_buffer`: field `__buffer` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(220)|line60`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(220)|line60`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(105)|line37`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(105)|line37`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::lib::_IO_FILE|itemNodeId(161)|line48`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::lib::_IO_FILE|itemNodeId(161)|line48`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::analyzer::_IO_FILE|itemNodeId(565)|line140`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::analyzer::_IO_FILE|itemNodeId(565)|line140`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(283)|line70`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(283)|line70`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(2753)|line502`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(2753)|line502`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::driver::_IO_FILE|itemNodeId(166)|line51`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::driver::_IO_FILE|itemNodeId(166)|line51`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::main::_IO_FILE|itemNodeId(3504)|line548`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::main::_IO_FILE|itemNodeId(3504)|line548`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+
+- KEY: `TY-140|<main.rs>|src::luggage::_IO_FILE|itemNodeId(156)|line45`
+  - rule_id: `TY-140`
+  - site: `<main.rs>|src::luggage::_IO_FILE|itemNodeId(156)|line45`
+  - legacy_decision: `Raw(Const)`
+  - spec_decision: `Move`
+  - chosen: `Raw(Const)`
+  - chosen_behavior: `Raw(Const)`
+  - minimal_repro: `<pending capture>`
+  - current_output: `<pending capture>`
+  - expected_output: `<pending capture>`
+  - spec_author_question: TY-140 default synthesis skipped for `_IO_FILE`: field `_markers` is unsupported (raw pointer to unsized/foreign pointee).
+

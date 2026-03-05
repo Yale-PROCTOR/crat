@@ -263,6 +263,74 @@ pub unsafe extern "C" fn foo() -> *mut libc::c_int {
 }
 
 #[test]
+fn test_adapt110_move_to_raw_uses_box_into_raw() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+    fn consume_raw(ptr: *mut libc::c_int);
+}
+pub unsafe extern "C" fn foo() {
+    let p: *mut libc::c_int = malloc(core::mem::size_of::<libc::c_int>() as libc::size_t) as *mut libc::c_int;
+    consume_raw(p);
+}
+"#,
+        &config,
+        &["Box::into_raw"],
+        &[],
+    );
+}
+
+#[test]
+fn test_call210_free_on_move_rewrites_to_drop() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn malloc(size: libc::size_t) -> *mut libc::c_void;
+    fn free(ptr: *mut libc::c_void);
+}
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let p: *mut libc::c_int = malloc(core::mem::size_of::<libc::c_int>() as libc::size_t) as *mut libc::c_int;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    free(p as *mut libc::c_void);
+    1 as libc::c_int
+}
+"#,
+        &config,
+        &["drop(p)"],
+        &["free(p as *mut libc::c_void)"],
+    );
+}
+
+#[test]
+fn test_call220_free_non_move_keeps_free_call() {
+    let mut config = Config::default();
+    config.force_box = true;
+    run_test_with_config(
+        r#"
+use ::libc;
+unsafe extern "C" {
+    fn free(ptr: *mut libc::c_void);
+}
+pub unsafe extern "C" fn foo(p: *mut libc::c_int) {
+    free(p as *mut libc::c_void);
+}
+"#,
+        &config,
+        &["free(p as *mut libc::c_void)"],
+        &["drop(p)"],
+    );
+}
+
+#[test]
 fn test_ty140_synthesizes_named_tuple_and_unit_defaults_without_duplicates() {
     let config = Config::default();
     let output = ::utils::compilation::run_compiler_on_str(
