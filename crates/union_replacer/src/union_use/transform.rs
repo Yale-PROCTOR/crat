@@ -10,14 +10,14 @@ use super::{
         CondensationGraph, build_union_callgraphs, callgraphs_to_condensation_graphs,
         collect_union_seed_functions,
     },
-    reverse_cfg::{ReverseCfgAnalysis, analyze_reaching_writes},
+    reverse_cfg::{ReverseCfgResult, analyze_reaching_writes},
     ty_visit::{collect_local_union_types, collect_union_related_types},
 };
 
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let krate = utils::ast::expanded_ast(tcx);
     let use_optimized_mir = false;
-    let print_mir = true;
+    let print_mir = false;
 
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
     let related_types_map = collect_union_related_types(&tcx, &union_tys, &ty_visitor, verbose);
@@ -38,7 +38,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &callgraphs, use_optimized_mir);
 
-    if verbose {
+    if true {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
 
@@ -66,7 +66,7 @@ fn print_condensation_graphs(
 fn print_reaching_writes(
     tcx: TyCtxt<'_>,
     union_uses: &UnionUseResult,
-    analysis: &ReverseCfgAnalysis,
+    analysis: &ReverseCfgResult,
 ) {
     println!("\nReaching Writes:");
     let mut union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
@@ -160,6 +160,7 @@ fn print_reaching_writes(
         }
     }
 
+    // TODO: Print result at the better place
     if !overlapping_tys.is_empty() {
         overlapping_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
         println!("\noverlapping:");

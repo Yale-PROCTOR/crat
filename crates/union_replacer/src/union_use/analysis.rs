@@ -640,10 +640,10 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
                 }
             }
         }
-        println!(
-            "Detecting field for access at {place:?} of field {found:?} in function {:?}:",
-            self.def_id
-        );
+        // println!(
+        //     "Detecting field for access at {place:?} of field {found:?} in function {:?}:",
+        //     self.def_id
+        // );
         found.map_or(UnionAccessField::Top, UnionAccessField::Field)
     }
 
