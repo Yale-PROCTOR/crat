@@ -1,3 +1,5 @@
+use std::panic::AssertUnwindSafe;
+
 use super::*;
 
 fn rewrite_with_config(code: &str, config: &Config) -> (String, bool, bool) {
@@ -61,6 +63,36 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 
     assert_eq!(fallback, baseline);
     ::utils::compilation::run_compiler_on_str(&fallback.0, ::utils::type_check).expect(&fallback.0);
+}
+
+#[test]
+fn test_rewriter_panics_when_opt_box_transform_is_reached() {
+    let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn foo() -> *mut i32 {
+    let p: *mut i32 = malloc(4);
+    p
+}
+"#;
+
+    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = rewrite_with_config(code, &Config::default());
+    }))
+    .expect_err("expected M3 staging panic for OptBox local");
+
+    let message = if let Some(msg) = panic.downcast_ref::<String>() {
+        msg.clone()
+    } else if let Some(msg) = panic.downcast_ref::<&'static str>() {
+        (*msg).to_owned()
+    } else {
+        format!("{panic:?}")
+    };
+
+    assert!(message.contains("M3 staging error"), "{message}");
+    assert!(message.contains("OptBox"), "{message}");
 }
 
 // ===== Cross-PtrKind assignment tests (same type, no cast) =====

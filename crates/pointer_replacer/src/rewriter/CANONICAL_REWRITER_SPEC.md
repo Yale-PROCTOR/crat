@@ -36,13 +36,17 @@
 - `PtrKind`
   - Current variants:
     - `OptRef(bool)` (`Option<&T>` / `Option<&mut T>`)
+    - `OptBox` (`Option<Box<T>>`)
     - `Raw(bool)` (`*const T` / `*mut T`)
+    - `OptBoxedSlice` (`Option<Box<[T]>>`)
     - `Slice(bool)` (`&[T]` / `&mut [T]`)
     - `SliceCursor(bool)` (`SliceCursorRef<'_, T>` / `SliceCursor<'_, T>`)
 - `DecisionMaker::new(analysis, did, tcx)`
   - Materializes per-local facts for one function:
     - mutability-by-local
     - array/fatness-by-local
+    - top-level owning-by-local
+    - output-parameter bitset
     - promoted mut/shared sets
     - `needs_cursor` set derived from offset-sign facts via THIR->MIR binding mapping
 - `DecisionMaker::decide(local, decl, aliases) -> Option<PtrKind>`
@@ -115,7 +119,7 @@ For one function (`did`), `DecisionMaker::new` computes:
   - local requires cursor when offset-sign facts for its HIR binding report `needs_cursor()`.
 
 Current consequence:
-- `_owning_pointers` and `_output_params` are threaded into `DecisionMaker` but are not yet consulted by `decide`.
+- `_owning_pointers` and `_output_params` are now consulted by `decide`.
 
 ### 3.2 Branch-Ordered Precedence (`DecisionMaker::decide`)
 The following table is exact branch order.
@@ -124,20 +128,27 @@ The following table is exact branch order.
 |---|---|---|
 | 1 | `unwrap_ptr_from_mir_ty(decl.ty)` fails | `None` |
 | 2 | pointee is `c_void` OR file-like type | `Some(Raw(decl mutability))` |
-| 3 | alias cluster exists and any member (including `local`) is mutable | `Some(Raw(mutable_pointers[local]))` |
-| 4a | `array_pointers[local]` and local in promoted shared set and `needs_cursor` | `Some(SliceCursor(false))` |
-| 4b | `array_pointers[local]` and local in promoted shared set and not `needs_cursor` | `Some(Slice(false))` |
-| 4c | `array_pointers[local]` and local in promoted mut set and `needs_cursor` | `Some(SliceCursor(true))` |
-| 4d | `array_pointers[local]` and local in promoted mut set and not `needs_cursor` | `Some(Slice(true))` |
-| 4e | `array_pointers[local]` and not promoted | `Some(Raw(mutable_pointers[local]))` |
-| 5 | non-array and local in promoted shared set | `Some(OptRef(false))` |
-| 6 | non-array and local in promoted mut set | `Some(OptRef(true))` |
-| 7 | `decl.ty.is_raw_ptr()` | `Some(Raw(mutable_pointers[local]))` |
-| 8 | otherwise | `None` |
+| 3a | top-level owning, array, `needs_cursor`, output param | `Some(Raw(mutable_pointers[local]))` |
+| 3b | top-level owning, array, `needs_cursor`, not output param | `Some(Raw(mutable_pointers[local]))` |
+| 3c | top-level owning, array, not `needs_cursor`, output param | `Some(Slice(true))` |
+| 3d | top-level owning, array, not `needs_cursor`, not output param | `Some(OptBoxedSlice)` |
+| 4a | top-level owning, non-array, output param | `Some(OptRef(true))` |
+| 4b | top-level owning, non-array, not output param | `Some(OptBox)` |
+| 5 | alias cluster exists and any member (including `local`) is mutable | `Some(Raw(mutable_pointers[local]))` |
+| 6a | non-owning array and local in promoted shared set and `needs_cursor` | `Some(SliceCursor(false))` |
+| 6b | non-owning array and local in promoted shared set and not `needs_cursor` | `Some(Slice(false))` |
+| 6c | non-owning array and local in promoted mut set and `needs_cursor` | `Some(SliceCursor(true))` |
+| 6d | non-owning array and local in promoted mut set and not `needs_cursor` | `Some(Slice(true))` |
+| 6e | non-owning array and not promoted | `Some(Raw(mutable_pointers[local]))` |
+| 7 | non-array and local in promoted shared set | `Some(OptRef(false))` |
+| 8 | non-array and local in promoted mut set | `Some(OptRef(true))` |
+| 9 | `decl.ty.is_raw_ptr()` | `Some(Raw(mutable_pointers[local]))` |
+| 10 | otherwise | `None` |
 
 Notes:
 - `unwrap_ptr_from_mir_ty` treats both raw pointers and references as pointer-like for decision purposes.
-- Alias rule is intentionally conservative and precedes array/ref promotion.
+- `needs_cursor` remains a conservative raw staging carveout for owning arrays in M3 because signed-offset-safe owning transforms are not implemented yet.
+- Alias rule remains intentionally conservative for the non-owning path.
 
 ### 3.3 Signature Decision Rules (`SigDecisions::new`)
 1. Compute `fn_ptrs = collect_fn_ptrs(rust_program)`.
@@ -151,7 +162,7 @@ Notes:
        - `Some(Raw(m)) -> Some(Raw(m))`
        - any other result -> `None`
 
-Current consequence: non-raw return signature rewrites are intentionally disabled.
+Current consequence: non-raw return signature rewrites, including `OptBox`/`OptBoxedSlice`, are intentionally disabled in M3.
 
 ## 4) `SigDecisions` and `collect_diffs` Interaction
 - `TransformVisitor::new` computes both from the same `Analysis` snapshot.
@@ -182,6 +193,7 @@ Practical result for function-pointer-used functions:
   - Fetch `SigDecision` for this function.
   - For each parameter:
     - `OptRef(m)` -> rewrite to `Option<&{mut?} T>` via `mk_opt_ref_ty`; force binding pattern mutable.
+    - `OptBox` / `OptBoxedSlice` -> panic as an internal M3 staging error.
     - `Slice(m)` -> rewrite to `&{mut?}[T]` via `mk_slice_ty`.
     - `Raw(m)` -> rewrite to `*{mut|const} T` via `mk_raw_ptr_ty`.
     - `SliceCursor(m)` -> rewrite to cursor type via `mk_cursor_ty`; set `slice_cursor = true`.
@@ -191,6 +203,7 @@ Practical result for function-pointer-used functions:
 ### 5.2 `visit_local`
 - For let-bindings with `ptr_kinds[hir_id]`:
   - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
+  - `OptBox` / `OptBoxedSlice` currently panic as an internal M3 staging error instead of rewriting.
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
 ### 5.3 `visit_expr` major cases
@@ -199,6 +212,7 @@ Practical result for function-pointer-used functions:
     - if LHS is path and resolves to a local HIR id -> use direct index `self.ptr_kinds[&hir_id]` (not `get`); this can panic if the id is missing from `ptr_kinds`
     - else fallback `Raw(lhs mutability)`
   - Convert RHS with `transform_rhs`.
+  - `OptBox` / `OptBoxedSlice` LHS targets currently panic as an internal M3 staging error.
   - Special case for `SliceCursor` self-assign with single `offset` projection:
     - `p = p.offset(k)` -> `p.seek((k) as isize)`
 - Pointer comparisons (`== != < <= > >=`)
@@ -209,6 +223,7 @@ Practical result for function-pointer-used functions:
   - Run `hoist_opt_ref_borrow` post-pass to reduce repeated mutable deref borrow conflicts.
 - Method call `is_null`
   - local `OptRef` receiver -> rename to `is_none`
+  - local `OptBox` / `OptBoxedSlice` receiver -> panic as an internal M3 staging error
   - local `Slice` / `SliceCursor` receiver -> rename to `is_empty`
   - `Raw` -> unchanged
 - Method call `offset_from`
@@ -220,6 +235,7 @@ Practical result for function-pointer-used functions:
   - If source is cursor with exactly one offset projection, emits indexed access directly.
   - Otherwise transforms pointer and post-adjusts:
     - deref of `OptRef` -> `.unwrap()`
+    - deref of `OptBox` / `OptBoxedSlice` -> panic as an internal M3 staging error
     - deref of `Slice` -> `[0]`
     - deref of `SliceCursor` -> `[0 as usize]`
 
@@ -318,9 +334,10 @@ If no local-path kind match applies:
 1. Return borrow inference is absent.
 - `SigDecisions` only keeps `output_dec = Some(Raw(_))`; non-raw returns are dropped.
 
-2. Ownership/output-parameter analysis is not consumed by current rewriter decisions.
+2. Ownership/output-parameter analysis is now consumed by current rewriter decisions.
 - `Analysis` in `rewriter/mod.rs` now carries output-parameter facts and optional solidified ownership facts.
-- Current M2 behavior still does not consult those facts when producing rewrite decisions.
+- Current M3 behavior consults top-level ownership and output-parameter facts in `DecisionMaker::decide`.
+- Struct-field and deeper nested-pointer ownership facts are still not consumed.
 - If ownership analysis is unavailable, the rewriter continues with `ownership_schemes = None`.
 
 3. `ItemKind::Impl(_)` is skipped in `visit_item`.
@@ -333,27 +350,30 @@ If no local-path kind match applies:
 - Appears in raw->slice/cursor materialization and several non-numeric cast fallback conversions.
 - Example emitted pattern: `std::slice::from_raw_parts_mut(ptr, 100000)`.
 
-6. Multiple conversion branches intentionally panic on unsupported shapes.
+6. `OptBox` / `OptBoxedSlice` are decision-only staging kinds in M3.
+- Any transform path that reaches them panics as an internal staging error until M4A.
+
+7. Multiple other conversion branches intentionally panic on unsupported shapes.
 - Examples:
   - integer-cast pointer rewrite requested into non-raw context
   - target slice/cursor from `OptRef` source in local-path matrix
   - byte-string deref context
 
-7. `collect_diffs` only rewrites locals that have at least one mapped HIR binding.
+8. `collect_diffs` only rewrites locals that have at least one mapped HIR binding.
 - Locals without binding mapping do not get `ptr_kinds` entries.
 - Duplicate reverse-map collisions (multiple bindings to one local) are not guarded; hash-map collection would keep the last one seen.
 
-8. `hoist_opt_ref_borrow` only hoists under a narrow pattern.
+9. `hoist_opt_ref_borrow` only hoists under a narrow pattern.
 - It detects `*arg.as_deref_mut().unwrap()` style shapes and rewrites selected repeated mutable borrows.
 - candidate selection iterates hash-map entries and uses `break` when first entry is non-qualifying; this makes hoisting of later candidates iteration-order dependent.
 
-9. Alias conservatism can force raw even when other facts could allow higher-level types.
+10. Alias conservatism can force raw even when other facts could allow higher-level types.
 - Any mutable alias in the alias cluster triggers raw for that local.
 
-10. Hard raw exceptions are always applied first.
+11. Hard raw exceptions are always applied first.
 - `c_void` and file-like pointees are always `Raw`.
 
-11. Some paths use direct `ptr_kinds` indexing (`[]`) rather than `get`.
+12. Some paths use direct `ptr_kinds` indexing (`[]`) rather than `get`.
 - Assignment-LHS resolution can index directly when a local HIR id is found.
 - Fallback mutability inference for array+deref roots (`PathOrDeref::Deref`) also indexes directly.
 - `is_base_not_a_raw_ptr` deref-path handling indexes directly as well.
@@ -375,17 +395,28 @@ If no local-path kind match applies:
   - null handling, `if/else` and block expression normalization
   - raw mutability casts and call-site return mutability propagation
   - ownership-analysis-fallback equivalence via test-only forced failure
+  - M3 fail-fast regression for unsupported `OptBox` transform paths
 
-### 8.2 Ownership analysis tests in same file
+### 8.2 Rewriter decision tests
+- File: `crates/pointer_replacer/src/rewriter/decision.rs`
+- Internal white-box tests exercise `DecisionMaker::decide` directly with synthetic facts over real MIR `LocalDecl`s.
+- Covered M3 decision areas include:
+  - owning scalar output override -> `OptRef(true)`
+  - owning scalar non-output -> `OptBox`
+  - owning array + `needs_cursor` -> staged `Raw(...)`
+  - owning array without `needs_cursor` -> `Slice(true)` / `OptBoxedSlice`
+  - non-owning scalar and cursor regressions remain unchanged
+
+### 8.3 Ownership analysis tests in same file
 - Module: `ownership_analysis` inside `tests.rs`
 - Validates ownership and output-param analyses (not rewriter mutation).
 - Also includes a MIR-source regression guard over the ownership/output guarded paths.
 
-### 8.3 B02 test suite
+### 8.4 B02 test suite
 - File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.
 - Current checks are ownership-analysis/candidate validation and aggregated stats; this suite does not currently execute the rewriter transform path.
 
-### 8.4 Standard commands used for validation
+### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
 - `cargo test -p pointer_replacer analyses::B02_tests -- --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`

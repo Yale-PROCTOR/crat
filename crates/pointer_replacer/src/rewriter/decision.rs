@@ -13,8 +13,12 @@ use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 pub enum PtrKind {
     /// reference: &mut T for Ref(true), or &T for Ref(false)
     OptRef(bool),
+    /// owning scalar pointer rewritten to Option<Box<T>>
+    OptBox,
     /// raw pointer: *mut T for Raw(true), or *const T for Raw(false)
     Raw(bool),
+    /// owning array pointer rewritten to Option<Box<[T]>>
+    OptBoxedSlice,
     /// plain slice: &mut [T] for Slice(true), or &[T] for Slice(false)
     Slice(bool),
     /// slice cursor with offset tracking: SliceCursor<T> for SliceCursor(false),
@@ -28,6 +32,7 @@ impl PtrKind {
             PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) | PtrKind::SliceCursor(m) => {
                 *m
             }
+            PtrKind::OptBox | PtrKind::OptBoxedSlice => true,
         }
     }
 }
@@ -110,6 +115,20 @@ impl<'tcx> DecisionMaker<'tcx> {
         let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
         if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
             Some(PtrKind::Raw(m.is_mut()))
+        } else if self._owning_pointers[local] && self.array_pointers[local] {
+            if self.needs_cursor.contains(local) {
+                Some(PtrKind::Raw(self.mutable_pointers[local]))
+            } else if self._output_params.contains(local) {
+                Some(PtrKind::Slice(true))
+            } else {
+                Some(PtrKind::OptBoxedSlice)
+            }
+        } else if self._owning_pointers[local] {
+            if self._output_params.contains(local) {
+                Some(PtrKind::OptRef(true))
+            } else {
+                Some(PtrKind::OptBox)
+            }
         } else if aliases.is_some_and(|aliases| {
             std::iter::once(local)
                 .chain(aliases.iter().copied())
@@ -225,5 +244,192 @@ impl SigDecisions {
             );
         }
         SigDecisions { data }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_index::{IndexVec, bit_set::DenseBitSet};
+    use rustc_middle::{mir::Body, ty::TyCtxt};
+
+    use super::*;
+
+    fn with_test_fn_body<F>(code: &str, f: F)
+    where F: for<'tcx> FnOnce(TyCtxt<'tcx>, LocalDefId, &Body<'tcx>) + Send {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = tcx
+                .hir_crate(())
+                .owners
+                .iter()
+                .filter_map(|maybe_owner| {
+                    let owner = maybe_owner.as_owner()?;
+                    let OwnerNode::Item(item) = owner.node() else {
+                        return None;
+                    };
+                    match item.kind {
+                        ItemKind::Fn { .. } => Some(item.owner_id.def_id),
+                        _ => None,
+                    }
+                })
+                .next()
+                .expect("expected test function");
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            f(tcx, did, &body);
+        })
+        .unwrap();
+    }
+
+    fn synthetic_decision_maker<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+        mutable: bool,
+        is_array: bool,
+        owning: bool,
+        output: bool,
+        promoted_mut: bool,
+        promoted_shared: bool,
+        needs_cursor: bool,
+    ) -> DecisionMaker<'tcx> {
+        let len = body.local_decls.len();
+        let mut mutable_pointers = IndexVec::from_elem_n(false, len);
+        mutable_pointers[local] = mutable;
+        let mut array_pointers = IndexVec::from_elem_n(false, len);
+        array_pointers[local] = is_array;
+        let mut owning_pointers = IndexVec::from_elem_n(false, len);
+        owning_pointers[local] = owning;
+        let mut output_params = DenseBitSet::new_empty(len);
+        if output {
+            output_params.insert(local);
+        }
+        let mut promoted_mut_refs = DenseBitSet::new_empty(len);
+        if promoted_mut {
+            promoted_mut_refs.insert(local);
+        }
+        let mut promoted_shared_refs = DenseBitSet::new_empty(len);
+        if promoted_shared {
+            promoted_shared_refs.insert(local);
+        }
+        let mut needs_cursor_set = DenseBitSet::new_empty(len);
+        if needs_cursor {
+            needs_cursor_set.insert(local);
+        }
+
+        DecisionMaker {
+            tcx,
+            mutable_pointers,
+            array_pointers,
+            _owning_pointers: owning_pointers,
+            _output_params: output_params,
+            promoted_mut_refs,
+            promoted_shared_refs,
+            needs_cursor: needs_cursor_set,
+        }
+    }
+
+    fn decide_for_param(
+        owning: bool,
+        output: bool,
+        is_array: bool,
+        needs_cursor: bool,
+        promoted_mut: bool,
+        promoted_shared: bool,
+        mutable: bool,
+    ) -> PtrKind {
+        let mut decision = None;
+        with_test_fn_body(
+            r#"
+pub unsafe fn foo(p: *mut i32) {
+    let _ = p;
+}
+"#,
+            |tcx, _did, body| {
+                let local = Local::from_u32(1);
+                let decision_maker = synthetic_decision_maker(
+                    tcx,
+                    body,
+                    local,
+                    mutable,
+                    is_array,
+                    owning,
+                    output,
+                    promoted_mut,
+                    promoted_shared,
+                    needs_cursor,
+                );
+                let decl = &body.local_decls[local];
+                decision = Some(
+                    decision_maker
+                        .decide(local, decl, None)
+                        .expect("expected pointer decision"),
+                );
+            },
+        );
+        decision.expect("decision should be set")
+    }
+
+    #[test]
+    fn owning_scalar_output_becomes_mut_opt_ref() {
+        assert_eq!(
+            decide_for_param(true, true, false, false, false, false, true),
+            PtrKind::OptRef(true)
+        );
+    }
+
+    #[test]
+    fn owning_scalar_non_output_becomes_opt_box() {
+        assert_eq!(
+            decide_for_param(true, false, false, false, false, false, true),
+            PtrKind::OptBox
+        );
+    }
+
+    #[test]
+    fn owning_array_output_with_cursor_need_stays_raw() {
+        assert_eq!(
+            decide_for_param(true, true, true, true, false, false, true),
+            PtrKind::Raw(true)
+        );
+    }
+
+    #[test]
+    fn owning_array_non_output_with_cursor_need_stays_raw() {
+        assert_eq!(
+            decide_for_param(true, false, true, true, false, false, true),
+            PtrKind::Raw(true)
+        );
+    }
+
+    #[test]
+    fn owning_array_output_without_cursor_need_becomes_mut_slice() {
+        assert_eq!(
+            decide_for_param(true, true, true, false, false, false, true),
+            PtrKind::Slice(true)
+        );
+    }
+
+    #[test]
+    fn owning_array_non_output_without_cursor_need_becomes_opt_boxed_slice() {
+        assert_eq!(
+            decide_for_param(true, false, true, false, false, false, true),
+            PtrKind::OptBoxedSlice
+        );
+    }
+
+    #[test]
+    fn non_owning_scalar_regression_stays_opt_ref() {
+        assert_eq!(
+            decide_for_param(false, false, false, false, true, false, true),
+            PtrKind::OptRef(true)
+        );
+    }
+
+    #[test]
+    fn non_owning_array_with_cursor_need_stays_slice_cursor() {
+        assert_eq!(
+            decide_for_param(false, false, true, true, true, false, true),
+            PtrKind::SliceCursor(true)
+        );
     }
 }

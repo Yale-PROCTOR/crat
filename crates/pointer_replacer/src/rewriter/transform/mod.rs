@@ -32,6 +32,17 @@ pub(crate) struct TransformVisitor<'tcx> {
     pub slice_cursor: Cell<bool>,
 }
 
+fn is_m3_box_kind(kind: PtrKind) -> bool {
+    matches!(kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+}
+
+fn panic_m3_box_staging(site: &str, kind: PtrKind) -> ! {
+    panic!(
+        "M3 staging error: {site} reached unsupported owning pointer kind {:?}",
+        kind
+    )
+}
+
 impl MutVisitor for TransformVisitor<'_> {
     fn visit_item(&mut self, item: &mut Item) {
         let node_id = item.id;
@@ -96,6 +107,9 @@ impl MutVisitor for TransformVisitor<'_> {
                                 });
                             *param.ty = mk_cursor_ty(inner_ty, *m, self.tcx);
                             self.slice_cursor.set(true);
+                        }
+                        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                            panic_m3_box_staging("visit_item parameter", *kind);
                         }
                         None => continue,
                     }
@@ -163,6 +177,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 PtrKind::OptRef(m) => {
                     local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
                 }
+                PtrKind::OptBox | PtrKind::OptBoxedSlice => {
+                    panic_m3_box_staging("visit_local", lhs_kind);
+                }
                 PtrKind::Slice(m) => {
                     local.ty = Some(P(mk_slice_ty(lhs_inner_ty, m, self.tcx)));
                 }
@@ -202,6 +219,9 @@ impl MutVisitor for TransformVisitor<'_> {
                 };
 
                 match lhs_kind {
+                    kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                        panic_m3_box_staging("visit_expr assignment lhs", kind);
+                    }
                     PtrKind::SliceCursor(_) => {
                         // Detect self-assignment with offset: p = p.offset(k)
                         if let Some(lhs_hir_id) = self.hir_id_of_path(lhs.id) {
@@ -296,6 +316,9 @@ impl MutVisitor for TransformVisitor<'_> {
                         PtrKind::OptRef(_) => {
                             seg.ident.name = Symbol::intern("is_none");
                         }
+                        kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                            panic_m3_box_staging("visit_expr is_null", *kind);
+                        }
                         PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
                             seg.ident.name = Symbol::intern("is_empty");
                         }
@@ -386,6 +409,9 @@ impl MutVisitor for TransformVisitor<'_> {
                             PtrKind::OptRef(_) => {
                                 **e = utils::expr!("{}.unwrap()", pprust::expr_to_string(e));
                             }
+                            kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                                panic_m3_box_staging("visit_expr deref", kind);
+                            }
                             PtrKind::Slice(_) => {
                                 *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
                             }
@@ -439,10 +465,18 @@ impl<'tcx> TransformVisitor<'tcx> {
         hir_rhs: &hir::Expr<'tcx>,
         lhs_kind: PtrKind,
     ) -> PtrKind {
+        if is_m3_box_kind(lhs_kind) {
+            panic_m3_box_staging("transform_rhs target", lhs_kind);
+        }
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
+        if let PtrCtx::Rhs(kind) = ctx
+            && is_m3_box_kind(kind)
+        {
+            panic_m3_box_staging("transform_ptr target", kind);
+        }
         let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
         let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_ptr));
 
@@ -512,6 +546,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = utils::expr!("None");
                     return PtrKind::OptRef(m);
                 }
+                PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr zero target", kind);
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     *ptr = utils::expr!("std::ptr::null{}()", if m { "_mut" } else { "" });
                     return PtrKind::Raw(m);
@@ -565,7 +602,13 @@ impl<'tcx> TransformVisitor<'tcx> {
             {
                 matches!(
                     self.ptr_kinds.get(&hir_id),
-                    Some(PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                    Some(
+                        PtrKind::OptRef(_)
+                            | PtrKind::OptBox
+                            | PtrKind::OptBoxedSlice
+                            | PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
+                    )
                 )
             } else {
                 false
@@ -586,6 +629,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     | PtrCtx::Rhs(PtrKind::Slice(m))
                     | PtrCtx::Rhs(PtrKind::SliceCursor(m))
                     | PtrCtx::Deref(m) => m,
+                    PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                        panic_m3_box_staging("transform_ptr addr_of target", kind)
+                    }
                 };
                 // Create initial slice from the single element:
                 //   std::slice::from_mut(&mut x) or std::slice::from_ref(&x)
@@ -667,6 +713,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                             rhs_inner_ty,
                         );
                         return PtrKind::Raw(m);
+                    }
+                    PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                        panic_m3_box_staging("transform_ptr addr_of slice wrapping", kind)
                     }
                 }
             }
@@ -805,6 +854,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                     return PtrKind::Slice(m);
                 }
+                PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr addr_of target", kind)
+                }
             }
         }
 
@@ -875,6 +927,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
+                PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr as_ptr target", kind)
+                }
             }
         }
 
@@ -882,6 +937,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Res::Local(hir_id) = res
             && let Some(rhs_kind) = self.ptr_kinds.get(&hir_id)
         {
+            if is_m3_box_kind(*rhs_kind) {
+                panic_m3_box_staging("transform_ptr source", *rhs_kind);
+            }
             match (ctx, *rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
                     if m && !m1 {
@@ -1039,6 +1097,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Rhs(PtrKind::SliceCursor(_) | PtrKind::Slice(_)), PtrKind::OptRef(_)) => {
                     panic!()
                 }
+                (PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)), _)
+                | (PtrCtx::Deref(_), kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr local-path matrix", kind)
+                }
+                (_, kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr local-path source", kind)
+                }
             }
         }
 
@@ -1060,6 +1125,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                     }
                     return PtrKind::OptRef(m);
+                }
+                PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                    panic_m3_box_staging("transform_ptr bytestr target", kind)
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     assert!(!m, "{}", pprust::expr_to_string(ptr));
@@ -1128,6 +1196,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                 *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                 PtrKind::OptRef(m)
+            }
+            PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                panic_m3_box_staging("transform_ptr raw fallback target", kind)
             }
             PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                 self.slice_cursor.set(true);
@@ -1724,6 +1795,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         {
             match self.ptr_kinds.get(&hir_id) {
                 Some(PtrKind::OptRef(m)) => Some(*m),
+                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => Some(true),
                 Some(PtrKind::Slice(m)) | Some(PtrKind::SliceCursor(m)) => Some(*m),
                 Some(PtrKind::Raw(m)) => Some(*m),
                 None => None,
@@ -1945,7 +2017,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PathOrDeref::Deref(hir_id) => {
                     matches!(
                         self.ptr_kinds[&hir_id],
-                        PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+                        PtrKind::OptRef(_)
+                            | PtrKind::OptBox
+                            | PtrKind::OptBoxedSlice
+                            | PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
                     )
                 }
                 PathOrDeref::Other => pe.base_ty.is_array(),
