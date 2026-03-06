@@ -1503,7 +1503,7 @@ pub unsafe extern "C" fn bar() {
 
 mod ownership_analysis {
     use rustc_hash::{FxHashMap, FxHashSet};
-    use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
+    use rustc_hir::{def_id::DefId, ItemKind, OwnerNode};
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
 
@@ -1511,9 +1511,9 @@ mod ownership_analysis {
         analyses::{
             output_params::compute_output_params,
             ownership::{
-                AnalysisKind, CrateCtxt, Ownership, Param,
-                ssa::{AnalysisResults, consume::Consume},
+                ssa::{consume::Consume, AnalysisResults},
                 whole_program::WholeProgramAnalysis,
+                AnalysisKind, CrateCtxt, Ownership, Param,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         },
@@ -1912,7 +1912,10 @@ pub unsafe fn make_holder() -> Holder {
                 "analyses/output_params/mod.rs",
                 include_str!("analyses/output_params/mod.rs"),
             ),
-            ("analyses/ownership/mod.rs", include_str!("analyses/ownership/mod.rs")),
+            (
+                "analyses/ownership/mod.rs",
+                include_str!("analyses/ownership/mod.rs"),
+            ),
             (
                 "analyses/ownership/call_graph.rs",
                 include_str!("analyses/ownership/call_graph.rs"),
@@ -1929,7 +1932,10 @@ pub unsafe fn make_holder() -> Holder {
                 "analyses/ownership/solidify.rs",
                 include_str!("analyses/ownership/solidify.rs"),
             ),
-            ("analyses/B02_tests/mod.rs", include_str!("analyses/B02_tests/mod.rs")),
+            (
+                "analyses/B02_tests/mod.rs",
+                include_str!("analyses/B02_tests/mod.rs"),
+            ),
             ("tests.rs", include_str!("tests.rs")),
         ];
 
@@ -1937,6 +1943,23 @@ pub unsafe fn make_holder() -> Holder {
             assert!(
                 !src.contains(FORBIDDEN),
                 "MIR source guard violation in {path}: found `{FORBIDDEN}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rewriter_m2_plumbing_guard_for_ownership_and_output_facts() {
+        let src = include_str!("rewriter/mod.rs");
+        for required in [
+            "output_params::compute_output_params",
+            "WholeProgramAnalysis",
+            "solidify(&input)",
+            "output_params: OutputParams",
+            "solidified_ownership: SolidifiedOwnershipSchemes",
+        ] {
+            assert!(
+                src.contains(required),
+                "M2 plumbing guard violation in rewriter/mod.rs: missing `{required}`"
             );
         }
     }

@@ -14,6 +14,11 @@ use crate::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
         offset_sign::OffsetSignResult,
+        output_params::OutputParams,
+        ownership::{
+            solidify::SolidifiedOwnershipSchemes, whole_program::WholeProgramAnalysis,
+            AnalysisKind, CrateCtxt,
+        },
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -30,6 +35,8 @@ pub struct Analysis {
     fatness_result: FatnessResult,
     aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
     offset_sign_result: OffsetSignResult,
+    output_params: OutputParams,
+    solidified_ownership: SolidifiedOwnershipSchemes,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -75,6 +82,13 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+    let output_params =
+        analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+    let crate_ctxt = CrateCtxt::new(&input);
+    let ownership_results =
+        <WholeProgramAnalysis as AnalysisKind>::analyze(crate_ctxt, &output_params)
+            .expect("whole-program ownership analysis should succeed for rewriter input");
+    let solidified_ownership = ownership_results.solidify(&input);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
     let (mutable_references, shared_references) =
@@ -92,6 +106,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         fatness_result,
         aliases,
         offset_sign_result,
+        output_params,
+        solidified_ownership,
     };
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);

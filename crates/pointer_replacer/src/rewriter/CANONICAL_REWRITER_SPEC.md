@@ -13,7 +13,16 @@
 
 ### `mod.rs`
 - `Analysis`
-  - Holds rewriter inputs actually consumed by the current decision/rewrite flow:
+  - Holds rewriter inputs available to the current pipeline:
+    - promoted mut refs
+    - promoted shared refs
+    - mutability analysis result
+    - fatness analysis result
+    - Andersen-derived param alias map
+    - offset-sign result
+    - output-parameter analysis result
+    - solidified whole-program ownership result
+  - Decision/rewrite behavior currently consumes only:
     - promoted mut refs
     - promoted shared refs
     - mutability analysis result
@@ -79,11 +88,14 @@
    - include `ItemKind::Struct`
 6. Run analyses used by rewriter:
    - mutability analysis
+   - output-parameter analysis (`compute_output_params`)
+   - whole-program ownership analysis + solidification (`WholeProgramAnalysis::analyze(...).solidify(...)`)
    - source-variable grouping postprocessing
    - promoted mutable/shared reference extraction
    - fatness analysis
    - offset-sign analysis
-7. Build `Analysis` with the six fields listed in Section 1.
+7. Build `Analysis` with the eight fields listed in Section 1.
+   - ownership analysis execution is fail-fast (`expect(...)`) if whole-program ownership solving fails.
 8. Construct `TransformVisitor::new(&input, &analysis_results, ast_to_hir)`:
    - computes `sig_decs = SigDecisions::new(...)`
    - computes `ptr_kinds = collect_diffs(...)`
@@ -306,8 +318,9 @@ If no local-path kind match applies:
 1. Return borrow inference is absent.
 - `SigDecisions` only keeps `output_dec = Some(Raw(_))`; non-raw returns are dropped.
 
-2. Ownership/output-parameter analysis is not consumed by current rewriter decisions.
-- `Analysis` in `rewriter/mod.rs` has no ownership/output-param field.
+2. Ownership/output-parameter facts are plumbed but not consumed by current rewriter decisions.
+- `Analysis` in `rewriter/mod.rs` stores both `output_params` and `solidified_ownership`.
+- `DecisionMaker`/`SigDecisions` continue to use mutability/fatness/promoted-ref/alias/offset inputs only.
 
 3. `ItemKind::Impl(_)` is skipped in `visit_item`.
 - Impl methods are not rewritten by this pass.
@@ -364,6 +377,7 @@ If no local-path kind match applies:
 ### 8.2 Ownership analysis tests in same file
 - Module: `ownership_analysis` inside `tests.rs`
 - Validates ownership and output-param analyses (not rewriter mutation).
+- Includes source-level guards for MIR-source policy and M2 rewriter plumbing presence.
 
 ### 8.3 B02 test suite
 - File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.

@@ -109,7 +109,7 @@ Authoritative sources for this roadmap and implementation:
 
 - [x] M0 - Canonical spec-first baseline
 - [x] M1 - MIR source migration for ownership/output analyses
-- [ ] M2 - Post-spec plumbing foundation
+- [x] M2 - Post-spec plumbing foundation
 - [ ] M3 - Decision logic extension (`OptBox`, `OptBoxedSlice`)
 - [ ] M4A - Core rewrite implementation for box kinds
 - [ ] M4B - Conditional struct support (`Default`, `take`)
@@ -260,6 +260,61 @@ Use this format whenever a milestone is completed:
   - none
   Notes:
   - Subworker protocol executed with sequential fallback for the third worker due temporary thread-limit; all three roles were completed and recorded.
+```
+
+```text
+- Date: 2026-03-06
+  Milestone: M2
+  Files changed:
+  - AGENTS.md
+  - crates/pointer_replacer/src/rewriter/mod.rs
+  - crates/pointer_replacer/src/rewriter/CANONICAL_REWRITER_SPEC.md
+  - crates/pointer_replacer/src/tests.rs
+  Behavior changes:
+  - Threaded output-parameter and solidified ownership facts into `rewriter::Analysis` (`output_params`, `solidified_ownership`) in `replace_local_borrows`.
+  - Added M2 plumbing pipeline in rewriter driver: `compute_output_params` -> `WholeProgramAnalysis::analyze` -> `solidify`, with fail-fast ownership-analysis expectation.
+  - Preserved existing rewrite decision and transform behavior (no `PtrKind` decision precedence changes; no conversion-path changes).
+  - Added a lightweight source guard test ensuring M2 ownership/output plumbing calls and fields remain present in `rewriter/mod.rs`.
+  - Updated canonical rewriter spec to match checked-in M2 plumbing behavior and unchanged decision-consumption policy.
+  Tests run:
+  - command: cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning
+    result: pass
+  - command: cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return
+    result: pass
+  - command: cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc
+    result: pass
+  - command: cargo test -p pointer_replacer ownership_analysis::mutable_pointer_to_pointer_argument_becomes_output_param
+    result: pass
+  - command: cargo test -p pointer_replacer analyses::B02_tests -- --nocapture
+    result: pass
+  - command: cargo test -p pointer_replacer
+    result: pass
+  - command: ! rg -n "optimized_mir\\(" crates/pointer_replacer/src/analyses/output_params crates/pointer_replacer/src/analyses/ownership crates/pointer_replacer/src/analyses/B02_tests/mod.rs crates/pointer_replacer/src/tests.rs
+    result: pass
+  Worker runs:
+  - role: coverage
+    run_id: 019cc0ba-1364-7d52-ba54-0cf5ee6889d4
+    verdict: pass
+  - role: correctness
+    run_id: 019cc0ba-136f-7cc2-b214-6147f3e591db
+    verdict: pass
+  - role: implementation-readiness
+    run_id: 019cc0ba-137f-7833-b804-eb805d270599
+    verdict: pass
+  Blockers:
+  - role: none
+    summary: none
+    status: fixed
+  B02 result deltas:
+  - case: none
+    changed: none
+    rationale: M2 is plumbing-only and preserves rewrite behavior.
+    disposition: accepted
+  Waiver rationale:
+  - none
+  Notes:
+  - Subworker Validation Protocol executed in required order (implementation -> spec sync -> validation loop -> worker triad -> gate aggregation).
+  - Gate result: PASS
 ```
 
 ## Planned Change Surface
