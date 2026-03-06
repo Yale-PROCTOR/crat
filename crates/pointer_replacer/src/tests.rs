@@ -72,7 +72,7 @@ extern "C" {
 }
 
 pub unsafe fn foo() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 7;
     return p;
 }
@@ -146,7 +146,7 @@ extern "C" {
 }
 
 pub unsafe fn alloc_one() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 5;
     return p;
 }
@@ -178,7 +178,7 @@ extern "C" {
 }
 
 pub unsafe fn alloc_one() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 5;
     return p;
 }
@@ -244,7 +244,7 @@ pub unsafe fn id(mut p: *mut i32) -> *mut i32 {
 }
 
 pub unsafe fn foo() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 7;
     let q: *mut i32 = id(p);
     return q;
@@ -253,7 +253,7 @@ pub unsafe fn foo() -> *mut i32 {
         &[
             "pub unsafe fn id(mut p: Option<Box<i32>>) -> Option<Box<i32>>",
             "pub unsafe fn foo() -> Option<Box<i32>>",
-            "let q: Option<Box<i32>> = id(p);",
+            "let mut q: Option<Box<i32>> = id((p).take());",
         ],
         &[],
     );
@@ -268,7 +268,7 @@ extern "C" {
 }
 
 pub unsafe fn keep_raw() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 1;
     return p;
 }
@@ -327,7 +327,7 @@ extern "C" {
 }
 
 pub unsafe fn alloc_one() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 5;
     return p;
 }
@@ -348,6 +348,139 @@ pub unsafe fn caller() -> *mut i32 {
 }
 
 #[test]
+#[ignore = "Supplemental gotomach-derived probe only; landed primary struct-default coverage lives in rewriter::transform white-box tests."]
+fn test_rewriter_materializes_local_struct_malloc_default_gotomach_probe() {
+    let gotomach = include_str!("analyses/B02_tests/gotomach_lib.rs");
+    let code = gotomach
+        .split("const SOURCE: &str = r####\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\"####;").next())
+        .expect("gotomach source fixture");
+    run_test(
+        code,
+        &[
+            "Option<Box<crate::src::lib::ProcessorState>>",
+            "results: std::ptr::null_mut::<core::ffi::c_int>()",
+            "capacity: <crate::src::lib::size_t as Default>::default()",
+            "count: <crate::src::lib::size_t as Default>::default()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_moves_opt_box_locals_with_take() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn move_owner() -> *mut i32 {
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
+    *p = 7;
+    let q: *mut i32 = p;
+    return q;
+}
+"#,
+        &["let mut q: Option<Box<i32>> = (p).take();", ".take()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_composite_realloc_struct_raw_across_return_and_call_result() {
+    run_test(
+        r#"
+extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Header {
+    tag: i32,
+}
+
+pub unsafe fn make_header() -> *mut Header {
+    let mut h: *mut Header = std::ptr::null_mut();
+    h = realloc(
+        std::ptr::null_mut(),
+        std::mem::size_of::<Header>() + 16usize,
+    ) as *mut Header;
+    (*h).tag = 1;
+    h
+}
+
+pub unsafe fn use_header() -> i32 {
+    let mut h: *mut Header = make_header();
+    let mut alias: *mut Header = std::ptr::null_mut();
+    alias = h;
+    return (*alias).tag;
+}
+"#,
+        &[
+            "pub unsafe fn make_header() -> *mut crate::Header",
+            "let mut h: *mut crate::Header = make_header();",
+            "let mut alias: *mut crate::Header = std::ptr::null_mut();",
+            "alias = h;",
+            "let mut h: *mut crate::Header = std::ptr::null_mut();",
+        ],
+        &["Option<Box<Header>>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_mutable_local_struct_params_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut State;
+}
+
+#[repr(C)]
+pub struct State {
+    value: i32,
+    buf: [i32; 4],
+}
+
+pub unsafe fn touch_state(s: *mut State, buf: *mut i32) -> i32 {
+    *buf = (*s).value;
+    return (*s).value;
+}
+
+pub unsafe fn caller() -> i32 {
+    let mut s: *mut State = malloc(std::mem::size_of::<State>());
+    (*s).value = 3;
+    return touch_state(s, ((*s).buf).as_mut_ptr());
+}
+"#,
+        &[
+            "pub unsafe fn touch_state(s: *mut crate::State, mut buf: Option<&mut i32>)",
+        ],
+        &["Option<&mut State>"],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_add_on_slice_like_receivers() {
+    run_test(
+        r#"
+extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut i32;
+}
+
+pub unsafe fn fill() -> *mut i32 {
+    let mut p: *mut i32 = realloc(std::ptr::null_mut(), 4 * std::mem::size_of::<i32>());
+    *p.add(1usize) = 5;
+    return p;
+}
+"#,
+        &[".as_mut_ptr().add(1usize)"],
+        &[],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback() {
     run_test(
         r#"
@@ -356,7 +489,7 @@ extern "C" {
 }
 
 pub unsafe fn alloc_one() -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 5;
     return p;
 }
@@ -412,7 +545,7 @@ extern "C" {
 }
 
 pub unsafe fn maybe_alloc(flag: bool) -> *mut i32 {
-    let mut p: *mut i32 = malloc(4);
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
     *p = 7;
     if flag {
         return p;
@@ -813,7 +946,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(1 as isize);
 }
 "#,
-        &["from_raw_parts_mut", "as *mut i32", "&mut [i32]"],
+        &["from_raw_parts_mut", "as *mut _", "&mut [i32]"],
         &["bytemuck"],
     );
 }

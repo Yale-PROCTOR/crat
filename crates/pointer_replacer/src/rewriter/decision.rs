@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{Local, LocalDecl, Operand, Rvalue, StatementKind},
-    ty::TyCtxt,
+    ty::{self, TyCtxt},
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -50,6 +50,29 @@ pub struct DecisionMaker<'tcx> {
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
+    fn force_raw_local_struct_borrows(
+        &self,
+        decision: Option<PtrKind>,
+        ty: ty::Ty<'tcx>,
+        is_mut: bool,
+    ) -> Option<PtrKind> {
+        let is_local_struct = matches!(
+            ty.kind(),
+            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+        );
+        if is_local_struct
+            && is_mut
+            && matches!(
+                decision,
+                Some(PtrKind::OptRef(true) | PtrKind::Slice(true) | PtrKind::SliceCursor(true))
+            )
+        {
+            Some(PtrKind::Raw(true))
+        } else {
+            decision
+        }
+    }
+
     pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
         let mutable_pointers = analysis
             .mutability_result
@@ -113,10 +136,14 @@ impl<'tcx> DecisionMaker<'tcx> {
         aliases: Option<&FxHashSet<Local>>,
     ) -> Option<PtrKind> {
         let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
-        if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
+        let is_local_struct = matches!(
+            ty.kind(),
+            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+        );
+        let decision = if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
             Some(PtrKind::Raw(m.is_mut()))
         } else if self._owning_pointers[local] && self.array_pointers[local] {
-            if self.needs_cursor.contains(local) {
+            if self.needs_cursor.contains(local) || is_local_struct {
                 Some(PtrKind::Raw(self.mutable_pointers[local]))
             } else if self._output_params.contains(local) {
                 Some(PtrKind::Slice(true))
@@ -129,6 +156,8 @@ impl<'tcx> DecisionMaker<'tcx> {
             } else {
                 Some(PtrKind::OptBox)
             }
+        } else if is_local_struct && m.is_mut() {
+            Some(PtrKind::Raw(true))
         } else if aliases.is_some_and(|aliases| {
             std::iter::once(local)
                 .chain(aliases.iter().copied())
@@ -159,7 +188,9 @@ impl<'tcx> DecisionMaker<'tcx> {
             Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else {
             None
-        }
+        };
+
+        self.force_raw_local_struct_borrows(decision, ty, m.is_mut())
     }
 }
 

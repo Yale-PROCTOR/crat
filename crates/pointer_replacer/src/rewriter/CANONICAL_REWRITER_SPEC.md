@@ -335,9 +335,17 @@ Deref context behavior:
 
 ### 6.5 Direct owning allocator-root materialization
 When the target context is `OptBox` or `OptBoxedSlice`, `transform_ptr` checks the normalized AST expression for direct allocator calls before entering the general conversion matrix:
-- `malloc(bytes)` + target `OptBox` -> `Some(Box::<T>::new(<T as Default>::default()))`
-- `calloc(count, _)` + target `OptBoxedSlice` -> `Some(std::iter::repeat_with(<T as Default>::default).take((count) as usize).collect::<Vec<T>>().into_boxed_slice())`
+- exact scalar roots only:
+  - `malloc(size_of::<T>())` + target `OptBox`
+  - `calloc(1, size_of::<T>())` + target `OptBox`
+  - `realloc(null_like, size_of::<T>())` + target `OptBox`
+- scalar `OptBox` materialization uses `Some(Box::<T>::new(...))`
+  - raw-pointer fields become `std::ptr::null[_mut]::<...>()`
+  - program-defined local structs recurse field-by-field into a struct literal default expression
+  - all other fields use `<T as Default>::default()`
+- `calloc(count, _)` + target `OptBoxedSlice` -> `Some(std::iter::repeat_with(|| { default_expr }).take((count) as usize).collect::<Vec<T>>().into_boxed_slice())`
 - `malloc(bytes)` + target `OptBoxedSlice` -> same iterator materialization with element count `bytes / size_of::<T>()`
+- `realloc(null_like, bytes)` shares the same allocator-root handling as `malloc(bytes)`
 - this direct allocator-root materialization runs for scalar and owning-array M4A roots before raw fallback handling
 
 ### 6.6 General fallback path
@@ -348,6 +356,10 @@ If no local-path kind match applies:
 - raw fallback support is asymmetric for owning box targets:
   - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
   - array `OptBoxedSlice` targets still panic unless direct allocator-root length evidence was matched earlier
+- before those panic paths are reachable, M4B adds conservative raw downgrades for locals/functions that cannot be safely materialized as owning boxes:
+  - scalar locals/functions fed by unsupported composite allocator roots (header padding, arithmetic, multi-`size_of`, etc.)
+  - locals assigned from local helper calls whose output decision was explicitly forced raw
+  - locals assigned directly from already-raw local aliases (one-hop propagation only)
 
 ### 6.7 Mutability Heuristics Used by Call/Deref Rewrites
 - `get_mutability_decision(hir_expr)`:
@@ -390,6 +402,13 @@ If no local-path kind match applies:
 
 6. Owning box support is implemented only for the M4A-supported source/target surface.
 - Direct allocator roots and local/call box sources are supported.
+- Scalar `OptBox` allocator roots are intentionally narrower in M4B:
+  - only exact `size_of::<T>()` scalar roots stay eligible
+  - unsupported composite scalar roots are forced back to raw before rewrite
+- Some raw fallback propagation is now intentional rather than panicking:
+  - direct local bindings assigned from local helpers whose output decision was forced raw stay raw
+  - direct local aliases assigned from already-raw bindings also stay raw
+  - unsupported composite-root function-output forcing is currently limited to recognized tail-return-local shapes
 - Several non-goal shapes still panic, especially:
   - `addr_of` / `addr_of` arithmetic into box targets
   - `as_ptr` into box targets
@@ -409,9 +428,12 @@ If no local-path kind match applies:
 - Locals without binding mapping do not get `ptr_kinds` entries.
 - Duplicate reverse-map collisions (multiple bindings to one local) are not guarded; hash-map collection would keep the last one seen.
 
-9. `hoist_opt_ref_borrow` only hoists under a narrow pattern.
-- It detects `*arg.as_deref_mut().unwrap()` style shapes and rewrites selected repeated mutable borrows.
-- candidate selection iterates hash-map entries and uses `break` when first entry is non-qualifying; this makes hoisting of later candidates iteration-order dependent.
+9. `hoist_opt_ref_borrow` is still pattern-driven, but broader than the pre-M4B helper.
+- It now hoists repeated mutable borrow roots for:
+  - `arg.as_deref_mut().unwrap()` / `arg.as_deref().unwrap()`
+  - raw extraction patterns produced from `arg.as_deref_mut().map_or(...)`
+- It rewrites field projections and raw extractions to use one hoisted borrowed temp within a call expression.
+- It still does not attempt a general borrow-restructuring framework outside those emitted patterns.
 
 10. Alias conservatism can force raw even when other facts could allow higher-level types.
 - Any mutable alias in the alias cluster triggers raw for that local.
@@ -428,7 +450,9 @@ If no local-path kind match applies:
 ## 8) Test Mapping (Current)
 
 ### 8.1 Rewriter behavior tests
-- File: `crates/pointer_replacer/src/tests.rs`
+- Files:
+  - `crates/pointer_replacer/src/tests.rs`
+  - `crates/pointer_replacer/src/rewriter/transform/mod.rs` (`#[cfg(test)]` white-box regression module)
 - Harness `run_test`:
   - runs `replace_local_borrows`
   - type-checks rewritten output
@@ -455,6 +479,13 @@ If no local-path kind match applies:
     - `test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback`
     - `test_rewriter_preserves_fn_pointer_signature_with_opt_boxed_slice_raw_fallback`
     - `test_rewriter_mixed_return_shapes_do_not_infer_box_signature`
+  - M4B direct regressions:
+    - `test_rewriter_moves_opt_box_locals_with_take`
+    - `test_rewriter_keeps_composite_realloc_struct_raw_across_return_and_call_result`
+    - `test_rewriter_keeps_mutable_local_struct_params_raw`
+    - `test_rewriter_rewrites_add_on_slice_like_receivers`
+    - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
+    - `test_rewriter_materializes_local_struct_malloc_default_gotomach_probe` remains an ignored supplemental probe in `tests.rs`; it is not the landed primary coverage artifact
 
 ### 8.2 Rewriter decision tests
 - File: `crates/pointer_replacer/src/rewriter/decision.rs`
@@ -473,7 +504,8 @@ If no local-path kind match applies:
 
 ### 8.4 B02 test suite
 - File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.
-- Current checks are ownership-analysis/candidate validation and aggregated stats; this suite does not currently execute the rewriter transform path.
+- Current checks are ownership-analysis/candidate validation and aggregated stats.
+- The landed tree does not currently keep the staged local rewrite-compile gate that was used to drive M4B development.
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
