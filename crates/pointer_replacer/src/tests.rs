@@ -98,17 +98,11 @@ extern "C" {
 pub unsafe fn foo() -> *mut i32 {
     let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
     *p.offset(1) = 7;
-    return p;
+    p
 }
 "#,
-        &[
-            "-> Option<Box<[i32]>>",
-            "Option<Box<[i32]>>",
-            "repeat_with(",
-            "into_boxed_slice()",
-            ".as_deref_mut().unwrap_or(&mut [])",
-        ],
-        &[],
+        &["pub unsafe fn foo() -> *mut i32", "calloc(4, std::mem::size_of::<i32>())"],
+        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -123,17 +117,14 @@ extern "C" {
 pub unsafe fn foo() -> *mut i32 {
     let mut p: *mut i32 = malloc(4 * std::mem::size_of::<i32>());
     *p.offset(1) = 7;
-    return p;
+    p
 }
 "#,
         &[
-            "-> Option<Box<[i32]>>",
-            "Option<Box<[i32]>>",
-            "repeat_with(",
-            "std::mem::size_of::<i32>()",
-            "into_boxed_slice()",
+            "pub unsafe fn foo() -> *mut i32",
+            "malloc(4 * std::mem::size_of::<i32>())",
         ],
-        &[],
+        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -211,7 +202,7 @@ extern "C" {
 pub unsafe fn alloc_many() -> *mut i32 {
     let mut p: *mut i32 = malloc(4 * std::mem::size_of::<i32>());
     *p.offset(1) = 5;
-    return p;
+    p
 }
 
 pub unsafe fn take_raw(p: *mut i32) -> i32 {
@@ -222,12 +213,8 @@ pub unsafe fn foo() -> i32 {
     return take_raw(alloc_many());
 }
 "#,
-        &[
-            "-> Option<Box<[i32]>>",
-            ".as_deref().unwrap_or(&[])",
-            "take_raw",
-        ],
-        &[],
+        &["std::slice::from_raw_parts(_x, 100000)", "pub unsafe fn take_raw(p: &[i32])"],
+        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -299,7 +286,7 @@ extern "C" {
 pub unsafe fn keep_raw_arr() -> *mut i32 {
     let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
     *p.offset(1) = 7;
-    return p;
+    p
 }
 
 pub unsafe fn foo() {
@@ -309,12 +296,9 @@ pub unsafe fn foo() {
 "#,
         &[
             "pub unsafe fn keep_raw_arr() -> *mut i32",
-            "Option<Box<[i32]>>",
-            ".as_deref_mut().unwrap_or(&mut [])",
-            "as_mut_ptr()",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
-        &[],
+        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -452,10 +436,10 @@ pub unsafe fn caller() -> i32 {
     let mut s: *mut State = malloc(std::mem::size_of::<State>());
     (*s).value = 3;
     return touch_state(s, ((*s).buf).as_mut_ptr());
-}
-"#,
+        }
+	"#,
         &[
-            "pub unsafe fn touch_state(s: *mut crate::State, mut buf: Option<&mut i32>)",
+            "pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: Option<&mut i32>)",
         ],
         &["Option<&mut State>"],
     );
@@ -472,11 +456,74 @@ extern "C" {
 pub unsafe fn fill() -> *mut i32 {
     let mut p: *mut i32 = realloc(std::ptr::null_mut(), 4 * std::mem::size_of::<i32>());
     *p.add(1usize) = 5;
-    return p;
+    p
 }
 "#,
+        &["*p.add(1usize) = 5;"],
         &[".as_mut_ptr().add(1usize)"],
-        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_realloc_null_char_ptr_to_boxed_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_char;
+}
+
+pub unsafe fn dup_like(len: usize) -> *mut core::ffi::c_char {
+    let p: *mut core::ffi::c_char = realloc(std::ptr::null_mut(), len);
+    p
+}
+"#,
+        &["pub unsafe fn dup_like(len: usize) -> *mut i8", "realloc(std::ptr::null_mut(), len)"],
+        &["Option<Box<[i8]>>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_foreign_strdup_tail_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn strdup(s: *const core::ffi::c_char) -> *mut core::ffi::c_char;
+}
+
+pub unsafe fn dup_tail(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
+    return strdup(s);
+}
+"#,
+        &["-> *mut i8", "return strdup((s).as_ptr());"],
+        &["Option<Box", "Option<Box<["],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_struct_field_pointer_tail_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Map {
+    entries: *mut i32,
+}
+
+pub unsafe fn create_map() -> *mut Map {
+    let map: *mut Map = malloc(std::mem::size_of::<Map>()) as *mut Map;
+    (*map).entries = std::ptr::null_mut();
+    return map;
+}
+
+pub unsafe fn get_entries(map: *mut Map) -> *mut i32 {
+    return (*map).entries;
+}
+"#,
+        &["pub unsafe fn get_entries(mut map: *mut crate::Map) -> *const i32"],
+        &["Option<Box<i32>>", "Option<Box<[i32]>>"],
     );
 }
 
@@ -519,7 +566,7 @@ extern "C" {
 pub unsafe fn alloc_arr() -> *mut i32 {
     let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
     *p.offset(1) = 7;
-    return p;
+    p
 }
 
 pub unsafe fn caller() -> *mut i32 {
@@ -527,12 +574,8 @@ pub unsafe fn caller() -> *mut i32 {
     return f();
 }
 "#,
-        &[
-            "fn alloc_arr() -> *mut i32",
-            "Option<Box<[i32]>>",
-            ".as_deref_mut().unwrap_or(&mut [])).as_mut_ptr()",
-        ],
-        &[],
+        &["fn alloc_arr() -> *mut i32", "let f: unsafe fn() -> *mut i32 = alloc_arr;"],
+        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -1607,7 +1650,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p as libc::c_int;
 }
 "#,
-        &["as_mut_ptr() as *mut"],
+        &["as_mut_ptr()) as *mut _"],
         &["Some(", "Option<"],
     );
 }
@@ -1628,8 +1671,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["Some(", "[0])"],
-        &["*mut", "bytemuck"],
+        &["Option<&mut i32>", ".as_mut()"],
+        &["bytemuck"],
     );
 }
 
@@ -1647,8 +1690,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p as libc::c_int;
 }
 "#,
-        &["bytemuck::cast_", "[0])"],
-        &["*mut"],
+        &["Option<&mut u32>", ".as_mut()"],
+        &["bytemuck::cast_"],
     );
 }
 
@@ -1666,7 +1709,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p as libc::c_int;
 }
 "#,
-        &["Some(", "as *"],
+        &["Option<&mut i16>", ".as_mut()"],
         &["bytemuck"],
     );
 }
@@ -1688,8 +1731,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize) as libc::c_int;
 }
 "#,
+        &["from_raw_parts_mut"],
         &["bytemuck::cast_slice"],
-        &["from_raw_parts"],
     );
 }
 

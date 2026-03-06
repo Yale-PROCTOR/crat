@@ -50,6 +50,23 @@ pub struct DecisionMaker<'tcx> {
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
+    fn preserve_original_pointer_constness(
+        &self,
+        decision: Option<PtrKind>,
+        is_mut: bool,
+    ) -> Option<PtrKind> {
+        if is_mut {
+            return decision;
+        }
+        match decision {
+            Some(PtrKind::OptRef(_)) => Some(PtrKind::OptRef(false)),
+            Some(PtrKind::Raw(_)) => Some(PtrKind::Raw(false)),
+            Some(PtrKind::Slice(_)) => Some(PtrKind::Slice(false)),
+            Some(PtrKind::SliceCursor(_)) => Some(PtrKind::SliceCursor(false)),
+            other => other,
+        }
+    }
+
     fn force_raw_local_struct_borrows(
         &self,
         decision: Option<PtrKind>,
@@ -151,7 +168,9 @@ impl<'tcx> DecisionMaker<'tcx> {
                 Some(PtrKind::OptBoxedSlice)
             }
         } else if self._owning_pointers[local] {
-            if self._output_params.contains(local) {
+            if matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
+                Some(PtrKind::Raw(self.mutable_pointers[local]))
+            } else if self._output_params.contains(local) {
                 Some(PtrKind::OptRef(true))
             } else {
                 Some(PtrKind::OptBox)
@@ -190,6 +209,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             None
         };
 
+        let decision = self.preserve_original_pointer_constness(decision, m.is_mut());
         self.force_raw_local_struct_borrows(decision, ty, m.is_mut())
     }
 }
@@ -272,6 +292,9 @@ impl SigDecisions {
             let returned_local_output_dec =
                 infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
             let output_dec = match (direct_output_dec, returned_local_output_dec) {
+                (Some(PtrKind::Raw(_)), Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice))) => {
+                    Some(kind)
+                }
                 (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
                 (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice)) => {
                     Some(PtrKind::OptBoxedSlice)
@@ -413,7 +436,8 @@ mod tests {
         }
     }
 
-    fn decide_for_param(
+    fn decide_for_param_with_ty(
+        pointer_ty: &str,
         owning: bool,
         output: bool,
         is_array: bool,
@@ -423,12 +447,15 @@ mod tests {
         mutable: bool,
     ) -> PtrKind {
         let mut decision = None;
-        with_test_fn_body(
+        let code = format!(
             r#"
-pub unsafe fn foo(p: *mut i32) {
+pub unsafe fn foo(p: {pointer_ty}) {{
     let _ = p;
-}
-"#,
+}}
+"#
+        );
+        with_test_fn_body(
+            &code,
             |tcx, _did, body| {
                 let local = Local::from_u32(1);
                 let decision_maker = synthetic_decision_maker(
@@ -452,6 +479,27 @@ pub unsafe fn foo(p: *mut i32) {
             },
         );
         decision.expect("decision should be set")
+    }
+
+    fn decide_for_param(
+        owning: bool,
+        output: bool,
+        is_array: bool,
+        needs_cursor: bool,
+        promoted_mut: bool,
+        promoted_shared: bool,
+        mutable: bool,
+    ) -> PtrKind {
+        decide_for_param_with_ty(
+            "*mut i32",
+            owning,
+            output,
+            is_array,
+            needs_cursor,
+            promoted_mut,
+            promoted_shared,
+            mutable,
+        )
     }
 
     #[test]
@@ -515,6 +563,22 @@ pub unsafe fn foo(p: *mut i32) {
         assert_eq!(
             decide_for_param(false, false, true, true, true, false, true),
             PtrKind::SliceCursor(true)
+        );
+    }
+
+    #[test]
+    fn const_scalar_pointer_does_not_become_mut_opt_ref() {
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, false, false, true, false, true),
+            PtrKind::OptRef(false)
+        );
+    }
+
+    #[test]
+    fn const_array_pointer_does_not_become_mut_slice() {
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, true, false, true, false, true),
+            PtrKind::Slice(false)
         );
     }
 }

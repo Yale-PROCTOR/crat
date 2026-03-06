@@ -148,6 +148,7 @@ Notes:
 - `unwrap_ptr_from_mir_ty` treats both raw pointers and references as pointer-like for decision purposes.
 - `needs_cursor` remains a conservative raw carveout for owning arrays in M4A because signed-offset-safe owning transforms are not implemented yet.
 - Alias rule remains intentionally conservative for the non-owning path.
+- After the branch-ordered choice is made, mutable `Raw` / `OptRef` / `Slice` / `SliceCursor` results are downgraded back to their shared/const forms when the original pointer type was `*const T` or `&T`; the rewriter does not synthesize mutable borrow-like forms from originally-const pointer types.
 
 ### 3.3 Signature Decision Rules (`SigDecisions::new`)
 1. Compute `fn_ptrs = collect_fn_ptrs(rust_program)`.
@@ -159,7 +160,7 @@ Notes:
    - Else:
      - For each parameter local (`_1..` up to input arity), run `DecisionMaker::decide`.
       - For return local `_0`, run `decide` and keep:
-        - `Some(Raw(m)) -> Some(Raw(m))`
+        - `Some(Raw(m)) -> Some(Raw(m))`, unless `infer_returned_local_box_kind(...)` below finds an owning `OptBox` / `OptBoxedSlice` source local to upgrade from
         - `Some(OptBox) -> Some(OptBox)`
         - `Some(OptBoxedSlice) -> Some(OptBoxedSlice)`
         - any borrow-like result -> try `infer_returned_local_box_kind(body, decision_maker, aliases, _0)`:
@@ -204,19 +205,22 @@ Practical result for function-pointer-used functions:
 - For `ItemKind::Fn`:
   - Fetch `SigDecision` for this function.
   - For each parameter:
-    - `OptRef(m)` -> rewrite to `Option<&{mut?} T>` via `mk_opt_ref_ty`; force binding pattern mutable.
-    - `OptBox` -> rewrite to `Option<Box<T>>` via `mk_opt_box_ty`; force binding pattern mutable.
-    - `OptBoxedSlice` -> rewrite to `Option<Box<[T]>>` via `mk_opt_boxed_slice_ty`; force binding pattern mutable.
+    - `OptRef(m)` -> rewrite to `Option<&{mut?} T>` via `mk_opt_ref_ty`.
+    - `OptBox` -> rewrite to `Option<Box<T>>` via `mk_opt_box_ty`.
+    - `OptBoxedSlice` -> rewrite to `Option<Box<[T]>>` via `mk_opt_boxed_slice_ty`.
     - `Slice(m)` -> rewrite to `&{mut?}[T]` via `mk_slice_ty`.
     - `Raw(m)` -> rewrite to `*{mut|const} T` via `mk_raw_ptr_ty`.
     - `SliceCursor(m)` -> rewrite to cursor type via `mk_cursor_ty`; set `slice_cursor = true`.
     - `None` -> keep as-is.
-  - Return type rewrite occurs when `sig_dec.output_dec` is `Some(Raw(_)|OptBox|OptBoxedSlice)`.
-  - Borrow-like return kinds still do not rewrite signatures.
+    - after the type rewrite, any mutable chosen kind (`kind.is_mut()`) forces the binding pattern to `mut`
+- Return type rewrite occurs when `sig_dec.output_dec` is `Some(Raw(_)|OptBox|OptBoxedSlice)`.
+- Borrow-like return kinds still do not rewrite signatures.
+- Before the chosen output kind is applied, `visit_item` conservatively downgrades `OptBox` / `OptBoxedSlice` outputs to `Raw` when any explicit `return expr` or implicit tail expression in the function body is not a supported box source for that output kind.
 
 ### 5.2 `visit_local`
 - For let-bindings with `ptr_kinds[hir_id]`:
   - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`OptBox`/`OptBoxedSlice`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
+  - Any mutable selected kind forces the binding pattern to `mut`.
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
 ### 5.3 `visit_expr` major cases
@@ -238,12 +242,16 @@ Practical result for function-pointer-used functions:
   - local `OptBox` / `OptBoxedSlice` receiver -> rename to `is_none`
   - local `Slice` / `SliceCursor` receiver -> rename to `is_empty`
   - `Raw` -> unchanged
+- Method call `add`
+  - lower the receiver expression through raw-pointer conversion using the actual raw receiver type mutability
+  - this now handles rewritten local and non-local receivers, including `Option<&mut T>`, slices, cursors, and boxed-slice views
 - Method call `offset_from`
   - force receiver and argument through raw-pointer conversion.
 - Return (`ret expr`)
   - only for original raw-pointer function outputs: convert return expr with:
     - `sig_decs.output_dec` if present
     - else raw mutability fallback
+  - the same conservative output fallback used in `visit_item` is based on both explicit `return expr` nodes and the final tail expression, not just tail-local `_0` MIR shapes
 - Unary deref (`*p`)
   - Uses expression context (`Lvalue/Rvalue/AddrTaken`) to choose target mutability.
   - If source is cursor with exactly one offset projection, emits indexed access directly.
@@ -353,6 +361,7 @@ If no local-path kind match applies:
 - infer mutability from base raw/array type (with array-path deref inspection)
 - if callee return signature mutability was rewritten to raw, override fallback mutability accordingly
 - convert to requested target using `opt_ref_from_raw`, `slice_from_raw`, `cursor_from_raw`, or raw cast fallback.
+- plain array bases now also participate in non-raw fallback for `Slice`, `SliceCursor`, and `OptRef` targets instead of being left unchanged at rewrite-enabled call sites
 - raw fallback support is asymmetric for owning box targets:
   - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
   - array `OptBoxedSlice` targets still panic unless direct allocator-root length evidence was matched earlier
@@ -366,6 +375,7 @@ If no local-path kind match applies:
   - strips leading `.offset(...)` receivers to the root expression
   - if root is a local path with `ptr_kinds` entry, returns that kind mutability
   - otherwise returns `None` (caller falls back to type mutability).
+- For raw adaptation in `transform_ptr`, source raw mutability now prefers the full raw expression type before falling back to base-local/base-array heuristics.
 - `expr_ctx(hir_expr)` classifies expression usage as:
   - `Lvalue`
   - `Rvalue`
@@ -402,13 +412,15 @@ If no local-path kind match applies:
 
 6. Owning box support is implemented only for the M4A-supported source/target surface.
 - Direct allocator roots and local/call box sources are supported.
+- Local/call box-source propagation now only trusts local function items with bodies; foreign declarations are not treated as rewrite-aware box sources for fallback/propagation purposes.
 - Scalar `OptBox` allocator roots are intentionally narrower in M4B:
   - only exact `size_of::<T>()` scalar roots stay eligible
   - unsupported composite scalar roots are forced back to raw before rewrite
 - Some raw fallback propagation is now intentional rather than panicking:
   - direct local bindings assigned from local helpers whose output decision was forced raw stay raw
   - direct local aliases assigned from already-raw bindings also stay raw
-  - unsupported composite-root function-output forcing is currently limited to recognized tail-return-local shapes
+  - unsupported direct `return expr` / tail-expression box outputs are forced back to raw before signature rewrite
+  - raw struct-field pointer flows such as `(*map).entries` remain raw; struct-field ownership is still out of scope
 - Several non-goal shapes still panic, especially:
   - `addr_of` / `addr_of` arithmetic into box targets
   - `as_ptr` into box targets
@@ -484,8 +496,16 @@ If no local-path kind match applies:
     - `test_rewriter_keeps_composite_realloc_struct_raw_across_return_and_call_result`
     - `test_rewriter_keeps_mutable_local_struct_params_raw`
     - `test_rewriter_rewrites_add_on_slice_like_receivers`
+    - `test_rewriter_rewrites_realloc_null_char_ptr_to_boxed_slice`
+    - `test_rewriter_keeps_foreign_strdup_tail_raw`
+    - `test_rewriter_keeps_struct_field_pointer_tail_raw`
     - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
     - `test_rewriter_materializes_local_struct_malloc_default_gotomach_probe` remains an ignored supplemental probe in `tests.rs`; it is not the landed primary coverage artifact
+  - The direct `test_rewriter_` bucket now also covers:
+    - const-pointer mutability preservation through `rewriter::decision::tests`
+    - unsupported foreign `strdup` tail returns staying raw
+    - raw struct-field pointer tail flows staying raw
+  - Minimal toy array snippets in `tests.rs` are still conservative under the current analysis in some paths; the authoritative rewrite-compile proof for the broader array-owning surface is the landed B02 rewrite gate in Section 8.4
 
 ### 8.2 Rewriter decision tests
 - File: `crates/pointer_replacer/src/rewriter/decision.rs`
@@ -504,8 +524,14 @@ If no local-path kind match applies:
 
 ### 8.4 B02 test suite
 - File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.
-- Current checks are ownership-analysis/candidate validation and aggregated stats.
-- The landed tree does not currently keep the staged local rewrite-compile gate that was used to drive M4B development.
+- Shared harness behavior:
+  - run ownership analysis and candidate/stat assertions first
+  - then run `replace_local_borrows(&Config::default(), tcx)` on the original case source
+  - then type-check the rewritten output in a fresh compiler invocation
+  - failure messages include the B02 case name plus the rewritten source text
+- Current consequence:
+  - every B02 case is now gated on both ownership expectations and rewrite-compile success
+  - failing rewrite compilation reports the B02 case name plus the rewritten source text
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
