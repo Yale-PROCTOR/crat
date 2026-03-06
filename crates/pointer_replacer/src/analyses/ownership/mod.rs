@@ -212,7 +212,10 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for IntraProcedura
         // let mut databases = Vec::with_capacity(crate_ctxt.fns().len());
         for &did in crate_ctxt.fns() {
             println!("solving {:?}", did);
-            let body = crate_ctxt.tcx.optimized_mir(did);
+            let body = &*crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .borrow();
 
             let dominance_frontier = compute_dominance_frontier(body);
             let definitions = initial_definitions(body, &crate_ctxt);

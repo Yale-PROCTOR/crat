@@ -364,6 +364,7 @@ If no local-path kind match applies:
 ### 8.2 Ownership analysis tests in same file
 - Module: `ownership_analysis` inside `tests.rs`
 - Validates ownership and output-param analyses (not rewriter mutation).
+- Also includes a MIR-source regression guard over the ownership/output guarded paths.
 
 ### 8.3 B02 test suite
 - File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.
@@ -376,6 +377,7 @@ If no local-path kind match applies:
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
 - `cargo test -p pointer_replacer ownership_analysis::mutable_pointer_to_pointer_argument_becomes_output_param`
+- `! rg -n "optimized_mir\\(" crates/pointer_replacer/src/analyses/output_params crates/pointer_replacer/src/analyses/ownership crates/pointer_replacer/src/analyses/B02_tests/mod.rs crates/pointer_replacer/src/tests.rs`
 
 ## 9) Maintenance Checklist for Spec Sync
 When rewriter behavior changes, update this document in the same change set.

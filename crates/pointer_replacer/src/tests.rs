@@ -1588,6 +1588,11 @@ pub unsafe extern "C" fn bar() {
 }
 
 mod ownership_analysis {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
     use rustc_middle::{mir::Local, ty::TyCtxt};
@@ -1656,6 +1661,69 @@ mod ownership_analysis {
                 path.rsplit("::").next() == Some(name)
             })
             .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    fn collect_guarded_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap_or_else(|err| {
+                panic!("failed to read guarded path `{}`: {err}", path.display())
+            }) {
+                let entry = entry.unwrap_or_else(|err| {
+                    panic!("failed to iterate guarded path `{}`: {err}", path.display())
+                });
+                collect_guarded_rust_files(&entry.path(), files);
+            }
+            return;
+        }
+
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path.to_path_buf());
+        }
+    }
+
+    fn forbidden_mir_source_bytes() -> Vec<u8> {
+        [b"optimized".as_slice(), b"_mir".as_slice(), b"(".as_slice()].concat()
+    }
+
+    #[test]
+    fn mir_source_regression_guard_rejects_legacy_callsites() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let guarded_paths = [
+            root.join("analyses/output_params"),
+            root.join("analyses/ownership"),
+            root.join("analyses/B02_tests/mod.rs"),
+            root.join("tests.rs"),
+        ];
+        let needle = forbidden_mir_source_bytes();
+        let mut files = Vec::new();
+        for path in &guarded_paths {
+            collect_guarded_rust_files(path, &mut files);
+        }
+        files.sort();
+
+        let offenders = files
+            .into_iter()
+            .filter(|path| {
+                let bytes = fs::read(path).unwrap_or_else(|err| {
+                    panic!("failed to read guarded file `{}`: {err}", path.display())
+                });
+                bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_slice())
+            })
+            .map(|path| {
+                path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            offenders.is_empty(),
+            "legacy MIR source token found in guarded files:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]
@@ -1925,7 +1993,9 @@ pub unsafe fn phi_merge(flag: bool, p: *mut i32) -> *mut i32 {
                 );
 
                 let solidified = results.solidify(&program);
-                let body = tcx.optimized_mir(did);
+                let body = &*tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow();
                 let fn_results = solidified.fn_results(&did);
 
                 let ptr_temporaries = body

@@ -4,12 +4,14 @@ use either::Either::Left;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
-use rustc_middle::mir::{
-    Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, Rvalue, StatementKind,
-    TerminatorKind, VarDebugInfoContents, RETURN_PLACE,
-    visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+use rustc_middle::{
+    mir::{
+        Body, ClearCrossCrate, Local, LocalInfo, Location, Operand, Place, RETURN_PLACE, Rvalue,
+        StatementKind, TerminatorKind, VarDebugInfoContents,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
+    },
+    ty::TyKind,
 };
-use rustc_middle::ty::TyKind;
 
 use super::{Ownership, whole_program::WholeProgramResults};
 use crate::{
@@ -80,7 +82,9 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         tcx: rustc_middle::ty::TyCtxt,
     ) -> impl Iterator<Item = &[Qualifier]> {
         let fn_result = self.fn_results(r#fn);
-        let body = tcx.optimized_mir(*r#fn);
+        let body = &*tcx
+            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+            .borrow();
         fn_result.results().take(body.arg_count + 1)
     }
 
@@ -228,7 +232,10 @@ impl<'tcx> WholeProgramResults<'tcx> {
         for (idx, r#fn) in fns.iter().enumerate() {
             did_idx.insert(*r#fn, idx);
 
-            let body = program.tcx.optimized_mir(*r#fn);
+            let body = &*program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+                .borrow();
 
             let mut locals = Vec::with_capacity(body.local_decls.len());
             for local_decl in body.local_decls.iter() {
@@ -483,9 +490,7 @@ fn apply_allocator_owner_fallback<'tcx>(
                 continue;
             };
             let TerminatorKind::Call {
-                func,
-                destination,
-                ..
+                func, destination, ..
             } = &terminator.kind
             else {
                 continue;
@@ -505,6 +510,7 @@ fn apply_allocator_owner_fallback<'tcx>(
     // Track locals that can receive pointer values with no allocator-root provenance.
     // If such flow reaches a local, do not promote it via fallback.
     let mut has_non_root_flow = IndexVec::from_elem_n(false, body.local_decls.len());
+    let mut direct_internal_alloc_flow = IndexVec::from_elem_n(false, body.local_decls.len());
     let mut changed = true;
     while changed {
         changed = false;
@@ -536,6 +542,18 @@ fn apply_allocator_owner_fallback<'tcx>(
                     || (origins[rhs_local].is_empty() && rhs_is_external_provenance);
                 if rhs_non_root && !has_non_root_flow[lhs_local] {
                     has_non_root_flow[lhs_local] = true;
+                    changed = true;
+                }
+
+                let rhs_is_internal_alloc_chain = !origins[rhs_local].is_empty()
+                    && !user_visible_locals.contains(&rhs_local)
+                    && !matches!(
+                        body.local_decls[rhs_local].local_info.as_ref(),
+                        ClearCrossCrate::Set(local_info)
+                            if matches!(local_info.as_ref(), LocalInfo::User(_))
+                    );
+                if rhs_is_internal_alloc_chain && !direct_internal_alloc_flow[lhs_local] {
+                    direct_internal_alloc_flow[lhs_local] = true;
                     changed = true;
                 }
             }
@@ -588,7 +606,7 @@ fn apply_allocator_owner_fallback<'tcx>(
         }
     }
 
-    if promoted_roots.is_empty() {
+    if promoted_roots.is_empty() && !direct_internal_alloc_flow.iter().any(|&flag| flag) {
         return;
     }
 
@@ -610,9 +628,10 @@ fn apply_allocator_owner_fallback<'tcx>(
         if has_non_root_flow[local] {
             continue;
         }
-        if origins[local]
-            .iter()
-            .any(|root| promoted_roots.contains(root))
+        if direct_internal_alloc_flow[local]
+            || origins[local]
+                .iter()
+                .any(|root| promoted_roots.contains(root))
         {
             locals[local.index()][0] = Ownership::Owning;
         }
@@ -626,7 +645,10 @@ fn sanity_check<'tcx>(
     fns: &[DefId],
 ) {
     for r#fn in fns {
-        let body = program.tcx.optimized_mir(*r#fn);
+        let body = &*program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+            .borrow();
 
         let ownership_schemes = ownership_schemes.fn_results(*r#fn).unwrap();
 

@@ -1,7 +1,7 @@
-pub mod borrow;
 #[cfg(test)]
 #[allow(non_snake_case)]
 pub mod B02_tests;
+pub mod borrow;
 mod encoding;
 mod lattice;
 mod liveness;

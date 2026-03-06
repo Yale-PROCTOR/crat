@@ -823,7 +823,9 @@ fn fit<'tcx, T, U, DB>(
     }
 
     if fitter.next().is_some() || fittee.next().is_some() {
-        tracing::debug!("fit: non-empty iterator tail after structural fit; ignoring trailing items");
+        tracing::debug!(
+            "fit: non-empty iterator tail after structural fit; ignoring trailing items"
+        );
     }
 }
 

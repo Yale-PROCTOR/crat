@@ -133,7 +133,11 @@ impl CallGraph {
                 graph: &mut graph,
                 node_idx: &node_idx,
             }
-            .visit_body(tcx.optimized_mir(did));
+            .visit_body(
+                &*tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow(),
+            );
         }
 
         let mut tarjan_scc = TarjanScc::new();
@@ -173,7 +177,9 @@ impl CallGraph {
                 }
             }
             let mut vis = Vis(tcx, 0);
-            let body = tcx.optimized_mir(*did);
+            let body = &*tcx
+                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .borrow();
             vis.visit_body(body);
             n_alloc_deallocs.insert(*did, vis.1);
         }
@@ -190,7 +196,9 @@ impl CallGraph {
 
                 for did in nodes {
                     let did = graph[*did];
-                    let body = tcx.optimized_mir(did);
+                    let body = &*tcx
+                        .mir_drops_elaborated_and_const_checked(did.expect_local())
+                        .borrow();
                     let original = monotonicity[&did];
                     let mut mc = MonotonicityChecker {
                         this: original,

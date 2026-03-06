@@ -29,7 +29,10 @@ pub(super) fn initial_inter_ctxt(
     fn_sigs.reserve(crate_ctxt.fns().len());
     for &did in crate_ctxt.fn_ctxt.fns() {
         let output_params = &output_params[&did.expect_local()];
-        let body = crate_ctxt.tcx.optimized_mir(did);
+        let body = &*crate_ctxt
+            .tcx
+            .mir_drops_elaborated_and_const_checked(did.expect_local())
+            .borrow();
         let fn_sig = {
             let mut local_decls = body.local_decls.iter_enumerated();
             let (_, return_local_decl) = local_decls.next().unwrap();

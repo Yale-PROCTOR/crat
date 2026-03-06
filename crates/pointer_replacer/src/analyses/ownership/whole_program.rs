@@ -46,7 +46,10 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAn
     ) -> anyhow::Result<Self::Results> {
         let required_precision = std::cmp::min(
             crate_ctxt.fns().iter().copied().fold(0, |acc, did| {
-                let body = crate_ctxt.tcx.optimized_mir(did);
+                let body = &*crate_ctxt
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow();
                 std::cmp::max(acc, total_deref_level(body) + 1)
             }),
             3,
@@ -108,7 +111,9 @@ impl<'tcx> WholeProgramResults<'tcx> {
         }
 
         for did in self.fn_locals.fn_summaries.keys() {
-            let body = tcx.optimized_mir(did);
+            let body = &*tcx
+                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .borrow();
             tracing::debug!("@{}", tcx.def_path_str(*did));
             for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
                 for index in 0..bb_data.statements.len() + bb_data.terminator.iter().count() {
@@ -207,7 +212,10 @@ fn solve_crate(
             let inter_ctxt =
                 initial_inter_ctxt(crate_ctxt, noalias_params, &mut var_gen, &mut database);
             for &did in crate_ctxt.fn_ctxt.fns() {
-                let body = crate_ctxt.tcx.optimized_mir(did);
+                let body = &*crate_ctxt
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow();
                 let ssa_state = initial_ssa_state(crate_ctxt, body);
                 let fn_summary = solve_body(
                     body,
@@ -232,7 +240,10 @@ fn solve_crate(
                 &mut database,
             );
             for (did, ssa_state, precision) in fns {
-                let body = crate_ctxt.tcx.optimized_mir(did);
+                let body = &*crate_ctxt
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow();
                 let fn_summary = solve_body(
                     body,
                     ssa_state,
@@ -424,7 +435,10 @@ impl FnLocals {
         inter_ctxt.reserve(self.fn_sigs.len());
 
         for (did, original) in self.fn_sigs.into_iter() {
-            let body = crate_ctxt.tcx.optimized_mir(did);
+            let body = &*crate_ctxt
+                .tcx
+                .mir_drops_elaborated_and_const_checked(did.expect_local())
+                .borrow();
             let precision = self.fn_summaries[&did].1;
 
             let fn_sig = original
@@ -488,11 +502,10 @@ impl FnLocals {
             self.fn_summaries
                 .into_iter()
                 .map(move |(did, (fn_summary, precision))| {
-                    (
-                        did,
-                        refine_state(tcx.optimized_mir(did), fn_summary, &model),
-                        precision,
-                    )
+                    let body = &*tcx
+                        .mir_drops_elaborated_and_const_checked(did.expect_local())
+                        .borrow();
+                    (did, refine_state(body, fn_summary, &model), precision)
                 });
 
         (inter_ctxt, state_iter)

@@ -372,7 +372,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             | StatementKind::ConstEvalCounter
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::Nop => {
-                unreachable!("statement {:?} is not assumed to appear", statement)
+                tracing::debug!("ignoring statement {:?}", statement)
             }
         }
     }
