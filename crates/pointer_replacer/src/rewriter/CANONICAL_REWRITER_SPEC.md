@@ -53,13 +53,12 @@
   - Core precedence-ordered local decision algorithm.
 - `SigDecisions::new(rust_program, analysis)`
   - Produces per-function input/output signature rewrite decisions.
-  - Disables signature rewrites for functions used as function pointers.
+  - Carries `signature_locked` when a function is used as a function pointer, keeping that function signature raw.
 
 ### `collector.rs`
 - `collect_fn_ptrs(rust_program)`
-  - Finds local functions used as function pointers by scanning HIR for:
-    - `ExprKind::Cast(inner, ty)` where `ty` is `TyKind::BareFn`
-    - `inner` resolves to local `Fn`/`AssocFn`
+  - Finds local functions used as function pointers by scanning HIR for local `Fn`/`AssocFn` paths whose adjusted HIR type is `FnPtr`.
+  - This includes explicit `as bare_fn_type` casts and ordinary fn-pointer coercions such as typed let-bindings.
 - `collect_diffs(rust_program, analysis) -> FxHashMap<HirId, PtrKind>`
   - Computes local rewrite decisions and maps MIR locals back to HIR binding IDs.
   - Skips input locals for functions used as function pointers.
@@ -147,7 +146,7 @@ The following table is exact branch order.
 
 Notes:
 - `unwrap_ptr_from_mir_ty` treats both raw pointers and references as pointer-like for decision purposes.
-- `needs_cursor` remains a conservative raw staging carveout for owning arrays in M3 because signed-offset-safe owning transforms are not implemented yet.
+- `needs_cursor` remains a conservative raw carveout for owning arrays in M4A because signed-offset-safe owning transforms are not implemented yet.
 - Alias rule remains intentionally conservative for the non-owning path.
 
 ### 3.3 Signature Decision Rules (`SigDecisions::new`)
@@ -155,20 +154,33 @@ Notes:
 2. For each function `did`:
    - If `did in fn_ptrs`:
      - `input_decs = vec![None; input_arity]`
-     - `output_dec = None`
+      - `output_dec = None`
+      - `signature_locked = true`
    - Else:
      - For each parameter local (`_1..` up to input arity), run `DecisionMaker::decide`.
-     - For return local `_0`, run `decide` and keep only raw:
-       - `Some(Raw(m)) -> Some(Raw(m))`
-       - any other result -> `None`
+      - For return local `_0`, run `decide` and keep:
+        - `Some(Raw(m)) -> Some(Raw(m))`
+        - `Some(OptBox) -> Some(OptBox)`
+        - `Some(OptBoxedSlice) -> Some(OptBoxedSlice)`
+        - any borrow-like result -> try `infer_returned_local_box_kind(body, decision_maker, aliases, _0)`:
+          - scan MIR statements for assignments to `_0`
+          - if every `_0` assignment is a direct `_0 = move/copy <local>`
+          - and every such assignment agrees on one source local
+          - and that local decides to `OptBox` / `OptBoxedSlice`
+          - use that box kind as `output_dec`
+          - otherwise `None`
+      - `signature_locked = false`
 
-Current consequence: non-raw return signature rewrites, including `OptBox`/`OptBoxedSlice`, are intentionally disabled in M3.
+Current consequence:
+- signature decisions can now request owning return rewrites for `OptBox` and `OptBoxedSlice`
+- borrow-like return rewrites remain disabled
 
 ## 4) `SigDecisions` and `collect_diffs` Interaction
 - `TransformVisitor::new` computes both from the same `Analysis` snapshot.
 - `SigDecisions` drives:
   - function signature parameter/return type rewriting (`visit_item`)
   - call-argument target kind selection (`visit_expr` call branch)
+  - source-kind lookup for local call expressions whose rewritten return kind is non-`None`
   - call-site return mutability override when callee output decision is `Raw(m)`.
 - `collect_diffs` drives:
   - local variable type rewrite (`visit_local`)
@@ -193,17 +205,18 @@ Practical result for function-pointer-used functions:
   - Fetch `SigDecision` for this function.
   - For each parameter:
     - `OptRef(m)` -> rewrite to `Option<&{mut?} T>` via `mk_opt_ref_ty`; force binding pattern mutable.
-    - `OptBox` / `OptBoxedSlice` -> panic as an internal M3 staging error.
+    - `OptBox` -> rewrite to `Option<Box<T>>` via `mk_opt_box_ty`; force binding pattern mutable.
+    - `OptBoxedSlice` -> rewrite to `Option<Box<[T]>>` via `mk_opt_boxed_slice_ty`; force binding pattern mutable.
     - `Slice(m)` -> rewrite to `&{mut?}[T]` via `mk_slice_ty`.
     - `Raw(m)` -> rewrite to `*{mut|const} T` via `mk_raw_ptr_ty`.
     - `SliceCursor(m)` -> rewrite to cursor type via `mk_cursor_ty`; set `slice_cursor = true`.
     - `None` -> keep as-is.
-  - Return type rewrite occurs only when `sig_dec.output_dec == Some(Raw(m))` and return AST is explicit type.
+  - Return type rewrite occurs when `sig_dec.output_dec` is `Some(Raw(_)|OptBox|OptBoxedSlice)`.
+  - Borrow-like return kinds still do not rewrite signatures.
 
 ### 5.2 `visit_local`
 - For let-bindings with `ptr_kinds[hir_id]`:
-  - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
-  - `OptBox` / `OptBoxedSlice` currently panic as an internal M3 staging error instead of rewriting.
+  - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`OptBox`/`OptBoxedSlice`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
 ### 5.3 `visit_expr` major cases
@@ -212,7 +225,6 @@ Practical result for function-pointer-used functions:
     - if LHS is path and resolves to a local HIR id -> use direct index `self.ptr_kinds[&hir_id]` (not `get`); this can panic if the id is missing from `ptr_kinds`
     - else fallback `Raw(lhs mutability)`
   - Convert RHS with `transform_rhs`.
-  - `OptBox` / `OptBoxedSlice` LHS targets currently panic as an internal M3 staging error.
   - Special case for `SliceCursor` self-assign with single `offset` projection:
     - `p = p.offset(k)` -> `p.seek((k) as isize)`
 - Pointer comparisons (`== != < <= > >=`)
@@ -223,19 +235,23 @@ Practical result for function-pointer-used functions:
   - Run `hoist_opt_ref_borrow` post-pass to reduce repeated mutable deref borrow conflicts.
 - Method call `is_null`
   - local `OptRef` receiver -> rename to `is_none`
-  - local `OptBox` / `OptBoxedSlice` receiver -> panic as an internal M3 staging error
+  - local `OptBox` / `OptBoxedSlice` receiver -> rename to `is_none`
   - local `Slice` / `SliceCursor` receiver -> rename to `is_empty`
   - `Raw` -> unchanged
 - Method call `offset_from`
   - force receiver and argument through raw-pointer conversion.
 - Return (`ret expr`)
-  - only for raw-pointer function outputs: convert return expr with `sig_decs.output_dec` if present, else raw mutability fallback.
+  - only for original raw-pointer function outputs: convert return expr with:
+    - `sig_decs.output_dec` if present
+    - else raw mutability fallback
 - Unary deref (`*p`)
   - Uses expression context (`Lvalue/Rvalue/AddrTaken`) to choose target mutability.
   - If source is cursor with exactly one offset projection, emits indexed access directly.
   - Otherwise transforms pointer and post-adjusts:
     - deref of `OptRef` -> `.unwrap()`
-    - deref of `OptBox` / `OptBoxedSlice` -> panic as an internal M3 staging error
+    - deref of `OptBox` -> `.as_deref{_mut}().unwrap()`
+    - deref of `OptBoxedSlice` with no projections -> `.as_deref{_mut}().unwrap()[0]`
+    - deref of projected `OptBoxedSlice` sources first materializes a slice expression, then indexes `[0]`
     - deref of `Slice` -> `[0]`
     - deref of `SliceCursor` -> `[0 as usize]`
 
@@ -269,6 +285,7 @@ When parsed pointer expression is literal zero with no projections:
 - target `SliceCursor(m)` -> `SliceCursor::empty()` / `SliceCursorRef::empty()`
 - target `Slice(m)` -> `&mut []` / `&[]`
 - target `OptRef(_)` -> `None`
+- target `OptBox` / `OptBoxedSlice` -> `None`
 - target `Raw(m)` -> `std::ptr::null_mut()` / `std::ptr::null()`
 - deref context -> keep as `Raw`
 
@@ -292,14 +309,18 @@ When parsed pointer expression is literal zero with no projections:
   - all successful raw->slice/cursor materializations use fixed length sentinel `100000`.
 
 ### 6.4 Source-kind/target-kind conversion matrix (local path bases)
-This matrix is for the branch where `PtrExpr` base resolves to local path with known `ptr_kinds`.
+This matrix is for the branch where `PtrExpr` base resolves to:
+- local path with known `ptr_kinds`, or
+- direct local-function call whose rewritten `output_dec` is non-`None`
 
-| Source kind | Target `Raw` | Target `OptRef` | Target `Slice` | Target `SliceCursor` |
-|---|---|---|---|---|
-| `Raw` | direct / mutability cast | `opt_ref_from_raw` | `slice_from_raw` | `cursor_from_raw` |
-| `OptRef` | `raw_from_opt_ref` | `opt_ref_from_opt_ref` | `panic!` | `panic!` |
-| `Slice` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` | `plain_slice_from_slice` | `cursor_from_plain_slice` |
-| `SliceCursor` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` (offset-only fast path uses `as_slice{_mut}`) | `cursor_or_slice_to_slice_expr` | `cursor_from_slice_or_cursor` (+ possible `to_ref_cursor`/`fork`) |
+| Source kind | Target `Raw` | Target `OptRef` | Target `OptBox` | Target `Slice` | Target `OptBoxedSlice` | Target `SliceCursor` |
+|---|---|---|---|---|---|---|
+| `Raw` | direct / mutability cast | `opt_ref_from_raw` | panic without allocator-root evidence | `slice_from_raw` | panic without allocator-root length evidence | `cursor_from_raw` |
+| `OptRef` | `raw_from_opt_ref` | `opt_ref_from_opt_ref` | panic | `panic!` | panic | `panic!` |
+| `OptBox` | `raw_from_opt_box` | `opt_ref_from_opt_box` (same-type or same-size numeric bytemuck only) | `opt_box_from_opt_box` (same-type only) | panic | panic | panic |
+| `Slice` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` | panic | `plain_slice_from_slice` | panic | `cursor_from_plain_slice` |
+| `OptBoxedSlice` | `raw_from_slice_or_cursor` over projected boxed-slice view | `opt_ref_from_slice_or_cursor` over projected boxed-slice view | panic | boxed-slice view -> `plain_slice_from_expr` | `opt_boxed_slice_from_opt_boxed_slice` (identity only, no projections) | boxed-slice view -> `cursor_from_slice_or_cursor_inner(..., is_plain_slice=true)` |
+| `SliceCursor` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` (offset-only fast path uses `as_slice{_mut}`) | panic | `cursor_or_slice_to_slice_expr` | panic | `cursor_from_slice_or_cursor` (+ possible `to_ref_cursor`/`fork`) |
 
 `raw_from_opt_ref` foreign-type note:
 - if RHS inner type is `ty::Foreign`, conversion uses an explicit `match` (`Some(x) => *x as *...`, `None => null`) rather than the normal `.as_deref[_mut]().map_or(...)` path.
@@ -307,14 +328,28 @@ This matrix is for the branch where `PtrExpr` base resolves to local path with k
 Deref context behavior:
 - `Deref` targeting `Raw/OptRef/Slice` reuses corresponding conversions.
 - `Deref` on `SliceCursor` uses `cursor_from_slice_or_cursor_inner(..., is_plain_slice=false)` then indexing logic in `visit_expr`.
+- `Deref` on `OptBox` keeps same-type box identity, then `visit_expr` appends `.as_deref{_mut}().unwrap()`.
+- `Deref` on `OptBoxedSlice`:
+  - no projections -> keeps same-type boxed-slice identity, then `visit_expr` appends `.as_deref{_mut}().unwrap()[0]`
+  - with projections -> first materializes a plain slice expression, then `visit_expr` indexes `[0]`
 
-### 6.5 General fallback path
+### 6.5 Direct owning allocator-root materialization
+When the target context is `OptBox` or `OptBoxedSlice`, `transform_ptr` checks the normalized AST expression for direct allocator calls before entering the general conversion matrix:
+- `malloc(bytes)` + target `OptBox` -> `Some(Box::<T>::new(<T as Default>::default()))`
+- `calloc(count, _)` + target `OptBoxedSlice` -> `Some(std::iter::repeat_with(<T as Default>::default).take((count) as usize).collect::<Vec<T>>().into_boxed_slice())`
+- `malloc(bytes)` + target `OptBoxedSlice` -> same iterator materialization with element count `bytes / size_of::<T>()`
+- this direct allocator-root materialization runs for scalar and owning-array M4A roots before raw fallback handling
+
+### 6.6 General fallback path
 If no local-path kind match applies:
 - infer mutability from base raw/array type (with array-path deref inspection)
 - if callee return signature mutability was rewritten to raw, override fallback mutability accordingly
 - convert to requested target using `opt_ref_from_raw`, `slice_from_raw`, `cursor_from_raw`, or raw cast fallback.
+- raw fallback support is asymmetric for owning box targets:
+  - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
+  - array `OptBoxedSlice` targets still panic unless direct allocator-root length evidence was matched earlier
 
-### 6.6 Mutability Heuristics Used by Call/Deref Rewrites
+### 6.7 Mutability Heuristics Used by Call/Deref Rewrites
 - `get_mutability_decision(hir_expr)`:
   - strips leading `.offset(...)` receivers to the root expression
   - if root is a local path with `ptr_kinds` entry, returns that kind mutability
@@ -331,32 +366,43 @@ If no local-path kind match applies:
   - method calls (`as_ptr`, `as_mut_ptr`, and `set_*` treated as address-taking).
 
 ## 7) Conservative Fallbacks and Known Limitations
-1. Return borrow inference is absent.
-- `SigDecisions` only keeps `output_dec = Some(Raw(_))`; non-raw returns are dropped.
+1. Borrow-like return inference is still absent.
+- `SigDecisions` keeps `Raw`, `OptBox`, and `OptBoxedSlice` outputs.
+- `OptRef` / `Slice` / `SliceCursor` return rewrites are still dropped.
+- Non-fn-pointer functions additionally have a narrow MIR returned-local fallback for `_0 = move/copy <local>` shapes that already decide to `OptBox` / `OptBoxedSlice`.
 
 2. Ownership/output-parameter analysis is now consumed by current rewriter decisions.
 - `Analysis` in `rewriter/mod.rs` now carries output-parameter facts and optional solidified ownership facts.
-- Current M3 behavior consults top-level ownership and output-parameter facts in `DecisionMaker::decide`.
+- Current behavior consults top-level ownership and output-parameter facts in `DecisionMaker::decide`.
 - Struct-field and deeper nested-pointer ownership facts are still not consumed.
 - If ownership analysis is unavailable, the rewriter continues with `ownership_schemes = None`.
 
 3. `ItemKind::Impl(_)` is skipped in `visit_item`.
 - Impl methods are not rewritten by this pass.
 
-4. Function-pointer-use detection is narrow.
-- Only explicit `fn_item as bare_fn_type` cast patterns are recognized by `collect_fn_ptrs`.
+4. Function-pointer-use detection is HIR-type-driven, not purely syntax-driven.
+- `collect_fn_ptrs` recognizes both explicit `as bare_fn_type` casts and plain coercions where the adjusted expression type is `FnPtr`.
+- It still only protects local functions/assoc fns, not arbitrary foreign callees.
 
 5. Length fallback often uses a fixed sentinel (`100000`) when concrete length is unavailable.
 - Appears in raw->slice/cursor materialization and several non-numeric cast fallback conversions.
 - Example emitted pattern: `std::slice::from_raw_parts_mut(ptr, 100000)`.
 
-6. `OptBox` / `OptBoxedSlice` are decision-only staging kinds in M3.
-- Any transform path that reaches them panics as an internal staging error until M4A.
+6. Owning box support is implemented only for the M4A-supported source/target surface.
+- Direct allocator roots and local/call box sources are supported.
+- Several non-goal shapes still panic, especially:
+  - `addr_of` / `addr_of` arithmetic into box targets
+  - `as_ptr` into box targets
+  - casted `OptBox -> OptRef` reinterpretation outside the same-size numeric bytemuck path
+  - byte-string source into box targets
+  - scalar-box to slice/cursor targets
+  - raw-to-scalar-box targets without direct allocator-root evidence
+  - owning array box target without allocator-root length evidence
 
 7. Multiple other conversion branches intentionally panic on unsupported shapes.
 - Examples:
   - integer-cast pointer rewrite requested into non-raw context
-  - target slice/cursor from `OptRef` source in local-path matrix
+  - target slice/cursor from `OptRef` source in local/call source-kind matrix
   - byte-string deref context
 
 8. `collect_diffs` only rewrites locals that have at least one mapped HIR binding.
@@ -395,15 +441,28 @@ If no local-path kind match applies:
   - null handling, `if/else` and block expression normalization
   - raw mutability casts and call-site return mutability propagation
   - ownership-analysis-fallback equivalence via test-only forced failure
-  - M3 fail-fast regression for unsupported `OptBox` transform paths
+  - M4A positive box rewrite regressions:
+    - `test_rewriter_rewrites_malloc_scalar_to_opt_box`
+    - `test_rewriter_rewrites_calloc_array_to_opt_boxed_slice`
+    - `test_rewriter_rewrites_malloc_array_to_opt_boxed_slice`
+    - `test_rewriter_rewrites_local_call_boundary_for_opt_box`
+    - `test_rewriter_rewrites_local_call_result_from_opt_box`
+    - `test_rewriter_converts_opt_box_call_result_into_opt_ref_param`
+    - `test_rewriter_converts_opt_boxed_slice_call_result_into_slice_param`
+    - `test_rewriter_keeps_explicit_fn_pointer_return_signature_raw`
+    - `test_rewriter_keeps_fn_pointer_scalar_return_raw_while_local_is_box`
+    - `test_rewriter_keeps_fn_pointer_array_return_raw_while_local_is_boxed_slice`
+    - `test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback`
+    - `test_rewriter_preserves_fn_pointer_signature_with_opt_boxed_slice_raw_fallback`
+    - `test_rewriter_mixed_return_shapes_do_not_infer_box_signature`
 
 ### 8.2 Rewriter decision tests
 - File: `crates/pointer_replacer/src/rewriter/decision.rs`
 - Internal white-box tests exercise `DecisionMaker::decide` directly with synthetic facts over real MIR `LocalDecl`s.
-- Covered M3 decision areas include:
+- Covered decision areas include:
   - owning scalar output override -> `OptRef(true)`
   - owning scalar non-output -> `OptBox`
-  - owning array + `needs_cursor` -> staged `Raw(...)`
+  - owning array + `needs_cursor` -> conservative `Raw(...)`
   - owning array without `needs_cursor` -> `Slice(true)` / `OptBoxedSlice`
   - non-owning scalar and cursor regressions remain unchanged
 

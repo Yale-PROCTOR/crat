@@ -1,5 +1,3 @@
-use std::panic::AssertUnwindSafe;
-
 use super::*;
 
 fn rewrite_with_config(code: &str, config: &Config) -> (String, bool, bool) {
@@ -66,33 +64,369 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
-fn test_rewriter_panics_when_opt_box_transform_is_reached() {
-    let code = r#"
+fn test_rewriter_rewrites_malloc_scalar_to_opt_box() {
+    run_test(
+        r#"
 extern "C" {
     fn malloc(size: usize) -> *mut i32;
 }
 
 pub unsafe fn foo() -> *mut i32 {
-    let p: *mut i32 = malloc(4);
-    p
+    let mut p: *mut i32 = malloc(4);
+    *p = 7;
+    return p;
 }
-"#;
+"#,
+        &[
+            "-> Option<Box<i32>>",
+            "Option<Box<i32>>",
+            "Box::<i32>::new(<i32 as Default>::default())",
+            "as_deref_mut().unwrap()",
+        ],
+        &[],
+    );
+}
 
-    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let _ = rewrite_with_config(code, &Config::default());
-    }))
-    .expect_err("expected M3 staging panic for OptBox local");
+#[test]
+fn test_rewriter_rewrites_calloc_array_to_opt_boxed_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+}
 
-    let message = if let Some(msg) = panic.downcast_ref::<String>() {
-        msg.clone()
-    } else if let Some(msg) = panic.downcast_ref::<&'static str>() {
-        (*msg).to_owned()
-    } else {
-        format!("{panic:?}")
-    };
+pub unsafe fn foo() -> *mut i32 {
+    let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *p.offset(1) = 7;
+    return p;
+}
+"#,
+        &[
+            "-> Option<Box<[i32]>>",
+            "Option<Box<[i32]>>",
+            "repeat_with(",
+            "into_boxed_slice()",
+            ".as_deref_mut().unwrap_or(&mut [])",
+        ],
+        &[],
+    );
+}
 
-    assert!(message.contains("M3 staging error"), "{message}");
-    assert!(message.contains("OptBox"), "{message}");
+#[test]
+fn test_rewriter_rewrites_malloc_array_to_opt_boxed_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn foo() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4 * std::mem::size_of::<i32>());
+    *p.offset(1) = 7;
+    return p;
+}
+"#,
+        &[
+            "-> Option<Box<[i32]>>",
+            "Option<Box<[i32]>>",
+            "repeat_with(",
+            "std::mem::size_of::<i32>()",
+            "into_boxed_slice()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_explicit_fn_pointer_return_signature_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 5;
+    return p;
+}
+
+pub unsafe fn call_it(f: unsafe fn() -> *mut i32) -> *mut i32 {
+    return f();
+}
+
+pub unsafe fn foo() -> i32 {
+    let p = call_it(alloc_one as unsafe fn() -> *mut i32);
+    return *p;
+}
+"#,
+        &[
+            "pub unsafe fn alloc_one() -> *mut i32",
+            "Option<Box<i32>>",
+            "map_or(std::ptr::null_mut::<i32>()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_converts_opt_box_call_result_into_opt_ref_param() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 5;
+    return p;
+}
+
+pub unsafe fn take_raw(p: *mut i32) -> i32 {
+    return *p;
+}
+
+pub unsafe fn foo() -> i32 {
+    return take_raw(alloc_one());
+}
+"#,
+        &[
+            "-> Option<Box<i32>>",
+            ".as_deref()",
+            "take_raw",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_converts_opt_boxed_slice_call_result_into_slice_param() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_many() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4 * std::mem::size_of::<i32>());
+    *p.offset(1) = 5;
+    return p;
+}
+
+pub unsafe fn take_raw(p: *mut i32) -> i32 {
+    return *p.offset(1);
+}
+
+pub unsafe fn foo() -> i32 {
+    return take_raw(alloc_many());
+}
+"#,
+        &[
+            "-> Option<Box<[i32]>>",
+            ".as_deref().unwrap_or(&[])",
+            "take_raw",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_local_call_boundary_for_opt_box() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn id(mut p: *mut i32) -> *mut i32 {
+    return p;
+}
+
+pub unsafe fn foo() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 7;
+    let q: *mut i32 = id(p);
+    return q;
+}
+"#,
+        &[
+            "pub unsafe fn id(mut p: Option<Box<i32>>) -> Option<Box<i32>>",
+            "pub unsafe fn foo() -> Option<Box<i32>>",
+            "let q: Option<Box<i32>> = id(p);",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fn_pointer_scalar_return_raw_while_local_is_box() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn keep_raw() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 1;
+    return p;
+}
+
+pub unsafe fn foo() {
+    let fp: unsafe fn() -> *mut i32 = keep_raw;
+    let _ = fp();
+}
+"#,
+        &[
+            "pub unsafe fn keep_raw() -> *mut i32",
+            "Option<Box<i32>>",
+            "map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+            "let fp: unsafe fn() -> *mut i32 = keep_raw;",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fn_pointer_array_return_raw_while_local_is_boxed_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+}
+
+pub unsafe fn keep_raw_arr() -> *mut i32 {
+    let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *p.offset(1) = 7;
+    return p;
+}
+
+pub unsafe fn foo() {
+    let fp: unsafe fn() -> *mut i32 = keep_raw_arr;
+    let _ = fp();
+}
+"#,
+        &[
+            "pub unsafe fn keep_raw_arr() -> *mut i32",
+            "Option<Box<[i32]>>",
+            ".as_deref_mut().unwrap_or(&mut [])",
+            "as_mut_ptr()",
+            "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_local_call_result_from_opt_box() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 5;
+    return p;
+}
+
+pub unsafe fn caller() -> *mut i32 {
+    let mut q: *mut i32 = alloc_one();
+    *q = 9;
+    return q;
+}
+"#,
+        &[
+            "fn alloc_one() -> Option<Box<i32>>",
+            "fn caller() -> Option<Box<i32>>",
+            "let mut q: Option<Box<i32>> = alloc_one();",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 5;
+    return p;
+}
+
+pub unsafe fn caller() -> *mut i32 {
+    let f: unsafe fn() -> *mut i32 = alloc_one;
+    return f();
+}
+"#,
+        &[
+            "fn alloc_one() -> *mut i32",
+            "let mut p: Option<Box<i32>>",
+            "as_deref_mut().map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_fn_pointer_signature_with_opt_boxed_slice_raw_fallback() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_arr() -> *mut i32 {
+    let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *p.offset(1) = 7;
+    return p;
+}
+
+pub unsafe fn caller() -> *mut i32 {
+    let f: unsafe fn() -> *mut i32 = alloc_arr;
+    return f();
+}
+"#,
+        &[
+            "fn alloc_arr() -> *mut i32",
+            "Option<Box<[i32]>>",
+            ".as_deref_mut().unwrap_or(&mut [])).as_mut_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_rewriter_mixed_return_shapes_do_not_infer_box_signature() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn maybe_alloc(flag: bool) -> *mut i32 {
+    let mut p: *mut i32 = malloc(4);
+    *p = 7;
+    if flag {
+        return p;
+    }
+    return 0 as *mut i32;
+}
+"#,
+        &[
+            "fn maybe_alloc(flag: bool) -> *const i32",
+            "std::ptr::null()",
+            "as_deref().map_or(std::ptr::null::<i32>(), |_x| _x)",
+        ],
+        &["-> Option<Box<i32>>"],
+    );
 }
 
 // ===== Cross-PtrKind assignment tests (same type, no cast) =====

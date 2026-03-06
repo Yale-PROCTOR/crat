@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
-    mir::{Local, LocalDecl},
+    mir::{Local, LocalDecl, Operand, Rvalue, StatementKind},
     ty::TyCtxt,
 };
 use rustc_span::def_id::LocalDefId;
@@ -168,6 +168,7 @@ pub struct SigDecision {
     /// None means no change
     pub input_decs: Vec<Option<PtrKind>>,
     pub output_dec: Option<PtrKind>,
+    pub signature_locked: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -199,6 +200,7 @@ impl SigDecisions {
                                 .len()
                         ],
                         output_dec: None,
+                        signature_locked: true,
                     },
                 );
                 continue;
@@ -229,10 +231,23 @@ impl SigDecisions {
             let return_local = Local::from_u32(0);
             let return_decl = &body.local_decls[return_local];
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
-            let output_dec = match decision_maker.decide(return_local, return_decl, return_aliases)
-            {
-                Some(PtrKind::Raw(m)) => Some(PtrKind::Raw(m)),
-                _ => None, // no borrow inference for returns yet
+            let direct_output_dec =
+                match decision_maker.decide(return_local, return_decl, return_aliases) {
+                    Some(kind @ (PtrKind::Raw(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
+                        Some(kind)
+                    }
+                    _ => None,
+                };
+            let returned_local_output_dec =
+                infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
+            let output_dec = match (direct_output_dec, returned_local_output_dec) {
+                (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
+                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice)) => {
+                    Some(PtrKind::OptBoxedSlice)
+                }
+                (Some(kind), None) | (None, Some(kind)) => Some(kind),
+                (Some(kind), Some(_)) => Some(kind),
+                (None, None) => None,
             };
 
             data.insert(
@@ -240,10 +255,49 @@ impl SigDecisions {
                 SigDecision {
                     input_decs,
                     output_dec,
+                    signature_locked: false,
                 },
             );
         }
         SigDecisions { data }
+    }
+}
+
+fn infer_returned_local_box_kind<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    decision_maker: &DecisionMaker<'tcx>,
+    aliases: Option<&FxHashMap<Local, FxHashSet<Local>>>,
+    return_local: Local,
+) -> Option<PtrKind> {
+    let mut candidate = None;
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if place.as_local() != Some(return_local) {
+                continue;
+            }
+            let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
+                return None;
+            };
+            let Some(src_local) = src.as_local() else {
+                return None;
+            };
+            match candidate {
+                Some(prev) if prev != src_local => return None,
+                None => candidate = Some(src_local),
+                _ => {}
+            }
+        }
+    }
+
+    let local = candidate?;
+    let decl = &body.local_decls[local];
+    let aliases = aliases.and_then(|aliases| aliases.get(&local));
+    match decision_maker.decide(local, decl, aliases) {
+        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some(kind),
+        _ => None,
     }
 }
 

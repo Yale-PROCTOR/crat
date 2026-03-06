@@ -65,26 +65,41 @@ pub fn collect_diffs<'tcx>(
 }
 
 pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
-    struct FnPtrCollector {
+    struct FnPtrCollector<'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
         pub fn_ptrs: FxHashSet<LocalDefId>,
     }
 
-    impl<'tcx> Visitor<'tcx> for FnPtrCollector {
+    impl<'tcx> Visitor<'tcx> for FnPtrCollector<'tcx> {
         fn visit_expr(&mut self, ex: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
-            if let ExprKind::Cast(inner, ty) = ex.kind
+            let mut maybe_local_fn = None;
+            if let ExprKind::Path(ref qpath) = ex.kind
+                && let QPath::Resolved(_, path) = qpath
+                && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
+            {
+                maybe_local_fn = def_id.as_local();
+            } else if let ExprKind::Cast(inner, ty) = ex.kind
                 && let TyKind::BareFn(_) = ty.kind
                 && let ExprKind::Path(ref qpath) = inner.kind
                 && let QPath::Resolved(_, path) = qpath
                 && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
-                && let Some(def_id) = def_id.as_local()
             {
-                self.fn_ptrs.insert(def_id);
+                maybe_local_fn = def_id.as_local();
+            }
+
+            if let Some(def_id) = maybe_local_fn {
+                let typeck = self.tcx.typeck(ex.hir_id.owner);
+                if matches!(typeck.expr_ty_adjusted(ex).kind(), rustc_middle::ty::TyKind::FnPtr(..))
+                {
+                    self.fn_ptrs.insert(def_id);
+                }
             }
             walk_expr(self, ex);
         }
     }
 
     let mut collector = FnPtrCollector {
+        tcx: rust_program.tcx,
         fn_ptrs: FxHashSet::default(),
     };
 
