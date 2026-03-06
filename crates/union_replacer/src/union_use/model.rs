@@ -29,40 +29,155 @@ pub struct FnModel {
     pub ret_alias: Option<RetAlias>,
 }
 
-const MEMCPY_EFFECTS: [ArgEffect; 2] = [
-    ArgEffect {
-        arg_index: 0,
-        kind: ArgEffectKind::Write,
-        deref_count: 1,
-    },
-    ArgEffect {
-        arg_index: 1,
-        kind: ArgEffectKind::Read,
-        deref_count: 1,
-    },
-];
+macro_rules! read_effect {
+    ($arg_index:expr, $deref_count:expr) => {
+        ArgEffect {
+            arg_index: $arg_index,
+            kind: ArgEffectKind::Read,
+            deref_count: $deref_count,
+        }
+    };
+}
 
-const MEMCPY_MODEL: FnModel = FnModel {
-    arg_effects: &MEMCPY_EFFECTS,
-    ret_alias: Some(RetAlias::Arg(0)),
-};
+macro_rules! write_effect {
+    ($arg_index:expr, $deref_count:expr) => {
+        ArgEffect {
+            arg_index: $arg_index,
+            kind: ArgEffectKind::Write,
+            deref_count: $deref_count,
+        }
+    };
+}
 
 /// Return a modeled summary for known external/library functions.
 ///
-/// Current coverage:
-/// - memcpy
+/// Notes:
+/// - Effects are memory-level summaries over pointer arguments.
 pub fn lookup_fn_model(tcx: TyCtxt<'_>, callee: DefId) -> Option<FnModel> {
-    let name: Vec<_> = tcx
+    let path: Vec<_> = tcx
         .def_path(callee)
         .data
         .into_iter()
         .map(|data| data.to_string())
         .collect();
 
-    let seg = |i: usize| name.get(i).map(|s| s.as_str()).unwrap_or_default();
-    let name = (seg(0), seg(1), seg(2), seg(3));
-    match name {
-        (_, _, _, "memcpy") => Some(MEMCPY_MODEL),
+    let fn_name = path.last().map(|s| s.as_str()).unwrap_or_default();
+    match fn_name {
+        // memory/string primitives
+        "memcpy" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "memset" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "memmove" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "memchr" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "memrchr" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "memcmp" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "strcmp" | "strncmp" | "strcasecmp" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "strlen" | "strnlen" | "strspn" | "strtol" | "strtoul" | "strtod" | "atoi" => {
+            Some(FnModel {
+                arg_effects: &[read_effect!(0, 1)],
+                ret_alias: None,
+            })
+        }
+        "strstr" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "strcpy" | "strncpy" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "snprintf" | "vsnprintf" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(2, 1)],
+            ret_alias: None,
+        }),
+        "strchr" | "strrchr" | "strchrnul" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "strerror_r" => Some(FnModel {
+            arg_effects: &[write_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "strdup" | "strndup" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1)],
+            ret_alias: None,
+        }),
+        "strcat" | "strncat" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: Some(RetAlias::Arg(0)),
+        }),
+        "strtok_r" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1), write_effect!(2, 1)],
+            ret_alias: None,
+        }),
+        "sprintf" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "sscanf" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+
+        // i/o
+        "read" | "tape_buffered_read" => Some(FnModel {
+            arg_effects: &[write_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "write" | "tape_buffered_write" => Some(FnModel {
+            arg_effects: &[read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "fread" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1)],
+            ret_alias: None,
+        }),
+        "fwrite" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1)],
+            ret_alias: None,
+        }),
+        "readlink" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), write_effect!(1, 1)],
+            ret_alias: None,
+        }),
+
+        // others
+        "htable_insert" => Some(FnModel {
+            arg_effects: &[write_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "htable_find" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), read_effect!(1, 1)],
+            ret_alias: None,
+        }),
+        "qsort" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), write_effect!(0, 1)],
+            ret_alias: None,
+        }),
+        "to_ascii" | "from_ascii" => Some(FnModel {
+            arg_effects: &[read_effect!(0, 1), write_effect!(1, 1)],
+            ret_alias: None,
+        }),
         _ => None,
     }
 }

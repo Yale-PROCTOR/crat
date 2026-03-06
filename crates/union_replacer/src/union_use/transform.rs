@@ -19,7 +19,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let use_optimized_mir = false;
     let print_mir = false;
 
-    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
+    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, true);
     let related_types_map = collect_union_related_types(&tcx, &union_tys, &ty_visitor, verbose);
     let seed_functions = collect_union_seed_functions(tcx, &union_tys, verbose);
     let callgraphs = build_union_callgraphs(tcx, &seed_functions, &related_types_map, verbose);

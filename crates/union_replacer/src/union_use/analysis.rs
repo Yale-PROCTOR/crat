@@ -11,7 +11,7 @@ use rustc_middle::{
         StatementKind, Terminator, TerminatorKind,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MirVisitor},
     },
-    ty::{TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 use typed_arena::Arena;
@@ -199,11 +199,10 @@ fn identify_union_uses(
         .union_offsets
         .keys()
         .copied()
-        .map(|root| UnionMemoryInstance {
-            root,
-            end: result.ends[root],
-        })
+        .filter_map(|root| union_instance_from_root(&result, root))
         .collect();
+    let union_instance_set: FxHashSet<UnionMemoryInstance> =
+        union_instances.iter().copied().collect();
     // if verbose {
     //     println!("Union Instances: {union_instances:?}");
     // }
@@ -237,17 +236,14 @@ fn identify_union_uses(
                 let Some(node) = result.var_nodes.get(&(def_id, local)) else {
                     continue;
                 };
-
-                let instance = UnionMemoryInstance {
-                    root: node.index,
-                    end: result.ends[node.index],
-                };
-                if union_instances.contains(&instance)
-                    && let TyKind::Adt(adt, _) = decl.ty.kind()
-                    && adt.is_union()
-                {
-                    instance_to_union_ty.entry(instance).or_insert(adt.did());
-                }
+                collect_union_instances_from_local(
+                    tcx,
+                    decl.ty,
+                    *node,
+                    &result,
+                    &union_instance_set,
+                    &mut instance_to_union_ty,
+                );
             }
         });
     }
@@ -329,6 +325,64 @@ fn identify_union_uses(
     res
 }
 
+fn collect_union_instances_from_local<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    node: LocNode,
+    result: &andersen::AnalysisResult,
+    union_instance_set: &FxHashSet<UnionMemoryInstance>,
+    out: &mut FxHashMap<UnionMemoryInstance, DefId>,
+) {
+    let TyKind::Adt(adt, args) = ty.kind() else {
+        return;
+    };
+
+    if adt.is_union() {
+        let Some(instance) = union_instance_from_root(result, node.index) else {
+            return;
+        };
+        if union_instance_set.contains(&instance) {
+            out.entry(instance).or_insert(adt.did());
+        }
+        // Ignore nested unions inside union fields for now.
+        return;
+    }
+
+    if !adt.is_struct() {
+        return;
+    }
+
+    let Some(LocEdges::Fields(succs)) = result.graph.get(&node) else {
+        return;
+    };
+
+    for (field_idx, succ) in succs.iter().enumerate() {
+        let Some(field) = adt.all_fields().nth(field_idx) else {
+            continue;
+        };
+        let field_ty = field.ty(tcx, args);
+        collect_union_instances_from_local(tcx, field_ty, *succ, result, union_instance_set, out);
+    }
+}
+
+fn union_instance_from_root(
+    result: &andersen::AnalysisResult,
+    root: andersen::Loc,
+) -> Option<UnionMemoryInstance> {
+    // `union_offsets[root]` is [field_offset..., union_len].
+    // Use union_len (not `result.ends[root]`) to avoid including non-union tail bytes
+    // when a union shares the same root index with an enclosing struct at offset 0.
+    let offsets = result.union_offsets.get(&root)?;
+    let union_len = *offsets.last()?;
+    if union_len == 0 {
+        return None;
+    }
+    Some(UnionMemoryInstance {
+        root,
+        end: root + (union_len - 1),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AccessKind {
     Read,
@@ -355,27 +409,116 @@ struct BodyUnionAccessCollector<'tcx, 'a> {
     seen: FxHashSet<DetectedAccess>,
     accesses: Vec<DetectedAccess>,
     init_lhs: FxHashMap<Location, Local>,
+    skip_store_locations: FxHashSet<Location>,
+    union_local_known_field: FxHashMap<Local, (DefId, UnionAccessField)>,
 }
 
 impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
+        let mut local_field_update: Option<(Local, Option<(DefId, UnionAccessField)>)> = None;
+
         // Handle union init statement
         // i.e. let x = UnionType { field: ... };
         if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
             && let Some((union_ty, field)) = self.is_union_init(*place, rvalue)
         {
             self.init_lhs.insert(location, place.local);
+            self.skip_store_locations.insert(location);
             let site = UnionAccessSite {
                 def_id: self.def_id,
                 location,
             };
             self.push_access(*place, AccessKind::Write, site, 0, Some((union_ty, field)));
+            local_field_update = Some((place.local, Some((union_ty, field))));
+        } else if let StatementKind::Assign(box (place, rvalue)) = &statement.kind
+            && place.projection.is_empty()
+            && let Some(union_ty) = self.local_union_ty(place.local)
+        {
+            // Propagate known active field through simple union value moves/copies.
+            let propagated = match rvalue {
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
+                    if src.projection.is_empty() =>
+                {
+                    self.union_local_known_field.get(&src.local).copied()
+                }
+                _ => None,
+            };
+            let next = propagated.filter(|(src_ty, _)| *src_ty == union_ty);
+            local_field_update = Some((place.local, next));
+        }
+
+        // Handle struct aggregate assignment that moves/copies a union value into a union field.
+        // This lets us preserve concrete union field info across:
+        //   _2 = U { b: ... };
+        //   _1 = S { u: move _2, ... };
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &statement.kind
+            && let Rvalue::Aggregate(box AggregateKind::Adt(_, _, _, _, _), operands) = rvalue
+            && let TyKind::Adt(dst_adt, dst_args) = dst_place.ty(self.body, self.tcx).ty.kind()
+            && dst_adt.is_struct()
+        {
+            let site = UnionAccessSite {
+                def_id: self.def_id,
+                location,
+            };
+            for (field_idx, field_def) in dst_adt.non_enum_variant().fields.iter_enumerated() {
+                let field_ty = field_def.ty(self.tcx, dst_args);
+                let TyKind::Adt(field_adt, _) = field_ty.kind() else {
+                    continue;
+                };
+                if !field_adt.is_union() {
+                    continue;
+                }
+                let Some((src_union_ty, src_field)) = operands
+                    .get(field_idx)
+                    .and_then(|op| self.known_union_field_from_operand(op))
+                else {
+                    continue;
+                };
+                if src_union_ty != field_adt.did() {
+                    continue;
+                }
+
+                let union_field_place =
+                    dst_place.project_deeper(&[PlaceElem::Field(field_idx, field_ty)], self.tcx);
+                self.push_access(
+                    union_field_place,
+                    AccessKind::Write,
+                    site,
+                    0,
+                    Some((src_union_ty, src_field)),
+                );
+                // Avoid adding an additional coarse Top write for the same Assign statement.
+                self.skip_store_locations.insert(location);
+            }
         }
 
         self.super_statement(statement, location);
+
+        if let Some((local, state)) = local_field_update {
+            match state {
+                Some(state) => {
+                    self.union_local_known_field.insert(local, state);
+                }
+                None => {
+                    self.union_local_known_field.remove(&local);
+                }
+            }
+        }
     }
 
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        // Ignore lhs of union init (already handled in visit_statement)
+        if self.skip_store_locations.contains(&location)
+            && matches!(
+                context,
+                PlaceContext::MutatingUse(
+                    MutatingUseContext::Store | MutatingUseContext::AsmOutput
+                )
+            )
+        {
+            return;
+        }
+
         // Ignore lhs of union init (already handled in visit_statement)
         if self
             .init_lhs
@@ -452,6 +595,8 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             seen: FxHashSet::default(),
             accesses: Vec::new(),
             init_lhs: FxHashMap::default(),
+            skip_store_locations: FxHashSet::default(),
+            union_local_known_field: FxHashMap::default(),
         }
     }
 
@@ -603,9 +748,42 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             if union_ty.is_some_and(|union_ty| union_ty != adt.did()) {
                 return None;
             }
+            if place.projection.is_empty()
+                && let Some((known_union_ty, known_field)) =
+                    self.union_local_known_field.get(&place.local).copied()
+                && known_union_ty == adt.did()
+            {
+                return Some(known_field);
+            }
             return Some(UnionAccessField::Top);
         }
         None
+    }
+
+    fn local_union_ty(&self, local: Local) -> Option<DefId> {
+        let ty = self.body.local_decls[local].ty;
+        let TyKind::Adt(adt, _) = ty.kind() else {
+            return None;
+        };
+        if adt.is_union() {
+            Some(adt.did())
+        } else {
+            None
+        }
+    }
+
+    fn known_union_field_from_operand(
+        &self,
+        op: &Operand<'tcx>,
+    ) -> Option<(DefId, UnionAccessField)> {
+        let place = match *op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Constant(_) => return None,
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        self.union_local_known_field.get(&place.local).copied()
     }
 
     fn detect_field_from_points_to(
@@ -655,9 +833,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
     ) -> Option<(DefId, UnionAccessField)> {
         let instance_union_ty = self.instance_to_union_ty.get(&instance).copied();
         let union_ty = instance_union_ty?;
-        if let Some(syntax_field) = self.detect_field_from_syntax(place, instance_union_ty)
-            && let UnionAccessField::Field(_) = syntax_field
-        {
+        if let Some(syntax_field) = self.detect_field_from_syntax(place, instance_union_ty) {
             return Some((union_ty, syntax_field));
         }
         Some((
@@ -682,8 +858,25 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         }
 
         for instance in instances {
+            let mapped_union_ty = self.instance_to_union_ty.get(&instance).copied();
             let (union_ty, field) = match type_field {
-                Some((union_ty, field)) => (Some(union_ty), field),
+                Some((union_ty, field)) => {
+                    // A place may alias multiple union instances.
+                    // Use the provided field only for matching instance type,
+                    // otherwise fall back to per-instance field detection.
+                    if let Some(mapped_union_ty) = mapped_union_ty
+                        && mapped_union_ty == union_ty
+                    {
+                        (Some(mapped_union_ty), field)
+                    } else {
+                        let Some((detected_union_ty, detected_field)) =
+                            self.detect_field(place, instance, implicit_deref_count)
+                        else {
+                            continue;
+                        };
+                        (Some(detected_union_ty), detected_field)
+                    }
+                }
                 None => {
                     let Some((union_ty, field)) =
                         self.detect_field(place, instance, implicit_deref_count)
