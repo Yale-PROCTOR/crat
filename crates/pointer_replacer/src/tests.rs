@@ -1,10 +1,13 @@
 use super::*;
 
+fn rewrite_with_config(code: &str, config: &Config) -> (String, bool, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(config, tcx))
+        .unwrap()
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
-    let (s, _) =
-        ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(&config, tcx))
-            .unwrap();
+    let (s, _, _) = rewrite_with_config(code, &config);
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     for include in includes {
         assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
@@ -33,6 +36,31 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &["&mut"],
         &["*mut"],
     );
+}
+
+#[test]
+fn test_rewriter_output_unchanged_when_ownership_analysis_fails() {
+    let code = r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    let mut q: *mut libc::c_int = p;
+    return *q;
+}
+"#;
+    let baseline = rewrite_with_config(code, &Config::default());
+    let fallback = rewrite_with_config(
+        code,
+        &Config {
+            force_ownership_analysis_failure: true,
+            ..Config::default()
+        },
+    );
+
+    assert_eq!(fallback, baseline);
+    ::utils::compilation::run_compiler_on_str(&fallback.0, ::utils::type_check).expect(&fallback.0);
 }
 
 // ===== Cross-PtrKind assignment tests (same type, no cast) =====

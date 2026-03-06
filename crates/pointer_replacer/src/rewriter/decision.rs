@@ -7,7 +7,7 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 
 use super::{Analysis, collector::collect_fn_ptrs};
-use crate::utils::rustc::RustProgram;
+use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
@@ -36,6 +36,8 @@ pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
     mutable_pointers: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
+    _owning_pointers: IndexVec<Local, bool>,
+    _output_params: DenseBitSet<Local>,
     promoted_mut_refs: DenseBitSet<Local>,
     promoted_shared_refs: DenseBitSet<Local>,
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
@@ -60,6 +62,28 @@ impl<'tcx> DecisionMaker<'tcx> {
             .get(&did)
             .unwrap()
             .clone();
+        let _owning_pointers = if let Some(ownership_schemes) = analysis.ownership_schemes.as_ref()
+        {
+            let fn_results = ownership_schemes.fn_results(&did.to_def_id());
+            (0..mutable_pointers.len())
+                .map(|index| {
+                    fn_results
+                        .local_result(Local::from_usize(index))
+                        .first()
+                        .is_some_and(Ownership::is_owning)
+                })
+                .collect::<IndexVec<Local, _>>()
+        } else {
+            (0..mutable_pointers.len())
+                .map(|_| false)
+                .collect::<IndexVec<Local, _>>()
+        };
+        let mut _output_params = DenseBitSet::new_empty(mutable_pointers.len());
+        if let Some(output_params) = analysis.output_params.get(&did) {
+            for local in output_params.iter() {
+                _output_params.insert(local);
+            }
+        }
         let fn_offset_signs = analysis.offset_sign_result.access_signs.get(&did);
         let mut needs_cursor = DenseBitSet::new_empty(mutable_pointers.len());
         if let Some(signs) = fn_offset_signs {
@@ -69,6 +93,8 @@ impl<'tcx> DecisionMaker<'tcx> {
             tcx,
             array_pointers,
             mutable_pointers,
+            _owning_pointers,
+            _output_params,
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor,

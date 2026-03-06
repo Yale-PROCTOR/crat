@@ -19,11 +19,14 @@
     - mutability analysis result
     - fatness analysis result
     - Andersen-derived param alias map
+    - output-parameter facts
+    - optional solidified ownership facts
     - offset-sign result
 - `Config`
-  - `c_exposed_fns` only; passed through to Andersen configuration.
+  - `c_exposed_fns`; passed through to Andersen configuration.
+  - Test-only field `force_ownership_analysis_failure`; forces the ownership-analysis fallback path for regression coverage.
 - `replace_local_borrows(config, tcx) -> (String, bool, bool)`
-  - End-to-end driver: build AST, run analyses, construct `TransformVisitor`, mutate AST, render source, optionally append `slice_cursor` module, return feature flags.
+  - End-to-end driver: build AST, run analyses, compute output-parameter facts, attempt ownership-analysis solidification, construct `TransformVisitor`, mutate AST, render source, optionally append `slice_cursor` module, return feature flags.
 - `find_param_aliases(pre, points_to, tcx)`
   - Builds per-function param alias clusters by intersecting points-to sets across call-argument pairs.
 - `slice_cursor_mod_str()`
@@ -79,11 +82,13 @@
    - include `ItemKind::Struct`
 6. Run analyses used by rewriter:
    - mutability analysis
+   - output-parameter analysis
+   - attempted ownership-analysis solidification (`None` if unavailable or test-forced off)
    - source-variable grouping postprocessing
    - promoted mutable/shared reference extraction
    - fatness analysis
    - offset-sign analysis
-7. Build `Analysis` with the six fields listed in Section 1.
+7. Build `Analysis` with the eight fields listed in Section 1.
 8. Construct `TransformVisitor::new(&input, &analysis_results, ast_to_hir)`:
    - computes `sig_decs = SigDecisions::new(...)`
    - computes `ptr_kinds = collect_diffs(...)`
@@ -100,10 +105,17 @@ For one function (`did`), `DecisionMaker::new` computes:
   - `true` if any mutability fact for that local is mutable.
 - `array_pointers[local]`:
   - uses only the first available fatness fact (`iter().next()`); sets `true` only if that first fact is `is_arr()`, otherwise `false`.
+- `_owning_pointers[local]`:
+  - top-level owning bit from solidified ownership facts when available; otherwise `false`.
+- `_output_params`:
+  - dense bitset derived from output-parameter facts for the function.
 - `promoted_mut_refs` / `promoted_shared_refs`:
   - dense bitsets keyed by MIR `Local`.
 - `needs_cursor`:
   - local requires cursor when offset-sign facts for its HIR binding report `needs_cursor()`.
+
+Current consequence:
+- `_owning_pointers` and `_output_params` are threaded into `DecisionMaker` but are not yet consulted by `decide`.
 
 ### 3.2 Branch-Ordered Precedence (`DecisionMaker::decide`)
 The following table is exact branch order.
@@ -307,7 +319,9 @@ If no local-path kind match applies:
 - `SigDecisions` only keeps `output_dec = Some(Raw(_))`; non-raw returns are dropped.
 
 2. Ownership/output-parameter analysis is not consumed by current rewriter decisions.
-- `Analysis` in `rewriter/mod.rs` has no ownership/output-param field.
+- `Analysis` in `rewriter/mod.rs` now carries output-parameter facts and optional solidified ownership facts.
+- Current M2 behavior still does not consult those facts when producing rewrite decisions.
+- If ownership analysis is unavailable, the rewriter continues with `ownership_schemes = None`.
 
 3. `ItemKind::Impl(_)` is skipped in `visit_item`.
 - Impl methods are not rewritten by this pass.
@@ -360,6 +374,7 @@ If no local-path kind match applies:
   - pointer comparisons, call argument adaptation, return adaptation
   - null handling, `if/else` and block expression normalization
   - raw mutability casts and call-site return mutability propagation
+  - ownership-analysis-fallback equivalence via test-only forced failure
 
 ### 8.2 Ownership analysis tests in same file
 - Module: `ownership_analysis` inside `tests.rs`
