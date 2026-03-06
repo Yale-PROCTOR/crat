@@ -371,10 +371,11 @@ If no local-path kind match applies:
 
 ### 8.4 Standard commands used for validation
 - `cargo test -p pointer_replacer`
-- `cargo test -p pointer_replacer analyses::B02_tests`
+- `cargo test -p pointer_replacer analyses::B02_tests -- --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
+- `cargo test -p pointer_replacer ownership_analysis::mutable_pointer_to_pointer_argument_becomes_output_param`
 
 ## 9) Maintenance Checklist for Spec Sync
 When rewriter behavior changes, update this document in the same change set.
