@@ -80,7 +80,9 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         tcx: rustc_middle::ty::TyCtxt,
     ) -> impl Iterator<Item = &[Qualifier]> {
         let fn_result = self.fn_results(r#fn);
-        let body = tcx.optimized_mir(*r#fn);
+        let body = &*tcx
+            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+            .borrow();
         fn_result.results().take(body.arg_count + 1)
     }
 
@@ -228,7 +230,10 @@ impl<'tcx> WholeProgramResults<'tcx> {
         for (idx, r#fn) in fns.iter().enumerate() {
             did_idx.insert(*r#fn, idx);
 
-            let body = program.tcx.optimized_mir(*r#fn);
+            let body = &*program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+                .borrow();
 
             let mut locals = Vec::with_capacity(body.local_decls.len());
             for local_decl in body.local_decls.iter() {
@@ -626,7 +631,10 @@ fn sanity_check<'tcx>(
     fns: &[DefId],
 ) {
     for r#fn in fns {
-        let body = program.tcx.optimized_mir(*r#fn);
+        let body = &*program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
+            .borrow();
 
         let ownership_schemes = ownership_schemes.fn_results(*r#fn).unwrap();
 

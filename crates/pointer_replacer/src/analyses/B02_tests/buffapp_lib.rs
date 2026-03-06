@@ -232,5 +232,11 @@ pub mod src {
 
 #[test]
 fn ownership_analysis_runs() {
-    run_ownership_case_with_box_candidates("buffapp_lib", SOURCE, &["create_buffer#buffer"], &[]);
+    run_ownership_case_with_box_candidates(
+        "buffapp_lib",
+        SOURCE,
+        &["create_buffer#buffer"],
+        // M1 MIR-source migration: realloc temporary no longer classified as owning local.
+        &["src::lib::append_to_buffer#new_data"],
+    );
 }

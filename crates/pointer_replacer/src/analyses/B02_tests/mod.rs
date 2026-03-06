@@ -255,7 +255,10 @@ fn collect_raw_ptr_local_ownership<'tcx>(
 
     for local_did in &program.functions {
         let did = local_did.to_def_id();
-        let body = program.tcx.optimized_mir(did);
+        let body = &*program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(did.expect_local())
+            .borrow();
         let fn_path = program.tcx.def_path_str(did);
         let fn_results = solidified.fn_results(&did);
         for debug_info in &body.var_debug_info {
@@ -665,6 +668,11 @@ pub(super) fn run_ownership_case_with_box_candidates(
             expected_non_candidates.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         effective_expected_non_candidates.sort();
         effective_expected_non_candidates.dedup();
+        let expected_non_set = effective_expected_non_candidates
+            .iter()
+            .cloned()
+            .collect::<FxHashSet<_>>();
+        effective_expected_box_candidates.retain(|spec| !expected_non_set.contains(spec));
 
         record_total_analysis_stats(
             &program,

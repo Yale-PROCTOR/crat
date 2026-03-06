@@ -1839,7 +1839,9 @@ pub unsafe fn phi_merge(flag: bool, p: *mut i32) -> *mut i32 {
                 );
 
                 let solidified = results.solidify(&program);
-                let body = tcx.optimized_mir(did);
+                let body = &*tcx
+                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow();
                 let fn_results = solidified.fn_results(&did);
 
                 let ptr_temporaries = body
@@ -1900,5 +1902,42 @@ pub unsafe fn make_holder() -> Holder {
                 assert_eq!(fields[0].len(), 1);
             },
         );
+    }
+
+    #[test]
+    fn mir_source_guard_disallows_optimized_mir_in_ownership_and_output_paths() {
+        const FORBIDDEN: &str = concat!("optimized_", "mir(");
+        let files = [
+            (
+                "analyses/output_params/mod.rs",
+                include_str!("analyses/output_params/mod.rs"),
+            ),
+            ("analyses/ownership/mod.rs", include_str!("analyses/ownership/mod.rs")),
+            (
+                "analyses/ownership/call_graph.rs",
+                include_str!("analyses/ownership/call_graph.rs"),
+            ),
+            (
+                "analyses/ownership/whole_program.rs",
+                include_str!("analyses/ownership/whole_program.rs"),
+            ),
+            (
+                "analyses/ownership/whole_program/state.rs",
+                include_str!("analyses/ownership/whole_program/state.rs"),
+            ),
+            (
+                "analyses/ownership/solidify.rs",
+                include_str!("analyses/ownership/solidify.rs"),
+            ),
+            ("analyses/B02_tests/mod.rs", include_str!("analyses/B02_tests/mod.rs")),
+            ("tests.rs", include_str!("tests.rs")),
+        ];
+
+        for (path, src) in files {
+            assert!(
+                !src.contains(FORBIDDEN),
+                "MIR source guard violation in {path}: found `{FORBIDDEN}`"
+            );
+        }
     }
 }

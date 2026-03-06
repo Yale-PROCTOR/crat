@@ -2158,6 +2158,12 @@ fn ownership_analysis_runs() {
         "generic-foreach",
         SOURCE,
         &["array_int_create#arr", "list_int_create#list"],
-        &[],
+        // M1 MIR-source migration: realloc temporary no longer classified as owning local.
+        &[
+            "src::inventory::array_int_push#new_data",
+            "src::inventory::array_double_push#new_data",
+            "src::inventory::array_item_t_push#new_data",
+            "src::inventory::array_order_t_push#new_data",
+        ],
     );
 }
