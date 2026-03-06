@@ -298,7 +298,7 @@ pub unsafe fn foo() {
             "pub unsafe fn keep_raw_arr() -> *mut i32",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
-        &["Option<Box<[i32]>>"],
+        &["Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 
@@ -528,6 +528,53 @@ pub unsafe fn get_entries(map: *mut Map) -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_bridges_raw_scalar_allocator_root_and_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_nested() {
+    let mut p: *mut *mut i32 =
+        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &[
+            "let mut p: *mut *mut i32 = malloc(",
+            "free(p as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_nested_alias() {
+    let p: *mut *mut i32 =
+        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    let q = p;
+    free(q as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "malloc(std::mem::size_of::<*mut i32>())",
+            "free(q as *mut core::ffi::c_void",
+        ],
+        &["Box::into_raw(", "Box::from_raw("],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback() {
     run_test(
         r#"
@@ -575,7 +622,7 @@ pub unsafe fn caller() -> *mut i32 {
 }
 "#,
         &["fn alloc_arr() -> *mut i32", "let f: unsafe fn() -> *mut i32 = alloc_arr;"],
-        &["Option<Box<[i32]>>"],
+        &["Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 

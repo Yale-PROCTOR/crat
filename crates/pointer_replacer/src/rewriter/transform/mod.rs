@@ -33,6 +33,7 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: FxHashSet<HirId>,
+    raw_scalar_bridge_bindings: FxHashSet<HirId>,
     ast_to_hir: AstToHir,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
@@ -288,7 +289,10 @@ impl MutVisitor for TransformVisitor<'_> {
             }
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
-                self.transform_rhs(rhs, let_stmt.init.unwrap(), lhs_kind);
+                let hir_rhs = let_stmt.init.unwrap();
+                if !self.try_bridge_scalar_raw_root(rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
+                    self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                }
             }
         }
     }
@@ -368,14 +372,36 @@ impl MutVisitor for TransformVisitor<'_> {
                                 return;
                             }
                         }
-                        self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        if let Some(lhs_hir_id) = lhs_hir_id
+                            && !self.try_bridge_scalar_raw_root(
+                                rhs,
+                                lhs_kind,
+                                lhs_inner_ty,
+                                Some(lhs_hir_id),
+                            )
+                        {
+                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        } else if lhs_hir_id.is_none() {
+                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        }
                     }
                     PtrKind::Slice(_)
                     | PtrKind::OptRef(_)
                     | PtrKind::OptBox
                     | PtrKind::OptBoxedSlice
                     | PtrKind::Raw(_) => {
-                        self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        if let Some(lhs_hir_id) = lhs_hir_id
+                            && !self.try_bridge_scalar_raw_root(
+                                rhs,
+                                lhs_kind,
+                                lhs_inner_ty,
+                                Some(lhs_hir_id),
+                            )
+                        {
+                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        } else if lhs_hir_id.is_none() {
+                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                        }
                     }
                 }
             }
@@ -430,6 +456,11 @@ impl MutVisitor for TransformVisitor<'_> {
                     let Some(param_kind) = param_kind else { continue };
 
                     self.transform_rhs(arg, harg, param_kind);
+                }
+
+                if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
+                    *expr = free_rewrite;
+                    return;
                 }
 
                 hoist_opt_ref_borrow(expr);
@@ -636,15 +667,78 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         }
 
+        let raw_scalar_bridge_bindings =
+            collect_scalar_raw_bridge_bindings(rust_program.tcx, &ptr_kinds);
+
         TransformVisitor {
             tcx: rust_program.tcx,
             sig_decs,
             ptr_kinds,
             forced_raw_bindings,
+            raw_scalar_bridge_bindings,
             ast_to_hir,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
+    }
+
+    fn try_bridge_scalar_raw_root(
+        &self,
+        rhs: &mut Expr,
+        lhs_kind: PtrKind,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        lhs_hir_id: Option<HirId>,
+    ) -> bool {
+        let PtrKind::Raw(m) = lhs_kind else {
+            return false;
+        };
+        let Some(lhs_hir_id) = lhs_hir_id else {
+            return false;
+        };
+        if !self.raw_scalar_bridge_bindings.contains(&lhs_hir_id) {
+            return false;
+        }
+        if !expr_supports_scalar_opt_box_allocator_root(self.tcx, rhs, lhs_inner_ty) {
+            return false;
+        }
+        *rhs = self.raw_scalar_bridge_expr(lhs_inner_ty, m);
+        true
+    }
+
+    fn raw_scalar_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool) -> Expr {
+        let ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let default_expr = self.default_value_expr(lhs_inner_ty);
+        utils::expr!(
+            "Box::into_raw(Box::new({})) as *{} {}",
+            pprust::expr_to_string(&default_expr),
+            if m { "mut" } else { "const" },
+            ty,
+        )
+    }
+
+    fn rewrite_direct_free_call(
+        &self,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        args: &[P<Expr>],
+    ) -> Option<Expr> {
+        let Some((hir_id, _harg)) = hir_free_arg_local_id(self.tcx, hir_expr) else {
+            return None;
+        };
+        if !self.raw_scalar_bridge_bindings.contains(&hir_id) {
+            return None;
+        }
+        let [arg] = args else { return None };
+        let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
+        let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(arg_ty) else {
+            return None;
+        };
+        let arg_str = pprust::expr_to_string(arg);
+        let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
+        Some(utils::expr!(
+            "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(({0}) as *mut {1}) }}); }}",
+            arg_str,
+            inner_ty_str,
+        ))
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -3368,6 +3462,7 @@ fn ast_is_exact_size_of_expr(tcx: TyCtxt<'_>, expr: &Expr, ty_name: &str) -> boo
         format!("std::mem::size_of::<{ty_name}>()"),
     ]
     .into_iter()
+    .map(|candidate| normalize_expr_snippet(&candidate))
     .any(|candidate| snippet == candidate)
 }
 
@@ -3445,6 +3540,7 @@ fn hir_is_exact_size_of_expr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, ty_name: &st
         format!("std::mem::size_of::<{ty_name}>()"),
     ]
     .into_iter()
+    .map(|candidate| normalize_expr_snippet(&candidate))
     .any(|candidate| snippet == candidate)
 }
 
@@ -3776,6 +3872,189 @@ fn local_def_id_has_fn_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
             ..
         })
     )
+}
+
+fn hir_call_matches_foreign_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, name: &str) -> bool {
+    let hir::ExprKind::Call(func, _) = expr.kind else {
+        return false;
+    };
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind else {
+        return false;
+    };
+    if path
+        .segments
+        .last()
+        .is_none_or(|seg| seg.ident.name.as_str() != name)
+    {
+        return false;
+    }
+    let Res::Def(_, def_id) = path.res else {
+        return false;
+    };
+    !def_id
+        .as_local()
+        .is_some_and(|local| local_def_id_has_fn_body(tcx, local))
+}
+
+fn hir_free_arg_local_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<(HirId, &'tcx hir::Expr<'tcx>)> {
+    if !hir_call_matches_foreign_name(tcx, expr, "free") {
+        return None;
+    }
+    let hir::ExprKind::Call(_, args) = expr.kind else {
+        return None;
+    };
+    let [arg] = args else { return None };
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(arg).kind else {
+        return None;
+    };
+    let Res::Local(hir_id) = path.res else {
+        return None;
+    };
+    Some((hir_id, arg))
+}
+
+fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(expr).kind else {
+        return None;
+    };
+    let Res::Local(hir_id) = path.res else {
+        return None;
+    };
+    Some(hir_id)
+}
+
+fn collect_scalar_raw_bridge_bindings(
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<HirId> {
+    #[derive(Default)]
+    struct State {
+        saw_bridge: bool,
+        saw_free: bool,
+        disqualified: bool,
+    }
+
+    struct RawScalarBridgeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        states: FxHashMap<HirId, State>,
+    }
+
+    impl<'tcx> RawScalarBridgeVisitor<'_, 'tcx> {
+        fn update_rhs(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>, lhs_inner_ty: ty::Ty<'tcx>) {
+            let state = self.states.entry(hir_id).or_default();
+            if hir_supports_scalar_box_allocator_root(self.tcx, lhs_inner_ty, rhs) {
+                state.saw_bridge = true;
+            } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                state.disqualified = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawScalarBridgeVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                && let Some(init) = let_stmt.init
+            {
+                let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+                if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) {
+                    self.update_rhs(hir_id, init, lhs_inner_ty);
+                }
+            }
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let Some(init) = let_stmt.init
+                && let Some(rhs_hir_id) = hir_unwrapped_local_id(init)
+                && matches!(self.ptr_kinds.get(&rhs_hir_id), Some(PtrKind::Raw(_)))
+            {
+                self.states.entry(rhs_hir_id).or_default().disqualified = true;
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && let Res::Local(hir_id) = path.res
+                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+            {
+                let lhs_ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(lhs);
+                if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) {
+                    self.update_rhs(hir_id, rhs, lhs_inner_ty);
+                }
+            }
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs)
+                && matches!(self.ptr_kinds.get(&rhs_hir_id), Some(PtrKind::Raw(_)))
+            {
+                let lhs_hir_id = hir_unwrapped_local_id(lhs);
+                if lhs_hir_id != Some(rhs_hir_id) {
+                    self.states.entry(rhs_hir_id).or_default().disqualified = true;
+                }
+            }
+            if let Some((hir_id, _)) = hir_free_arg_local_id(self.tcx, expr)
+                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+            {
+                self.states.entry(hir_id).or_default().saw_free = true;
+            }
+            if let hir::ExprKind::Call(_, args) = expr.kind
+                && !hir_call_matches_foreign_name(self.tcx, expr, "free")
+            {
+                for arg in args {
+                    if let Some(hir_id) = hir_unwrapped_local_id(arg)
+                        && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                    {
+                        self.states.entry(hir_id).or_default().disqualified = true;
+                    }
+                }
+            }
+            if let hir::ExprKind::Ret(Some(ret)) = expr.kind
+                && let Some(hir_id) = hir_unwrapped_local_id(ret)
+                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+            {
+                self.states.entry(hir_id).or_default().disqualified = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+
+        fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
+            intravisit::walk_body(self, body);
+            if let Some(hir_id) = hir_unwrapped_local_id(body.value)
+                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+            {
+                self.states.entry(hir_id).or_default().disqualified = true;
+            }
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    let crate_hir = tcx.hir_crate(());
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = RawScalarBridgeVisitor {
+            tcx,
+            ptr_kinds,
+            states: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        bindings.extend(visitor.states.into_iter().filter_map(|(hir_id, state)| {
+            (state.saw_bridge && state.saw_free && !state.disqualified).then_some(hir_id)
+        }));
+    }
+    bindings
 }
 
 fn collect_raw_call_result_bindings(
@@ -4301,6 +4580,7 @@ mod tests {
             },
             ptr_kinds: FxHashMap::default(),
             forced_raw_bindings: FxHashSet::default(),
+            raw_scalar_bridge_bindings: FxHashSet::default(),
             ast_to_hir: AstToHir::default(),
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),

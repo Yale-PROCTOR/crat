@@ -221,6 +221,10 @@ Practical result for function-pointer-used functions:
 - For let-bindings with `ptr_kinds[hir_id]`:
   - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`OptBox`/`OptBoxedSlice`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
   - Any mutable selected kind forces the binding pattern to `mut`.
+  - For `Raw(...)` locals, exact scalar allocator roots now route through the same scalar-root detector used by box materialization only when the local is conservatively tracked as an M6 scalar-bridge candidate.
+    - tracked candidates are direct local bindings with exact scalar allocator-root writes plus a matching direct foreign `free(local[_cast])`
+    - locals whose raw value escapes through aliases, returns, or other call arguments stay on the original allocator/free path
+    - matched initializers are rewritten to `Box::into_raw(Box::new(default_value_expr))` cast back to the chosen raw pointer type.
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
 ### 5.3 `visit_expr` major cases
@@ -236,6 +240,7 @@ Practical result for function-pointer-used functions:
 - Function calls (`ExprKind::Call`)
   - If direct local callee path, use `sig_decs` parameter decisions for each arg.
   - Otherwise fallback per-arg to `Raw(get_mutability_decision(..) or type mutability)`.
+  - Direct foreign `free(...)` calls whose single argument is a tracked scalar raw-bridge local (optionally wrapped in one cast layer) are rewritten to a null-guarded `drop(Box::from_raw(...))`.
   - Run `hoist_opt_ref_borrow` post-pass to reduce repeated mutable deref borrow conflicts.
 - Method call `is_null`
   - local `OptRef` receiver -> rename to `is_none`
@@ -361,6 +366,7 @@ If no local-path kind match applies:
 - infer mutability from base raw/array type (with array-path deref inspection)
 - if callee return signature mutability was rewritten to raw, override fallback mutability accordingly
 - convert to requested target using `opt_ref_from_raw`, `slice_from_raw`, `cursor_from_raw`, or raw cast fallback.
+- Before the generic raw fallback runs, local-binding visitors may pre-rewrite tracked exact scalar allocator roots in `Raw(...)` context to `Box::into_raw(Box::new(default_value_expr))` with the requested raw mutability cast.
 - plain array bases now also participate in non-raw fallback for `Slice`, `SliceCursor`, and `OptRef` targets instead of being left unchanged at rewrite-enabled call sites
 - raw fallback support is asymmetric for owning box targets:
   - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
@@ -413,6 +419,10 @@ If no local-path kind match applies:
 6. Owning box support is implemented only for the M4A-supported source/target surface.
 - Direct allocator roots and local/call box sources are supported.
 - Local/call box-source propagation now only trusts local function items with bodies; foreign declarations are not treated as rewrite-aware box sources for fallback/propagation purposes.
+- M6 adds a scalar raw-bridge hardening path:
+  - exact scalar allocator roots that remain `Raw(...)` are emitted as `Box::into_raw(Box::new(...))` only for conservatively tracked local bindings whose deallocation stays as a direct `free(local[_cast])`
+  - locals whose raw value escapes through aliases, returns, or other call arguments stay on the original allocator/free path
+  - direct `free(local[_cast])` calls for those bridged locals are emitted as null-guarded `drop(Box::from_raw(...))`
 - Scalar `OptBox` allocator roots are intentionally narrower in M4B:
   - only exact `size_of::<T>()` scalar roots stay eligible
   - unsupported composite scalar roots are forced back to raw before rewrite
@@ -429,6 +439,7 @@ If no local-path kind match applies:
   - scalar-box to slice/cursor targets
   - raw-to-scalar-box targets without direct allocator-root evidence
   - owning array box target without allocator-root length evidence
+  - raw array allocator roots still do not use the scalar raw bridge; `from_raw_parts{,_mut}` and allocator/free-style behavior remain unchanged for those paths because unsized free reconstruction metadata is unavailable
 
 7. Multiple other conversion branches intentionally panic on unsupported shapes.
 - Examples:
@@ -499,6 +510,8 @@ If no local-path kind match applies:
     - `test_rewriter_rewrites_realloc_null_char_ptr_to_boxed_slice`
     - `test_rewriter_keeps_foreign_strdup_tail_raw`
     - `test_rewriter_keeps_struct_field_pointer_tail_raw`
+    - `test_rewriter_bridges_raw_scalar_allocator_root_and_free`
+    - `test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed`
     - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
     - `test_rewriter_materializes_local_struct_malloc_default_gotomach_probe` remains an ignored supplemental probe in `tests.rs`; it is not the landed primary coverage artifact
   - The direct `test_rewriter_` bucket now also covers:
