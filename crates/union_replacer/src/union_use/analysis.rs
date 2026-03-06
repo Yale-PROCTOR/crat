@@ -17,12 +17,16 @@ use rustc_span::def_id::{DefId, LocalDefId};
 use typed_arena::Arena;
 use utils::ty_shape;
 
-use super::model::{self, ArgEffectKind};
-use crate::union_use::callgraph::CondensationGraph;
+use super::{
+    callgraph::UnionCallContext,
+    model::{self, ArgEffectKind},
+    utils::{print_all_local_bodies_with_points_to, with_body},
+};
 
 pub fn analyze(
     tcx: TyCtxt,
-    condensation_graphs: &FxHashMap<LocalDefId, CondensationGraph>,
+    target_union_tys: &[LocalDefId],
+    call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
     print_mir: bool,
     use_optimized_mir: bool,
     verbose: bool,
@@ -51,7 +55,7 @@ pub fn analyze(
     // }
 
     if print_mir {
-        _print_all_local_bodies_with_points_to(tcx, &may_points_to, use_optimized_mir);
+        print_all_local_bodies_with_points_to(tcx, &may_points_to, use_optimized_mir);
     }
 
     if verbose {
@@ -60,8 +64,9 @@ pub fn analyze(
 
     identify_union_uses(
         tcx,
+        target_union_tys,
         may_points_to,
-        condensation_graphs,
+        call_contexts,
         use_optimized_mir,
         verbose,
     )
@@ -99,6 +104,47 @@ pub struct UnionRead {
 pub struct UnionWrite {
     pub site: UnionAccessSite,
     pub field: UnionAccessField,
+}
+
+pub fn format_access(tcx: TyCtxt<'_>, union_ty: DefId, access: &impl HasUnionField) -> String {
+    match access.union_field() {
+        UnionAccessField::Field(index) => {
+            let ty = union_field_ty(tcx, union_ty, access.union_field())
+                .map(|ty| format!("{ty:?}"))
+                .unwrap_or_else(|| "?".to_string());
+            format!("field#{index}\t({ty})")
+        }
+        UnionAccessField::Top => "top\t(unknown)".to_string(),
+    }
+}
+
+pub fn union_field_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: DefId,
+    field: UnionAccessField,
+) -> Option<Ty<'tcx>> {
+    let UnionAccessField::Field(index) = field else {
+        return None;
+    };
+    let adt = tcx.adt_def(union_ty);
+    let field = adt.all_fields().nth(index)?;
+    Some(tcx.type_of(field.did).instantiate_identity())
+}
+
+pub trait HasUnionField {
+    fn union_field(&self) -> UnionAccessField;
+}
+
+impl HasUnionField for UnionRead {
+    fn union_field(&self) -> UnionAccessField {
+        self.field
+    }
+}
+
+impl HasUnionField for UnionWrite {
+    fn union_field(&self) -> UnionAccessField {
+        self.field
+    }
 }
 
 #[derive(Default)]
@@ -190,8 +236,9 @@ impl std::fmt::Debug for UnionUseResult {
 /// - For each union instance (memory)
 fn identify_union_uses(
     tcx: TyCtxt<'_>,
+    target_union_tys: &[LocalDefId],
     result: andersen::AnalysisResult,
-    condensation_graphs: &FxHashMap<LocalDefId, CondensationGraph>,
+    call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
     use_optimized_mir: bool,
     verbose: bool,
 ) -> UnionUseResult {
@@ -203,18 +250,18 @@ fn identify_union_uses(
         .collect();
     let union_instance_set: FxHashSet<UnionMemoryInstance> =
         union_instances.iter().copied().collect();
+    let target_union_ty_set: FxHashSet<DefId> = target_union_tys
+        .iter()
+        .map(|def_id| def_id.to_def_id())
+        .collect();
     // if verbose {
     //     println!("Union Instances: {union_instances:?}");
     // }
 
     let mut target_fns: FxHashSet<LocalDefId> = FxHashSet::default();
-    for graph in condensation_graphs.values() {
-        for node in &graph.nodes {
-            for def_id in &node.members {
-                if let Some(local_def_id) = def_id.as_local() {
-                    target_fns.insert(local_def_id);
-                }
-            }
+    for ctx in call_contexts.values() {
+        for &def_id in &ctx.target_fns {
+            target_fns.insert(def_id);
         }
     }
 
@@ -242,11 +289,14 @@ fn identify_union_uses(
                     *node,
                     &result,
                     &union_instance_set,
+                    &target_union_ty_set,
                     &mut instance_to_union_ty,
                 );
             }
         });
     }
+
+    let union_instances: Vec<UnionMemoryInstance> = instance_to_union_ty.keys().copied().collect();
 
     // Pass 2
     // Collect union instance accesses and classify them
@@ -331,6 +381,7 @@ fn collect_union_instances_from_local<'tcx>(
     node: LocNode,
     result: &andersen::AnalysisResult,
     union_instance_set: &FxHashSet<UnionMemoryInstance>,
+    target_union_ty_set: &FxHashSet<DefId>,
     out: &mut FxHashMap<UnionMemoryInstance, DefId>,
 ) {
     let TyKind::Adt(adt, args) = ty.kind() else {
@@ -341,7 +392,7 @@ fn collect_union_instances_from_local<'tcx>(
         let Some(instance) = union_instance_from_root(result, node.index) else {
             return;
         };
-        if union_instance_set.contains(&instance) {
+        if union_instance_set.contains(&instance) && target_union_ty_set.contains(&adt.did()) {
             out.entry(instance).or_insert(adt.did());
         }
         // Ignore nested unions inside union fields for now.
@@ -361,7 +412,15 @@ fn collect_union_instances_from_local<'tcx>(
             continue;
         };
         let field_ty = field.ty(tcx, args);
-        collect_union_instances_from_local(tcx, field_ty, *succ, result, union_instance_set, out);
+        collect_union_instances_from_local(
+            tcx,
+            field_ty,
+            *succ,
+            result,
+            union_instance_set,
+            target_union_ty_set,
+            out,
+        );
     }
 }
 
@@ -959,205 +1018,4 @@ fn ranges_overlap(
     b_end: andersen::Loc,
 ) -> bool {
     a_start <= b_end && b_start <= a_end
-}
-
-fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    use_optimized_mir: bool,
-    f: F,
-) -> R {
-    if use_optimized_mir {
-        f(tcx.optimized_mir(def_id.to_def_id()))
-    } else {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body: &Body<'_> = &body.borrow();
-        f(body)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LocalLocInfo {
-    owner: LocalDefId,
-    local: Local,
-    root: andersen::Loc,
-    end: andersen::Loc,
-}
-
-fn _build_local_loc_infos(result: &andersen::AnalysisResult) -> Vec<LocalLocInfo> {
-    let mut infos = Vec::with_capacity(result.var_nodes.len());
-    for ((owner, local), node) in &result.var_nodes {
-        let root = node.index;
-        let end = result.ends[root];
-        infos.push(LocalLocInfo {
-            owner: *owner,
-            local: *local,
-            root,
-            end,
-        });
-    }
-    infos.sort_by_key(|info| info.root.index());
-    infos
-}
-
-fn _find_local_loc_info(loc: andersen::Loc, infos: &[LocalLocInfo]) -> Option<LocalLocInfo> {
-    infos
-        .iter()
-        .copied()
-        .find(|info| info.root <= loc && loc <= info.end)
-}
-
-fn _format_target_loc(
-    loc: andersen::Loc,
-    result: &andersen::AnalysisResult,
-    infos: &[LocalLocInfo],
-) -> String {
-    let end = result.ends[loc];
-    if let Some(info) = _find_local_loc_info(loc, infos) {
-        let owner = info.owner;
-        let local = info.local;
-        let offset = loc.index() - info.root.index();
-        if offset == 0 {
-            format!("{owner:?}::{local:?} [L{}..=L{}]", loc.index(), end.index())
-        } else {
-            format!(
-                "{owner:?}::{local:?}+{offset} [L{}..=L{}]",
-                loc.index(),
-                end.index()
-            )
-        }
-    } else {
-        format!("L{}..=L{}", loc.index(), end.index())
-    }
-}
-
-fn _print_local_points_to<'a>(
-    def_id: LocalDefId,
-    body: &Body<'a>,
-    _tcx: TyCtxt<'a>,
-    result: &andersen::AnalysisResult,
-    infos: &[LocalLocInfo],
-) {
-    println!("\tLOCAL MAY-POINTS-TO:");
-    for (local, decl) in body.local_decls.iter_enumerated() {
-        let Some(node) = result.var_nodes.get(&(def_id, local)) else {
-            println!("\t\t{local:?}: {:?} -> no index", decl.ty);
-            continue;
-        };
-        let root = node.index;
-        let root_end = result.ends[root];
-        let sols = &result.solutions[root];
-        if sols.is_empty() {
-            println!(
-                "\t\t{local:?}: {:?} [L{}..=L{}] -> {{}}",
-                decl.ty,
-                root.index(),
-                root_end.index()
-            );
-            continue;
-        }
-
-        let mut targets = Vec::new();
-        for target in sols.iter() {
-            targets.push(_format_target_loc(target, result, infos));
-        }
-        println!(
-            "\t\t{local:?}: {:?} [L{}..=L{}] -> {{{}}}",
-            decl.ty,
-            root.index(),
-            root_end.index(),
-            targets.join(", ")
-        );
-    }
-}
-
-fn _print_all_local_bodies_with_points_to<'a>(
-    tcx: TyCtxt<'a>,
-    result: &andersen::AnalysisResult,
-    use_optimized_mir: bool,
-) {
-    let infos = _build_local_loc_infos(result);
-    for def_id in tcx.hir_body_owners() {
-        let _ = _print_local_body(def_id, tcx, result, true, &infos, use_optimized_mir);
-    }
-}
-
-fn _print_body<'a>(
-    def_id: LocalDefId,
-    tcx: TyCtxt<'a>,
-    body: &Body<'a>,
-    result: &andersen::AnalysisResult,
-    print_mir: bool,
-    infos: &[LocalLocInfo],
-    func_calls: &mut Vec<DefId>,
-) {
-    if print_mir {
-        let args: FxHashSet<_> = body.args_iter().collect();
-        for (local, decl) in body.local_decls.iter_enumerated() {
-            if local == Local::from_usize(0) {
-                println!("\tRETURN: {local:?} -> {:?}", decl.ty);
-            } else if args.contains(&local) {
-                println!("\tARG: {local:?} -> {:?}", decl.ty);
-            } else {
-                println!("\tLOCAL: {local:?} -> {:?}", decl.ty);
-            }
-        }
-    }
-    for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-        if print_mir {
-            println!("\tBB: {bb:?}");
-        }
-        for (stmt_idx, stmt) in bbd.statements.iter().enumerate() {
-            if print_mir && let StatementKind::Assign(box (place, _)) = &stmt.kind {
-                let ty = place.ty(body, tcx).ty;
-                println!("\t\tSTMT {stmt_idx}: {stmt:?}\n\t\t{ty:?}\n");
-            }
-        }
-        if print_mir {
-            println!("\t\tTERM: {:?}", bbd.terminator().kind);
-            if let TerminatorKind::Call {
-                func, destination, ..
-            } = &bbd.terminator().kind
-            {
-                let ty = destination.ty(body, tcx).ty;
-                println!("\t\t{ty:?}");
-
-                if let Some((func_def_id, _)) = func.const_fn_def() {
-                    func_calls.push(func_def_id);
-                }
-            }
-        }
-    }
-    if print_mir {
-        _print_local_points_to(def_id, body, tcx, result, infos);
-    }
-}
-
-/// Print the MIR body of a local function definition.
-/// Return: a list of function DefIds called within the body.
-fn _print_local_body<'a>(
-    def_id: LocalDefId,
-    tcx: TyCtxt<'a>,
-    result: &andersen::AnalysisResult,
-    print_mir: bool,
-    infos: &[LocalLocInfo],
-    use_optimized_mir: bool,
-) -> Option<Vec<DefId>> {
-    let mut func_calls = Vec::new();
-    if tcx.def_kind(def_id) != DefKind::Fn {
-        return None;
-    }
-    if print_mir {
-        println!("\nDEF: {def_id:?}");
-    }
-
-    if use_optimized_mir {
-        let body: &Body<'_> = tcx.optimized_mir(def_id.to_def_id());
-        _print_body(def_id, tcx, body, result, print_mir, infos, &mut func_calls);
-    } else {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body: &Body<'_> = &body.borrow();
-        _print_body(def_id, tcx, body, result, print_mir, infos, &mut func_calls);
-    }
-    Some(func_calls)
 }

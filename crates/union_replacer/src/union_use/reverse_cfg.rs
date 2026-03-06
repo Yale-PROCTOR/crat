@@ -1,15 +1,18 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::def::DefKind;
 use rustc_index::Idx;
 use rustc_middle::{
-    mir::{Body, Location, TerminatorKind},
+    mir::{Body, Location},
     ty::TyCtxt,
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
-    analysis::{UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUseResult, UnionWrite},
-    callgraph::CallGraph,
+    analysis::{
+        UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUseResult, UnionWrite,
+        format_access, union_field_ty,
+    },
+    callgraph::{CallIndex, CallSite, UnionCallContext},
+    utils::with_body,
 };
 
 pub type ReadToWrites = FxHashMap<UnionRead, Vec<UnionWrite>>;
@@ -21,12 +24,6 @@ pub struct ReverseCfgResult {
 #[derive(Default)]
 pub struct InstanceResult {
     pub instances: FxHashMap<UnionMemoryInstance, ReadToWrites>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CallSite {
-    caller: LocalDefId,
-    location: Location,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,21 +47,10 @@ struct InstanceIndex {
     writes_by_loc: FxHashMap<(LocalDefId, Location), Vec<UnionWrite>>,
 }
 
-#[derive(Default)]
-struct CallIndex {
-    /// callee function -> callsites that invoke it.
-    callers_of: FxHashMap<LocalDefId, Vec<CallSite>>,
-    /// callsite -> direct local callees (filtered by union-related callgraph).
-    callees_of: FxHashMap<CallSite, Vec<LocalDefId>>,
-    /// callsite -> flattened (callee, callee return location) pairs used during backward entry.
-    /// `callee return location` means the MIR location of a `Return` terminator in the callee:
-    return_entries_of: FxHashMap<CallSite, Vec<(LocalDefId, Location)>>,
-}
-
 pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
-    callgraphs: &FxHashMap<LocalDefId, CallGraph>,
+    call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
     use_optimized_mir: bool,
 ) -> ReverseCfgResult {
     let mut result = FxHashMap::default();
@@ -73,14 +59,18 @@ pub fn analyze_reaching_writes<'tcx>(
         let Some(local_union_ty) = union_ty.as_local() else {
             continue;
         };
-        let Some(callgraph) = callgraphs.get(&local_union_ty) else {
+        let Some(call_context) = call_contexts.get(&local_union_ty) else {
             continue;
         };
 
         let mut instances = FxHashMap::default();
         for (&instance, instance_uses) in &type_uses.instances {
-            let reaching =
-                analyze_instance_reaching_writes(tcx, instance_uses, callgraph, use_optimized_mir);
+            let reaching = analyze_instance_reaching_writes(
+                tcx,
+                instance_uses,
+                &call_context.call_index,
+                use_optimized_mir,
+            );
             instances.insert(instance, reaching);
         }
 
@@ -90,14 +80,128 @@ pub fn analyze_reaching_writes<'tcx>(
     ReverseCfgResult { uses: result }
 }
 
+pub fn detect_overlapping_types<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_uses: &UnionUseResult,
+    analysis: &ReverseCfgResult,
+    verbose: bool,
+) -> Vec<DefId> {
+    let mut union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
+    union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+    let mut overlapping_tys = Vec::new();
+
+    if verbose {
+        println!("\nReaching Writes:");
+    }
+
+    for union_ty in union_tys {
+        let Some(type_uses) = union_uses.uses.get(&union_ty) else {
+            continue;
+        };
+        let Some(type_result) = analysis.uses.get(&union_ty) else {
+            continue;
+        };
+        let mut is_overlapping = false;
+        if verbose {
+            println!("\t{}:", tcx.def_path_str(union_ty));
+        }
+
+        let mut instances = type_uses.instances.iter().collect::<Vec<_>>();
+        instances.sort_by_key(|(instance, _)| instance.root.index());
+
+        for (instance, _) in instances {
+            if verbose {
+                println!(
+                    "\t\tInstance L{}..=L{}:",
+                    instance.root.index(),
+                    instance.end.index()
+                );
+            }
+
+            let Some(reaching) = type_result.instances.get(instance) else {
+                if verbose {
+                    println!("\t\t\t(no reads)");
+                }
+                continue;
+            };
+
+            let mut reads = reaching.iter().collect::<Vec<_>>();
+            reads.sort_by_key(|(read, _)| {
+                (
+                    read.site.def_id.index(),
+                    read.site.location.block.index(),
+                    read.site.location.statement_index,
+                )
+            });
+
+            if reads.is_empty() {
+                if verbose {
+                    println!("\t\t\t(no reads)");
+                }
+                continue;
+            }
+
+            for (read, writes) in reads {
+                let read_field = format_access(tcx, union_ty, read);
+                let read_field_ty = union_field_ty(tcx, union_ty, read.field);
+                let mut writes = writes.clone();
+                writes.sort_by_key(|write| {
+                    (
+                        write.site.def_id.index(),
+                        write.site.location.block.index(),
+                        write.site.location.statement_index,
+                    )
+                });
+
+                let write_sites = writes
+                    .into_iter()
+                    .map(|write| {
+                        if is_overlapping_pair(tcx, union_ty, read, &write) {
+                            is_overlapping = true;
+                        }
+                        format!(
+                            "{:?}@{:?}\n\t\t\t\t\tfield:\t{}",
+                            write.site.def_id,
+                            write.site.location,
+                            format_access(tcx, union_ty, &write),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\t\t\t\t");
+
+                if verbose {
+                    println!(
+                        "\t\t\tRead {:?}@{:?}\n\t\t\t\tfield:\t{}",
+                        read.site.def_id, read.site.location, read_field
+                    );
+                    if let Some(ty) = read_field_ty {
+                        println!("\t\t\t\ttype:\t{ty:?}");
+                    }
+                    if write_sites.is_empty() {
+                        println!("\t\t\t\tWrites:\t(none)");
+                    } else {
+                        println!("\t\t\t\tWrites:\n\t\t\t\t{write_sites}");
+                    }
+                }
+            }
+        }
+
+        if is_overlapping {
+            overlapping_tys.push(union_ty);
+        }
+    }
+
+    overlapping_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+    overlapping_tys
+}
+
 fn analyze_instance_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_uses: &UnionInstanceUses,
-    callgraph: &CallGraph,
+    call_index: &CallIndex,
     use_optimized_mir: bool,
 ) -> ReadToWrites {
     let instance_index = build_instance_index(instance_uses);
-    let call_index = build_call_index(tcx, callgraph, use_optimized_mir);
 
     let mut reads = instance_index.reads.clone();
     reads.sort_by_key(|read| sort_location_key(read.site.def_id, read.site.location));
@@ -108,7 +212,7 @@ fn analyze_instance_reaching_writes<'tcx>(
             tcx,
             read,
             &instance_index,
-            &call_index,
+            call_index,
             use_optimized_mir,
         );
         result.insert(read, writes);
@@ -145,15 +249,17 @@ fn collect_reaching_writes_for_read<'tcx>(
                     // Check if that callsite is a write
                     if let Some(writes) = instance_index
                         .writes_by_loc
-                        .get(&(active_callsite.caller, active_callsite.location))
+                        .get(&(active_callsite.caller, active_callsite.call_location))
                     {
                         found.extend(writes.iter().copied());
                     }
                     // Spread to the callsite
                     with_body(tcx, active_callsite.caller, use_optimized_mir, |body| {
-                        for point in
-                            previous_points(body, active_callsite.caller, active_callsite.location)
-                        {
+                        for point in previous_points(
+                            body,
+                            active_callsite.caller,
+                            active_callsite.call_location,
+                        ) {
                             worklist.push(SearchState {
                                 point,
                                 active_callsite: None,
@@ -172,13 +278,15 @@ fn collect_reaching_writes_for_read<'tcx>(
                         // Check if that callsite is a write
                         if let Some(writes) = instance_index
                             .writes_by_loc
-                            .get(&(callsite.caller, callsite.location))
+                            .get(&(callsite.caller, callsite.call_location))
                         {
                             found.extend(writes.iter().copied());
                         }
                         // Spread to the callsite
                         with_body(tcx, callsite.caller, use_optimized_mir, |body| {
-                            for point in previous_points(body, callsite.caller, callsite.location) {
+                            for point in
+                                previous_points(body, callsite.caller, callsite.call_location)
+                            {
                                 worklist.push(SearchState {
                                     point,
                                     active_callsite: None,
@@ -198,7 +306,7 @@ fn collect_reaching_writes_for_read<'tcx>(
                 // Check if current location is a callsite
                 let callsite = CallSite {
                     caller: def_id,
-                    location,
+                    call_location: location,
                 };
                 if call_index.callees_of.contains_key(&callsite) {
                     if entered_callsites.insert(callsite)
@@ -258,114 +366,6 @@ fn build_instance_index(instance_uses: &UnionInstanceUses) -> InstanceIndex {
     index
 }
 
-fn build_call_index<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    callgraph: &CallGraph,
-    use_optimized_mir: bool,
-) -> CallIndex {
-    let mut relevant_callees: FxHashMap<LocalDefId, FxHashSet<LocalDefId>> = FxHashMap::default();
-    for (&caller, callees) in callgraph {
-        let Some(caller) = caller.as_local() else {
-            continue;
-        };
-        for callee in callees.iter().filter_map(|callee| callee.as_local()) {
-            relevant_callees.entry(caller).or_default().insert(callee);
-        }
-    }
-
-    let mut index = CallIndex::default();
-    let mut return_cache: FxHashMap<LocalDefId, Vec<Location>> = FxHashMap::default();
-
-    for (&caller, candidate_callees) in &relevant_callees {
-        with_body(tcx, caller, use_optimized_mir, |body| {
-            for (block, bbd) in body.basic_blocks.iter_enumerated() {
-                let location = Location {
-                    block,
-                    statement_index: bbd.statements.len(),
-                };
-                let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else {
-                    continue;
-                };
-                let Some((callee, _)) = func.const_fn_def() else {
-                    continue;
-                };
-                let Some(callee) = callee.as_local() else {
-                    continue;
-                };
-                if !candidate_callees.contains(&callee) {
-                    continue;
-                }
-                if !tcx.is_mir_available(callee.to_def_id()) {
-                    continue;
-                }
-
-                let callsite = CallSite { caller, location };
-                index.callees_of.entry(callsite).or_default().push(callee);
-                index.callers_of.entry(callee).or_default().push(callsite);
-            }
-        });
-    }
-
-    for callees in index.callees_of.values_mut() {
-        callees.sort_by_key(|def_id| def_id.index());
-        callees.dedup();
-    }
-    for callers in index.callers_of.values_mut() {
-        callers.sort_by_key(|callsite| {
-            (
-                callsite.caller.index(),
-                callsite.location.block.index(),
-                callsite.location.statement_index,
-            )
-        });
-        callers.dedup();
-    }
-
-    for (&callsite, callees) in &index.callees_of {
-        let mut entries = Vec::new();
-        for &callee in callees {
-            let returns = return_cache
-                .entry(callee)
-                .or_insert_with(|| collect_return_locations(tcx, callee, use_optimized_mir));
-            for &ret in returns.iter() {
-                entries.push((callee, ret));
-            }
-        }
-        entries.sort_by_key(|(def_id, location)| {
-            (
-                def_id.index(),
-                location.block.index(),
-                location.statement_index,
-            )
-        });
-        entries.dedup();
-        index.return_entries_of.insert(callsite, entries);
-    }
-
-    index
-}
-
-fn collect_return_locations<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    use_optimized_mir: bool,
-) -> Vec<Location> {
-    with_body(tcx, def_id, use_optimized_mir, |body| {
-        let mut returns = Vec::new();
-        for (block, bbd) in body.basic_blocks.iter_enumerated() {
-            if matches!(bbd.terminator().kind, TerminatorKind::Return) {
-                returns.push(Location {
-                    block,
-                    statement_index: bbd.statements.len(),
-                });
-            }
-        }
-        returns.sort_by_key(|location| (location.block.index(), location.statement_index));
-        returns.dedup();
-        returns
-    })
-}
-
 fn previous_points<'tcx>(
     body: &Body<'tcx>,
     def_id: LocalDefId,
@@ -401,25 +401,6 @@ fn previous_points<'tcx>(
     out
 }
 
-fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    use_optimized_mir: bool,
-    f: F,
-) -> R {
-    debug_assert!(matches!(
-        tcx.def_kind(def_id),
-        DefKind::Fn | DefKind::AssocFn
-    ));
-    if use_optimized_mir {
-        f(tcx.optimized_mir(def_id.to_def_id()))
-    } else {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body = body.borrow();
-        f(&body)
-    }
-}
-
 fn sort_location_key(def_id: LocalDefId, location: Location) -> (usize, usize, usize) {
     (
         def_id.index(),
@@ -438,4 +419,19 @@ fn sort_point_key(point: &SearchPoint) -> (usize, usize, usize, u8) {
             1,
         ),
     }
+}
+
+fn is_overlapping_pair<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: DefId,
+    read: &UnionRead,
+    write: &UnionWrite,
+) -> bool {
+    let Some(read_ty) = union_field_ty(tcx, union_ty, read.field) else {
+        return false;
+    };
+    let Some(write_ty) = union_field_ty(tcx, union_ty, write.field) else {
+        return false;
+    };
+    read_ty != write_ty
 }

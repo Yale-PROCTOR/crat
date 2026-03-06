@@ -4,5 +4,6 @@ pub mod model;
 pub mod reverse_cfg;
 pub mod transform;
 pub mod ty_visit;
+pub mod utils;
 
 pub use transform::replace_unions;

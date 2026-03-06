@@ -1,7 +1,8 @@
-use std::{collections::VecDeque, fmt};
+use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
+use rustc_index::Idx;
 use rustc_middle::{
     mir::{
         Body, Location, Place, TerminatorKind,
@@ -11,7 +12,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
-use super::ty_visit::UnionRelatedTypes;
+use super::{ty_visit::UnionRelatedTypes, utils::with_body};
 
 /// Seed functions: union type -> list of functions
 pub type SeedFuncs = FxHashMap<LocalDefId, Vec<LocalDefId>>;
@@ -19,39 +20,29 @@ pub type SeedFuncs = FxHashMap<LocalDefId, Vec<LocalDefId>>;
 /// CallGraph: caller -> list of callees
 pub type CallGraph = FxHashMap<DefId, Vec<DefId>>;
 
-#[derive(Debug, Clone)]
-pub struct SCCNode {
-    pub id: usize,
-    pub members: Vec<DefId>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallSite {
+    pub caller: LocalDefId,
+    pub call_location: Location,
 }
 
 #[derive(Clone, Default)]
-pub struct CondensationGraph {
-    pub nodes: Vec<SCCNode>,
-    pub edges: FxHashMap<usize, FxHashSet<usize>>,
+pub struct CallIndex {
+    /// callee function -> callsites that invoke it.
+    pub callers_of: FxHashMap<LocalDefId, Vec<CallSite>>,
+    /// callsite -> direct local callees (filtered by union-related callgraph).
+    pub callees_of: FxHashMap<CallSite, Vec<LocalDefId>>,
+    /// callsite -> flattened (callee, callee return location) pairs used during backward entry.
+    /// `callee return location` means the MIR location of a `Return` terminator in the callee.
+    pub return_entries_of: FxHashMap<CallSite, Vec<(LocalDefId, Location)>>,
 }
 
-impl fmt::Debug for CondensationGraph {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "CondensationGraph {{")?;
-        writeln!(f, "\tnodes:")?;
-        for node in &self.nodes {
-            writeln!(f, "\t\tSCC #{}:", node.id)?;
-            writeln!(f, "\t\t\tmembers: {:?}", node.members)?;
-        }
-
-        writeln!(f, "\tedges:")?;
-        for node in &self.nodes {
-            let scc_id = node.id;
-            let dsts = self
-                .edges
-                .get(&scc_id)
-                .map(|set| set.iter().copied().collect::<Vec<_>>())
-                .unwrap_or_default();
-            writeln!(f, "\t\t{scc_id} -> {dsts:?}")?;
-        }
-        write!(f, "}}")
-    }
+#[derive(Clone, Default)]
+pub struct UnionCallContext {
+    pub callgraph: CallGraph,
+    /// Flattened local function list in the callgraph.
+    pub target_fns: Vec<LocalDefId>,
+    pub call_index: CallIndex,
 }
 
 struct BodyUnionUseCollector<'tcx, 'a> {
@@ -65,6 +56,7 @@ struct BodyUnionUseCollector<'tcx, 'a> {
 struct DirectCallee<'tcx> {
     def_id: DefId,
     args: Option<GenericArgsRef<'tcx>>,
+    call_location: Location,
 }
 
 impl<'tcx, 'a> BodyUnionUseCollector<'tcx, 'a> {
@@ -177,17 +169,18 @@ pub fn collect_union_seed_functions<'tcx>(
 }
 
 /// Build a callgraph for each target union type
-pub fn build_union_callgraphs<'tcx>(
+pub fn build_union_call_contexts<'tcx>(
     tcx: TyCtxt<'tcx>,
     seed_functions: &SeedFuncs,
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    use_optimized_mir: bool,
     verbose: bool,
-) -> FxHashMap<LocalDefId, CallGraph> {
+) -> FxHashMap<LocalDefId, UnionCallContext> {
     // Debug step option
     let verbose_callgraph_steps = false;
 
     let mut callee_cache: FxHashMap<DefId, Vec<DirectCallee<'tcx>>> = FxHashMap::default();
-    let mut union_callgraphs = FxHashMap::default();
+    let mut union_contexts = FxHashMap::default();
 
     for (&union_ty, seeds) in seed_functions {
         let related_types = related_types_map
@@ -214,6 +207,8 @@ pub fn build_union_callgraphs<'tcx>(
             VecDeque::from(seeds.iter().map(|id| id.to_def_id()).collect::<Vec<_>>());
 
         let mut graph: FxHashMap<DefId, FxHashSet<DefId>> = FxHashMap::default();
+        let mut call_index = CallIndex::default();
+        let mut return_cache: FxHashMap<LocalDefId, Vec<Location>> = FxHashMap::default();
 
         if verbose && verbose_callgraph_steps {
             let mut parent_names = related_types
@@ -291,7 +286,7 @@ pub fn build_union_callgraphs<'tcx>(
                 }
             }
 
-            let callees = collect_direct_callees(tcx, caller, &mut callee_cache);
+            let callees = collect_direct_callees(tcx, caller, &mut callee_cache, use_optimized_mir);
             if verbose && verbose_callgraph_steps {
                 println!(
                     "\t\tDirect callees from {}: {}",
@@ -325,6 +320,25 @@ pub fn build_union_callgraphs<'tcx>(
                     continue;
                 }
                 graph.entry(caller).or_default().insert(callee.def_id);
+                if let (Some(caller_local), Some(callee_local)) =
+                    (caller.as_local(), callee.def_id.as_local())
+                    && tcx.is_mir_available(callee_local.to_def_id())
+                {
+                    let callsite = CallSite {
+                        caller: caller_local,
+                        call_location: callee.call_location,
+                    };
+                    call_index
+                        .callees_of
+                        .entry(callsite)
+                        .or_default()
+                        .push(callee_local);
+                    call_index
+                        .callers_of
+                        .entry(callee_local)
+                        .or_default()
+                        .push(callsite);
+                }
                 if verbose && verbose_callgraph_steps {
                     println!(
                         "\t\t[Keep Callee] {} | hits: {}",
@@ -352,7 +366,7 @@ pub fn build_union_callgraphs<'tcx>(
             }
         }
 
-        let graph = graph
+        let graph: CallGraph = graph
             .into_iter()
             .map(|(caller, mut callees)| {
                 let mut callees = callees.drain().collect::<Vec<_>>();
@@ -360,16 +374,61 @@ pub fn build_union_callgraphs<'tcx>(
                 (caller, callees)
             })
             .collect::<FxHashMap<_, _>>();
-        union_callgraphs.insert(union_ty, graph);
+
+        for callees in call_index.callees_of.values_mut() {
+            callees.sort_by_key(|def_id| def_id.index());
+            callees.dedup();
+        }
+        for callers in call_index.callers_of.values_mut() {
+            callers.sort_by_key(|callsite| {
+                (
+                    callsite.caller.index(),
+                    callsite.call_location.block.index(),
+                    callsite.call_location.statement_index,
+                )
+            });
+            callers.dedup();
+        }
+        for (&callsite, callees) in &call_index.callees_of {
+            let mut entries = Vec::new();
+            for &callee in callees {
+                let returns = return_cache
+                    .entry(callee)
+                    .or_insert_with(|| collect_return_locations(tcx, callee, use_optimized_mir));
+                for &ret in returns.iter() {
+                    entries.push((callee, ret));
+                }
+            }
+            entries.sort_by_key(|(def_id, location)| {
+                (
+                    def_id.index(),
+                    location.block.index(),
+                    location.statement_index,
+                )
+            });
+            entries.dedup();
+            call_index.return_entries_of.insert(callsite, entries);
+        }
+
+        let target_fns = collect_local_functions_from_callgraph(&graph);
+        union_contexts.insert(
+            union_ty,
+            UnionCallContext {
+                callgraph: graph,
+                target_fns,
+                call_index,
+            },
+        );
     }
 
     if verbose {
         println!("\nUnion Callgraphs:");
-        let mut union_tys = union_callgraphs.keys().copied().collect::<Vec<_>>();
+        let mut union_tys = union_contexts.keys().copied().collect::<Vec<_>>();
         union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
         for union_ty in union_tys {
             println!("\t{}:", tcx.def_path_str(union_ty));
-            if let Some(graph) = union_callgraphs.get(&union_ty) {
+            if let Some(ctx) = union_contexts.get(&union_ty) {
+                let graph = &ctx.callgraph;
                 let mut callers = graph.keys().copied().collect::<Vec<_>>();
                 callers.sort_by_key(|def_id| tcx.def_path_str(*def_id));
                 for caller in callers {
@@ -387,128 +446,18 @@ pub fn build_union_callgraphs<'tcx>(
         }
     }
 
-    union_callgraphs
+    union_contexts
 }
 
-pub fn callgraph_to_condensation_graph(callgraph: &CallGraph) -> CondensationGraph {
-    struct Tarjan<'a> {
-        graph: &'a CallGraph,
-        index: usize,
-        stack: Vec<DefId>,
-        on_stack: FxHashSet<DefId>,
-        index_of: FxHashMap<DefId, usize>,
-        lowlink: FxHashMap<DefId, usize>,
-        sccs: Vec<Vec<DefId>>,
-    }
-
-    impl<'a> Tarjan<'a> {
-        fn strongconnect(&mut self, v: DefId) {
-            let v_index = self.index;
-            self.index += 1;
-            self.index_of.insert(v, v_index);
-            self.lowlink.insert(v, v_index);
-            self.stack.push(v);
-            self.on_stack.insert(v);
-
-            if let Some(succs) = self.graph.get(&v) {
-                for &w in succs {
-                    if !self.index_of.contains_key(&w) {
-                        self.strongconnect(w);
-                        let w_low = *self.lowlink.get(&w).expect("w lowlink exists");
-                        let v_low = self.lowlink.get_mut(&v).expect("v lowlink exists");
-                        if w_low < *v_low {
-                            *v_low = w_low;
-                        }
-                    } else if self.on_stack.contains(&w) {
-                        let w_idx = *self.index_of.get(&w).expect("w index exists");
-                        let v_low = self.lowlink.get_mut(&v).expect("v lowlink exists");
-                        if w_idx < *v_low {
-                            *v_low = w_idx;
-                        }
-                    }
-                }
-            }
-
-            let v_low = *self.lowlink.get(&v).expect("v lowlink exists");
-            if v_low == v_index {
-                let mut scc = Vec::new();
-                loop {
-                    let w = self.stack.pop().expect("stack not empty");
-                    self.on_stack.remove(&w);
-                    scc.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                self.sccs.push(scc);
-            }
-        }
-    }
-
-    let mut all_nodes = FxHashSet::default();
-    for (&caller, callees) in callgraph {
-        all_nodes.insert(caller);
-        for &callee in callees {
-            all_nodes.insert(callee);
-        }
-    }
-
-    let mut tarjan = Tarjan {
-        graph: callgraph,
-        index: 0,
-        stack: Vec::new(),
-        on_stack: FxHashSet::default(),
-        index_of: FxHashMap::default(),
-        lowlink: FxHashMap::default(),
-        sccs: Vec::new(),
-    };
-
-    for &node in &all_nodes {
-        if !tarjan.index_of.contains_key(&node) {
-            tarjan.strongconnect(node);
-        }
-    }
-
-    // Tarjan emits SCCs in reverse topological order of the condensation DAG.
-    let mut nodes = Vec::with_capacity(tarjan.sccs.len());
-    let mut scc_of = FxHashMap::default();
-    for (scc_id, members) in tarjan.sccs.into_iter().enumerate() {
-        for &member in &members {
-            scc_of.insert(member, scc_id);
-        }
-        nodes.push(SCCNode {
-            id: scc_id,
-            members,
-        });
-    }
-
-    let mut edges: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
-    for node in &nodes {
-        edges.entry(node.id).or_default();
-    }
-    for (&caller, callees) in callgraph {
-        let src = *scc_of
-            .get(&caller)
-            .expect("caller in graph should map to an SCC");
-        for &callee in callees {
-            let dst = *scc_of
-                .get(&callee)
-                .expect("callee in graph should map to an SCC");
-            if src != dst {
-                edges.entry(src).or_default().insert(dst);
-            }
-        }
-    }
-
-    CondensationGraph { nodes, edges }
-}
-
-pub fn callgraphs_to_condensation_graphs(
-    callgraphs: &FxHashMap<LocalDefId, CallGraph>,
-) -> FxHashMap<LocalDefId, CondensationGraph> {
-    callgraphs
-        .iter()
-        .map(|(&union_ty, graph)| (union_ty, callgraph_to_condensation_graph(graph)))
+pub fn _build_union_callgraphs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    seed_functions: &SeedFuncs,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    verbose: bool,
+) -> FxHashMap<LocalDefId, CallGraph> {
+    build_union_call_contexts(tcx, seed_functions, related_types_map, false, verbose)
+        .into_iter()
+        .map(|(union_ty, ctx)| (union_ty, ctx.callgraph))
         .collect()
 }
 
@@ -516,17 +465,22 @@ fn collect_direct_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     cache: &mut FxHashMap<DefId, Vec<DirectCallee<'tcx>>>,
+    use_optimized_mir: bool,
 ) -> Vec<DirectCallee<'tcx>> {
     if let Some(cached) = cache.get(&def_id) {
         return cached.clone();
     }
 
-    let collected = do_collect_direct_callees(tcx, def_id);
+    let collected = do_collect_direct_callees(tcx, def_id, use_optimized_mir);
     cache.insert(def_id, collected.clone());
     collected
 }
 
-fn do_collect_direct_callees<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Vec<DirectCallee<'tcx>> {
+fn do_collect_direct_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    use_optimized_mir: bool,
+) -> Vec<DirectCallee<'tcx>> {
     if !is_expandable_def(tcx, def_id) {
         return Vec::new();
     }
@@ -536,32 +490,82 @@ fn do_collect_direct_callees<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Vec<Dire
         None => return Vec::new(),
     };
 
-    let body = tcx.mir_drops_elaborated_and_const_checked(local_def_id);
-    let body: &Body<'_> = &body.borrow();
-    let mut callees = FxHashMap::<DefId, Option<GenericArgsRef<'tcx>>>::default();
+    let mut callees = Vec::new();
 
-    for bbd in body.basic_blocks.iter() {
-        if let TerminatorKind::Call { func, .. } = &bbd.terminator().kind {
-            if let Some((callee, _args)) = func.const_fn_def() {
-                if is_callable_def(tcx, callee) {
-                    callees.insert(callee, Some(_args));
+    with_body(tcx, local_def_id, use_optimized_mir, |body| {
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+            let location = Location {
+                block,
+                statement_index: bbd.statements.len(),
+            };
+            if let TerminatorKind::Call { func, .. } = &bbd.terminator().kind {
+                if let Some((callee, _args)) = func.const_fn_def() {
+                    if is_callable_def(tcx, callee) {
+                        callees.push(DirectCallee {
+                            def_id: callee,
+                            args: Some(_args),
+                            call_location: location,
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if let ty::FnDef(callee, _) = func.ty(body, tcx).kind()
-                && is_callable_def(tcx, *callee)
-            {
-                callees.entry(*callee).or_insert(None);
+                if let ty::FnDef(callee, _) = func.ty(body, tcx).kind()
+                    && is_callable_def(tcx, *callee)
+                {
+                    callees.push(DirectCallee {
+                        def_id: *callee,
+                        args: None,
+                        call_location: location,
+                    });
+                }
             }
         }
-    }
+    });
 
-    let mut callees = callees
-        .into_iter()
-        .map(|(def_id, args)| DirectCallee { def_id, args })
-        .collect::<Vec<_>>();
-    callees.sort_by_key(|callee| tcx.def_path_str(callee.def_id));
+    callees.sort_by_key(|callee| {
+        (
+            callee.call_location.block.index(),
+            callee.call_location.statement_index,
+            tcx.def_path_str(callee.def_id),
+        )
+    });
     callees
+}
+
+fn collect_local_functions_from_callgraph(callgraph: &CallGraph) -> Vec<LocalDefId> {
+    let mut locals = FxHashSet::default();
+    for (&caller, callees) in callgraph {
+        if let Some(local) = caller.as_local() {
+            locals.insert(local);
+        }
+        for callee in callees.iter().filter_map(|def_id| def_id.as_local()) {
+            locals.insert(callee);
+        }
+    }
+    let mut locals = locals.into_iter().collect::<Vec<_>>();
+    locals.sort_by_key(|def_id| def_id.index());
+    locals
+}
+
+fn collect_return_locations<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    use_optimized_mir: bool,
+) -> Vec<Location> {
+    with_body(tcx, def_id, use_optimized_mir, |body| {
+        let mut returns = Vec::new();
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+            if matches!(bbd.terminator().kind, TerminatorKind::Return) {
+                returns.push(Location {
+                    block,
+                    statement_index: bbd.statements.len(),
+                });
+            }
+        }
+        returns.sort_by_key(|location| (location.block.index(), location.statement_index));
+        returns.dedup();
+        returns
+    })
 }
 
 /// Heuristic to find user-defined seed functions that uses target union types
