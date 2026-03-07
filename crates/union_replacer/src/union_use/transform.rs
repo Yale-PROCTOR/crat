@@ -9,11 +9,15 @@ use super::{
 };
 
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
-    let krate = utils::ast::expanded_ast(tcx);
+    let mut krate = utils::ast::expanded_ast(tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    // for debug
     let use_optimized_mir = false;
     let print_mir = false;
 
-    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, true);
+    // collect union types and build call graphs
+    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
     let related_types_map = collect_union_related_types(&tcx, &union_tys, &ty_visitor, verbose);
     let seed_functions = collect_union_seed_functions(tcx, &union_tys, verbose);
     let call_contexts = build_union_call_contexts(
@@ -24,6 +28,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
         verbose,
     );
 
+    // analyze union uses and detect overlapping unions
     let union_uses = analyze(
         tcx,
         &union_tys,
@@ -36,7 +41,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
         analyze_reaching_writes(tcx, &union_uses, &call_contexts, use_optimized_mir);
     let overlapping_tys = detect_overlapping_types(tcx, &union_uses, &reaching_writes, verbose);
 
-    if verbose && !overlapping_tys.is_empty() {
+    if !overlapping_tys.is_empty() {
         println!("\noverlapping:");
         for union_ty in overlapping_tys {
             println!("{}", tcx.def_path_str(union_ty));
@@ -44,7 +49,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     }
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    if false {
+    if true {
         println!("\n{str}");
     }
     str
