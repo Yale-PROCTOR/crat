@@ -556,10 +556,76 @@ If no local-path kind match applies:
   - then type-check the rewritten output in a fresh compiler invocation
   - failure messages include the B02 case name plus the rewritten source text
   - a direct census regression also rewrites all 86 case sources from disk and counts emitted `malloc(` / `calloc(` / `free(` tokens
+  - a second inspection-only classifier pass scans the rewritten output for remaining `malloc(` / `calloc(` call sites and records future-work metadata for each site
+  - focused classifier regressions cover:
+    - `classifier_direct_local_binding_maps_to_outermost_extension`
+    - `classifier_field_target_maps_to_struct_field_scope`
+    - `classifier_nested_pointer_scope_augments_but_does_not_change_shape`
+    - `classifier_wrapper_body_gets_priority_over_other_shape_buckets`
+    - `classifier_return_tail_maps_to_return_flow_generalization`
+    - `classifier_same_function_realloc_sets_context_and_capability`
+    - `classifier_fallback_uses_manual_followup`
+    - `classifier_deduplicates_capabilities_and_respects_primary_precedence`
+    - `classifier_normalizes_and_truncates_statement_snippet`
+    - `remaining_allocator_site_classification_is_complete`
 - Current consequence:
   - every B02 case is now gated on both ownership expectations and rewrite-compile success
   - failing rewrite compilation reports the B02 case name plus the rewritten source text
-  - the current post-M7 corpus totals are `malloc=101`, `calloc=27`, `free=270`, down from the M6 baseline `120/27/292`
+  - the current post-M8 corpus totals remain `malloc=101`, `calloc=27`, `free=270`, down from the M6 baseline `120/27/292`
+  - M8 adds planning metadata only; it does not expand the rewrite surface or change transform behavior
+- Remaining allocator-site classifier schema:
+  - per-site fields:
+    - `case_name`
+    - `function_name`
+    - `callee_kind` (`malloc` or `calloc`)
+    - `statement_snippet`
+    - `shape_bucket`
+    - `required_capabilities`
+    - `primary_unlock`
+    - `has_adjacent_realloc_context`
+    - `has_adjacent_free_context`
+  - shape buckets, in fixed priority order:
+    - `allocator_wrapper_body`
+    - `return_or_tail_alloc`
+    - `field_or_projection_assignment`
+    - `direct_local_binding`
+    - `other`
+  - `nested_pointer_scope` is capability metadata only; it does not change the chosen shape bucket by itself
+  - capability taxonomy:
+    - `outermost_extension`
+    - `struct_field_scope`
+    - `nested_pointer_scope`
+    - `wrapper_generalization`
+    - `return_flow_generalization`
+    - `realloc_flow_support`
+    - `manual_followup`
+  - `required_capabilities` are deduplicated and emitted in the fixed taxonomy order above
+  - `primary_unlock` is chosen by fixed precedence:
+    - `struct_field_scope`
+    - `nested_pointer_scope`
+    - `wrapper_generalization`
+    - `return_flow_generalization`
+    - `realloc_flow_support`
+    - `outermost_extension`
+    - `manual_followup`
+  - `has_adjacent_realloc_context = true` when the same function contains `realloc(`
+  - `has_adjacent_free_context = true` when the same function contains `free(`
+  - `statement_snippet` is normalized to single-space whitespace and truncated to at most 200 characters
+- Example M8 classification record:
+  - `case_name: b02_list_push`
+  - `function_name: push_node`
+  - `callee_kind: malloc`
+  - `statement_snippet: node = malloc(sizeof(struct Node))`
+  - `shape_bucket: direct_local_binding`
+  - `required_capabilities: [outermost_extension]`
+  - `primary_unlock: outermost_extension`
+  - `has_adjacent_realloc_context: false`
+  - `has_adjacent_free_context: true`
+- The M8 harness now prints:
+  - shape-bucket totals
+  - capability totals
+  - `primary_unlock` totals
+  - top unresolved cases by remaining `malloc` / `calloc` count
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
