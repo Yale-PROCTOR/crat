@@ -101,8 +101,8 @@ pub unsafe fn foo() -> *mut i32 {
     p
 }
 "#,
-        &["pub unsafe fn foo() -> *mut i32", "calloc(4, std::mem::size_of::<i32>())"],
-        &["Option<Box<[i32]>>"],
+        &["pub unsafe fn foo() -> *mut i32", "Box::leak("],
+        &["Option<Box<[i32]>>", "calloc(4, std::mem::size_of::<i32>())"],
     );
 }
 
@@ -120,11 +120,11 @@ pub unsafe fn foo() -> *mut i32 {
     p
 }
 "#,
+        &["pub unsafe fn foo() -> *mut i32", "Box::leak("],
         &[
-            "pub unsafe fn foo() -> *mut i32",
+            "Option<Box<[i32]>>",
             "malloc(4 * std::mem::size_of::<i32>())",
         ],
-        &["Option<Box<[i32]>>"],
     );
 }
 
@@ -477,8 +477,8 @@ pub unsafe fn dup_like(len: usize) -> *mut core::ffi::c_char {
     p
 }
 "#,
-        &["pub unsafe fn dup_like(len: usize) -> *mut i8", "realloc(std::ptr::null_mut(), len)"],
-        &["Option<Box<[i8]>>"],
+        &["pub unsafe fn dup_like(len: usize) -> *mut i8", "Box::leak("],
+        &["Option<Box<[i8]>>", "realloc(std::ptr::null_mut(), len)"],
     );
 }
 
@@ -651,6 +651,110 @@ pub unsafe fn foo() {
             "alloc_zeroed(1, std::mem::size_of::<i32>())",
             "dealloc_ptr(p as *mut core::ffi::c_void);",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_generalizes_wrapper_returning_allocated_local() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn snprintf(dst: *mut core::ffi::c_char, size: usize, fmt: *const core::ffi::c_char, ...);
+}
+
+pub unsafe fn create_msg(v: i32) -> *mut core::ffi::c_char {
+    let msg: *mut core::ffi::c_char = malloc(64) as *mut core::ffi::c_char;
+    if msg.is_null() {
+        return std::ptr::null_mut();
+    }
+    snprintf(msg, 64, b"value=%d\0" as *const u8 as *const core::ffi::c_char, v);
+    msg
+}
+
+pub unsafe fn free_msg(msg: *mut core::ffi::c_void) {
+    free(msg);
+}
+
+pub unsafe fn caller() {
+    let msg: *mut core::ffi::c_char = create_msg(7);
+    free_msg(msg as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &["malloc(64)", "free_msg(msg as *mut core::ffi::c_void);"],
+    );
+}
+
+#[test]
+fn test_rewriter_generalizes_wrapper_with_internal_free_after_foreign_use() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
+    let dest: *mut i32 =
+        malloc(count * std::mem::size_of::<i32>()) as *mut i32;
+    if dest.is_null() {
+        return -1;
+    }
+    memcpy(
+        dest as *mut core::ffi::c_void,
+        src as *const core::ffi::c_void,
+        count * std::mem::size_of::<i32>(),
+    );
+    let out = *dest;
+    free(dest as *mut core::ffi::c_void);
+    out
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &["malloc(count * std::mem::size_of::<i32>())", "free(dest as *mut core::ffi::c_void);"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_wrapper_escape_through_parameter_raw_in_m9() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn alloc_into(out: *mut *mut *mut i32) {
+    let p: *mut *mut i32 =
+        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    *out = p;
+}
+"#,
+        &["malloc(std::mem::size_of::<*mut i32>())"],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_wrapper_escape_through_global_raw_in_m9() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+static mut SLOT: *mut *mut i32 = std::ptr::null_mut();
+
+pub unsafe fn save_global() {
+    let p: *mut *mut i32 =
+        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    SLOT = p;
+}
+"#,
+        &["malloc(std::mem::size_of::<*mut i32>())"],
+        &["Box::into_raw(", "Box::leak("],
     );
 }
 

@@ -47,8 +47,9 @@ enum RawBridgeInfo {
     Array { len_expr: String },
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AllocWrapperInfo {
+    Fixed(RawBridgeInfo),
     Bytes { bytes_param: usize },
     CountSize { count_param: usize, elem_size_param: usize },
     Realloc { ptr_param: usize, bytes_param: usize },
@@ -721,12 +722,20 @@ impl<'tcx> TransformVisitor<'tcx> {
         let Some(lhs_hir_id) = lhs_hir_id else {
             return false;
         };
-        let Some(info) = self.raw_bridge_bindings.get(&lhs_hir_id) else {
-            return false;
-        };
         let Some(current_info) =
             hir_raw_bridge_info(self.tcx, lhs_inner_ty, hir_rhs, Some(&self.alloc_wrappers))
         else {
+            return false;
+        };
+        let info = self
+            .raw_bridge_bindings
+            .get(&lhs_hir_id)
+            .or_else(|| {
+                self.alloc_wrappers
+                    .contains_key(&lhs_hir_id.owner.def_id)
+                    .then_some(&current_info)
+            });
+        let Some(info) = info else {
             return false;
         };
         if &current_info != info {
@@ -1963,6 +1972,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                 if mutability.is_mut() { "_mut" } else { "" },
                 mir_ty_to_string(*pointee, self.tcx),
             ),
+            ty::TyKind::Array(elem, _) => {
+                let elem_expr = self.default_value_expr(*elem);
+                utils::expr!(
+                    "std::array::from_fn(|_| {{ {} }})",
+                    pprust::expr_to_string(&elem_expr)
+                )
+            }
             ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() && adt_def.is_struct() => {
                 let ty_name = mir_ty_to_string(ty, self.tcx);
                 let fields = adt_def
@@ -4106,6 +4122,7 @@ fn hir_raw_bridge_info<'tcx>(
     };
     let arg = |idx: usize| args.get(idx);
     match *wrapper {
+        AllocWrapperInfo::Fixed(ref info) => Some(info.clone()),
         AllocWrapperInfo::Bytes { bytes_param } => {
             raw_bridge_info_from_call(
                 tcx,
@@ -4135,43 +4152,89 @@ fn hir_raw_bridge_info<'tcx>(
     }
 }
 
-fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, AllocWrapperInfo> {
-    fn wrapper_name_allows_alloc(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-        let name = tcx.item_name(def_id.to_def_id()).as_str().to_ascii_lowercase();
-        name.contains("alloc") || name.contains("malloc") || name.contains("calloc") || name.contains("realloc")
-    }
-
-    fn body_tail_expr<'tcx>(body: &'tcx hir::Body<'tcx>) -> &'tcx hir::Expr<'tcx> {
-        let mut expr = body.value;
-        while let hir::ExprKind::Block(block, _) = expr.kind {
-            let Some(tail) = block.expr else { break };
-            expr = tail;
+fn raw_wrapper_info_from_rhs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    rhs: &'tcx hir::Expr<'tcx>,
+    params: &[(HirId, ty::Ty<'tcx>)],
+) -> Option<AllocWrapperInfo> {
+    let rhs = hir_unwrap_casts(rhs);
+    let hir::ExprKind::Call(_, args) = rhs.kind else {
+        return None;
+    };
+    let Some(name) = hir_call_name(rhs) else {
+        return None;
+    };
+    let param_index = |expr: &hir::Expr<'_>| {
+        let hir_id = hir_unwrapped_local_id(expr)?;
+        params
+            .iter()
+            .position(|(param_hir_id, _)| *param_hir_id == hir_id)
+    };
+    let mentions_only_params = |expr: &hir::Expr<'_>| {
+        struct LocalUseVisitor {
+            locals: Vec<HirId>,
         }
-        expr
-    }
-
-    fn top_level_let_init<'tcx>(body: &'tcx hir::Body<'tcx>, target: HirId) -> Option<&'tcx hir::Expr<'tcx>> {
-        let hir::ExprKind::Block(block, _) = body.value.kind else {
-            return None;
-        };
-        for stmt in block.stmts {
-            if let hir::StmtKind::Let(let_stmt) = stmt.kind
-                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-                && hir_id == target
-            {
-                return let_stmt.init;
+        impl<'tcx> Visitor<'tcx> for LocalUseVisitor {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let Some(hir_id) = hir_unwrapped_local_id(expr) {
+                    self.locals.push(hir_id);
+                }
+                intravisit::walk_expr(self, expr);
             }
         }
-        None
-    }
+        let mut visitor = LocalUseVisitor { locals: Vec::new() };
+        visitor.visit_expr(expr);
+        visitor.locals.into_iter().all(|hir_id| {
+            params
+                .iter()
+                .any(|(param_hir_id, _)| *param_hir_id == hir_id)
+        })
+    };
 
-    fn is_integer_like_ty(ty: ty::Ty<'_>) -> bool {
-        matches!(
-            ty.kind(),
-            ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Bool | ty::TyKind::Char
-        )
+    match (name, &args[..]) {
+        (name, [bytes]) if name == Symbol::intern("malloc") => {
+            if let Some(bytes_param) = param_index(bytes) {
+                Some(AllocWrapperInfo::Bytes { bytes_param })
+            } else if mentions_only_params(bytes) {
+                raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &[bytes]).map(AllocWrapperInfo::Fixed)
+            } else {
+                None
+            }
+        }
+        (name, [count, elem_size]) if name == Symbol::intern("calloc") => {
+            if let (Some(count_param), Some(elem_size_param)) =
+                (param_index(count), param_index(elem_size))
+            {
+                Some(AllocWrapperInfo::CountSize {
+                    count_param,
+                    elem_size_param,
+                })
+            } else if mentions_only_params(count) && mentions_only_params(elem_size) {
+                raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &[count, elem_size])
+                    .map(AllocWrapperInfo::Fixed)
+            } else {
+                None
+            }
+        }
+        (name, [ptr, bytes]) if name == Symbol::intern("realloc") => {
+            if let (Some(ptr_param), Some(bytes_param)) = (param_index(ptr), param_index(bytes)) {
+                Some(AllocWrapperInfo::Realloc {
+                    ptr_param,
+                    bytes_param,
+                })
+            } else if mentions_only_params(ptr) && mentions_only_params(bytes) {
+                raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &[ptr, bytes])
+                    .map(AllocWrapperInfo::Fixed)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
+}
 
+fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, AllocWrapperInfo> {
     let mut wrappers = FxHashMap::default();
     let crate_hir = tcx.hir_crate(());
     for maybe_owner in crate_hir.owners.iter() {
@@ -4185,9 +4248,6 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
             continue;
         };
         let def_id = item.owner_id.def_id;
-        if !wrapper_name_allows_alloc(tcx, def_id) {
-            continue;
-        }
         let body = tcx.hir_body(body);
         let typeck = tcx.typeck(def_id);
         let params = body
@@ -4200,62 +4260,161 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                 Some((hir_id, typeck.node_type(hir_id)))
             })
             .collect::<Vec<_>>();
-        let tail = body_tail_expr(body);
-        let call = match hir_unwrap_casts(tail).kind {
-            hir::ExprKind::Call(_, _) => Some(hir_unwrap_casts(tail)),
-            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
-                let Res::Local(hir_id) = path.res else {
-                    continue;
+        #[derive(Default)]
+        struct Candidate {
+            info: Option<AllocWrapperInfo>,
+            aliases: FxHashSet<HirId>,
+            returned: bool,
+            disqualified: bool,
+        }
+
+        struct WrapperVisitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            params: &'a [(HirId, ty::Ty<'tcx>)],
+            typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+            candidates: FxHashMap<HirId, Candidate>,
+            root_of: FxHashMap<HirId, HirId>,
+        }
+
+        impl<'a, 'tcx> WrapperVisitor<'a, 'tcx> {
+            fn mark_root(&mut self, hir_id: HirId, info: AllocWrapperInfo) {
+                let candidate = self.candidates.entry(hir_id).or_default();
+                if let Some(existing) = &candidate.info {
+                    if *existing != info {
+                        candidate.disqualified = true;
+                    }
+                } else {
+                    candidate.info = Some(info);
+                }
+                candidate.aliases.insert(hir_id);
+                self.root_of.insert(hir_id, hir_id);
+            }
+
+            fn mark_alias(&mut self, alias: HirId, source: HirId) {
+                let Some(root) = self.root_of.get(&source).copied() else {
+                    return;
                 };
-                top_level_let_init(body, hir_id).map(hir_unwrap_casts)
+                self.root_of.insert(alias, root);
+                self.candidates
+                    .entry(root)
+                    .or_default()
+                    .aliases
+                    .insert(alias);
             }
-            _ => None,
+
+            fn mark_disqualified(&mut self, hir_id: HirId) {
+                if let Some(root) = self.root_of.get(&hir_id).copied() {
+                    self.candidates.entry(root).or_default().disqualified = true;
+                }
+            }
+
+            fn mark_returned(&mut self, hir_id: HirId) {
+                if let Some(root) = self.root_of.get(&hir_id).copied() {
+                    self.candidates.entry(root).or_default().returned = true;
+                }
+            }
+        }
+
+        impl<'tcx> Visitor<'tcx> for WrapperVisitor<'_, 'tcx> {
+            fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+                if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                    && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                    && let Some(init) = let_stmt.init
+                {
+                    let lhs_ty = self.typeck.node_type(hir_id);
+                    if lhs_ty.is_raw_ptr()
+                        && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+                    {
+                        if let Some(info) =
+                            raw_wrapper_info_from_rhs(self.tcx, lhs_inner_ty, init, self.params)
+                        {
+                            self.mark_root(hir_id, info);
+                        } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(init) {
+                            self.mark_alias(hir_id, rhs_hir_id);
+                        }
+                    }
+                }
+                intravisit::walk_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                match expr.kind {
+                    hir::ExprKind::Assign(lhs, rhs, _) => {
+                        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                            && let Res::Local(lhs_hir_id) = path.res
+                        {
+                            let lhs_ty = self.typeck.expr_ty(lhs);
+                            if lhs_ty.is_raw_ptr()
+                                && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+                            {
+                                if let Some(info) = raw_wrapper_info_from_rhs(
+                                    self.tcx,
+                                    lhs_inner_ty,
+                                    rhs,
+                                    self.params,
+                                ) {
+                                    self.mark_root(lhs_hir_id, info);
+                                } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
+                                    self.mark_alias(lhs_hir_id, rhs_hir_id);
+                                }
+                            }
+                        } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
+                            self.mark_disqualified(rhs_hir_id);
+                        }
+                    }
+                    hir::ExprKind::Ret(Some(ret)) => {
+                        if let Some(hir_id) = hir_unwrapped_local_id(ret) {
+                            self.mark_returned(hir_id);
+                        }
+                    }
+                    hir::ExprKind::Call(_, args) => {
+                        let is_local_callee = hir_called_local_fn(self.tcx, expr).is_some();
+                        for arg in args {
+                            if let Some(hir_id) = hir_unwrapped_local_id(arg)
+                                && is_local_callee
+                            {
+                                self.mark_disqualified(hir_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                intravisit::walk_expr(self, expr);
+            }
+
+            fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
+                intravisit::walk_body(self, body);
+                let mut tail = body.value;
+                while let hir::ExprKind::Block(block, _) = tail.kind {
+                    let Some(expr) = block.expr else {
+                        break;
+                    };
+                    tail = expr;
+                }
+                if let Some(hir_id) = hir_unwrapped_local_id(tail) {
+                    self.mark_returned(hir_id);
+                }
+            }
+        }
+
+        let mut visitor = WrapperVisitor {
+            tcx,
+            params: &params,
+            typeck,
+            candidates: FxHashMap::default(),
+            root_of: FxHashMap::default(),
         };
-        let Some(call) = call else {
-            continue;
-        };
-        let hir::ExprKind::Call(_, args) = call.kind else {
-            continue;
-        };
-        let arg_param_indices = args
-            .iter()
-            .map(|arg| {
-                let hir_id = hir_unwrapped_local_id(arg)?;
-                params.iter().position(|(param_hir_id, _)| *param_hir_id == hir_id)
+        visitor.visit_body(body);
+
+        let eligible = visitor
+            .candidates
+            .into_iter()
+            .filter_map(|(_root, candidate)| {
+                (!candidate.disqualified && candidate.returned).then_some(candidate.info?)
             })
-            .collect::<Option<Vec<_>>>();
-        let Some(arg_param_indices) = arg_param_indices else {
-            continue;
-        };
-
-        let info = match arg_param_indices.as_slice() {
-            [bytes_param] if is_integer_like_ty(params[*bytes_param].1) => {
-                Some(AllocWrapperInfo::Bytes {
-                    bytes_param: *bytes_param,
-                })
-            }
-            [first, second]
-                if params[*first].1.is_raw_ptr() && is_integer_like_ty(params[*second].1) =>
-            {
-                Some(AllocWrapperInfo::Realloc {
-                    ptr_param: *first,
-                    bytes_param: *second,
-                })
-            }
-            [count_param, elem_size_param]
-                if is_integer_like_ty(params[*count_param].1)
-                    && is_integer_like_ty(params[*elem_size_param].1) =>
-            {
-                Some(AllocWrapperInfo::CountSize {
-                    count_param: *count_param,
-                    elem_size_param: *elem_size_param,
-                })
-            }
-            _ => None,
-        };
-
-        if let Some(info) = info {
-            wrappers.insert(def_id, info);
+            .collect::<Vec<_>>();
+        if eligible.len() == 1 {
+            wrappers.insert(def_id, eligible.into_iter().next().unwrap());
         }
     }
     wrappers
@@ -4336,7 +4495,9 @@ fn collect_raw_bridge_bindings(
     struct State {
         bridge: Option<RawBridgeInfo>,
         saw_free: bool,
+        saw_return: bool,
         disqualified: bool,
+        aliases: FxHashSet<HirId>,
     }
 
     struct RawBridgeVisitor<'a, 'tcx> {
@@ -4344,22 +4505,60 @@ fn collect_raw_bridge_bindings(
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         alloc_wrappers: &'a FxHashMap<LocalDefId, AllocWrapperInfo>,
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
+        body_owner: LocalDefId,
+        alias_roots: FxHashMap<HirId, HirId>,
         states: FxHashMap<HirId, State>,
     }
 
     impl<'tcx> RawBridgeVisitor<'_, 'tcx> {
-        fn update_rhs(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>, lhs_inner_ty: ty::Ty<'tcx>) {
+        fn mark_root(&mut self, hir_id: HirId, info: RawBridgeInfo) {
             let state = self.states.entry(hir_id).or_default();
+            match &state.bridge {
+                None => state.bridge = Some(info.clone()),
+                Some(existing) if *existing == info => {}
+                Some(_) => state.disqualified = true,
+            }
+            state.aliases.insert(hir_id);
+            self.alias_roots.insert(hir_id, hir_id);
+        }
+
+        fn mark_alias(&mut self, alias: HirId, source: HirId) {
+            let Some(root) = self.alias_roots.get(&source).copied() else {
+                return;
+            };
+            self.alias_roots.insert(alias, root);
+            self.states.entry(root).or_default().aliases.insert(alias);
+        }
+
+        fn state_for_local_mut(&mut self, hir_id: HirId) -> Option<&mut State> {
+            let root = self.alias_roots.get(&hir_id).copied().unwrap_or(hir_id);
+            self.states.get_mut(&root)
+        }
+
+        fn disqualify_local(&mut self, hir_id: HirId) {
+            if let Some(state) = self.state_for_local_mut(hir_id) {
+                state.disqualified = true;
+            }
+        }
+
+        fn update_local_from_rhs(
+            &mut self,
+            lhs_hir_id: HirId,
+            rhs: &'tcx hir::Expr<'tcx>,
+            lhs_inner_ty: ty::Ty<'tcx>,
+        ) {
             if let Some(info) =
                 hir_raw_bridge_info(self.tcx, lhs_inner_ty, rhs, Some(self.alloc_wrappers))
             {
-                match &state.bridge {
-                    None => state.bridge = Some(info),
-                    Some(existing) if *existing == info => {}
-                    Some(_) => state.disqualified = true,
+                self.mark_root(lhs_hir_id, info);
+            } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
+                if self.alloc_wrappers.contains_key(&self.body_owner) {
+                    self.mark_alias(lhs_hir_id, rhs_hir_id);
+                } else {
+                    self.disqualify_local(rhs_hir_id);
                 }
             } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
-                state.disqualified = true;
+                self.disqualify_local(lhs_hir_id);
             }
         }
     }
@@ -4373,15 +4572,8 @@ fn collect_raw_bridge_bindings(
             {
                 let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
                 if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) {
-                    self.update_rhs(hir_id, init, lhs_inner_ty);
+                    self.update_local_from_rhs(hir_id, init, lhs_inner_ty);
                 }
-            }
-            if let hir::StmtKind::Let(let_stmt) = stmt.kind
-                && let Some(init) = let_stmt.init
-                && let Some(rhs_hir_id) = hir_unwrapped_local_id(init)
-                && matches!(self.ptr_kinds.get(&rhs_hir_id), Some(PtrKind::Raw(_)))
-            {
-                self.states.entry(rhs_hir_id).or_default().disqualified = true;
             }
             intravisit::walk_stmt(self, stmt);
         }
@@ -4394,40 +4586,38 @@ fn collect_raw_bridge_bindings(
             {
                 let lhs_ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(lhs);
                 if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) {
-                    self.update_rhs(hir_id, rhs, lhs_inner_ty);
+                    self.update_local_from_rhs(hir_id, rhs, lhs_inner_ty);
                 }
             }
             if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
                 && let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs)
-                && matches!(self.ptr_kinds.get(&rhs_hir_id), Some(PtrKind::Raw(_)))
+                && hir_unwrapped_local_id(lhs).is_none()
             {
-                let lhs_hir_id = hir_unwrapped_local_id(lhs);
-                if lhs_hir_id != Some(rhs_hir_id) {
-                    self.states.entry(rhs_hir_id).or_default().disqualified = true;
+                self.disqualify_local(rhs_hir_id);
+            }
+            if let hir::ExprKind::Call(_, args) = expr.kind {
+                let free_arg = hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
+                    .map(|(hir_id, _)| hir_id);
+                let local_callee = hir_called_local_fn(self.tcx, expr);
+                if let Some(hir_id) = free_arg
+                    && let Some(state) = self.state_for_local_mut(hir_id)
+                {
+                    state.saw_free = true;
                 }
-            }
-            if let Some((hir_id, _)) =
-                hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
-                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
-            {
-                self.states.entry(hir_id).or_default().saw_free = true;
-            }
-            if let hir::ExprKind::Call(_, args) = expr.kind
-                && hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers).is_none()
-            {
                 for arg in args {
                     if let Some(hir_id) = hir_unwrapped_local_id(arg)
-                        && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                        && Some(hir_id) != free_arg
+                        && local_callee.is_some()
                     {
-                        self.states.entry(hir_id).or_default().disqualified = true;
+                        self.disqualify_local(hir_id);
                     }
                 }
             }
             if let hir::ExprKind::Ret(Some(ret)) = expr.kind
                 && let Some(hir_id) = hir_unwrapped_local_id(ret)
-                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                && let Some(state) = self.state_for_local_mut(hir_id)
             {
-                self.states.entry(hir_id).or_default().disqualified = true;
+                state.saw_return = true;
             }
             intravisit::walk_expr(self, expr);
         }
@@ -4435,9 +4625,9 @@ fn collect_raw_bridge_bindings(
         fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
             intravisit::walk_body(self, body);
             if let Some(hir_id) = hir_unwrapped_local_id(body.value)
-                && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                && let Some(state) = self.state_for_local_mut(hir_id)
             {
-                self.states.entry(hir_id).or_default().disqualified = true;
+                state.saw_return = true;
             }
         }
     }
@@ -4460,12 +4650,20 @@ fn collect_raw_bridge_bindings(
             ptr_kinds,
             alloc_wrappers,
             free_like_wrappers,
+            body_owner: item.owner_id.def_id,
+            alias_roots: FxHashMap::default(),
             states: FxHashMap::default(),
         };
         visitor.visit_body(body);
-        for (hir_id, state) in visitor.states {
-            if state.saw_free && !state.disqualified && let Some(info) = state.bridge {
-                bindings.insert(hir_id, info);
+        for (_hir_id, state) in visitor.states {
+            let allow_return_bridge =
+                state.saw_return && alloc_wrappers.contains_key(&visitor.body_owner);
+            if (state.saw_free || allow_return_bridge) && !state.disqualified
+                && let Some(info) = state.bridge
+            {
+                for alias in state.aliases {
+                    bindings.insert(alias, info.clone());
+                }
             }
         }
     }
@@ -5058,6 +5256,51 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_collector_recognizes_returning_local_after_mutation() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn snprintf(dst: *mut core::ffi::c_char, size: usize, fmt: *const core::ffi::c_char, ...);
+}
+
+pub unsafe fn create_msg(v: i32) -> *mut core::ffi::c_char {
+    let msg: *mut core::ffi::c_char = malloc(64) as *mut core::ffi::c_char;
+    if msg.is_null() {
+        return std::ptr::null_mut();
+    }
+    snprintf(msg, 64, b"value=%d\0" as *const u8 as *const core::ffi::c_char, v);
+    msg
+}
+"#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let wrappers = collect_local_allocator_wrappers(tcx);
+            let did = tcx
+                .hir_crate(())
+                .owners
+                .iter()
+                .filter_map(|maybe_owner| maybe_owner.as_owner())
+                .filter_map(|owner| {
+                    let OwnerNode::Item(item) = owner.node() else {
+                        return None;
+                    };
+                    let HirItemKind::Fn { .. } = item.kind else {
+                        return None;
+                    };
+                    (tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() == "create_msg")
+                        .then_some(item.owner_id.def_id)
+                })
+                .next()
+                .expect("create_msg should exist");
+            let names = wrappers
+                .keys()
+                .map(|def_id| tcx.item_name(def_id.to_def_id()).as_str().to_owned())
+                .collect::<Vec<_>>();
+            assert!(wrappers.contains_key(&did), "{names:?}");
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn struct_default_materialization_uses_recursive_defaults() {
         let code = r#"
 extern "C" {
@@ -5119,6 +5362,68 @@ pub struct StructDefaultProbe {{
 
 pub fn check() {{
     let _: Option<Box<crate::StructDefaultProbe>> = {emitted};
+}}
+"#
+            );
+            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
+                .expect(&check_code);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn struct_default_materialization_handles_large_array_fields() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct StructArrayDefaultProbe {
+    pub name: [i8; 64],
+    pub nodes: [*mut i32; 100],
+}
+
+pub unsafe fn alloc_struct() {
+    let state: *mut StructArrayDefaultProbe =
+        malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>()) as *mut crate::StructArrayDefaultProbe;
+    let _ = state;
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let mut krate = ::utils::ast::expanded_ast(tcx);
+            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+            let struct_ty = find_struct_ty(tcx, "StructArrayDefaultProbe");
+            let init_expr = find_local_init_expr(&krate, "alloc_struct", "state");
+            let mut materialized = init_expr.clone();
+            let visitor = synthetic_transform_visitor(tcx);
+
+            let kind = visitor.try_materialize_box_allocator_root(
+                &mut materialized,
+                init_expr,
+                PtrKind::OptBox,
+                struct_ty,
+            );
+            assert_eq!(kind, Some(PtrKind::OptBox));
+
+            let emitted = pprust::expr_to_string(&materialized);
+            assert!(emitted.contains("Some(Box::<crate::StructArrayDefaultProbe>::new("), "{emitted}");
+            assert!(emitted.contains("name: std::array::from_fn"), "{emitted}");
+            assert!(emitted.contains("nodes: std::array::from_fn"), "{emitted}");
+            assert!(emitted.contains("std::ptr::null_mut::<i32>()"), "{emitted}");
+
+            let check_code = format!(
+                r#"
+#[repr(C)]
+pub struct StructArrayDefaultProbe {{
+    pub name: [i8; 64],
+    pub nodes: [*mut i32; 100],
+}}
+
+pub fn check() {{
+    let _: Option<Box<crate::StructArrayDefaultProbe>> = {emitted};
 }}
 "#
             );

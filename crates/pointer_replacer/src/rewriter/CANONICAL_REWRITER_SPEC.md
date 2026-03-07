@@ -225,6 +225,7 @@ Practical result for function-pointer-used functions:
     - tracked candidates are direct local bindings (or direct local wrapper-call results) whose writes stay outermost-local and whose deallocation stays on the same local path
     - exact scalar roots rewrite to `Box::into_raw(Box::new(default_value_expr))`
     - supported array roots rewrite to leaked boxed-slice storage via `Box::leak(...into_boxed_slice()).as_{mut,}ptr()`
+    - `default_value_expr` now recurses through local structs and array fields, using `std::array::from_fn(...)` instead of `<[T; N] as Default>::default()` for array members
     - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
@@ -374,6 +375,11 @@ If no local-path kind match applies:
   - exact scalar roots -> `Box::into_raw(Box::new(default_value_expr))`
   - supported array roots -> leaked boxed slices with tracked length expressions
   - direct local allocator wrappers (`alloc`/`calloc`/`realloc`-style wrappers returning one outermost local) participate when their call arguments preserve the same raw-bridge shape
+  - wrapper eligibility is structural:
+    - the wrapper allocates one principal outermost local
+    - the same local is ultimately returned or freed
+    - simple alias propagation inside the wrapper body is allowed, but the ownership flow must remain confined to that wrapper
+    - wrappers that let the allocated value escape through parameters, globals, nested-pointer writes, or indirect container writes remain unchanged
 - plain array bases now also participate in non-raw fallback for `Slice`, `SliceCursor`, and `OptRef` targets instead of being left unchanged at rewrite-enabled call sites
 - raw fallback support is asymmetric for owning box targets:
   - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
@@ -431,6 +437,7 @@ If no local-path kind match applies:
   - supported raw array roots (`malloc(bytes)`, `calloc(count, _)`, `realloc(null_like, bytes)`) are emitted as leaked boxed slices with tracked lengths for those same outermost locals
   - direct `free(local[_cast])` and supported local free-wrapper calls are rewritten to null-guarded `drop(Box::from_raw(...))` / `drop(Box::from_raw(slice_from_raw_parts_mut(...)))`
   - simple local allocator-wrapper calls participate when the wrapper body still preserves a direct outermost-local allocator-root shape
+  - M9 generalizes that wrapper path to structural local helpers that allocate one principal outermost local, optionally null-check/mutate it, and then return or free that same local without allowing it to escape through params, globals, or indirect container writes
   - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
 - Scalar `OptBox` allocator roots are intentionally narrower in M4B:
   - only exact `size_of::<T>()` scalar roots stay eligible
@@ -523,9 +530,14 @@ If no local-path kind match applies:
     - `test_rewriter_bridges_raw_scalar_calloc_root_and_free`
     - `test_rewriter_bridges_raw_array_realloc_null_root_and_free`
     - `test_rewriter_bridges_outermost_local_allocator_wrappers`
+    - `test_rewriter_generalizes_wrapper_returning_allocated_local`
+    - `test_rewriter_generalizes_wrapper_with_internal_free_after_foreign_use`
+    - `test_rewriter_keeps_wrapper_escape_through_parameter_raw_in_m9`
+    - `test_rewriter_keeps_wrapper_escape_through_global_raw_in_m9`
     - `test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed`
     - `test_rewriter_keeps_owner_struct_field_frees_raw_in_m7`
     - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
+    - `transform::tests::struct_default_materialization_handles_large_array_fields` directly covers recursive raw-bridge struct defaults for large array fields in `transform/mod.rs`
     - `test_rewriter_materializes_local_struct_malloc_default_gotomach_probe` remains an ignored supplemental probe in `tests.rs`; it is not the landed primary coverage artifact
   - The direct `test_rewriter_` bucket now also covers:
     - const-pointer mutability preservation through `rewriter::decision::tests`
@@ -568,11 +580,20 @@ If no local-path kind match applies:
     - `classifier_deduplicates_capabilities_and_respects_primary_precedence`
     - `classifier_normalizes_and_truncates_statement_snippet`
     - `remaining_allocator_site_classification_is_complete`
+    - `m9_wrapper_generalization_reduction_vs_verified_baseline`
 - Current consequence:
   - every B02 case is now gated on both ownership expectations and rewrite-compile success
   - failing rewrite compilation reports the B02 case name plus the rewritten source text
-  - the current post-M8 corpus totals remain `malloc=101`, `calloc=27`, `free=270`, down from the M6 baseline `120/27/292`
-  - M8 adds planning metadata only; it does not expand the rewrite surface or change transform behavior
+  - the M8 planning baseline was re-verified through the same checked-in classifier path now used by M9 closeout:
+    - `remaining_malloc_sites=64`
+    - `remaining_calloc_sites=13`
+    - `primary_unlock_wrapper_generalization=46`
+  - the current post-M9 classifier totals are:
+    - `remaining_malloc_sites=54`
+    - `remaining_calloc_sites=11`
+    - `primary_unlock_wrapper_generalization=36`
+  - the direct token census also improved under M9, from the post-M8 `malloc=101`, `calloc=27`, `free=270` totals to the current `malloc=91`, `calloc=24`, `free=267`
+  - M8 remains planning metadata only; M9 reduces wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
   - per-site fields:
     - `case_name`
