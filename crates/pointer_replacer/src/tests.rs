@@ -575,6 +575,115 @@ pub unsafe fn free_nested_alias() {
 }
 
 #[test]
+fn test_rewriter_bridges_raw_scalar_calloc_root_and_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_one() {
+    let p: *mut *mut i32 =
+        calloc(1, std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &[
+            "calloc(1, std::mem::size_of::<*mut i32>())",
+            "free(p as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_bridges_raw_array_realloc_null_root_and_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_chars(len: usize) {
+    let buf: *mut core::ffi::c_char =
+        realloc(std::ptr::null_mut::<core::ffi::c_void>(), len) as *mut core::ffi::c_char;
+    free(buf as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &[
+            "realloc(std::ptr::null_mut::<core::ffi::c_void>(), len)",
+            "free(buf as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_bridges_outermost_local_allocator_wrappers() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_zeroed(num: usize, size: usize) -> *mut core::ffi::c_void {
+    let out: *mut core::ffi::c_void = calloc(num, size);
+    if out.is_null() {
+        std::process::abort();
+    }
+    out
+}
+
+pub unsafe fn dealloc_ptr(ptr: *mut core::ffi::c_void) {
+    free(ptr);
+}
+
+pub unsafe fn foo() {
+    let p: *mut i32 = alloc_zeroed(1, std::mem::size_of::<i32>()) as *mut i32;
+    dealloc_ptr(p as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &[
+            "alloc_zeroed(1, std::mem::size_of::<i32>())",
+            "dealloc_ptr(p as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_owner_struct_field_frees_raw_in_m7() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn foo() {
+    let owner: *mut Holder = malloc(std::mem::size_of::<Holder>()) as *mut Holder;
+    (*owner).data = malloc(4 * std::mem::size_of::<i32>()) as *mut i32;
+    free((*owner).data as *mut core::ffi::c_void);
+    free(owner as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "malloc(4 * std::mem::size_of::<i32>())",
+            "free((*owner).data as *mut core::ffi::c_void);",
+        ],
+        &[],
+    );
+}
+
+#[test]
 fn test_rewriter_preserves_fn_pointer_signature_with_opt_box_raw_fallback() {
     run_test(
         r#"

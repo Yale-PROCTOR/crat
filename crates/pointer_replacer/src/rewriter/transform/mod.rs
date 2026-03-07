@@ -33,10 +33,25 @@ pub(crate) struct TransformVisitor<'tcx> {
     sig_decs: SigDecisions,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: FxHashSet<HirId>,
-    raw_scalar_bridge_bindings: FxHashSet<HirId>,
+    raw_bridge_bindings: FxHashMap<HirId, RawBridgeInfo>,
+    alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
+    free_like_wrappers: FxHashSet<LocalDefId>,
     ast_to_hir: AstToHir,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RawBridgeInfo {
+    Scalar,
+    Array { len_expr: String },
+}
+
+#[derive(Copy, Clone, Debug)]
+enum AllocWrapperInfo {
+    Bytes { bytes_param: usize },
+    CountSize { count_param: usize, elem_size_param: usize },
+    Realloc { ptr_param: usize, bytes_param: usize },
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -290,7 +305,7 @@ impl MutVisitor for TransformVisitor<'_> {
 
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
                 let hir_rhs = let_stmt.init.unwrap();
-                if !self.try_bridge_scalar_raw_root(rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
+                if !self.try_bridge_raw_root(rhs, hir_rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
                     self.transform_rhs(rhs, hir_rhs, lhs_kind);
                 }
             }
@@ -373,8 +388,9 @@ impl MutVisitor for TransformVisitor<'_> {
                             }
                         }
                         if let Some(lhs_hir_id) = lhs_hir_id
-                            && !self.try_bridge_scalar_raw_root(
+                            && !self.try_bridge_raw_root(
                                 rhs,
+                                hir_rhs,
                                 lhs_kind,
                                 lhs_inner_ty,
                                 Some(lhs_hir_id),
@@ -391,8 +407,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     | PtrKind::OptBoxedSlice
                     | PtrKind::Raw(_) => {
                         if let Some(lhs_hir_id) = lhs_hir_id
-                            && !self.try_bridge_scalar_raw_root(
+                            && !self.try_bridge_raw_root(
                                 rhs,
+                                hir_rhs,
                                 lhs_kind,
                                 lhs_inner_ty,
                                 Some(lhs_hir_id),
@@ -667,24 +684,33 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         }
 
-        let raw_scalar_bridge_bindings =
-            collect_scalar_raw_bridge_bindings(rust_program.tcx, &ptr_kinds);
+        let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
+        let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
+        let raw_bridge_bindings = collect_raw_bridge_bindings(
+            rust_program.tcx,
+            &ptr_kinds,
+            &alloc_wrappers,
+            &free_like_wrappers,
+        );
 
         TransformVisitor {
             tcx: rust_program.tcx,
             sig_decs,
             ptr_kinds,
             forced_raw_bindings,
-            raw_scalar_bridge_bindings,
+            raw_bridge_bindings,
+            alloc_wrappers,
+            free_like_wrappers,
             ast_to_hir,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
     }
 
-    fn try_bridge_scalar_raw_root(
+    fn try_bridge_raw_root(
         &self,
         rhs: &mut Expr,
+        hir_rhs: &'tcx hir::Expr<'tcx>,
         lhs_kind: PtrKind,
         lhs_inner_ty: ty::Ty<'tcx>,
         lhs_hir_id: Option<HirId>,
@@ -695,25 +721,45 @@ impl<'tcx> TransformVisitor<'tcx> {
         let Some(lhs_hir_id) = lhs_hir_id else {
             return false;
         };
-        if !self.raw_scalar_bridge_bindings.contains(&lhs_hir_id) {
+        let Some(info) = self.raw_bridge_bindings.get(&lhs_hir_id) else {
+            return false;
+        };
+        let Some(current_info) =
+            hir_raw_bridge_info(self.tcx, lhs_inner_ty, hir_rhs, Some(&self.alloc_wrappers))
+        else {
+            return false;
+        };
+        if &current_info != info {
             return false;
         }
-        if !expr_supports_scalar_opt_box_allocator_root(self.tcx, rhs, lhs_inner_ty) {
-            return false;
-        }
-        *rhs = self.raw_scalar_bridge_expr(lhs_inner_ty, m);
+        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, info);
         true
     }
 
-    fn raw_scalar_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool) -> Expr {
+    fn raw_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool, info: &RawBridgeInfo) -> Expr {
         let ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
         let default_expr = self.default_value_expr(lhs_inner_ty);
-        utils::expr!(
-            "Box::into_raw(Box::new({})) as *{} {}",
-            pprust::expr_to_string(&default_expr),
-            if m { "mut" } else { "const" },
-            ty,
-        )
+        let default_expr_str = pprust::expr_to_string(&default_expr);
+        match info {
+            RawBridgeInfo::Scalar => utils::expr!(
+                "Box::into_raw(Box::new({})) as *{} {}",
+                default_expr_str,
+                if m { "mut" } else { "const" },
+                ty,
+            ),
+            RawBridgeInfo::Array { len_expr } => {
+                let ptr_expr = if m {
+                    format!(
+                        "Box::leak(std::iter::repeat_with(|| {{ {default_expr_str} }}).take(({len_expr}) as usize).collect::<Vec<{ty}>>().into_boxed_slice()).as_mut_ptr()"
+                    )
+                } else {
+                    format!(
+                        "Box::leak(std::iter::repeat_with(|| {{ {default_expr_str} }}).take(({len_expr}) as usize).collect::<Vec<{ty}>>().into_boxed_slice()).as_ptr()"
+                    )
+                };
+                utils::expr!("{ptr_expr}")
+            }
+        }
     }
 
     fn rewrite_direct_free_call(
@@ -721,12 +767,14 @@ impl<'tcx> TransformVisitor<'tcx> {
         hir_expr: &'tcx hir::Expr<'tcx>,
         args: &[P<Expr>],
     ) -> Option<Expr> {
-        let Some((hir_id, _harg)) = hir_free_arg_local_id(self.tcx, hir_expr) else {
+        let Some((hir_id, _harg)) =
+            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)
+        else {
             return None;
         };
-        if !self.raw_scalar_bridge_bindings.contains(&hir_id) {
+        let Some(info) = self.raw_bridge_bindings.get(&hir_id) else {
             return None;
-        }
+        };
         let [arg] = args else { return None };
         let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
         let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(arg_ty) else {
@@ -734,11 +782,19 @@ impl<'tcx> TransformVisitor<'tcx> {
         };
         let arg_str = pprust::expr_to_string(arg);
         let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
-        Some(utils::expr!(
-            "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(({0}) as *mut {1}) }}); }}",
-            arg_str,
-            inner_ty_str,
-        ))
+        Some(match info {
+            RawBridgeInfo::Scalar => utils::expr!(
+                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(({0}) as *mut {1}) }}); }}",
+                arg_str,
+                inner_ty_str,
+            ),
+            RawBridgeInfo::Array { len_expr } => utils::expr!(
+                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(std::ptr::slice_from_raw_parts_mut(({0}) as *mut {1}, ({2}) as usize)) }}); }}",
+                arg_str,
+                inner_ty_str,
+                len_expr,
+            ),
+        })
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -3896,11 +3952,29 @@ fn hir_call_matches_foreign_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, name: &s
         .is_some_and(|local| local_def_id_has_fn_body(tcx, local))
 }
 
-fn hir_free_arg_local_id<'tcx>(
+fn hir_called_local_fn(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LocalDefId> {
+    let hir::ExprKind::Call(func, _) = expr.kind else {
+        return None;
+    };
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind else {
+        return None;
+    };
+    let Res::Def(_, def_id) = path.res else {
+        return None;
+    };
+    let def_id = def_id.as_local()?;
+    local_def_id_has_fn_body(tcx, def_id).then_some(def_id)
+}
+
+fn hir_free_like_arg_local_id<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
 ) -> Option<(HirId, &'tcx hir::Expr<'tcx>)> {
-    if !hir_call_matches_foreign_name(tcx, expr, "free") {
+    let is_direct_free = hir_call_matches_foreign_name(tcx, expr, "free");
+    let is_wrapper_free = hir_called_local_fn(tcx, expr)
+        .is_some_and(|def_id| free_like_wrappers.contains(&def_id));
+    if !is_direct_free && !is_wrapper_free {
         return None;
     }
     let hir::ExprKind::Call(_, args) = expr.kind else {
@@ -3926,35 +4000,371 @@ fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
     Some(hir_id)
 }
 
-fn collect_scalar_raw_bridge_bindings(
+fn hir_expr_verbatim_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    tcx.sess.source_map().span_to_snippet(expr.span).ok()
+}
+
+fn ty_supports_raw_bridge_default_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::TyKind::Bool
+        | ty::TyKind::Char
+        | ty::TyKind::Int(_)
+        | ty::TyKind::Uint(_)
+        | ty::TyKind::Float(_) => true,
+        ty::TyKind::RawPtr(..) => true,
+        ty::TyKind::Array(elem, _) => ty_supports_raw_bridge_default_expr(tcx, *elem),
+        ty::TyKind::Tuple(elems) => elems
+            .iter()
+            .all(|elem| ty_supports_raw_bridge_default_expr(tcx, elem)),
+        ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() && adt_def.is_struct() => {
+            adt_def
+                .all_fields()
+                .all(|field| ty_supports_raw_bridge_default_expr(tcx, field.ty(tcx, args)))
+        }
+        _ => false,
+    }
+}
+
+fn raw_array_len_expr_from_bytes<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    bytes: &hir::Expr<'_>,
+) -> Option<String> {
+    let bytes = hir_expr_verbatim_snippet(tcx, hir_unwrap_casts(bytes))?;
+    let ty = mir_ty_to_string(lhs_inner_ty, tcx);
+    Some(format!("((({bytes}) as usize) / std::mem::size_of::<{ty}>())"))
+}
+
+fn raw_bridge_info_from_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    name: Symbol,
+    args: &[&hir::Expr<'_>],
+) -> Option<RawBridgeInfo> {
+    if !ty_supports_raw_bridge_default_expr(tcx, lhs_inner_ty) {
+        return None;
+    }
+    let ty_name = mir_ty_to_string(lhs_inner_ty, tcx);
+    match (name, args) {
+        (name, [bytes]) if name == Symbol::intern("malloc") => {
+            if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
+                Some(RawBridgeInfo::Scalar)
+            } else {
+                raw_array_len_expr_from_bytes(tcx, lhs_inner_ty, bytes)
+                    .map(|len_expr| RawBridgeInfo::Array { len_expr })
+            }
+        }
+        (name, [count, elem_size]) if name == Symbol::intern("calloc") => {
+            if hir_is_literal_one(tcx, count) && hir_is_exact_size_of_expr(tcx, elem_size, &ty_name)
+            {
+                Some(RawBridgeInfo::Scalar)
+            } else {
+                Some(RawBridgeInfo::Array {
+                    len_expr: hir_expr_verbatim_snippet(tcx, hir_unwrap_casts(count))?,
+                })
+            }
+        }
+        (name, [ptr, bytes])
+            if name == Symbol::intern("realloc") && hir_is_null_like_ptr_arg(tcx, ptr) =>
+        {
+            if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
+                Some(RawBridgeInfo::Scalar)
+            } else {
+                raw_array_len_expr_from_bytes(tcx, lhs_inner_ty, bytes)
+                    .map(|len_expr| RawBridgeInfo::Array { len_expr })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn hir_raw_bridge_info<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    rhs: &hir::Expr<'_>,
+    alloc_wrappers: Option<&FxHashMap<LocalDefId, AllocWrapperInfo>>,
+) -> Option<RawBridgeInfo> {
+    let rhs = hir_unwrap_casts(rhs);
+    if let hir::ExprKind::Call(_, args) = rhs.kind
+        && let Some(name) = hir_call_name(rhs)
+    {
+        let arg_refs = args.iter().collect::<Vec<_>>();
+        if let Some(info) = raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &arg_refs) {
+            return Some(info);
+        }
+    }
+
+    let Some(alloc_wrappers) = alloc_wrappers else {
+        return None;
+    };
+    let Some(def_id) = hir_called_local_fn(tcx, rhs) else {
+        return None;
+    };
+    let wrapper = alloc_wrappers.get(&def_id)?;
+    let hir::ExprKind::Call(_, args) = rhs.kind else {
+        return None;
+    };
+    let arg = |idx: usize| args.get(idx);
+    match *wrapper {
+        AllocWrapperInfo::Bytes { bytes_param } => {
+            raw_bridge_info_from_call(
+                tcx,
+                lhs_inner_ty,
+                Symbol::intern("malloc"),
+                &[arg(bytes_param)?],
+            )
+        }
+        AllocWrapperInfo::CountSize {
+            count_param,
+            elem_size_param,
+        } => raw_bridge_info_from_call(
+            tcx,
+            lhs_inner_ty,
+            Symbol::intern("calloc"),
+            &[arg(count_param)?, arg(elem_size_param)?],
+        ),
+        AllocWrapperInfo::Realloc {
+            ptr_param,
+            bytes_param,
+        } => raw_bridge_info_from_call(
+            tcx,
+            lhs_inner_ty,
+            Symbol::intern("realloc"),
+            &[arg(ptr_param)?, arg(bytes_param)?],
+        ),
+    }
+}
+
+fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, AllocWrapperInfo> {
+    fn wrapper_name_allows_alloc(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+        let name = tcx.item_name(def_id.to_def_id()).as_str().to_ascii_lowercase();
+        name.contains("alloc") || name.contains("malloc") || name.contains("calloc") || name.contains("realloc")
+    }
+
+    fn body_tail_expr<'tcx>(body: &'tcx hir::Body<'tcx>) -> &'tcx hir::Expr<'tcx> {
+        let mut expr = body.value;
+        while let hir::ExprKind::Block(block, _) = expr.kind {
+            let Some(tail) = block.expr else { break };
+            expr = tail;
+        }
+        expr
+    }
+
+    fn top_level_let_init<'tcx>(body: &'tcx hir::Body<'tcx>, target: HirId) -> Option<&'tcx hir::Expr<'tcx>> {
+        let hir::ExprKind::Block(block, _) = body.value.kind else {
+            return None;
+        };
+        for stmt in block.stmts {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && hir_id == target
+            {
+                return let_stmt.init;
+            }
+        }
+        None
+    }
+
+    fn is_integer_like_ty(ty: ty::Ty<'_>) -> bool {
+        matches!(
+            ty.kind(),
+            ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Bool | ty::TyKind::Char
+        )
+    }
+
+    let mut wrappers = FxHashMap::default();
+    let crate_hir = tcx.hir_crate(());
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        if !wrapper_name_allows_alloc(tcx, def_id) {
+            continue;
+        }
+        let body = tcx.hir_body(body);
+        let typeck = tcx.typeck(def_id);
+        let params = body
+            .params
+            .iter()
+            .filter_map(|param| {
+                let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+                    return None;
+                };
+                Some((hir_id, typeck.node_type(hir_id)))
+            })
+            .collect::<Vec<_>>();
+        let tail = body_tail_expr(body);
+        let call = match hir_unwrap_casts(tail).kind {
+            hir::ExprKind::Call(_, _) => Some(hir_unwrap_casts(tail)),
+            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                let Res::Local(hir_id) = path.res else {
+                    continue;
+                };
+                top_level_let_init(body, hir_id).map(hir_unwrap_casts)
+            }
+            _ => None,
+        };
+        let Some(call) = call else {
+            continue;
+        };
+        let hir::ExprKind::Call(_, args) = call.kind else {
+            continue;
+        };
+        let arg_param_indices = args
+            .iter()
+            .map(|arg| {
+                let hir_id = hir_unwrapped_local_id(arg)?;
+                params.iter().position(|(param_hir_id, _)| *param_hir_id == hir_id)
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(arg_param_indices) = arg_param_indices else {
+            continue;
+        };
+
+        let info = match arg_param_indices.as_slice() {
+            [bytes_param] if is_integer_like_ty(params[*bytes_param].1) => {
+                Some(AllocWrapperInfo::Bytes {
+                    bytes_param: *bytes_param,
+                })
+            }
+            [first, second]
+                if params[*first].1.is_raw_ptr() && is_integer_like_ty(params[*second].1) =>
+            {
+                Some(AllocWrapperInfo::Realloc {
+                    ptr_param: *first,
+                    bytes_param: *second,
+                })
+            }
+            [count_param, elem_size_param]
+                if is_integer_like_ty(params[*count_param].1)
+                    && is_integer_like_ty(params[*elem_size_param].1) =>
+            {
+                Some(AllocWrapperInfo::CountSize {
+                    count_param: *count_param,
+                    elem_size_param: *elem_size_param,
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(info) = info {
+            wrappers.insert(def_id, info);
+        }
+    }
+    wrappers
+}
+
+fn collect_local_free_wrappers(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+    fn wrapper_name_allows_free(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+        let name = tcx.item_name(def_id.to_def_id()).as_str().to_ascii_lowercase();
+        name.contains("free") || name.contains("dealloc")
+    }
+
+    struct FreeWrapperVisitor {
+        target: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FreeWrapperVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::Call(_, args) = expr.kind
+                && args.len() == 1
+                && hir_unwrapped_local_id(&args[0]) == Some(self.target)
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut wrappers = FxHashSet::default();
+    let crate_hir = tcx.hir_crate(());
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.def_id;
+        if !wrapper_name_allows_free(tcx, def_id) {
+            continue;
+        }
+        let body = tcx.hir_body(body);
+        let [param] = body.params else {
+            continue;
+        };
+        let hir::PatKind::Binding(_, param_hir_id, _, _) = param.pat.kind else {
+            continue;
+        };
+        if !tcx.typeck(def_id).node_type(param_hir_id).is_raw_ptr() {
+            continue;
+        }
+        let mut visitor = FreeWrapperVisitor {
+            target: param_hir_id,
+            found: false,
+        };
+        visitor.visit_body(body);
+        if visitor.found {
+            wrappers.insert(def_id);
+        }
+    }
+    wrappers
+}
+
+fn collect_raw_bridge_bindings(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) -> FxHashSet<HirId> {
+    alloc_wrappers: &FxHashMap<LocalDefId, AllocWrapperInfo>,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
+) -> FxHashMap<HirId, RawBridgeInfo> {
     #[derive(Default)]
     struct State {
-        saw_bridge: bool,
+        bridge: Option<RawBridgeInfo>,
         saw_free: bool,
         disqualified: bool,
     }
 
-    struct RawScalarBridgeVisitor<'a, 'tcx> {
+    struct RawBridgeVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        alloc_wrappers: &'a FxHashMap<LocalDefId, AllocWrapperInfo>,
+        free_like_wrappers: &'a FxHashSet<LocalDefId>,
         states: FxHashMap<HirId, State>,
     }
 
-    impl<'tcx> RawScalarBridgeVisitor<'_, 'tcx> {
+    impl<'tcx> RawBridgeVisitor<'_, 'tcx> {
         fn update_rhs(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>, lhs_inner_ty: ty::Ty<'tcx>) {
             let state = self.states.entry(hir_id).or_default();
-            if hir_supports_scalar_box_allocator_root(self.tcx, lhs_inner_ty, rhs) {
-                state.saw_bridge = true;
+            if let Some(info) =
+                hir_raw_bridge_info(self.tcx, lhs_inner_ty, rhs, Some(self.alloc_wrappers))
+            {
+                match &state.bridge {
+                    None => state.bridge = Some(info),
+                    Some(existing) if *existing == info => {}
+                    Some(_) => state.disqualified = true,
+                }
             } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
                 state.disqualified = true;
             }
         }
     }
 
-    impl<'tcx> Visitor<'tcx> for RawScalarBridgeVisitor<'_, 'tcx> {
+    impl<'tcx> Visitor<'tcx> for RawBridgeVisitor<'_, 'tcx> {
         fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
             if let hir::StmtKind::Let(let_stmt) = stmt.kind
                 && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
@@ -3996,13 +4406,14 @@ fn collect_scalar_raw_bridge_bindings(
                     self.states.entry(rhs_hir_id).or_default().disqualified = true;
                 }
             }
-            if let Some((hir_id, _)) = hir_free_arg_local_id(self.tcx, expr)
+            if let Some((hir_id, _)) =
+                hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
                 && matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
             {
                 self.states.entry(hir_id).or_default().saw_free = true;
             }
             if let hir::ExprKind::Call(_, args) = expr.kind
-                && !hir_call_matches_foreign_name(self.tcx, expr, "free")
+                && hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers).is_none()
             {
                 for arg in args {
                     if let Some(hir_id) = hir_unwrapped_local_id(arg)
@@ -4031,7 +4442,7 @@ fn collect_scalar_raw_bridge_bindings(
         }
     }
 
-    let mut bindings = FxHashSet::default();
+    let mut bindings = FxHashMap::default();
     let crate_hir = tcx.hir_crate(());
     for maybe_owner in crate_hir.owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
@@ -4044,15 +4455,19 @@ fn collect_scalar_raw_bridge_bindings(
             continue;
         };
         let body = tcx.hir_body(body);
-        let mut visitor = RawScalarBridgeVisitor {
+        let mut visitor = RawBridgeVisitor {
             tcx,
             ptr_kinds,
+            alloc_wrappers,
+            free_like_wrappers,
             states: FxHashMap::default(),
         };
         visitor.visit_body(body);
-        bindings.extend(visitor.states.into_iter().filter_map(|(hir_id, state)| {
-            (state.saw_bridge && state.saw_free && !state.disqualified).then_some(hir_id)
-        }));
+        for (hir_id, state) in visitor.states {
+            if state.saw_free && !state.disqualified && let Some(info) = state.bridge {
+                bindings.insert(hir_id, info);
+            }
+        }
     }
     bindings
 }
@@ -4580,7 +4995,9 @@ mod tests {
             },
             ptr_kinds: FxHashMap::default(),
             forced_raw_bindings: FxHashSet::default(),
-            raw_scalar_bridge_bindings: FxHashSet::default(),
+            raw_bridge_bindings: FxHashMap::default(),
+            alloc_wrappers: FxHashMap::default(),
+            free_like_wrappers: FxHashSet::default(),
             ast_to_hir: AstToHir::default(),
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
