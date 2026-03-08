@@ -9,7 +9,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use passes::*;
 use serde::Deserialize;
-use utils::compilation::run_compiler_on_path;
+use utils::compilation::{run_compiler_on_path, run_compiler_on_str};
 
 #[derive(Parser)]
 #[command(version)]
@@ -508,7 +508,15 @@ fn main() {
                     union_replacer::union_use::replace_unions(tcx, config.verbose)
                 })
                 .unwrap();
-                std::fs::write(&file, s).unwrap();
+                let out = if s.contains("extern crate bytemuck as __crat_bytemuck;") {
+                    run_compiler_on_str(&s, |tcx| {
+                        union_replacer::union_use::replace_unions(tcx, config.verbose)
+                    })
+                    .unwrap()
+                } else {
+                    s
+                };
+                std::fs::write(&file, out).unwrap();
             }
             Pass::Io => {
                 let res =
