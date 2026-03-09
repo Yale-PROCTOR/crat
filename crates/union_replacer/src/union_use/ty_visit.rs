@@ -77,22 +77,18 @@ pub fn collect_union_related_types<'tcx>(
 
     if verbose {
         println!("\nUnion Related Types:");
-        let mut unions = related_types.keys().copied().collect::<Vec<_>>();
-        unions.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-        for union_ty in unions {
+        for &union_ty in related_types.keys() {
             let related = related_types.get(&union_ty).expect("union key exists");
-            let mut parent_names = related
+            let parent_names = related
                 .parent_types
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
                 .collect::<Vec<_>>();
-            parent_names.sort();
-            let mut field_names = related
+            let field_names = related
                 .field_types
                 .iter()
                 .map(|ty| format!("{ty:?}"))
                 .collect::<Vec<_>>();
-            field_names.sort();
             println!("\t{}:", tcx.def_path_str(union_ty));
             println!("\t\tparents: {}", parent_names.join(", "));
             println!("\t\tfields: {}", field_names.join(", "));

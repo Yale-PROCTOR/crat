@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
-use rustc_index::Idx;
 use rustc_middle::{
     mir::{
         Body, Location, Place, TerminatorKind,
@@ -140,15 +139,14 @@ pub fn collect_union_seed_functions<'tcx>(
     let map: SeedFuncs = map
         .into_iter()
         .map(|(union_ty, mut fn_ids)| {
-            let mut fn_ids = fn_ids.drain().collect::<Vec<_>>();
-            fn_ids.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+            let fn_ids = fn_ids.drain().collect::<Vec<_>>();
             (union_ty, fn_ids)
         })
         .collect();
 
     if verbose {
         println!("\nCallgraph Seed Functions:\n\t{}", {
-            let mut lines = map
+            let lines = map
                 .iter()
                 .map(|(ty, funcs)| {
                     let ty_name = tcx.def_path_str(*ty);
@@ -160,7 +158,6 @@ pub fn collect_union_seed_functions<'tcx>(
                     format!("{ty_name}\n\t\t-> {func_names}")
                 })
                 .collect::<Vec<_>>();
-            lines.sort();
             lines.join("\n\t")
         });
     }
@@ -211,31 +208,27 @@ pub fn build_union_call_contexts<'tcx>(
         let mut return_cache: FxHashMap<LocalDefId, Vec<Location>> = FxHashMap::default();
 
         if verbose && verbose_callgraph_steps {
-            let mut parent_names = related_types
+            let parent_names = related_types
                 .parent_types
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
                 .collect::<Vec<_>>();
-            parent_names.sort();
 
-            let mut seed_names = seeds
+            let seed_names = seeds
                 .iter()
                 .map(|def_id| tcx.def_path_str(*def_id))
                 .collect::<Vec<_>>();
-            seed_names.sort();
 
-            let mut field_names = related_types
+            let field_names = related_types
                 .field_types
                 .iter()
                 .map(|ty| format!("{ty:?}"))
                 .collect::<Vec<_>>();
-            field_names.sort();
 
-            let mut ptr_names = field_pointer_types
+            let ptr_names = field_pointer_types
                 .iter()
                 .map(|ty| format!("{ty:?}"))
                 .collect::<Vec<_>>();
-            ptr_names.sort();
 
             println!(
                 "\n[Callgraph][{}]\n\tParent Types:\n\t\t{}\n\tSeeds:\n\t\t{}",
@@ -369,25 +362,18 @@ pub fn build_union_call_contexts<'tcx>(
         let graph: CallGraph = graph
             .into_iter()
             .map(|(caller, mut callees)| {
-                let mut callees = callees.drain().collect::<Vec<_>>();
-                callees.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+                let callees = callees.drain().collect::<Vec<_>>();
                 (caller, callees)
             })
             .collect::<FxHashMap<_, _>>();
 
         for callees in call_index.callees_of.values_mut() {
-            callees.sort_by_key(|def_id| def_id.index());
-            callees.dedup();
+            let mut seen = FxHashSet::default();
+            callees.retain(|def_id| seen.insert(*def_id));
         }
         for callers in call_index.callers_of.values_mut() {
-            callers.sort_by_key(|callsite| {
-                (
-                    callsite.caller.index(),
-                    callsite.call_location.block.index(),
-                    callsite.call_location.statement_index,
-                )
-            });
-            callers.dedup();
+            let mut seen = FxHashSet::default();
+            callers.retain(|callsite| seen.insert(*callsite));
         }
         for (&callsite, callees) in &call_index.callees_of {
             let mut entries = Vec::new();
@@ -399,14 +385,8 @@ pub fn build_union_call_contexts<'tcx>(
                     entries.push((callee, ret));
                 }
             }
-            entries.sort_by_key(|(def_id, location)| {
-                (
-                    def_id.index(),
-                    location.block.index(),
-                    location.statement_index,
-                )
-            });
-            entries.dedup();
+            let mut seen = FxHashSet::default();
+            entries.retain(|entry| seen.insert(*entry));
             call_index.return_entries_of.insert(callsite, entries);
         }
 
@@ -423,15 +403,11 @@ pub fn build_union_call_contexts<'tcx>(
 
     if verbose {
         println!("\nUnion Callgraphs:");
-        let mut union_tys = union_contexts.keys().copied().collect::<Vec<_>>();
-        union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-        for union_ty in union_tys {
+        for &union_ty in union_contexts.keys() {
             println!("\t{}:", tcx.def_path_str(union_ty));
             if let Some(ctx) = union_contexts.get(&union_ty) {
                 let graph = &ctx.callgraph;
-                let mut callers = graph.keys().copied().collect::<Vec<_>>();
-                callers.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-                for caller in callers {
+                for &caller in graph.keys() {
                     let caller_name = tcx.def_path_str(caller);
                     let callees = graph
                         .get(&caller)
@@ -522,13 +498,6 @@ fn do_collect_direct_callees<'tcx>(
         }
     });
 
-    callees.sort_by_key(|callee| {
-        (
-            callee.call_location.block.index(),
-            callee.call_location.statement_index,
-            tcx.def_path_str(callee.def_id),
-        )
-    });
     callees
 }
 
@@ -542,9 +511,7 @@ fn collect_local_functions_from_callgraph(callgraph: &CallGraph) -> Vec<LocalDef
             locals.insert(callee);
         }
     }
-    let mut locals = locals.into_iter().collect::<Vec<_>>();
-    locals.sort_by_key(|def_id| def_id.index());
-    locals
+    locals.into_iter().collect::<Vec<_>>()
 }
 
 fn collect_return_locations<'tcx>(
@@ -562,8 +529,6 @@ fn collect_return_locations<'tcx>(
                 });
             }
         }
-        returns.sort_by_key(|location| (location.block.index(), location.statement_index));
-        returns.dedup();
         returns
     })
 }

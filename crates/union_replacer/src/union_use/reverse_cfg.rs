@@ -1,5 +1,4 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::Idx;
 use rustc_middle::{
     mir::{Body, Location},
     ty::TyCtxt,
@@ -86,8 +85,7 @@ pub fn detect_overlapping_types<'tcx>(
     analysis: &ReverseCfgResult,
     verbose: bool,
 ) -> Vec<LocalDefId> {
-    let mut union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
-    union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+    let union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
     let mut overlapping_tys: Vec<LocalDefId> = Vec::new();
 
     if verbose {
@@ -106,10 +104,7 @@ pub fn detect_overlapping_types<'tcx>(
             println!("\t{}:", tcx.def_path_str(union_ty));
         }
 
-        let mut instances = type_uses.instances.iter().collect::<Vec<_>>();
-        instances.sort_by_key(|(instance, _)| instance.root.index());
-
-        for (instance, _) in instances {
+        for instance in type_uses.instances.keys() {
             if verbose {
                 println!(
                     "\t\tInstance L{}..=L{}:",
@@ -125,14 +120,7 @@ pub fn detect_overlapping_types<'tcx>(
                 continue;
             };
 
-            let mut reads = reaching.iter().collect::<Vec<_>>();
-            reads.sort_by_key(|(read, _)| {
-                (
-                    read.site.def_id.index(),
-                    read.site.location.block.index(),
-                    read.site.location.statement_index,
-                )
-            });
+            let reads = reaching.iter().collect::<Vec<_>>();
 
             if reads.is_empty() {
                 if verbose {
@@ -144,14 +132,7 @@ pub fn detect_overlapping_types<'tcx>(
             for (read, writes) in reads {
                 let read_field = format_access(tcx, union_ty, read);
                 let read_field_ty = union_field_ty(tcx, union_ty, read.field);
-                let mut writes = writes.clone();
-                writes.sort_by_key(|write| {
-                    (
-                        write.site.def_id.index(),
-                        write.site.location.block.index(),
-                        write.site.location.statement_index,
-                    )
-                });
+                let writes = writes.clone();
 
                 let write_sites = writes
                     .into_iter()
@@ -191,7 +172,6 @@ pub fn detect_overlapping_types<'tcx>(
         }
     }
 
-    overlapping_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
     overlapping_tys
 }
 
@@ -203,8 +183,7 @@ fn analyze_instance_reaching_writes<'tcx>(
 ) -> ReadToWrites {
     let instance_index = build_instance_index(instance_uses);
 
-    let mut reads = instance_index.reads.clone();
-    reads.sort_by_key(|read| sort_location_key(read.site.def_id, read.site.location));
+    let reads = instance_index.reads.clone();
 
     let mut result = FxHashMap::default();
     for read in reads {
@@ -338,9 +317,7 @@ fn collect_reaching_writes_for_read<'tcx>(
         }
     }
 
-    let mut writes = found.into_iter().collect::<Vec<_>>();
-    writes.sort_by_key(|write| sort_location_key(write.site.def_id, write.site.location));
-    writes
+    found.into_iter().collect::<Vec<_>>()
 }
 
 fn build_instance_index(instance_uses: &UnionInstanceUses) -> InstanceIndex {
@@ -396,29 +373,9 @@ fn previous_points<'tcx>(
         });
     }
 
-    out.sort_by_key(sort_point_key);
-    out.dedup();
+    let mut seen = FxHashSet::default();
+    out.retain(|p| seen.insert(*p));
     out
-}
-
-fn sort_location_key(def_id: LocalDefId, location: Location) -> (usize, usize, usize) {
-    (
-        def_id.index(),
-        location.block.index(),
-        location.statement_index,
-    )
-}
-
-fn sort_point_key(point: &SearchPoint) -> (usize, usize, usize, u8) {
-    match point {
-        SearchPoint::Entry(def_id) => (def_id.index(), 0, 0, 0),
-        SearchPoint::Location { def_id, location } => (
-            def_id.index(),
-            location.block.index(),
-            location.statement_index,
-            1,
-        ),
-    }
 }
 
 fn is_overlapping_pair<'tcx>(

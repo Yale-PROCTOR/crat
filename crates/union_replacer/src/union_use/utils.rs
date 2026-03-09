@@ -140,7 +140,6 @@ fn build_local_loc_infos(result: &andersen::AnalysisResult) -> Vec<LocalLocInfo>
             end,
         });
     }
-    infos.sort_by_key(|info| info.root.index());
     infos
 }
 

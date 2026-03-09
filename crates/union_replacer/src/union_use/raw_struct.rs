@@ -104,9 +104,7 @@ pub fn classify_union_field_types<'tcx>(
 
     if verbose {
         println!("\nUnion Field Type Classification:");
-        let mut unions = results.keys().copied().collect::<Vec<_>>();
-        unions.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-        for union_ty in unions {
+        for &union_ty in results.keys() {
             println!("\t{}:", tcx.def_path_str(union_ty));
             for field in &results[&union_ty] {
                 println!(

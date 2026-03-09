@@ -169,25 +169,17 @@ pub struct UnionUseResult {
 impl std::fmt::Debug for UnionInstanceUses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "READ:")?;
-        let mut read_entries = self.reads.iter().collect::<Vec<_>>();
-        read_entries.sort_by_key(|(def_id, _)| format!("{def_id:?}"));
-        for (def_id, reads) in read_entries {
+        for (def_id, reads) in &self.reads {
             writeln!(f, "\t{def_id:?}:")?;
-            let mut locs = reads.iter().map(|r| r.site.location).collect::<Vec<_>>();
-            locs.sort_by_key(|loc| (loc.block.index(), loc.statement_index));
-            for loc in locs {
+            for loc in reads.iter().map(|r| r.site.location) {
                 writeln!(f, "\t\t{loc:?}")?;
             }
         }
 
         writeln!(f, "WRITE:")?;
-        let mut write_entries = self.writes.iter().collect::<Vec<_>>();
-        write_entries.sort_by_key(|(def_id, _)| format!("{def_id:?}"));
-        for (def_id, writes) in write_entries {
+        for (def_id, writes) in &self.writes {
             writeln!(f, "\t{def_id:?}:")?;
-            let mut locs = writes.iter().map(|w| w.site.location).collect::<Vec<_>>();
-            locs.sort_by_key(|loc| (loc.block.index(), loc.statement_index));
-            for loc in locs {
+            for loc in writes.iter().map(|w| w.site.location) {
                 writeln!(f, "\t\t{loc:?}")?;
             }
         }
@@ -197,9 +189,7 @@ impl std::fmt::Debug for UnionInstanceUses {
 
 impl std::fmt::Debug for UnionInstanceMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut instances = self.instances.iter().collect::<Vec<_>>();
-        instances.sort_by_key(|(instance, _)| instance.root.index());
-        for (instance, uses) in instances {
+        for (instance, uses) in &self.instances {
             writeln!(
                 f,
                 "\tInstance L{}..=L{}:",
@@ -217,9 +207,7 @@ impl std::fmt::Debug for UnionInstanceMap {
 
 impl std::fmt::Debug for UnionUseResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut entries = self.uses.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|(def_id, _)| format!("{def_id:?}"));
-        for (union_ty, type_uses) in entries {
+        for (union_ty, type_uses) in &self.uses {
             writeln!(f, "UnionType {union_ty:?}:")?;
             let ty_uses_str = format!("{type_uses:?}");
             for line in ty_uses_str.lines() {
@@ -699,8 +687,8 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             }
         }
 
-        next.sort_by_key(|n| (n.index.index(), n.prefix));
-        next.dedup();
+        let mut seen = FxHashSet::default();
+        next.retain(|n| seen.insert(*n));
         next
     }
 
@@ -729,9 +717,13 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             }
         }
 
-        let mut out: Vec<_> = frontier.into_iter().map(|n| n.index).collect();
-        out.sort_by_key(|l| l.index());
-        out.dedup();
+        let mut out = Vec::new();
+        let mut seen = FxHashSet::default();
+        for loc in frontier.into_iter().map(|n| n.index) {
+            if seen.insert(loc) {
+                out.push(loc);
+            }
+        }
         out
     }
 
@@ -750,8 +742,8 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             }
         }
 
-        out.sort_by_key(|i| i.root.index());
-        out.dedup();
+        let mut seen = FxHashSet::default();
+        out.retain(|i| seen.insert(*i));
         out
     }
 
