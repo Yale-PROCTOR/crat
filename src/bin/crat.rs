@@ -9,7 +9,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use passes::*;
 use serde::Deserialize;
-use utils::compilation::{run_compiler_on_path, run_compiler_on_str};
+use utils::compilation::run_compiler_on_path;
 
 #[derive(Parser)]
 #[command(version)]
@@ -504,19 +504,28 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
             }
             Pass::UnionUse => {
-                let s = run_compiler_on_path(&file, |tcx| {
+                let had_bytemuck = union_replacer::union_use::utils::has_bytemuck(&dir);
+
+                let mut res = run_compiler_on_path(&file, |tcx| {
                     union_replacer::union_use::replace_unions(tcx, config.verbose)
                 })
                 .unwrap();
-                let out = if s.contains("extern crate bytemuck as __crat_bytemuck;") {
-                    run_compiler_on_str(&s, |tcx| {
+
+                if !had_bytemuck && res.needs_bytemuck {
+                    // add bytemuck dependency and rerun the pass
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                    res = utils::compilation::run_compiler_on_str(&res.code, |tcx| {
                         union_replacer::union_use::replace_unions(tcx, config.verbose)
                     })
-                    .unwrap()
-                } else {
-                    s
-                };
-                std::fs::write(&file, out).unwrap();
+                    .unwrap();
+                }
+
+                if !had_bytemuck && !res.needs_bytemuck {
+                    // remove the dependency if it is not needed
+                    union_replacer::union_use::utils::remove_bytemuck(&dir);
+                }
+
+                std::fs::write(&file, res.code).unwrap();
             }
             Pass::Io => {
                 let res =

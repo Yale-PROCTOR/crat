@@ -1,10 +1,81 @@
+use std::{fs, path::Path};
+
 use points_to::andersen;
+use rustc_hash::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{Body, Local, StatementKind, TerminatorKind},
     ty::TyCtxt,
 };
 use rustc_span::def_id::{DefId, LocalDefId};
+
+use super::raw_struct::{FieldTypeClass, UnionFieldClassification};
+
+pub fn has_bytemuck(project_dir: &Path) -> bool {
+    let cargo_toml = project_dir.join("Cargo.toml");
+    let Ok(content) = fs::read_to_string(cargo_toml) else {
+        return false;
+    };
+    let mut in_dependencies = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_dependencies = trimmed == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((dep_name, _)) = trimmed.split_once('=')
+            && dep_name.trim() == "bytemuck"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn needs_bytemuck<'tcx>(
+    overlapping_tys: &[LocalDefId],
+    union_field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
+) -> bool {
+    overlapping_tys.iter().any(|union_ty| {
+        union_field_classes
+            .get(union_ty)
+            .is_some_and(|fields| fields.iter().any(|f| f.class != FieldTypeClass::Other))
+    })
+}
+
+pub fn remove_bytemuck(project_dir: &Path) {
+    let cargo_toml = project_dir.join("Cargo.toml");
+
+    if let Ok(content) = fs::read_to_string(&cargo_toml) {
+        let mut in_dependencies = false;
+        let mut changed = false;
+        let mut out = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_dependencies = trimmed == "[dependencies]";
+                out.push(line);
+                continue;
+            }
+            if in_dependencies
+                && !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && let Some((dep_name, _)) = trimmed.split_once('=')
+                && dep_name.trim() == "bytemuck"
+            {
+                changed = true;
+                continue;
+            }
+            out.push(line);
+        }
+        if changed {
+            fs::write(cargo_toml, format!("{}\n", out.join("\n"))).unwrap();
+        }
+    }
+}
 
 pub fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
     tcx: TyCtxt<'tcx>,

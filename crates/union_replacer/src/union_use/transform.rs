@@ -8,31 +8,38 @@ use super::{
     analysis::analyze,
     callgraph::{build_union_call_contexts, collect_union_seed_functions},
     raw_struct::{
-        RawStructVisitor, UnionUseRewriteVisitor, classify_union_field_types,
-        has_visible_bytemuck_traits,
+        RawStructVisitor, UnionUseRewriteVisitor, classify_union_field_types, has_bytemuck_traits,
     },
     reverse_cfg::{analyze_reaching_writes, detect_overlapping_types},
     ty_visit::{collect_local_union_types, collect_union_related_types},
+    utils::needs_bytemuck,
 };
 
-pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
+#[derive(Debug)]
+pub struct TransformationResult {
+    pub code: String,
+    pub needs_bytemuck: bool,
+}
+
+pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
 
-    // TODO: bytemuck dependency should be added only if there is an overlapping union
-    let missing_all_bytemuck_traits = !has_visible_bytemuck_traits(tcx);
-    if missing_all_bytemuck_traits && !has_analysis_bytemuck_extern(&krate) {
+    // bytemuck trait visibility is needed for field classification
+    if !has_bytemuck_traits(tcx) {
+        println!("bytemuck traits are not visible in current tcx;");
+        println!("add bytemuck dependency and rerun this pass once.");
         krate.items.insert(
             0,
             P(utils::item!(
                 "extern crate bytemuck as {};",
-                ANALYSIS_BYTEMUCK_ALIAS
+                ANALYSIS_BYTEMUCK
             )),
         );
-        println!(
-            "bytemuck traits are not visible in current tcx; injected analysis extern crate. rerun this pass once."
-        );
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-        return pprust::crate_to_string_for_macros(&krate);
+        return TransformationResult {
+            code: pprust::crate_to_string_for_macros(&krate),
+            needs_bytemuck: true,
+        };
     }
 
     // for debug
@@ -64,11 +71,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     let reaching_writes =
         analyze_reaching_writes(tcx, &union_uses, &call_contexts, use_optimized_mir);
     let overlapping_tys = detect_overlapping_types(tcx, &union_uses, &reaching_writes, verbose);
-    let mut overlapping_local_union_tys = overlapping_tys
-        .iter()
-        .filter_map(|def_id| def_id.as_local())
-        .collect::<Vec<_>>();
-    overlapping_local_union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
+    let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
     if !overlapping_tys.is_empty() {
         println!("\noverlapping:");
@@ -79,17 +82,16 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
         println!("\nno overlapping unions detected");
     }
 
+    // transform the AST
     let ast_to_hir: AstToHir = utils::ast::make_ast_to_hir(&mut krate, tcx);
 
-    let mut raw_struct_visitor =
-        RawStructVisitor::new(tcx, &overlapping_local_union_tys, union_field_classes);
+    // Step 1: replace unions with raw structs
+    let mut raw_struct_visitor = RawStructVisitor::new(tcx, &overlapping_tys, union_field_classes);
     raw_struct_visitor.visit_crate(&mut krate);
-    println!("Step 1: replaced unions with raw structs");
 
-    let mut use_visitor =
-        UnionUseRewriteVisitor::new(tcx, ast_to_hir, &overlapping_local_union_tys);
+    // Step 2: update union uses
+    let mut use_visitor = UnionUseRewriteVisitor::new(tcx, ast_to_hir, &overlapping_tys);
     use_visitor.visit_crate(&mut krate);
-    println!("Step 2: updated union uses");
 
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
     remove_analysis_bytemuck_extern(&mut krate);
@@ -98,21 +100,17 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> String {
     if true {
         println!("\n{str}");
     }
-    str
+
+    TransformationResult {
+        code: str,
+        needs_bytemuck,
+    }
 }
 
-const ANALYSIS_BYTEMUCK_ALIAS: &str = "__crat_bytemuck";
-
-fn has_analysis_bytemuck_extern(krate: &rustc_ast::Crate) -> bool {
-    let alias = Symbol::intern(ANALYSIS_BYTEMUCK_ALIAS);
-    krate.items.iter().any(|item| match item.kind {
-        ItemKind::ExternCrate(_, ident) => ident.name == alias,
-        _ => false,
-    })
-}
+const ANALYSIS_BYTEMUCK: &str = "__crat_bytemuck";
 
 fn remove_analysis_bytemuck_extern(krate: &mut rustc_ast::Crate) {
-    let alias = Symbol::intern(ANALYSIS_BYTEMUCK_ALIAS);
+    let alias = Symbol::intern(ANALYSIS_BYTEMUCK);
     krate.items.retain(|item| match item.kind {
         ItemKind::ExternCrate(_, ident) => ident.name != alias,
         _ => true,

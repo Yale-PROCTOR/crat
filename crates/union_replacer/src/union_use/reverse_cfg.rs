@@ -85,10 +85,10 @@ pub fn detect_overlapping_types<'tcx>(
     union_uses: &UnionUseResult,
     analysis: &ReverseCfgResult,
     verbose: bool,
-) -> Vec<DefId> {
+) -> Vec<LocalDefId> {
     let mut union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
     union_tys.sort_by_key(|def_id| tcx.def_path_str(*def_id));
-    let mut overlapping_tys = Vec::new();
+    let mut overlapping_tys: Vec<LocalDefId> = Vec::new();
 
     if verbose {
         println!("\nReaching Writes:");
@@ -186,8 +186,8 @@ pub fn detect_overlapping_types<'tcx>(
             }
         }
 
-        if is_overlapping {
-            overlapping_tys.push(union_ty);
+        if is_overlapping && let Some(local) = union_ty.as_local() {
+            overlapping_tys.push(local);
         }
     }
 

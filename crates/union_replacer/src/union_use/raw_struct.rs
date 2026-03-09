@@ -32,7 +32,7 @@ struct BytemuckTraitIds {
     pod: Option<DefId>,
 }
 
-pub fn has_visible_bytemuck_traits(tcx: TyCtxt<'_>) -> bool {
+pub fn has_bytemuck_traits(tcx: TyCtxt<'_>) -> bool {
     let trait_ids = resolve_bytemuck_trait_ids(tcx);
     trait_ids.pod.is_some() || trait_ids.any_bit_pattern.is_some() || trait_ids.no_uninit.is_some()
 }
@@ -227,7 +227,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
                     format!(
                         "{{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }}"
                     ),
-                    "{{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }}".to_string()
+                    "{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }".to_string()
                 ),
                 FieldTypeClass::AnyBitPattern => (
                     format!(
@@ -245,7 +245,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
                     ),
                     format!("{{ unsafe {{ &*(self.raw.as_ptr() as *const {ty_s}) }} }}"),
                     format!("{{ unsafe {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} }}"),
-                    "{{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }}".to_string()
+                    "{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }".to_string()
                 ),
                 FieldTypeClass::Other => (
                     format!(
