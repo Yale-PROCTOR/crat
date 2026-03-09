@@ -759,6 +759,328 @@ pub unsafe fn save_global() {
 }
 
 #[test]
+fn test_rewriter_admits_local_scalar_temp_malloc_free_shape_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn strlen(s: *const core::ffi::c_char) -> usize;
+    fn puts(s: *const core::ffi::c_char) -> core::ffi::c_int;
+}
+
+pub unsafe fn helper(out: *mut core::ffi::c_char) -> i32 {
+    let len: usize = strlen(out).wrapping_add(5);
+    let buf: *mut core::ffi::c_char = malloc(len) as *mut core::ffi::c_char;
+    if buf.is_null() {
+        return -1;
+    }
+    puts(buf);
+    free(buf as *mut core::ffi::c_void);
+    0
+}
+
+pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
+    helper(out)
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &["malloc(len)", "free(buf as *mut core::ffi::c_void);"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_field_read_size_source_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub len: usize,
+}
+
+pub unsafe fn helper(state: State) -> i32 {
+    let len: usize = state.len;
+    let buf: *mut core::ffi::c_char = malloc(len) as *mut core::ffi::c_char;
+    if buf.is_null() {
+        return -1;
+    }
+    free(buf as *mut core::ffi::c_void);
+    0
+}
+
+pub unsafe fn caller(state: State) -> i32 {
+    helper(state)
+}
+"#,
+        &["malloc(len)", "free(buf as *mut core::ffi::c_void);"],
+        &["Box::leak(", "Box::from_raw(", "slice_from_raw_parts_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_deref_read_size_source_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn helper(n: *const usize) -> i32 {
+    let len: usize = *n;
+    let buf: *mut core::ffi::c_char = malloc(len) as *mut core::ffi::c_char;
+    if buf.is_null() {
+        return -1;
+    }
+    free(buf as *mut core::ffi::c_void);
+    0
+}
+
+pub unsafe fn caller(n: *const usize) -> i32 {
+    helper(n)
+}
+"#,
+        &["malloc(len)", "free(buf as *mut core::ffi::c_void);"],
+        &["Box::leak(", "Box::from_raw(", "slice_from_raw_parts_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_borrow_only_local_callee_for_raw_bridge_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+unsafe fn touch(state: *mut State) -> i32 {
+    (*state).value = 7;
+    (*state).value
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    let result = touch(s);
+    free(s as *mut core::ffi::c_void);
+    result
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(s as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_callee_pointer_alias_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+unsafe fn touch_with_alias(state: *mut State) -> i32 {
+    let alias = state;
+    (*alias).value = 7;
+    (*alias).value
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    let result = touch_with_alias(s);
+    free(s as *mut core::ffi::c_void);
+    result
+}
+"#,
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(s as *mut core::ffi::c_void);",
+        ],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_callee_pointer_return_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+unsafe fn echo(state: *mut State) -> *mut State {
+    state
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    let result = echo(s);
+    free(result as *mut core::ffi::c_void);
+    0
+}
+"#,
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(result as *mut core::ffi::c_void);",
+        ],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_callee_pointer_free_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+unsafe fn consume(state: *mut State) {
+    free(state as *mut core::ffi::c_void);
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    consume(s);
+    0
+}
+"#,
+        &["calloc(1, std::mem::size_of::<State>())"],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_callee_pointer_global_store_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+static mut SLOT: *mut State = std::ptr::null_mut();
+
+unsafe fn stash(state: *mut State) {
+    SLOT = state;
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    stash(s);
+    free(s as *mut core::ffi::c_void);
+    0
+}
+"#,
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(s as *mut core::ffi::c_void);",
+        ],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_cjson_style_local_field_storage_raw_in_m10() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct PrintBuf {
+    pub buffer: *mut State,
+    pub length: usize,
+}
+
+unsafe fn print_preallocated_like(buffer: *mut State, length: usize) -> i32 {
+    let mut p = PrintBuf {
+        buffer: std::ptr::null_mut::<State>(),
+        length: 0,
+    };
+    p.buffer = buffer;
+    p.length = length;
+    if p.buffer.is_null() {
+        0
+    } else {
+        1
+    }
+}
+
+pub unsafe fn helper() -> i32 {
+    let s: *mut State = calloc(1, std::mem::size_of::<State>()) as *mut State;
+    if s.is_null() {
+        return -1;
+    }
+    let result = print_preallocated_like(s, 1);
+    free(s as *mut core::ffi::c_void);
+    result
+}
+"#,
+        &["calloc(1, std::mem::size_of::<State>())"],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
 fn test_rewriter_keeps_owner_struct_field_frees_raw_in_m7() {
     run_test(
         r#"

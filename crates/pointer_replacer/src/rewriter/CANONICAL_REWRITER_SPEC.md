@@ -225,6 +225,9 @@ Practical result for function-pointer-used functions:
     - tracked candidates are direct local bindings (or direct local wrapper-call results) whose writes stay outermost-local and whose deallocation stays on the same local path
     - exact scalar roots rewrite to `Box::into_raw(Box::new(default_value_expr))`
     - supported array roots rewrite to leaked boxed-slice storage via `Box::leak(...into_boxed_slice()).as_{mut,}ptr()`
+    - local raw-bridge admission now accepts bounded scalar-temp size/count DAGs in the current body for non-exact `malloc` / `calloc` / `realloc(null_like, ...)` roots
+      - allowed scalar sources include params, scalar locals defined earlier in the same body, casts/drop-temps, integer arithmetic, `wrapping_*` arithmetic methods, and size-query calls such as `strlen(...)`
+      - rejected scalar sources include field reads, projection/index reads, raw dereference reads, address-of, globals/statics, and nested-pointer expressions
     - `default_value_expr` now recurses through local structs and array fields, using `std::array::from_fn(...)` instead of `<[T; N] as Default>::default()` for array members
     - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
@@ -242,6 +245,17 @@ Practical result for function-pointer-used functions:
 - Function calls (`ExprKind::Call`)
   - If direct local callee path, use `sig_decs` parameter decisions for each arg.
   - Otherwise fallback per-arg to `Raw(get_mutability_decision(..) or type mutability)`.
+  - During raw-bridge candidate collection, a tracked local passed to a local callee is no longer disqualified unconditionally.
+    - The candidate survives only when the exact matching local-callee raw-pointer parameter is proven `BorrowOnly`.
+    - `BorrowOnly` permits transient pointee reads/writes, pointer arithmetic, and calls into other local `BorrowOnly` params.
+    - Anything inconclusive defaults to `Escapes`, which preserves the previous disqualification behavior.
+    - `Escapes` includes:
+      - storing the pointer value
+      - returning it
+      - freeing it
+      - writing it into a field / projection / container / global
+      - passing it to foreign callees
+      - passing it to local callees whose matching parameter is not proven `BorrowOnly`
   - Direct `free`-like calls whose single argument is a tracked raw-bridge local (optionally wrapped in one cast layer) are rewritten to a null-guarded drop:
     - scalar locals use `drop(Box::from_raw(...))`
     - array locals use `drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(...)))`
@@ -375,6 +389,9 @@ If no local-path kind match applies:
   - exact scalar roots -> `Box::into_raw(Box::new(default_value_expr))`
   - supported array roots -> leaked boxed slices with tracked length expressions
   - direct local allocator wrappers (`alloc`/`calloc`/`realloc`-style wrappers returning one outermost local) participate when their call arguments preserve the same raw-bridge shape
+  - for the direct local raw-bridge path, allocator byte/count expressions may now come from bounded wrapper-local scalar temp DAGs
+  - tracked raw locals may also survive local helper calls when the matching local callee raw-pointer parameter is proven `BorrowOnly`
+  - local aggregate-field-storage helpers remain excluded from this relaxation; a `cJSON_PrintPreallocated`-style `p.buffer = buffer` write still classifies that parameter as `Escapes`
   - wrapper eligibility is structural:
     - the wrapper allocates one principal outermost local
     - the same local is ultimately returned or freed
@@ -438,6 +455,7 @@ If no local-path kind match applies:
   - direct `free(local[_cast])` and supported local free-wrapper calls are rewritten to null-guarded `drop(Box::from_raw(...))` / `drop(Box::from_raw(slice_from_raw_parts_mut(...)))`
   - simple local allocator-wrapper calls participate when the wrapper body still preserves a direct outermost-local allocator-root shape
   - M9 generalizes that wrapper path to structural local helpers that allocate one principal outermost local, optionally null-check/mutate it, and then return or free that same local without allowing it to escape through params, globals, or indirect container writes
+  - M10 slice 1 adds bounded scalar-temp size/count DAG support for that direct local raw-bridge path only; omni-style branch-return `*mut c_void` factories and other caller-side ambiguous deallocation shapes remain unchanged
   - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
 - Scalar `OptBox` allocator roots are intentionally narrower in M4B:
   - only exact `size_of::<T>()` scalar roots stay eligible
@@ -534,6 +552,15 @@ If no local-path kind match applies:
     - `test_rewriter_generalizes_wrapper_with_internal_free_after_foreign_use`
     - `test_rewriter_keeps_wrapper_escape_through_parameter_raw_in_m9`
     - `test_rewriter_keeps_wrapper_escape_through_global_raw_in_m9`
+    - `test_rewriter_admits_local_scalar_temp_malloc_free_shape_in_m10`
+    - `test_rewriter_keeps_field_read_size_source_raw_in_m10`
+    - `test_rewriter_keeps_deref_read_size_source_raw_in_m10`
+    - `test_rewriter_allows_borrow_only_local_callee_for_raw_bridge_in_m10`
+    - `test_rewriter_keeps_local_callee_pointer_alias_raw_in_m10`
+    - `test_rewriter_keeps_local_callee_pointer_return_raw_in_m10`
+    - `test_rewriter_keeps_local_callee_pointer_free_raw_in_m10`
+    - `test_rewriter_keeps_local_callee_pointer_global_store_raw_in_m10`
+    - `test_rewriter_keeps_cjson_style_local_field_storage_raw_in_m10`
     - `test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed`
     - `test_rewriter_keeps_owner_struct_field_frees_raw_in_m7`
     - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
