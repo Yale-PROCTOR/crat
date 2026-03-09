@@ -32,11 +32,6 @@ struct BytemuckTraitIds {
     pod: Option<DefId>,
 }
 
-pub fn has_bytemuck_traits(tcx: TyCtxt<'_>) -> bool {
-    let trait_ids = resolve_bytemuck_trait_ids(tcx);
-    trait_ids.pod.is_some() || trait_ids.any_bit_pattern.is_some() || trait_ids.no_uninit.is_some()
-}
-
 /// Classify each local union field type into one of:
 /// `AnyBitPattern` / `NoUninit` / `Pod` / `Other`.
 pub fn classify_union_field_types<'tcx>(
@@ -124,17 +119,9 @@ fn classify_field_type<'tcx>(
     FieldTypeClass::Other
 }
 
-fn ty_implements_trait<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    owner: LocalDefId,
-    ty: Ty<'tcx>,
-    trait_def_id: DefId,
-) -> bool {
-    let param_env = tcx.param_env(owner);
-    let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
-    infcx
-        .type_implements_trait(trait_def_id, [ty], param_env)
-        .must_apply_modulo_regions()
+pub fn has_bytemuck_traits(tcx: TyCtxt<'_>) -> bool {
+    let trait_ids = resolve_bytemuck_trait_ids(tcx);
+    trait_ids.pod.is_some() || trait_ids.any_bit_pattern.is_some() || trait_ids.no_uninit.is_some()
 }
 
 fn resolve_bytemuck_trait_ids(tcx: TyCtxt<'_>) -> BytemuckTraitIds {
@@ -155,6 +142,19 @@ fn resolve_bytemuck_trait_ids(tcx: TyCtxt<'_>) -> BytemuckTraitIds {
         }
     }
     trait_ids
+}
+
+fn ty_implements_trait<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    ty: Ty<'tcx>,
+    trait_def_id: DefId,
+) -> bool {
+    let param_env = tcx.param_env(owner);
+    let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
+    infcx
+        .type_implements_trait(trait_def_id, [ty], param_env)
+        .must_apply_modulo_regions()
 }
 
 pub struct RawStructVisitor<'tcx> {

@@ -1,7 +1,6 @@
-use rustc_ast::{ItemKind, mut_visit::MutVisitor, ptr::P};
+use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::Symbol;
 use utils::ir::AstToHir;
 
 use super::{
@@ -28,13 +27,6 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     if !has_bytemuck_traits(tcx) {
         println!("bytemuck traits are not visible in current tcx;");
         println!("add bytemuck dependency and rerun this pass once.");
-        krate.items.insert(
-            0,
-            P(utils::item!(
-                "extern crate bytemuck as {};",
-                ANALYSIS_BYTEMUCK
-            )),
-        );
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         return TransformationResult {
             code: pprust::crate_to_string_for_macros(&krate),
@@ -94,10 +86,9 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     use_visitor.visit_crate(&mut krate);
 
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-    remove_analysis_bytemuck_extern(&mut krate);
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    if true {
+    if false {
         println!("\n{str}");
     }
 
@@ -105,14 +96,4 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         code: str,
         needs_bytemuck,
     }
-}
-
-const ANALYSIS_BYTEMUCK: &str = "__crat_bytemuck";
-
-fn remove_analysis_bytemuck_extern(krate: &mut rustc_ast::Crate) {
-    let alias = Symbol::intern(ANALYSIS_BYTEMUCK);
-    krate.items.retain(|item| match item.kind {
-        ItemKind::ExternCrate(_, ident) => ident.name != alias,
-        _ => true,
-    });
 }

@@ -77,6 +77,34 @@ pub fn remove_bytemuck(project_dir: &Path) {
     }
 }
 
+pub fn inject_bytemuck(file: &Path) {
+    let alias = "extern crate bytemuck as __crat_bytemuck;";
+    let Ok(code) = fs::read_to_string(file) else {
+        return;
+    };
+
+    // Remove stale alias line first.
+    let code = code
+        .lines()
+        .filter(|line| line.trim() != alias)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut lines = code.lines().map(str::to_string).collect::<Vec<_>>();
+
+    // Keep crate-level inner attrs at top.
+    let mut insert_at = 0usize;
+    while insert_at < lines.len() {
+        let t = lines[insert_at].trim();
+        if t.starts_with("#![") || t.is_empty() {
+            insert_at += 1;
+        } else {
+            break;
+        }
+    }
+    lines.insert(insert_at, alias.to_string());
+    fs::write(file, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
 pub fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,

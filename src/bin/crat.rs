@@ -512,9 +512,9 @@ fn main() {
                 .unwrap();
 
                 if !had_bytemuck && res.needs_bytemuck {
-                    // add bytemuck dependency and rerun the pass
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
-                    res = utils::compilation::run_compiler_on_str(&res.code, |tcx| {
+                    union_replacer::union_use::utils::inject_bytemuck(&file);
+                    res = run_compiler_on_path(&file, |tcx| {
                         union_replacer::union_use::replace_unions(tcx, config.verbose)
                     })
                     .unwrap();
