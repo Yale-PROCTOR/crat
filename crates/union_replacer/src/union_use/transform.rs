@@ -25,8 +25,10 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
 
     // bytemuck trait visibility is needed for field classification
     if !has_bytemuck_traits(tcx) {
-        println!("bytemuck traits are not visible in current tcx;");
-        println!("add bytemuck dependency and rerun this pass once.");
+        if verbose {
+            println!("bytemuck traits are not visible in current tcx;");
+            println!("add bytemuck dependency and rerun this pass once.");
+        }
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         return TransformationResult {
             code: pprust::crate_to_string_for_macros(&krate),
@@ -40,7 +42,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
 
     // collect union types and build call graphs
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
-    let union_field_classes = classify_union_field_types(tcx, &union_tys, true);
+    let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose);
     let related_types_map = collect_union_related_types(&tcx, &union_tys, &ty_visitor, verbose);
     let seed_functions = collect_union_seed_functions(tcx, &union_tys, verbose);
     let call_contexts = build_union_call_contexts(
@@ -65,13 +67,15 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     let overlapping_tys = detect_overlapping_types(tcx, &union_uses, &reaching_writes, verbose);
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
-    if !overlapping_tys.is_empty() {
-        println!("\noverlapping:");
-        for union_ty in &overlapping_tys {
-            println!("{}", tcx.def_path_str(*union_ty));
+    if true {
+        if !overlapping_tys.is_empty() {
+            println!("\noverlapping:");
+            for union_ty in &overlapping_tys {
+                println!("{}", tcx.def_path_str(*union_ty));
+            }
+        } else {
+            println!("\noverlapping: none");
         }
-    } else {
-        println!("\nno overlapping unions detected");
     }
 
     // transform the AST
@@ -88,7 +92,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    if false {
+    if verbose {
         println!("\n{str}");
     }
 
