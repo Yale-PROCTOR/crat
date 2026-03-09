@@ -596,6 +596,11 @@ If no local-path kind match applies:
   - failure messages include the B02 case name plus the rewritten source text
   - a direct census regression also rewrites all 86 case sources from disk and counts emitted `malloc(` / `calloc(` / `free(` tokens
   - a second inspection-only classifier pass scans the rewritten output for remaining `malloc(` / `calloc(` call sites and records future-work metadata for each site
+  - M11 extends that inspection pass with a second-stage implementation-oriented landscape report:
+    - wrapper-body allocator sites are split into wrapper subshapes
+    - remaining `free(` calls are split into teardown shapes
+    - allocator and teardown shapes are tagged with policy status
+    - allocator shapes are also tagged with whether they are blocked mainly by allocation shape, deallocation shape, or both
   - focused classifier regressions cover:
     - `classifier_direct_local_binding_maps_to_outermost_extension`
     - `classifier_field_target_maps_to_struct_field_scope`
@@ -606,6 +611,15 @@ If no local-path kind match applies:
     - `classifier_fallback_uses_manual_followup`
     - `classifier_deduplicates_capabilities_and_respects_primary_precedence`
     - `classifier_normalizes_and_truncates_statement_snippet`
+    - `classifier_wrapper_transient_local_helper_use_is_admissible`
+    - `classifier_wrapper_local_aggregate_field_storage_is_blocked_struct_field_scope`
+    - `classifier_wrapper_branch_return_opaque_type_maps_to_deallocation_blocker`
+    - `classifier_wrapper_alias_escape_is_not_worth_targeting_yet`
+    - `classifier_free_direct_local_free_is_admissible`
+    - `classifier_free_field_owned_teardown_is_blocked_struct_field_scope`
+    - `classifier_free_recursive_tree_list_teardown_is_blocked_free_shape`
+    - `classifier_free_matrix_row_teardown_is_blocked_free_shape`
+    - `classifier_free_helper_destructor_cleanup_is_blocked_free_shape`
     - `remaining_allocator_site_classification_is_complete`
     - `m9_wrapper_generalization_reduction_vs_verified_baseline`
 - Current consequence:
@@ -615,12 +629,12 @@ If no local-path kind match applies:
     - `remaining_malloc_sites=64`
     - `remaining_calloc_sites=13`
     - `primary_unlock_wrapper_generalization=46`
-  - the current post-M9 classifier totals are:
-    - `remaining_malloc_sites=54`
-    - `remaining_calloc_sites=11`
-    - `primary_unlock_wrapper_generalization=36`
-  - the direct token census also improved under M9, from the post-M8 `malloc=101`, `calloc=27`, `free=270` totals to the current `malloc=91`, `calloc=24`, `free=267`
-  - M8 remains planning metadata only; M9 reduces wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
+  - the current post-M10 classifier totals are:
+    - `remaining_malloc_sites=53`
+    - `remaining_calloc_sites=7`
+    - `primary_unlock_wrapper_generalization=33`
+  - the direct token census currently reads `malloc=90`, `calloc=20`, `free=258`
+  - M8 remains planning metadata only; M9 and M10 reduced wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
   - per-site fields:
     - `case_name`
@@ -628,8 +642,11 @@ If no local-path kind match applies:
     - `callee_kind` (`malloc` or `calloc`)
     - `statement_snippet`
     - `shape_bucket`
+    - `wrapper_subshape` (wrapper-body sites only)
     - `required_capabilities`
     - `primary_unlock`
+    - `policy_status`
+    - `blocking_axis`
     - `has_adjacent_realloc_context`
     - `has_adjacent_free_context`
   - shape buckets, in fixed priority order:
@@ -659,6 +676,33 @@ If no local-path kind match applies:
   - `has_adjacent_realloc_context = true` when the same function contains `realloc(`
   - `has_adjacent_free_context = true` when the same function contains `free(`
   - `statement_snippet` is normalized to single-space whitespace and truncated to at most 200 characters
+  - wrapper subshapes:
+    - `transient_local_helper_use`
+    - `local_aggregate_field_storage`
+    - `branch_return_opaque_typed_deallocation_recovery`
+    - `alias_escape_mediated`
+  - policy-status tags:
+    - `admissible_current_policy`
+    - `blocked_struct_field_scope`
+    - `blocked_dedicated_free_shape_reduction`
+    - `not_worth_targeting_yet`
+  - allocator blocking-axis tags:
+    - `allocation_shape`
+    - `deallocation_shape`
+    - `both_together`
+- Remaining `free(` classifier schema:
+  - per-site fields:
+    - `case_name`
+    - `function_name`
+    - `statement_snippet`
+    - `teardown_shape`
+    - `policy_status`
+  - teardown shapes:
+    - `direct_local_free`
+    - `field_owned_teardown`
+    - `recursive_tree_list_destruction`
+    - `matrix_row_element_teardown`
+    - `helper_destructor_mediated_cleanup`
 - Example M8 classification record:
   - `case_name: b02_list_push`
   - `function_name: push_node`
@@ -673,6 +717,11 @@ If no local-path kind match applies:
   - shape-bucket totals
   - capability totals
   - `primary_unlock` totals
+  - wrapper-subshape totals
+  - allocator policy-status totals
+  - allocator blocking-axis totals
+  - remaining `free(` totals by teardown shape
+  - `free(` policy-status totals
   - top unresolved cases by remaining `malloc` / `calloc` count
 
 ### 8.5 Standard commands used for validation
