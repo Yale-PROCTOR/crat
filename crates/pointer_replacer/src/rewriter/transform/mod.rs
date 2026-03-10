@@ -986,13 +986,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Deref(m), PtrKind::SliceCursor(_)) => {
                     self.slice_cursor.set(true);
                     let base = self.projected_expr(&pe, m, false);
-                    *ptr = self.cursor_from_slice_or_cursor_inner(
-                        &base,
-                        m,
-                        lhs_inner_ty,
-                        rhs_inner_ty,
-                        false,
-                    );
+                    *ptr = self.cursor_from_cursor(&base, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::SliceCursor(m);
                 }
                 (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Raw(m1)) => {
@@ -1013,7 +1007,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     self.slice_cursor.set(true);
                     let base = self.projected_expr(&pe, m, false);
                     let mut result =
-                        self.cursor_from_slice_or_cursor(&base, m, lhs_inner_ty, rhs_inner_ty);
+                        self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     if !m && m1 {
                         result =
                             utils::expr!("({}).to_ref_cursor()", pprust::expr_to_string(&result),);
@@ -1572,7 +1566,21 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
-    // slice -> Cursor
+    fn cursor_from_slice_or_cursor(
+        &self,
+        e: &Expr,
+        pe: &PtrExpr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        if is_plain_slice_expr(e) {
+            self.cursor_from_plain_slice(e, pe, m, lhs_inner_ty, rhs_inner_ty)
+        } else {
+            self.cursor_from_cursor(e, m, lhs_inner_ty, rhs_inner_ty)
+        }
+    }
+
     fn cursor_from_plain_slice(
         &self,
         e: &Expr,
@@ -1594,14 +1602,28 @@ impl<'tcx> TransformVisitor<'tcx> {
         } else {
             "crate::slice_cursor::SliceCursorRef"
         };
+
         if !need_cast {
             let reference = get_reference(pe.base_kind != PtrExprBaseKind::Alloca);
-            utils::expr!(
-                "{}::new({}{})",
-                cursor_ty,
-                reference,
-                pprust::expr_to_string(e),
-            )
+            if pe.projs.len() == 1
+                && let PtrExprProj::Offset(offset) = pe.projs[0]
+            {
+                // if there are only offsets, we can use the original slice and let the cursor handle the offsets
+                utils::expr!(
+                    "{}::with_pos({}{}, ({}) as usize)",
+                    cursor_ty,
+                    reference,
+                    pprust::expr_to_string(pe.base),
+                    pprust::expr_to_string(offset),
+                )
+            } else {
+                utils::expr!(
+                    "{}::new({}{})",
+                    cursor_ty,
+                    reference,
+                    pprust::expr_to_string(e),
+                )
+            }
         } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
             let reference = get_reference(pe.base_kind != PtrExprBaseKind::Alloca);
             self.bytemuck.set(true);
@@ -1626,29 +1648,12 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
-    fn cursor_from_slice_or_cursor(
+    fn cursor_from_cursor(
         &self,
         e: &Expr,
         m: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
-    ) -> Expr {
-        self.cursor_from_slice_or_cursor_inner(
-            e,
-            m,
-            lhs_inner_ty,
-            rhs_inner_ty,
-            is_plain_slice_expr(e),
-        )
-    }
-
-    fn cursor_from_slice_or_cursor_inner(
-        &self,
-        e: &Expr,
-        m: bool,
-        lhs_inner_ty: ty::Ty<'tcx>,
-        rhs_inner_ty: ty::Ty<'tcx>,
-        is_plain_slice: bool,
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cursor_ty = if m {
@@ -1658,28 +1663,6 @@ impl<'tcx> TransformVisitor<'tcx> {
         };
         if !need_cast {
             e.clone()
-        } else if is_plain_slice {
-            if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
-                self.bytemuck.set(true);
-                utils::expr!(
-                    "{}::new(bytemuck::cast_slice{}::<_, {}>({}{}))",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
-                    if m { "&mut *" } else { "&*" },
-                    pprust::expr_to_string(e),
-                )
-            } else {
-                utils::expr!(
-                    "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, ({}).len())",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    if m { "mut" } else { "const" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
-                    pprust::expr_to_string(e),
-                )
-            }
         } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
             self.bytemuck.set(true);
             utils::expr!(
@@ -2019,7 +2002,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                             e = self.plain_slice_from_slice(&e, pe, m, to_ty, from_ty);
                             is_plain_slice = true;
                         } else {
-                            e = self.cursor_from_slice_or_cursor(&e, m, to_ty, from_ty);
+                            e = self.cursor_from_slice_or_cursor(&e, pe, m, to_ty, from_ty);
                         }
                         from_ty = to_ty;
                     }
