@@ -103,6 +103,24 @@ fn lit_pos_is_safe() {
 }
 
 #[test]
+fn named_const_pos_is_safe() {
+    let map = run_analysis(
+        "
+        const SPX_OFFSET_LAYER: i32 = 3;
+
+        pub unsafe fn f(p: *const i32) {
+            let _ = *p.offset(SPX_OFFSET_LAYER as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(SPX_OFFSET_LAYER as isize) with SPX_OFFSET_LAYER=3 should be safe"
+    );
+}
+
+#[test]
 fn lit_zero_is_safe() {
     let map = run_analysis(
         "

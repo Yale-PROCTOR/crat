@@ -16,7 +16,7 @@ use rustc_middle::{
         self, Body, Local, Location, Operand, Place, Rvalue, StatementKind, TerminatorEdges,
         TerminatorKind, visit::Visitor as MVisitor,
     },
-    ty::{self, TyCtxt},
+    ty::{self, ScalarInt, Ty, TyCtxt},
 };
 use rustc_mir_dataflow::{
     Analysis, Forward, JoinSemiLattice, ResultsCursor, fmt::DebugWithContext,
@@ -453,7 +453,7 @@ impl<'tcx> Analysis<'tcx> for Signedness<'_, 'tcx> {
         _location: Location,
     ) {
         if let mir::StatementKind::Assign(box (place, rvalue)) = &statement.kind {
-            let val = eval_rvalue(rvalue, &state.0);
+            let val = eval_rvalue(rvalue, &state.0, self.tcx);
             let bound = abs_value_for_ty(self.local_tys[place.local]);
             let val = constrain_by_bound(val, bound);
 
@@ -529,21 +529,30 @@ fn collect_addr_takens<'tcx>(body: &Body<'tcx>) -> FxHashSet<Local> {
 
     locals
 }
+fn const_int_to_val(int_val: ScalarInt, ty: Ty) -> AbsValue {
+    let size = int_val.size();
+    let bits = int_val.to_bits(size);
+    if is_unsigned_ty(ty) {
+        abs_from_u128(bits)
+    } else {
+        let val = size.sign_extend(bits);
+        abs_from_i128(val)
+    }
+}
 
-fn eval_const_operand<'tcx>(c: &mir::ConstOperand<'tcx>) -> AbsValue {
+fn eval_constant_operand<'tcx>(c: &mir::ConstOperand<'tcx>, tcx: TyCtxt<'tcx>) -> AbsValue {
     if let Some(scalar) = c.const_.try_to_scalar()
         && let Ok(int_val) = scalar.try_to_scalar_int()
     {
         let ty = c.const_.ty();
-        let size = int_val.size();
-        let bits = int_val.to_bits(size);
-
-        if is_unsigned_ty(ty) {
-            abs_from_u128(bits)
-        } else {
-            let val = size.sign_extend(bits);
-            abs_from_i128(val)
-        }
+        const_int_to_val(int_val, ty)
+    } else if let mir::Const::Unevaluated(unevaluated, ty) = &c.const_
+        && unevaluated.promoted.is_none()
+        && let Ok(v) = tcx.const_eval_poly(unevaluated.def)
+        && let mir::ConstValue::Scalar(scalar) = v
+        && let Ok(int_val) = scalar.try_to_scalar_int()
+    {
+        const_int_to_val(int_val, *ty)
     } else {
         AbsValue::Top
     }
@@ -582,7 +591,11 @@ fn cast_to_signed(v: AbsValue) -> AbsValue {
     }
 }
 
-fn eval_operand<'tcx>(op: &Operand<'tcx>, state: &IndexVec<Local, AbsValue>) -> AbsValue {
+fn eval_operand<'tcx>(
+    op: &Operand<'tcx>,
+    state: &IndexVec<Local, AbsValue>,
+    tcx: TyCtxt<'tcx>,
+) -> AbsValue {
     match op {
         Operand::Copy(place) | Operand::Move(place) => {
             if contains_deref(place) {
@@ -591,18 +604,22 @@ fn eval_operand<'tcx>(op: &Operand<'tcx>, state: &IndexVec<Local, AbsValue>) -> 
                 state[place.local]
             }
         }
-        Operand::Constant(c) => eval_const_operand(c),
+        Operand::Constant(c) => eval_constant_operand(c, tcx),
     }
 }
 
-fn eval_rvalue<'tcx>(rvalue: &Rvalue<'tcx>, state: &IndexVec<Local, AbsValue>) -> AbsValue {
+fn eval_rvalue<'tcx>(
+    rvalue: &Rvalue<'tcx>,
+    state: &IndexVec<Local, AbsValue>,
+    tcx: TyCtxt<'tcx>,
+) -> AbsValue {
     use AbsValue::*;
     match rvalue {
-        Rvalue::Use(op) => eval_operand(op, state),
-        Rvalue::UnaryOp(mir::UnOp::Neg, op) => eval_operand(op, state).neg(),
+        Rvalue::Use(op) => eval_operand(op, state, tcx),
+        Rvalue::UnaryOp(mir::UnOp::Neg, op) => eval_operand(op, state, tcx).neg(),
         Rvalue::BinaryOp(op, box (lhs, rhs)) => {
-            let l = eval_operand(lhs, state);
-            let r = eval_operand(rhs, state);
+            let l = eval_operand(lhs, state, tcx);
+            let r = eval_operand(rhs, state, tcx);
             match op {
                 mir::BinOp::Add => l.add(&r),
                 mir::BinOp::Sub => l.sub(&r),
@@ -623,7 +640,7 @@ fn eval_rvalue<'tcx>(rvalue: &Rvalue<'tcx>, state: &IndexVec<Local, AbsValue>) -
         }
         // preserve concrete constants through casts when possible
         Rvalue::Cast(_, op, ty) => {
-            let v = eval_operand(op, state);
+            let v = eval_operand(op, state, tcx);
             if is_unsigned_ty(*ty) {
                 cast_to_unsigned(v)
             } else {
@@ -633,7 +650,7 @@ fn eval_rvalue<'tcx>(rvalue: &Rvalue<'tcx>, state: &IndexVec<Local, AbsValue>) -
         Rvalue::Aggregate(_, ops) => {
             let mut res = Bottom;
             for op in ops {
-                res.join(&eval_operand(op, state));
+                res.join(&eval_operand(op, state, tcx));
             }
             res
         }
@@ -666,7 +683,7 @@ fn eval_integer_terminator_call<'tcx>(
 
     let unary = |f: fn(&AbsValue) -> AbsValue| {
         args.first().map(|a| {
-            let v = eval_operand(&a.node, state);
+            let v = eval_operand(&a.node, state, tcx);
             f(&v)
         })
     };
@@ -674,8 +691,8 @@ fn eval_integer_terminator_call<'tcx>(
         if args.len() < 2 {
             return None;
         }
-        let l = eval_operand(&args[0].node, state);
-        let r = eval_operand(&args[1].node, state);
+        let l = eval_operand(&args[0].node, state, tcx);
+        let r = eval_operand(&args[1].node, state, tcx);
         Some(f(&l, &r))
     };
 
@@ -775,7 +792,7 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                     if let Some(offset_arg) = args.get(1) {
                         self.cursor.seek_before_primary_effect(location);
                         let state = self.cursor.get();
-                        let offset_val = eval_operand(&offset_arg.node, &state.0);
+                        let offset_val = eval_operand(&offset_arg.node, &state.0, self.tcx);
                         if offset_val.needs_cursor() {
                             self.tainted.insert((self.def_id, place.local));
                         }
