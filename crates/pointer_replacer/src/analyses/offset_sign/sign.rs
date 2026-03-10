@@ -13,8 +13,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
-        self, Body, CallReturnPlaces, Local, Location, Operand, Place, Rvalue, StatementKind,
-        TerminatorEdges, TerminatorKind, visit::Visitor as MVisitor,
+        self, Body, Local, Location, Operand, Place, Rvalue, StatementKind, TerminatorEdges,
+        TerminatorKind, visit::Visitor as MVisitor,
     },
     ty::{self, TyCtxt},
 };
@@ -421,13 +421,15 @@ fn constrain_by_bound(v: AbsValue, bound: AbsValue) -> AbsValue {
 }
 
 /// forward MIR dataflow analysis that tracks the abstract sign of locals
-pub struct Signedness<'tcx> {
+pub struct Signedness<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     /// declared type for each local
     pub local_tys: IndexVec<Local, ty::Ty<'tcx>>,
+    /// locals whose address is taken via MIR references/raw pointers
+    pub addr_takens: &'a FxHashSet<Local>,
 }
 
-impl<'tcx> Analysis<'tcx> for Signedness<'tcx> {
+impl<'tcx> Analysis<'tcx> for Signedness<'_, 'tcx> {
     type Direction = Forward;
     type Domain = SignState;
 
@@ -454,7 +456,19 @@ impl<'tcx> Analysis<'tcx> for Signedness<'tcx> {
             let val = eval_rvalue(rvalue, &state.0);
             let bound = abs_value_for_ty(self.local_tys[place.local]);
             let val = constrain_by_bound(val, bound);
-            state.0[place.local].join(&val);
+
+            if contains_deref(place) {
+                for local in self.addr_takens.iter() {
+                    state.0[*local].join(&val);
+                }
+                return;
+            }
+
+            if place.projection.is_empty() {
+                state.0[place.local] = val;
+            } else {
+                state.0[place.local].join(&val);
+            }
         }
     }
 
@@ -480,14 +494,6 @@ impl<'tcx> Analysis<'tcx> for Signedness<'tcx> {
         }
         terminator.edges()
     }
-
-    fn apply_call_return_effect(
-        &mut self,
-        _state: &mut Self::Domain,
-        _block: mir::BasicBlock,
-        _return_places: CallReturnPlaces<'_, 'tcx>,
-    ) {
-    }
 }
 
 /// helpers
@@ -502,9 +508,26 @@ fn is_integer_ty(ty: ty::Ty<'_>) -> bool {
 fn abs_value_for_ty(ty: ty::Ty<'_>) -> AbsValue {
     if is_unsigned_ty(ty) {
         AbsValue::NonNeg
-    } else {
+    } else if is_integer_ty(ty) {
         AbsValue::Top
+    } else {
+        AbsValue::Bottom
     }
+}
+
+fn collect_addr_takens<'tcx>(body: &Body<'tcx>) -> FxHashSet<Local> {
+    let mut locals = FxHashSet::default();
+
+    for statement in body.basic_blocks.iter().flat_map(|bb| bb.statements.iter()) {
+        if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place))) =
+            &statement.kind
+            && !contains_deref(place)
+        {
+            locals.insert(place.local);
+        }
+    }
+
+    locals
 }
 
 fn eval_const_operand<'tcx>(c: &mir::ConstOperand<'tcx>) -> AbsValue {
@@ -561,7 +584,13 @@ fn cast_to_signed(v: AbsValue) -> AbsValue {
 
 fn eval_operand<'tcx>(op: &Operand<'tcx>, state: &IndexVec<Local, AbsValue>) -> AbsValue {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => state[place.local],
+        Operand::Copy(place) | Operand::Move(place) => {
+            if contains_deref(place) {
+                AbsValue::Top
+            } else {
+                state[place.local]
+            }
+        }
         Operand::Constant(c) => eval_const_operand(c),
     }
 }
@@ -600,6 +629,13 @@ fn eval_rvalue<'tcx>(rvalue: &Rvalue<'tcx>, state: &IndexVec<Local, AbsValue>) -
             } else {
                 cast_to_signed(v)
             }
+        }
+        Rvalue::Aggregate(_, ops) => {
+            let mut res = Bottom;
+            for op in ops {
+                res.join(&eval_operand(op, state));
+            }
+            res
         }
         _ => Top,
     }
@@ -665,9 +701,10 @@ type SignGraph = FxHashMap<Node, FxHashSet<Node>>;
 struct Collector<'mir, 'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    cursor: &'a mut ResultsCursor<'mir, 'tcx, Signedness<'tcx>>,
+    cursor: &'a mut ResultsCursor<'mir, 'tcx, Signedness<'a, 'tcx>>,
     graph: &'a mut FxHashMap<Node, FxHashSet<Node>>,
     tainted: &'a mut FxHashSet<Node>,
+    addr_takens: &'a FxHashSet<Local>,
 }
 
 fn contains_deref(place: &Place<'_>) -> bool {
@@ -690,15 +727,33 @@ fn is_pointer_offset_like_call(name: &str) -> bool {
 impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
     fn visit_statement(&mut self, stmt: &mir::Statement<'tcx>, _location: Location) {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+            if contains_deref(place) {
+                match rvalue {
+                    Rvalue::Use(Operand::Copy(dst) | Operand::Move(dst))
+                    | Rvalue::Cast(_, Operand::Copy(dst) | Operand::Move(dst), _)
+                        if !contains_deref(dst) =>
+                    {
+                        let rhs = (self.def_id, dst.local);
+
+                        for local in self.addr_takens.iter() {
+                            let lhs = (self.def_id, *local);
+                            self.graph.entry(lhs).or_default().insert(rhs);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match rvalue {
-                Rvalue::Use(Operand::Copy(src) | Operand::Move(src))
-                | Rvalue::Cast(_, Operand::Copy(src) | Operand::Move(src), _)
-                    if !contains_deref(src) =>
+                Rvalue::Use(Operand::Copy(dst) | Operand::Move(dst))
+                | Rvalue::Cast(_, Operand::Copy(dst) | Operand::Move(dst), _)
+                    if !contains_deref(dst) =>
                 {
                     // when p = q (or p = q as T), cursor requirement on p implies
                     // cursor requirement on q, so we add p -> q
                     let lhs = (self.def_id, place.local);
-                    let rhs = (self.def_id, src.local);
+                    let rhs = (self.def_id, dst.local);
                     self.graph.entry(lhs).or_default().insert(rhs);
                 }
                 _ => {}
@@ -766,9 +821,14 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
         }
 
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
-        let mut cursor = Signedness { tcx, local_tys }
-            .iterate_to_fixpoint(tcx, &body, None)
-            .into_results_cursor(&body);
+        let addr_takens = collect_addr_takens(&body);
+        let mut cursor = Signedness {
+            tcx,
+            local_tys,
+            addr_takens: &addr_takens,
+        }
+        .iterate_to_fixpoint(tcx, &body, None)
+        .into_results_cursor(&body);
 
         let mut collector = Collector {
             tcx,
@@ -776,6 +836,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
             cursor: &mut cursor,
             graph: &mut graph,
             tainted: &mut tainted,
+            addr_takens: &addr_takens,
         };
         collector.visit_body(&body);
     }
