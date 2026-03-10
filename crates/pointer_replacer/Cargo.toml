@@ -18,5 +18,8 @@ etrace.workspace = true
 typed-arena.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+similar = "2.7.0"
+
 [package.metadata.rust-analyzer]
 rustc_private = true

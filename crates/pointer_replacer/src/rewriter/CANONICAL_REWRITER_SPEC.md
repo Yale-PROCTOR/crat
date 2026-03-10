@@ -632,6 +632,14 @@ If no local-path kind match applies:
     - text/token counts for `Option<Box<[... ]>>`, `Box<[... ]>`, and `.into_boxed_slice()`
     - site-based counts for realized boxed-slice ownership sites, boxed-slice-like fallback materializations, and remaining raw array allocator sites
     - per-case breakdowns plus top contributing cases
+  - an optional inspection-only dump path can write original/re-written B02 case sources and unified diffs:
+    - enable with `POINTER_REPLACER_B02_DUMP_DIR=<path>`
+    - mode via `POINTER_REPLACER_B02_DUMP_MODE=rewritten|diff|both` (`both` default)
+    - optional case filter via `POINTER_REPLACER_B02_DUMP_FILTER=case_a,case_b`
+    - outputs are written under `<dump_dir>/<case_name>/`
+      - `original.rs` and `rewritten.rs` in `rewritten`/`both` modes
+      - `diff.patch` in `diff`/`both` modes
+    - dump behavior is inspection-only and does not change rewrite decisions, census totals, or type-checking behavior
   - unit note for the boxed-slice census:
     - type-surface counts are compacted-text token counts
     - array-like allocator totals are site-based and are computed as realized boxed-slice sites plus non-boxed-slice fallback sites in the rewritten corpus
@@ -657,6 +665,10 @@ If no local-path kind match applies:
     - `classifier_free_helper_destructor_cleanup_is_blocked_free_shape`
     - `boxed_slice_census_distinguishes_ownership_from_remaining_raw_array_sites`
     - `boxed_slice_census_is_complete`
+    - `b02_rewrite_dump_is_disabled_by_default`
+    - `b02_rewrite_dump_writes_original_and_rewritten_files`
+    - `b02_rewrite_dump_diff_mode_writes_non_empty_diff`
+    - `b02_rewrite_dump_filter_limits_written_cases`
     - `remaining_allocator_site_classification_is_complete`
     - `m9_wrapper_generalization_reduction_vs_verified_baseline`
 - Current consequence:
