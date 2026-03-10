@@ -622,7 +622,11 @@ mod tests {
 
     #[test]
     fn test_int_cast_index() {
-        run_test("fn f(a: &[i32]) { let _ = a[0 as usize]; }", &["a[0usize]"], &["as"])
+        run_test(
+            "fn f(a: &[i32]) { let _ = a[0 as usize]; }",
+            &["a[0usize]"],
+            &["as"],
+        )
     }
 
     #[test]
