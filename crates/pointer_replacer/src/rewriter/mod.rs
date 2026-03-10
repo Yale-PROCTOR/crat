@@ -37,7 +37,7 @@ pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
 }
 
-pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool, bool) {
+pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -107,7 +107,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
         code.push_str(slice_cursor_mod_str());
     }
 
-    (code, visitor.bytemuck.get(), slice_cursor_used)
+    (code, visitor.bytemuck.get())
 }
 
 fn find_param_aliases<'tcx>(

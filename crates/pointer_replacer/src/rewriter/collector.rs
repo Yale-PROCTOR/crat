@@ -56,12 +56,6 @@ pub fn collect_diffs<'tcx>(
             if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
-                // Future policy knob (Step 2): selectively downgrade cursor params.
-                // if local.index() <= input_skip_len
-                //     && let PtrKind::SliceCursor(m) = ptr_kind
-                // {
-                //     ptr_kind = PtrKind::Slice(m);
-                // }
                 ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }

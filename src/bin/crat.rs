@@ -509,7 +509,7 @@ fn main() {
                 }
             }
             Pass::Pointer => {
-                let (s, bytemuck, _slice_cursor) = run_compiler_on_path(&file, |tcx| {
+                let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::replace_local_borrows(&config.pointer, tcx)
                 })
                 .unwrap();
