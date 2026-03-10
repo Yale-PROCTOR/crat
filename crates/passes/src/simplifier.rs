@@ -175,7 +175,12 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         .get(&mod_id)
                         .is_some_and(|s| s.contains(&local_def_id)))
             {
-                *ty = utils::ty!("{}", self.tcx.item_name(def_id));
+                if let TyKind::Path(None, ast_path) = &mut ty.kind
+                    && let Some(last_seg) = ast_path.segments.last().cloned()
+                {
+                    ast_path.segments.clear();
+                    ast_path.segments.push(last_seg);
+                }
             }
         }
     }
@@ -681,5 +686,14 @@ mod tests {
     #[test]
     fn test_int_cast_out_of_i32_range() {
         run_test("fn f() { 0xb504f32d as u32; }", &["0xb504f32du32"], &["as"])
+    }
+
+    #[test]
+    fn test_keep_generics_when_shortening_ty_path() {
+        run_test(
+            "mod m { pub struct S<'a, T>(&'a T); } use crate::m::S; fn f<'a>(x: &'a i32) { let _y: crate::m::S<'a, i32>; }",
+            &["let _y: S<'a, i32>;"],
+            &[],
+        )
     }
 }
