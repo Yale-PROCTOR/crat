@@ -644,14 +644,14 @@ fn eval_integer_terminator_call<'tcx>(
     };
 
     match name.as_str() {
-        "wrapping_add" | "saturating_add" | "strict_add" | "unchecked_add" => binary(AbsValue::add),
-        "wrapping_sub" | "saturating_sub" | "strict_sub" | "unchecked_sub" => binary(AbsValue::sub),
-        "wrapping_mul" | "saturating_mul" | "strict_mul" | "unchecked_mul" => binary(AbsValue::mul),
-        "wrapping_div" | "strict_div" | "unchecked_div" => binary(AbsValue::div),
-        "wrapping_rem" | "strict_rem" | "unchecked_rem" => binary(AbsValue::rem),
-        "wrapping_shl" | "strict_shl" | "unchecked_shl" => binary(AbsValue::shl),
-        "wrapping_shr" | "strict_shr" | "unchecked_shr" => binary(AbsValue::shr),
-        "wrapping_neg" | "strict_neg" | "unchecked_neg" => unary(AbsValue::neg),
+        "wrapping_add" | "saturating_add" => binary(AbsValue::add),
+        "wrapping_sub" | "saturating_sub" => binary(AbsValue::sub),
+        "wrapping_mul" | "saturating_mul" => binary(AbsValue::mul),
+        "wrapping_div" | "saturating_div" => binary(AbsValue::div),
+        "wrapping_neg" | "saturating_neg" => unary(AbsValue::neg),
+        "wrapping_rem" => binary(AbsValue::rem),
+        "wrapping_shl" => binary(AbsValue::shl),
+        "wrapping_shr" => binary(AbsValue::shr),
         _ => None,
     }
 }
