@@ -93,6 +93,30 @@ impl SourceVarGroups {
             })
             .collect::<FxHashMap<_, _>>()
     }
+
+    pub fn postprocess_offset_signs(
+        &self,
+        access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+        // if any local in a source variable group needs cursor, all locals in the
+        // group need cursor (they alias the same source-level pointer).
+        access_signs
+            .into_iter()
+            .map(|(did, mut cursor_locals)| {
+                if let Some(groups) = self.inner.get(&did) {
+                    for locals in groups.values() {
+                        if locals.iter().any(|&local| cursor_locals.contains(local)) {
+                            for &local in locals {
+                                cursor_locals.insert(local);
+                            }
+                        }
+                    }
+                }
+                (did, cursor_locals)
+            })
+            .filter(|(_, s)| !s.is_empty())
+            .collect()
+    }
 }
 
 fn group_locals_by_source_variable<'tcx>(

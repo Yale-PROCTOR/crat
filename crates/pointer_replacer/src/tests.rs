@@ -1411,9 +1411,76 @@ pub unsafe extern "C" fn foo() {
     *(&mut x as *mut libc::c_int as *mut libc::c_char)
         .offset(1 as libc::c_int as isize) = 0 as libc::c_char;
 }
+
 "#,
-        &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize]"],
+        &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize..]"],
         &["*mut", "as *mut"],
+    );
+}
+
+#[test]
+fn test_interproc_negative_offset_propagation() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(
+    mut end: *mut libc::c_int,
+    mut count: libc::c_int,
+) -> libc::c_int {
+    let mut sum: libc::c_int = 0 as libc::c_int;
+    let mut ptr: *mut libc::c_int = end;
+    let mut i: libc::c_int = 0 as libc::c_int;
+    while i < count {
+        sum += *ptr;
+        ptr = ptr.offset(-1);
+        i += 1;
+    }
+    return sum;
+}
+pub unsafe extern "C" fn bar() -> libc::c_int {
+    let mut arr: [libc::c_int; 5] = [1, 2, 3, 4, 5];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    let mut last_element: *mut libc::c_int = p.offset(4 as isize);
+    return foo(last_element, 5 as libc::c_int);
+}
+"#,
+        &[
+            "let mut last_element: crate::slice_cursor::SliceCursorRef",
+            "foo((last_element).fork(), 5 as libc::c_int)",
+        ],
+        &["let mut last_element: &[i32]"],
+    );
+}
+
+#[test]
+fn test_cursor_mut_to_ref_preserves_pos() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(
+    mut end: *const libc::c_int,
+    mut count: libc::c_int,
+) -> libc::c_int {
+    let mut sum: libc::c_int = 0 as libc::c_int;
+    while count > 0 {
+        sum += *end;
+        end = end.offset(-1);
+        count -= 1;
+    }
+    return sum;
+}
+pub unsafe extern "C" fn bar() -> libc::c_int {
+    let mut arr: [libc::c_int; 6] = [1, 2, 3, 4, 5, 6];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr();
+    *p = 9 as libc::c_int;
+    p = p.offset(1 as isize);
+    p = p.offset(-1 as isize);
+    let mut q: *const libc::c_int = p.offset(4 as isize) as *const libc::c_int;
+    return foo(q, 1 as libc::c_int);
+}
+"#,
+        &[".to_ref_cursor()"],
+        &["SliceCursorRef::new((", ").as_slice())"],
     );
 }
 

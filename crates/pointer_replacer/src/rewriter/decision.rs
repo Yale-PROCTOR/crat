@@ -60,15 +60,10 @@ impl<'tcx> DecisionMaker<'tcx> {
             .get(&did)
             .unwrap()
             .clone();
-        let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
         let fn_offset_signs = analysis.offset_sign_result.access_signs.get(&did);
         let mut needs_cursor = DenseBitSet::new_empty(mutable_pointers.len());
-        for (hir_id, local) in hir_to_mir.binding_to_local {
-            if fn_offset_signs
-                .is_some_and(|signs| signs.get(&hir_id).is_some_and(|s| s.needs_cursor()))
-            {
-                needs_cursor.insert(local);
-            }
+        if let Some(signs) = fn_offset_signs {
+            needs_cursor.union(signs);
         }
         DecisionMaker {
             tcx,

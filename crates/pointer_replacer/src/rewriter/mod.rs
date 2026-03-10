@@ -13,7 +13,7 @@ use crate::{
     analyses::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
-        offset_sign::OffsetSignResult,
+        offset_sign::sign::OffsetSignResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -84,7 +84,9 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool,
     let promoted_shared_ref_result =
         source_var_groups.postprocess_promoted_mut_refs(shared_references);
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
-    let offset_sign_result = analyses::offset_sign::offset_sign_analysis(&input);
+    let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
+    offset_sign_result.access_signs =
+        source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
@@ -156,8 +158,12 @@ fn slice_cursor_mod_str() -> &'static str {
     }
 
     impl<'a, T> SliceCursor<'a, T> {
-        pub fn new(slice: &'a mut [T]) -> Self {
-            Self { base: slice, pos: 0 }
+        pub fn new(base: &'a mut [T]) -> Self {
+            Self { base, pos: 0 }
+        }
+
+        pub fn with_pos(base: &'a mut [T], pos: usize) -> Self {
+            Self { base, pos }
         }
 
         pub fn empty() -> Self {
@@ -240,6 +246,10 @@ fn slice_cursor_mod_str() -> &'static str {
     impl<'a, T> SliceCursorRef<'a, T> {
         pub fn new(slice: &'a [T]) -> Self {
             Self { base: slice, pos: 0 }
+        }
+
+        pub fn with_pos(base: &'a [T], pos: usize) -> Self {
+            Self { base, pos }
         }
 
         pub fn empty() -> Self {
