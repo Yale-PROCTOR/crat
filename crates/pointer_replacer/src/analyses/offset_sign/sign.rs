@@ -566,8 +566,6 @@ fn cast_to_unsigned(v: AbsValue) -> AbsValue {
         Zero => Zero,
         // non-negative signed constant: value is the same as unsigned
         ConstI(c) if c >= 0 => abs_from_u128(c as u128),
-        // negative signed constant: wraps to a large unsigned value whose
-        // exact magnitude depends on the concrete bit-width, so lose exactness
         ConstI(_) => NonNeg,
         ConstU(c) => ConstU(c),
         // sign-only values: unsigned target is always non-negative
@@ -584,7 +582,6 @@ fn cast_to_signed(v: AbsValue) -> AbsValue {
         ConstI(c) => ConstI(c),
         // unsigned constant that fits in signed i128: preserve as ConstI
         ConstU(c) if c <= i128::MAX as u128 => abs_from_i128(c as i128),
-        // too large: sign after truncation is bit-width–dependent
         ConstU(_) => Top,
         // sign-only values: preserve existing sign information
         other => other,
