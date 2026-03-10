@@ -282,6 +282,7 @@ impl<'tcx> AstVisitor<'tcx> {
                 {
                     return true;
                 }
+                hir::ExprKind::Index(_, idx, _) if idx.hir_id == curr_id => return true,
                 hir::ExprKind::Index(_, _, _) | hir::ExprKind::Cast(_, _) => return false,
                 _ => {}
             }
@@ -617,6 +618,11 @@ mod tests {
     #[test]
     fn test_int_cast_shift() {
         run_test("fn f() { (1 as i32 as u32) >> 1; }", &["1u32"], &["as"])
+    }
+
+    #[test]
+    fn test_int_cast_index() {
+        run_test("fn f(a: &[i32]) { let _ = a[0 as usize]; }", &["a[0usize]"], &["as"])
     }
 
     #[test]
