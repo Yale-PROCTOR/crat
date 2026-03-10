@@ -125,6 +125,20 @@
 //! };
 //! ```
 //!
+//! # Merge multiple pointer offsets
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! p.offset(a as isize).offset(-(1 as core::ffi::c_int as isize));
+//! ```
+//!
+//! We merge such offsets into one offset:
+//!
+//! ```rust,ignore
+//! p.offset((a as isize) + (-(1 as core::ffi::c_int as isize)));
+//! ```
+//!
 //! # Replace file function pointer type aliases
 //!
 //! Some type aliases contain function pointers types with `FILE *`, like below:
@@ -708,6 +722,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         mut_visit::walk_expr(self, expr);
 
+        if let Some(replacement) = self.try_merge_pointer_offsets(expr) {
+            *expr = replacement;
+        }
+
         let expr_id = expr.id;
         match &mut expr.kind {
             ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) => {
@@ -884,6 +902,45 @@ impl<'tcx> AstVisitor<'tcx> {
         let field_name = field_ident.name;
 
         Some(expr!("core::mem::offset_of!({ty_str}, {field_name})"))
+    }
+
+    fn try_merge_pointer_offsets(&self, expr: &Expr) -> Option<Expr> {
+        let ExprKind::MethodCall(box call) = &expr.kind else { return None };
+        if call.seg.ident.name != sym::offset || call.args.len() != 1 {
+            return None;
+        }
+
+        let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        if !typeck.expr_ty(hir_expr).is_raw_ptr() {
+            return None;
+        }
+
+        let mut args = vec![pprust::expr_to_string(&call.args[0])];
+        let mut base = &*call.receiver;
+        loop {
+            let ExprKind::MethodCall(box inner) = &base.kind else { break };
+            if inner.seg.ident.name != sym::offset || inner.args.len() != 1 {
+                break;
+            }
+            args.push(pprust::expr_to_string(&inner.args[0]));
+            base = &inner.receiver;
+        }
+        if args.len() < 2 {
+            return None;
+        }
+
+        args.reverse();
+        let mut combined = String::new();
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                combined.push_str(" + ");
+            }
+            write!(combined, "({arg})").unwrap();
+        }
+
+        let base = pprust::expr_to_string(base);
+        Some(expr!("{base}.offset({combined})"))
     }
 }
 
@@ -1829,6 +1886,19 @@ pub unsafe extern "C" fn f(mut s_inc: *mut core::ffi::c_uchar) {
             "#,
             &["let __idx_0", "s_inc.offset(__idx_0)"],
             &["s_inc.offset((*s_inc.offset(64 as isize) as isize) as isize)"],
+        );
+    }
+
+    #[test]
+    fn test_merge_offset_chain() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut p: *mut core::ffi::c_int, mut a: core::ffi::c_int) -> *mut core::ffi::c_int {
+    p.offset(a as isize).offset(-(1 as core::ffi::c_int as isize))
+}
+            "#,
+            &["p.offset((a as isize) + (-(1 as core::ffi::c_int as isize)))"],
+            &["p.offset(a as isize).offset(-(1 as core::ffi::c_int as isize))"],
         );
     }
 
