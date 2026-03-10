@@ -202,7 +202,7 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn seek(&mut self, offset: isize) {
-            self.pos = (self.pos as isize + offset) as usize;
+            self.pos = self.pos.wrapping_add_signed(offset);
         }
 
         pub fn is_empty(&self) -> bool {
@@ -269,7 +269,7 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn seek(&mut self, offset: isize) {
-            self.pos = (self.pos as isize + offset) as usize;
+            self.pos = self.pos.wrapping_add_signed(offset);
         }
 
         pub fn is_empty(&self) -> bool {
@@ -293,7 +293,7 @@ fn slice_cursor_mod_str() -> &'static str {
 
     #[inline(always)]
     fn abs_idx(pos: usize, index: isize) -> usize {
-        (pos as isize + index) as usize
+        pos.wrapping_add_signed(index)
     }
 
     macro_rules! impl_readable_index {
@@ -395,21 +395,5 @@ fn slice_cursor_mod_str() -> &'static str {
     impl_readable_index!(SliceCursor, isize, usize, i32);
     impl_readable_index!(SliceCursorRef, isize, usize, i32);
     impl_mutable_index!(isize, usize, i32);
-
-    pub fn seek_slice<T>(s: &mut &[T], offset: isize) {
-        *s = unsafe {
-            let ptr = s.as_ptr().offset(offset);
-            let len = (s.len() as isize - offset) as usize;
-            std::slice::from_raw_parts(ptr, len)
-        };
-    }
-
-    pub fn seek_slice_mut<T>(s: &mut &mut [T], offset: isize) {
-        *s = unsafe {
-            let ptr = s.as_mut_ptr().offset(offset);
-            let len = (s.len() as isize - offset) as usize;
-            std::slice::from_raw_parts_mut(ptr, len)
-        };
-    }
 }"#
 }
