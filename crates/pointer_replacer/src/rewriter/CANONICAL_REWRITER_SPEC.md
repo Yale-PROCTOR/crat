@@ -247,7 +247,11 @@ Practical result for function-pointer-used functions:
   - Otherwise fallback per-arg to `Raw(get_mutability_decision(..) or type mutability)`.
   - During raw-bridge candidate collection, a tracked local passed to a local callee is no longer disqualified unconditionally.
     - The candidate survives only when the exact matching local-callee raw-pointer parameter is proven `BorrowOnly`.
-    - `BorrowOnly` permits transient pointee reads/writes, pointer arithmetic, and calls into other local `BorrowOnly` params.
+    - `BorrowOnly` permits transient pointee reads/writes, pointer arithmetic, calls into other local `BorrowOnly` params, and a narrow whitelist of transient foreign buffer APIs:
+      - `memcpy` arg positions 0 and 1
+      - `memmove` arg positions 0 and 1
+      - `memset` arg position 0
+      - `strncpy` arg positions 0 and 1
     - Anything inconclusive defaults to `Escapes`, which preserves the previous disqualification behavior.
     - `Escapes` includes:
       - storing the pointer value
@@ -260,6 +264,11 @@ Practical result for function-pointer-used functions:
     - scalar locals use `drop(Box::from_raw(...))`
     - array locals use `drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(...)))`
     - supported local deallocator wrappers participate in the same rewrite path as direct foreign `free(...)`
+    - M13 slice 1 broadens local deallocator-wrapper recognition structurally:
+      - the wrapper must have exactly one raw-pointer parameter
+      - it may null-check that parameter and assign it to null afterwards
+      - it must directly call foreign `free(param)`
+      - any field access, pointer-value aliasing, return, or non-free call use of that parameter keeps the wrapper out of this path
   - Run `hoist_opt_ref_borrow` post-pass to reduce repeated mutable deref borrow conflicts.
 - Method call `is_null`
   - local `OptRef` receiver -> rename to `is_none`
@@ -390,7 +399,14 @@ If no local-path kind match applies:
   - supported array roots -> leaked boxed slices with tracked length expressions
   - direct local allocator wrappers (`alloc`/`calloc`/`realloc`-style wrappers returning one outermost local) participate when their call arguments preserve the same raw-bridge shape
   - for the direct local raw-bridge path, allocator byte/count expressions may now come from bounded wrapper-local scalar temp DAGs
+  - for byte-sized pointees only, direct local `calloc(size_of::<T>(), len)` roots normalize to array length `len`; this is limited to the existing direct-local raw-bridge path
+  - reversed non-byte `calloc(size_of::<T>(), len)` roots remain conservative in this path
+  - a tracked direct-local returned byte-buffer root may now survive a one-hop same-body byte-view cast alias such as `p = dest as *mut u8`, but only when the alias:
+    - stays byte-sized
+    - is updated only through transient pointer arithmetic like `offset`/`add`
+    - is not returned, freed, stored, or passed to calls
   - tracked raw locals may also survive local helper calls when the matching local callee raw-pointer parameter is proven `BorrowOnly`
+  - M12 slice 1 extends that `BorrowOnly` proof narrowly for local helper params that only forward the pointer into transient foreign buffer calls (`memcpy`, `memmove`, `memset`, `strncpy`) without storing, returning, or freeing the pointer value
   - local aggregate-field-storage helpers remain excluded from this relaxation; a `cJSON_PrintPreallocated`-style `p.buffer = buffer` write still classifies that parameter as `Escapes`
   - wrapper eligibility is structural:
     - the wrapper allocates one principal outermost local
@@ -561,6 +577,17 @@ If no local-path kind match applies:
     - `test_rewriter_keeps_local_callee_pointer_free_raw_in_m10`
     - `test_rewriter_keeps_local_callee_pointer_global_store_raw_in_m10`
     - `test_rewriter_keeps_cjson_style_local_field_storage_raw_in_m10`
+    - `test_rewriter_allows_memcpy_style_local_helper_use_in_m12`
+    - `test_rewriter_keeps_unknown_foreign_helper_use_raw_in_m12`
+    - `test_rewriter_allows_returned_byte_calloc_buffer_in_m13`
+    - `test_rewriter_allows_byte_view_alias_of_returned_byte_buffer_in_m13`
+    - `test_rewriter_keeps_opaque_byte_calloc_wrapper_return_raw_in_m13`
+    - `test_rewriter_keeps_helper_cleanup_byte_calloc_raw_in_m13`
+    - `test_rewriter_keeps_non_byte_reversed_calloc_raw_in_m13`
+    - `test_rewriter_keeps_returned_byte_buffer_alias_return_raw_in_m13`
+    - `test_rewriter_keeps_returned_byte_buffer_alias_free_raw_in_m13`
+    - `test_rewriter_keeps_returned_byte_buffer_alias_store_raw_in_m13`
+    - `test_rewriter_keeps_non_byte_view_alias_raw_in_m13`
     - `test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed`
     - `test_rewriter_keeps_owner_struct_field_frees_raw_in_m7`
     - `transform::tests::struct_default_materialization_uses_recursive_defaults` directly covers scalar `OptBox` struct-default materialization in `transform/mod.rs`
@@ -629,11 +656,12 @@ If no local-path kind match applies:
     - `remaining_malloc_sites=64`
     - `remaining_calloc_sites=13`
     - `primary_unlock_wrapper_generalization=46`
-  - the current post-M10 classifier totals are:
-    - `remaining_malloc_sites=53`
+  - the current post-M12 classifier totals are:
+    - `remaining_malloc_sites=49`
     - `remaining_calloc_sites=7`
     - `primary_unlock_wrapper_generalization=33`
-  - the direct token census currently reads `malloc=90`, `calloc=20`, `free=258`
+    - `alloc_policy_status:admissible_current_policy=6`
+  - the direct token census currently reads `malloc=86`, `calloc=20`, `free=254`
   - M8 remains planning metadata only; M9 and M10 reduced wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
   - per-site fields:

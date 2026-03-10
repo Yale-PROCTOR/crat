@@ -1081,6 +1081,321 @@ pub unsafe fn helper() -> i32 {
 }
 
 #[test]
+fn test_rewriter_allows_memcpy_style_local_helper_use_in_m12() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: usize,
+    ) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+unsafe fn init_state(state: *mut State) {
+    let template = State { value: 7 };
+    memcpy(
+        state as *mut core::ffi::c_void,
+        &template as *const State as *const core::ffi::c_void,
+        std::mem::size_of::<State>(),
+    );
+}
+
+pub unsafe fn checkshift_like() -> i32 {
+    let state: *mut State = malloc(std::mem::size_of::<State>()) as *mut State;
+    if state.is_null() {
+        return -1;
+    }
+    init_state(state);
+    let result = (*state).value;
+    free(state as *mut core::ffi::c_void);
+    result
+}
+"#,
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &[
+            "malloc(std::mem::size_of::<State>())",
+            "free(state as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_unknown_foreign_helper_use_raw_in_m12() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+    fn puts(s: *const core::ffi::c_char) -> i32;
+}
+
+unsafe fn show_task(task: *mut core::ffi::c_char) {
+    puts(task);
+}
+
+pub unsafe fn driver_like(length: usize) -> i32 {
+    let task: *mut core::ffi::c_char = malloc(length.wrapping_add(1)) as *mut core::ffi::c_char;
+    if task.is_null() {
+        return -1;
+    }
+    show_task(task);
+    free(task as *mut core::ffi::c_void);
+    0
+}
+"#,
+        &[
+            "malloc(length.wrapping_add(1))",
+            "free(task as *mut core::ffi::c_void);",
+        ],
+        &["Box::into_raw(", "Box::leak("],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_returned_byte_calloc_buffer_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn decode_like(len: usize, fail: bool) -> *mut core::ffi::c_char {
+    let dest: *mut core::ffi::c_char =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len) as *mut core::ffi::c_char;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    if fail {
+        free(dest as *mut core::ffi::c_void);
+        return std::ptr::null_mut();
+    }
+    dest
+}
+"#,
+        &["Box::leak("],
+        &[
+            "calloc(std::mem::size_of::<core::ffi::c_char>(), len)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_opaque_byte_calloc_wrapper_return_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn opaque_factory(len: usize) -> *mut core::ffi::c_void {
+    let dest: *mut core::ffi::c_void =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len);
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    dest
+}
+"#,
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
+        &["Box::leak(", "Box::into_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_helper_cleanup_byte_calloc_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+unsafe fn cleanup_resources(dynamic_buf: *mut core::ffi::c_void) {
+    free(dynamic_buf);
+}
+
+pub unsafe fn decode_like(len: usize) -> i32 {
+    let dest: *mut core::ffi::c_void =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len);
+    if dest.is_null() {
+        return -1;
+    }
+    cleanup_resources(dest);
+    0
+}
+"#,
+        &[
+            "calloc(std::mem::size_of::<core::ffi::c_char>(), len)",
+            "cleanup_resources(dest);",
+        ],
+        &["Box::leak(", "Box::into_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_non_byte_reversed_calloc_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn alloc_words(len: usize) -> *mut i32 {
+    let dest: *mut i32 = calloc(std::mem::size_of::<i32>(), len) as *mut i32;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    dest
+}
+"#,
+        &["calloc(std::mem::size_of::<i32>(), len)"],
+        &["Box::leak(", "Box::into_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_byte_view_alias_of_returned_byte_buffer_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn decode_like(len: usize) -> *mut core::ffi::c_char {
+    let dest: *mut core::ffi::c_char =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len) as *mut core::ffi::c_char;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut p: *mut core::ffi::c_uchar = dest as *mut core::ffi::c_uchar;
+    *p = b'A';
+    p = p.offset(1);
+    *p = 0;
+    dest
+}
+
+pub unsafe fn caller(len: usize) {
+    let dest = decode_like(len);
+    if !dest.is_null() {
+        free(dest as *mut core::ffi::c_void);
+    }
+}
+"#,
+        &["Box::leak("],
+        &[
+            "calloc(std::mem::size_of::<core::ffi::c_char>(), len)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_returned_byte_buffer_alias_return_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn decode_like(len: usize) -> *mut core::ffi::c_char {
+    let dest: *mut core::ffi::c_char =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len) as *mut core::ffi::c_char;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p: *mut core::ffi::c_uchar = dest as *mut core::ffi::c_uchar;
+    p as *mut core::ffi::c_char
+}
+"#,
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_returned_byte_buffer_alias_free_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn decode_like(len: usize) -> *mut core::ffi::c_char {
+    let dest: *mut core::ffi::c_char =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len) as *mut core::ffi::c_char;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p: *mut core::ffi::c_uchar = dest as *mut core::ffi::c_uchar;
+    free(p as *mut core::ffi::c_void);
+    std::ptr::null_mut()
+}
+"#,
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_returned_byte_buffer_alias_store_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+static mut SLOT: *mut core::ffi::c_uchar = std::ptr::null_mut();
+
+pub unsafe fn decode_like(len: usize) -> *mut core::ffi::c_char {
+    let dest: *mut core::ffi::c_char =
+        calloc(std::mem::size_of::<core::ffi::c_char>(), len) as *mut core::ffi::c_char;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p: *mut core::ffi::c_uchar = dest as *mut core::ffi::c_uchar;
+    SLOT = p;
+    dest
+}
+"#,
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_non_byte_view_alias_raw_in_m13() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn alloc_words(len: usize) -> *mut i32 {
+    let dest: *mut i32 = calloc(std::mem::size_of::<i32>(), len) as *mut i32;
+    if dest.is_null() {
+        return std::ptr::null_mut();
+    }
+    let p: *mut u16 = dest as *mut u16;
+    let _ = p;
+    dest
+}
+"#,
+        &["calloc(std::mem::size_of::<i32>(), len)"],
+        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+    );
+}
+
+#[test]
 fn test_rewriter_keeps_owner_struct_field_frees_raw_in_m7() {
     run_test(
         r#"

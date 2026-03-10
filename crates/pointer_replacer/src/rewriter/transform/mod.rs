@@ -3630,6 +3630,55 @@ fn hir_is_exact_size_of_expr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, ty_name: &st
     .any(|candidate| snippet == candidate)
 }
 
+fn hir_is_exact_c_char_size_of_expr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    let Some(snippet) = hir_expr_snippet(tcx, hir_unwrap_casts(expr)) else {
+        return false;
+    };
+    [
+        "::core::mem::size_of::<core::ffi::c_char>()",
+        "core::mem::size_of::<core::ffi::c_char>()",
+        "::std::mem::size_of::<core::ffi::c_char>()",
+        "std::mem::size_of::<core::ffi::c_char>()",
+        "::core::mem::size_of::<std::ffi::c_char>()",
+        "core::mem::size_of::<std::ffi::c_char>()",
+        "::std::mem::size_of::<std::ffi::c_char>()",
+        "std::mem::size_of::<std::ffi::c_char>()",
+    ]
+    .into_iter()
+    .map(normalize_expr_snippet)
+    .any(|candidate| snippet == candidate)
+}
+
+fn ty_is_byte_sized_raw_inner(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
+    )
+}
+
+fn hir_is_casted_local(rhs: &hir::Expr<'_>, target: HirId) -> bool {
+    match rhs.kind {
+        hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) => {
+            hir_unwrapped_local_id(inner) == Some(target) || hir_is_casted_local(inner, target)
+        }
+        _ => false,
+    }
+}
+
+fn hir_is_byte_view_self_update(target: HirId, rhs: &hir::Expr<'_>) -> bool {
+    let rhs = hir_unwrap_casts(rhs);
+    match rhs.kind {
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if hir_unwrapped_local_id(receiver) == Some(target)
+                && args.len() == 1
+                && matches!(seg.ident.name.as_str(), "offset" | "add" | "wrapping_offset") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 fn hir_is_literal_one(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
     hir_expr_snippet(tcx, hir_unwrap_casts(expr)).is_some_and(|snippet| snippet == "1")
 }
@@ -3996,6 +4045,25 @@ fn hir_called_local_fn(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LocalDef
     local_def_id_has_fn_body(tcx, def_id).then_some(def_id)
 }
 
+fn hir_is_borrow_only_foreign_buffer_arg(
+    tcx: TyCtxt<'_>,
+    expr: &hir::Expr<'_>,
+    arg_index: usize,
+) -> bool {
+    if hir_called_local_fn(tcx, expr).is_some() {
+        return false;
+    }
+    let Some(name) = hir_call_name(expr) else {
+        return false;
+    };
+    match name.as_str() {
+        "memcpy" | "memmove" => arg_index < 2,
+        "memset" => arg_index == 0,
+        "strncpy" => arg_index < 2,
+        _ => false,
+    }
+}
+
 fn hir_free_like_arg_local_id<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
@@ -4279,6 +4347,21 @@ fn raw_bridge_info_from_call<'tcx>(
     args: &[&'tcx hir::Expr<'tcx>],
     scalar_ctx: Option<&WrapperScalarDagContext<'_, 'tcx>>,
 ) -> Option<RawBridgeInfo> {
+    let scalar_arg_rejected = |expr: &'tcx hir::Expr<'tcx>| {
+        scalar_ctx.is_some_and(|ctx| {
+            hir_expr_uses_any_local(expr)
+                && hir_wrapper_scalar_dag_status(
+                    ctx,
+                    expr,
+                    &mut FxHashSet::default(),
+                    0,
+                ) == WrapperScalarDagStatus::Rejected
+        })
+    };
+    let byte_sized_elem = matches!(
+        lhs_inner_ty.kind(),
+        ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
+    );
     if !ty_supports_raw_bridge_default_expr(tcx, lhs_inner_ty) {
         return None;
     }
@@ -4287,15 +4370,7 @@ fn raw_bridge_info_from_call<'tcx>(
         (name, [bytes]) if name == Symbol::intern("malloc") => {
             if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
                 Some(RawBridgeInfo::Scalar)
-            } else if scalar_ctx.is_some_and(|ctx| {
-                hir_expr_uses_any_local(bytes)
-                    && hir_wrapper_scalar_dag_status(
-                        ctx,
-                        bytes,
-                        &mut FxHashSet::default(),
-                        0,
-                    ) == WrapperScalarDagStatus::Rejected
-            }) {
+            } else if scalar_arg_rejected(bytes) {
                 None
             } else {
                 raw_array_len_expr_from_bytes(tcx, lhs_inner_ty, bytes)
@@ -4306,23 +4381,18 @@ fn raw_bridge_info_from_call<'tcx>(
             if hir_is_literal_one(tcx, count) && hir_is_exact_size_of_expr(tcx, elem_size, &ty_name)
             {
                 Some(RawBridgeInfo::Scalar)
-            } else if scalar_ctx.is_some_and(|ctx| {
-                (hir_expr_uses_any_local(count)
-                    && hir_wrapper_scalar_dag_status(
-                        ctx,
-                        count,
-                        &mut FxHashSet::default(),
-                        0,
-                    ) == WrapperScalarDagStatus::Rejected)
-                    || (hir_expr_uses_any_local(elem_size)
-                        && hir_wrapper_scalar_dag_status(
-                            ctx,
-                            elem_size,
-                            &mut FxHashSet::default(),
-                            0,
-                        ) == WrapperScalarDagStatus::Rejected)
-            }) {
+            } else if scalar_arg_rejected(count) || scalar_arg_rejected(elem_size) {
                 None
+            } else if hir_is_exact_size_of_expr(tcx, count, &ty_name)
+                || (byte_sized_elem && hir_is_exact_c_char_size_of_expr(tcx, count))
+            {
+                if byte_sized_elem {
+                    Some(RawBridgeInfo::Array {
+                        len_expr: hir_expr_verbatim_snippet(tcx, hir_unwrap_casts(elem_size))?,
+                    })
+                } else {
+                    None
+                }
             } else {
                 Some(RawBridgeInfo::Array {
                     len_expr: hir_expr_verbatim_snippet(tcx, hir_unwrap_casts(count))?,
@@ -4334,15 +4404,7 @@ fn raw_bridge_info_from_call<'tcx>(
         {
             if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
                 Some(RawBridgeInfo::Scalar)
-            } else if scalar_ctx.is_some_and(|ctx| {
-                hir_expr_uses_any_local(bytes)
-                    && hir_wrapper_scalar_dag_status(
-                        ctx,
-                        bytes,
-                        &mut FxHashSet::default(),
-                        0,
-                    ) == WrapperScalarDagStatus::Rejected
-            }) {
+            } else if scalar_arg_rejected(bytes) {
                 None
             } else {
                 raw_array_len_expr_from_bytes(tcx, lhs_inner_ty, bytes)
@@ -4536,6 +4598,7 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
         struct Candidate {
             info: Option<AllocWrapperInfo>,
             aliases: FxHashSet<HirId>,
+            byte_view_aliases: FxHashSet<HirId>,
             returned: bool,
             disqualified: bool,
         }
@@ -4575,6 +4638,15 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                     .insert(alias);
             }
 
+            fn mark_byte_view_alias(&mut self, alias: HirId, source: HirId) {
+                self.mark_alias(alias, source);
+                self.candidates
+                    .entry(self.root_of[&source])
+                    .or_default()
+                    .byte_view_aliases
+                    .insert(alias);
+            }
+
             fn mark_disqualified(&mut self, hir_id: HirId) {
                 if let Some(root) = self.root_of.get(&hir_id).copied() {
                     self.candidates.entry(root).or_default().disqualified = true;
@@ -4583,6 +4655,14 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
 
             fn mark_returned(&mut self, hir_id: HirId) {
                 if let Some(root) = self.root_of.get(&hir_id).copied() {
+                    if self
+                        .candidates
+                        .get(&root)
+                        .is_some_and(|candidate| candidate.byte_view_aliases.contains(&hir_id))
+                    {
+                        self.candidates.entry(root).or_default().disqualified = true;
+                        return;
+                    }
                     self.candidates.entry(root).or_default().returned = true;
                 }
             }
@@ -4615,7 +4695,25 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                         {
                             self.mark_root(hir_id, info);
                         } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(init) {
-                            self.mark_alias(hir_id, rhs_hir_id);
+                            let rhs_ty = self.typeck.node_type(rhs_hir_id);
+                            let is_byte_view_alias = hir_is_casted_local(init, rhs_hir_id)
+                                && ty_is_byte_sized_raw_inner(lhs_inner_ty)
+                                && unwrap_ptr_from_mir_ty(rhs_ty).is_some_and(|(rhs_inner_ty, _)| {
+                                    ty_is_byte_sized_raw_inner(rhs_inner_ty)
+                                })
+                                && self
+                                    .root_of
+                                    .get(&rhs_hir_id)
+                                    .and_then(|root| self.candidates.get(root))
+                                    .and_then(|candidate| candidate.info.as_ref())
+                                    .is_some_and(|info| {
+                                        matches!(info, AllocWrapperInfo::Fixed(RawBridgeInfo::Array { .. }))
+                                    });
+                            if is_byte_view_alias {
+                                self.mark_byte_view_alias(hir_id, rhs_hir_id);
+                            } else {
+                                self.mark_alias(hir_id, rhs_hir_id);
+                            }
                         }
                     }
                     self.record_scalar_local(hir_id, init);
@@ -4642,7 +4740,26 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                                 ) {
                                     self.mark_root(lhs_hir_id, info);
                                 } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
-                                    self.mark_alias(lhs_hir_id, rhs_hir_id);
+                                    let rhs_ty = self.typeck.node_type(rhs_hir_id);
+                                    let is_byte_view_alias = hir_is_casted_local(rhs, rhs_hir_id)
+                                        && ty_is_byte_sized_raw_inner(lhs_inner_ty)
+                                        && unwrap_ptr_from_mir_ty(rhs_ty)
+                                            .is_some_and(|(rhs_inner_ty, _)| {
+                                                ty_is_byte_sized_raw_inner(rhs_inner_ty)
+                                            })
+                                        && self
+                                            .root_of
+                                            .get(&rhs_hir_id)
+                                            .and_then(|root| self.candidates.get(root))
+                                            .and_then(|candidate| candidate.info.as_ref())
+                                            .is_some_and(|info| {
+                                                matches!(info, AllocWrapperInfo::Fixed(RawBridgeInfo::Array { .. }))
+                                            });
+                                    if is_byte_view_alias {
+                                        self.mark_byte_view_alias(lhs_hir_id, rhs_hir_id);
+                                    } else {
+                                        self.mark_alias(lhs_hir_id, rhs_hir_id);
+                                    }
                                 }
                             }
                             self.record_scalar_local(lhs_hir_id, rhs);
@@ -4699,7 +4816,10 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
             .candidates
             .into_iter()
             .filter_map(|(_root, candidate)| {
-                (!candidate.disqualified && candidate.returned).then_some(candidate.info?)
+                if candidate.disqualified || !candidate.returned {
+                    return None;
+                }
+                candidate.info
             })
             .collect::<Vec<_>>();
         if eligible.len() == 1 {
@@ -4922,7 +5042,15 @@ fn collect_local_raw_param_summaries(
                                     self.mark_escape(param_index);
                                 }
                             }
-                            None => self.mark_escape(param_index),
+                            None => {
+                                if !hir_is_borrow_only_foreign_buffer_arg(
+                                    self.tcx,
+                                    expr,
+                                    arg_index,
+                                ) {
+                                    self.mark_escape(param_index);
+                                }
+                            }
                         }
                     }
                 }
@@ -5027,6 +5155,7 @@ fn collect_raw_bridge_bindings(
         body_owner: LocalDefId,
         param_positions: FxHashMap<HirId, usize>,
         alias_roots: FxHashMap<HirId, HirId>,
+        byte_view_aliases: FxHashSet<HirId>,
         states: FxHashMap<HirId, State>,
         scalar_defs: FxHashMap<HirId, &'tcx hir::Expr<'tcx>>,
     }
@@ -5051,6 +5180,11 @@ fn collect_raw_bridge_bindings(
             self.states.entry(root).or_default().aliases.insert(alias);
         }
 
+        fn mark_byte_view_alias(&mut self, alias: HirId, source: HirId) {
+            self.mark_alias(alias, source);
+            self.byte_view_aliases.insert(alias);
+        }
+
         fn state_for_local_mut(&mut self, hir_id: HirId) -> Option<&mut State> {
             let root = self.alias_roots.get(&hir_id).copied().unwrap_or(hir_id);
             self.states.get_mut(&root)
@@ -5068,6 +5202,11 @@ fn collect_raw_bridge_bindings(
             rhs: &'tcx hir::Expr<'tcx>,
             lhs_inner_ty: ty::Ty<'tcx>,
         ) {
+            if self.byte_view_aliases.contains(&lhs_hir_id)
+                && hir_is_byte_view_self_update(lhs_hir_id, rhs)
+            {
+                return;
+            }
             let scalar_ctx = self.wrapper_like_bodies.contains(&self.body_owner).then_some(
                 WrapperScalarDagContext {
                     tcx: self.tcx,
@@ -5086,6 +5225,23 @@ fn collect_raw_bridge_bindings(
             {
                 self.mark_root(lhs_hir_id, info);
             } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
+                if self.byte_view_aliases.contains(&rhs_hir_id) && lhs_hir_id != rhs_hir_id {
+                    self.disqualify_local(rhs_hir_id);
+                    return;
+                }
+                let rhs_ty = self.tcx.typeck(rhs_hir_id.owner).node_type(rhs_hir_id);
+                let can_mark_byte_view_alias = hir_is_casted_local(rhs, rhs_hir_id)
+                    && ty_is_byte_sized_raw_inner(lhs_inner_ty)
+                    && unwrap_ptr_from_mir_ty(rhs_ty)
+                        .is_some_and(|(rhs_inner_ty, _)| ty_is_byte_sized_raw_inner(rhs_inner_ty))
+                    && self
+                        .state_for_local_mut(rhs_hir_id)
+                        .and_then(|state| state.bridge.as_ref())
+                        .is_some_and(|info| matches!(info, RawBridgeInfo::Array { .. }));
+                if can_mark_byte_view_alias {
+                    self.mark_byte_view_alias(lhs_hir_id, rhs_hir_id);
+                    return;
+                }
                 if self.alloc_wrappers.contains_key(&self.body_owner) {
                     self.mark_alias(lhs_hir_id, rhs_hir_id);
                 } else {
@@ -5143,16 +5299,28 @@ fn collect_raw_bridge_bindings(
                 let free_arg = hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
                     .map(|(hir_id, _)| hir_id);
                 let local_callee = hir_called_local_fn(self.tcx, expr);
+                let free_arg_is_byte_view =
+                    free_arg.is_some_and(|hir_id| self.byte_view_aliases.contains(&hir_id));
                 if let Some(hir_id) = free_arg
                     && let Some(state) = self.state_for_local_mut(hir_id)
                 {
-                    state.saw_free = true;
+                    if free_arg_is_byte_view {
+                        state.disqualified = true;
+                    } else {
+                        state.saw_free = true;
+                    }
                 }
                 for (arg_index, arg) in args.iter().enumerate() {
                     if let Some(hir_id) = hir_unwrapped_local_id(arg)
                         && Some(hir_id) != free_arg
-                        && local_callee.is_some()
                     {
+                        if self.byte_view_aliases.contains(&hir_id) {
+                            self.disqualify_local(hir_id);
+                            continue;
+                        }
+                        if local_callee.is_none() {
+                            continue;
+                        }
                         let local_callee = local_callee.unwrap();
                         if self
                             .local_raw_param_summaries
@@ -5166,9 +5334,12 @@ fn collect_raw_bridge_bindings(
             }
             if let hir::ExprKind::Ret(Some(ret)) = expr.kind
                 && let Some(hir_id) = hir_unwrapped_local_id(ret)
-                && let Some(state) = self.state_for_local_mut(hir_id)
             {
-                state.saw_return = true;
+                if self.byte_view_aliases.contains(&hir_id) {
+                    self.disqualify_local(hir_id);
+                } else if let Some(state) = self.state_for_local_mut(hir_id) {
+                    state.saw_return = true;
+                }
             }
             intravisit::walk_expr(self, expr);
         }
@@ -5176,9 +5347,12 @@ fn collect_raw_bridge_bindings(
         fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
             intravisit::walk_body(self, body);
             if let Some(hir_id) = hir_unwrapped_local_id(body.value)
-                && let Some(state) = self.state_for_local_mut(hir_id)
             {
-                state.saw_return = true;
+                if self.byte_view_aliases.contains(&hir_id) {
+                    self.disqualify_local(hir_id);
+                } else if let Some(state) = self.state_for_local_mut(hir_id) {
+                    state.saw_return = true;
+                }
             }
         }
     }
@@ -5219,6 +5393,7 @@ fn collect_raw_bridge_bindings(
                 })
                 .collect(),
             alias_roots: FxHashMap::default(),
+            byte_view_aliases: FxHashSet::default(),
             states: FxHashMap::default(),
             scalar_defs: FxHashMap::default(),
         };
