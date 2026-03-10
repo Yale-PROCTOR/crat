@@ -1012,7 +1012,7 @@ fn hoist_self_ref_place_expr(
                 && is_hoistable_self_ref_arg(idx)
             {
                 let idx_str = pprust::expr_to_string(idx);
-                let temp_name = format!("__idx_{}", idx_counter);
+                let temp_name = format!("__idx_{idx_counter})");
                 *idx_counter += 1;
                 let_stmts.push(format!("let {temp_name} = {idx_str};"));
                 **idx = expr!("{temp_name}");
@@ -1028,7 +1028,7 @@ fn hoist_self_ref_place_expr(
                 && is_hoistable_self_ref_arg(&call.args[0])
             {
                 let arg_str = pprust::expr_to_string(&call.args[0]);
-                let temp_name = format!("__idx_{}", idx_counter);
+                let temp_name = format!("__idx_{idx_counter}");
                 *idx_counter += 1;
                 let_stmts.push(format!("let {temp_name} = {arg_str};"));
                 call.args[0] = P(expr!("{temp_name}"));

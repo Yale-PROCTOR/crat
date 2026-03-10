@@ -116,7 +116,7 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
                     continue;
                 };
                 for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
-                    let ty = fd.ty(tcx, *generic_args);
+                    let ty = fd.ty(tcx, generic_args);
                     if utils::file::contains_file_ty(ty, tcx) {
                         locs.push(MirLoc::Field(local_def_id, i));
                     }

@@ -261,7 +261,7 @@ pub fn replace_io(config: Config, tcx: TyCtxt<'_>) -> TransformationResult {
                 let adt_def = tcx.adt_def(*def_id);
                 let adt_ty = tcx.type_of(*def_id).instantiate_identity();
                 let TyKind::Adt(_, generic_args) = adt_ty.kind() else { continue };
-                let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, *generic_args);
+                let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, generic_args);
                 let mut ctx = LocCtx::new(ty);
                 ctx.is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _, _));
                 (vec![HirLoc::Field(*def_id, *field)], ctx)

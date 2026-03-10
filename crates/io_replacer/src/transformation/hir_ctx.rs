@@ -193,7 +193,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 };
                 for variant in adt_def.variants() {
                     for (i, field) in variant.fields.iter_enumerated() {
-                        let ty = field.ty(self.tcx, *generic_args);
+                        let ty = field.ty(self.tcx, generic_args);
                         let owned_def_id = some_or!(owned_def_id(ty), continue);
                         self.ctx
                             .struct_to_owning_structs

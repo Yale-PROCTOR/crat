@@ -936,7 +936,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if only_offsets {
                         let as_slice = if m { "as_slice_mut" } else { "as_slice" };
                         let slice_expr = if offsets.is_empty() {
-                            format!("({}).{}()", base_str, as_slice)
+                            format!("({base_str}).{as_slice}()")
                         } else {
                             let offset_str = offsets.join(" + ");
                             format!(
@@ -1013,7 +1013,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                             utils::expr!("({}).to_ref_cursor()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
-                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && !(m1 && !m) {
+                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && (!m1 || m) {
                         result = utils::expr!("({}).fork()", pprust::expr_to_string(&result));
                     }
                     *ptr = result;

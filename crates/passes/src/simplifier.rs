@@ -174,13 +174,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         .imports
                         .get(&mod_id)
                         .is_some_and(|s| s.contains(&local_def_id)))
+                && let TyKind::Path(None, ast_path) = &mut ty.kind
+                && let Some(last_seg) = ast_path.segments.last().cloned()
             {
-                if let TyKind::Path(None, ast_path) = &mut ty.kind
-                    && let Some(last_seg) = ast_path.segments.last().cloned()
-                {
-                    ast_path.segments.clear();
-                    ast_path.segments.push(last_seg);
-                }
+                ast_path.segments.clear();
+                ast_path.segments.push(last_seg);
             }
         }
     }
