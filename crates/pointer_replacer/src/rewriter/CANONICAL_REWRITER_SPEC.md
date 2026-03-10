@@ -628,6 +628,14 @@ If no local-path kind match applies:
     - remaining `free(` calls are split into teardown shapes
     - allocator and teardown shapes are tagged with policy status
     - allocator shapes are also tagged with whether they are blocked mainly by allocation shape, deallocation shape, or both
+  - an additional inspection-only boxed-slice census now scans the rewritten B02 outputs and reports:
+    - text/token counts for `Option<Box<[... ]>>`, `Box<[... ]>`, and `.into_boxed_slice()`
+    - site-based counts for realized boxed-slice ownership sites, boxed-slice-like fallback materializations, and remaining raw array allocator sites
+    - per-case breakdowns plus top contributing cases
+  - unit note for the boxed-slice census:
+    - type-surface counts are compacted-text token counts
+    - array-like allocator totals are site-based and are computed as realized boxed-slice sites plus non-boxed-slice fallback sites in the rewritten corpus
+    - `.into_boxed_slice()` counts may differ from `Option<Box<[... ]>>` / `Box<[... ]>` counts because one logical site can contribute multiple type tokens and boxed-slice-like fallback sites still materialize `.into_boxed_slice()`
   - focused classifier regressions cover:
     - `classifier_direct_local_binding_maps_to_outermost_extension`
     - `classifier_field_target_maps_to_struct_field_scope`
@@ -647,6 +655,8 @@ If no local-path kind match applies:
     - `classifier_free_recursive_tree_list_teardown_is_blocked_free_shape`
     - `classifier_free_matrix_row_teardown_is_blocked_free_shape`
     - `classifier_free_helper_destructor_cleanup_is_blocked_free_shape`
+    - `boxed_slice_census_distinguishes_ownership_from_remaining_raw_array_sites`
+    - `boxed_slice_census_is_complete`
     - `remaining_allocator_site_classification_is_complete`
     - `m9_wrapper_generalization_reduction_vs_verified_baseline`
 - Current consequence:
