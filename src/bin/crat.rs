@@ -211,6 +211,31 @@ struct Config {
     analysis_output: Option<PathBuf>,
 }
 
+fn has_dependency(dir: &Path, name: &str) -> bool {
+    let cargo_file = dir.join("Cargo.toml");
+    let Ok(content) = fs::read_to_string(cargo_file) else {
+        return false;
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(toml::Value::Table(dependencies)) = table.get("dependencies") else {
+        return false;
+    };
+    dependencies.contains_key(name)
+}
+
+fn remove_dependency(dir: &Path, name: &str) {
+    let path = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&path).unwrap();
+    let mut doc = content.parse::<toml_edit::DocumentMut>().unwrap();
+    let Some(dependencies) = doc["dependencies"].as_table_mut() else {
+        return;
+    };
+    dependencies.remove(name);
+    fs::write(path, doc.to_string()).unwrap();
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -496,25 +521,18 @@ fn main() {
                 .unwrap();
             }
             Pass::Punning => {
-                let had_bytemuck = union_replacer::union_use::utils::has_bytemuck(&dir);
-
-                let mut res = run_compiler_on_path(&file, |tcx| {
+                let had_bytemuck = has_dependency(&dir, "bytemuck");
+                if !had_bytemuck {
+                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
+                }
+                let res = run_compiler_on_path(&file, |tcx| {
                     union_replacer::union_use::replace_unions(tcx, config.verbose)
                 })
                 .unwrap();
 
-                if !had_bytemuck && res.needs_bytemuck {
-                    utils::add_dependency(&dir, "bytemuck", "1.24.0");
-                    union_replacer::union_use::utils::inject_bytemuck(&file);
-                    res = run_compiler_on_path(&file, |tcx| {
-                        union_replacer::union_use::replace_unions(tcx, config.verbose)
-                    })
-                    .unwrap();
-                }
-
                 if !had_bytemuck && !res.needs_bytemuck {
                     // remove the dependency if it is not needed
-                    union_replacer::union_use::utils::remove_bytemuck(&dir);
+                    remove_dependency(&dir, "bytemuck");
                 }
 
                 std::fs::write(&file, res.code).unwrap();

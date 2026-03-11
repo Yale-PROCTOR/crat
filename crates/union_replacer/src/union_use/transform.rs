@@ -8,7 +8,7 @@ use super::{
     callgraph::{build_union_call_contexts, collect_union_seed_functions},
     raw_struct::{
         RawStructVisitor, UnionUseRewriteVisitor, all_union_fields_are_pod,
-        classify_union_field_types, has_bytemuck_traits,
+        classify_union_field_types,
     },
     reverse_cfg::{analyze_reaching_writes, detect_overlapping_types},
     ty_visit::{collect_local_union_types, collect_union_related_types},
@@ -28,19 +28,6 @@ fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, o
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
 
-    // bytemuck trait visibility is needed for field classification
-    if !has_bytemuck_traits(tcx) {
-        if verbose {
-            println!("bytemuck traits are not visible in current tcx;");
-            println!("add bytemuck dependency and rerun this pass once.");
-        }
-        utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-        return TransformationResult {
-            code: pprust::crate_to_string_for_macros(&krate),
-            needs_bytemuck: true,
-        };
-    }
-
     // for debug
     let print_mir = false;
     let print_result = true;
@@ -48,7 +35,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     // collect union types and build call graphs
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
     let all_local_union_count = union_tys.len();
-    let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose);
+    let union_field_classes = classify_union_field_types(tcx, &union_tys, true);
     let pod_union_tys = union_tys
         .iter()
         .copied()

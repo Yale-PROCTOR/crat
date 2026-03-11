@@ -2,62 +2,20 @@ use rustc_ast::{Expr, ExprKind, Item, ItemKind, mut_visit, mut_visit::MutVisitor
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{
-    Ty, TyCtxt, TyKind, TypingMode,
+    Ty, TyCtxt, TyKind,
     adjustment::{Adjust, AutoBorrow, AutoBorrowMutability},
 };
-use rustc_span::{
-    Symbol,
-    def_id::{DefId, LocalDefId},
-};
-use rustc_trait_selection::infer::{InferCtxtExt as _, TyCtxtInferExt as _};
+use rustc_span::{Symbol, def_id::LocalDefId};
 use smallvec::{SmallVec, smallvec};
 use utils::ir::AstToHir;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldTypeClass {
-    AnyBitPattern,
-    NoUninit,
-    Pod,
-    Other,
-}
+use super::check::{BytemuckTypeClassifier, FieldTypeClass};
 
 #[derive(Debug, Clone)]
 pub struct UnionFieldClassification<'tcx> {
     pub field_name: String,
     pub field_ty: Ty<'tcx>,
     pub class: FieldTypeClass,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct BytemuckTraitIds {
-    any_bit_pattern: Option<DefId>,
-    no_uninit: Option<DefId>,
-    pod: Option<DefId>,
-}
-
-pub fn has_bytemuck_traits(tcx: TyCtxt<'_>) -> bool {
-    let trait_ids = resolve_bytemuck_trait_ids(tcx);
-    trait_ids.pod.is_some() || trait_ids.any_bit_pattern.is_some() || trait_ids.no_uninit.is_some()
-}
-
-fn resolve_bytemuck_trait_ids(tcx: TyCtxt<'_>) -> BytemuckTraitIds {
-    let mut trait_ids = BytemuckTraitIds::default();
-    for did in tcx.all_traits() {
-        if tcx.crate_name(did.krate).as_str() != "bytemuck" {
-            continue;
-        }
-        match tcx.item_name(did).as_str() {
-            "Pod" if trait_ids.pod.is_none() => trait_ids.pod = Some(did),
-            "AnyBitPattern" if trait_ids.any_bit_pattern.is_none() => {
-                trait_ids.any_bit_pattern = Some(did);
-            }
-            "NoUninit" if trait_ids.no_uninit.is_none() => {
-                trait_ids.no_uninit = Some(did);
-            }
-            _ => {}
-        }
-    }
-    trait_ids
 }
 
 /// Classify each local union field type into one of:
@@ -67,14 +25,10 @@ pub fn classify_union_field_types<'tcx>(
     union_tys: &[LocalDefId],
     verbose: bool,
 ) -> FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>> {
-    let trait_ids = resolve_bytemuck_trait_ids(tcx);
+    let mut classifier = BytemuckTypeClassifier::new(tcx);
     if verbose {
-        println!(
-            "\nBytemuck trait ids: Pod={:?}, AnyBitPattern={:?}, NoUninit={:?}",
-            trait_ids.pod, trait_ids.any_bit_pattern, trait_ids.no_uninit
-        );
+        println!("\nUnion field classification uses the local bytemuck rule reimplementation.");
     }
-    let mut class_cache: FxHashMap<Ty<'tcx>, FieldTypeClass> = FxHashMap::default();
     let mut results: FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>> =
         FxHashMap::default();
 
@@ -89,9 +43,7 @@ pub fn classify_union_field_types<'tcx>(
         if let TyKind::Adt(_, args) = union_ty_value.kind() {
             for field in union_adt.all_fields() {
                 let field_ty = field.ty(tcx, args);
-                let class = *class_cache
-                    .entry(field_ty)
-                    .or_insert_with(|| classify_field_type(tcx, union_ty, field_ty, trait_ids));
+                let class = classifier.classify_type(union_ty, field_ty);
                 fields.push(UnionFieldClassification {
                     field_name: field.ident(tcx).name.to_ident_string(),
                     field_ty,
@@ -128,46 +80,6 @@ pub fn all_union_fields_are_pod<'tcx>(
                 .iter()
                 .all(|field| field.class == FieldTypeClass::Pod)
     })
-}
-
-fn classify_field_type<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    owner: LocalDefId,
-    ty: Ty<'tcx>,
-    trait_ids: BytemuckTraitIds,
-) -> FieldTypeClass {
-    if trait_ids
-        .pod
-        .is_some_and(|did| ty_implements_trait(tcx, owner, ty, did))
-    {
-        return FieldTypeClass::Pod;
-    }
-    if trait_ids
-        .any_bit_pattern
-        .is_some_and(|did| ty_implements_trait(tcx, owner, ty, did))
-    {
-        return FieldTypeClass::AnyBitPattern;
-    }
-    if trait_ids
-        .no_uninit
-        .is_some_and(|did| ty_implements_trait(tcx, owner, ty, did))
-    {
-        return FieldTypeClass::NoUninit;
-    }
-    FieldTypeClass::Other
-}
-
-fn ty_implements_trait<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    owner: LocalDefId,
-    ty: Ty<'tcx>,
-    trait_def_id: DefId,
-) -> bool {
-    let param_env = tcx.param_env(owner);
-    let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
-    infcx
-        .type_implements_trait(trait_def_id, [ty], param_env)
-        .must_apply_modulo_regions()
 }
 
 #[derive(Debug, Clone)]
