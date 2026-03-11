@@ -5,7 +5,7 @@ use rustc_middle::ty::{
     Ty, TyCtxt, TyKind,
     adjustment::{Adjust, AutoBorrow, AutoBorrowMutability},
 };
-use rustc_span::{Symbol, def_id::LocalDefId};
+use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 use utils::ir::AstToHir;
 
@@ -84,8 +84,8 @@ pub fn all_union_fields_are_pod<'tcx>(
 
 #[derive(Debug, Clone)]
 struct UnionTransformInfo<'tcx> {
-    raw_name: String,
     size: u64,
+    align: u64,
     fields: Vec<UnionFieldClassification<'tcx>>,
 }
 
@@ -103,15 +103,17 @@ impl<'tcx> RawStructVisitor<'tcx> {
         let mut union_infos = FxHashMap::default();
         for &union_ty in union_tys {
             let name = tcx.item_name(union_ty.to_def_id()).as_str().to_string();
-            let raw_name = format!("{name}Raw");
             let ty = tcx.type_of(union_ty).instantiate_identity();
-            let size = utils::ir::ty_size(ty, union_ty.to_def_id(), tcx);
+            let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, union_ty);
+            let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
+            let size = layout.size.bytes();
+            let align = layout.align.abi.bytes();
             let fields = field_classes.get(&union_ty).cloned().unwrap_or_default();
             union_infos.insert(
                 name,
                 UnionTransformInfo {
-                    raw_name,
                     size,
+                    align,
                     fields,
                 },
             );
@@ -195,7 +197,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
     ) -> rustc_ast::ptr::P<Item> {
         let mut methods = String::new();
         methods.push_str(&format!(
-            "fn new() -> Self {{ Self {{ raw: [0u8; {}], _align: [] }} }}",
+            "fn new() -> Self {{ Self {{ raw: [0u8; {}] }} }}",
             info.size
         ));
 
@@ -215,7 +217,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
 impl MutVisitor for RawStructVisitor<'_> {
     fn flat_map_item(
         &mut self,
-        mut item: rustc_ast::ptr::P<Item>,
+        item: rustc_ast::ptr::P<Item>,
     ) -> SmallVec<[rustc_ast::ptr::P<Item>; 1]> {
         let union_name = match &item.kind {
             ItemKind::Union(ident, _, _) => ident.name.as_str().to_string(),
@@ -225,22 +227,17 @@ impl MutVisitor for RawStructVisitor<'_> {
             return mut_visit::walk_flat_map_item(self, item);
         };
 
-        // let mut align = info.size;
-        if let ItemKind::Union(ident, _, _) = &mut item.kind {
-            ident.name = Symbol::intern(&info.raw_name);
-        }
-
         let mut struct_item = rustc_ast::ptr::P(utils::item!(
-            "#[repr(C)] struct {} {{ raw: [u8; {}], _align: [{}; 0] }}",
+            "#[repr(C, align({}))] struct {} {{ raw: [u8; {}] }}",
+            info.align,
             union_name,
-            info.size,
-            info.raw_name
+            info.size
         ));
         struct_item.vis = item.vis.clone();
         let access_impl_item = self.make_access_impl_item(&union_name, info);
         let init_impl_item = self.make_init_impl_item(&union_name, info);
 
-        smallvec![item, struct_item, access_impl_item, init_impl_item]
+        smallvec![struct_item, access_impl_item, init_impl_item]
     }
 }
 

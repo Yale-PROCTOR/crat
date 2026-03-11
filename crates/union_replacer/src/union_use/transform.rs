@@ -100,7 +100,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    if verbose {
+    if true {
         println!("\n{str}");
     }
 
