@@ -1,13 +1,13 @@
 use super::*;
 
-fn rewrite_with_config(code: &str, config: &Config) -> (String, bool, bool) {
+fn rewrite_with_config(code: &str, config: &Config) -> (String, bool) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(config, tcx))
         .unwrap()
 }
 
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
-    let (s, _, _) = rewrite_with_config(code, &config);
+    let (s, _) = rewrite_with_config(code, &config);
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     for include in includes {
         assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");

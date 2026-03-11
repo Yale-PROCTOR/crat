@@ -1713,12 +1713,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let (base, source_inner_ty) = self
                         .projected_opt_boxed_slice_expr(&pe, m)
                         .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
-                    *ptr = self.cursor_from_slice_or_cursor_inner(
+                    *ptr = self.cursor_from_slice_or_cursor(
                         &base,
+                        &pe,
                         m,
                         lhs_inner_ty,
                         source_inner_ty,
-                        true,
                     );
                     return PtrKind::SliceCursor(m);
                 }
@@ -2707,7 +2707,7 @@ impl<'tcx> TransformVisitor<'tcx> {
     fn cursor_from_slice_or_cursor(
         &self,
         e: &Expr,
-        pe: &PtrExpr,
+        pe: &PtrExpr<'_, 'tcx>,
         m: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
