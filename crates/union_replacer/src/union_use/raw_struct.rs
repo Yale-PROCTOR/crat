@@ -118,6 +118,18 @@ pub fn classify_union_field_types<'tcx>(
     results
 }
 
+pub fn all_union_fields_are_pod<'tcx>(
+    field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
+    union_ty: LocalDefId,
+) -> bool {
+    field_classes.get(&union_ty).is_some_and(|fields| {
+        !fields.is_empty()
+            && fields
+                .iter()
+                .all(|field| field.class == FieldTypeClass::Pod)
+    })
+}
+
 fn classify_field_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner: LocalDefId,
@@ -301,6 +313,7 @@ impl MutVisitor for RawStructVisitor<'_> {
             return mut_visit::walk_flat_map_item(self, item);
         };
 
+        // let mut align = info.size;
         if let ItemKind::Union(ident, _, _) = &mut item.kind {
             ident.name = Symbol::intern(&info.raw_name);
         }

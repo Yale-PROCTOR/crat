@@ -108,16 +108,11 @@ pub fn inject_bytemuck(file: &Path) {
 pub fn with_body<'tcx, R, F: FnOnce(&Body<'tcx>) -> R>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    use_optimized_mir: bool,
     f: F,
 ) -> R {
-    if use_optimized_mir {
-        f(tcx.optimized_mir(def_id.to_def_id()))
-    } else {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body: &Body<'_> = &body.borrow();
-        f(body)
-    }
+    let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+    let body: &Body<'_> = &body.borrow();
+    f(body)
 }
 
 #[derive(Clone, Copy)]
@@ -270,7 +265,6 @@ fn print_local_body<'tcx>(
     result: &andersen::AnalysisResult,
     print_mir: bool,
     infos: &[LocalLocInfo],
-    use_optimized_mir: bool,
 ) -> Option<Vec<DefId>> {
     let mut func_calls = Vec::new();
     if tcx.def_kind(def_id) != DefKind::Fn {
@@ -280,24 +274,16 @@ fn print_local_body<'tcx>(
         println!("\nDEF: {def_id:?}");
     }
 
-    if use_optimized_mir {
-        let body: &Body<'_> = tcx.optimized_mir(def_id.to_def_id());
-        print_body(def_id, tcx, body, result, print_mir, infos, &mut func_calls);
-    } else {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
-        let body: &Body<'_> = &body.borrow();
-        print_body(def_id, tcx, body, result, print_mir, infos, &mut func_calls);
-    }
+    let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+    let body: &Body<'_> = &body.borrow();
+    print_body(def_id, tcx, body, result, print_mir, infos, &mut func_calls);
+
     Some(func_calls)
 }
 
-pub fn print_all_local_bodies_with_points_to(
-    tcx: TyCtxt<'_>,
-    result: &andersen::AnalysisResult,
-    use_optimized_mir: bool,
-) {
+pub fn print_all_local_bodies_with_points_to(tcx: TyCtxt<'_>, result: &andersen::AnalysisResult) {
     let infos = build_local_loc_infos(result);
     for def_id in tcx.hir_body_owners() {
-        let _ = print_local_body(def_id, tcx, result, true, &infos, use_optimized_mir);
+        let _ = print_local_body(def_id, tcx, result, true, &infos);
     }
 }

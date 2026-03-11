@@ -170,7 +170,6 @@ pub fn build_union_call_contexts<'tcx>(
     tcx: TyCtxt<'tcx>,
     seed_functions: &SeedFuncs,
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
-    use_optimized_mir: bool,
     verbose: bool,
 ) -> FxHashMap<LocalDefId, UnionCallContext> {
     // Debug step option
@@ -279,7 +278,7 @@ pub fn build_union_call_contexts<'tcx>(
                 }
             }
 
-            let callees = collect_direct_callees(tcx, caller, &mut callee_cache, use_optimized_mir);
+            let callees = collect_direct_callees(tcx, caller, &mut callee_cache);
             if verbose && verbose_callgraph_steps {
                 println!(
                     "\t\tDirect callees from {}: {}",
@@ -380,7 +379,7 @@ pub fn build_union_call_contexts<'tcx>(
             for &callee in callees {
                 let returns = return_cache
                     .entry(callee)
-                    .or_insert_with(|| collect_return_locations(tcx, callee, use_optimized_mir));
+                    .or_insert_with(|| collect_return_locations(tcx, callee));
                 for &ret in returns.iter() {
                     entries.push((callee, ret));
                 }
@@ -431,7 +430,7 @@ pub fn _build_union_callgraphs<'tcx>(
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     verbose: bool,
 ) -> FxHashMap<LocalDefId, CallGraph> {
-    build_union_call_contexts(tcx, seed_functions, related_types_map, false, verbose)
+    build_union_call_contexts(tcx, seed_functions, related_types_map, verbose)
         .into_iter()
         .map(|(union_ty, ctx)| (union_ty, ctx.callgraph))
         .collect()
@@ -441,22 +440,17 @@ fn collect_direct_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     cache: &mut FxHashMap<DefId, Vec<DirectCallee<'tcx>>>,
-    use_optimized_mir: bool,
 ) -> Vec<DirectCallee<'tcx>> {
     if let Some(cached) = cache.get(&def_id) {
         return cached.clone();
     }
 
-    let collected = do_collect_direct_callees(tcx, def_id, use_optimized_mir);
+    let collected = do_collect_direct_callees(tcx, def_id);
     cache.insert(def_id, collected.clone());
     collected
 }
 
-fn do_collect_direct_callees<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    use_optimized_mir: bool,
-) -> Vec<DirectCallee<'tcx>> {
+fn do_collect_direct_callees<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Vec<DirectCallee<'tcx>> {
     if !is_expandable_def(tcx, def_id) {
         return Vec::new();
     }
@@ -468,7 +462,7 @@ fn do_collect_direct_callees<'tcx>(
 
     let mut callees = Vec::new();
 
-    with_body(tcx, local_def_id, use_optimized_mir, |body| {
+    with_body(tcx, local_def_id, |body| {
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             let location = Location {
                 block,
@@ -514,12 +508,8 @@ fn collect_local_functions_from_callgraph(callgraph: &CallGraph) -> Vec<LocalDef
     locals.into_iter().collect::<Vec<_>>()
 }
 
-fn collect_return_locations<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    use_optimized_mir: bool,
-) -> Vec<Location> {
-    with_body(tcx, def_id, use_optimized_mir, |body| {
+fn collect_return_locations<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<Location> {
+    with_body(tcx, def_id, |body| {
         let mut returns = Vec::new();
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             if matches!(bbd.terminator().kind, TerminatorKind::Return) {

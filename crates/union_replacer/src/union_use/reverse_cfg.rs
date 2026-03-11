@@ -50,7 +50,6 @@ pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
-    use_optimized_mir: bool,
 ) -> ReverseCfgResult {
     let mut result = FxHashMap::default();
 
@@ -64,12 +63,8 @@ pub fn analyze_reaching_writes<'tcx>(
 
         let mut instances = FxHashMap::default();
         for (&instance, instance_uses) in &type_uses.instances {
-            let reaching = analyze_instance_reaching_writes(
-                tcx,
-                instance_uses,
-                &call_context.call_index,
-                use_optimized_mir,
-            );
+            let reaching =
+                analyze_instance_reaching_writes(tcx, instance_uses, &call_context.call_index);
             instances.insert(instance, reaching);
         }
 
@@ -179,7 +174,6 @@ fn analyze_instance_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance_uses: &UnionInstanceUses,
     call_index: &CallIndex,
-    use_optimized_mir: bool,
 ) -> ReadToWrites {
     let instance_index = build_instance_index(instance_uses);
 
@@ -187,13 +181,7 @@ fn analyze_instance_reaching_writes<'tcx>(
 
     let mut result = FxHashMap::default();
     for read in reads {
-        let writes = collect_reaching_writes_for_read(
-            tcx,
-            read,
-            &instance_index,
-            call_index,
-            use_optimized_mir,
-        );
+        let writes = collect_reaching_writes_for_read(tcx, read, &instance_index, call_index);
         result.insert(read, writes);
     }
     result
@@ -204,7 +192,6 @@ fn collect_reaching_writes_for_read<'tcx>(
     read: UnionRead,
     instance_index: &InstanceIndex,
     call_index: &CallIndex,
-    use_optimized_mir: bool,
 ) -> Vec<UnionWrite> {
     let mut found = FxHashSet::default();
     let mut visited = FxHashSet::default();
@@ -233,7 +220,7 @@ fn collect_reaching_writes_for_read<'tcx>(
                         found.extend(writes.iter().copied());
                     }
                     // Spread to the callsite
-                    with_body(tcx, active_callsite.caller, use_optimized_mir, |body| {
+                    with_body(tcx, active_callsite.caller, |body| {
                         for point in previous_points(
                             body,
                             active_callsite.caller,
@@ -262,7 +249,7 @@ fn collect_reaching_writes_for_read<'tcx>(
                             found.extend(writes.iter().copied());
                         }
                         // Spread to the callsite
-                        with_body(tcx, callsite.caller, use_optimized_mir, |body| {
+                        with_body(tcx, callsite.caller, |body| {
                             for point in
                                 previous_points(body, callsite.caller, callsite.call_location)
                             {
@@ -305,7 +292,7 @@ fn collect_reaching_writes_for_read<'tcx>(
                     continue;
                 }
 
-                with_body(tcx, def_id, use_optimized_mir, |body| {
+                with_body(tcx, def_id, |body| {
                     for point in previous_points(body, def_id, location) {
                         worklist.push(SearchState {
                             point,

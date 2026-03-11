@@ -157,7 +157,6 @@ enum Pass {
     Lock,
     Union,
     Punning,
-    UnionUse,
     Io,
     Pointer,
     Static,
@@ -497,13 +496,6 @@ fn main() {
                 .unwrap();
             }
             Pass::Punning => {
-                let s = run_compiler_on_path(&file, |tcx| {
-                    union_replacer::punning::replace_unions(tcx, config.verbose)
-                })
-                .unwrap();
-                std::fs::write(&file, s).unwrap();
-            }
-            Pass::UnionUse => {
                 let had_bytemuck = union_replacer::union_use::utils::has_bytemuck(&dir);
 
                 let mut res = run_compiler_on_path(&file, |tcx| {

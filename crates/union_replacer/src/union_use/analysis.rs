@@ -28,14 +28,13 @@ pub fn analyze(
     target_union_tys: &[LocalDefId],
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
     print_mir: bool,
-    use_optimized_mir: bool,
     verbose: bool,
 ) -> UnionUseResult {
     let arena = Arena::new();
-    let tss = ty_shape::get_ty_shapes(&arena, tcx, use_optimized_mir);
+    let tss = ty_shape::get_ty_shapes(&arena, tcx, false);
 
     let points_to_config = andersen::Config {
-        use_optimized_mir,
+        use_optimized_mir: false,
         c_exposed_fns: FxHashSet::default(),
     };
 
@@ -55,21 +54,14 @@ pub fn analyze(
     // }
 
     if print_mir {
-        print_all_local_bodies_with_points_to(tcx, &may_points_to, use_optimized_mir);
+        print_all_local_bodies_with_points_to(tcx, &may_points_to);
     }
 
     if verbose {
         println!("\nUnion use analysis result:");
     }
 
-    identify_union_uses(
-        tcx,
-        target_union_tys,
-        may_points_to,
-        call_contexts,
-        use_optimized_mir,
-        verbose,
-    )
+    identify_union_uses(tcx, target_union_tys, may_points_to, call_contexts, verbose)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -227,7 +219,6 @@ fn identify_union_uses(
     target_union_tys: &[LocalDefId],
     result: andersen::AnalysisResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
-    use_optimized_mir: bool,
     verbose: bool,
 ) -> UnionUseResult {
     let union_instances: Vec<UnionMemoryInstance> = result
@@ -266,7 +257,7 @@ fn identify_union_uses(
             continue;
         }
 
-        with_body(tcx, def_id, use_optimized_mir, |body| {
+        with_body(tcx, def_id, |body| {
             for (local, decl) in body.local_decls.iter_enumerated() {
                 let Some(node) = result.var_nodes.get(&(def_id, local)) else {
                     continue;
@@ -299,7 +290,7 @@ fn identify_union_uses(
             continue;
         }
 
-        let accesses = with_body(tcx, def_id, use_optimized_mir, |body| {
+        let accesses = with_body(tcx, def_id, |body| {
             let mut collector = BodyUnionAccessCollector::new(
                 tcx,
                 body,

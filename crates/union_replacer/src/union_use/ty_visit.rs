@@ -49,8 +49,8 @@ pub fn collect_local_union_types<'tcx>(
     tcx: &TyCtxt<'tcx>,
     verbose: bool,
 ) -> (Vec<LocalDefId>, TyVisitor<'tcx>) {
-    let ty_visitor = TyVisitor::new(*tcx);
-    let (union_tys, ty_visitor) = ty_visitor.analyse_tys(*tcx);
+    let mut ty_visitor = TyVisitor::new(*tcx);
+    let union_tys = ty_visitor.analyze_tys(*tcx);
 
     let union_vec = union_tys.into_iter().collect::<Vec<_>>();
 
@@ -111,8 +111,8 @@ impl<'tcx> TyVisitor<'tcx> {
     }
 
     // Return: (union_types, self)
-    pub fn analyse_tys(mut self, tcx: TyCtxt<'tcx>) -> (FxHashSet<LocalDefId>, Self) {
-        tcx.hir_visit_all_item_likes_in_crate(&mut self);
+    pub fn analyze_tys(&mut self, tcx: TyCtxt<'tcx>) -> FxHashSet<LocalDefId> {
+        tcx.hir_visit_all_item_likes_in_crate(self);
         let ftypes: FxHashSet<_> = self
             .foreign_types
             .iter()
@@ -125,7 +125,7 @@ impl<'tcx> TyVisitor<'tcx> {
                 union_types.insert(*ty);
             }
         }
-        (union_types, self)
+        union_types
     }
 
     /// Analyze union-related types: target union type -> (parent struct, fields)
