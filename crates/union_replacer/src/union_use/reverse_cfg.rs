@@ -74,18 +74,13 @@ pub fn analyze_reaching_writes<'tcx>(
     ReverseCfgResult { uses: result }
 }
 
-pub fn detect_overlapping_types<'tcx>(
+pub fn print_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
     analysis: &ReverseCfgResult,
-    verbose: bool,
-) -> Vec<LocalDefId> {
+) {
     let union_tys = union_uses.uses.keys().copied().collect::<Vec<_>>();
-    let mut overlapping_tys: Vec<LocalDefId> = Vec::new();
-
-    if verbose {
-        println!("\nReaching Writes:");
-    }
+    println!("\nReaching Writes:");
 
     for union_ty in union_tys {
         let Some(type_uses) = union_uses.uses.get(&union_ty) else {
@@ -94,47 +89,45 @@ pub fn detect_overlapping_types<'tcx>(
         let Some(type_result) = analysis.uses.get(&union_ty) else {
             continue;
         };
-        let mut is_overlapping = false;
-        if verbose {
-            println!("\t{}:", tcx.def_path_str(union_ty));
-        }
+        println!("\t{}:", tcx.def_path_str(union_ty));
 
         for instance in type_uses.instances.keys() {
-            if verbose {
-                println!(
-                    "\t\tInstance L{}..=L{}:",
-                    instance.root.index(),
-                    instance.end.index()
-                );
-            }
+            println!(
+                "\t\tInstance L{}..=L{}:",
+                instance.root.index(),
+                instance.end.index()
+            );
 
             let Some(reaching) = type_result.instances.get(instance) else {
-                if verbose {
-                    println!("\t\t\t(no reads)");
-                }
+                println!("\t\t\t(no reads)");
                 continue;
             };
 
             let reads = reaching.iter().collect::<Vec<_>>();
 
             if reads.is_empty() {
-                if verbose {
-                    println!("\t\t\t(no reads)");
-                }
+                println!("\t\t\t(no reads)");
                 continue;
             }
 
             for (read, writes) in reads {
                 let read_field = format_access(tcx, union_ty, read);
-                let read_field_ty = union_field_ty(tcx, union_ty, read.field);
+                let read_fields = read.field.to_fields(tcx, union_ty);
+                let read_field_ty = if read_fields.len() == 1 {
+                    let read_index = *read_fields.iter().next().unwrap();
+                    union_field_ty(
+                        tcx,
+                        union_ty,
+                        super::analysis::UnionAccessField::Field(read_index),
+                    )
+                } else {
+                    None
+                };
                 let writes = writes.clone();
 
                 let write_sites = writes
                     .into_iter()
                     .map(|write| {
-                        if is_overlapping_pair(tcx, union_ty, read, &write) {
-                            is_overlapping = true;
-                        }
                         format!(
                             "{:?}@{:?}\n\t\t\t\t\tfield:\t{}",
                             write.site.def_id,
@@ -145,29 +138,21 @@ pub fn detect_overlapping_types<'tcx>(
                     .collect::<Vec<_>>()
                     .join("\n\t\t\t\t");
 
-                if verbose {
-                    println!(
-                        "\t\t\tRead {:?}@{:?}\n\t\t\t\tfield:\t{}",
-                        read.site.def_id, read.site.location, read_field
-                    );
-                    if let Some(ty) = read_field_ty {
-                        println!("\t\t\t\ttype:\t{ty:?}");
-                    }
-                    if write_sites.is_empty() {
-                        println!("\t\t\t\tWrites:\t(none)");
-                    } else {
-                        println!("\t\t\t\tWrites:\n\t\t\t\t{write_sites}");
-                    }
+                println!(
+                    "\t\t\tRead {:?}@{:?}\n\t\t\t\tfield:\t{}",
+                    read.site.def_id, read.site.location, read_field
+                );
+                if let Some(ty) = read_field_ty {
+                    println!("\t\t\t\ttype:\t{ty:?}");
+                }
+                if write_sites.is_empty() {
+                    println!("\t\t\t\tWrites:\t(none)");
+                } else {
+                    println!("\t\t\t\tWrites:\n\t\t\t\t{write_sites}");
                 }
             }
         }
-
-        if is_overlapping && let Some(local) = union_ty.as_local() {
-            overlapping_tys.push(local);
-        }
     }
-
-    overlapping_tys
 }
 
 fn analyze_instance_reaching_writes<'tcx>(
@@ -363,19 +348,4 @@ fn previous_points<'tcx>(
     let mut seen = FxHashSet::default();
     out.retain(|p| seen.insert(*p));
     out
-}
-
-fn is_overlapping_pair<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    union_ty: DefId,
-    read: &UnionRead,
-    write: &UnionWrite,
-) -> bool {
-    let Some(read_ty) = union_field_ty(tcx, union_ty, read.field) else {
-        return false;
-    };
-    let Some(write_ty) = union_field_ty(tcx, union_ty, write.field) else {
-        return false;
-    };
-    read_ty != write_ty
 }

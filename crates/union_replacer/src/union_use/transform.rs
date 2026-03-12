@@ -1,16 +1,19 @@
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LocalDefId;
 use utils::ir::AstToHir;
 
 use super::{
-    analysis::analyze,
+    analysis::{UnionUseResult, analyze, union_field_ty},
     callgraph::{build_union_call_contexts, collect_union_seed_functions},
+    bytemuck::FieldTypeClass,
     raw_struct::{
-        RawStructVisitor, UnionUseRewriteVisitor, all_union_fields_are_pod,
+        RawStructVisitor, UnionFieldClassification, UnionUseRewriteVisitor,
         classify_union_field_types,
     },
-    reverse_cfg::{analyze_reaching_writes, detect_overlapping_types},
+    reverse_cfg::{ReverseCfgResult, analyze_reaching_writes, print_reaching_writes},
     ty_visit::{collect_local_union_types, collect_union_related_types},
     utils::needs_bytemuck,
 };
@@ -19,10 +22,6 @@ use super::{
 pub struct TransformationResult {
     pub code: String,
     pub needs_bytemuck: bool,
-}
-
-fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, overlapping: usize) {
-    println!("UNION_USE_STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
 }
 
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
@@ -35,44 +34,67 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     // collect union types and build call graphs
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
     let all_local_union_count = union_tys.len();
-    let union_field_classes = classify_union_field_types(tcx, &union_tys, true);
-    let pod_union_tys = union_tys
-        .iter()
-        .copied()
-        .filter(|union_ty| all_union_fields_are_pod(&union_field_classes, *union_ty))
+
+    let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose);
+    let allowed_pairs = build_allowed_pair_map(&union_field_classes);
+    let analysis_target_tys = union_tys
+        .into_iter()
+        .filter(|union_ty| {
+            allowed_pairs
+                .get(union_ty)
+                .is_some_and(|(allowed_reads, _)| !allowed_reads.is_empty())
+        })
         .collect::<Vec<_>>();
-    let analysis_target_count = pod_union_tys.len();
+    let analysis_target_count = analysis_target_tys.len();
 
     if verbose {
-        println!("\nPod-only target unions:");
-        if pod_union_tys.is_empty() {
+        println!("\nAnalysis target unions:");
+        if analysis_target_tys.is_empty() {
             println!("\t(none)");
         } else {
-            for union_ty in &pod_union_tys {
+            for union_ty in &analysis_target_tys {
                 println!("\t{}", tcx.def_path_str(*union_ty));
             }
         }
     }
 
-    if pod_union_tys.is_empty() {
+    if analysis_target_tys.is_empty() {
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         let code = pprust::crate_to_string_for_macros(&krate);
-        print_union_use_stats(all_local_union_count, analysis_target_count, 0);
+        if print_result {
+            print_union_use_stats(all_local_union_count, analysis_target_count, 0);
+        }
         return TransformationResult {
             code,
             needs_bytemuck: false,
         };
     }
 
-    let related_types_map = collect_union_related_types(&tcx, &pod_union_tys, &ty_visitor, verbose);
-    let seed_functions = collect_union_seed_functions(tcx, &pod_union_tys, verbose);
+    let related_types_map =
+        collect_union_related_types(&tcx, &analysis_target_tys, &ty_visitor, verbose);
+    let seed_functions = collect_union_seed_functions(tcx, &analysis_target_tys, verbose);
     let call_contexts =
         build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose);
 
     // analyze union uses and detect overlapping unions
-    let union_uses = analyze(tcx, &pod_union_tys, &call_contexts, print_mir, verbose);
+    let union_uses = analyze(
+        tcx,
+        &analysis_target_tys,
+        &call_contexts,
+        print_mir,
+        verbose,
+    );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
-    let overlapping_tys = detect_overlapping_types(tcx, &union_uses, &reaching_writes, verbose);
+    if verbose || print_result {
+        print_reaching_writes(tcx, &union_uses, &reaching_writes);
+    }
+    let overlapping_tys = determine_transformable_unions(
+        tcx,
+        &union_uses,
+        &reaching_writes,
+        &allowed_pairs,
+        verbose,
+    );
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
     if print_result {
@@ -100,7 +122,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
     let str = pprust::crate_to_string_for_macros(&krate);
-    if true {
+    if verbose {
         println!("\n{str}");
     }
 
@@ -116,4 +138,125 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         code: str,
         needs_bytemuck,
     }
+}
+
+fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, overlapping: usize) {
+    println!("UNION_USE_STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
+}
+
+/// type -> set of fields (allowed to read, allowed to write)
+type AllowedPairMap = FxHashMap<LocalDefId, (FxHashSet<usize>, FxHashSet<usize>)>;
+
+fn build_allowed_pair_map<'tcx>(
+    field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
+) -> AllowedPairMap {
+    let mut allowed = FxHashMap::default();
+
+    for (&union_ty, fields) in field_classes {
+        let mut allowed_reads = FxHashSet::default();
+        let mut allowed_writes = FxHashSet::default();
+        for (write_idx, write_field) in fields.iter().enumerate() {
+            if !matches!(write_field.class, FieldTypeClass::Pod) {
+                continue;
+            }
+            for (read_idx, read_field) in fields.iter().enumerate() {
+                if !matches!(read_field.class, FieldTypeClass::Pod) {
+                    continue;
+                }
+                allowed_writes.insert(write_idx);
+                allowed_reads.insert(read_idx);
+            }
+        }
+        if !allowed_reads.is_empty() || !allowed_writes.is_empty() {
+            allowed.insert(union_ty, (allowed_reads, allowed_writes));
+        }
+    }
+
+    allowed
+}
+fn determine_transformable_unions(
+    tcx: TyCtxt<'_>,
+    union_uses: &UnionUseResult,
+    reaching_writes: &ReverseCfgResult,
+    allowed_pairs: &AllowedPairMap,
+    verbose: bool,
+) -> Vec<LocalDefId> {
+    let mut target_unions = Vec::new();
+
+    for (&union_ty, type_uses) in &union_uses.uses {
+        let Some(local_union_ty) = union_ty.as_local() else {
+            continue;
+        };
+        let Some(union_allowed_pairs) = allowed_pairs.get(&local_union_ty) else {
+            continue;
+        };
+        let Some(type_result) = reaching_writes.uses.get(&union_ty) else {
+            unreachable!("Writes not found for union: {:?}", union_ty);
+        };   
+
+        let mut rejected = false;
+        let mut saw_allowed_pair = false;
+        let mut saw_cross_type_pair = false;
+
+        'instances: for instance in type_uses.instances.keys() {
+            let Some(read_to_writes) = type_result.instances.get(instance) else {
+                continue;
+            };
+            for (read, writes) in read_to_writes {
+                let read_fields = read.field.to_fields(tcx, union_ty);
+                if !read_fields.is_subset(&union_allowed_pairs.0) {
+                    rejected = true;
+                    break 'instances;
+                }
+
+                for write in writes {
+                    let write_fields = write.field.to_fields(tcx, union_ty);
+                    if !write_fields.is_subset(&union_allowed_pairs.1) {
+                        rejected = true;
+                        break 'instances;
+                    }
+                    saw_allowed_pair = true;
+                    if has_distinct_type_pair(tcx, union_ty, &write_fields, &read_fields) {
+                        saw_cross_type_pair = true;
+                    }
+                }
+            }
+        }
+
+        if verbose && rejected {
+            println!("\nRejecting {union_ty:?}");
+        }
+
+        if !rejected && saw_allowed_pair && saw_cross_type_pair {
+            target_unions.push(local_union_ty);
+        }
+    }
+
+    target_unions
+}
+
+fn has_distinct_type_pair(
+    tcx: TyCtxt<'_>,
+    union_ty: rustc_span::def_id::DefId,
+    write_fields: &FxHashSet<usize>,
+    read_fields: &FxHashSet<usize>,
+) -> bool {
+    for &write_idx in write_fields {
+        let Some(write_ty) =
+            union_field_ty(tcx, union_ty, super::analysis::UnionAccessField::Field(write_idx))
+        else {
+            continue;
+        };
+        for &read_idx in read_fields {
+            let Some(read_ty) =
+                union_field_ty(tcx, union_ty, super::analysis::UnionAccessField::Field(read_idx))
+            else {
+                continue;
+            };
+            if write_ty != read_ty {
+                return true;
+            }
+        }
+    }
+    false
 }

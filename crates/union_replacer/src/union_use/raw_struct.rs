@@ -9,7 +9,7 @@ use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 use utils::ir::AstToHir;
 
-use super::check::{BytemuckTypeClassifier, FieldTypeClass};
+use super::bytemuck::{BytemuckTypeClassifier, FieldTypeClass};
 
 #[derive(Debug, Clone)]
 pub struct UnionFieldClassification<'tcx> {

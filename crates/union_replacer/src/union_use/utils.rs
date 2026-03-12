@@ -7,7 +7,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
-use super::{check::FieldTypeClass, raw_struct::UnionFieldClassification};
+use super::{bytemuck::FieldTypeClass, raw_struct::UnionFieldClassification};
 
 pub fn needs_bytemuck<'tcx>(
     overlapping_tys: &[LocalDefId],
