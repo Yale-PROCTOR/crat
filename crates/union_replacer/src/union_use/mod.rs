@@ -1,6 +1,6 @@
 pub mod analysis;
-pub mod callgraph;
 pub mod bytemuck;
+pub mod callgraph;
 pub mod model;
 pub mod raw_struct;
 pub mod reverse_cfg;

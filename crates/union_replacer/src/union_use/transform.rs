@@ -7,8 +7,8 @@ use utils::ir::AstToHir;
 
 use super::{
     analysis::{UnionUseResult, analyze, union_field_ty},
-    callgraph::{build_union_call_contexts, collect_union_seed_functions},
     bytemuck::FieldTypeClass,
+    callgraph::{build_union_call_contexts, collect_union_seed_functions},
     raw_struct::{
         RawStructVisitor, UnionFieldClassification, UnionUseRewriteVisitor,
         classify_union_field_types,
@@ -88,13 +88,8 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     if verbose || print_result {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
-    let overlapping_tys = determine_transformable_unions(
-        tcx,
-        &union_uses,
-        &reaching_writes,
-        &allowed_pairs,
-        verbose,
-    );
+    let overlapping_tys =
+        determine_transformable_unions(tcx, &union_uses, &reaching_writes, &allowed_pairs, verbose);
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
     if print_result {
@@ -192,7 +187,7 @@ fn determine_transformable_unions(
         };
         let Some(type_result) = reaching_writes.uses.get(&union_ty) else {
             unreachable!("Writes not found for union: {:?}", union_ty);
-        };   
+        };
 
         let mut rejected = false;
         let mut saw_allowed_pair = false;
@@ -242,15 +237,19 @@ fn has_distinct_type_pair(
     read_fields: &FxHashSet<usize>,
 ) -> bool {
     for &write_idx in write_fields {
-        let Some(write_ty) =
-            union_field_ty(tcx, union_ty, super::analysis::UnionAccessField::Field(write_idx))
-        else {
+        let Some(write_ty) = union_field_ty(
+            tcx,
+            union_ty,
+            super::analysis::UnionAccessField::Field(write_idx),
+        ) else {
             continue;
         };
         for &read_idx in read_fields {
-            let Some(read_ty) =
-                union_field_ty(tcx, union_ty, super::analysis::UnionAccessField::Field(read_idx))
-            else {
+            let Some(read_ty) = union_field_ty(
+                tcx,
+                union_ty,
+                super::analysis::UnionAccessField::Field(read_idx),
+            ) else {
                 continue;
             };
             if write_ty != read_ty {
