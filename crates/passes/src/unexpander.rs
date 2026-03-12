@@ -16,7 +16,7 @@ use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{DUMMY_SP, Symbol, kw, sym};
 use serde::Deserialize;
 use smallvec::{SmallVec, smallvec};
-use thin_vec::thin_vec;
+use thin_vec::{ThinVec, thin_vec};
 use utils::{
     ast::{unwrap_paren, unwrap_paren_mut},
     attr, expr, item,
@@ -157,6 +157,9 @@ impl MutVisitor for AstVisitor<'_> {
                     *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
                 }
             }
+            ItemKind::Mod(_, _, ModKind::Loaded(items, ..)) => {
+                unexpand_cursor_macros(items);
+            }
             _ => {}
         }
         mut_visit::walk_item(self, item);
@@ -296,6 +299,71 @@ fn unwrap_addr_of(expr: &Expr) -> &Expr {
         unwrap_addr_of(e)
     } else {
         expr
+    }
+}
+
+fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
+    let mut cursor_read_types = vec![];
+    let mut cursor_ref_read_types = vec![];
+    let mut cursor_mut_types = vec![];
+
+    *items = items
+        .drain(..)
+        .filter(|item| {
+            if let ItemKind::Impl(imp) = &item.kind
+                && let Some(of_trait) = &imp.of_trait
+                && let Some(trait_seg) = of_trait.path.segments.last()
+                && let TyKind::Path(_, self_ty) = &imp.self_ty.kind
+                && let Some(self_seg) = self_ty.segments.last()
+            {
+                let self_name = self_seg.ident.name.as_str();
+                let trait_name = trait_seg.ident.name.as_str();
+                if self_name.starts_with("SliceCursor")
+                    && let Some(box GenericArgs::AngleBracketed(args)) = &trait_seg.args
+                    && let [AngleBracketedArg::Arg(GenericArg::Type(idx_ty))] = &args.args[..]
+                    && let TyKind::Path(_, idx_path) = &idx_ty.kind
+                    && let Some(idx_seg) = idx_path.segments.last()
+                {
+                    let ty = idx_seg.ident.name.to_string();
+
+                    if ty.contains("Range") {
+                        return false;
+                    }
+
+                    match (self_name, trait_name) {
+                        ("SliceCursor", "Index") => {
+                            cursor_read_types.push(ty);
+                            return false;
+                        }
+                        ("SliceCursorRef", "Index") => {
+                            cursor_ref_read_types.push(ty);
+                            return false;
+                        }
+                        ("SliceCursor", "IndexMut") => {
+                            cursor_mut_types.push(ty);
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            true
+        })
+        .collect();
+
+    if !cursor_read_types.is_empty() {
+        let args = cursor_read_types.join(", ");
+        items.push(P::new(item!("impl_readable_index!(SliceCursor, {args});")));
+    }
+    if !cursor_ref_read_types.is_empty() {
+        let args = cursor_ref_read_types.join(", ");
+        items.push(P::new(item!(
+            "impl_readable_index!(SliceCursorRef, {args});"
+        )));
+    }
+    if !cursor_mut_types.is_empty() {
+        let args = cursor_mut_types.join(", ");
+        items.push(P::new(item!("impl_mutable_index!({args});")));
     }
 }
 
