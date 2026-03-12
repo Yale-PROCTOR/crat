@@ -264,6 +264,39 @@
 //! ```rust,ignore
 //! { let __arg_0 = ((*p).x() + 1 as c_int) as c_int; (*p).set_x(__arg_0) }
 //! ```
+//! # Hoist self-referential indexing
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! s_inc[s_inc[64 as usize] as usize] =
+//!     (s_inc[s_inc[64 as usize] as usize] as core::ffi::c_int ^ 0x1f as core::ffi::c_int)
+//!         as u8;
+//! ```
+//!
+//! We hoist such indexes as follows:
+//!
+//! ```rust,ignore
+//! {
+//!     let __idx_0 = s_inc[64 as usize] as usize;
+//!     s_inc[__idx_0] = (s_inc[__idx_0] as core::ffi::c_int ^ 0x1f as core::ffi::c_int) as u8;
+//! }
+//! ```
+//!
+//! C2Rust may also generate pointer offset assignments like below:
+//!
+//! ```rust,ignore
+//! *s_inc.offset((*s_inc.offset(64 as isize) as isize) as isize) = 0 as core::ffi::c_uchar;
+//! ```
+//!
+//! We hoist such offsets as follows:
+//!
+//! ```rust,ignore
+//! {
+//!     let __idx_0 = (*s_inc.offset(64 as isize) as isize) as isize;
+//!     *s_inc.offset(__idx_0) = 0 as core::ffi::c_uchar;
+//! }
+//! ```
 
 use std::fmt::Write as _;
 
