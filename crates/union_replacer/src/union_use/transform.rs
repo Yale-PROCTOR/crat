@@ -29,14 +29,15 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
 
     // for debug
     let print_mir = false;
+    let verbose_debug = false;
     let print_result = true;
 
     // Collect union types
-    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, true);
+    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose_debug);
     let all_local_union_count = union_tys.len();
 
     // Classify field types and determine allowed read/write sets
-    let union_field_classes = classify_union_field_types(tcx, &union_tys, true);
+    let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose_debug);
     let allowed_rw = build_allowed_rw(&union_field_classes);
 
     // Filter unions to analyze based on the allowed read set
@@ -50,7 +51,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         .collect::<Vec<_>>();
     let analysis_target_count = analysis_target_tys.len();
 
-    if true {
+    if print_result {
         println!("\nAnalysis target unions:");
         if analysis_target_tys.is_empty() {
             println!("\t(none)");
@@ -61,12 +62,12 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         }
     }
 
-    // If there is no union to analyze, stop here
+    // If there is no union to analyze, early stop
     if analysis_target_tys.is_empty() {
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         let code = pprust::crate_to_string_for_macros(&krate);
         if print_result {
-            print_union_use_stats(all_local_union_count, analysis_target_count, 0);
+            print_union_use_stats(all_local_union_count, 0, 0);
         }
         return TransformationResult {
             code,
@@ -76,10 +77,10 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
 
     // Collect related types and call contexts for the unions to analyze
     let related_types_map =
-        collect_union_related_types(&tcx, &analysis_target_tys, &ty_visitor, verbose);
-    let seed_functions = collect_union_seed_functions(tcx, &analysis_target_tys, verbose);
+        collect_union_related_types(&tcx, &analysis_target_tys, &ty_visitor, verbose_debug);
+    let seed_functions = collect_union_seed_functions(tcx, &related_types_map, verbose_debug);
     let call_contexts =
-        build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose);
+        build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose_debug);
 
     // Analyze union uses and detect overlapping unions
     let union_uses = analyze(
@@ -87,17 +88,23 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         &analysis_target_tys,
         &call_contexts,
         print_mir,
-        verbose,
+        verbose_debug,
     );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
-    if true {
+    if verbose || print_result {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
-    let overlapping_tys =
-        determine_overlapping_unions(tcx, &union_uses, &reaching_writes, &allowed_rw, verbose);
+    let overlapping_tys = determine_overlapping_unions(
+        tcx,
+        &union_uses,
+        &reaching_writes,
+        &allowed_rw,
+        verbose_debug,
+    );
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
-    if print_result {
+    // Analysis done
+    if verbose || print_result {
         if !overlapping_tys.is_empty() {
             println!("\noverlapping:");
             for union_ty in &overlapping_tys {
@@ -126,7 +133,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         println!("\n{str}");
     }
 
-    if print_result {
+    if verbose || print_result {
         print_union_use_stats(
             all_local_union_count,
             analysis_target_count,
@@ -177,6 +184,7 @@ fn build_allowed_rw<'tcx>(
 
     allowed
 }
+
 fn determine_overlapping_unions(
     tcx: TyCtxt<'_>,
     union_uses: &UnionUseResult,

@@ -48,6 +48,7 @@ struct BodyUnionUseCollector<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     union_tys: &'a FxHashSet<LocalDefId>,
+    related_types_map: &'a FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     found_unions: FxHashSet<LocalDefId>,
 }
 
@@ -59,11 +60,17 @@ struct DirectCallee<'tcx> {
 }
 
 impl<'tcx, 'a> BodyUnionUseCollector<'tcx, 'a> {
-    fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>, union_tys: &'a FxHashSet<LocalDefId>) -> Self {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        union_tys: &'a FxHashSet<LocalDefId>,
+        related_types_map: &'a FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    ) -> Self {
         Self {
             tcx,
             body,
             union_tys,
+            related_types_map,
             found_unions: FxHashSet::default(),
         }
     }
@@ -72,14 +79,20 @@ impl<'tcx, 'a> BodyUnionUseCollector<'tcx, 'a> {
 impl<'tcx> MirVisitor<'tcx> for BodyUnionUseCollector<'tcx, '_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
         let ty = place.ty(self.body, self.tcx).ty;
-        collect_union_ids_from_ty(ty, self.union_tys, &mut self.found_unions);
+        collect_seed_unions_from_ty(
+            ty,
+            self.union_tys,
+            self.related_types_map,
+            &mut self.found_unions,
+        );
         self.super_place(place, context, location);
     }
 }
 
-fn collect_union_ids_from_ty<'tcx>(
+fn collect_seed_unions_from_ty<'tcx>(
     mut ty: Ty<'tcx>,
     union_tys: &FxHashSet<LocalDefId>,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     out: &mut FxHashSet<LocalDefId>,
 ) {
     loop {
@@ -94,6 +107,17 @@ fn collect_union_ids_from_ty<'tcx>(
             }
             ty::Ref(_, inner, _) => ty = *inner,
             ty::RawPtr(t, _) => ty = *t,
+            ty::Adt(adt, _) => {
+                let Some(local_def_id) = adt.did().as_local() else {
+                    break;
+                };
+                for (&union_ty, related) in related_types_map {
+                    if related.parent_types.contains(&local_def_id) {
+                        out.insert(union_ty);
+                    }
+                }
+                break;
+            }
             _ => break,
         }
     }
@@ -103,10 +127,10 @@ fn collect_union_ids_from_ty<'tcx>(
 /// functions that directly use the union type in their signature (arguments or return type).
 pub fn collect_union_seed_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
-    union_tys: &[LocalDefId],
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     verbose: bool,
 ) -> SeedFuncs {
-    let union_tys: FxHashSet<_> = union_tys.iter().copied().collect();
+    let union_tys: FxHashSet<_> = related_types_map.keys().copied().collect();
     let mut map: FxHashMap<LocalDefId, FxHashSet<LocalDefId>> = union_tys
         .iter()
         .copied()
@@ -120,18 +144,30 @@ pub fn collect_union_seed_functions<'tcx>(
 
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
         let body: &Body<'_> = &body.borrow();
+
+        // union types use in this function
         let mut found_unions = FxHashSet::default();
 
         for arg in body.args_iter() {
             let ty = body.local_decls[arg].ty;
-            collect_union_ids_from_ty(ty, &union_tys, &mut found_unions);
+            collect_seed_unions_from_ty(ty, &union_tys, related_types_map, &mut found_unions);
         }
 
-        let mut collector = BodyUnionUseCollector::new(tcx, body, &union_tys);
+        let mut collector = BodyUnionUseCollector::new(tcx, body, &union_tys, related_types_map);
         collector.visit_body(body);
         found_unions.extend(collector.found_unions);
 
+        for local_decl in body.local_decls.iter() {
+            collect_seed_unions_from_ty(
+                local_decl.ty,
+                &union_tys,
+                related_types_map,
+                &mut found_unions,
+            );
+        }
+
         for union_ty in found_unions {
+            // this function becomes a seed function for each union_ty
             map.entry(union_ty).or_default().insert(def_id);
         }
     }

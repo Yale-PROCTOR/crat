@@ -26,9 +26,7 @@ pub fn classify_union_field_types<'tcx>(
     verbose: bool,
 ) -> FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>> {
     let mut classifier = BytemuckTypeClassifier::new(tcx);
-    if verbose {
-        println!("\nUnion field classification uses the local bytemuck rule reimplementation.");
-    }
+
     let mut results: FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>> =
         FxHashMap::default();
 
