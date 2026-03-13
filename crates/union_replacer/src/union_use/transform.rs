@@ -31,23 +31,26 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     let print_mir = false;
     let print_result = true;
 
-    // collect union types and build call graphs
-    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose);
+    // Collect union types
+    let (union_tys, ty_visitor) = collect_local_union_types(&tcx, true);
     let all_local_union_count = union_tys.len();
 
-    let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose);
-    let allowed_pairs = build_allowed_pair_map(&union_field_classes);
+    // Classify field types and determine allowed read/write sets
+    let union_field_classes = classify_union_field_types(tcx, &union_tys, true);
+    let allowed_rw = build_allowed_rw(&union_field_classes);
+
+    // Filter unions to analyze based on the allowed read set
     let analysis_target_tys = union_tys
         .into_iter()
         .filter(|union_ty| {
-            allowed_pairs
+            allowed_rw
                 .get(union_ty)
                 .is_some_and(|(allowed_reads, _)| !allowed_reads.is_empty())
         })
         .collect::<Vec<_>>();
     let analysis_target_count = analysis_target_tys.len();
 
-    if verbose {
+    if true {
         println!("\nAnalysis target unions:");
         if analysis_target_tys.is_empty() {
             println!("\t(none)");
@@ -58,6 +61,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         }
     }
 
+    // If there is no union to analyze, stop here
     if analysis_target_tys.is_empty() {
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         let code = pprust::crate_to_string_for_macros(&krate);
@@ -70,13 +74,14 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         };
     }
 
+    // Collect related types and call contexts for the unions to analyze
     let related_types_map =
         collect_union_related_types(&tcx, &analysis_target_tys, &ty_visitor, verbose);
     let seed_functions = collect_union_seed_functions(tcx, &analysis_target_tys, verbose);
     let call_contexts =
         build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose);
 
-    // analyze union uses and detect overlapping unions
+    // Analyze union uses and detect overlapping unions
     let union_uses = analyze(
         tcx,
         &analysis_target_tys,
@@ -85,11 +90,11 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         verbose,
     );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
-    if verbose || print_result {
+    if true {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
     let overlapping_tys =
-        determine_transformable_unions(tcx, &union_uses, &reaching_writes, &allowed_pairs, verbose);
+        determine_overlapping_unions(tcx, &union_uses, &reaching_writes, &allowed_rw, verbose);
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
 
     if print_result {
@@ -139,41 +144,44 @@ fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, o
     println!("UNION_USE_STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
 }
 
-/// type -> set of fields (allowed to read, allowed to write)
+/// type -> set of fields (allowed_read, allowed_write)
 type AllowedPairMap = FxHashMap<LocalDefId, (FxHashSet<usize>, FxHashSet<usize>)>;
 
-fn build_allowed_pair_map<'tcx>(
+fn build_allowed_rw<'tcx>(
     field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
 ) -> AllowedPairMap {
     let mut allowed = FxHashMap::default();
 
     for (&union_ty, fields) in field_classes {
-        let mut allowed_reads = FxHashSet::default();
-        let mut allowed_writes = FxHashSet::default();
-        for (write_idx, write_field) in fields.iter().enumerate() {
-            if !matches!(write_field.class, FieldTypeClass::Pod) {
-                continue;
-            }
-            for (read_idx, read_field) in fields.iter().enumerate() {
-                if !matches!(read_field.class, FieldTypeClass::Pod) {
-                    continue;
+        let mut allowed_read = FxHashSet::default();
+        let mut allowed_write = FxHashSet::default();
+        for (field_idx, field) in fields.iter().enumerate() {
+            match field.class {
+                FieldTypeClass::Pod => {
+                    allowed_read.insert(field_idx);
+                    allowed_write.insert(field_idx);
                 }
-                allowed_writes.insert(write_idx);
-                allowed_reads.insert(read_idx);
+                FieldTypeClass::AnyBitPattern => {
+                    allowed_read.insert(field_idx);
+                }
+                FieldTypeClass::NoUninit => {
+                    allowed_write.insert(field_idx);
+                }
+                FieldTypeClass::Other => {}
             }
         }
-        if !allowed_reads.is_empty() || !allowed_writes.is_empty() {
-            allowed.insert(union_ty, (allowed_reads, allowed_writes));
+        if !allowed_read.is_empty() || !allowed_write.is_empty() {
+            allowed.insert(union_ty, (allowed_read, allowed_write));
         }
     }
 
     allowed
 }
-fn determine_transformable_unions(
+fn determine_overlapping_unions(
     tcx: TyCtxt<'_>,
     union_uses: &UnionUseResult,
     reaching_writes: &ReverseCfgResult,
-    allowed_pairs: &AllowedPairMap,
+    allowed_rw: &AllowedPairMap,
     verbose: bool,
 ) -> Vec<LocalDefId> {
     let mut target_unions = Vec::new();
@@ -182,7 +190,7 @@ fn determine_transformable_unions(
         let Some(local_union_ty) = union_ty.as_local() else {
             continue;
         };
-        let Some(union_allowed_pairs) = allowed_pairs.get(&local_union_ty) else {
+        let Some(union_allowed_pairs) = allowed_rw.get(&local_union_ty) else {
             continue;
         };
         let Some(type_result) = reaching_writes.uses.get(&union_ty) else {
