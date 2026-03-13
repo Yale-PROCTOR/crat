@@ -527,10 +527,14 @@ impl<'thir, 'tcx> thir::visit::Visitor<'thir, 'tcx> for ThirVisitor<'thir, 'tcx>
     }
 
     fn visit_expr(&mut self, expr: &'thir thir::Expr<'tcx>) {
-        if let rustc_middle::ty::TyKind::FnDef(def_id, _) = expr.ty.kind()
-            && let Some(def_id) = def_id.as_local()
-        {
-            self.callees.push(def_id);
+        match expr.ty.kind() {
+            rustc_middle::ty::TyKind::FnDef(def_id, _)
+            | rustc_middle::ty::TyKind::Closure(def_id, _) => {
+                if let Some(def_id) = def_id.as_local() {
+                    self.callees.push(def_id);
+                }
+            }
+            _ => {}
         }
         thir::visit::walk_expr(self, expr);
     }

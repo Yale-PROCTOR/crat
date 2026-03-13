@@ -24,7 +24,7 @@ use rustc_middle::{
         UnevaluatedConst,
         interpret::{GlobalAlloc, Scalar},
     },
-    ty::{List, Ty, TyCtxt, TyKind, adjustment::PointerCoercion},
+    ty::{Ty, TyCtxt, TyKind, adjustment::PointerCoercion},
 };
 use rustc_span::{Span, Symbol, source_map::Spanned};
 use typed_arena::Arena;
@@ -111,8 +111,12 @@ pub(super) fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> Analysi
                 if ident.as_str() != "_IO_FILE" =>
             {
                 let adt_def = tcx.adt_def(item.owner_id);
+                let ty = tcx.type_of(local_def_id).instantiate_identity();
+                let TyKind::Adt(_, generic_args) = ty.kind() else {
+                    continue;
+                };
                 for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
-                    let ty = fd.ty(tcx, List::empty());
+                    let ty = fd.ty(tcx, generic_args);
                     if utils::file::contains_file_ty(ty, tcx) {
                         locs.push(MirLoc::Field(local_def_id, i));
                     }

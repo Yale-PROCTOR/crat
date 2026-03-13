@@ -187,9 +187,13 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     self.add_binding(loc, f.span);
                 }
                 let adt_def = self.tcx.adt_def(def_id);
+                let adt_ty = self.tcx.type_of(def_id).instantiate_identity();
+                let TyKind::Adt(_, generic_args) = adt_ty.kind() else {
+                    return;
+                };
                 for variant in adt_def.variants() {
                     for (i, field) in variant.fields.iter_enumerated() {
-                        let ty = field.ty(self.tcx, rustc_middle::ty::List::empty());
+                        let ty = field.ty(self.tcx, generic_args);
                         let owned_def_id = some_or!(owned_def_id(ty), continue);
                         self.ctx
                             .struct_to_owning_structs
