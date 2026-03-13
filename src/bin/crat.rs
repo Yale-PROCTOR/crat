@@ -526,7 +526,7 @@ fn main() {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
                 let res = run_compiler_on_path(&file, |tcx| {
-                    union_replacer::union_use::replace_unions(tcx, config.verbose)
+                    union_replacer::punning::replace_unions(tcx, config.verbose)
                 })
                 .unwrap();
 

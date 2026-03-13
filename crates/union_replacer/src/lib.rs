@@ -17,9 +17,9 @@ extern crate smallvec;
 extern crate thin_vec;
 
 mod must_analysis;
+pub mod punning;
 pub mod tag_analysis;
 mod ty_finder;
-pub mod union_use;
 mod util;
 
 pub use tag_analysis::Config;
