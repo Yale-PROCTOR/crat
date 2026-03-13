@@ -22,6 +22,7 @@ use super::{
 pub struct TransformationResult {
     pub code: String,
     pub needs_bytemuck: bool,
+    pub union_use_stats: (usize, usize, usize),
 }
 
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
@@ -72,6 +73,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         return TransformationResult {
             code,
             needs_bytemuck: false,
+            union_use_stats: (all_local_union_count, 0, 0),
         };
     }
 
@@ -144,11 +146,16 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     TransformationResult {
         code: str,
         needs_bytemuck,
+        union_use_stats: (
+            all_local_union_count,
+            analysis_target_count,
+            overlapping_tys.len(),
+        ),
     }
 }
 
 fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, overlapping: usize) {
-    println!("UNION_USE_STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
+    println!("STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
 }
 
 /// type -> set of fields (allowed_read, allowed_write)
