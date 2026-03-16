@@ -167,24 +167,31 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         && is_libc_ty(path.segments.last().unwrap().ident.as_str()))
             {
                 *ty = utils::ty!("{}", utils::ir::mir_ty_to_string(mir_ty, self.tcx));
-            } else if let Some(local_def_id) = def_id.as_local()
-                && let mod_id = self.tcx.parent_module(hir_ty.hir_id)
-                && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
-                    || self
-                        .imports
-                        .get(&mod_id)
-                        .is_some_and(|s| s.contains(&local_def_id)))
-                && let TyKind::Path(None, ast_path) = &mut ty.kind
-                && let Some(last_seg) = ast_path.segments.last().cloned()
-            {
-                ast_path.segments.clear();
-                ast_path.segments.push(last_seg);
+            } else if let TyKind::Path(None, ast_path) = &mut ty.kind {
+                self.shorten_path(ast_path, hir_ty.hir_id);
             }
         }
     }
 }
 
 impl<'tcx> AstVisitor<'tcx> {
+    fn shorten_path(&self, path: &mut Path, hir_id: hir::HirId) {
+        if let Some(&res) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Res::Def(_, def_id) = res
+            && let Some(local_def_id) = def_id.as_local()
+            && let mod_id = self.tcx.parent_module(hir_id)
+            && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
+                || self
+                    .imports
+                    .get(&mod_id)
+                    .is_some_and(|s| s.contains(&local_def_id)))
+            && let Some(last_seg) = path.segments.last().cloned()
+        {
+            path.segments.clear();
+            path.segments.push(last_seg);
+        }
+    }
+
     fn hir_expr_to_loc(&self, expr: &hir::Expr<'tcx>) -> Option<Location> {
         let expr = utils::hir::unwrap_drop_temps(expr);
         let (thir, _) = self.tcx.thir_body(expr.hir_id.owner).unwrap();
@@ -202,6 +209,16 @@ impl<'tcx> AstVisitor<'tcx> {
 
     fn visit_post(&self, expr: &mut Expr) {
         let id = expr.id;
+
+        match &mut expr.kind {
+            ExprKind::Struct(box StructExpr { path, .. }) | ExprKind::Path(None, path) => {
+                if let Some(hir_expr) = self.ast_to_hir.get_expr(id, self.tcx) {
+                    self.shorten_path(path, hir_expr.hir_id);
+                }
+            }
+            _ => {}
+        }
+
         match &mut expr.kind {
             ExprKind::Paren(e) => {
                 if is_atomic(e) {
@@ -702,6 +719,24 @@ mod tests {
             "mod m { pub struct S<'a, T>(&'a T); } use crate::m::S; fn f<'a>(x: &'a i32) { let _y: crate::m::S<'a, i32>; }",
             &["let _y: S<'a, i32>;"],
             &[],
+        )
+    }
+
+    #[test]
+    fn test_shorten_struct_construction_path() {
+        run_test(
+            "mod m { pub struct S { pub x: i32 } } use crate::m::S; fn f() -> crate::m::S { crate::m::S { x: 1 } }",
+            &["S { x: 1 }"],
+            &["crate::m::S {"],
+        )
+    }
+
+    #[test]
+    fn test_shorten_path_expr() {
+        run_test(
+            "mod m { pub fn g() {} } use crate::m::g; fn f() { crate::m::g(); }",
+            &["g()"],
+            &["crate::m::g()"],
         )
     }
 }
