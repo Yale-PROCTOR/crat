@@ -25,12 +25,13 @@
 - `Config`
   - `c_exposed_fns`; passed through to Andersen configuration.
   - Test-only field `force_ownership_analysis_failure`; forces the ownership-analysis fallback path for regression coverage.
-- `replace_local_borrows(config, tcx) -> (String, bool, bool)`
-  - End-to-end driver: build AST, run analyses, compute output-parameter facts, attempt ownership-analysis solidification, construct `TransformVisitor`, mutate AST, render source, optionally append `slice_cursor` module, return feature flags.
+- `replace_local_borrows(config, tcx) -> (String, bool)`
+  - End-to-end driver: build AST, run analyses, compute output-parameter facts, attempt ownership-analysis solidification, construct `TransformVisitor`, mutate AST, render source, optionally append `slice_cursor` module, return rewritten code plus the `bytemuck` usage flag.
 - `find_param_aliases(pre, points_to, tcx)`
   - Builds per-function param alias clusters by intersecting points-to sets across call-argument pairs.
 - `slice_cursor_mod_str()`
   - Returns the generated `crate::slice_cursor` runtime module source text.
+  - The emitted module includes `SliceCursor::{new, with_pos, empty, seek}` and `SliceCursorRef::{new, with_pos, empty, seek}`; position math uses `wrapping_add_signed`.
 
 ### `decision.rs`
 - `PtrKind`
@@ -48,7 +49,7 @@
     - top-level owning-by-local
     - output-parameter bitset
     - promoted mut/shared sets
-    - `needs_cursor` set derived from offset-sign facts via THIR->MIR binding mapping
+    - `needs_cursor` set derived directly from the postprocessed offset-sign MIR-local bitset
 - `DecisionMaker::decide(local, decl, aliases) -> Option<PtrKind>`
   - Core precedence-ordered local decision algorithm.
 - `SigDecisions::new(rust_program, analysis)`
@@ -87,10 +88,10 @@
    - mutability analysis
    - output-parameter analysis
    - attempted ownership-analysis solidification (`None` if unavailable or test-forced off)
-   - source-variable grouping postprocessing
+   - source-variable grouping postprocessing for promoted mutable/shared reference facts
    - promoted mutable/shared reference extraction
    - fatness analysis
-   - offset-sign analysis
+   - offset-sign analysis followed by source-variable-group postprocessing of local access-sign bitsets
 7. Build `Analysis` with the eight fields listed in Section 1.
 8. Construct `TransformVisitor::new(&input, &analysis_results, ast_to_hir)`:
    - computes `sig_decs = SigDecisions::new(...)`
@@ -98,7 +99,8 @@
 9. Mutate AST (`visitor.visit_crate(&mut krate)`).
 10. Render rewritten crate (`pprust::crate_to_string_for_macros`).
 11. If `visitor.slice_cursor` is true, append `slice_cursor_mod_str()`.
-12. Return `(rewritten_code, visitor.bytemuck.get(), slice_cursor_used)`.
+12. Return `(rewritten_code, visitor.bytemuck.get())`.
+    - `slice_cursor` usage is reflected only by whether the generated runtime module was appended to the rewritten source.
 
 ## 3) Decision Logic (`decision.rs`)
 
@@ -115,7 +117,7 @@ For one function (`did`), `DecisionMaker::new` computes:
 - `promoted_mut_refs` / `promoted_shared_refs`:
   - dense bitsets keyed by MIR `Local`.
 - `needs_cursor`:
-  - local requires cursor when offset-sign facts for its HIR binding report `needs_cursor()`.
+  - local requires cursor when the postprocessed offset-sign MIR-local bitset contains that local.
 
 Current consequence:
 - `_owning_pointers` and `_output_params` are now consulted by `decide`.
@@ -359,8 +361,8 @@ This matrix is for the branch where `PtrExpr` base resolves to:
 | `Raw` | direct / mutability cast | `opt_ref_from_raw` | panic without allocator-root evidence | `slice_from_raw` | panic without allocator-root length evidence | `cursor_from_raw` |
 | `OptRef` | `raw_from_opt_ref` | `opt_ref_from_opt_ref` | panic | `panic!` | panic | `panic!` |
 | `OptBox` | `raw_from_opt_box` | `opt_ref_from_opt_box` (same-type or same-size numeric bytemuck only) | `opt_box_from_opt_box` (same-type only) | panic | panic | panic |
-| `Slice` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` | panic | `plain_slice_from_slice` | panic | `cursor_from_plain_slice` |
-| `OptBoxedSlice` | `raw_from_slice_or_cursor` over projected boxed-slice view | `opt_ref_from_slice_or_cursor` over projected boxed-slice view | panic | boxed-slice view -> `plain_slice_from_expr` | `opt_boxed_slice_from_opt_boxed_slice` (identity only, no projections) | boxed-slice view -> `cursor_from_slice_or_cursor_inner(..., is_plain_slice=true)` |
+| `Slice` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` | panic | `plain_slice_from_slice` | panic | `cursor_from_plain_slice` (offset-only fast path may use `SliceCursor{Ref}::with_pos`) |
+| `OptBoxedSlice` | `raw_from_slice_or_cursor` over projected boxed-slice view | `opt_ref_from_slice_or_cursor` over projected boxed-slice view | panic | boxed-slice view -> `plain_slice_from_expr` | `opt_boxed_slice_from_opt_boxed_slice` (identity only, no projections) | boxed-slice view -> `cursor_from_slice_or_cursor` |
 | `SliceCursor` | `raw_from_slice_or_cursor` | `opt_ref_from_slice_or_cursor` (offset-only fast path uses `as_slice{_mut}`) | panic | `cursor_or_slice_to_slice_expr` | panic | `cursor_from_slice_or_cursor` (+ possible `to_ref_cursor`/`fork`) |
 
 `raw_from_opt_ref` foreign-type note:
@@ -368,11 +370,15 @@ This matrix is for the branch where `PtrExpr` base resolves to:
 
 Deref context behavior:
 - `Deref` targeting `Raw/OptRef/Slice` reuses corresponding conversions.
-- `Deref` on `SliceCursor` uses `cursor_from_slice_or_cursor_inner(..., is_plain_slice=false)` then indexing logic in `visit_expr`.
+- `Deref` on `SliceCursor` uses `cursor_from_cursor(...)` then indexing logic in `visit_expr`.
 - `Deref` on `OptBox` keeps same-type box identity, then `visit_expr` appends `.as_deref{_mut}().unwrap()`.
 - `Deref` on `OptBoxedSlice`:
   - no projections -> keeps same-type boxed-slice identity, then `visit_expr` appends `.as_deref{_mut}().unwrap()[0]`
   - with projections -> first materializes a plain slice expression, then `visit_expr` indexes `[0]`
+
+Cursor-position note:
+- When `cursor_from_plain_slice` sees exactly one offset projection and no cast, it emits `SliceCursor{Ref}::with_pos(base, offset as usize)` instead of materializing a sliced base first.
+- Cursor-to-cursor adaptation preserves position by transforming the existing cursor value directly; mutability downgrades use `.to_ref_cursor()`, and identity copies fork only when there are no projections and no cast.
 
 ### 6.5 Direct owning allocator-root materialization
 When the target context is `OptBox` or `OptBoxedSlice`, `transform_ptr` checks the normalized AST expression for direct allocator calls before entering the general conversion matrix:
@@ -597,6 +603,8 @@ If no local-path kind match applies:
     - const-pointer mutability preservation through `rewriter::decision::tests`
     - unsupported foreign `strdup` tail returns staying raw
     - raw struct-field pointer tail flows staying raw
+    - interprocedural negative-offset cursor propagation through `test_interproc_negative_offset_propagation`
+    - mutable-to-shared cursor position preservation through `test_cursor_mut_to_ref_preserves_pos`
   - Minimal toy array snippets in `tests.rs` are still conservative under the current analysis in some paths; the authoritative rewrite-compile proof for the broader array-owning surface is the landed B02 rewrite gate in Section 8.4
 
 ### 8.2 Rewriter decision tests
@@ -678,12 +686,12 @@ If no local-path kind match applies:
     - `remaining_malloc_sites=64`
     - `remaining_calloc_sites=13`
     - `primary_unlock_wrapper_generalization=46`
-  - the current post-M12 classifier totals are:
+  - the current post-M13 classifier totals are:
     - `remaining_malloc_sites=49`
-    - `remaining_calloc_sites=7`
+    - `remaining_calloc_sites=6`
     - `primary_unlock_wrapper_generalization=33`
-    - `alloc_policy_status:admissible_current_policy=6`
-  - the direct token census currently reads `malloc=86`, `calloc=20`, `free=254`
+    - `alloc_policy_status:admissible_current_policy=5`
+  - the direct token census currently reads `malloc=86`, `calloc=19`, `free=253`
   - M8 remains planning metadata only; M9 and M10 reduced wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
   - per-site fields:
