@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
-use rustc_abi::{FieldIdx, Size, VariantIdx};
-use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
+use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Local, Location, Operand,
-        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Local, Location, NullOp,
+        Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{AdtKind, Ty, TyKind, adjustment::PointerCoercion},
@@ -635,7 +635,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     AbsOption::Bot => AbsValue::bot(),
                 }
             }
-            ("", "option", _, "unwrap") => match &args[0].optionv {
+            ("", "option", _, "unwrap" | "expect") => match &args[0].optionv {
                 AbsOption::Top => AbsValue::top(),
                 AbsOption::Some(v) => v.clone(),
                 _ => AbsValue::bot(),
@@ -912,7 +912,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads_l.extend(reads_r);
                 (v, reads_l, cmps)
             }
-            Rvalue::NullaryOp(_, _) => unreachable!("{:?}", rvalue),
+            Rvalue::NullaryOp(op, _) => {
+                if matches!(op, NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(..)) {
+                    (AbsValue::top_uint(), vec![], vec![])
+                } else {
+                    unreachable!("{:?}", rvalue)
+                }
+            }
             Rvalue::UnaryOp(unary, operand) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match unary {
@@ -1070,6 +1076,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                     TyKind::Bool => AbsValue::alpha_bool(i.try_to_bool().unwrap()),
                     TyKind::Char => AbsValue::alpha_uint(i.to_u32() as _),
+                    TyKind::RawPtr(_, _) => AbsValue::null(),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
@@ -1086,24 +1093,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 TyKind::FnDef(def_id, _) => AbsValue::alpha_fn(*def_id),
                 _ => unreachable!("{:?}", ty),
             },
-            ConstValue::Slice { data, meta } => {
-                let size = Size::from_bytes(*meta);
-                let range = AllocRange {
-                    start: Size::ZERO,
-                    size,
-                };
-                let arr = data
-                    .inner()
-                    .get_bytes_strip_provenance(&self.tcx, range)
-                    .unwrap();
-                let msg = String::from_utf8(arr.to_vec()).unwrap();
-                if msg == "explicit panic" || msg == "internal error: entered unreachable code" {
-                    AbsValue::top()
-                } else {
-                    unreachable!("{:?}", msg)
-                }
-            }
-            ConstValue::Indirect { .. } => AbsValue::top(),
+            ConstValue::Slice { .. } | ConstValue::Indirect { .. } => AbsValue::top(),
         }
     }
 
