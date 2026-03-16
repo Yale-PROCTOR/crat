@@ -192,6 +192,15 @@ pub fn transform(
     let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let mut thir_to_mir = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
+        if !matches!(
+            tcx.hir_node_by_def_id(def_id),
+            HirNode::Item(HirItem {
+                kind: HirItemKind::Fn { .. },
+                ..
+            })
+        ) {
+            continue;
+        }
         thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
     }
 
