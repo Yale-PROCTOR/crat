@@ -25,7 +25,7 @@ use utils::{
     stmt, ty,
 };
 
-use crate::outparam_replacer::ai::analysis::*;
+use crate::ai::analysis::*;
 
 #[derive(Default, Clone, Copy, Debug)]
 struct Counter {
@@ -175,11 +175,7 @@ enum ReturnTyItem {
     Option(Param),
 }
 
-pub fn transform(
-    tcx: TyCtxt<'_>,
-    config: &crate::outparam_replacer::Config,
-    verbose: bool,
-) -> String {
+pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);

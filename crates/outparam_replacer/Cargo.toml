@@ -1,0 +1,17 @@
+[package]
+name = "outparam_replacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+points_to = { path = "../points_to" }
+etrace.workspace = true
+typed-arena.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lazy_static.workspace = true
+tracing.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true
