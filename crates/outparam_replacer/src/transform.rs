@@ -1259,9 +1259,7 @@ fn generate_default_init<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>
         MirTyKind::Float(_) => "0.0".to_string(),
         MirTyKind::Bool => "false".to_string(),
         MirTyKind::Char => "'\\0'".to_string(),
-        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Mut) => {
-            "0 as *mut _".to_string()
-        }
+        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Mut) => "0 as *mut _".to_string(),
         MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Not) => "0 as *const _".to_string(),
         MirTyKind::Adt(adt_def, generic_args) if adt_def.is_struct() => {
             let variant = adt_def.variant(rustc_abi::FIRST_VARIANT);
