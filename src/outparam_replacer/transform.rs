@@ -738,10 +738,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
             // add value, ref, flag local declarations
             for param in func.index_map.values() {
+                let default_init = primitive_default(&param.ty_str);
                 let value_decl = stmt!(
-                    "let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+                    "let mut {0}___v: {1} = {2};",
                     param.name,
-                    param.ty_str
+                    param.ty_str,
+                    default_init
                 );
                 let ref_decl = stmt!(
                     "let mut {0}: *mut {1} = &mut {0}___v;",
@@ -1233,5 +1235,18 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
             _ => {}
         }
         intravisit::walk_expr(self, expr);
+    }
+}
+
+fn primitive_default(ty: &str) -> String {
+    match ty {
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => "0".to_string(),
+        "f16" | "f32" | "f64" | "f128" => "0.0".to_string(),
+        "bool" => "false".to_string(),
+        "char" => "'\\0'".to_string(),
+        _ if ty.starts_with("*mut ") => "std::ptr::null_mut()".to_string(),
+        _ if ty.starts_with("*const ") => "std::ptr::null()".to_string(),
+        _ => format!("std::mem::transmute([0u8; std::mem::size_of::<{ty}>()])"),
     }
 }
