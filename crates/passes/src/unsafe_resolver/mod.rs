@@ -44,6 +44,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used_locals: FxHashSet::default(),
         item_mods: FxHashMap::default(),
         extern_c_fn_ptrs: FxHashSet::default(),
+        used_attr_items: vec![],
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let mut used = visitor.used;
@@ -64,10 +65,15 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut entries = visitor.mains;
     for f in visitor.fns {
         let name = tcx.item_name(f.to_def_id());
-        if config.c_exposed_fns.contains(name.as_str()) {
+        let has_exposed_export_name = tcx.get_attrs(f.to_def_id(), sym::export_name).any(|attr| {
+            attr.value_str()
+                .is_some_and(|s| config.c_exposed_fns.contains(s.as_str()))
+        });
+        if config.c_exposed_fns.contains(name.as_str()) || has_exposed_export_name {
             entries.push(f);
         }
     }
+    entries.extend(visitor.used_attr_items);
 
     let used_items: FxHashSet<_> = entries
         .iter()
@@ -204,7 +210,14 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
             ident, sig, body, ..
         }) = &mut item.kind
         {
-            let is_exposed_fn = self.config.c_exposed_fns.contains(ident.name.as_str());
+            let has_exposed_export_name = item.attrs.iter().any(|attr| {
+                attr.has_name(sym::export_name)
+                    && attr
+                        .value_str()
+                        .is_some_and(|s| self.config.c_exposed_fns.contains(s.as_str()))
+            });
+            let is_exposed_fn =
+                self.config.c_exposed_fns.contains(ident.name.as_str()) || has_exposed_export_name;
 
             if self.config.replace_pub
                 && item.vis.kind.is_pub()
@@ -324,6 +337,7 @@ struct HirVisitor<'tcx> {
     used_locals: FxHashSet<HirId>,
     item_mods: FxHashMap<LocalDefId, LocalModDefId>,
     extern_c_fn_ptrs: FxHashSet<LocalDefId>,
+    used_attr_items: Vec<LocalDefId>,
 }
 
 impl HirVisitor<'_> {
@@ -447,6 +461,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             }
             _ => {}
         }
+        if self.tcx.has_attr(item.owner_id.def_id, sym::used) {
+            self.used_attr_items.push(item.owner_id.def_id);
+        }
         intravisit::walk_item(self, item)
     }
 
@@ -489,6 +506,21 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             && let Some(def_id) = def_id.as_local()
         {
             self.extern_c_fn_ptrs.insert(def_id);
+        }
+        // Also detect implicit coercions to extern C function pointers
+        // (e.g., functions placed in static arrays of fn pointers).
+        if let hir::ExprKind::Path(ref qpath) = expr.kind
+            && let hir::QPath::Resolved(_, path) = qpath
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+            let adjusted_ty = typeck.expr_ty_adjusted(expr);
+            if let rustc_middle::ty::TyKind::FnPtr(_, hdr) = adjusted_ty.kind()
+                && !hdr.abi.is_rustic_abi()
+            {
+                self.extern_c_fn_ptrs.insert(def_id);
+            }
         }
         intravisit::walk_expr(self, expr);
     }

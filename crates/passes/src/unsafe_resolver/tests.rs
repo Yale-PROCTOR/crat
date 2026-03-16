@@ -363,6 +363,65 @@ unsafe fn g(mut x: i32) -> i32 {
     run_test(code, &["f"]);
 }
 
+#[test]
+fn test_transformation_unused_used_attr() {
+    let code = r#"
+#[used]
+static INIT: i32 = 42;
+fn main() {}
+"#;
+    run_transformation_test(code, true, &["fn main()", "#[used]", "static INIT"], &[]);
+}
+
+fn run_exposed_test(code: &str, c_exposed_fns: &[&str], includes: &[&str], excludes: &[&str]) {
+    let c_exposed_fns: FxHashSet<String> = c_exposed_fns.iter().map(|s| s.to_string()).collect();
+    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let config = super::Config {
+            remove_unused: true,
+            remove_no_mangle: false,
+            remove_extern_c: false,
+            replace_pub: false,
+            c_exposed_fns,
+        };
+        super::resolve_unsafe(&config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+        utils::type_check(tcx);
+    })
+    .expect(&transformed);
+    for include in includes {
+        assert!(
+            transformed.contains(include),
+            "{transformed}\ndoes not contain \"{include}\"",
+        );
+    }
+    for exclude in excludes {
+        assert!(
+            !transformed.contains(exclude),
+            "{transformed}\ncontains \"{exclude}\"",
+        );
+    }
+}
+
+#[test]
+fn test_transformation_export_name_exposed() {
+    let code = r#"
+#[export_name = "exposed"]
+fn exposed_0() {}
+fn other() {}
+fn main() {
+    exposed_0();
+}
+"#;
+    run_exposed_test(
+        code,
+        &["exposed"],
+        &["fn exposed_0()", "fn main()"],
+        &["fn other()"],
+    );
+}
+
 fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
         let config = super::Config {
@@ -405,6 +464,20 @@ extern "C" fn g(x: i32) -> i32 {
 fn main() {
     let p = f as extern "C" fn(i32) -> i32;
     g(0);
+}
+"#;
+    run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
+}
+
+#[test]
+fn test_extern_c_fn_in_static_array_preserved() {
+    let code = r#"
+extern "C" fn f() {}
+extern "C" fn g() {}
+#[used]
+static INIT_ARRAY: [extern "C" fn(); 1] = [f];
+fn main() {
+    g();
 }
 "#;
     run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);

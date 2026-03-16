@@ -619,24 +619,26 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     }
                 }
                 AggregateKind::Adt(_, v_idx, _, _, idx) => {
-                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
-                    let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
-                    let variant = adt_def.variant(*v_idx);
-                    for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
-                        if let Some(r) = self.transfer_op(f, ctx) {
-                            let i = if let Some(idx) = idx { *idx } else { i };
-                            let proj = ts[i.index()].0;
-                            let ty = d.ty(self.tcx, generic_args);
-                            self.transfer_assign(l.add(proj), r, ty);
+                    if let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] {
+                        let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
+                        let variant = adt_def.variant(*v_idx);
+                        for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
+                            if let Some(r) = self.transfer_op(f, ctx) {
+                                let i = if let Some(idx) = idx { *idx } else { i };
+                                let proj = ts[i.index()].0;
+                                let ty = d.ty(self.tcx, generic_args);
+                                self.transfer_assign(l.add(proj), r, ty);
+                            }
                         }
                     }
                 }
                 AggregateKind::Tuple => {
-                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
-                    let TyKind::Tuple(tys) = ty.kind() else { unreachable!() };
-                    for ((proj_ty, (proj, _)), f) in tys.iter().zip(ts).zip(fs) {
-                        if let Some(r) = self.transfer_op(f, ctx) {
-                            self.transfer_assign(l.add(*proj), r, proj_ty);
+                    if let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] {
+                        let TyKind::Tuple(tys) = ty.kind() else { unreachable!() };
+                        for ((proj_ty, (proj, _)), f) in tys.iter().zip(ts).zip(fs) {
+                            if let Some(r) = self.transfer_op(f, ctx) {
+                                self.transfer_assign(l.add(*proj), r, proj_ty);
+                            }
                         }
                     }
                 }
@@ -813,12 +815,13 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
 
     fn prefixed_loc(&self, place: Place<'tcx>, ctx: Context<'_, 'tcx>) -> PrefixedLoc {
         let mut index = 0;
-        let mut ty = ctx.locals[place.local].ty;
+        let mut mir_ty = ctx.locals[place.local].ty;
         let deref = place.is_indirect_first_projection();
         if deref {
-            ty = ty_shape::unwrap_ptr(ty).unwrap();
+            mir_ty = ty_shape::unwrap_ptr(mir_ty).unwrap();
         }
-        let mut ty = self.tss.tys[&ty];
+        let mut ty = self.tss.tys[&mir_ty];
+        let mut variant_field_offset = 0;
         for proj in place.projection {
             match proj {
                 PlaceElem::Deref => {}
@@ -826,11 +829,22 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     let TyShape::Array(t, _) = ty else { unreachable!() };
                     ty = t;
                 }
-                PlaceElem::Field(f, _) => {
+                PlaceElem::Downcast(_, variant_idx) => {
+                    let TyKind::Adt(adt_def, _) = mir_ty.kind() else { unreachable!() };
+                    variant_field_offset = adt_def
+                        .variants()
+                        .iter()
+                        .take(variant_idx.index())
+                        .map(|v| v.fields.len())
+                        .sum();
+                }
+                PlaceElem::Field(f, field_ty) => {
                     let TyShape::Struct(_, fs, _) = ty else { unreachable!() };
-                    let (i, nested_ty) = fs[f.index()];
+                    let (i, nested_ty) = fs[variant_field_offset + f.index()];
                     index += i;
                     ty = nested_ty;
+                    mir_ty = field_ty;
+                    variant_field_offset = 0;
                 }
                 _ => unreachable!(),
             }
