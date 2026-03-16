@@ -287,6 +287,7 @@ impl MutVisitor for TransformVisitor<'_> {
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "is_null" =>
             {
+                let receiver = unwrap_paren(receiver);
                 if matches!(receiver.kind, ExprKind::Path(_, _))
                     && let Some(hir_id) = self.hir_id_of_path(receiver.id)
                     && let Some(ptr_kind) = self.ptr_kinds.get(&hir_id)
@@ -333,6 +334,22 @@ impl MutVisitor for TransformVisitor<'_> {
                         .and_then(|sd| sd.output_dec)
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_rhs(ret, hir_ret, kind);
+                } else if let ty::TyKind::Tuple(tys) = sig.output().kind() {
+                    let ExprKind::Tup(elems) = &mut ret.kind else {
+                        panic!("expected tuple expr for tuple return type")
+                    };
+                    let hir::ExprKind::Tup(hir_elems) = hir_ret.kind else {
+                        panic!("expected HIR tuple expr for tuple return type")
+                    };
+                    for (i, elem_ty) in tys.iter().enumerate() {
+                        if let ty::TyKind::RawPtr(_, m) = elem_ty.kind() {
+                            self.transform_rhs(
+                                &mut elems[i],
+                                &hir_elems[i],
+                                PtrKind::Raw(m.is_mut()),
+                            );
+                        }
+                    }
                 }
             }
             ExprKind::Unary(UnOp::Deref, e) => {

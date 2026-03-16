@@ -848,6 +848,25 @@ pub unsafe extern "C" fn foo() -> *mut libc::c_int {
     );
 }
 
+/// Tuple return with a pointer element: p is promoted to Option<&mut>,
+/// and the return expression must coerce the tuple element back to raw.
+#[test]
+fn test_return_tuple_with_ptr() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> (libc::c_int, *mut libc::c_int) {
+    let mut x: libc::c_int = 42 as libc::c_int;
+    let mut p: *mut libc::c_int = &mut x;
+    *p = 10 as libc::c_int;
+    return (0 as libc::c_int, p);
+}
+"#,
+        &["Option<&mut"],
+        &[],
+    );
+}
+
 /// Slice deref fallback: `*p` on a Slice variable without offset → `(p)[0]`.
 /// When p is Slice but deref doesn't match the `&arr[start..]` pattern,
 /// the else branch at line 296 produces `(*p)[0]`.
