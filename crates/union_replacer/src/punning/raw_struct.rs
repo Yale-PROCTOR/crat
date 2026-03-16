@@ -72,12 +72,9 @@ pub fn all_union_fields_are_pod<'tcx>(
     field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
     union_ty: LocalDefId,
 ) -> bool {
-    field_classes.get(&union_ty).is_some_and(|fields| {
-        !fields.is_empty()
-            && fields
-                .iter()
-                .all(|field| field.class == FieldTypeClass::Pod)
-    })
+    field_classes
+        .get(&union_ty)
+        .is_some_and(|fields| !fields.is_empty() && fields.iter().all(|field| field.class.is_pod()))
 }
 
 #[derive(Debug, Clone)]
@@ -134,55 +131,31 @@ impl<'tcx> RawStructVisitor<'tcx> {
             let set = format!("set_{}", field.field_name);
             let size_expr = format!("core::mem::size_of::<{ty_s}>()");
 
-            let (get_body, get_ref_body, get_mut_body, set_body) = match field.class {
-                FieldTypeClass::Pod => (
-                    format!(
-                        "{{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }}"
-                    ),
-                    format!(
-                        "{{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }}"
-                    ),
-                    format!(
-                        "{{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }}"
-                    ),
-                    "{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }".to_string()
-                ),
-                FieldTypeClass::AnyBitPattern => (
-                    format!(
-                        "{{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }}"
-                    ),
-                    format!("{{ unsafe {{ &*(self.raw.as_ptr() as *const {ty_s}) }} }}"),
-                    format!("{{ unsafe {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} }}"),
-                    format!(
-                        "{{ unsafe {{ core::ptr::write(self.raw.as_mut_ptr() as *mut {ty_s}, value); }} }}"
-                    ),
-                ),
-                FieldTypeClass::NoUninit => (
-                    format!(
-                        "{{ unsafe {{ core::ptr::read(self.raw.as_ptr() as *const {ty_s}) }} }}"
-                    ),
-                    format!("{{ unsafe {{ &*(self.raw.as_ptr() as *const {ty_s}) }} }}"),
-                    format!("{{ unsafe {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} }}"),
-                    "{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }".to_string()
-                ),
-                FieldTypeClass::Other => (
-                    format!(
-                        "{{ unsafe {{ core::ptr::read(self.raw.as_ptr() as *const {ty_s}) }} }}"
-                    ),
-                    format!("{{ unsafe {{ &*(self.raw.as_ptr() as *const {ty_s}) }} }}"),
-                    format!("{{ unsafe {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} }}"),
-                    format!(
-                        "{{ unsafe {{ core::ptr::write(self.raw.as_mut_ptr() as *mut {ty_s}, value); }} }}"
-                    ),
-                ),
-            };
-
-            methods.push_str(&format!(
-                " fn {get}(&self) -> {ty_s} {get_body} \
-                  fn {get_ref}(&self) -> &{ty_s} {get_ref_body} \
-                  fn {get_mut}(&mut self) -> &mut {ty_s} {get_mut_body} \
-                  fn {set}(&mut self, value: {ty_s}) {set_body} "
-            ));
+            match field.class {
+                FieldTypeClass::Pod => methods.push_str(&format!(
+                    " fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      fn {get_mut}(&mut self) -> &mut {ty_s} {{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }} \
+                      fn {set}(&mut self, value: {ty_s}) {{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }} "
+                )),
+                FieldTypeClass::AnyBitPattern => methods.push_str(&format!(
+                    " fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} "
+                )),
+                FieldTypeClass::NoUninit(is_raw_ptr) => {
+                    let set_body = if is_raw_ptr {
+                        "let addr = value as usize; let bytes = bytemuck::bytes_of(&addr); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string()
+                    } else {
+                        "let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string()
+                    };
+                    methods.push_str(&format!(
+                        " unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
+                          fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
+                    ));
+                }
+                FieldTypeClass::Other => {}
+            }
         }
 
         rustc_ast::ptr::P(utils::item!("impl {} {{ {} }}", union_name, methods))
@@ -200,6 +173,9 @@ impl<'tcx> RawStructVisitor<'tcx> {
         ));
 
         for field in &info.fields {
+            if !field.class.is_writable() {
+                continue;
+            }
             let ty_s = utils::ir::mir_ty_to_string(field.field_ty, self.tcx);
             let new_field = format!("new_{}", field.field_name);
             let set_field = format!("set_{}", field.field_name);

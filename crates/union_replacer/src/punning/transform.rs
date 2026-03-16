@@ -7,7 +7,7 @@ use utils::ir::AstToHir;
 
 use super::{
     analysis::{UnionUseResult, analyze, union_field_ty},
-    bytemuck::FieldTypeClass,
+    bytemuck::{BytemuckDeriveVisitor, FieldTypeClass, build_bytemuck_derive_plan},
     callgraph::{build_union_call_contexts, collect_union_seed_functions},
     raw_struct::{
         RawStructVisitor, UnionFieldClassification, UnionUseRewriteVisitor,
@@ -93,7 +93,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         verbose_debug,
     );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
-    if verbose || print_result {
+    if true {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
     let overlapping_tys = determine_overlapping_unions(
@@ -120,11 +120,16 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
     // transform the AST
     let ast_to_hir: AstToHir = utils::ast::make_ast_to_hir(&mut krate, tcx);
 
-    // Step 1: replace unions with raw structs
+    // Step 1: derive bytemuck traits for user-defined field types
+    let derive_plan = build_bytemuck_derive_plan(tcx, &overlapping_tys, &union_field_classes);
+    let mut derive_visitor = BytemuckDeriveVisitor::new(derive_plan);
+    derive_visitor.visit_crate(&mut krate);
+
+    // Step 2: replace unions with raw structs
     let mut raw_struct_visitor = RawStructVisitor::new(tcx, &overlapping_tys, union_field_classes);
     raw_struct_visitor.visit_crate(&mut krate);
 
-    // Step 2: update union uses
+    // Step 3: update union uses
     let mut use_visitor = UnionUseRewriteVisitor::new(tcx, ast_to_hir, &overlapping_tys);
     use_visitor.visit_crate(&mut krate);
 
@@ -178,7 +183,7 @@ fn build_allowed_rw<'tcx>(
                 FieldTypeClass::AnyBitPattern => {
                     allowed_read.insert(field_idx);
                 }
-                FieldTypeClass::NoUninit => {
+                FieldTypeClass::NoUninit(_) => {
                     allowed_write.insert(field_idx);
                 }
                 FieldTypeClass::Other => {}

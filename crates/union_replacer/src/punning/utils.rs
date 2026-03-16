@@ -1,3 +1,5 @@
+use std::{fs, path::Path};
+
 use points_to::andersen;
 use rustc_hash::FxHashMap;
 use rustc_hir::def::DefKind;
@@ -7,7 +9,7 @@ use rustc_middle::{
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
-use super::{bytemuck::FieldTypeClass, raw_struct::UnionFieldClassification};
+use super::raw_struct::UnionFieldClassification;
 
 pub fn needs_bytemuck<'tcx>(
     overlapping_tys: &[LocalDefId],
@@ -16,7 +18,7 @@ pub fn needs_bytemuck<'tcx>(
     overlapping_tys.iter().any(|union_ty| {
         union_field_classes
             .get(union_ty)
-            .is_some_and(|fields| fields.iter().any(|f| f.class != FieldTypeClass::Other))
+            .is_some_and(|fields| fields.iter().any(|f| !f.class.is_other()))
     })
 }
 
@@ -201,4 +203,60 @@ pub fn print_all_local_bodies_with_points_to(tcx: TyCtxt<'_>, result: &andersen:
     for def_id in tcx.hir_body_owners() {
         let _ = print_local_body(def_id, tcx, result, true, &infos);
     }
+}
+
+pub fn ensure_bytemuck_with_derive(dir: &Path) {
+    let path = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&path).unwrap();
+    let updated = ensure_bytemuck_derive_in_manifest(&content);
+    if updated != content {
+        fs::write(path, updated).unwrap();
+    }
+}
+
+fn ensure_bytemuck_derive_in_manifest(content: &str) -> String {
+    const BYTEMUCK: &str = r#"bytemuck = { version = "1.24.0", features = ["derive"] }"#;
+
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut dep_start = None;
+    let mut dep_end = lines.len();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if dep_start.is_none() {
+            if trimmed == "[dependencies]" {
+                dep_start = Some(idx);
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            dep_end = idx;
+            break;
+        }
+    }
+
+    match dep_start {
+        Some(start) => {
+            if let Some(idx) =
+                (start + 1..dep_end).find(|&i| lines[i].trim().starts_with("bytemuck"))
+            {
+                lines[idx] = BYTEMUCK.to_string();
+            } else {
+                lines.insert(dep_end, BYTEMUCK.to_string());
+            }
+        }
+        None => {
+            if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("[dependencies]".to_string());
+            lines.push(BYTEMUCK.to_string());
+        }
+    }
+
+    let mut rendered = lines.join("\n");
+    if content.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
 }

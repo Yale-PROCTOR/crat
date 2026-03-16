@@ -1,7 +1,13 @@
 use rustc_abi::Size;
+use rustc_ast::{
+    Item, ItemKind,
+    mut_visit::{self, MutVisitor},
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind, TypeVisitableExt};
 use rustc_span::def_id::{DefId, LocalDefId};
+
+use super::raw_struct::UnionFieldClassification;
 
 // This module recreates the bytemuck 1.24.x derive rules
 // Assume AnyBitPattern + NoUninit = Pod, which is a stricter requirement than bytemuck's actual Pod.
@@ -9,15 +15,42 @@ use rustc_span::def_id::{DefId, LocalDefId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldTypeClass {
     AnyBitPattern,
-    NoUninit,
+    NoUninit(bool),
     Pod,
     Other,
+}
+
+impl FieldTypeClass {
+    pub fn is_other(self) -> bool {
+        matches!(self, Self::Other)
+    }
+
+    pub fn is_pod(self) -> bool {
+        matches!(self, Self::Pod)
+    }
+
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Pod | Self::NoUninit(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DerivedMarker {
     NoUninit,
     AnyBitPattern,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BytemuckDerive {
+    Zeroable,
+    AnyBitPattern,
+    NoUninit,
+    Pod,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BytemuckDerivePlan {
+    pub per_type: FxHashMap<String, FxHashSet<BytemuckDerive>>,
 }
 
 pub struct BytemuckTypeClassifier<'tcx> {
@@ -46,15 +79,38 @@ impl<'tcx> BytemuckTypeClassifier<'tcx> {
         match (is_any_bit_pattern, is_no_uninit) {
             (true, true) => FieldTypeClass::Pod,
             (true, false) => FieldTypeClass::AnyBitPattern,
-            (false, true) => FieldTypeClass::NoUninit,
+            (false, true) => FieldTypeClass::NoUninit(matches!(ty.kind(), TyKind::RawPtr(..))),
             (false, false) => FieldTypeClass::Other,
         }
+    }
+
+    pub fn derive_markers_for_type(&mut self, ty: Ty<'tcx>) -> FxHashSet<BytemuckDerive> {
+        let mut derives = FxHashSet::default();
+        let is_any_bit_pattern = self.is_derivable(ty, DerivedMarker::AnyBitPattern);
+        let is_no_uninit = self.is_derivable(ty, DerivedMarker::NoUninit);
+
+        match (is_any_bit_pattern, is_no_uninit) {
+            (true, true) => {
+                derives.insert(BytemuckDerive::Zeroable);
+                derives.insert(BytemuckDerive::Pod);
+            }
+            (true, false) => {
+                derives.insert(BytemuckDerive::AnyBitPattern);
+            }
+            (false, true) => {
+                derives.insert(BytemuckDerive::NoUninit);
+            }
+            (false, false) => {}
+        }
+
+        derives
     }
 
     fn primitive_class(ty: Ty<'tcx>) -> Option<FieldTypeClass> {
         match ty.kind() {
             TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => Some(FieldTypeClass::Pod),
-            TyKind::RawPtr(..) | TyKind::Char | TyKind::Bool => Some(FieldTypeClass::NoUninit),
+            TyKind::RawPtr(..) => Some(FieldTypeClass::NoUninit(true)),
+            TyKind::Char | TyKind::Bool => Some(FieldTypeClass::NoUninit(false)),
             TyKind::Array(elem, _) => Self::primitive_class(*elem),
             TyKind::Ref(..) | TyKind::Never | TyKind::FnDef(..) | TyKind::FnPtr(..) => {
                 Some(FieldTypeClass::Other)
@@ -180,5 +236,129 @@ impl<'tcx> BytemuckTypeClassifier<'tcx> {
         }
 
         cursor == layout.size
+    }
+}
+
+/// This function must be called after the analysis
+pub fn build_bytemuck_derive_plan<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    overlapping_tys: &[LocalDefId],
+    field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
+) -> BytemuckDerivePlan {
+    let mut builder = BytemuckDerivePlanBuilder::new(tcx);
+
+    for &union_ty in overlapping_tys {
+        let Some(fields) = field_classes.get(&union_ty) else {
+            continue;
+        };
+        for field in fields {
+            if !field.class.is_other() {
+                builder.collect_from_ty(field.field_ty);
+            }
+        }
+    }
+
+    builder.plan
+}
+
+struct BytemuckDerivePlanBuilder<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    classifier: BytemuckTypeClassifier<'tcx>,
+    visited_tys: FxHashSet<Ty<'tcx>>,
+    plan: BytemuckDerivePlan,
+}
+
+impl<'tcx> BytemuckDerivePlanBuilder<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            classifier: BytemuckTypeClassifier::new(tcx),
+            visited_tys: FxHashSet::default(),
+            plan: BytemuckDerivePlan::default(),
+        }
+    }
+
+    fn collect_from_ty(&mut self, ty: Ty<'tcx>) {
+        if !self.visited_tys.insert(ty) {
+            return;
+        }
+
+        match ty.kind() {
+            TyKind::Array(elem, _) => self.collect_from_ty(*elem),
+            TyKind::Adt(adt, args) if adt.is_struct() => {
+                let Some(local_def_id) = adt.did().as_local() else {
+                    return;
+                };
+                let derives = self.classifier.derive_markers_for_type(ty);
+
+                // if ty derives some bytemuck traits, record that in the plan
+                if !derives.is_empty() {
+                    self.plan
+                        .per_type
+                        .entry(self.tcx.item_name(local_def_id.to_def_id()).to_string())
+                        .or_default()
+                        .extend(derives);
+                }
+
+                // and then recursively check its fields
+                for field in adt.all_fields() {
+                    self.collect_from_ty(field.ty(self.tcx, args));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Visitor for bytemuck derives
+pub struct BytemuckDeriveVisitor {
+    derives_by_type: FxHashMap<String, Vec<BytemuckDerive>>,
+}
+
+impl BytemuckDeriveVisitor {
+    pub fn new(plan: BytemuckDerivePlan) -> Self {
+        let derives_by_type = plan
+            .per_type
+            .into_iter()
+            .map(|(name, derives)| {
+                let derives = derives.into_iter().collect::<Vec<_>>();
+                (name, derives)
+            })
+            .collect();
+        Self { derives_by_type }
+    }
+}
+
+impl MutVisitor for BytemuckDeriveVisitor {
+    fn visit_item(&mut self, item: &mut Item) {
+        mut_visit::walk_item(self, item);
+
+        let type_name = match &item.kind {
+            ItemKind::Struct(ident, _, _) => ident.name.as_str().to_string(),
+            _ => return,
+        };
+        let Some(derives) = self.derives_by_type.get(&type_name) else {
+            return;
+        };
+
+        let derive_list = derives
+            .iter()
+            .map(|derive| derive.path())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut new_attrs = utils::attr!("#[derive({derive_list})]");
+        new_attrs.extend(item.attrs.drain(..));
+        item.attrs = new_attrs;
+    }
+}
+
+impl BytemuckDerive {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Zeroable => "bytemuck::Zeroable",
+            Self::AnyBitPattern => "bytemuck::AnyBitPattern",
+            Self::NoUninit => "bytemuck::NoUninit",
+            Self::Pod => "bytemuck::Pod",
+        }
     }
 }
