@@ -220,51 +220,66 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                 else_opt,
                 ..
             } => {
-                let conds = cond_dest(cond, &thir, &mut ctx.nested_logical_exprs);
-                let mut true_targets = vec![];
-                let mut false_targets = vec![];
-                for cond in &conds {
-                    if let Some(targets) = ctx.find_switch_int(cond.expr_id) {
-                        let when_true = targets.otherwise();
-                        let when_false = targets.target_for_value(0);
-                        match cond.when_true {
-                            None => {}
-                            Some(true) => true_targets.push(when_true),
-                            Some(false) => false_targets.push(when_true),
-                        }
-                        match cond.when_false {
-                            None => {}
-                            Some(true) => true_targets.push(when_false),
-                            Some(false) => false_targets.push(when_false),
+                let cond_unwrapped = unwrap_expr(cond, &thir);
+                let (true_target, false_target) =
+                    if let ExprKind::Let { pat, .. } = &thir[cond_unwrapped].kind {
+                        // For `if let`, the SwitchInt span matches the pattern span,
+                        // not the Let expression span. Find the SwitchInt by pattern span.
+                        let pat_span: LoHi = pat.span.into();
+                        if let Some(targets) = ctx.find_switch_int_by_span(pat_span) {
+                            let true_target = targets.iter().next().unwrap().1;
+                            let false_target = targets.otherwise();
+                            (true_target, false_target)
+                        } else {
+                            ctx.print_debug("If let", pat_span);
+                            continue;
                         }
                     } else {
-                        ctx.print_debug("If", thir[cond.expr_id].span.into());
-                    }
-                }
-                let find_target = |targets: &[BasicBlock]| match targets {
-                    [] => panic!(),
-                    [bb] => *bb,
-                    _ => {
-                        let mut targets: Vec<_> = targets
-                            .iter()
-                            .map(|bb| {
-                                let term = body.basic_blocks[*bb].terminator();
-                                if let TerminatorKind::Goto { target } = term.kind {
-                                    vec![*bb, target]
-                                } else {
-                                    vec![*bb]
+                        let conds = cond_dest(cond, &thir, &mut ctx.nested_logical_exprs);
+                        let mut true_targets = vec![];
+                        let mut false_targets = vec![];
+                        for cond in &conds {
+                            if let Some(targets) = ctx.find_switch_int(cond.expr_id) {
+                                let when_true = targets.otherwise();
+                                let when_false = targets.target_for_value(0);
+                                match cond.when_true {
+                                    None => {}
+                                    Some(true) => true_targets.push(when_true),
+                                    Some(false) => false_targets.push(when_true),
                                 }
-                            })
-                            .collect();
-                        let mut target = targets.pop().unwrap();
-                        for target1 in targets {
-                            target.retain(|bb| target1.contains(bb));
+                                match cond.when_false {
+                                    None => {}
+                                    Some(true) => true_targets.push(when_false),
+                                    Some(false) => false_targets.push(when_false),
+                                }
+                            } else {
+                                ctx.print_debug("If", thir[cond.expr_id].span.into());
+                            }
                         }
-                        target[0]
-                    }
-                };
-                let true_target = find_target(&true_targets);
-                let false_target = find_target(&false_targets);
+                        let find_target = |targets: &[BasicBlock]| match targets {
+                            [] => panic!(),
+                            [bb] => *bb,
+                            _ => {
+                                let mut targets: Vec<_> = targets
+                                    .iter()
+                                    .map(|bb| {
+                                        let term = body.basic_blocks[*bb].terminator();
+                                        if let TerminatorKind::Goto { target } = term.kind {
+                                            vec![*bb, target]
+                                        } else {
+                                            vec![*bb]
+                                        }
+                                    })
+                                    .collect();
+                                let mut target = targets.pop().unwrap();
+                                for target1 in targets {
+                                    target.retain(|bb| target1.contains(bb));
+                                }
+                                target[0]
+                            }
+                        };
+                        (find_target(&true_targets), find_target(&false_targets))
+                    };
                 assert_ne!(true_target, false_target);
                 let if_blocks = IfBlocks {
                     true_entry: true_target,
@@ -862,6 +877,17 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         let term = self.get_terminator(loc);
         let TerminatorKind::SwitchInt { targets, .. } = &term.kind else { panic!() };
         Some(targets)
+    }
+
+    fn find_switch_int_by_span(&self, span: LoHi) -> Option<&'a SwitchTargets> {
+        let locs = self.term_span_to_locs.get(&span)?;
+        for loc in locs {
+            let term = self.get_terminator(*loc);
+            if let TerminatorKind::SwitchInt { targets, .. } = &term.kind {
+                return Some(targets);
+            }
+        }
+        None
     }
 
     fn find_assign_ty_location<P: Fn(Ty<'tcx>) -> bool>(
