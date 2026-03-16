@@ -34,16 +34,12 @@ use rustc_span::{
 };
 use serde::{Deserialize, Serialize};
 use typed_arena::Arena;
-use utils::ty_shape;
+use utils::{graph as graph_utils, ir as ir_utils, ir::hir_to_thir::HirToThir, ty_shape};
 
 use super::{
     domains::*,
     pre_analysis::{self, PreAnalysisContext},
     semantics::{CallKind, TransferedTerminator},
-};
-use crate::{
-    graph_utils,
-    ir_utils::{self, hir_to_thir::HirToThir},
 };
 
 // The result of the output parameter analysis
@@ -169,7 +165,7 @@ pub fn write_analysis_result(path: &Path, result: &AnalysisResult) {
 }
 
 pub fn analyze(
-    config: &crate::outparam_replacer::Config,
+    config: &crate::Config,
     verbose: bool,
     tcx: TyCtxt<'_>,
 ) -> (AnalysisResult, FunctionSummaries) {
@@ -602,10 +598,14 @@ pub fn analyze(
                 .borrow();
             let blocks = body.basic_blocks.len();
             let stmts = ir_utils::body_size(&body);
-            println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
+            if verbose {
+                println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
+            }
         }
     }
-    println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
+    if verbose {
+        println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
+    }
 
     summaries
         .into_iter()
@@ -643,7 +643,7 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
 pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
-    config: &'a crate::outparam_replacer::Config,
+    config: &'a crate::Config,
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: IndexVec<ArgIdx, Local>,
     pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
@@ -673,7 +673,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn new(
         tcx: TyCtxt<'tcx>,
         info: &'a FuncInfo,
-        config: &'a crate::outparam_replacer::Config,
+        config: &'a crate::Config,
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
         pre_context: PreAnalysisContext<'a>,
         local_decl: &'a IndexVec<Local, LocalDecl<'tcx>>,

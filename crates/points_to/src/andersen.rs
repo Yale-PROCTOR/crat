@@ -631,6 +631,15 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         }
                     }
                 }
+                AggregateKind::Tuple => {
+                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
+                    let TyKind::Tuple(tys) = ty.kind() else { unreachable!() };
+                    for ((proj_ty, (proj, _)), f) in tys.iter().zip(ts).zip(fs) {
+                        if let Some(r) = self.transfer_op(f, ctx) {
+                            self.transfer_assign(l.add(*proj), r, proj_ty);
+                        }
+                    }
+                }
                 _ => unreachable!(),
             },
             Rvalue::ShallowInitBox(_, _) => unreachable!(),

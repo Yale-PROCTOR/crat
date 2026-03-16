@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
-use rustc_abi::{FieldIdx, Size, VariantIdx};
-use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
-use rustc_hir as hir;
+use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Local, Location, Operand,
-        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Local, Location, NullOp,
+        Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{AdtKind, Ty, TyKind, adjustment::PointerCoercion},
@@ -414,37 +413,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         args: &[AbsValue],
         reads: &mut Vec<AbsPath>,
     ) -> AbsValue {
-        let node = self.tcx.hir_get_if_local(callee).unwrap();
-        if let hir::Node::ImplItem(item) = node {
-            let span_str = self.span_to_string(item.span);
-            assert_eq!(span_str, "BitfieldStruct", "{callee:?} {span_str}");
-            let reads2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
-            reads.extend(reads2);
-            if let hir::ImplItemKind::Fn(sig, _) = &item.kind {
-                match &sig.decl.output {
-                    hir::FnRetTy::Return(ty) => {
-                        if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind
-                            && let hir::def::Res::Def(_, def_id) = path.res
-                        {
-                            let ty = self.def_id_to_string(def_id);
-                            let ty = ty.split("::").last().unwrap();
-                            let v = match ty {
-                                "c_int" => AbsValue::top_int(),
-                                "c_uint" => AbsValue::top_uint(),
-                                _ => AbsValue::top(),
-                            };
-                            return v;
-                        }
-                    }
-                    hir::FnRetTy::DefaultReturn(_) => {
-                        let name = item.ident.name.to_ident_string();
-                        assert!(name.starts_with("set_"), "{callee:?}");
-                        return AbsValue::bot();
-                    }
-                }
-            }
+        let reads2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
+        reads.extend(reads2);
+        let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
+        let ret_ty = sig.output();
+        match ret_ty.kind() {
+            TyKind::Int(_) => AbsValue::top_int(),
+            TyKind::Uint(_) => AbsValue::top_uint(),
+            TyKind::Bool => AbsValue::top_bool(),
+            _ => AbsValue::top(),
         }
-        unreachable!("{:?}", callee)
     }
 
     fn transfer_c_call(
@@ -657,7 +635,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     AbsOption::Bot => AbsValue::bot(),
                 }
             }
-            ("", "option", _, "unwrap") => match &args[0].optionv {
+            ("", "option", _, "unwrap" | "expect") => match &args[0].optionv {
                 AbsOption::Top => AbsValue::top(),
                 AbsOption::Some(v) => v.clone(),
                 _ => AbsValue::bot(),
@@ -746,6 +724,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads1);
                 AbsValue::top_bool()
             }
+            ("", "vec" | "slice" | "f32" | "f64", _, _)
+            | ("fmt", _, _, _)
+            | (_, _, _, "panic_fmt") => AbsValue::top(),
             _ => todo!("{}", name),
         };
         (vec![v], vec![], call_kind)
@@ -931,7 +912,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads_l.extend(reads_r);
                 (v, reads_l, cmps)
             }
-            Rvalue::NullaryOp(_, _) => unreachable!("{:?}", rvalue),
+            Rvalue::NullaryOp(op, _) => {
+                if matches!(op, NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(..)) {
+                    (AbsValue::top_uint(), vec![], vec![])
+                } else {
+                    unreachable!("{:?}", rvalue)
+                }
+            }
             Rvalue::UnaryOp(unary, operand) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match unary {
@@ -1089,6 +1076,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                     TyKind::Bool => AbsValue::alpha_bool(i.try_to_bool().unwrap()),
                     TyKind::Char => AbsValue::alpha_uint(i.to_u32() as _),
+                    TyKind::RawPtr(_, _) => AbsValue::null(),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
@@ -1105,24 +1093,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 TyKind::FnDef(def_id, _) => AbsValue::alpha_fn(*def_id),
                 _ => unreachable!("{:?}", ty),
             },
-            ConstValue::Slice { data, meta } => {
-                let size = Size::from_bytes(*meta);
-                let range = AllocRange {
-                    start: Size::ZERO,
-                    size,
-                };
-                let arr = data
-                    .inner()
-                    .get_bytes_strip_provenance(&self.tcx, range)
-                    .unwrap();
-                let msg = String::from_utf8(arr.to_vec()).unwrap();
-                if msg == "explicit panic" || msg == "internal error: entered unreachable code" {
-                    AbsValue::top()
-                } else {
-                    unreachable!("{:?}", msg)
-                }
-            }
-            ConstValue::Indirect { .. } => AbsValue::top(),
+            ConstValue::Slice { .. } | ConstValue::Indirect { .. } => AbsValue::top(),
         }
     }
 
@@ -1151,7 +1122,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     let ty = format!("{adt:?}");
                     match ty.as_str() {
                         "std::option::Option" => AbsValue::top_option(),
-                        "libc::c_void" => AbsValue::top(),
+                        "libc::c_void" | "std::ffi::c_void" => AbsValue::top(),
                         _ => unreachable!("{:?}", ty),
                     }
                 }

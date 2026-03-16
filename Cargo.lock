@@ -122,6 +122,7 @@ dependencies = [
  "finders",
  "io_replacer",
  "lazy_static",
+ "outparam_replacer",
  "passes",
  "pointer_replacer",
  "points_to",
@@ -271,6 +272,20 @@ name = "once_cell_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
+
+[[package]]
+name = "outparam_replacer"
+version = "0.1.0"
+dependencies = [
+ "etrace",
+ "lazy_static",
+ "points_to",
+ "serde",
+ "serde_json",
+ "tracing",
+ "typed-arena",
+ "utils",
+]
 
 [[package]]
 name = "passes"

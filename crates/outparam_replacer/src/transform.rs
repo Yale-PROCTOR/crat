@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs::File, io::Write};
 
 use etrace::some_or;
 use rustc_ast::{
@@ -14,8 +10,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
-    Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, definitions::DefPathData,
-    intravisit,
+    Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, intravisit,
 };
 use rustc_index::IndexVec;
 use rustc_middle::{
@@ -23,15 +18,14 @@ use rustc_middle::{
     mir::{BasicBlock, Local, Location, TerminatorKind},
     ty::{TyCtxt, TyKind as MirTyKind},
 };
-use rustc_span::{FileName, RealFileName, Span, def_id::LocalDefId};
+use rustc_span::{Span, def_id::LocalDefId};
 use utils::{
-    ast::transform_ast,
     expr,
-    ir::{AstToHir, AstToHirMapper, HirToThir, ThirToMir, mir_ty_to_string},
+    ir::{AstToHir, HirToThir, ThirToMir, mir_ty_to_string},
     stmt, ty,
 };
 
-use crate::outparam_replacer::ai::analysis::*;
+use crate::ai::analysis::*;
 
 #[derive(Default, Clone, Copy, Debug)]
 struct Counter {
@@ -66,6 +60,8 @@ struct Param {
     simplify_ref_decl: bool,
     /// HirId of return and value written to param before return
     direct_returns: FxHashMap<HirId, String>,
+    /// default initializer expression for the type
+    default_init: String,
 }
 
 impl Param {
@@ -179,34 +175,30 @@ enum ReturnTyItem {
     Option(Param),
 }
 
-pub fn transform(
-    tcx: TyCtxt<'_>,
-    dir: &Path,
-    lib_name: &str,
-    config: &crate::outparam_replacer::Config,
-) {
+pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> String {
+    let mut expanded_ast = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
+
     let analysis_result: AnalysisResult = if let Some(file) = &config.analysis_file {
         let file = File::open(file).unwrap();
         serde_json::from_reader(file).unwrap()
     } else {
-        analyze(config, false, tcx).0
+        analyze(config, verbose, tcx).0
     };
-
-    let mut path_to_mod_id = FxHashMap::default();
-    tcx.hir_for_each_module(|mod_id| {
-        let def_path = tcx.def_path(mod_id.to_def_id());
-        let mut path = dir.to_path_buf();
-        for data in def_path.data {
-            let DefPathData::TypeNs(name) = data.data else { panic!() };
-            path.push(name.as_str());
-        }
-        path.set_extension("rs");
-        path_to_mod_id.insert(path, mod_id);
-    });
 
     let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let mut thir_to_mir = FxHashMap::default();
     for def_id in tcx.hir_body_owners() {
+        if !matches!(
+            tcx.hir_node_by_def_id(def_id),
+            HirNode::Item(HirItem {
+                kind: HirItemKind::Fn { .. },
+                ..
+            })
+        ) {
+            continue;
+        }
         thir_to_mir.insert(def_id, utils::ir::map_thir_to_mir(def_id, false, tcx));
     }
 
@@ -222,12 +214,16 @@ pub fn transform(
 
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        let HirItemKind::Fn { body, .. } = item.kind else {
+        let HirItemKind::Fn { ident, body, .. } = item.kind else {
             continue;
         };
 
         let local_def_id = id.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
+        let name = ident.name.as_str();
+        if config.c_exposed_fns.contains(name) {
+            continue;
+        }
         let name = tcx.def_path_str(def_id);
         let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let hir_body = tcx.hir_body(body);
@@ -289,10 +285,11 @@ pub fn transform(
             let name = ident.name.to_string();
 
             let mir_ty = mir_body.local_decls[mir_local].ty;
-            let ty_str = match mir_ty.kind() {
-                MirTyKind::RawPtr(ty, ..) => mir_ty_to_string(*ty, tcx),
+            let (inner_ty, ty_str) = match mir_ty.kind() {
+                MirTyKind::RawPtr(ty, ..) => (*ty, mir_ty_to_string(*ty, tcx)),
                 _ => unreachable!("{mir_ty:?}"),
             };
+            let default_init = generate_default_init(inner_ty, tcx);
 
             // simplify 1: once may parameter is fully written, flag sets can be removed
             let rcfws = if config.simplify {
@@ -447,6 +444,7 @@ pub fn transform(
                     simplify_value_decl,
                     simplify_ref_decl,
                     direct_returns,
+                    default_init,
                 },
             );
         }
@@ -478,49 +476,33 @@ pub fn transform(
         funcs.insert(local_def_id, func);
     }
 
-    let res = transform_ast(
-        |krate| {
-            let source_map = tcx.sess.source_map();
-            let filename = source_map.span_to_filename(krate.spans.inner_span);
-            let p = match filename {
-                FileName::Real(RealFileName::LocalPath(p)) => p,
-                FileName::Custom(p) => PathBuf::from(p),
-                _ => unreachable!(),
-            };
-
-            if p.file_name().unwrap().to_str().unwrap() == lib_name {
-                return false;
-            }
-
-            let mod_id: rustc_hir::def_id::LocalModDefId = path_to_mod_id[&p];
-            let (module, _, _) = tcx.hir_get_module(mod_id);
-            let mut mapper = AstToHirMapper::new(tcx);
-            mapper.map_crate_to_mod(krate, module, false);
-
-            let mut visitor = TransformVisitor {
-                tcx,
-                ast_to_hir: mapper.ast_to_hir,
-                hir_to_thir: &hir_to_thir,
-                thir_to_mir: &thir_to_mir,
-                funcs: &funcs,
-                current_fns: vec![],
-                write_args: &write_args,
-                bounds: &hir_visitor.bounds,
-                call_in_ret: &hir_visitor.call_in_ret,
-                updated: false,
-                counter: &mut counter,
-            };
-            visitor.visit_crate(krate);
-            visitor.updated
-        },
+    let mut transformed_fns = Vec::new();
+    let mut visitor = TransformVisitor {
         tcx,
-    );
+        ast_to_hir,
+        hir_to_thir: &hir_to_thir,
+        thir_to_mir: &thir_to_mir,
+        funcs: &funcs,
+        current_fns: vec![],
+        write_args: &write_args,
+        bounds: &hir_visitor.bounds,
+        call_in_ret: &hir_visitor.call_in_ret,
+        updated: false,
+        counter: &mut counter,
+        transformed_fns: &mut transformed_fns,
+    };
+    visitor.visit_crate(&mut expanded_ast);
 
-    if config.simplify {
+    if config.simplify && verbose {
         println!("{counter:#?}");
     }
 
-    res.apply();
+    if let Some(path) = &config.transformed_fns_file {
+        let mut file = File::create(path).unwrap();
+        write!(file, "{}", transformed_fns.join("\n")).unwrap();
+    }
+
+    pprust::crate_to_string_for_macros(&expanded_ast)
 }
 
 struct TransformVisitor<'tcx, 'a> {
@@ -540,6 +522,8 @@ struct TransformVisitor<'tcx, 'a> {
     updated: bool,
     /// tracks simplification status
     counter: &'a mut Counter,
+    /// collects def_path_str of transformed functions
+    transformed_fns: &'a mut Vec<String>,
 }
 
 impl TransformVisitor<'_, '_> {
@@ -767,10 +751,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
             // add value, ref, flag local declarations
             for param in func.index_map.values() {
+                let default_init = &param.default_init;
                 let value_decl = stmt!(
-                    "let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+                    "let mut {0}___v: {1} = {2};",
                     param.name,
-                    param.ty_str
+                    param.ty_str,
+                    default_init
                 );
                 let ref_decl = stmt!(
                     "let mut {0}: *mut {1} = &mut {0}___v;",
@@ -811,6 +797,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
 
             self.updated = true;
+            self.transformed_fns
+                .push(self.tcx.def_path_str(local_def_id.to_def_id()));
         }
         self.current_fns.pop();
     }
@@ -1262,5 +1250,37 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
             _ => {}
         }
         intravisit::walk_expr(self, expr);
+    }
+}
+
+fn generate_default_init<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
+    match ty.kind() {
+        MirTyKind::Int(_) | MirTyKind::Uint(_) => "0".to_string(),
+        MirTyKind::Float(_) => "0.0".to_string(),
+        MirTyKind::Bool => "false".to_string(),
+        MirTyKind::Char => "'\\0'".to_string(),
+        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Mut) => {
+            "std::ptr::null_mut()".to_string()
+        }
+        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Not) => "std::ptr::null()".to_string(),
+        MirTyKind::Adt(adt_def, generic_args) if adt_def.is_struct() => {
+            let variant = adt_def.variant(rustc_abi::FIRST_VARIANT);
+            let mut fields = Vec::new();
+            for field in &variant.fields {
+                let field_ty = field.ty(tcx, generic_args);
+                let field_default = generate_default_init(field_ty, tcx);
+                if field_default.contains("std::mem::transmute") {
+                    let ty_str = mir_ty_to_string(ty, tcx);
+                    return format!("std::mem::transmute([0u8; std::mem::size_of::<{ty_str}>()])");
+                }
+                fields.push(format!("{}: {}", field.name, field_default));
+            }
+            let ty_str = mir_ty_to_string(ty, tcx);
+            format!("{ty_str} {{ {} }}", fields.join(", "))
+        }
+        _ => {
+            let ty_str = mir_ty_to_string(ty, tcx);
+            format!("std::mem::transmute([0u8; std::mem::size_of::<{ty_str}>()])")
+        }
     }
 }
