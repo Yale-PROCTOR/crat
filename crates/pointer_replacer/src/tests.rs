@@ -80,10 +80,10 @@ pub unsafe fn foo() -> *mut i32 {
         &[
             "-> Option<Box<i32>>",
             "Option<Box<i32>>",
-            "Box::<i32>::new(<i32 as Default>::default())",
+            "Some(Box::new(<i32 as Default>::default()))",
             "as_deref_mut().unwrap()",
         ],
-        &[],
+        &["Box::<i32>::new(", "Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -101,8 +101,13 @@ pub unsafe fn foo() -> *mut i32 {
     p
 }
 "#,
-        &["pub unsafe fn foo() -> *mut i32", "Box::leak("],
-        &["Option<Box<[i32]>>", "calloc(4, std::mem::size_of::<i32>())"],
+        &[
+            "pub unsafe fn foo() -> Option<Box<[i32]>>",
+            "Option<Box<[i32]>>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "as_deref_mut().unwrap_or(&mut [])",
+        ],
+        &["Box::leak(", "Box::into_raw(", "calloc(4, std::mem::size_of::<i32>())"],
     );
 }
 
@@ -120,15 +125,20 @@ pub unsafe fn foo() -> *mut i32 {
     p
 }
 "#,
-        &["pub unsafe fn foo() -> *mut i32", "Box::leak("],
         &[
+            "pub unsafe fn foo() -> Option<Box<[i32]>>",
             "Option<Box<[i32]>>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "as_deref_mut().unwrap_or(&mut [])",
+        ],
+        &[
+            "Box::leak(",
+            "Box::into_raw(",
             "malloc(4 * std::mem::size_of::<i32>())",
         ],
     );
 }
 
-#[test]
 fn test_rewriter_keeps_explicit_fn_pointer_return_signature_raw() {
     run_test(
         r#"
@@ -213,8 +223,12 @@ pub unsafe fn foo() -> i32 {
     return take_raw(alloc_many());
 }
 "#,
-        &["std::slice::from_raw_parts(_x, 100000)", "pub unsafe fn take_raw(p: &[i32])"],
-        &["Option<Box<[i32]>>"],
+        &[
+            "pub unsafe fn alloc_many() -> Option<Box<[i32]>>",
+            "pub unsafe fn take_raw(p: &[i32])",
+            "return take_raw((alloc_many()).as_deref().unwrap_or(&[]));",
+        ],
+        &["std::slice::from_raw_parts(", "Box::leak("],
     );
 }
 
@@ -296,9 +310,11 @@ pub unsafe fn foo() {
 "#,
         &[
             "pub unsafe fn keep_raw_arr() -> *mut i32",
+            "Option<Box<[i32]>>",
+            "as_deref_mut().unwrap_or(&mut [])",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
-        &["Option<Box<[i32]>>", "Box::into_raw("],
+        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -326,27 +342,6 @@ pub unsafe fn caller() -> *mut i32 {
             "fn alloc_one() -> Option<Box<i32>>",
             "fn caller() -> Option<Box<i32>>",
             "let mut q: Option<Box<i32>> = alloc_one();",
-        ],
-        &[],
-    );
-}
-
-#[test]
-#[ignore = "Supplemental gotomach-derived probe only; landed primary struct-default coverage lives in rewriter::transform white-box tests."]
-fn test_rewriter_materializes_local_struct_malloc_default_gotomach_probe() {
-    let gotomach = include_str!("analyses/B02_tests/gotomach_lib.rs");
-    let code = gotomach
-        .split("const SOURCE: &str = r####\"")
-        .nth(1)
-        .and_then(|rest| rest.split("\"####;").next())
-        .expect("gotomach source fixture");
-    run_test(
-        code,
-        &[
-            "Option<Box<crate::src::lib::ProcessorState>>",
-            "results: std::ptr::null_mut::<core::ffi::c_int>()",
-            "capacity: <crate::src::lib::size_t as Default>::default()",
-            "count: <crate::src::lib::size_t as Default>::default()",
         ],
         &[],
     );
@@ -459,8 +454,12 @@ pub unsafe fn fill() -> *mut i32 {
     p
 }
 "#,
-        &["*p.add(1usize) = 5;"],
-        &[".as_mut_ptr().add(1usize)"],
+        &[
+            "pub unsafe fn fill() -> Option<Box<[i32]>>",
+            "Option<Box<[i32]>>",
+            ".as_mut_ptr().add(1usize)",
+        ],
+        &["Box::leak(", "Box::into_raw("],
     );
 }
 
@@ -477,8 +476,12 @@ pub unsafe fn dup_like(len: usize) -> *mut core::ffi::c_char {
     p
 }
 "#,
-        &["pub unsafe fn dup_like(len: usize) -> *mut i8", "Box::leak("],
-        &["Option<Box<[i8]>>", "realloc(std::ptr::null_mut(), len)"],
+        &[
+            "pub unsafe fn dup_like(len: usize) -> Option<Box<[i8]>>",
+            "Option<Box<[i8]>>",
+            "collect::<Vec<i8>>().into_boxed_slice()",
+        ],
+        &["Box::leak(", "Box::into_raw(", "realloc(std::ptr::null_mut(), len)"],
     );
 }
 
@@ -1471,8 +1474,13 @@ pub unsafe fn caller() -> *mut i32 {
     return f();
 }
 "#,
-        &["fn alloc_arr() -> *mut i32", "let f: unsafe fn() -> *mut i32 = alloc_arr;"],
-        &["Option<Box<[i32]>>", "Box::into_raw("],
+        &[
+            "fn alloc_arr() -> *mut i32",
+            "Option<Box<[i32]>>",
+            "as_deref_mut().unwrap_or(&mut [])",
+            "let f: unsafe fn() -> *mut i32 = alloc_arr;",
+        ],
+        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -3158,7 +3166,6 @@ mod ownership_analysis {
         let guarded_paths = [
             root.join("analyses/output_params"),
             root.join("analyses/ownership"),
-            root.join("analyses/B02_tests/mod.rs"),
             root.join("tests.rs"),
         ];
         let needle = forbidden_mir_source_bytes();

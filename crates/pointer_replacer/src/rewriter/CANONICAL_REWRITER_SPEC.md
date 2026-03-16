@@ -1,13 +1,14 @@
-# Canonical Rewriter Specification (Current Checked-In Behavior)
+# Canonical Rewriter Specification (Owning-Target Materialization Policy)
 
 ## 0) Status and Scope
-- This document describes the **current checked-in behavior only** of `crates/pointer_replacer/src/rewriter`.
-- It is implementation-canonical for:
+- This document defines the canonical owning-target materialization policy for `crates/pointer_replacer/src/rewriter`.
+- It is the source of truth for the intended behavior of:
   - `crates/pointer_replacer/src/rewriter/mod.rs`
   - `crates/pointer_replacer/src/rewriter/decision.rs`
   - `crates/pointer_replacer/src/rewriter/collector.rs`
   - `crates/pointer_replacer/src/rewriter/transform/mod.rs`
-- It does **not** describe planned behavior that is not implemented.
+- In particular, when a local or boundary target has already been decided as an owning target kind (`OptBox` or `OptBoxedSlice`), allocator-root expressions should be materialized directly into the corresponding Rust owning value rather than preserved through raw-pointer bridge forms.
+- This document may therefore lead implementation when the checked-in code still contains older conservative fallbacks.
 
 ## 1) Module and Function Responsibilities
 
@@ -120,7 +121,8 @@ For one function (`did`), `DecisionMaker::new` computes:
   - local requires cursor when the postprocessed offset-sign MIR-local bitset contains that local.
 
 Current consequence:
-- `_owning_pointers` and `_output_params` are now consulted by `decide`.
+- `_owning_pointers` and `_output_params` are consulted by `decide`.
+- Once `decide` has chosen `OptBox` or `OptBoxedSlice` for a local or signature position, later rewrite stages treat that owning target kind as authoritative and attempt direct owning materialization first; later non-owning uses are handled by adaptation from the owning representation rather than by reclassifying the site back to raw.
 
 ### 3.2 Branch-Ordered Precedence (`DecisionMaker::decide`)
 The following table is exact branch order.
@@ -223,14 +225,19 @@ Practical result for function-pointer-used functions:
 - For let-bindings with `ptr_kinds[hir_id]`:
   - Set `local.ty = Some(...)` to the selected pointer-kind type (`OptRef`/`OptBox`/`OptBoxedSlice`/`Slice`/`Raw`/`SliceCursor`) even when the original binding had no explicit type annotation.
   - Any mutable selected kind forces the binding pattern to `mut`.
-  - For `Raw(...)` locals, tracked outermost-local allocator roots may now bridge before generic raw conversion.
-    - tracked candidates are direct local bindings (or direct local wrapper-call results) whose writes stay outermost-local and whose deallocation stays on the same local path
+  - For `OptBox` locals, allocator-root initializers are materialized directly as owning Rust values before any generic conversion logic:
+    - admitted scalar `malloc` / `calloc` / `realloc(null_like, ...)` roots rewrite to `Some(Box::new(default_value_expr))`
+    - the materialization policy assumes `Default` is available for the pointee type and uses recursive struct/array default construction where needed
+    - later ref/raw uses of the same local are handled by adaptation from the owning `Option<Box<T>>` representation
+  - For `OptBoxedSlice` locals, allocator-root initializers are materialized directly as owning boxed slices before any generic conversion logic:
+    - admitted owning-array roots rewrite to `Some(...collect::<Vec<T>>().into_boxed_slice())`
+    - `calloc`-style roots use the inferred element count directly
+    - `malloc` / `realloc(null_like, bytes)` roots compute the element count from bytes divided by `size_of::<T>()`
+    - later slice/cursor/raw uses of the same local are handled by adaptation from the owning `Option<Box<[T]>>` representation
+  - For `Raw(...)` locals, tracked outermost-local allocator roots may still use raw-pointer bridge forms before generic raw conversion.
     - exact scalar roots rewrite to `Box::into_raw(Box::new(default_value_expr))`
-    - supported array roots rewrite to leaked boxed-slice storage via `Box::leak(...into_boxed_slice()).as_{mut,}ptr()`
-    - local raw-bridge admission now accepts bounded scalar-temp size/count DAGs in the current body for non-exact `malloc` / `calloc` / `realloc(null_like, ...)` roots
-      - allowed scalar sources include params, scalar locals defined earlier in the same body, casts/drop-temps, integer arithmetic, `wrapping_*` arithmetic methods, and size-query calls such as `strlen(...)`
-      - rejected scalar sources include field reads, projection/index reads, raw dereference reads, address-of, globals/statics, and nested-pointer expressions
-    - `default_value_expr` now recurses through local structs and array fields, using `std::array::from_fn(...)` instead of `<[T; N] as Default>::default()` for array members
+    - supported array roots may still rewrite to leaked boxed-slice storage via `Box::leak(...into_boxed_slice()).as_{mut,}ptr()`
+    - `default_value_expr` recurses through local structs and array fields, using `std::array::from_fn(...)` instead of `<[T; N] as Default>::default()` for array members
     - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
   - If local has initializer (`Init` / `InitElse`), run `transform_rhs` to convert RHS expression to LHS kind.
 
@@ -356,6 +363,8 @@ This matrix is for the branch where `PtrExpr` base resolves to:
 - local path with known `ptr_kinds`, or
 - direct local-function call whose rewritten `output_dec` is non-`None`
 
+For owning targets, the canonical rule is representation-first: if the target kind is `OptBox` or `OptBoxedSlice`, allocator-root expressions should first be materialized into the corresponding owning Rust value, and only later uses that require raw/ref/slice/cursor forms should adapt from that owning representation.
+
 | Source kind | Target `Raw` | Target `OptRef` | Target `OptBox` | Target `Slice` | Target `OptBoxedSlice` | Target `SliceCursor` |
 |---|---|---|---|---|---|---|
 | `Raw` | direct / mutability cast | `opt_ref_from_raw` | panic without allocator-root evidence | `slice_from_raw` | panic without allocator-root length evidence | `cursor_from_raw` |
@@ -381,26 +390,30 @@ Cursor-position note:
 - Cursor-to-cursor adaptation preserves position by transforming the existing cursor value directly; mutability downgrades use `.to_ref_cursor()`, and identity copies fork only when there are no projections and no cast.
 
 ### 6.5 Direct owning allocator-root materialization
-When the target context is `OptBox` or `OptBoxedSlice`, `transform_ptr` checks the normalized AST expression for direct allocator calls before entering the general conversion matrix:
-- exact scalar roots only:
-  - `malloc(size_of::<T>())` + target `OptBox`
-  - `calloc(1, size_of::<T>())` + target `OptBox`
-  - `realloc(null_like, size_of::<T>())` + target `OptBox`
-- scalar `OptBox` materialization uses `Some(Box::<T>::new(...))`
+When the target context is `OptBox` or `OptBoxedSlice`, `transform_ptr` must treat allocator-root materialization as the primary path before any generic conversion matrix or raw fallback handling.
+- For `OptBox` targets:
+  - admitted scalar `malloc` roots rewrite to `Some(Box::new(default_value_expr))`
+  - admitted scalar `calloc` roots rewrite to `Some(Box::new(default_value_expr))`
+  - admitted scalar `realloc(null_like, size_of::<T>())` roots rewrite to `Some(Box::new(default_value_expr))`
+  - `default_value_expr` is built under the canonical assumption that `T: Default`
   - raw-pointer fields become `std::ptr::null[_mut]::<...>()`
   - program-defined local structs recurse field-by-field into a struct literal default expression
-  - all other fields use `<T as Default>::default()`
-- `calloc(count, _)` + target `OptBoxedSlice` -> `Some(std::iter::repeat_with(|| { default_expr }).take((count) as usize).collect::<Vec<T>>().into_boxed_slice())`
-- `malloc(bytes)` + target `OptBoxedSlice` -> same iterator materialization with element count `bytes / size_of::<T>()`
-- `realloc(null_like, bytes)` shares the same allocator-root handling as `malloc(bytes)`
-- this direct allocator-root materialization runs for scalar and owning-array M4A roots before raw fallback handling
+  - array fields recurse through `std::array::from_fn(...)`
+  - later non-owning uses of the resulting local must adapt from `Option<Box<T>>`
+- For `OptBoxedSlice` targets:
+  - admitted owning-array `calloc(count, _)` roots rewrite to `Some(std::iter::repeat_with(|| default_expr).take((count) as usize).collect::<Vec<T>>().into_boxed_slice())`
+  - admitted owning-array `malloc(bytes)` roots rewrite to the same boxed-slice materialization using element count `bytes / size_of::<T>()`
+  - admitted owning-array `realloc(null_like, bytes)` roots use the same boxed-slice materialization as `malloc(bytes)`
+  - `default_expr` is built under the canonical assumption that `T: Default`
+  - later non-owning uses of the resulting local must adapt from `Option<Box<[T]>>`
+- These owning-target materializations take precedence over raw-pointer bridge recovery whenever the target kind has already been decided as `OptBox` or `OptBoxedSlice`.
 
 ### 6.6 General fallback path
 If no local-path kind match applies:
 - infer mutability from base raw/array type (with array-path deref inspection)
 - if callee return signature mutability was rewritten to raw, override fallback mutability accordingly
 - convert to requested target using `opt_ref_from_raw`, `slice_from_raw`, `cursor_from_raw`, or raw cast fallback.
-- Before the generic raw fallback runs, local-binding visitors may pre-rewrite tracked outermost-local allocator roots in `Raw(...)` context:
+- Raw-pointer bridge recovery remains a secondary path used only when the chosen target kind is still `Raw(...)`; it must not override an already-chosen `OptBox` or `OptBoxedSlice` target:
   - exact scalar roots -> `Box::into_raw(Box::new(default_value_expr))`
   - supported array roots -> leaked boxed slices with tracked length expressions
   - direct local allocator wrappers (`alloc`/`calloc`/`realloc`-style wrappers returning one outermost local) participate when their call arguments preserve the same raw-bridge shape
@@ -420,9 +433,10 @@ If no local-path kind match applies:
     - simple alias propagation inside the wrapper body is allowed, but the ownership flow must remain confined to that wrapper
     - wrappers that let the allocated value escape through parameters, globals, nested-pointer writes, or indirect container writes remain unchanged
 - plain array bases now also participate in non-raw fallback for `Slice`, `SliceCursor`, and `OptRef` targets instead of being left unchanged at rewrite-enabled call sites
-- raw fallback support is asymmetric for owning box targets:
-  - scalar `OptBox` targets still panic unless direct allocator-root evidence or an existing box source was matched earlier
-  - array `OptBoxedSlice` targets still panic unless direct allocator-root length evidence was matched earlier
+- owning-target fallback is representation-preserving rather than raw-first:
+  - scalar `OptBox` targets should first attempt direct owning materialization from allocator roots or preserve an existing owning-box source
+  - array `OptBoxedSlice` targets should first attempt direct owning boxed-slice materialization from allocator roots or preserve an existing owning boxed-slice source
+  - only when no such owning source can be established may the implementation conservatively reject the rewrite or fall back according to separate policy; it should not preemptively choose raw bridge recovery for a site already decided as `OptBox` or `OptBoxedSlice`
 - before those panic paths are reachable, M4B adds conservative raw downgrades for locals/functions that cannot be safely materialized as owning boxes:
   - scalar locals/functions fed by unsupported composite allocator roots (header padding, arithmetic, multi-`size_of`, etc.)
   - locals assigned from local helper calls whose output decision was explicitly forced raw
@@ -468,34 +482,17 @@ If no local-path kind match applies:
 - Appears in raw->slice/cursor materialization and several non-numeric cast fallback conversions.
 - Example emitted pattern: `std::slice::from_raw_parts_mut(ptr, 100000)`.
 
-6. Owning box support is implemented only for the M4A-supported source/target surface.
-- Direct allocator roots and local/call box sources are supported.
-- Local/call box-source propagation now only trusts local function items with bodies; foreign declarations are not treated as rewrite-aware box sources for fallback/propagation purposes.
-- M6/M7 add an outermost-local raw-bridge hardening path:
-  - exact scalar allocator roots that remain `Raw(...)` are emitted as `Box::into_raw(Box::new(...))` for conservatively tracked outermost locals
-  - supported raw array roots (`malloc(bytes)`, `calloc(count, _)`, `realloc(null_like, bytes)`) are emitted as leaked boxed slices with tracked lengths for those same outermost locals
-  - direct `free(local[_cast])` and supported local free-wrapper calls are rewritten to null-guarded `drop(Box::from_raw(...))` / `drop(Box::from_raw(slice_from_raw_parts_mut(...)))`
-  - simple local allocator-wrapper calls participate when the wrapper body still preserves a direct outermost-local allocator-root shape
-  - M9 generalizes that wrapper path to structural local helpers that allocate one principal outermost local, optionally null-check/mutate it, and then return or free that same local without allowing it to escape through params, globals, or indirect container writes
-  - M10 slice 1 adds bounded scalar-temp size/count DAG support for that direct local raw-bridge path only; omni-style branch-return `*mut c_void` factories and other caller-side ambiguous deallocation shapes remain unchanged
-  - locals whose raw value escapes through aliases, returns, or unrelated call arguments stay on the original allocator/free path
-- Scalar `OptBox` allocator roots are intentionally narrower in M4B:
-  - only exact `size_of::<T>()` scalar roots stay eligible
-  - unsupported composite scalar roots are forced back to raw before rewrite
-- Some raw fallback propagation is now intentional rather than panicking:
-  - direct local bindings assigned from local helpers whose output decision was forced raw stay raw
-  - direct local aliases assigned from already-raw bindings also stay raw
-  - unsupported direct `return expr` / tail-expression box outputs are forced back to raw before signature rewrite
-  - raw struct-field pointer flows such as `(*map).entries` remain raw; struct-field ownership is still out of scope
-- Several non-goal shapes still panic, especially:
-  - `addr_of` / `addr_of` arithmetic into box targets
-  - `as_ptr` into box targets
-  - casted `OptBox -> OptRef` reinterpretation outside the same-size numeric bytemuck path
-  - byte-string source into box targets
-  - scalar-box to slice/cursor targets
-  - raw-to-scalar-box targets without direct allocator-root evidence
-  - owning array box target without allocator-root length evidence
-  - owner-struct/container field frees and container-internal realloc growth remain unchanged; M7 still does not rewrite through struct fields or container-owner internals
+6. Owning-target materialization is canonical once `PtrKind` has already been decided as `OptBox` or `OptBoxedSlice`.
+- Direct allocator roots and local/call box sources remain the primary admitted source surface.
+- For `OptBox` and `OptBoxedSlice` targets, the canonical rewrite prefers direct `Box::new(...)` / boxed-slice materialization over raw-pointer bridge forms.
+- Raw bridge recovery via `Box::into_raw(...)`, `Box::from_raw(...)`, or leaked boxed slices is a secondary policy for sites whose chosen target kind is still `Raw(...)`; it is not the canonical owning-target realization path.
+- The materialization policy intentionally assumes `Default` is available for admitted owning pointee types and uses recursive default construction for local struct and array fields as needed.
+- Remaining non-goal or unsupported shapes still include:
+  - raw struct-field pointer flows such as `(*map).entries`
+  - owner-struct/container field frees and container-internal realloc growth
+  - unsupported `addr_of` / `as_ptr` / byte-string into box-target conversions
+  - shapes where the implementation still lacks array-length evidence for `OptBoxedSlice` materialization
+  - shapes intentionally left under separate conservative fallback policy
 
 7. Multiple other conversion branches intentionally panic on unsupported shapes.
 - Examples:
@@ -544,6 +541,9 @@ If no local-path kind match applies:
   - null handling, `if/else` and block expression normalization
   - raw mutability casts and call-site return mutability propagation
   - ownership-analysis-fallback equivalence via test-only forced failure
+  - owning-target allocator materialization for already-decided `OptBox` locals via `Some(Box::new(...))`
+  - owning-target allocator materialization for already-decided `OptBoxedSlice` locals via `Some(...into_boxed_slice())`
+  - adaptation from owning locals into later raw/ref/slice/cursor use sites without reclassifying the owning local itself
   - M4A positive box rewrite regressions:
     - `test_rewriter_rewrites_malloc_scalar_to_opt_box`
     - `test_rewriter_rewrites_calloc_array_to_opt_boxed_slice`
@@ -611,11 +611,10 @@ If no local-path kind match applies:
 - File: `crates/pointer_replacer/src/rewriter/decision.rs`
 - Internal white-box tests exercise `DecisionMaker::decide` directly with synthetic facts over real MIR `LocalDecl`s.
 - Covered decision areas include:
-  - owning scalar output override -> `OptRef(true)`
-  - owning scalar non-output -> `OptBox`
-  - owning array + `needs_cursor` -> conservative `Raw(...)`
-  - owning array without `needs_cursor` -> `Slice(true)` / `OptBoxedSlice`
-  - non-owning scalar and cursor regressions remain unchanged
+  - owning scalar decisions that keep `OptBox` as the canonical owning target kind
+  - owning array decisions that keep `OptBoxedSlice` as the canonical owning target kind
+  - non-owning scalar and array decisions remain covered separately
+  - cursor-related adaptation is validated at transform time rather than by changing an already-chosen owning target kind
 
 ### 8.3 Ownership analysis tests in same file
 - Module: `ownership_analysis` inside `tests.rs`
@@ -623,72 +622,10 @@ If no local-path kind match applies:
 - Also includes a MIR-source regression guard over the ownership/output guarded paths.
 
 ### 8.4 B02 test suite
-- File: `crates/pointer_replacer/src/analyses/B02_tests/mod.rs` + case modules.
-- Shared harness behavior:
-  - run ownership analysis and candidate/stat assertions first
-  - then run `replace_local_borrows(&Config::default(), tcx)` on the original case source
-  - then type-check the rewritten output in a fresh compiler invocation
-  - failure messages include the B02 case name plus the rewritten source text
-  - a direct census regression also rewrites all 86 case sources from disk and counts emitted `malloc(` / `calloc(` / `free(` tokens
-  - a second inspection-only classifier pass scans the rewritten output for remaining `malloc(` / `calloc(` call sites and records future-work metadata for each site
-  - M11 extends that inspection pass with a second-stage implementation-oriented landscape report:
-    - wrapper-body allocator sites are split into wrapper subshapes
-    - remaining `free(` calls are split into teardown shapes
-    - allocator and teardown shapes are tagged with policy status
-    - allocator shapes are also tagged with whether they are blocked mainly by allocation shape, deallocation shape, or both
-  - an additional inspection-only boxed-slice census now scans the rewritten B02 outputs and reports:
-    - text/token counts for `Option<Box<[... ]>>`, `Box<[... ]>`, and `.into_boxed_slice()`
-    - site-based counts for realized boxed-slice ownership sites, boxed-slice-like fallback materializations, and remaining raw array allocator sites
-    - per-case breakdowns plus top contributing cases
-  - an optional inspection-only dump path can write original/re-written B02 case sources and unified diffs:
-    - enable with `POINTER_REPLACER_B02_DUMP_DIR=<path>`
-    - mode via `POINTER_REPLACER_B02_DUMP_MODE=rewritten|diff|both` (`both` default)
-    - optional case filter via `POINTER_REPLACER_B02_DUMP_FILTER=case_a,case_b`
-    - outputs are written under `<dump_dir>/<case_name>/`
-      - `original.rs` and `rewritten.rs` in `rewritten`/`both` modes
-      - `diff.patch` in `diff`/`both` modes
-    - dump behavior is inspection-only and does not change rewrite decisions, census totals, or type-checking behavior
-  - unit note for the boxed-slice census:
-    - type-surface counts are compacted-text token counts
-    - array-like allocator totals are site-based and are computed as realized boxed-slice sites plus non-boxed-slice fallback sites in the rewritten corpus
-    - `.into_boxed_slice()` counts may differ from `Option<Box<[... ]>>` / `Box<[... ]>` counts because one logical site can contribute multiple type tokens and boxed-slice-like fallback sites still materialize `.into_boxed_slice()`
-  - focused classifier regressions cover:
-    - `classifier_direct_local_binding_maps_to_outermost_extension`
-    - `classifier_field_target_maps_to_struct_field_scope`
-    - `classifier_nested_pointer_scope_augments_but_does_not_change_shape`
-    - `classifier_wrapper_body_gets_priority_over_other_shape_buckets`
-    - `classifier_return_tail_maps_to_return_flow_generalization`
-    - `classifier_same_function_realloc_sets_context_and_capability`
-    - `classifier_fallback_uses_manual_followup`
-    - `classifier_deduplicates_capabilities_and_respects_primary_precedence`
-    - `classifier_normalizes_and_truncates_statement_snippet`
-    - `classifier_wrapper_transient_local_helper_use_is_admissible`
-    - `classifier_wrapper_local_aggregate_field_storage_is_blocked_struct_field_scope`
-    - `classifier_wrapper_branch_return_opaque_type_maps_to_deallocation_blocker`
-    - `classifier_wrapper_alias_escape_is_not_worth_targeting_yet`
-    - `classifier_free_direct_local_free_is_admissible`
-    - `classifier_free_field_owned_teardown_is_blocked_struct_field_scope`
-    - `classifier_free_recursive_tree_list_teardown_is_blocked_free_shape`
-    - `classifier_free_matrix_row_teardown_is_blocked_free_shape`
-    - `classifier_free_helper_destructor_cleanup_is_blocked_free_shape`
-    - `boxed_slice_census_distinguishes_ownership_from_remaining_raw_array_sites`
-    - `boxed_slice_census_is_complete`
-    - `b02_rewrite_dump_is_disabled_by_default`
-    - `b02_rewrite_dump_writes_original_and_rewritten_files`
-    - `b02_rewrite_dump_diff_mode_writes_non_empty_diff`
-    - `b02_rewrite_dump_filter_limits_written_cases`
-    - `remaining_allocator_site_classification_is_complete`
-    - `m9_wrapper_generalization_reduction_vs_verified_baseline`
-- Current consequence:
-  - every B02 case is now gated on both ownership expectations and rewrite-compile success
-  - failing rewrite compilation reports the B02 case name plus the rewritten source text
-  - the M8 planning baseline was re-verified through the same checked-in classifier path now used by M9 closeout:
-    - `remaining_malloc_sites=64`
-    - `remaining_calloc_sites=13`
-    - `primary_unlock_wrapper_generalization=46`
-  - the current post-M13 classifier totals are:
-    - `remaining_malloc_sites=49`
-    - `remaining_calloc_sites=6`
+- Historical note:
+  - earlier revisions used a corpus-backed B02 harness under `crates/pointer_replacer/src/analyses/B02_tests/`
+  - that harness is not present in the current checked-in tree on this branch
+  - current checked-in validation for this branch is represented by the direct regressions in `tests.rs` plus white-box transform tests
     - `primary_unlock_wrapper_generalization=33`
     - `alloc_policy_status:admissible_current_policy=5`
   - the direct token census currently reads `malloc=86`, `calloc=19`, `free=253`
@@ -784,12 +721,11 @@ If no local-path kind match applies:
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
-- `cargo test -p pointer_replacer analyses::B02_tests -- --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
 - `cargo test -p pointer_replacer ownership_analysis::mutable_pointer_to_pointer_argument_becomes_output_param`
-- `! rg -n "optimized_mir\\(" crates/pointer_replacer/src/analyses/output_params crates/pointer_replacer/src/analyses/ownership crates/pointer_replacer/src/analyses/B02_tests/mod.rs crates/pointer_replacer/src/tests.rs`
+- `! rg -n "optimized_mir\\(" crates/pointer_replacer/src/analyses/output_params crates/pointer_replacer/src/analyses/ownership crates/pointer_replacer/src/tests.rs`
 
 ## 9) Maintenance Checklist for Spec Sync
 When rewriter behavior changes, update this document in the same change set.
@@ -801,5 +737,6 @@ Checklist:
 4. Update Section 4 if `SigDecisions`/`collect_diffs` interaction changed.
 5. Update Section 5 if any `visit_item`, `visit_local`, `visit_expr`, or statement flattening behavior changed.
 6. Update Section 6 matrix and helper descriptions for new/removed conversion paths.
-7. Update Section 7 limitations/fallbacks for added/removed conservative behavior or panic guards.
-8. Update Section 8 test mapping if coverage location or validation commands changed.
+7. Update the owning-target materialization rules whenever `OptBox` / `OptBoxedSlice` allocator handling or owning-to-non-owning adaptation changes.
+8. Update Section 7 limitations/fallbacks for added/removed conservative behavior or panic guards.
+9. Update Section 8 test mapping if coverage location or validation commands changed.
