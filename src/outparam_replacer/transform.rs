@@ -218,12 +218,16 @@ pub fn transform(
 
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        let HirItemKind::Fn { body, .. } = item.kind else {
+        let HirItemKind::Fn { ident, body, .. } = item.kind else {
             continue;
         };
 
         let local_def_id = id.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
+        let name = ident.name.as_str();
+        if config.c_exposed_fns.contains(name) {
+            continue;
+        }
         let name = tcx.def_path_str(def_id);
         let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let hir_body = tcx.hir_body(body);

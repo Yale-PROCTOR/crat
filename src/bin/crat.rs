@@ -360,6 +360,10 @@ fn main() {
         .andersen
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .outparam
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use rustc_hash::FxHashSet;
 use serde::Deserialize;
 
 fn default_max_loop_head_states() -> usize {
@@ -25,6 +26,8 @@ pub struct Config {
     pub simplify: bool,
     #[serde(default)]
     pub analysis_file: Option<PathBuf>,
+    #[serde(default)]
+    pub c_exposed_fns: FxHashSet<String>,
 
     // debug
     #[serde(default)]
