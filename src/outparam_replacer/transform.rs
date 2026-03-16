@@ -60,6 +60,8 @@ struct Param {
     simplify_ref_decl: bool,
     /// HirId of return and value written to param before return
     direct_returns: FxHashMap<HirId, String>,
+    /// default initializer expression for the type
+    default_init: String,
 }
 
 impl Param {
@@ -283,10 +285,11 @@ pub fn transform(
             let name = ident.name.to_string();
 
             let mir_ty = mir_body.local_decls[mir_local].ty;
-            let ty_str = match mir_ty.kind() {
-                MirTyKind::RawPtr(ty, ..) => mir_ty_to_string(*ty, tcx),
+            let (inner_ty, ty_str) = match mir_ty.kind() {
+                MirTyKind::RawPtr(ty, ..) => (*ty, mir_ty_to_string(*ty, tcx)),
                 _ => unreachable!("{mir_ty:?}"),
             };
+            let default_init = generate_default_init(inner_ty, tcx);
 
             // simplify 1: once may parameter is fully written, flag sets can be removed
             let rcfws = if config.simplify {
@@ -441,6 +444,7 @@ pub fn transform(
                     simplify_value_decl,
                     simplify_ref_decl,
                     direct_returns,
+                    default_init,
                 },
             );
         }
@@ -738,7 +742,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
             // add value, ref, flag local declarations
             for param in func.index_map.values() {
-                let default_init = primitive_default(&param.ty_str);
+                let default_init = &param.default_init;
                 let value_decl = stmt!(
                     "let mut {0}___v: {1} = {2};",
                     param.name,
@@ -1238,15 +1242,34 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for HirVisitor<'a, 'tcx> {
     }
 }
 
-fn primitive_default(ty: &str) -> String {
-    match ty {
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
-        | "usize" => "0".to_string(),
-        "f16" | "f32" | "f64" | "f128" => "0.0".to_string(),
-        "bool" => "false".to_string(),
-        "char" => "'\\0'".to_string(),
-        _ if ty.starts_with("*mut ") => "std::ptr::null_mut()".to_string(),
-        _ if ty.starts_with("*const ") => "std::ptr::null()".to_string(),
-        _ => format!("std::mem::transmute([0u8; std::mem::size_of::<{ty}>()])"),
+fn generate_default_init<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> String {
+    match ty.kind() {
+        MirTyKind::Int(_) | MirTyKind::Uint(_) => "0".to_string(),
+        MirTyKind::Float(_) => "0.0".to_string(),
+        MirTyKind::Bool => "false".to_string(),
+        MirTyKind::Char => "'\\0'".to_string(),
+        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Mut) => {
+            "std::ptr::null_mut()".to_string()
+        }
+        MirTyKind::RawPtr(_, rustc_middle::ty::Mutability::Not) => "std::ptr::null()".to_string(),
+        MirTyKind::Adt(adt_def, generic_args) if adt_def.is_struct() => {
+            let variant = adt_def.variant(rustc_abi::FIRST_VARIANT);
+            let mut fields = Vec::new();
+            for field in &variant.fields {
+                let field_ty = field.ty(tcx, generic_args);
+                let field_default = generate_default_init(field_ty, tcx);
+                if field_default.contains("std::mem::transmute") {
+                    let ty_str = mir_ty_to_string(ty, tcx);
+                    return format!("std::mem::transmute([0u8; std::mem::size_of::<{ty_str}>()])");
+                }
+                fields.push(format!("{}: {}", field.name, field_default));
+            }
+            let ty_str = mir_ty_to_string(ty, tcx);
+            format!("{ty_str} {{ {} }}", fields.join(", "))
+        }
+        _ => {
+            let ty_str = mir_ty_to_string(ty, tcx);
+            format!("std::mem::transmute([0u8; std::mem::size_of::<{ty_str}>()])")
+        }
     }
 }
