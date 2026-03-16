@@ -192,7 +192,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     let tys = match self.ctx.tss.tys[&lty] {
                         TyShape::Array(t, len) => vec![t; *len],
                         TyShape::Struct(_, tys, _) => tys.iter().map(|(_, t)| t).collect(),
-                        TyShape::Primitive(_) => unreachable!(),
+                        TyShape::Slice(_) | TyShape::Primitive(_) => unreachable!(),
                     };
                     for ((field, op), ty) in rs.iter_enumerated().zip(&tys) {
                         let v = self.transfer_op(op, state);

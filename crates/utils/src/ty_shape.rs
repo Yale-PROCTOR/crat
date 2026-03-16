@@ -85,31 +85,34 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
                 };
                 let Res::Def(_, def_id) = path.res else { unreachable!() };
                 let local_def_id = def_id.expect_local();
-                let fields: Vec<_> = imp
-                    .items
-                    .chunks(2)
-                    .map(|items| {
-                        let name0 = items[0].ident.name.to_ident_string();
-                        let name0 = name0.strip_prefix("set_").unwrap();
-                        let name1 = items[1].ident.name.to_ident_string();
-                        assert_eq!(name0, name1);
-                        let ImplItemKind::Fn(sig, _) = tcx.hir_impl_item(items[1].id).kind else {
-                            unreachable!()
-                        };
-                        let FnRetTy::Return(ty) = sig.decl.output else { unreachable!() };
-                        let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
-                            unreachable!()
-                        };
-                        let ty: String = path
-                            .segments
-                            .iter()
-                            .map(|seg| seg.ident.name.to_ident_string())
-                            .intersperse("::".to_string())
-                            .collect();
-                        (name1, ty)
-                    })
-                    .collect();
-                bitfield_impls.insert(local_def_id, fields);
+                if tcx.is_automatically_derived(item_id.owner_id.def_id.to_def_id()) {
+                    let fields: Vec<_> = imp
+                        .items
+                        .chunks(2)
+                        .map(|items| {
+                            let name0 = items[0].ident.name.to_ident_string();
+                            let name0 = name0.strip_prefix("set_").unwrap();
+                            let name1 = items[1].ident.name.to_ident_string();
+                            assert_eq!(name0, name1);
+                            let ImplItemKind::Fn(sig, _) = tcx.hir_impl_item(items[1].id).kind
+                            else {
+                                unreachable!()
+                            };
+                            let FnRetTy::Return(ty) = sig.decl.output else { unreachable!() };
+                            let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
+                                unreachable!()
+                            };
+                            let ty: String = path
+                                .segments
+                                .iter()
+                                .map(|seg| seg.ident.name.to_ident_string())
+                                .intersperse("::".to_string())
+                                .collect();
+                            (name1, ty)
+                        })
+                        .collect();
+                    bitfield_impls.insert(local_def_id, fields);
+                }
             }
             _ => {}
         }
@@ -216,6 +219,10 @@ fn compute_ty_shape<'a, 'tcx>(
             let len = len.try_to_target_usize(tcx).unwrap() as usize;
             tss.arena.alloc(TyShape::Array(t, len))
         }
+        TyKind::Slice(ty) => {
+            let t = compute_ty_shape(*ty, owner, tss, tcx);
+            tss.arena.alloc(TyShape::Slice(t))
+        }
         TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, false, owner, tss, tcx),
         _ => tss.arena.alloc(TyShape::Primitive(ty)),
     };
@@ -263,14 +270,16 @@ pub fn unwrap_ptr(ty: Ty<'_>) -> Option<Ty<'_>> {
 pub enum TyShape<'a, 'tcx> {
     Primitive(Ty<'tcx>),
     Array(&'a TyShape<'a, 'tcx>, usize),
+    Slice(&'a TyShape<'a, 'tcx>),
     Struct(usize, Vec<(usize, &'a TyShape<'a, 'tcx>)>, bool),
 }
 
 impl std::fmt::Debug for TyShape<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Primitive(_) => write!(f, "*"),
+            Self::Primitive(ty) => write!(f, "{ty:?}"),
             Self::Array(t, len) => write!(f, "[{t:?}; {len}]"),
+            Self::Slice(t) => write!(f, "[{t:?}]"),
             Self::Struct(len, fields, is_union) => {
                 write!(f, "{{{len}")?;
                 for (i, ts) in fields {
@@ -293,7 +302,7 @@ impl TyShape<'_, '_> {
     pub fn len(&self) -> usize {
         match self {
             Self::Primitive(_) => 1,
-            Self::Array(t, _) => t.len(),
+            Self::Array(t, _) | Self::Slice(t) => t.len(),
             Self::Struct(len, _, _) => *len,
         }
     }

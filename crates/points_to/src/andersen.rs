@@ -472,7 +472,7 @@ fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id
         TyShape::Primitive(pty) => {
             ends.push(ends.next_index(), *pty, def_id);
         }
-        TyShape::Array(t, _) => compute_ends(t, ends, def_id),
+        TyShape::Array(t, _) | TyShape::Slice(t) => compute_ends(t, ends, def_id),
         TyShape::Struct(len, ts, _) => {
             let end = ends.next_index();
             for (_, t) in ts {
@@ -576,9 +576,13 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 }
             }
             Rvalue::RawPtr(_, r) => {
-                assert!(r.is_indirect_first_projection());
-                let r = self.prefixed_loc(*r, ctx).with_deref(false);
-                self.transfer_assign(l, r, ty);
+                if r.is_indirect_first_projection() {
+                    let r = self.prefixed_loc(*r, ctx).with_deref(false);
+                    self.transfer_assign(l, r, ty);
+                } else {
+                    let r = self.prefixed_loc(*r, ctx).with_ref(true);
+                    self.transfer_assign(l, r, ty);
+                }
             }
             Rvalue::Len(_) => {}
             Rvalue::Cast(_, r, _) => {
@@ -642,7 +646,10 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         }
                     }
                 }
-                _ => unreachable!(),
+                AggregateKind::Closure(_, _) => {
+                    // TODO
+                }
+                _ => unreachable!("{r:?}"),
             },
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
@@ -759,15 +766,8 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 let seg = |i: usize| name.get(i).map(|s| s.as_str()).unwrap_or_default();
                 let name = (seg(0), seg(1), seg(2), seg(3));
                 if let Some(local_def_id) = def_id.as_local() {
-                    if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
-                        let ty = self.tcx.type_of(impl_def_id).skip_binder();
-                        let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
-                        let adt_def_id = adt_def.did().as_local().unwrap();
-                        let bitfield = &self.tss.bitfields[&adt_def_id];
-                        let name = self.tcx.item_name(*def_id);
-                        let name = name.as_str();
-                        let name = name.strip_prefix("set_").unwrap_or(name);
-                        assert!(bitfield.name_to_idx.contains_key(name));
+                    if self.tcx.impl_of_method(*def_id).is_some() {
+                        // TODO
                     } else if is_extern {
                         if output.is_raw_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
@@ -825,8 +825,10 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
         for proj in place.projection {
             match proj {
                 PlaceElem::Deref => {}
-                PlaceElem::Index(_) => {
-                    let TyShape::Array(t, _) = ty else { unreachable!() };
+                PlaceElem::Index(_) | PlaceElem::ConstantIndex { .. } => {
+                    let (TyShape::Array(t, _) | TyShape::Slice(t)) = ty else {
+                        unreachable!("{ty:?}")
+                    };
                     ty = t;
                 }
                 PlaceElem::Downcast(_, variant_idx) => {
@@ -846,7 +848,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     mir_ty = field_ty;
                     variant_field_offset = 0;
                 }
-                _ => unreachable!(),
+                _ => unreachable!("{proj:?}"),
             }
         }
         let var = Var::Local(ctx.owner, place.local);
@@ -1072,7 +1074,7 @@ fn compute_bitfield_writes<'tcx>(
     let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
     let local_def_id = some_or!(def_id.as_local(), return);
     let (local_def_id, method) = some_or!(receiver_and_method(local_def_id, tcx), return);
-    let field = method.strip_prefix("set_").unwrap();
+    let field = some_or!(method.strip_prefix("set_"), return);
     let TyKind::Ref(_, ty, _) = args[0].node.ty(ctx.locals, tcx).kind() else { unreachable!() };
     let TyShape::Struct(_, fs, _) = tss.tys[ty] else { unreachable!() };
     let idx = tss.bitfields[&local_def_id].name_to_idx[field];
@@ -1278,7 +1280,7 @@ fn add_edges(
 ) -> LocNode {
     let node = match ty {
         TyShape::Primitive(_) => return LocNode::new(0, index),
-        TyShape::Array(t, _) => {
+        TyShape::Array(t, _) | TyShape::Slice(t) => {
             let succ = add_edges(t, index, graph, index_prefixes, union_offsets);
             let node = succ.parent();
             graph.insert(node, LocEdges::Index(succ));
