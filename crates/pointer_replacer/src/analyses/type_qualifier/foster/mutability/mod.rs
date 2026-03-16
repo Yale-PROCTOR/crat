@@ -424,10 +424,9 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(field, ty) => {
-                assert!(place_vars.is_empty());
-
                 match base_ty.kind() {
                     TyKind::Adt(adt_def, _) => {
+                        assert!(place_vars.is_empty());
                         // FIXME correctness?
                         if adt_def.is_union() {
                             return place_vars;
@@ -441,7 +440,19 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
 
                         base_ty = ty;
                     }
-                    TyKind::Tuple(..) => return place_vars,
+                    TyKind::Tuple(tys) => {
+                        let offset: usize = tys
+                            .iter()
+                            .take(field.index())
+                            .map(|t| super::count_ptr(t))
+                            .sum();
+                        let field_count = super::count_ptr(ty);
+                        place_vars = Range {
+                            start: place_vars.start + offset,
+                            end: place_vars.start + offset + field_count,
+                        };
+                        base_ty = ty;
+                    }
                     _ => unreachable!(),
                 }
             }

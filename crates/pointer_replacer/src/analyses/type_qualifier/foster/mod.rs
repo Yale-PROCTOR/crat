@@ -4,6 +4,7 @@ use constraint_system::{BooleanLattice, Var};
 use rustc_index::IndexVec;
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
+use rustc_type_ir::TyKind;
 
 use crate::{
     analyses::{
@@ -37,6 +38,9 @@ fn count_ptr(mut ty: Ty) -> usize {
         if let Some(inner_ty) = ty.builtin_index() {
             ty = inner_ty;
             continue;
+        }
+        if let TyKind::Tuple(tys) = ty.kind() {
+            return cnt + tys.iter().map(|t| count_ptr(t)).sum::<usize>();
         }
         break cnt;
     }
