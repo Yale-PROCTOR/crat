@@ -936,46 +936,46 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
                     let ret_tys = &func.return_tys;
                     // binds return values of a call to rv___, rv___1, ...
-                    let mut bindings = vec![];
                     // assign output parameter values to arguments
                     let mut assign_ret = vec![];
                     let mut mtch_assign = None;
 
+                    let multi = ret_tys.len() > 1;
                     for (ridx, ret_ty) in ret_tys.iter_enumerated() {
                         match ret_ty {
                             ReturnTyItem::Orig => {
                                 assert!(ridx.index() == 0);
-                                bindings.push(String::from("rv___"));
                             }
                             ReturnTyItem::Type(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = if ridx.index() == 0 {
+                                let rhs = if multi {
+                                    format!("rv___t.{}", ridx.index())
+                                } else if ridx.index() == 0 {
                                     String::from("rv___")
                                 } else {
                                     format!("rv___{}", ridx.index())
                                 };
                                 let assign = self.get_assign(arg, true, rhs.clone(), index, loc);
                                 assign_ret.push(assign);
-                                bindings.push(rhs);
                             }
                             ReturnTyItem::Option(param) => {
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                let rhs = if ridx.index() == 0 {
+                                let rhs = if multi {
+                                    format!("rv___t.{}", ridx.index())
+                                } else if ridx.index() == 0 {
                                     String::from("rv___")
                                 } else {
                                     format!("rv___{}", ridx.index())
                                 };
                                 let assign = self.get_assign(arg, false, rhs.clone(), index, loc);
                                 assign_ret.push(assign);
-                                bindings.push(rhs);
                             }
                             ReturnTyItem::Result(param) => {
                                 assert!(ridx.index() == 0);
                                 let index = param.index;
                                 let arg = args[index.index()].as_ref();
-                                bindings.push(String::from("rv___"));
                                 mtch_assign = Some(self.get_assign(
                                     arg,
                                     true,
@@ -1000,17 +1000,17 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         })
                         .collect();
 
-                    let binding = if bindings.len() == 1 {
-                        format!("let {} = {}", bindings[0], pprust::expr_to_string(expr))
+                    let binding = if multi {
+                        format!("let rv___t = {}", pprust::expr_to_string(expr))
                     } else {
-                        format!(
-                            "let ({}) = {}",
-                            bindings.join(", "),
-                            pprust::expr_to_string(expr)
-                        )
+                        format!("let rv___ = {}", pprust::expr_to_string(expr))
                     };
 
-                    assign_ret.push(String::from("rv___"));
+                    assign_ret.push(if multi {
+                        String::from("rv___t.0")
+                    } else {
+                        String::from("rv___")
+                    });
 
                     let new_expr = match &ret_tys[RetIdx::from_usize(0)] {
                         ReturnTyItem::Orig | ReturnTyItem::Type(_) | ReturnTyItem::Option(_) => {
