@@ -46,6 +46,8 @@ pub struct Config {
     pub analysis_file: Option<PathBuf>,
     #[serde(default)]
     pub c_exposed_fns: FxHashSet<String>,
+    #[serde(default)]
+    pub transformed_fns_file: Option<PathBuf>,
 
     // debug
     #[serde(default)]

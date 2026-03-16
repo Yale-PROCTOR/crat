@@ -99,6 +99,8 @@ struct Args {
         help = "Print analysis results of the specified functions"
     )]
     outparam_print_functions: Vec<String>,
+    #[arg(long, help = "File to write transformed function paths to")]
+    outparam_transformed_fns_file: Option<PathBuf>,
 
     // IO
     #[arg(long, help = "Assume that to_str from CStr always succeeds")]
@@ -334,6 +336,9 @@ fn main() {
     }
     if args.outparam_analysis_file.is_some() {
         config.outparam.analysis_file = args.outparam_analysis_file;
+    }
+    if args.outparam_transformed_fns_file.is_some() {
+        config.outparam.transformed_fns_file = args.outparam_transformed_fns_file;
     }
     if args.points_to_file.is_some() {
         config.outparam.points_to_file = args.points_to_file;

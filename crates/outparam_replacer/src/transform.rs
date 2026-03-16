@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::File};
+use std::{collections::BTreeMap, fs::File, io::Write};
 
 use etrace::some_or;
 use rustc_ast::{
@@ -476,6 +476,7 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
         funcs.insert(local_def_id, func);
     }
 
+    let mut transformed_fns = Vec::new();
     let mut visitor = TransformVisitor {
         tcx,
         ast_to_hir,
@@ -488,11 +489,17 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
         call_in_ret: &hir_visitor.call_in_ret,
         updated: false,
         counter: &mut counter,
+        transformed_fns: &mut transformed_fns,
     };
     visitor.visit_crate(&mut expanded_ast);
 
     if config.simplify && verbose {
         println!("{counter:#?}");
+    }
+
+    if let Some(path) = &config.transformed_fns_file {
+        let mut file = File::create(path).unwrap();
+        write!(file, "{}", transformed_fns.join("\n")).unwrap();
     }
 
     pprust::crate_to_string_for_macros(&expanded_ast)
@@ -515,6 +522,8 @@ struct TransformVisitor<'tcx, 'a> {
     updated: bool,
     /// tracks simplification status
     counter: &'a mut Counter,
+    /// collects def_path_str of transformed functions
+    transformed_fns: &'a mut Vec<String>,
 }
 
 impl TransformVisitor<'_, '_> {
@@ -788,6 +797,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
 
             self.updated = true;
+            self.transformed_fns
+                .push(self.tcx.def_path_str(local_def_id.to_def_id()));
         }
         self.current_fns.pop();
     }
