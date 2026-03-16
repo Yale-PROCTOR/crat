@@ -44,6 +44,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         used_locals: FxHashSet::default(),
         item_mods: FxHashMap::default(),
         extern_c_fn_ptrs: FxHashSet::default(),
+        used_attr_items: vec![],
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let mut used = visitor.used;
@@ -68,6 +69,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
             entries.push(f);
         }
     }
+    entries.extend(visitor.used_attr_items);
 
     let used_items: FxHashSet<_> = entries
         .iter()
@@ -324,6 +326,7 @@ struct HirVisitor<'tcx> {
     used_locals: FxHashSet<HirId>,
     item_mods: FxHashMap<LocalDefId, LocalModDefId>,
     extern_c_fn_ptrs: FxHashSet<LocalDefId>,
+    used_attr_items: Vec<LocalDefId>,
 }
 
 impl HirVisitor<'_> {
@@ -446,6 +449,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 self.uses.push((item.owner_id.def_id, def_ids));
             }
             _ => {}
+        }
+        if self.tcx.has_attr(item.owner_id.def_id, sym::used) {
+            self.used_attr_items.push(item.owner_id.def_id);
         }
         intravisit::walk_item(self, item)
     }

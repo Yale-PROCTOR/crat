@@ -363,6 +363,16 @@ unsafe fn g(mut x: i32) -> i32 {
     run_test(code, &["f"]);
 }
 
+#[test]
+fn test_transformation_unused_used_attr() {
+    let code = r#"
+#[used]
+static INIT: i32 = 42;
+fn main() {}
+"#;
+    run_transformation_test(code, true, &["fn main()", "#[used]", "static INIT"], &[]);
+}
+
 fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
         let config = super::Config {
