@@ -602,10 +602,14 @@ pub fn analyze(
                 .borrow();
             let blocks = body.basic_blocks.len();
             let stmts = ir_utils::body_size(&body);
-            println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
+            if verbose {
+                println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
+            }
         }
     }
-    println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
+    if verbose {
+        println!("Total Analaysis Time: {:.3}", time as f32 / 1000.0);
+    }
 
     summaries
         .into_iter()

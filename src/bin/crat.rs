@@ -472,10 +472,11 @@ fn main() {
                 }
             }
             Pass::OutParam => {
-                run_compiler_on_path(&file, |tcx| {
-                    outparam_replacer::transform::transform(tcx, &dir, &lib_path, &config.outparam)
+                let res = run_compiler_on_path(&file, |tcx| {
+                    outparam_replacer::transform::transform(tcx, &config.outparam, config.verbose)
                 })
                 .unwrap();
+                std::fs::write(&file, res).unwrap();
             }
             Pass::Lock => {
                 todo!()

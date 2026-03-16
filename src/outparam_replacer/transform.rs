@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs::File};
 
 use etrace::some_or;
 use rustc_ast::{
@@ -14,8 +10,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr as HirExpr, ExprKind as HirExprKind, HirId, Item as HirItem, ItemKind as HirItemKind,
-    Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, definitions::DefPathData,
-    intravisit,
+    Node as HirNode, PatKind, Path as HirPath, QPath, def::Res, intravisit,
 };
 use rustc_index::IndexVec;
 use rustc_middle::{
@@ -23,11 +18,10 @@ use rustc_middle::{
     mir::{BasicBlock, Local, Location, TerminatorKind},
     ty::{TyCtxt, TyKind as MirTyKind},
 };
-use rustc_span::{FileName, RealFileName, Span, def_id::LocalDefId};
+use rustc_span::{Span, def_id::LocalDefId};
 use utils::{
-    ast::transform_ast,
     expr,
-    ir::{AstToHir, AstToHirMapper, HirToThir, ThirToMir, mir_ty_to_string},
+    ir::{AstToHir, HirToThir, ThirToMir, mir_ty_to_string},
     stmt, ty,
 };
 
@@ -181,28 +175,19 @@ enum ReturnTyItem {
 
 pub fn transform(
     tcx: TyCtxt<'_>,
-    dir: &Path,
-    lib_name: &str,
     config: &crate::outparam_replacer::Config,
-) {
+    verbose: bool,
+) -> String {
+    let mut expanded_ast = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut expanded_ast);
+
     let analysis_result: AnalysisResult = if let Some(file) = &config.analysis_file {
         let file = File::open(file).unwrap();
         serde_json::from_reader(file).unwrap()
     } else {
-        analyze(config, false, tcx).0
+        analyze(config, verbose, tcx).0
     };
-
-    let mut path_to_mod_id = FxHashMap::default();
-    tcx.hir_for_each_module(|mod_id| {
-        let def_path = tcx.def_path(mod_id.to_def_id());
-        let mut path = dir.to_path_buf();
-        for data in def_path.data {
-            let DefPathData::TypeNs(name) = data.data else { panic!() };
-            path.push(name.as_str());
-        }
-        path.set_extension("rs");
-        path_to_mod_id.insert(path, mod_id);
-    });
 
     let hir_to_thir = utils::ir::map_hir_to_thir(tcx);
     let mut thir_to_mir = FxHashMap::default();
@@ -478,49 +463,26 @@ pub fn transform(
         funcs.insert(local_def_id, func);
     }
 
-    let res = transform_ast(
-        |krate| {
-            let source_map = tcx.sess.source_map();
-            let filename = source_map.span_to_filename(krate.spans.inner_span);
-            let p = match filename {
-                FileName::Real(RealFileName::LocalPath(p)) => p,
-                FileName::Custom(p) => PathBuf::from(p),
-                _ => unreachable!(),
-            };
-
-            if p.file_name().unwrap().to_str().unwrap() == lib_name {
-                return false;
-            }
-
-            let mod_id: rustc_hir::def_id::LocalModDefId = path_to_mod_id[&p];
-            let (module, _, _) = tcx.hir_get_module(mod_id);
-            let mut mapper = AstToHirMapper::new(tcx);
-            mapper.map_crate_to_mod(krate, module, false);
-
-            let mut visitor = TransformVisitor {
-                tcx,
-                ast_to_hir: mapper.ast_to_hir,
-                hir_to_thir: &hir_to_thir,
-                thir_to_mir: &thir_to_mir,
-                funcs: &funcs,
-                current_fns: vec![],
-                write_args: &write_args,
-                bounds: &hir_visitor.bounds,
-                call_in_ret: &hir_visitor.call_in_ret,
-                updated: false,
-                counter: &mut counter,
-            };
-            visitor.visit_crate(krate);
-            visitor.updated
-        },
+    let mut visitor = TransformVisitor {
         tcx,
-    );
+        ast_to_hir,
+        hir_to_thir: &hir_to_thir,
+        thir_to_mir: &thir_to_mir,
+        funcs: &funcs,
+        current_fns: vec![],
+        write_args: &write_args,
+        bounds: &hir_visitor.bounds,
+        call_in_ret: &hir_visitor.call_in_ret,
+        updated: false,
+        counter: &mut counter,
+    };
+    visitor.visit_crate(&mut expanded_ast);
 
-    if config.simplify {
+    if config.simplify && verbose {
         println!("{counter:#?}");
     }
 
-    res.apply();
+    pprust::crate_to_string_for_macros(&expanded_ast)
 }
 
 struct TransformVisitor<'tcx, 'a> {
