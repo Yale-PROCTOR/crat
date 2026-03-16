@@ -830,9 +830,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     ty = t;
                 }
                 PlaceElem::Downcast(_, variant_idx) => {
-                    let TyKind::Adt(adt_def, _) = mir_ty.kind() else {
-                        unreachable!()
-                    };
+                    let TyKind::Adt(adt_def, _) = mir_ty.kind() else { unreachable!() };
                     variant_field_offset = adt_def
                         .variants()
                         .iter()

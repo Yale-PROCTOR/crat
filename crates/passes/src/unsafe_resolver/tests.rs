@@ -373,6 +373,55 @@ fn main() {}
     run_transformation_test(code, true, &["fn main()", "#[used]", "static INIT"], &[]);
 }
 
+fn run_exposed_test(code: &str, c_exposed_fns: &[&str], includes: &[&str], excludes: &[&str]) {
+    let c_exposed_fns: FxHashSet<String> = c_exposed_fns.iter().map(|s| s.to_string()).collect();
+    let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let config = super::Config {
+            remove_unused: true,
+            remove_no_mangle: false,
+            remove_extern_c: false,
+            replace_pub: false,
+            c_exposed_fns,
+        };
+        super::resolve_unsafe(&config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+        utils::type_check(tcx);
+    })
+    .expect(&transformed);
+    for include in includes {
+        assert!(
+            transformed.contains(include),
+            "{transformed}\ndoes not contain \"{include}\"",
+        );
+    }
+    for exclude in excludes {
+        assert!(
+            !transformed.contains(exclude),
+            "{transformed}\ncontains \"{exclude}\"",
+        );
+    }
+}
+
+#[test]
+fn test_transformation_export_name_exposed() {
+    let code = r#"
+#[export_name = "exposed"]
+fn exposed_0() {}
+fn other() {}
+fn main() {
+    exposed_0();
+}
+"#;
+    run_exposed_test(
+        code,
+        &["exposed"],
+        &["fn exposed_0()", "fn main()"],
+        &["fn other()"],
+    );
+}
+
 fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let transformed = utils::compilation::run_compiler_on_str(&code, |tcx| {
         let config = super::Config {

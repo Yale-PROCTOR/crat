@@ -65,7 +65,11 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut entries = visitor.mains;
     for f in visitor.fns {
         let name = tcx.item_name(f.to_def_id());
-        if config.c_exposed_fns.contains(name.as_str()) {
+        let has_exposed_export_name = tcx.get_attrs(f.to_def_id(), sym::export_name).any(|attr| {
+            attr.value_str()
+                .is_some_and(|s| config.c_exposed_fns.contains(s.as_str()))
+        });
+        if config.c_exposed_fns.contains(name.as_str()) || has_exposed_export_name {
             entries.push(f);
         }
     }
@@ -206,7 +210,14 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
             ident, sig, body, ..
         }) = &mut item.kind
         {
-            let is_exposed_fn = self.config.c_exposed_fns.contains(ident.name.as_str());
+            let has_exposed_export_name = item.attrs.iter().any(|attr| {
+                attr.has_name(sym::export_name)
+                    && attr
+                        .value_str()
+                        .is_some_and(|s| self.config.c_exposed_fns.contains(s.as_str()))
+            });
+            let is_exposed_fn =
+                self.config.c_exposed_fns.contains(ident.name.as_str()) || has_exposed_export_name;
 
             if self.config.replace_pub
                 && item.vis.kind.is_pub()
