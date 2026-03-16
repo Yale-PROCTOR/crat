@@ -619,24 +619,26 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     }
                 }
                 AggregateKind::Adt(_, v_idx, _, _, idx) => {
-                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
-                    let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
-                    let variant = adt_def.variant(*v_idx);
-                    for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
-                        if let Some(r) = self.transfer_op(f, ctx) {
-                            let i = if let Some(idx) = idx { *idx } else { i };
-                            let proj = ts[i.index()].0;
-                            let ty = d.ty(self.tcx, generic_args);
-                            self.transfer_assign(l.add(proj), r, ty);
+                    if let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] {
+                        let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
+                        let variant = adt_def.variant(*v_idx);
+                        for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
+                            if let Some(r) = self.transfer_op(f, ctx) {
+                                let i = if let Some(idx) = idx { *idx } else { i };
+                                let proj = ts[i.index()].0;
+                                let ty = d.ty(self.tcx, generic_args);
+                                self.transfer_assign(l.add(proj), r, ty);
+                            }
                         }
                     }
                 }
                 AggregateKind::Tuple => {
-                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
-                    let TyKind::Tuple(tys) = ty.kind() else { unreachable!() };
-                    for ((proj_ty, (proj, _)), f) in tys.iter().zip(ts).zip(fs) {
-                        if let Some(r) = self.transfer_op(f, ctx) {
-                            self.transfer_assign(l.add(*proj), r, proj_ty);
+                    if let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] {
+                        let TyKind::Tuple(tys) = ty.kind() else { unreachable!() };
+                        for ((proj_ty, (proj, _)), f) in tys.iter().zip(ts).zip(fs) {
+                            if let Some(r) = self.transfer_op(f, ctx) {
+                                self.transfer_assign(l.add(*proj), r, proj_ty);
+                            }
                         }
                     }
                 }
