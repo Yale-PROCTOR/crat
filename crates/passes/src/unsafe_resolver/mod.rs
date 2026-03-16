@@ -496,6 +496,21 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         {
             self.extern_c_fn_ptrs.insert(def_id);
         }
+        // Also detect implicit coercions to extern C function pointers
+        // (e.g., functions placed in static arrays of fn pointers).
+        if let hir::ExprKind::Path(ref qpath) = expr.kind
+            && let hir::QPath::Resolved(_, path) = qpath
+            && let Res::Def(_, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+        {
+            let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+            let adjusted_ty = typeck.expr_ty_adjusted(expr);
+            if let rustc_middle::ty::TyKind::FnPtr(_, hdr) = adjusted_ty.kind()
+                && !hdr.abi.is_rustic_abi()
+            {
+                self.extern_c_fn_ptrs.insert(def_id);
+            }
+        }
         intravisit::walk_expr(self, expr);
     }
 }

@@ -419,3 +419,17 @@ fn main() {
 "#;
     run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
 }
+
+#[test]
+fn test_extern_c_fn_in_static_array_preserved() {
+    let code = r#"
+extern "C" fn f() {}
+extern "C" fn g() {}
+#[used]
+static INIT_ARRAY: [extern "C" fn(); 1] = [f];
+fn main() {
+    g();
+}
+"#;
+    run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
+}
