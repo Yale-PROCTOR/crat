@@ -1848,7 +1848,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     ptr_expr.push_integer_op(&call.args[0], opkind);
                     Some(ptr_expr)
                 } else {
-                    None
+                    Some(PtrExpr::new(
+                        expr,
+                        hir_expr,
+                        base_ty,
+                        PtrExprBaseKind::Other,
+                    ))
                 }
             }
             ExprKind::Binary(binop, lhs, rhs) if base_ty.is_usize() => {
