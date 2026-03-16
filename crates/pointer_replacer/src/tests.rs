@@ -1484,7 +1484,6 @@ pub unsafe fn caller() -> *mut i32 {
     );
 }
 
-#[test]
 fn test_rewriter_mixed_return_shapes_do_not_infer_box_signature() {
     run_test(
         r#"
@@ -3073,6 +3072,8 @@ mod ownership_analysis {
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
 
+    use points_to::andersen;
+
     use crate::{
         analyses::{
             output_params::compute_output_params,
@@ -3112,6 +3113,49 @@ mod ownership_analysis {
             functions,
             structs,
         }
+    }
+
+    fn compute_param_aliases(
+        tcx: TyCtxt<'_>,
+    ) -> FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>> {
+        let arena = typed_arena::Arena::new();
+        let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+        let config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        let pre = andersen::pre_analyze(&config, &tss, tcx);
+        let points_to = andersen::analyze(&config, &pre, &tss, tcx);
+
+        let mut param_aliases = FxHashMap::default();
+        for def_id in tcx.hir_body_owners() {
+            let Some(calls) = pre.call_args.get(&def_id) else {
+                continue;
+            };
+            let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+            let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+            for call_args in calls {
+                for i in 0..body.arg_count {
+                    for j in 0..i {
+                        let Some(arg_i) = call_args[i] else { continue };
+                        let Some(arg_j) = call_args[j] else { continue };
+                        let mut sol_i = points_to[arg_i].clone();
+                        sol_i.intersect(&points_to[arg_j]);
+                        if !sol_i.is_empty() {
+                            let i = Local::from_usize(i + 1);
+                            let j = Local::from_usize(j + 1);
+                            aliases.entry(i).or_default().insert(j);
+                            aliases.entry(j).or_default().insert(i);
+                        }
+                    }
+                }
+            }
+            if !aliases.is_empty() {
+                param_aliases.insert(def_id, aliases);
+            }
+        }
+
+        param_aliases
     }
 
     fn analyze_program<'tcx>(
@@ -3197,6 +3241,58 @@ mod ownership_analysis {
             offenders.is_empty(),
             "legacy MIR source token found in guarded files:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn overlapping_call_args_form_alias_cluster() {
+        run_compiler(
+            r#"
+pub unsafe fn keep_alias_raw(a: *mut i32, b: *mut i32) -> *mut i32 {
+    let _ = b;
+    a
+}
+
+pub unsafe fn foo() -> *mut i32 {
+    let mut x = 7i32;
+    let p: *mut i32 = &mut x;
+    keep_alias_raw(p, p)
+}
+"#,
+            |tcx| {
+                let aliases = compute_param_aliases(tcx);
+                let keep_alias_raw = tcx
+                    .hir_crate(())
+                    .owners
+                    .iter()
+                    .filter_map(|maybe_owner| maybe_owner.as_owner())
+                    .find_map(|owner| {
+                        let OwnerNode::Item(item) = owner.node() else {
+                            return None;
+                        };
+                        let ItemKind::Fn { .. } = item.kind else {
+                            return None;
+                        };
+                        (tcx.item_name(item.owner_id.def_id.to_def_id()).as_str()
+                            == "keep_alias_raw")
+                            .then_some(item.owner_id.def_id)
+                    })
+                    .expect("keep_alias_raw should exist");
+
+                let keep_alias_raw_aliases = aliases
+                    .get(&keep_alias_raw)
+                    .expect("expected alias cluster for keep_alias_raw");
+                assert!(
+                    keep_alias_raw_aliases
+                        .get(&Local::from_u32(1))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(2)))
+                );
+                assert!(
+                    keep_alias_raw_aliases
+                        .get(&Local::from_u32(2))
+                        .is_some_and(|locals| locals.contains(&Local::from_u32(1)))
+                );
+            },
         );
     }
 

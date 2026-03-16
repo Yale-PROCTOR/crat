@@ -159,6 +159,12 @@ impl<'tcx> DecisionMaker<'tcx> {
         );
         let decision = if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
             Some(PtrKind::Raw(m.is_mut()))
+        } else if aliases.is_some_and(|aliases| {
+            std::iter::once(local)
+                .chain(aliases.iter().copied())
+                .any(|l| self.mutable_pointers[l])
+        }) {
+            Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self._owning_pointers[local] && self.array_pointers[local] {
             if self.needs_cursor.contains(local) || is_local_struct {
                 Some(PtrKind::Raw(self.mutable_pointers[local]))
@@ -177,12 +183,6 @@ impl<'tcx> DecisionMaker<'tcx> {
             }
         } else if is_local_struct && m.is_mut() {
             Some(PtrKind::Raw(true))
-        } else if aliases.is_some_and(|aliases| {
-            std::iter::once(local)
-                .chain(aliases.iter().copied())
-                .any(|l| self.mutable_pointers[l])
-        }) {
-            Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self.array_pointers[local] {
             if self.promoted_shared_refs.contains(local) {
                 if self.needs_cursor.contains(local) {
@@ -580,5 +580,38 @@ pub unsafe fn foo(p: {pointer_ty}) {{
             decide_for_param_with_ty("*const i32", false, false, true, false, true, false, true),
             PtrKind::Slice(false)
         );
+    }
+
+    #[test]
+    fn alias_overlap_takes_precedence_over_owning_output_promotion() {
+        let mut decision = None;
+        let code = r#"
+pub unsafe fn foo(p: *mut i32, q: *mut i32) {
+    let _ = (p, q);
+}
+"#;
+        with_test_fn_body(code, |tcx, _did, body| {
+            let local = Local::from_u32(1);
+            let decision_maker = synthetic_decision_maker(
+                tcx,
+                body,
+                local,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
+            let decl = &body.local_decls[local];
+            let aliases = FxHashSet::from_iter([Local::from_u32(2)]);
+            decision = Some(
+                decision_maker
+                    .decide(local, decl, Some(&aliases))
+                    .expect("expected pointer decision"),
+            );
+        });
+        assert_eq!(decision, Some(PtrKind::Raw(true)));
     }
 }

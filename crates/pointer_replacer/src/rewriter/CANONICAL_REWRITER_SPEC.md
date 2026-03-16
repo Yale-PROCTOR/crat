@@ -131,13 +131,13 @@ The following table is exact branch order.
 |---|---|---|
 | 1 | `unwrap_ptr_from_mir_ty(decl.ty)` fails | `None` |
 | 2 | pointee is `c_void` OR file-like type | `Some(Raw(decl mutability))` |
-| 3a | top-level owning, array, `needs_cursor`, output param | `Some(Raw(mutable_pointers[local]))` |
-| 3b | top-level owning, array, `needs_cursor`, not output param | `Some(Raw(mutable_pointers[local]))` |
-| 3c | top-level owning, array, not `needs_cursor`, output param | `Some(Slice(true))` |
-| 3d | top-level owning, array, not `needs_cursor`, not output param | `Some(OptBoxedSlice)` |
-| 4a | top-level owning, non-array, output param | `Some(OptRef(true))` |
-| 4b | top-level owning, non-array, not output param | `Some(OptBox)` |
-| 5 | alias cluster exists and any member (including `local`) is mutable | `Some(Raw(mutable_pointers[local]))` |
+| 3 | alias cluster exists and any member (including `local`) is mutable | `Some(Raw(mutable_pointers[local]))` |
+| 4a | top-level owning, array, `needs_cursor`, output param | `Some(Raw(mutable_pointers[local]))` |
+| 4b | top-level owning, array, `needs_cursor`, not output param | `Some(Raw(mutable_pointers[local]))` |
+| 4c | top-level owning, array, not `needs_cursor`, output param | `Some(Slice(true))` |
+| 4d | top-level owning, array, not `needs_cursor`, not output param | `Some(OptBoxedSlice)` |
+| 5a | top-level owning, non-array, output param | `Some(OptRef(true))` |
+| 5b | top-level owning, non-array, not output param | `Some(OptBox)` |
 | 6a | non-owning array and local in promoted shared set and `needs_cursor` | `Some(SliceCursor(false))` |
 | 6b | non-owning array and local in promoted shared set and not `needs_cursor` | `Some(Slice(false))` |
 | 6c | non-owning array and local in promoted mut set and `needs_cursor` | `Some(SliceCursor(true))` |
