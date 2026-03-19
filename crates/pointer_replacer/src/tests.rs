@@ -1192,10 +1192,50 @@ pub unsafe fn checkshift_like() -> i32 {
     result
 }
 "#,
-        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &["Box::into_raw(Box::new(", "Box::from_raw("],
         &[
             "malloc(std::mem::size_of::<State>())",
             "free(state as *mut core::ffi::c_void);",
+            "Box::leak(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_consumes_direct_scalar_free_for_boxed_root() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+pub unsafe fn free_state() {
+    let state: *mut State = malloc(std::mem::size_of::<State>()) as *mut State;
+    if state.is_null() {
+        return;
+    }
+    (*state).value = 7;
+    free(state as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "let mut state: Option<Box<crate::State>>",
+            "if state.is_none() { return; }",
+            "(*state.as_deref_mut().unwrap()).value = 7;",
+            "drop((state).take());",
+        ],
+        &[
+            "malloc(std::mem::size_of::<State>())",
+            "free(state as *mut core::ffi::c_void);",
+            "Box::from_raw(",
+            "Box::into_raw(",
+            "Box::leak(",
         ],
     );
 }
@@ -1233,6 +1273,65 @@ pub unsafe fn driver_like(length: usize) -> i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_raw_local_for_raw_return_call_result_assignment() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn snprintf(
+        s: *mut core::ffi::c_char,
+        maxlen: usize,
+        format: *const core::ffi::c_char,
+        ...
+    ) -> i32;
+}
+
+pub unsafe fn create_result_string(
+    op: *const core::ffi::c_char,
+    val: i32,
+) -> *mut core::ffi::c_char {
+    let str: *mut core::ffi::c_char = malloc(64) as *mut core::ffi::c_char;
+    if str.is_null() {
+        return std::ptr::null_mut();
+    }
+    snprintf(
+        str,
+        64,
+        b"Operation: %s, Value: %d\0" as *const u8 as *const core::ffi::c_char,
+        op,
+        val,
+    );
+    str
+}
+
+pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8) {
+    let mut log_msg: *mut i8 = std::ptr::null_mut();
+    log_msg = create_result_string(
+        b"multiply\0" as *const u8 as *const core::ffi::c_char,
+        a * b,
+    ) as *mut i8;
+    if log_msg.is_null() {
+        return (0, log_msg);
+    }
+    (a * b, log_msg)
+}
+"#,
+        &[
+            "pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8)",
+            "let mut log_msg: *mut i8 = std::ptr::null_mut();",
+            "log_msg =",
+            "create_result_string(bytemuck::cast_slice",
+            ") as *mut i8;",
+        ],
+        &[
+            "Option<&mut i8>",
+            ".as_mut()",
+            "return (0, (log_msg).as_deref_mut()",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_allows_returned_byte_calloc_buffer_in_m13() {
     run_test(
         r#"
@@ -1256,6 +1355,77 @@ pub unsafe fn decode_like(len: usize, fail: bool) -> *mut core::ffi::c_char {
 "#,
         &["Box::leak("],
         &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
+    );
+}
+
+#[test]
+fn test_rewriter_consumes_direct_boxed_slice_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_many() {
+    let buf: *mut i32 = malloc(4 * std::mem::size_of::<i32>()) as *mut i32;
+    if buf.is_null() {
+        return;
+    }
+    *buf.offset(1) = 7;
+    free(buf as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "let mut buf: Option<Box<[i32]>>",
+            "if buf.is_none() { return; }",
+            "drop((buf).take());",
+        ],
+        &[
+            "malloc(4 * std::mem::size_of::<i32>())",
+            "free(buf as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "Box::from_raw(",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires branchy owning-return inference beyond direct free consumption"]
+fn test_rewriter_consumes_branchy_free_or_return_boxed_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_or_free(flag: bool) -> *mut i32 {
+    let buf: *mut i32 = malloc(4 * std::mem::size_of::<i32>()) as *mut i32;
+    if buf.is_null() {
+        return std::ptr::null_mut();
+    }
+    if flag {
+        free(buf as *mut core::ffi::c_void);
+        return std::ptr::null_mut();
+    }
+    buf
+}
+"#,
+        &[
+            "pub unsafe fn alloc_or_free(flag: bool) -> Option<Box<[i32]>>",
+            "let mut buf: Option<Box<[i32]>>",
+            "if buf.is_none()",
+            "drop((buf).take());",
+            "return None;",
+            "(buf).take()",
+        ],
+        &[
+            "malloc(4 * std::mem::size_of::<i32>())",
+            "free(buf as *mut core::ffi::c_void);",
+            "Box::from_raw(",
+            "Box::leak(",
+        ],
     );
 }
 

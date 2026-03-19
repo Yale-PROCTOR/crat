@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
-    mir::{Local, LocalDecl, Operand, Rvalue, StatementKind},
+    mir::{Local, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{self, TyCtxt},
 };
 use rustc_span::def_id::LocalDefId;
@@ -292,9 +292,10 @@ impl SigDecisions {
             let returned_local_output_dec =
                 infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
             let output_dec = match (direct_output_dec, returned_local_output_dec) {
-                (Some(PtrKind::Raw(_)), Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice))) => {
-                    Some(kind)
-                }
+                (
+                    Some(PtrKind::Raw(_)),
+                    Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)),
+                ) => Some(kind),
                 (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
                 (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice)) => {
                     Some(PtrKind::OptBoxedSlice)
@@ -323,6 +324,16 @@ fn infer_returned_local_box_kind<'tcx>(
     aliases: Option<&FxHashMap<Local, FxHashSet<Local>>>,
     return_local: Local,
 ) -> Option<PtrKind> {
+    fn is_null_like_return_call<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
+        let Some(func_const) = func.constant() else {
+            return false;
+        };
+        let ty::TyKind::FnDef(def_id, _) = func_const.ty().kind() else {
+            return false;
+        };
+        matches!(tcx.item_name(*def_id).as_str(), "null" | "null_mut")
+    }
+
     let mut candidate = None;
     for bb in body.basic_blocks.iter() {
         for stmt in &bb.statements {
@@ -344,6 +355,22 @@ fn infer_returned_local_box_kind<'tcx>(
                 _ => {}
             }
         }
+        let Some(terminator) = &bb.terminator else {
+            continue;
+        };
+        let TerminatorKind::Call {
+            func, destination, ..
+        } = &terminator.kind
+        else {
+            continue;
+        };
+        if destination.as_local() != Some(return_local) {
+            continue;
+        }
+        if is_null_like_return_call(decision_maker.tcx, func) {
+            continue;
+        }
+        return None;
     }
 
     let local = candidate?;
@@ -454,30 +481,27 @@ pub unsafe fn foo(p: {pointer_ty}) {{
 }}
 "#
         );
-        with_test_fn_body(
-            &code,
-            |tcx, _did, body| {
-                let local = Local::from_u32(1);
-                let decision_maker = synthetic_decision_maker(
-                    tcx,
-                    body,
-                    local,
-                    mutable,
-                    is_array,
-                    owning,
-                    output,
-                    promoted_mut,
-                    promoted_shared,
-                    needs_cursor,
-                );
-                let decl = &body.local_decls[local];
-                decision = Some(
-                    decision_maker
-                        .decide(local, decl, None)
-                        .expect("expected pointer decision"),
-                );
-            },
-        );
+        with_test_fn_body(&code, |tcx, _did, body| {
+            let local = Local::from_u32(1);
+            let decision_maker = synthetic_decision_maker(
+                tcx,
+                body,
+                local,
+                mutable,
+                is_array,
+                owning,
+                output,
+                promoted_mut,
+                promoted_shared,
+                needs_cursor,
+            );
+            let decl = &body.local_decls[local];
+            decision = Some(
+                decision_maker
+                    .decide(local, decl, None)
+                    .expect("expected pointer decision"),
+            );
+        });
         decision.expect("decision should be set")
     }
 
@@ -593,16 +617,7 @@ pub unsafe fn foo(p: *mut i32, q: *mut i32) {
         with_test_fn_body(code, |tcx, _did, body| {
             let local = Local::from_u32(1);
             let decision_maker = synthetic_decision_maker(
-                tcx,
-                body,
-                local,
-                true,
-                true,
-                true,
-                true,
-                false,
-                false,
-                false,
+                tcx, body, local, true, true, true, true, false, false, false,
             );
             let decl = &body.local_decls[local];
             let aliases = FxHashSet::from_iter([Local::from_u32(2)]);

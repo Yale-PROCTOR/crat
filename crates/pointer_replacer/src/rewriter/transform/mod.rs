@@ -272,8 +272,16 @@ impl MutVisitor for TransformVisitor<'_> {
         {
             let typeck = self.tcx.typeck(hir_id.owner);
             let lhs_ty = typeck.node_type(hir_id);
-            let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
+            let (lhs_inner_ty, lhs_mutability) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
             let original_lhs_kind = lhs_kind;
+            if let Some(init) = let_stmt.init
+                && matches!(
+                    self.forced_local_callee_output_kind(init),
+                    Some(PtrKind::Raw(_))
+                )
+            {
+                lhs_kind = PtrKind::Raw(lhs_mutability.is_mut());
+            }
             if matches!(lhs_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
                 && let Some(init) = let_stmt.init
                 && !self.rhs_supports_box_target(init, lhs_kind, lhs_inner_ty)
@@ -357,6 +365,12 @@ impl MutVisitor for TransformVisitor<'_> {
                     PtrKind::Raw(m.is_mut())
                 };
                 let original_lhs_kind = lhs_kind;
+                if matches!(
+                    self.forced_local_callee_output_kind(hir_rhs),
+                    Some(PtrKind::Raw(_))
+                ) {
+                    lhs_kind = PtrKind::Raw(m.is_mut());
+                }
                 if matches!(lhs_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
                     && !self.rhs_supports_box_target(hir_rhs, lhs_kind, lhs_inner_ty)
                 {
@@ -701,7 +715,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 changed = true;
             }
             let raw_call_result_bindings =
-                collect_raw_call_result_bindings(rust_program.tcx, &sig_decs);
+                collect_raw_call_result_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
                 collect_raw_local_assignment_bindings(rust_program.tcx, &ptr_kinds);
             let unsupported_box_target_bindings =
@@ -824,6 +838,15 @@ impl<'tcx> TransformVisitor<'tcx> {
         else {
             return None;
         };
+        if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
+            && matches!(
+                self.effective_ptr_kind(hir_id),
+                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
+            )
+        {
+            let local_name = self.tcx.hir_name(hir_id).to_string();
+            return Some(utils::expr!("drop(({local_name}).take())"));
+        }
         let Some(info) = self.raw_bridge_bindings.get(&hir_id) else {
             return None;
         };
@@ -858,30 +881,19 @@ impl<'tcx> TransformVisitor<'tcx> {
 
     fn effective_ptr_kind(&self, hir_id: HirId) -> Option<PtrKind> {
         let kind = self.ptr_kinds.get(&hir_id).copied()?;
-        if self.forced_raw_bindings.contains(&hir_id)
-            && matches!(kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
-        {
-            Some(PtrKind::Raw(true))
+        if self.forced_raw_bindings.contains(&hir_id) {
+            match kind {
+                PtrKind::Raw(_) => Some(kind),
+                other => Some(PtrKind::Raw(other.is_mut())),
+            }
         } else {
             Some(kind)
         }
     }
 
     fn forced_local_callee_output_kind(&self, hir_expr: &hir::Expr<'tcx>) -> Option<PtrKind> {
-        let hir::ExprKind::Call(func, _) = hir_expr.kind else {
-            return None;
-        };
-        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind else {
-            return None;
-        };
-        let Res::Def(_, def_id) = path.res else {
-            return None;
-        };
-        let def_id = def_id.as_local()?;
-        if !local_def_id_has_fn_body(self.tcx, def_id) {
-            return None;
-        }
-        self.sig_decs.data.get(&def_id)?.output_dec
+        let def_id = local_called_fn_def_id(self.tcx, hir_expr)?;
+        effective_callee_output_kind(self.tcx, &self.sig_decs, &self.ptr_kinds, def_id)
     }
 
     fn rhs_supports_box_target(
@@ -909,9 +921,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             _ => return true,
         }
 
-        if let hir::ExprKind::Call(..) = hir_expr.kind
-            && self.forced_local_callee_output_kind(hir_expr) == Some(target_kind)
-        {
+        if self.forced_local_callee_output_kind(hir_expr) == Some(target_kind) {
             return true;
         }
 
@@ -2072,6 +2082,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 utils::expr!("{} {{ {} }}", ty_name, fields)
+            }
+            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
+                let ty_name = mir_ty_to_string(ty, self.tcx);
+                utils::expr!("unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}")
             }
             _ => {
                 let ty = mir_ty_to_string(ty, self.tcx);
@@ -4087,10 +4101,11 @@ fn normalize_forced_raw_bindings(
     forced_raw_bindings: &FxHashSet<HirId>,
 ) {
     for (hir_id, kind) in ptr_kinds.iter_mut() {
-        if forced_raw_bindings.contains(hir_id)
-            && matches!(kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
-        {
-            *kind = PtrKind::Raw(true);
+        if forced_raw_bindings.contains(hir_id) {
+            *kind = match *kind {
+                PtrKind::Raw(_) => *kind,
+                other => PtrKind::Raw(other.is_mut()),
+            };
         }
     }
 }
@@ -4279,25 +4294,59 @@ fn fn_output_has_nonowning_local_consumers(
     false
 }
 
-fn hir_callee_output_kind(
-    tcx: TyCtxt<'_>,
-    sig_decs: &SigDecisions,
-    hir_expr: &hir::Expr<'_>,
-) -> Option<PtrKind> {
+fn local_called_fn_def_id(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<LocalDefId> {
+    let hir_expr = hir_unwrap_casts(hir_expr);
     let hir::ExprKind::Call(func, _) = hir_expr.kind else {
         return None;
     };
-    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind else {
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind else {
         return None;
     };
     let Res::Def(_, def_id) = path.res else {
         return None;
     };
     let def_id = def_id.as_local()?;
-    if !local_def_id_has_fn_body(tcx, def_id) {
-        return None;
+    local_def_id_has_fn_body(tcx, def_id).then_some(def_id)
+}
+
+fn effective_callee_output_kind(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    def_id: LocalDefId,
+) -> Option<PtrKind> {
+    let sig_dec = sig_decs.data.get(&def_id)?;
+    if let Some(output_dec) = sig_dec.output_dec {
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        let Some((inner_ty, _)) =
+            unwrap_ptr_from_mir_ty(body.local_decls[rustc_middle::mir::Local::from_u32(0)].ty)
+        else {
+            return Some(output_dec);
+        };
+        if matches!(output_dec, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+            && (fn_tail_returns_unsupported_box_binding(
+                tcx, sig_decs, ptr_kinds, def_id, output_dec, inner_ty,
+            ) || fn_output_has_nonowning_local_consumers(tcx, ptr_kinds, def_id, output_dec))
+        {
+            return Some(PtrKind::Raw(true));
+        }
+        return Some(output_dec);
     }
-    sig_decs.data.get(&def_id)?.output_dec
+    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+    match sig.output().kind() {
+        ty::TyKind::RawPtr(_, m) => Some(PtrKind::Raw(m.is_mut())),
+        _ => None,
+    }
+}
+
+fn hir_callee_output_kind(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    hir_expr: &hir::Expr<'_>,
+) -> Option<PtrKind> {
+    let def_id = local_called_fn_def_id(tcx, hir_expr)?;
+    effective_callee_output_kind(tcx, sig_decs, ptr_kinds, def_id)
 }
 
 fn local_def_id_has_fn_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
@@ -4311,6 +4360,7 @@ fn local_def_id_has_fn_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
 }
 
 fn hir_call_matches_foreign_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, name: &str) -> bool {
+    let expr = hir_unwrap_casts(expr);
     let hir::ExprKind::Call(func, _) = expr.kind else {
         return false;
     };
@@ -4333,17 +4383,7 @@ fn hir_call_matches_foreign_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, name: &s
 }
 
 fn hir_called_local_fn(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LocalDefId> {
-    let hir::ExprKind::Call(func, _) = expr.kind else {
-        return None;
-    };
-    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind else {
-        return None;
-    };
-    let Res::Def(_, def_id) = path.res else {
-        return None;
-    };
-    let def_id = def_id.as_local()?;
-    local_def_id_has_fn_body(tcx, def_id).then_some(def_id)
+    local_called_fn_def_id(tcx, expr)
 }
 
 fn hir_is_borrow_only_foreign_buffer_arg(
@@ -5885,10 +5925,15 @@ fn collect_raw_bridge_bindings(
     bindings
 }
 
-fn collect_raw_call_result_bindings(tcx: TyCtxt<'_>, sig_decs: &SigDecisions) -> FxHashSet<HirId> {
+fn collect_raw_call_result_bindings(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<HirId> {
     struct RawCallResultVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         bindings: FxHashSet<HirId>,
     }
 
@@ -5898,7 +5943,7 @@ fn collect_raw_call_result_bindings(tcx: TyCtxt<'_>, sig_decs: &SigDecisions) ->
                 && let hir::PatKind::Binding(_, hir_id, ident, _) = let_stmt.pat.kind
                 && let Some(init) = let_stmt.init
                 && matches!(
-                    hir_callee_output_kind(self.tcx, self.sig_decs, init),
+                    hir_callee_output_kind(self.tcx, self.sig_decs, self.ptr_kinds, init),
                     Some(PtrKind::Raw(_))
                 )
             {
@@ -5913,7 +5958,7 @@ fn collect_raw_call_result_bindings(tcx: TyCtxt<'_>, sig_decs: &SigDecisions) ->
                 && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
                 && let Res::Local(hir_id) = path.res
                 && matches!(
-                    hir_callee_output_kind(self.tcx, self.sig_decs, rhs),
+                    hir_callee_output_kind(self.tcx, self.sig_decs, self.ptr_kinds, rhs),
                     Some(PtrKind::Raw(_))
                 )
             {
@@ -5939,6 +5984,7 @@ fn collect_raw_call_result_bindings(tcx: TyCtxt<'_>, sig_decs: &SigDecisions) ->
         let mut visitor = RawCallResultVisitor {
             tcx,
             sig_decs,
+            ptr_kinds,
             bindings: FxHashSet::default(),
         };
         visitor.visit_expr(body.value);
@@ -6024,7 +6070,7 @@ fn hir_rhs_supports_box_target<'tcx>(
     }
 
     if let hir::ExprKind::Call(..) = hir_expr.kind
-        && hir_callee_output_kind(tcx, sig_decs, hir_expr) == Some(target_kind)
+        && hir_callee_output_kind(tcx, sig_decs, ptr_kinds, hir_expr) == Some(target_kind)
     {
         return true;
     }
@@ -6226,7 +6272,16 @@ fn collect_unsupported_box_usage_bindings(
                 hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
                 && let Some(root) = self.owning_root_of(hir_id)
             {
-                self.bindings.insert(root);
+                let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
+                let direct_box_consume = is_direct_free
+                    && hir_id == root
+                    && matches!(
+                        self.ptr_kinds.get(&hir_id),
+                        Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
+                    );
+                if !direct_box_consume {
+                    self.bindings.insert(root);
+                }
             }
 
             intravisit::walk_expr(self, expr);
@@ -6538,6 +6593,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
+        process::Command,
     };
 
     use rustc_ast::{Crate, Expr, ItemKind, LocalKind, PatKind, StmtKind};
@@ -6683,6 +6739,152 @@ mod tests {
         }
         projects.sort();
         projects
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn cargo_bin() -> PathBuf {
+        std::env::var_os("CARGO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cargo"))
+    }
+
+    fn crat_bin_path(workspace_root: &Path) -> PathBuf {
+        workspace_root
+            .join("target")
+            .join("debug")
+            .join(format!("crat{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    fn ensure_crat_bin_built(workspace_root: &Path) {
+        let status = Command::new(cargo_bin())
+            .current_dir(workspace_root)
+            .args(["build", "--bin", "crat"])
+            .status()
+            .unwrap_or_else(|err| panic!("failed to build crat binary: {err}"));
+        assert!(status.success(), "failed to build crat binary");
+    }
+
+    fn reset_temp_dir(path: &Path) {
+        if path.exists() {
+            fs::remove_dir_all(path).unwrap_or_else(|err| {
+                panic!("failed to clear temp dir `{}`: {err}", path.display())
+            });
+        }
+        fs::create_dir_all(path)
+            .unwrap_or_else(|err| panic!("failed to create temp dir `{}`: {err}", path.display()));
+    }
+
+    #[derive(Debug)]
+    struct ProjectCompileRecord {
+        project: String,
+        translated_dir: PathBuf,
+        crat_ok: bool,
+        cargo_check_ok: bool,
+        failure_output: Option<String>,
+    }
+
+    fn trim_command_output(output: &[u8]) -> String {
+        let output = String::from_utf8_lossy(output);
+        let lines = output.lines().collect::<Vec<_>>();
+        let start = lines.len().saturating_sub(40);
+        lines[start..].join("\n")
+    }
+
+    fn run_b02_pointer_compile_gate(temp_root_name: &str) -> Vec<ProjectCompileRecord> {
+        let workspace_root = workspace_root();
+        ensure_crat_bin_built(&workspace_root);
+        let crat_bin = crat_bin_path(&workspace_root);
+        assert!(
+            crat_bin.is_file(),
+            "expected crat binary at `{}`",
+            crat_bin.display()
+        );
+
+        let b02_root = b02_root();
+        let temp_root = std::env::temp_dir().join(temp_root_name);
+        reset_temp_dir(&temp_root);
+        let shared_target_dir = temp_root.join("_cargo_target");
+        fs::create_dir_all(&shared_target_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create shared cargo target dir `{}`: {err}",
+                shared_target_dir.display()
+            )
+        });
+
+        let mut records = Vec::new();
+        for project_dir in b02_project_dirs(&b02_root) {
+            let rel_project = project_dir
+                .strip_prefix(&b02_root)
+                .unwrap_or(project_dir.as_path())
+                .to_path_buf();
+            let project_name = project_dir
+                .file_name()
+                .expect("project directory should have a name");
+            let output_parent = temp_root.join(rel_project.parent().unwrap_or(Path::new("")));
+            fs::create_dir_all(&output_parent).unwrap_or_else(|err| {
+                panic!(
+                    "failed to create output parent `{}`: {err}",
+                    output_parent.display()
+                )
+            });
+            let translated_dir = output_parent.join(project_name);
+
+            let crat_output = Command::new(&crat_bin)
+                .current_dir(&workspace_root)
+                .args([
+                    "--pass",
+                    "pointer",
+                    "--pass",
+                    "check",
+                    "--output",
+                    output_parent.to_str().expect("utf8 path"),
+                    project_dir.to_str().expect("utf8 path"),
+                ])
+                .output()
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to execute crat for `{}`: {err}",
+                        rel_project.display()
+                    )
+                });
+
+            if !crat_output.status.success() {
+                records.push(ProjectCompileRecord {
+                    project: rel_project.display().to_string(),
+                    translated_dir,
+                    crat_ok: false,
+                    cargo_check_ok: false,
+                    failure_output: Some(trim_command_output(&crat_output.stderr)),
+                });
+                continue;
+            }
+
+            let cargo_check_output = Command::new(cargo_bin())
+                .current_dir(&translated_dir)
+                .env("CARGO_TARGET_DIR", &shared_target_dir)
+                .args(["check", "--offline"])
+                .output()
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to run cargo check for `{}`: {err}",
+                        rel_project.display()
+                    )
+                });
+
+            records.push(ProjectCompileRecord {
+                project: rel_project.display().to_string(),
+                translated_dir,
+                crat_ok: true,
+                cargo_check_ok: cargo_check_output.status.success(),
+                failure_output: (!cargo_check_output.status.success())
+                    .then(|| trim_command_output(&cargo_check_output.stderr)),
+            });
+        }
+
+        records
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -7001,7 +7203,8 @@ mod tests {
                 changed = true;
             }
 
-            let raw_call_result_bindings = collect_raw_call_result_bindings(tcx, &sig_decs);
+            let raw_call_result_bindings =
+                collect_raw_call_result_bindings(tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
                 collect_raw_local_assignment_bindings(tcx, &ptr_kinds);
             let unsupported_box_target_bindings =
@@ -7065,6 +7268,50 @@ mod tests {
         }
 
         (sig_decs, ptr_kinds, reason_map, usage_subreason_map)
+    }
+
+    #[test]
+    #[ignore = "expensive B02 pointer translation compile gate"]
+    fn b02_corpus_pointer_translation_compile_gate() {
+        let records = run_b02_pointer_compile_gate("crat-b02-pointer-compile-gate");
+        assert!(!records.is_empty(), "expected at least one B02 project");
+
+        let failures = records
+            .iter()
+            .filter(|record| !(record.crat_ok && record.cargo_check_ok))
+            .collect::<Vec<_>>();
+
+        eprintln!(
+            "B02 pointer compile gate across {} projects:",
+            records.len()
+        );
+        for record in &records {
+            eprintln!(
+                "{}: crat={} cargo_check={} translated_dir={}",
+                record.project,
+                record.crat_ok,
+                record.cargo_check_ok,
+                record.translated_dir.display(),
+            );
+            if let Some(failure_output) = &record.failure_output {
+                eprintln!("  failure tail:\n{failure_output}");
+            }
+        }
+        eprintln!(
+            "Totals: passed={} failed={}",
+            records.len() - failures.len(),
+            failures.len(),
+        );
+
+        assert!(
+            failures.is_empty(),
+            "pointer translation compile gate failed for:\n{}",
+            failures
+                .iter()
+                .map(|record| record.project.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     fn collect_unsupported_box_usage_subreasons(
@@ -7706,6 +7953,82 @@ pub struct StructArrayDefaultProbe {{
 
 pub fn check() {{
     let _: Option<Box<crate::StructArrayDefaultProbe>> = {emitted};
+}}
+"#
+            );
+            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
+                .expect(&check_code);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn struct_default_materialization_handles_union_fields() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub union TypeConfusion {
+    pub int_val: i32,
+    pub float_val: f32,
+}
+
+#[repr(C)]
+pub struct UnionHolderProbe {
+    pub data: TypeConfusion,
+    pub value: i32,
+}
+
+pub unsafe fn alloc_struct() {
+    let state: *mut UnionHolderProbe =
+        malloc(std::mem::size_of::<crate::UnionHolderProbe>()) as *mut crate::UnionHolderProbe;
+    let _ = state;
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let mut krate = ::utils::ast::expanded_ast(tcx);
+            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+            let struct_ty = find_struct_ty(tcx, "UnionHolderProbe");
+            let init_expr = find_local_init_expr(&krate, "alloc_struct", "state");
+            let mut materialized = init_expr.clone();
+            let visitor = synthetic_transform_visitor(tcx);
+
+            let kind = visitor.try_materialize_box_allocator_root(
+                &mut materialized,
+                init_expr,
+                None,
+                PtrKind::OptBox,
+                struct_ty,
+            );
+            assert_eq!(kind, Some(PtrKind::OptBox));
+
+            let emitted = pprust::expr_to_string(&materialized);
+            assert!(emitted.contains("Some(Box::new("), "{emitted}");
+            assert!(
+                emitted.contains("MaybeUninit::<crate::TypeConfusion>::zeroed().assume_init()"),
+                "{emitted}"
+            );
+
+            let check_code = format!(
+                r#"
+#[repr(C)]
+pub union TypeConfusion {{
+    pub int_val: i32,
+    pub float_val: f32,
+}}
+
+#[repr(C)]
+pub struct UnionHolderProbe {{
+    pub data: TypeConfusion,
+    pub value: i32,
+}}
+
+pub fn check() {{
+    let _: Option<Box<crate::UnionHolderProbe>> = {emitted};
 }}
 "#
             );

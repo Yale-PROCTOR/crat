@@ -273,10 +273,15 @@ Practical result for function-pointer-used functions:
     - scalar locals use `drop(Box::from_raw(...))`
     - array locals use `drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(...)))`
     - supported local deallocator wrappers participate in the same rewrite path as direct foreign `free(...)`
-    - M13 slice 1 broadens local deallocator-wrapper recognition structurally:
-      - the wrapper must have exactly one raw-pointer parameter
-      - it may null-check that parameter and assign it to null afterwards
-      - it must directly call foreign `free(param)`
+  - Direct foreign `free(...)` on a tracked owning local that still remains `OptBox` / `OptBoxedSlice` no longer forces raw-bridge recovery:
+    - the local stays boxed
+    - the call rewrites to ownership consumption via `drop((local).take())`
+    - this slice only applies to the owning root local itself; casted byte-view aliases and non-root aliases remain conservative
+    - local free-wrapper ownership-consuming signatures/calls remain out of scope; they still use the existing raw-bridge path when selected
+  - M13 slice 1 broadens local deallocator-wrapper recognition structurally:
+    - the wrapper must have exactly one raw-pointer parameter
+    - it may null-check that parameter and assign it to null afterwards
+    - it must directly call foreign `free(param)`
       - any field access, pointer-value aliasing, return, or non-free call use of that parameter keeps the wrapper out of this path
   - Run `hoist_opt_ref_borrow` post-pass to reduce repeated mutable deref borrow conflicts.
 - Method call `is_null`
@@ -729,6 +734,7 @@ If no local-path kind match applies:
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
 - `cargo test -p pointer_replacer b02_corpus_rewrite_sweep_records_option_box_rewrites -- --ignored --nocapture`
+- `cargo test -p pointer_replacer b02_corpus_pointer_translation_compile_gate -- --ignored --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
