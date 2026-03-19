@@ -699,7 +699,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             collect_local_raw_param_summaries(rust_program.tcx, &free_like_wrappers);
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
-        normalize_forced_raw_bindings(&mut ptr_kinds, &forced_raw_bindings);
+        normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         loop {
             let mut changed = false;
             let (box_input_changed, unsupported_box_input_bindings) =
@@ -734,7 +734,11 @@ impl<'tcx> TransformVisitor<'tcx> {
             forced_raw_bindings.extend(unsupported_box_usage_bindings);
             if forced_raw_bindings.len() != old_len {
                 changed = true;
-                normalize_forced_raw_bindings(&mut ptr_kinds, &forced_raw_bindings);
+                normalize_forced_raw_bindings(
+                    rust_program.tcx,
+                    &mut ptr_kinds,
+                    &forced_raw_bindings,
+                );
             }
             if !changed {
                 break;
@@ -2085,7 +2089,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
                 let ty_name = mir_ty_to_string(ty, self.tcx);
-                utils::expr!("unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}")
+                utils::expr!(
+                    "unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}"
+                )
             }
             _ => {
                 let ty = mir_ty_to_string(ty, self.tcx);
@@ -4097,15 +4103,17 @@ fn fn_tail_returns_unsupported_box_binding<'tcx>(
 }
 
 fn normalize_forced_raw_bindings(
+    tcx: TyCtxt<'_>,
     ptr_kinds: &mut FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: &FxHashSet<HirId>,
 ) {
     for (hir_id, kind) in ptr_kinds.iter_mut() {
         if forced_raw_bindings.contains(hir_id) {
-            *kind = match *kind {
-                PtrKind::Raw(_) => *kind,
-                other => PtrKind::Raw(other.is_mut()),
-            };
+            let ty = tcx.typeck(hir_id.owner).node_type(*hir_id);
+            let raw_mut = unwrap_ptr_from_mir_ty(ty)
+                .map(|(_, m)| m.is_mut())
+                .unwrap_or_else(|| kind.is_mut());
+            *kind = PtrKind::Raw(raw_mut);
         }
     }
 }
@@ -7190,7 +7198,7 @@ mod tests {
                 .or_default()
                 .push("unsupported_allocator_root");
         }
-        normalize_forced_raw_bindings(&mut ptr_kinds, &forced_raw_bindings);
+        normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
 
         loop {
             let mut changed = false;
@@ -7259,7 +7267,7 @@ mod tests {
             forced_raw_bindings.extend(unsupported_box_usage_bindings);
             if forced_raw_bindings.len() != old_len {
                 changed = true;
-                normalize_forced_raw_bindings(&mut ptr_kinds, &forced_raw_bindings);
+                normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
             }
 
             if !changed {

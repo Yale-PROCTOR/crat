@@ -89,8 +89,10 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
 
             if let Some(def_id) = maybe_local_fn {
                 let typeck = self.tcx.typeck(ex.hir_id.owner);
-                if matches!(typeck.expr_ty_adjusted(ex).kind(), rustc_middle::ty::TyKind::FnPtr(..))
-                {
+                if matches!(
+                    typeck.expr_ty_adjusted(ex).kind(),
+                    rustc_middle::ty::TyKind::FnPtr(..)
+                ) {
                     self.fn_ptrs.insert(def_id);
                 }
             }

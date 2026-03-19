@@ -2577,6 +2577,85 @@ pub unsafe extern "C" fn foo() -> (libc::c_int, *mut libc::c_int) {
     );
 }
 
+#[test]
+fn test_outparam_tuple_result_keeps_forced_raw_call_result_mutability() {
+    run_test(
+        r#"
+extern "C" {
+    fn printf(__format: *const core::ffi::c_char, ...) -> core::ffi::c_int;
+    fn snprintf(
+        __s: *mut core::ffi::c_char,
+        __maxlen: usize,
+        __format: *const core::ffi::c_char,
+        ...
+    ) -> core::ffi::c_int;
+    fn malloc(__size: usize) -> *mut core::ffi::c_void;
+    fn free(__ptr: *mut core::ffi::c_void);
+    fn strcmp(__s1: *const core::ffi::c_char, __s2: *const core::ffi::c_char)
+        -> core::ffi::c_int;
+}
+
+pub unsafe fn create_result_string(
+    mut op: *const core::ffi::c_char,
+    mut val: core::ffi::c_int,
+) -> *mut core::ffi::c_char {
+    let mut str: *mut core::ffi::c_char = malloc(64usize) as *mut core::ffi::c_char;
+    if str.is_null() {
+        return 0 as *mut core::ffi::c_char;
+    }
+    snprintf(
+        str,
+        64usize,
+        b"Operation: %s, Value: %d\0" as *const u8 as *const core::ffi::c_char,
+        op,
+        val,
+    );
+    return str;
+}
+
+pub unsafe fn multiply_with_log(
+    mut a: core::ffi::c_int,
+    mut b: core::ffi::c_int,
+) -> (core::ffi::c_int, *mut i8) {
+    let mut log_msg___v: *mut i8 = 0 as *mut _;
+    log_msg___v =
+        create_result_string(b"multiply\0" as *const u8 as *const core::ffi::c_char, a * b);
+    if (log_msg___v).is_null() {
+        return (0 as core::ffi::c_int, log_msg___v);
+    }
+    return (a * b, log_msg___v);
+}
+
+pub unsafe fn complexmode(
+    mut value1: core::ffi::c_int,
+    mut value2: core::ffi::c_int,
+) -> core::ffi::c_int {
+    let mut result: core::ffi::c_int = 0;
+    let mut log_message: *mut core::ffi::c_char = 0 as *mut core::ffi::c_char;
+    result = {
+        let rv___t = multiply_with_log(value1, value2);
+        *(&mut log_message) = rv___t.1;
+        rv___t.0
+    };
+    if log_message.is_null()
+        || strcmp(log_message, b"\0" as *const u8 as *const core::ffi::c_char) == 0
+    {
+        printf(b"Log message creation failed\n\0" as *const u8 as *const core::ffi::c_char);
+    } else {
+        printf(
+            b"Mode 2: %s\n\0" as *const u8 as *const core::ffi::c_char,
+            log_message,
+        );
+        free(log_message as *mut core::ffi::c_void);
+    }
+    result
+}
+"#,
+        &["let mut log_msg___v: *mut i8"],
+        &["let mut log_msg___v: *const i8"],
+    );
+}
+
 /// Slice deref fallback: `*p` on a Slice variable without offset → `(p)[0]`.
 /// When p is Slice but deref doesn't match the `&arr[start..]` pattern,
 /// the else branch at line 296 produces `(*p)[0]`.
