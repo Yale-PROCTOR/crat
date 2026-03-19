@@ -22,7 +22,7 @@ pub fn libc_call<'tcx>(
 ) {
     match callee.as_str() {
         // dest is fat, all ptr args are fat
-        "strchr" | "strrchr" | "strstr" | "strtok" => {
+        "strstr" | "strtok" => {
             mark_dest_and_args_bottom(
                 destination,
                 args,
@@ -44,7 +44,7 @@ pub fn libc_call<'tcx>(
             );
         }
         // dest is fat, first ptr arg is fat
-        "memset" | "realloc" => {
+        "memset" | "realloc" | "strchr" | "strrchr" => {
             mark_dest_and_args_bottom(
                 destination,
                 &args[..1.min(args.len())],
@@ -55,8 +55,18 @@ pub fn libc_call<'tcx>(
             );
         }
         // all ptr args are fat, no dest effect
-        "strcmp" | "strcasecmp" | "strncmp" | "strncasecmp" | "strcspn" | "memcmp" => {
+        "strcmp" | "strcasecmp" | "strcspn" => {
             mark_args_bottom(args, local_decls, locals, struct_fields, database);
+        }
+        // first 2 ptr args are fat (third arg is size_t), no dest effect
+        "strncmp" | "strncasecmp" | "memcmp" => {
+            mark_args_bottom(
+                &args[..2.min(args.len())],
+                local_decls,
+                locals,
+                struct_fields,
+                database,
+            );
         }
         // first ptr arg is fat, no dest effect
         "strlen" | "strdup" | "atoi" | "atof" | "fgets" | "fputs" | "puts" | "fread" | "fwrite"
@@ -134,7 +144,7 @@ pub fn libc_call<'tcx>(
             string_literals,
             database,
         ),
-        "fscanf" | "sscanf" => call_scanf(
+        "fscanf" => call_scanf(
             &args[1..],
             local_decls,
             locals,
@@ -142,6 +152,23 @@ pub fn libc_call<'tcx>(
             string_literals,
             database,
         ),
+        "sscanf" => {
+            mark_args_bottom(
+                &args[..1.min(args.len())],
+                local_decls,
+                locals,
+                struct_fields,
+                database,
+            );
+            call_scanf(
+                &args[1..],
+                local_decls,
+                locals,
+                struct_fields,
+                string_literals,
+                database,
+            );
+        }
         _ => {}
     }
 }
