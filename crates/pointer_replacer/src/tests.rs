@@ -88,6 +88,71 @@ pub unsafe fn foo() -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_rewrites_malloc_casted_sizeof_local_struct_to_opt_box() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+pub unsafe fn make_state() -> *mut State {
+    let mut state: *mut State = malloc(::core::mem::size_of::<State>() as usize) as *mut State;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn make_state() -> Option<Box<crate::State>>",
+            "Option<Box<crate::State>>",
+            "Some(Box::new(crate::State {",
+        ],
+        &[
+            "malloc(::core::mem::size_of::<State>() as usize)",
+            "Box::into_raw(",
+            "Box::leak(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_calloc_casted_sizeof_local_struct_to_opt_box() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+pub unsafe fn make_state() -> *mut State {
+    let mut state: *mut State =
+        calloc(1 as usize, ::core::mem::size_of::<State>() as usize) as *mut State;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn make_state() -> Option<Box<crate::State>>",
+            "Option<Box<crate::State>>",
+            "Some(Box::new(crate::State {",
+        ],
+        &[
+            "calloc(1 as usize, ::core::mem::size_of::<State>() as usize)",
+            "Box::into_raw(",
+            "Box::leak(",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_calloc_array_to_opt_boxed_slice() {
     run_test(
         r#"
@@ -107,7 +172,11 @@ pub unsafe fn foo() -> *mut i32 {
             "collect::<Vec<i32>>().into_boxed_slice()",
             "as_deref_mut().unwrap_or(&mut [])",
         ],
-        &["Box::leak(", "Box::into_raw(", "calloc(4, std::mem::size_of::<i32>())"],
+        &[
+            "Box::leak(",
+            "Box::into_raw(",
+            "calloc(4, std::mem::size_of::<i32>())",
+        ],
     );
 }
 
@@ -192,11 +261,7 @@ pub unsafe fn foo() -> i32 {
     return take_raw(alloc_one());
 }
 "#,
-        &[
-            "-> Option<Box<i32>>",
-            ".as_deref()",
-            "take_raw",
-        ],
+        &["-> Option<Box<i32>>", ".as_deref()", "take_raw"],
         &[],
     );
 }
@@ -433,9 +498,7 @@ pub unsafe fn caller() -> i32 {
     return touch_state(s, ((*s).buf).as_mut_ptr());
         }
 	"#,
-        &[
-            "pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: Option<&mut i32>)",
-        ],
+        &["pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: Option<&mut i32>)"],
         &["Option<&mut State>"],
     );
 }
@@ -481,7 +544,11 @@ pub unsafe fn dup_like(len: usize) -> *mut core::ffi::c_char {
             "Option<Box<[i8]>>",
             "collect::<Vec<i8>>().into_boxed_slice()",
         ],
-        &["Box::leak(", "Box::into_raw(", "realloc(std::ptr::null_mut(), len)"],
+        &[
+            "Box::leak(",
+            "Box::into_raw(",
+            "realloc(std::ptr::null_mut(), len)",
+        ],
     );
 }
 
@@ -717,7 +784,10 @@ pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
 }
 "#,
         &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
-        &["malloc(count * std::mem::size_of::<i32>())", "free(dest as *mut core::ffi::c_void);"],
+        &[
+            "malloc(count * std::mem::size_of::<i32>())",
+            "free(dest as *mut core::ffi::c_void);",
+        ],
     );
 }
 
@@ -1185,9 +1255,7 @@ pub unsafe fn decode_like(len: usize, fail: bool) -> *mut core::ffi::c_char {
 }
 "#,
         &["Box::leak("],
-        &[
-            "calloc(std::mem::size_of::<core::ffi::c_char>(), len)",
-        ],
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
     );
 }
 
@@ -1295,9 +1363,7 @@ pub unsafe fn caller(len: usize) {
 }
 "#,
         &["Box::leak("],
-        &[
-            "calloc(std::mem::size_of::<core::ffi::c_char>(), len)",
-        ],
+        &["calloc(std::mem::size_of::<core::ffi::c_char>(), len)"],
     );
 }
 
@@ -3067,12 +3133,11 @@ mod ownership_analysis {
         path::{Path, PathBuf},
     };
 
+    use points_to::andersen;
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{ItemKind, OwnerNode, def_id::DefId};
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
-
-    use points_to::andersen;
 
     use crate::{
         analyses::{

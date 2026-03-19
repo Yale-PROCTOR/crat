@@ -624,10 +624,17 @@ If no local-path kind match applies:
 ### 8.4 B02 test suite
 - Historical note:
   - earlier revisions used a corpus-backed B02 harness under `crates/pointer_replacer/src/analyses/B02_tests/`
-  - that harness is not present in the current checked-in tree on this branch
-  - current checked-in validation for this branch is represented by the direct regressions in `tests.rs` plus white-box transform tests
+  - the current checked-in tree reintroduces a corpus-backed rewrite sweep as an ignored rewriter-local test:
+    - `crates/pointer_replacer/src/rewriter/mod.rs`
+    - `rewriter::tests::b02_corpus_rewrite_sweep_records_option_box_rewrites`
+  - current checked-in validation for this branch is represented by the direct regressions in `tests.rs`, white-box transform tests, and the ignored B02 rewrite sweep
     - `primary_unlock_wrapper_generalization=33`
     - `alloc_policy_status:admissible_current_policy=5`
+  - the ignored B02 sweep:
+    - walks every `B02-translated-rust/*/*` crate with a `Cargo.toml`
+    - rewrites each crate's library entry through `replace_local_borrows`
+    - compiles the rewritten output
+    - prints a per-project census of raw-pointer type counts before/after plus added `Option<Box<T>>` and `Option<Box<[T]>>` type counts
   - the direct token census currently reads `malloc=86`, `calloc=19`, `free=253`
   - M8 remains planning metadata only; M9 and M10 reduced wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
@@ -721,6 +728,7 @@ If no local-path kind match applies:
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
+- `cargo test -p pointer_replacer b02_corpus_rewrite_sweep_records_option_box_rewrites -- --ignored --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
