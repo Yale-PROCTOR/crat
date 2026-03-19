@@ -40,7 +40,8 @@ pub fn libc_call<'tcx>(
             );
         }
         // _1 is mutated, _1 flows to _0
-        "memcpy" | "memmove" | "memset" | "strcat" | "strncat" | "strcpy" | "strncpy" => {
+        "memcpy" | "memmove" | "memset" | "strcat" | "strncat" | "strcpy" | "strncpy"
+        | "strtok" => {
             call_memcpy(
                 destination,
                 args,
