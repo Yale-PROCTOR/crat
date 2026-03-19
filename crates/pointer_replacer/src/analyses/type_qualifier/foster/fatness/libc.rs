@@ -211,19 +211,20 @@ fn call_printf<'tcx>(
     database: &mut BooleanSystem<Fatness>,
 ) {
     let [fmt, args @ ..] = args else { panic!() };
-    let lit = string_literals[&fmt.node.place().unwrap().local];
-    let specs = fprintf::parse_specs(lit);
-    for (arg, spec) in args.iter().zip(specs) {
-        if spec.conversion != fprintf::Conversion::Str {
-            continue;
+    if let Some(lit) = string_literals.get(&fmt.node.place().unwrap().local) {
+        let specs = fprintf::parse_specs(lit);
+        for (arg, spec) in args.iter().zip(specs) {
+            if spec.conversion != fprintf::Conversion::Str {
+                continue;
+            }
+            let Some(ptr) = arg.node.place() else { continue };
+            if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
+                continue;
+            }
+            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+            assert!(!ptr_vars.is_empty());
+            database.bottom(ptr_vars.start);
         }
-        let Some(ptr) = arg.node.place() else { continue };
-        if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
-            continue;
-        }
-        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
-        assert!(!ptr_vars.is_empty());
-        database.bottom(ptr_vars.start);
     }
 }
 
@@ -236,21 +237,22 @@ fn call_scanf<'tcx>(
     database: &mut BooleanSystem<Fatness>,
 ) {
     let [fmt, args @ ..] = args else { panic!() };
-    let lit = string_literals[&fmt.node.place().unwrap().local];
-    let specs = fscanf::parse_specs(lit);
-    for (arg, spec) in args.iter().zip(specs) {
-        if !matches!(
-            spec.conversion,
-            fscanf::Conversion::Str | fscanf::Conversion::ScanSet(_)
-        ) {
-            continue;
+    if let Some(lit) = string_literals.get(&fmt.node.place().unwrap().local) {
+        let specs = fscanf::parse_specs(lit);
+        for (arg, spec) in args.iter().zip(specs) {
+            if !matches!(
+                spec.conversion,
+                fscanf::Conversion::Str | fscanf::Conversion::ScanSet(_)
+            ) {
+                continue;
+            }
+            let Some(ptr) = arg.node.place() else { continue };
+            if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
+                continue;
+            }
+            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+            assert!(!ptr_vars.is_empty());
+            database.bottom(ptr_vars.start);
         }
-        let Some(ptr) = arg.node.place() else { continue };
-        if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
-            continue;
-        }
-        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
-        assert!(!ptr_vars.is_empty());
-        database.bottom(ptr_vars.start);
     }
 }
