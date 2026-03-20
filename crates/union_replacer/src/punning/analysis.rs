@@ -30,6 +30,7 @@ pub fn analyze(
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
     print_mir: bool,
     verbose: bool,
+    c_exposed_fns: &FxHashSet<String>,
 ) -> UnionUseResult {
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx, false);
@@ -37,7 +38,7 @@ pub fn analyze(
     let points_to_config = andersen::Config {
         use_optimized_mir: false,
         // c_exposed_fns: FxHashSet::from([].into_iter().collect()),
-        c_exposed_fns: FxHashSet::default(),
+        c_exposed_fns: c_exposed_fns.clone(),
     };
 
     let pre = andersen::pre_analyze(&points_to_config, &tss, tcx);

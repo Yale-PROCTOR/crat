@@ -604,6 +604,7 @@ dependencies = [
  "etrace",
  "points_to",
  "serde",
+ "toml_edit",
  "tracing",
  "typed-arena",
  "utils",

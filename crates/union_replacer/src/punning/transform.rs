@@ -3,6 +3,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
+use serde::Deserialize;
 use utils::ir::AstToHir;
 
 use super::{
@@ -18,6 +19,12 @@ use super::{
     utils::needs_bytemuck,
 };
 
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct Config {
+    pub verbose: bool,
+    pub c_exposed_fns: FxHashSet<String>,
+}
+
 #[derive(Debug)]
 pub struct TransformationResult {
     pub code: String,
@@ -25,8 +32,10 @@ pub struct TransformationResult {
     pub union_use_stats: (usize, usize, usize),
 }
 
-pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
+pub fn replace_unions(tcx: TyCtxt<'_>, config: &Config) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
+
+    let verbose = config.verbose;
 
     // for debug
     let print_mir = false;
@@ -91,6 +100,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool) -> TransformationResult {
         &call_contexts,
         print_mir,
         verbose_debug,
+        &config.c_exposed_fns,
     );
     let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
     if verbose_debug || print_result {

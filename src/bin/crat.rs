@@ -195,6 +195,8 @@ struct Config {
     pointer: pointer_replacer::Config,
     #[serde(default)]
     andersen: points_to::andersen::Config,
+    #[serde(default)]
+    punning: union_replacer::punning::Config,
 
     #[serde(default)]
     c_exposed_fns: Vec<String>,
@@ -498,7 +500,7 @@ fn main() {
             Pass::Punning => {
                 let had_bytemuck = utils::has_dependency(&dir, "bytemuck");
                 let res = run_compiler_on_path(&file, |tcx| {
-                    union_replacer::punning::replace_unions(tcx, config.verbose)
+                    union_replacer::punning::replace_unions(tcx, &config.punning)
                 })
                 .unwrap();
 

@@ -1,73 +1,16 @@
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        process::Command,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
-
-    static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
-
     fn run_test(code: &str, expected_stats: (usize, usize, usize)) {
+        let config = super::super::Config {
+            verbose: true,
+            c_exposed_fns: Default::default(),
+        };
         let s = utils::compilation::run_compiler_on_str(code, |tcx| {
-            super::super::replace_unions(tcx, true)
+            super::super::replace_unions(tcx, &config)
         })
         .unwrap();
         utils::compilation::run_compiler_on_str(&s.code, utils::type_check).expect(&s.code);
         assert_eq!(s.union_use_stats, expected_stats, "{}", s.code);
-    }
-
-    fn run_test_with_cargo_check(code: &str, expected_stats: (usize, usize, usize)) {
-        let s = utils::compilation::run_compiler_on_str(code, |tcx| {
-            super::super::replace_unions(tcx, true)
-        })
-        .unwrap();
-        cargo_type_check(&s.code);
-        assert_eq!(s.union_use_stats, expected_stats, "{}", s.code);
-    }
-
-    fn cargo_type_check(code: &str) {
-        let dir = make_temp_crate_dir();
-        fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(
-            dir.join("Cargo.toml"),
-            r#"[package]
-name = "punning_test"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-bytemuck = { version = "1.24.0", features = ["derive"] }
-"#,
-        )
-        .unwrap();
-        fs::write(dir.join("src/lib.rs"), code).unwrap();
-
-        let output = Command::new("cargo")
-            .arg("check")
-            .arg("--quiet")
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("{}\n\n{}", code, stderr);
-        }
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    fn make_temp_crate_dir() -> PathBuf {
-        let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "union_replacer_punning_test_{}_{}",
-            std::process::id(),
-            unique,
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
     }
 
     const BASE: &str = r#"
@@ -115,7 +58,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         }
         "#;
 
-        run_test_with_cargo_check(&format!("{BASE}\n{code}"), (1, 1, 1));
+        run_test(&format!("{BASE}\n{code}"), (1, 1, 1));
     }
 
     #[test]
@@ -167,7 +110,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         }
         "#;
 
-        run_test_with_cargo_check(&format!("{BASE}\n{code}"), (2, 2, 1));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -255,7 +198,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         }
         "#;
 
-        run_test_with_cargo_check(&format!("{BASE}\n{code}"), (2, 2, 1));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -379,7 +322,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         }
         "#;
 
-        run_test_with_cargo_check(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
     }
 
     #[test]
@@ -482,7 +425,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         }
         "#;
 
-        run_test_with_cargo_check(&format!("{BASE}\n{code}"), (2, 2, 1));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -510,5 +453,68 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
         "#;
 
         run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn ip() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Ipv4 {
+            pub as_int: u32,
+            pub octet: [u8; 4],
+        }
+
+        unsafe fn local_host(p: &mut [u8; 4]) {
+            *p = [127, 0, 0, 1];
+        }
+
+        pub extern "C" fn ip() {
+            let mut ip = Ipv4 { as_int: 0 };
+            unsafe { local_host(&mut ip.octet); }
+            unsafe { use_a(ip.as_int); }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
+        );
+    }
+
+    #[test]
+    fn ip_raw() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Ipv4 {
+            pub as_int: u32,
+            pub octet: [u8; 4],
+        }
+
+        unsafe fn local_host(p: *mut u8) {
+            *p = 127;
+            *p.add(1) = 0;
+            *p.add(2) = 0;
+            *p.add(3) = 1;
+        }
+
+        pub extern "C" fn ip() {
+            let mut ip = Ipv4 { as_int: 0 };
+            unsafe { local_host(ip.octet.as_mut_ptr()); }
+            unsafe { use_a(ip.as_int); }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
+        );
     }
 }

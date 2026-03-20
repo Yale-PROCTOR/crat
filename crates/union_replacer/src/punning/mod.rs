@@ -9,4 +9,4 @@ pub mod transform;
 pub mod ty_visit;
 pub mod utils;
 
-pub use transform::replace_unions;
+pub use transform::{Config, replace_unions};
