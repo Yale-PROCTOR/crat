@@ -888,6 +888,7 @@ impl Graph {
                     self.assign_with_ty(&l, l_deref, &r, ty);
                 }
             }
+            TyShape::Slice(_) => unreachable!(),
             TyShape::Struct(_, tys, is_union) => {
                 if *is_union {
                     self.assign_union(l, l_deref, r, tys);

@@ -295,6 +295,23 @@
 //!     *p.offset(__idx_0) = 0 as c_uchar;
 //! }
 //! ```
+//!
+//! # Hoist self-referential union field assignments
+//!
+//! C2Rust may generate code like below:
+//!
+//! ```rust,ignore
+//! x.i = foo(*(&mut x.i as *mut core::ffi::c_int));
+//! ```
+//!
+//! We hoist such assignments as follows:
+//!
+//! ```rust,ignore
+//! {
+//!     let __arg_0 = foo(*(&mut x.i as *mut core::ffi::c_int));
+//!     x.i = __arg_0
+//! }
+//! ```
 
 use std::fmt::Write as _;
 
@@ -759,10 +776,25 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         let expr_id = expr.id;
         match &mut expr.kind {
-            ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) => {
+            ExprKind::Assign(l, r, _) | ExprKind::AssignOp(_, l, r) => {
                 let mut idx_counter = 0;
                 let mut let_stmts = vec![];
                 hoist_self_ref_place_expr(l, &mut idx_counter, &mut let_stmts);
+                // Hoist RHS of union field assignments that reference the same base
+                if let ExprKind::Field(base, _) = &l.kind
+                    && let Some(base_ident) = receiver_base_ident(base)
+                    && expr_contains_ident(r, base_ident)
+                    && let Some(hir_base) = self.ast_to_hir.get_expr(base.id, self.tcx)
+                    && let typeck = self.tcx.typeck(hir_base.hir_id.owner.def_id)
+                    && typeck
+                        .expr_ty(hir_base)
+                        .ty_adt_def()
+                        .is_some_and(|adt| adt.is_union())
+                {
+                    let r_str = pprust::expr_to_string(r);
+                    let_stmts.push(format!("let __arg_0 = {r_str};"));
+                    *r = P::new(expr!("__arg_0"));
+                }
                 if !let_stmts.is_empty() {
                     let mut new_expr = "{".to_string();
                     for s in let_stmts {
@@ -2600,6 +2632,32 @@ pub unsafe extern "C" fn foo() {
             "#,
             &["[*const core::ffi::c_char; 2]"],
             &["[&[i8]; 2]"],
+        );
+    }
+
+    #[test]
+    fn test_union_field_assign() {
+        run_test(
+            r#"
+#![feature(derive_clone_copy)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub union u {
+    pub i: core::ffi::c_int,
+    pub f: core::ffi::c_float,
+}
+pub unsafe extern "C" fn foo(mut x: core::ffi::c_int) -> core::ffi::c_int {
+    return x;
+}
+unsafe fn main_0() -> core::ffi::c_int {
+    let mut x: u = u { i: 0 };
+    x.f = 3.14f32;
+    x.i = foo(*(&mut x.i as *mut core::ffi::c_int));
+    return x.i;
+}
+            "#,
+            &["let __arg_0", "x.i = __arg_0"],
+            &["x.i = foo"],
         );
     }
 }
