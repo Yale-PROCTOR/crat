@@ -182,11 +182,11 @@ fn slice_cursor_mod_str() -> &'static str {
             Self { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: 0 }
         }
 
-        pub fn fork(&mut self) -> SliceCursorMut<'_, T> {
+        pub fn as_deref_mut(&mut self) -> SliceCursorMut<'_, T> {
             SliceCursorMut { base: &mut self.base[..], pos: self.pos }
         }
 
-        pub fn into_ref(self) -> SliceCursor<'a, T> {
+        pub fn as_deref(self) -> SliceCursor<'a, T> {
             SliceCursor { base: self.base, pos: self.pos }
         }
 
@@ -228,6 +228,14 @@ fn slice_cursor_mod_str() -> &'static str {
         pos: usize,
     }
 
+    impl<'a, T> Copy for SliceCursor<'a, T> {}
+
+    impl<'a, T> Clone for SliceCursor<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
     impl<'a, T> SliceCursor<'a, T> {
         pub fn new(slice: &'a [T]) -> Self {
             Self { base: slice, pos: 0 }
@@ -247,10 +255,6 @@ fn slice_cursor_mod_str() -> &'static str {
 
         pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
             Self { base: unsafe { std::slice::from_raw_parts(ptr, len) }, pos: 0 }
-        }
-
-        pub fn fork(&self) -> SliceCursor<'a, T> {
-            SliceCursor { base: self.base, pos: self.pos }
         }
 
         pub fn seek(&mut self, offset: isize) {

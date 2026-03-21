@@ -1026,11 +1026,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     if !m && m1 {
-                        result = utils::expr!("({}).into_ref()", pprust::expr_to_string(&result),);
+                        result = utils::expr!("({}).as_deref()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
-                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && (!m1 || m) {
-                        result = utils::expr!("({}).fork()", pprust::expr_to_string(&result));
+                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && m1 && m {
+                        result =
+                            utils::expr!("({}).as_deref_mut()", pprust::expr_to_string(&result));
                     }
                     *ptr = result;
                     return PtrKind::SliceCursor(m);
@@ -1966,6 +1967,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                 pe.base_kind,
                 PtrExprBaseKind::Array | PtrExprBaseKind::Alloca
             );
+        let is_mut_cursor_base = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
+            matches!(
+                self.ptr_kinds.get(&hir_id),
+                Some(PtrKind::SliceCursor(true))
+            )
+        } else {
+            false
+        };
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -1988,9 +1997,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
+                    } else if m && is_mut_cursor_base {
+                        e = utils::expr!(
+                            "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                            pprust::expr_to_string(&e),
+                            pprust::expr_to_string(offset),
+                        );
                     } else {
                         e = utils::expr!(
-                            "{{ let mut _c = ({}).fork(); _c.seek(({}) as isize); _c }}",
+                            "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
