@@ -6,7 +6,7 @@
 /// - `needs_cursor() == false` → the pointer is only ever offset by non-negative
 ///   values; a plain `Slice`/`SliceRef` is sufficient.
 /// - `needs_cursor() == true`  → the pointer may be offset negatively;
-///   `SliceCursor`/`SliceCursorRef` is required.
+///   `SliceCursor`/`SliceCursorMut` is required.
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};

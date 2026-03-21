@@ -303,9 +303,9 @@ fn unwrap_addr_of(expr: &Expr) -> &Expr {
 }
 
 fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
+    let mut cursor_mut_read_types = vec![];
     let mut cursor_read_types = vec![];
-    let mut cursor_ref_read_types = vec![];
-    let mut cursor_mut_types = vec![];
+    let mut cursor_mut_write_types = vec![];
 
     let mut new_items: ThinVec<_> = items
         .drain(..)
@@ -332,16 +332,16 @@ fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
                         (_, _) if ty.contains("Range") => {
                             return None;
                         }
+                        ("SliceCursorMut", "Index") => {
+                            cursor_mut_read_types.push(ty);
+                            return None;
+                        }
                         ("SliceCursor", "Index") => {
                             cursor_read_types.push(ty);
                             return None;
                         }
-                        ("SliceCursorRef", "Index") => {
-                            cursor_ref_read_types.push(ty);
-                            return None;
-                        }
-                        ("SliceCursor", "IndexMut") => {
-                            cursor_mut_types.push(ty);
+                        ("SliceCursorMut", "IndexMut") => {
+                            cursor_mut_write_types.push(ty);
                             return None;
                         }
                         _ => {}
@@ -352,18 +352,18 @@ fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
         })
         .collect();
 
+    if !cursor_mut_read_types.is_empty() {
+        let args = cursor_mut_read_types.join(", ");
+        new_items.push(P::new(item!(
+            "impl_readable_index!(SliceCursorMut, {args});"
+        )));
+    }
     if !cursor_read_types.is_empty() {
         let args = cursor_read_types.join(", ");
         new_items.push(P::new(item!("impl_readable_index!(SliceCursor, {args});")));
     }
-    if !cursor_ref_read_types.is_empty() {
-        let args = cursor_ref_read_types.join(", ");
-        new_items.push(P::new(item!(
-            "impl_readable_index!(SliceCursorRef, {args});"
-        )));
-    }
-    if !cursor_mut_types.is_empty() {
-        let args = cursor_mut_types.join(", ");
+    if !cursor_mut_write_types.is_empty() {
+        let args = cursor_mut_write_types.join(", ");
         new_items.push(P::new(item!("impl_mutable_index!({args});")));
     }
     *items = new_items;

@@ -152,12 +152,12 @@ fn slice_cursor_mod_str() -> &'static str {
     use std::ops::RangeFull;
     use std::ops::RangeTo;
 
-    pub struct SliceCursor<'a, T> {
+    pub struct SliceCursorMut<'a, T> {
         base: &'a mut [T],
         pos: usize,
     }
 
-    impl<'a, T> SliceCursor<'a, T> {
+    impl<'a, T> SliceCursorMut<'a, T> {
         pub fn new(base: &'a mut [T]) -> Self {
             Self { base, pos: 0 }
         }
@@ -170,35 +170,24 @@ fn slice_cursor_mod_str() -> &'static str {
             Self { base: &mut [], pos: 0 }
         }
 
-        pub fn from_ref(val: &'a T) -> SliceCursorRef<'a, T> {
-            SliceCursorRef::from_ref(val)
-        }
-
         pub fn from_mut(val: &'a mut T) -> Self {
             Self { base: std::slice::from_mut(val), pos: 0 }
         }
 
-        pub fn from_raw_parts(ptr: *const T, len: usize) -> Self {
-            Self::from_raw_parts_mut(ptr as *mut T, len)
+        pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
+            unsafe { Self::from_raw_parts_mut(ptr as *mut T, len) }
         }
 
-        pub fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
+        pub unsafe fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
             Self { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: 0 }
         }
 
-        pub fn fork(&mut self) -> SliceCursor<'a, T> {
-            let ptr = self.base.as_mut_ptr();
-            let len = self.base.len();
-            SliceCursor { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: self.pos }
+        pub fn fork(&mut self) -> SliceCursorMut<'_, T> {
+            SliceCursorMut { base: &mut self.base[..], pos: self.pos }
         }
 
-        pub fn to_ref_cursor(&self) -> SliceCursorRef<'a, T> {
-            let ptr = self.base.as_ptr();
-            let len = self.base.len();
-            SliceCursorRef {
-                base: unsafe { std::slice::from_raw_parts(ptr, len) },
-                pos: self.pos,
-            }
+        pub fn into_ref(self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
         }
 
         pub fn seek(&mut self, offset: isize) {
@@ -206,7 +195,7 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn is_empty(&self) -> bool {
-            self.base.is_empty()
+            self.pos >= self.base.len()
         }
 
         pub fn as_mut_ptr(&mut self) -> *mut T {
@@ -225,25 +214,21 @@ fn slice_cursor_mod_str() -> &'static str {
             self.base.get_mut(self.pos)
         }
 
-        pub fn as_slice(&self) -> &'a [T] {
-            let ptr = self.base[self.pos..].as_ptr();
-            let len = self.base.len() - self.pos;
-            unsafe { std::slice::from_raw_parts(ptr, len) }
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
         }
 
-        pub fn as_slice_mut(&mut self) -> &'a mut [T] {
-            let ptr = self.base[self.pos..].as_mut_ptr();
-            let len = self.base.len() - self.pos;
-            unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+        pub fn as_slice_mut(&mut self) -> &mut [T] {
+            &mut self.base[self.pos..]
         }
     }
 
-    pub struct SliceCursorRef<'a, T> {
+    pub struct SliceCursor<'a, T> {
         base: &'a [T],
         pos: usize,
     }
 
-    impl<'a, T> SliceCursorRef<'a, T> {
+    impl<'a, T> SliceCursor<'a, T> {
         pub fn new(slice: &'a [T]) -> Self {
             Self { base: slice, pos: 0 }
         }
@@ -260,12 +245,12 @@ fn slice_cursor_mod_str() -> &'static str {
             Self { base: std::slice::from_ref(val), pos: 0 }
         }
 
-        pub fn from_raw_parts(ptr: *const T, len: usize) -> Self {
+        pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
             Self { base: unsafe { std::slice::from_raw_parts(ptr, len) }, pos: 0 }
         }
 
-        pub fn fork(&self) -> SliceCursorRef<'a, T> {
-            SliceCursorRef { base: self.base, pos: self.pos }
+        pub fn fork(&self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
         }
 
         pub fn seek(&mut self, offset: isize) {
@@ -273,7 +258,7 @@ fn slice_cursor_mod_str() -> &'static str {
         }
 
         pub fn is_empty(&self) -> bool {
-            self.base.is_empty()
+            self.pos >= self.base.len()
         }
 
         pub fn as_ptr(&self) -> *const T {
@@ -284,10 +269,8 @@ fn slice_cursor_mod_str() -> &'static str {
             self.base.get(self.pos)
         }
 
-        pub fn as_slice(&self) -> &'a [T] {
-            let ptr = self.base[self.pos..].as_ptr();
-            let len = self.base.len() - self.pos;
-            unsafe { std::slice::from_raw_parts(ptr, len) }
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
         }
     }
 
@@ -349,7 +332,7 @@ fn slice_cursor_mod_str() -> &'static str {
     macro_rules! impl_mutable_index {
         ($($idx_type:ty),*) => {
             $(
-                impl<T> IndexMut<$idx_type> for SliceCursor<'_, T> {
+                impl<T> IndexMut<$idx_type> for SliceCursorMut<'_, T> {
                     #[inline]
                     fn index_mut(&mut self, index: $idx_type) -> &mut Self::Output {
                         let i = abs_idx(self.pos, index as isize);
@@ -357,7 +340,7 @@ fn slice_cursor_mod_str() -> &'static str {
                     }
                 }
 
-                impl<T> IndexMut<Range<$idx_type>> for SliceCursor<'_, T> {
+                impl<T> IndexMut<Range<$idx_type>> for SliceCursorMut<'_, T> {
                     #[inline]
                     fn index_mut(&mut self, range: Range<$idx_type>) -> &mut Self::Output {
                         let start = abs_idx(self.pos, range.start as isize);
@@ -366,7 +349,7 @@ fn slice_cursor_mod_str() -> &'static str {
                     }
                 }
 
-                impl<T> IndexMut<RangeFrom<$idx_type>> for SliceCursor<'_, T> {
+                impl<T> IndexMut<RangeFrom<$idx_type>> for SliceCursorMut<'_, T> {
                     #[inline]
                     fn index_mut(&mut self, range: RangeFrom<$idx_type>) -> &mut Self::Output {
                         let start = abs_idx(self.pos, range.start as isize);
@@ -374,7 +357,7 @@ fn slice_cursor_mod_str() -> &'static str {
                     }
                 }
 
-                impl<T> IndexMut<RangeTo<$idx_type>> for SliceCursor<'_, T> {
+                impl<T> IndexMut<RangeTo<$idx_type>> for SliceCursorMut<'_, T> {
                     #[inline]
                     fn index_mut(&mut self, range: RangeTo<$idx_type>) -> &mut Self::Output {
                         let end = abs_idx(self.pos, range.end as isize);
@@ -383,7 +366,7 @@ fn slice_cursor_mod_str() -> &'static str {
                 }
             )*
 
-            impl<T> IndexMut<RangeFull> for SliceCursor<'_, T> {
+            impl<T> IndexMut<RangeFull> for SliceCursorMut<'_, T> {
                 #[inline]
                 fn index_mut(&mut self, _: RangeFull) -> &mut Self::Output {
                     &mut self.base[self.pos..]
@@ -392,8 +375,8 @@ fn slice_cursor_mod_str() -> &'static str {
         };
     }
 
+    impl_readable_index!(SliceCursorMut, isize, usize, i32);
     impl_readable_index!(SliceCursor, isize, usize, i32);
-    impl_readable_index!(SliceCursorRef, isize, usize, i32);
     impl_mutable_index!(isize, usize, i32);
 }"#
 }

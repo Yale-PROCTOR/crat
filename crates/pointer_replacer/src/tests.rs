@@ -1464,7 +1464,7 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
 }
 "#,
         &[
-            "let mut last_element: crate::slice_cursor::SliceCursorRef",
+            "let mut last_element: crate::slice_cursor::SliceCursor",
             "foo((last_element).fork(), 5 as libc::c_int)",
         ],
         &["let mut last_element: &[i32]"],
@@ -1498,8 +1498,8 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
     return foo(q, 1 as libc::c_int);
 }
 "#,
-        &[".to_ref_cursor()"],
-        &["SliceCursorRef::new((", ").as_slice())"],
+        &[".into_ref()"],
+        &["SliceCursor::new((", ").as_slice())"],
     );
 }
 

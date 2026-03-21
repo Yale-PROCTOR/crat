@@ -306,31 +306,31 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 {
                     let callee_name = pprust::expr_to_string(callee);
 
-                    if callee_name.ends_with("SliceCursorRef::new") {
+                    if callee_name.ends_with("SliceCursor::new") {
                         assert!(args.len() == 1);
                         let arg = pprust::expr_to_string(&args[0]);
                         *expr = expr!(
-                            "crate::slice_cursor::SliceCursorRef::new(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }})"
+                            "crate::slice_cursor::SliceCursor::new(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }})"
                         );
-                    } else if callee_name.ends_with("SliceCursor::new") {
-                        let arg = pprust::expr_to_string(&args[0]);
+                    } else if callee_name.ends_with("SliceCursorMut::new") {
                         assert!(args.len() == 1);
-                        *expr = expr!(
-                            "crate::slice_cursor::SliceCursor::new(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }})"
-                        );
-                    } else if callee_name.ends_with("SliceCursorRef::with_pos") {
-                        assert!(args.len() == 2);
                         let arg = pprust::expr_to_string(&args[0]);
-                        let pos = pprust::expr_to_string(&args[1]);
                         *expr = expr!(
-                            "crate::slice_cursor::SliceCursorRef::with_pos(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }}, {pos})"
+                            "crate::slice_cursor::SliceCursorMut::new(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }})"
                         );
                     } else if callee_name.ends_with("SliceCursor::with_pos") {
                         assert!(args.len() == 2);
                         let arg = pprust::expr_to_string(&args[0]);
                         let pos = pprust::expr_to_string(&args[1]);
                         *expr = expr!(
-                            "crate::slice_cursor::SliceCursor::with_pos(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }}, {pos})"
+                            "crate::slice_cursor::SliceCursor::with_pos(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }}, {pos})"
+                        );
+                    } else if callee_name.ends_with("SliceCursorMut::with_pos") {
+                        assert!(args.len() == 2);
+                        let arg = pprust::expr_to_string(&args[0]);
+                        let pos = pprust::expr_to_string(&args[1]);
+                        *expr = expr!(
+                            "crate::slice_cursor::SliceCursorMut::with_pos(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }}, {pos})"
                         );
                     }
                 }

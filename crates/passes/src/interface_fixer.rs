@@ -83,13 +83,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             if fix.mutability.is_mut() {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts_mut({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1024)) }}, ",
                                 )
                                 .unwrap();
                             } else {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorRef::empty() }} else {{ crate::slice_cursor::SliceCursorRef::new(std::slice::from_raw_parts({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1024)) }}, ",
                                 )
                                 .unwrap();
                             }
@@ -203,9 +203,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                         .map(|def_id| self.tcx.item_name(def_id.into()));
                     let Some(adt_name) = adt_name else { continue };
 
-                    let (kind, mutability) = if adt_name.as_str() == "SliceCursor" {
+                    let (kind, mutability) = if adt_name.as_str() == "SliceCursorMut" {
                         (ParamFixKind::SliceCursor, ty::Mutability::Mut)
-                    } else if adt_name.as_str() == "SliceCursorRef" {
+                    } else if adt_name.as_str() == "SliceCursor" {
                         (ParamFixKind::SliceCursor, ty::Mutability::Not)
                     } else {
                         continue;

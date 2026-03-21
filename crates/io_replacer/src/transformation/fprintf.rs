@@ -144,7 +144,7 @@ impl TransformVisitor<'_, '_, '_> {
                                 ty::TyKind::Adt(adt_def, _) => {
                                     let item_name = self.tcx.item_name(adt_def.did());
                                     if item_name == Symbol::intern("SliceCursor")
-                                        || item_name == Symbol::intern("SliceCursorRef")
+                                        || item_name == Symbol::intern("SliceCursorMut")
                                     {
                                         format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
                                     } else {
