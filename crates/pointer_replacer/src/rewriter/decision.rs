@@ -17,8 +17,8 @@ pub enum PtrKind {
     Raw(bool),
     /// plain slice: &mut [T] for Slice(true), or &[T] for Slice(false)
     Slice(bool),
-    /// slice cursor with offset tracking: SliceCursor<T> for SliceCursor(true),
-    /// or SliceCursorRef<T> for SliceCursor(false)
+    /// slice cursor with offset tracking: SliceCursor<T> for SliceCursor(false),
+    /// or SliceCursorMut<T> for SliceCursor(true)
     SliceCursor(bool),
 }
 

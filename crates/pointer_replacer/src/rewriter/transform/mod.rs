@@ -494,9 +494,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     self.slice_cursor.set(true);
                     *ptr = if m {
-                        utils::expr!("crate::slice_cursor::SliceCursor::empty()")
+                        utils::expr!("crate::slice_cursor::SliceCursorMut::empty()")
                     } else {
-                        utils::expr!("crate::slice_cursor::SliceCursorRef::empty()")
+                        utils::expr!("crate::slice_cursor::SliceCursor::empty()")
                     };
                     return PtrKind::SliceCursor(m);
                 }
@@ -727,12 +727,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if !need_cast && !ty_updated {
                         *ptr = if m {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursor::from_mut(&mut ({}))",
+                                "crate::slice_cursor::SliceCursorMut::from_mut(&mut ({}))",
                                 pprust::expr_to_string(e),
                             )
                         } else {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursorRef::from_ref(&({}))",
+                                "crate::slice_cursor::SliceCursor::from_ref(&({}))",
                                 pprust::expr_to_string(e),
                             )
                         };
@@ -744,12 +744,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                         self.bytemuck.set(true);
                         *ptr = if m {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursor::new(std::slice::from_mut(bytemuck::cast_mut(&mut ({}))))",
+                                "crate::slice_cursor::SliceCursorMut::new(std::slice::from_mut(bytemuck::cast_mut(&mut ({}))))",
                                 pprust::expr_to_string(e),
                             )
                         } else {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursorRef::new(std::slice::from_ref(bytemuck::cast_ref(&({}))))",
+                                "crate::slice_cursor::SliceCursor::new(std::slice::from_ref(bytemuck::cast_ref(&({}))))",
                                 pprust::expr_to_string(e),
                             )
                         };
@@ -758,14 +758,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let lhs_ty_str = mir_ty_to_string(lhs_inner_ty, self.tcx);
                         *ptr = if m {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursor::from_raw_parts_mut(&raw mut ({0}) as *mut {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
+                                "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(&raw mut ({0}) as *mut {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
                                 pprust::expr_to_string(e),
                                 lhs_ty_str,
                                 rhs_ty_str,
                             )
                         } else {
                             utils::expr!(
-                                "crate::slice_cursor::SliceCursorRef::from_raw_parts(&raw const ({0}) as *const {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
+                                "crate::slice_cursor::SliceCursor::from_raw_parts(&raw const ({0}) as *const {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
                                 pprust::expr_to_string(e),
                                 lhs_ty_str,
                                 rhs_ty_str,
@@ -1026,12 +1026,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     if !m && m1 {
-                        result =
-                            utils::expr!("({}).to_ref_cursor()", pprust::expr_to_string(&result),);
+                        result = utils::expr!("({}).as_deref()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
-                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && (!m1 || m) {
-                        result = utils::expr!("({}).fork()", pprust::expr_to_string(&result));
+                    if pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty && m1 && m {
+                        result =
+                            utils::expr!("({}).as_deref_mut()", pprust::expr_to_string(&result));
                     }
                     *ptr = result;
                     return PtrKind::SliceCursor(m);
@@ -1066,14 +1066,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                     self.slice_cursor.set(true);
                     if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!(
-                            "crate::slice_cursor::SliceCursorRef::new({})",
+                            "crate::slice_cursor::SliceCursor::new({})",
                             pprust::expr_to_string(e)
                         );
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
                         self.bytemuck.set(true);
                         *ptr = utils::expr!(
-                            "crate::slice_cursor::SliceCursorRef::new(bytemuck::cast_slice({}))",
+                            "crate::slice_cursor::SliceCursor::new(bytemuck::cast_slice({}))",
                             pprust::expr_to_string(e),
                         );
                     }
@@ -1447,9 +1447,9 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         let cursor_ty = if m {
-            "crate::slice_cursor::SliceCursor"
+            "crate::slice_cursor::SliceCursorMut"
         } else {
-            "crate::slice_cursor::SliceCursorRef"
+            "crate::slice_cursor::SliceCursor"
         };
 
         if let Some(name) = method_call_name(e)
@@ -1615,9 +1615,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         };
         let cursor_ty = if m {
-            "crate::slice_cursor::SliceCursor"
+            "crate::slice_cursor::SliceCursorMut"
         } else {
-            "crate::slice_cursor::SliceCursorRef"
+            "crate::slice_cursor::SliceCursor"
         };
 
         if !need_cast {
@@ -1674,9 +1674,9 @@ impl<'tcx> TransformVisitor<'tcx> {
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cursor_ty = if m {
-            "crate::slice_cursor::SliceCursor"
+            "crate::slice_cursor::SliceCursorMut"
         } else {
-            "crate::slice_cursor::SliceCursorRef"
+            "crate::slice_cursor::SliceCursor"
         };
         if !need_cast {
             e.clone()
@@ -1967,6 +1967,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                 pe.base_kind,
                 PtrExprBaseKind::Array | PtrExprBaseKind::Alloca
             );
+        let is_mut_cursor_base = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
+            matches!(
+                self.ptr_kinds.get(&hir_id),
+                Some(PtrKind::SliceCursor(true))
+            )
+        } else {
+            false
+        };
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -1989,9 +1997,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
+                    } else if m && is_mut_cursor_base {
+                        e = utils::expr!(
+                            "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                            pprust::expr_to_string(&e),
+                            pprust::expr_to_string(offset),
+                        );
                     } else {
                         e = utils::expr!(
-                            "{{ let mut _c = ({}).fork(); _c.seek(({}) as isize); _c }}",
+                            "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
@@ -2117,9 +2131,9 @@ fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) ->
 fn mk_cursor_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
     let ty = mir_ty_to_string(ty, tcx);
     if mutability {
-        utils::ty!("crate::slice_cursor::SliceCursor<'_, {ty}>")
+        utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {ty}>")
     } else {
-        utils::ty!("crate::slice_cursor::SliceCursorRef<'_, {ty}>")
+        utils::ty!("crate::slice_cursor::SliceCursor<'_, {ty}>")
     }
 }
 
