@@ -758,14 +758,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let lhs_ty_str = mir_ty_to_string(lhs_inner_ty, self.tcx);
                         *ptr = if m {
                             utils::expr!(
-                                "unsafe {{ crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(&raw mut ({0}) as *mut {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>()) }}",
+                                "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(&raw mut ({0}) as *mut {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
                                 pprust::expr_to_string(e),
                                 lhs_ty_str,
                                 rhs_ty_str,
                             )
                         } else {
                             utils::expr!(
-                                "unsafe {{ crate::slice_cursor::SliceCursor::from_raw_parts(&raw const ({0}) as *const {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>()) }}",
+                                "crate::slice_cursor::SliceCursor::from_raw_parts(&raw const ({0}) as *const {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
                                 pprust::expr_to_string(e),
                                 lhs_ty_str,
                                 rhs_ty_str,
@@ -1458,7 +1458,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             // we assume that the pointer is not null when such methods are called
             if !need_cast {
                 utils::expr!(
-                    "unsafe {{ {}::from_raw_parts{}(({}){}, 100000) }}",
+                    "{}::from_raw_parts{}(({}){}, 100000)",
                     cursor_ty,
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
@@ -1466,7 +1466,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 )
             } else {
                 utils::expr!(
-                    "unsafe {{ {}::from_raw_parts{}(({}){} as *{} _, 100000) }}",
+                    "{}::from_raw_parts{}(({}){} as *{} _, 100000)",
                     cursor_ty,
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
@@ -1480,7 +1480,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        unsafe {{ {1}::from_raw_parts{2}(({0}){3}, 100000) }}
+                        {1}::from_raw_parts{2}(({0}){3}, 100000)
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -1492,7 +1492,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        unsafe {{ {1}::from_raw_parts{2}(({0}){3} as *{4} _, 100000) }}
+                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, 100000)
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -1508,7 +1508,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        unsafe {{ {}::from_raw_parts{}(_x{}, 100000) }}
+                        {}::from_raw_parts{}(_x{}, 100000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -1524,7 +1524,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        unsafe {{ {}::from_raw_parts{}(_x{} as *{} _, 100000) }}
+                        {}::from_raw_parts{}(_x{} as *{} _, 100000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -1653,7 +1653,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             )
         } else {
             utils::expr!(
-                "unsafe {{ {}::from_raw_parts{}(({}).as_{}ptr() as *{} {}, 100000) }}",
+                "{}::from_raw_parts{}(({}).as_{}ptr() as *{} {}, 100000)",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
@@ -1691,7 +1691,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             )
         } else {
             utils::expr!(
-                "unsafe {{ {}::from_raw_parts{}(({}).as_ptr() as *{} {}, 100000) }}",
+                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 100000)",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
