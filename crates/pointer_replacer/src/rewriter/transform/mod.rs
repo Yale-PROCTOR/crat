@@ -1095,7 +1095,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
 
         let m1 = match pe.base_ty.kind() {
-            ty::TyKind::RawPtr(_, m) => m.is_mut(),
+            ty::TyKind::RawPtr(_, m) | ty::TyKind::Ref(_, _, m) => m.is_mut(),
             ty::TyKind::Array(_, _) => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => self.ptr_kinds[&hir_id].is_mut(),
