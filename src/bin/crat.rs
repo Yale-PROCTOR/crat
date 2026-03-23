@@ -370,6 +370,10 @@ fn main() {
         .outparam
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .punning
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
@@ -500,7 +504,7 @@ fn main() {
             Pass::Punning => {
                 let had_bytemuck = utils::has_dependency(&dir, "bytemuck");
                 let res = run_compiler_on_path(&file, |tcx| {
-                    union_replacer::punning::replace_unions(tcx, &config.punning)
+                    union_replacer::punning::replace_unions(tcx, config.verbose, &config.punning)
                 })
                 .unwrap();
 

@@ -21,7 +21,6 @@ use super::{
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
-    pub verbose: bool,
     pub c_exposed_fns: FxHashSet<String>,
 }
 
@@ -32,10 +31,8 @@ pub struct TransformationResult {
     pub union_use_stats: (usize, usize, usize),
 }
 
-pub fn replace_unions(tcx: TyCtxt<'_>, config: &Config) -> TransformationResult {
+pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
-
-    let verbose = config.verbose;
 
     // for debug
     let print_mir = false;
