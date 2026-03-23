@@ -1511,9 +1511,16 @@ fn project_nodes_with_tys<'tcx>(
         if let Some(offset) = field_offset_for_ty(tcx, base_ty, field.index()) {
             next = nodes
                 .into_iter()
-                .map(|node| LocNode {
-                    prefix: node.prefix,
-                    index: node.index + offset,
+                .filter_map(|node| {
+                    let index = node.index + offset;
+                    if index.index() < result.ends.len() {
+                        Some(LocNode {
+                            prefix: node.prefix,
+                            index,
+                        })
+                    } else {
+                        None
+                    }
                 })
                 .collect();
         }
