@@ -2,11 +2,10 @@
 mod tests {
     fn run_test(code: &str, expected_stats: (usize, usize, usize)) {
         let config = super::super::Config {
-            verbose: true,
             c_exposed_fns: Default::default(),
         };
         let s = utils::compilation::run_compiler_on_str(code, |tcx| {
-            super::super::replace_unions(tcx, &config)
+            super::super::replace_unions(tcx, true, &config)
         })
         .unwrap();
         utils::compilation::run_compiler_on_str(&s.code, utils::type_check).expect(&s.code);
