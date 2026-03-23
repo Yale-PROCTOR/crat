@@ -1,18 +1,20 @@
 #[cfg(test)]
 mod tests {
-    fn run_test(code: &str, no_transform: bool) {
+    fn run_test(code: &str, expected_stats: (usize, usize, usize)) {
+        let config = super::super::Config {
+            c_exposed_fns: Default::default(),
+        };
         let s = utils::compilation::run_compiler_on_str(code, |tcx| {
-            super::super::replace_unions(tcx, true)
+            super::super::replace_unions(tcx, true, &config)
         })
         .unwrap();
-        utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
-        if !no_transform {
-            assert!(s.contains("to_ne_bytes"));
-        }
+        utils::compilation::run_compiler_on_str(&s.code, utils::type_check).expect(&s.code);
+        assert_eq!(s.union_use_stats, expected_stats, "{}", s.code);
     }
 
     const BASE: &str = r#"
         #![feature(derive_clone_copy)]
+        #[repr(transparent)]
         #[derive(Copy, Clone)]
         pub struct NonPrimitive32(pub u32);
 
@@ -23,278 +25,495 @@ mod tests {
             pub c: NonPrimitive32,
         }
 
-        pub fn use_a(x: u32) {
-            ()
+        pub fn use_a(x: u32) -> u32 {
+            x
         }
 
-        pub fn use_b(x: f32) {
-            ()
+        pub fn use_b(x: f32) -> f32 {
+            x
         }
 
-        pub fn use_c(x: NonPrimitive32) {
-            ()
+        pub fn use_c(x: NonPrimitive32) -> NonPrimitive32 {
+            x
         }
 
         pub fn cond() -> bool {
             true
         }
 
-        pub fn nop() {
-            ()
+        pub fn nop() -> u8 {
+            0
         }
     "#;
 
     #[test]
-    fn trivial() {
+    fn basic_pod() {
         let code = r#"
-        pub extern "C" fn trivial() {
-            let u: U = U { a: 1 }; // Write A
+        pub extern "C" fn basic_pod() {
+            let u = U { a: 1 };
             unsafe {
-                use_b(u.b); // Read B
+                use_b(u.b);
             }
         }
         "#;
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+
+        run_test(&format!("{BASE}\n{code}"), (1, 1, 1));
     }
 
     #[test]
-    fn wwr() {
+    fn basic_nouninit() {
         let code = r#"
-        pub extern "C" fn wwr() {
-            let mut u: U = U { a: 1 }; // Write A
-            u.b = 2.0; // Write B
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union PtrU {
+            pub a: *mut u8,
+            pub b: usize,
+        }
+
+        pub extern "C" fn basic_nouninit() {
+            let u = PtrU { a: 1usize as *mut u8 };
             unsafe {
-                use_a(u.a); // Read A
+                use_a(u.b as u32);
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
-    fn no_transform() {
+    fn basic_anybitpattern() {
         let code = r#"
-        pub extern "C" fn no_transform() {
-            let mut u: U = U { c: NonPrimitive32(1) }; // Write C
+        #[derive(Copy, Clone)]
+        pub struct Padded {
+            pub tag: u8,
+            pub value: u32,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union AnyBitsU {
+            pub a: u64,
+            pub b: Padded,
+        }
+
+        fn use_padded(x: Padded) -> u32 {
+            x.value
+        }
+
+        pub extern "C" fn basic_anybitpattern() {
+            let u = AnyBitsU { a: 7 };
             unsafe {
-                use_a(u.a); // Read A
+                use_a(use_padded(u.b));
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, true);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
-    fn extra_write() {
+    fn parent_pod() {
         let code = r#"
-        pub extern "C" fn extra_write() {
-            let mut u: U = U { a: 1 }; // Write A
-            u.b = 2.0; // Write B, extra write will be added {e; e};
-            if cond() {
-                unsafe {
-                    use_c(u.c); // Read C, non-replacable
-                }
-            } else {
-                unsafe {
-                    use_a(u.a); // Read A, replacable
-                }
-            }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
         }
-        "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
-    }
-
-    #[test]
-    fn loop1() {
-        let code = r#"
-        pub extern "C" fn loop1() {
-            let mut u: U = U {
-                c: NonPrimitive32(0),
-            }; // Write C
-
-            loop {
-                u.a = 1; // Write A
-                unsafe {
-                    use_a(u.a); // Read A
-                }
-                u.b = 2.0; // Write B
-            }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub d: u32,
+            pub u: OverlapU,
+            pub i: i32,
         }
-        "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
-    }
-
-    #[test]
-    fn loop2() {
-        let code = r#"
-        pub extern "C" fn loop2() {
-            let mut u: U = U { a: 1 }; // Write A
-
-            loop {
-                unsafe {
-                    use_a(u.a); // Read A
-                }
-                u.b = 2.0; // Write B
-            }
-        }
-        "#;
-
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
-    }
-
-    #[test]
-    fn branch1() {
-        let code = r#"
-        pub extern "C" fn branch1() {
-            let mut u: U = U { a: 1 }; // Write A
-
-            if cond() {
-                u.a = 2; // Write A
-            } else {
-                u.b = 3.0; // Write B
-            }
+        pub extern "C" fn parent_pod() {
+            let mut s = ParentOverlap { d: 0, u: OverlapU { a: 0 }, i: 1 };
             unsafe {
-                use_a(u.a); // Read A
+                s.u.b = [1, 2, 3, 4];
+                use_a(s.u.a);
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
-    fn branch2() {
+    fn parent_nouninit() {
         let code = r#"
-        pub extern "C" fn branch2() {
-            let u: U = U { a: 1 }; // Write A
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union PtrU {
+            pub a: *mut u8,
+            pub b: usize,
+        }
 
-            if cond() {
-                nop();
-            } else {
-                unsafe {
-                    use_b(u.b); // Read B
-                }
-            }
-            nop();
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentPtr {
+            pub u: PtrU,
+        }
+
+        pub extern "C" fn parent_nouninit() {
+            let mut s = ParentPtr { u: PtrU { a: core::ptr::null_mut() } };
+            unsafe { s.u.a = 1usize as *mut u8; use_a(s.u.b as u32); }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
     }
 
     #[test]
-    fn branch3() {
+    fn parent_anybitpattern() {
         let code = r#"
-        pub extern "C" fn branch3() {
-            let mut u: U = U { a: 1 }; // Write A
+        #[derive(Copy, Clone)]
+        pub struct Padded {
+            pub tag: u8,
+            pub value: u32,
+        }
 
-            if cond() {
-                u.b = 2.0; // Write B
-            } else {
-                unsafe {
-                    use_b(u.b); // Read B
-                }
-            }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union AnyBitsU {
+            pub a: u64,
+            pub b: Padded,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentBits {
+            pub u: AnyBitsU,
+        }
+
+        pub extern "C" fn parent_anybitpattern() {
+            let s = ParentBits { u: AnyBitsU { a: 9 } };
             unsafe {
-                use_a(u.a); // Read A
+                use_a(s.u.b.value);
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
-    fn branch4() {
+    fn nested_parent_bytes_to_u32() {
         let code = r#"
-        pub extern "C" fn branch4() {
-            let mut u: U = U { a: 1 }; // Write A
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
 
-            if cond() {
-                u.a = 2; // Write A
-            } else {
-                unsafe {
-                    use_b(u.b); // Read B
-                }
-            }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct NestedOverlap {
+            pub inner: ParentOverlap,
+        }
+
+        pub extern "C" fn nested_parent_bytes_to_u32() {
+            let mut n = NestedOverlap { inner: ParentOverlap { u: OverlapU { a: 0 } } };
             unsafe {
-                use_a(u.a); // Read A
+                n.inner.u.b = [9, 8, 7, 6];
+                use_a(n.inner.u.a);
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
-    fn branch5() {
+    fn call_by_value_read() {
         let code = r#"
-        pub extern "C" fn branch5() {
-            let mut u: U = U {
-                c: NonPrimitive32(1),
-            }; // Write C
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
 
-            if cond() {
-                u.a = 2; // Write A
-            } else {
-                u.b = 3.0; // Write B
-            }
+        fn read_u(u: OverlapU) -> u32 {
+            unsafe { u.a }
+        }
+
+        pub extern "C" fn call_by_value_read() {
+            let mut u = OverlapU { a: 0 };
             unsafe {
-                use_a(u.a); // Read A
+                u.b = [1, 2, 3, 4];
             }
+            use_a(read_u(u));
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
     }
 
     #[test]
-    fn if_inside_loop() {
+    fn call_parent_write() {
         let code = r#"
-        pub extern "C" fn if_inside_loop() {
-            let mut u: U = U { a: 1 }; // Write A
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+            pub i: i32,
+        }
+
+        fn touch_overlap(p: *mut ParentOverlap) {
             unsafe {
-                use_c(u.c); // Read C
+                (*p).u.b = [5, 6, 7, 8];
             }
+        }
 
-            loop {
-                if cond() {
-                    u.a = 2; // Write A
-                }
-
-                u.b = 3.0; // Write B
-                unsafe {
-                    use_a(u.a); // Read A
-                }
+        pub extern "C" fn call_parent_write() {
+            let mut s = ParentOverlap { u: OverlapU { a: 0 }, i: 1 };
+            touch_overlap(&mut s as *mut ParentOverlap);
+            unsafe {
+                use_a(s.u.a);
             }
         }
         "#;
 
-        let code = format!("{BASE}\n{code}");
-        run_test(&code, false);
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
-    // #[test]
-    // fn temp() {
-    //     let code = r#"
-    //     "#;
+    #[test]
+    fn call_padded_read() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        pub struct Padded {
+            pub tag: u8,
+            pub value: u32,
+        }
 
-    //     let code = format!("{BASE}\n{code}");
-    //     run_test(&code);
-    // }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union AnyBitsU {
+            pub a: u64,
+            pub b: Padded,
+        }
+
+        fn read_padded(u: AnyBitsU) -> Padded {
+            unsafe { u.b }
+        }
+
+        pub extern "C" fn call_padded_read() {
+            let u = AnyBitsU { a: 11 };
+            use_a(read_padded(u).value);
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+    }
+
+    #[test]
+    fn pointer_write_then_read() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        pub extern "C" fn pointer_write_then_read() {
+            let mut u = OverlapU { a: 0 };
+            unsafe {
+                let p = &mut u as *mut OverlapU;
+                (*p).b = [1, 3, 5, 7];
+                use_a((*p).a);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn pointer_read_ptr_bits() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union PtrU {
+            pub a: *mut u8,
+            pub b: usize,
+        }
+
+        pub extern "C" fn pointer_read_ptr_bits() {
+            let mut u = PtrU { a: core::ptr::null_mut() };
+            unsafe {
+                let p = &mut u as *mut PtrU;
+                (*p).a = 1usize as *mut u8;
+                use_a((*p).b as u32);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn pointer_parent_union_field() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+        }
+
+        pub extern "C" fn pointer_parent_union_field() {
+            let mut s = ParentOverlap { u: OverlapU { a: 0 } };
+            unsafe {
+                let p = &mut s.u as *mut OverlapU;
+                (*p).b = [2, 4, 6, 8];
+                use_a(s.u.a);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn pointer_read_padded_field() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        pub struct Padded {
+            pub tag: u8,
+            pub value: u32,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union AnyBitsU {
+            pub a: u64,
+            pub b: Padded,
+        }
+
+        pub extern "C" fn pointer_read_padded_field() {
+            let mut u = AnyBitsU { a: 21 };
+            unsafe {
+                let p = &mut u as *mut AnyBitsU;
+                use_a((*p).b.value);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn pointer_call_chain() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        fn read_from_ptr(p: *const OverlapU) -> u32 {
+            unsafe { (*p).a }
+        }
+
+        pub extern "C" fn pointer_call_chain() {
+            let mut u = OverlapU { a: 0 };
+            unsafe {
+                let p = &mut u as *mut OverlapU;
+                (*p).b = [8, 6, 4, 2];
+                use_a(read_from_ptr(p));
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn ip() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Ipv4 {
+            pub as_int: u32,
+            pub octet: [u8; 4],
+        }
+
+        unsafe fn local_host(p: &mut [u8; 4]) {
+            *p = [127, 0, 0, 1];
+        }
+
+        pub extern "C" fn ip() {
+            let mut ip = Ipv4 { as_int: 0 };
+            unsafe { local_host(&mut ip.octet); }
+            unsafe { use_a(ip.as_int); }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
+        );
+    }
+
+    #[test]
+    fn ip_raw() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Ipv4 {
+            pub as_int: u32,
+            pub octet: [u8; 4],
+        }
+
+        unsafe fn local_host(p: *mut u8) {
+            *p = 127;
+            *p.add(1) = 0;
+            *p.add(2) = 0;
+            *p.add(3) = 1;
+        }
+
+        pub extern "C" fn ip() {
+            let mut ip = Ipv4 { as_int: 0 };
+            unsafe { local_host(ip.octet.as_mut_ptr()); }
+            unsafe { use_a(ip.as_int); }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
+        );
+    }
 }

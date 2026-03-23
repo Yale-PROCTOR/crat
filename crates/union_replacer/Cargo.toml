@@ -10,6 +10,7 @@ typed-arena.workspace = true
 etrace.workspace = true
 serde.workspace = true
 tracing.workspace = true
+toml_edit.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

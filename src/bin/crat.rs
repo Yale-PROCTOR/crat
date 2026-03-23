@@ -195,6 +195,8 @@ struct Config {
     pointer: pointer_replacer::Config,
     #[serde(default)]
     andersen: points_to::andersen::Config,
+    #[serde(default)]
+    punning: union_replacer::punning::Config,
 
     #[serde(default)]
     c_exposed_fns: Vec<String>,
@@ -368,6 +370,10 @@ fn main() {
         .outparam
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .punning
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
@@ -496,11 +502,22 @@ fn main() {
                 .unwrap();
             }
             Pass::Punning => {
-                let s = run_compiler_on_path(&file, |tcx| {
-                    union_replacer::punning::replace_unions(tcx, config.verbose)
+                let had_bytemuck = utils::has_dependency(&dir, "bytemuck");
+                let res = run_compiler_on_path(&file, |tcx| {
+                    union_replacer::punning::replace_unions(tcx, config.verbose, &config.punning)
                 })
                 .unwrap();
-                std::fs::write(&file, s).unwrap();
+
+                if res.needs_bytemuck {
+                    // ensure that bytemuck with derive feature is added if needed
+                    // i.e. bytemuck = { version = "1.24.0", features = ["derive"] }
+                    union_replacer::punning::utils::ensure_bytemuck_with_derive(&dir);
+                } else if !had_bytemuck {
+                    // remove the dependency if it is unnecessary
+                    utils::remove_dependency(&dir, "bytemuck");
+                }
+
+                std::fs::write(&file, res.code).unwrap();
             }
             Pass::Io => {
                 let res =

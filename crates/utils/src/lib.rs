@@ -61,6 +61,31 @@ pub fn add_dependency(dir: &std::path::Path, name: &str, version: &str) {
     std::fs::write(path, doc.to_string()).unwrap();
 }
 
+pub fn has_dependency(dir: &std::path::Path, name: &str) -> bool {
+    let path = dir.join("Cargo.toml");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(toml::Value::Table(dependencies)) = table.get("dependencies") else {
+        return false;
+    };
+    dependencies.contains_key(name)
+}
+
+pub fn remove_dependency(dir: &std::path::Path, name: &str) {
+    let path = dir.join("Cargo.toml");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let mut doc = content.parse::<toml_edit::DocumentMut>().unwrap();
+    let Some(dependencies) = doc["dependencies"].as_table_mut() else {
+        return;
+    };
+    dependencies.remove(name);
+    std::fs::write(path, doc.to_string()).unwrap();
+}
+
 pub fn type_check(tcx: rustc_middle::ty::TyCtxt<'_>) {
     let () = tcx.analysis(());
 }

@@ -1,5 +1,12 @@
-mod analysis;
-mod test;
-mod transformation;
+pub mod analysis;
+pub mod bytemuck;
+pub mod callgraph;
+pub mod model;
+pub mod raw_struct;
+pub mod reverse_cfg;
+pub mod test;
+pub mod transform;
+pub mod ty_visit;
+pub mod utils;
 
-pub use transformation::replace_unions;
+pub use transform::{Config, replace_unions};

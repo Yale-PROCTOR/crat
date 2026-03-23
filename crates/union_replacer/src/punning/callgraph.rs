@@ -1,0 +1,758 @@
+use std::collections::VecDeque;
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::def::DefKind;
+use rustc_middle::{
+    mir::{
+        Body, Location, Place, TerminatorKind,
+        visit::{PlaceContext, Visitor as MirVisitor},
+    },
+    ty::{self, GenericArgsRef, Ty, TyCtxt},
+};
+use rustc_span::def_id::{DefId, LocalDefId};
+
+use super::{ty_visit::UnionRelatedTypes, utils::with_body};
+
+/// Seed functions: union type -> list of functions
+pub type SeedFuncs = FxHashMap<LocalDefId, Vec<LocalDefId>>;
+
+/// CallGraph: caller -> list of callees
+pub type CallGraph = FxHashMap<DefId, Vec<DefId>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallSite {
+    pub caller: LocalDefId,
+    pub call_location: Location,
+}
+
+#[derive(Clone, Default)]
+pub struct CallIndex {
+    /// callee function -> callsites that invoke it.
+    pub callers_of: FxHashMap<LocalDefId, Vec<CallSite>>,
+    /// callsite -> direct local callees (filtered by union-related callgraph).
+    pub callees_of: FxHashMap<CallSite, Vec<LocalDefId>>,
+    /// callsite -> flattened (callee, callee return location) pairs used during backward entry.
+    /// `callee return location` means the MIR location of a `Return` terminator in the callee.
+    pub return_entries_of: FxHashMap<CallSite, Vec<(LocalDefId, Location)>>,
+}
+
+#[derive(Clone, Default)]
+pub struct UnionCallContext {
+    pub callgraph: CallGraph,
+    /// Flattened local function list in the callgraph.
+    pub target_fns: Vec<LocalDefId>,
+    pub call_index: CallIndex,
+}
+
+struct BodyUnionUseCollector<'tcx, 'a> {
+    tcx: TyCtxt<'tcx>,
+    body: &'a Body<'tcx>,
+    union_tys: &'a FxHashSet<LocalDefId>,
+    related_types_map: &'a FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    found_unions: FxHashSet<LocalDefId>,
+}
+
+#[derive(Clone, Copy)]
+struct DirectCallee<'tcx> {
+    def_id: DefId,
+    args: Option<GenericArgsRef<'tcx>>,
+    call_location: Location,
+}
+
+impl<'tcx, 'a> BodyUnionUseCollector<'tcx, 'a> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        body: &'a Body<'tcx>,
+        union_tys: &'a FxHashSet<LocalDefId>,
+        related_types_map: &'a FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    ) -> Self {
+        Self {
+            tcx,
+            body,
+            union_tys,
+            related_types_map,
+            found_unions: FxHashSet::default(),
+        }
+    }
+}
+
+impl<'tcx> MirVisitor<'tcx> for BodyUnionUseCollector<'tcx, '_> {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        let ty = place.ty(self.body, self.tcx).ty;
+        collect_seed_unions_from_ty(
+            ty,
+            self.union_tys,
+            self.related_types_map,
+            &mut self.found_unions,
+        );
+        self.super_place(place, context, location);
+    }
+}
+
+fn collect_seed_unions_from_ty<'tcx>(
+    mut ty: Ty<'tcx>,
+    union_tys: &FxHashSet<LocalDefId>,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    out: &mut FxHashSet<LocalDefId>,
+) {
+    loop {
+        match ty.kind() {
+            ty::Adt(adt_def, _) if adt_def.is_union() => {
+                if let Some(local_id) = adt_def.did().as_local()
+                    && union_tys.contains(&local_id)
+                {
+                    out.insert(local_id);
+                }
+                break;
+            }
+            ty::Ref(_, inner, _) => ty = *inner,
+            ty::RawPtr(t, _) => ty = *t,
+            ty::Adt(adt, _) => {
+                let Some(local_def_id) = adt.did().as_local() else {
+                    break;
+                };
+                for (&union_ty, related) in related_types_map {
+                    if related.parent_types.contains(&local_def_id) {
+                        out.insert(union_ty);
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Collect seed functions for each union type
+/// functions that directly use the union type in their signature (arguments or return type).
+pub fn collect_union_seed_functions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    verbose: bool,
+) -> SeedFuncs {
+    let union_tys: FxHashSet<_> = related_types_map.keys().copied().collect();
+    let mut map: FxHashMap<LocalDefId, FxHashSet<LocalDefId>> = union_tys
+        .iter()
+        .copied()
+        .map(|union_ty| (union_ty, FxHashSet::default()))
+        .collect();
+
+    for def_id in tcx.hir_body_owners() {
+        if !is_seed_candidate(tcx, def_id) {
+            continue;
+        }
+
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let body: &Body<'_> = &body.borrow();
+
+        // union types use in this function
+        let mut found_unions = FxHashSet::default();
+
+        for arg in body.args_iter() {
+            let ty = body.local_decls[arg].ty;
+            collect_seed_unions_from_ty(ty, &union_tys, related_types_map, &mut found_unions);
+        }
+
+        let mut collector = BodyUnionUseCollector::new(tcx, body, &union_tys, related_types_map);
+        collector.visit_body(body);
+        found_unions.extend(collector.found_unions);
+
+        for local_decl in body.local_decls.iter() {
+            collect_seed_unions_from_ty(
+                local_decl.ty,
+                &union_tys,
+                related_types_map,
+                &mut found_unions,
+            );
+        }
+
+        for union_ty in found_unions {
+            // this function becomes a seed function for each union_ty
+            map.entry(union_ty).or_default().insert(def_id);
+        }
+    }
+
+    let map: SeedFuncs = map
+        .into_iter()
+        .map(|(union_ty, mut fn_ids)| {
+            let fn_ids = fn_ids.drain().collect::<Vec<_>>();
+            (union_ty, fn_ids)
+        })
+        .collect();
+
+    if verbose {
+        println!("\nCallgraph Seed Functions:\n\t{}", {
+            let lines = map
+                .iter()
+                .map(|(ty, funcs)| {
+                    let ty_name = tcx.def_path_str(*ty);
+                    let func_names = funcs
+                        .iter()
+                        .map(|def_id| tcx.def_path_str(*def_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{ty_name}\n\t\t-> {func_names}")
+                })
+                .collect::<Vec<_>>();
+            lines.join("\n\t")
+        });
+    }
+
+    map
+}
+
+/// Build a callgraph for each target union type
+pub fn build_union_call_contexts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    seed_functions: &SeedFuncs,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    verbose: bool,
+) -> FxHashMap<LocalDefId, UnionCallContext> {
+    // Debug step option
+    let verbose_callgraph_steps = false;
+
+    let mut callee_cache: FxHashMap<DefId, Vec<DirectCallee<'tcx>>> = FxHashMap::default();
+    let mut union_contexts = FxHashMap::default();
+
+    for (&union_ty, seeds) in seed_functions {
+        let related_types = related_types_map
+            .get(&union_ty)
+            .cloned()
+            .unwrap_or_else(|| UnionRelatedTypes {
+                parent_types: FxHashSet::default(),
+                field_types: FxHashSet::default(),
+            });
+
+        // To handle array [T; N]
+        // In this case, we should also handle pointers or references to T or [T]
+        // ex. &[T], *const T, *mut T, ...
+        let field_pointer_types = collect_field_pointer_types(&related_types.field_types);
+
+        // Seed funcs
+        let seed_set = seeds
+            .iter()
+            .map(|id| id.to_def_id())
+            .collect::<FxHashSet<_>>();
+
+        let mut visited = FxHashSet::default();
+        let mut worklist =
+            VecDeque::from(seeds.iter().map(|id| id.to_def_id()).collect::<Vec<_>>());
+
+        let mut graph: FxHashMap<DefId, FxHashSet<DefId>> = FxHashMap::default();
+        let mut call_index = CallIndex::default();
+        let mut return_cache: FxHashMap<LocalDefId, Vec<Location>> = FxHashMap::default();
+
+        if verbose && verbose_callgraph_steps {
+            let parent_names = related_types
+                .parent_types
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+
+            let seed_names = seeds
+                .iter()
+                .map(|def_id| tcx.def_path_str(*def_id))
+                .collect::<Vec<_>>();
+
+            let field_names = related_types
+                .field_types
+                .iter()
+                .map(|ty| format!("{ty:?}"))
+                .collect::<Vec<_>>();
+
+            let ptr_names = field_pointer_types
+                .iter()
+                .map(|ty| format!("{ty:?}"))
+                .collect::<Vec<_>>();
+
+            println!(
+                "\n[Callgraph][{}]\n\tParent Types:\n\t\t{}\n\tSeeds:\n\t\t{}",
+                tcx.def_path_str(union_ty),
+                parent_names.join("\n\t\t"),
+                seed_names.join("\n\t\t")
+            );
+            println!(
+                "\tField Types:\n\t\t{}\n\tField Pointer Types:\n\t\t{}",
+                field_names.join("\n\t\t"),
+                ptr_names.join("\n\t\t")
+            );
+        }
+
+        while let Some(caller) = worklist.pop_front() {
+            if !visited.insert(caller) {
+                continue;
+            }
+
+            // Check the caller
+            let caller_hits = signature_related_hits(
+                tcx,
+                union_ty,
+                caller,
+                None,
+                &related_types,
+                &field_pointer_types,
+            );
+            let is_seed = seed_set.contains(&caller);
+            if !is_seed && caller_hits.is_empty() {
+                if verbose && verbose_callgraph_steps {
+                    println!(
+                        "\t[Drop Caller] {} (no related type in signature)",
+                        tcx.def_path_str(caller)
+                    );
+                }
+                continue;
+            }
+            if verbose && verbose_callgraph_steps {
+                if is_seed && caller_hits.is_empty() {
+                    println!("\t[Keep Caller:Seed] {}", tcx.def_path_str(caller));
+                } else {
+                    println!(
+                        "\t[Keep Caller] {} | hits: {}",
+                        tcx.def_path_str(caller),
+                        caller_hits.join(", ")
+                    );
+                }
+            }
+
+            let callees = collect_direct_callees(tcx, caller, &mut callee_cache);
+            if verbose && verbose_callgraph_steps {
+                println!(
+                    "\t\tDirect callees from {}: {}",
+                    tcx.def_path_str(caller),
+                    callees
+                        .iter()
+                        .map(|callee| tcx.def_path_str(callee.def_id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            graph.entry(caller).or_default();
+            for callee in &callees {
+                // Check callees
+                let callee_hits = signature_related_hits(
+                    tcx,
+                    union_ty,
+                    callee.def_id,
+                    callee.args,
+                    &related_types,
+                    &field_pointer_types,
+                );
+                if callee_hits.is_empty() {
+                    if verbose && verbose_callgraph_steps {
+                        println!(
+                            "\t\t[Drop Callee] {} (no related type in signature)",
+                            tcx.def_path_str(callee.def_id)
+                        );
+                    }
+                    continue;
+                }
+                graph.entry(caller).or_default().insert(callee.def_id);
+                if let (Some(caller_local), Some(callee_local)) =
+                    (caller.as_local(), callee.def_id.as_local())
+                    && tcx.is_mir_available(callee_local.to_def_id())
+                {
+                    let callsite = CallSite {
+                        caller: caller_local,
+                        call_location: callee.call_location,
+                    };
+                    call_index
+                        .callees_of
+                        .entry(callsite)
+                        .or_default()
+                        .push(callee_local);
+                    call_index
+                        .callers_of
+                        .entry(callee_local)
+                        .or_default()
+                        .push(callsite);
+                }
+                if verbose && verbose_callgraph_steps {
+                    println!(
+                        "\t\t[Keep Callee] {} | hits: {}",
+                        tcx.def_path_str(callee.def_id),
+                        callee_hits.join(", ")
+                    );
+                }
+                if !visited.contains(&callee.def_id)
+                    && is_expandable_graph_node(
+                        tcx,
+                        union_ty,
+                        callee.def_id,
+                        &related_types,
+                        &field_pointer_types,
+                    )
+                {
+                    // Add to worklist if not visited and expandable
+                    worklist.push_back(callee.def_id);
+                    if verbose && verbose_callgraph_steps {
+                        println!("\t\t\t[Expand] {}", tcx.def_path_str(callee.def_id));
+                    }
+                } else if verbose && verbose_callgraph_steps {
+                    println!("\t\t\t[No Expand] {}", tcx.def_path_str(callee.def_id));
+                }
+            }
+        }
+
+        let graph: CallGraph = graph
+            .into_iter()
+            .map(|(caller, mut callees)| {
+                let callees = callees.drain().collect::<Vec<_>>();
+                (caller, callees)
+            })
+            .collect::<FxHashMap<_, _>>();
+
+        for callees in call_index.callees_of.values_mut() {
+            let mut seen = FxHashSet::default();
+            callees.retain(|def_id| seen.insert(*def_id));
+        }
+        for callers in call_index.callers_of.values_mut() {
+            let mut seen = FxHashSet::default();
+            callers.retain(|callsite| seen.insert(*callsite));
+        }
+        for (&callsite, callees) in &call_index.callees_of {
+            let mut entries = Vec::new();
+            for &callee in callees {
+                let returns = return_cache
+                    .entry(callee)
+                    .or_insert_with(|| collect_return_locations(tcx, callee));
+                for &ret in returns.iter() {
+                    entries.push((callee, ret));
+                }
+            }
+            let mut seen = FxHashSet::default();
+            entries.retain(|entry| seen.insert(*entry));
+            call_index.return_entries_of.insert(callsite, entries);
+        }
+
+        let target_fns = collect_local_functions_from_callgraph(&graph);
+        union_contexts.insert(
+            union_ty,
+            UnionCallContext {
+                callgraph: graph,
+                target_fns,
+                call_index,
+            },
+        );
+    }
+
+    if verbose {
+        println!("\nUnion Callgraphs:");
+        for &union_ty in union_contexts.keys() {
+            println!("\t{}:", tcx.def_path_str(union_ty));
+            if let Some(ctx) = union_contexts.get(&union_ty) {
+                let graph = &ctx.callgraph;
+                for &caller in graph.keys() {
+                    let caller_name = tcx.def_path_str(caller);
+                    let callees = graph
+                        .get(&caller)
+                        .expect("caller key was collected from the same map")
+                        .iter()
+                        .map(|def_id| tcx.def_path_str(*def_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("\t\t{caller_name} -> {callees}");
+                }
+            }
+        }
+    }
+
+    union_contexts
+}
+
+pub fn _build_union_callgraphs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    seed_functions: &SeedFuncs,
+    related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
+    verbose: bool,
+) -> FxHashMap<LocalDefId, CallGraph> {
+    build_union_call_contexts(tcx, seed_functions, related_types_map, verbose)
+        .into_iter()
+        .map(|(union_ty, ctx)| (union_ty, ctx.callgraph))
+        .collect()
+}
+
+fn collect_direct_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    cache: &mut FxHashMap<DefId, Vec<DirectCallee<'tcx>>>,
+) -> Vec<DirectCallee<'tcx>> {
+    if let Some(cached) = cache.get(&def_id) {
+        return cached.clone();
+    }
+
+    let collected = do_collect_direct_callees(tcx, def_id);
+    cache.insert(def_id, collected.clone());
+    collected
+}
+
+fn do_collect_direct_callees<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Vec<DirectCallee<'tcx>> {
+    if !is_expandable_def(tcx, def_id) {
+        return Vec::new();
+    }
+
+    let local_def_id = match def_id.as_local() {
+        Some(local_def_id) => local_def_id,
+        None => return Vec::new(),
+    };
+
+    let mut callees = Vec::new();
+
+    with_body(tcx, local_def_id, |body| {
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+            let location = Location {
+                block,
+                statement_index: bbd.statements.len(),
+            };
+            if let TerminatorKind::Call { func, .. } = &bbd.terminator().kind {
+                if let Some((callee, _args)) = func.const_fn_def() {
+                    if is_callable_def(tcx, callee) {
+                        callees.push(DirectCallee {
+                            def_id: callee,
+                            args: Some(_args),
+                            call_location: location,
+                        });
+                    }
+                    continue;
+                }
+                if let ty::FnDef(callee, _) = func.ty(body, tcx).kind()
+                    && is_callable_def(tcx, *callee)
+                {
+                    callees.push(DirectCallee {
+                        def_id: *callee,
+                        args: None,
+                        call_location: location,
+                    });
+                }
+            }
+        }
+    });
+
+    callees
+}
+
+fn collect_local_functions_from_callgraph(callgraph: &CallGraph) -> Vec<LocalDefId> {
+    let mut locals = FxHashSet::default();
+    for (&caller, callees) in callgraph {
+        if let Some(local) = caller.as_local() {
+            locals.insert(local);
+        }
+        for callee in callees.iter().filter_map(|def_id| def_id.as_local()) {
+            locals.insert(callee);
+        }
+    }
+    locals.into_iter().collect::<Vec<_>>()
+}
+
+fn collect_return_locations<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Vec<Location> {
+    with_body(tcx, def_id, |body| {
+        let mut returns = Vec::new();
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+            if matches!(bbd.terminator().kind, TerminatorKind::Return) {
+                returns.push(Location {
+                    block,
+                    statement_index: bbd.statements.len(),
+                });
+            }
+        }
+        returns
+    })
+}
+
+/// Heuristic to find user-defined seed functions that uses target union types
+fn is_seed_candidate(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+
+    if !tcx.is_mir_available(def_id.to_def_id()) {
+        return false;
+    }
+
+    // Skip compiler/macro-generated bodies (ex. clone)
+    if tcx.def_span(def_id).from_expansion() {
+        return false;
+    }
+
+    let def_id = def_id.to_def_id();
+    if let Some(impl_id) = tcx.impl_of_method(def_id)
+        && let Some(trait_id) = tcx.trait_id_of_impl(impl_id)
+    {
+        let trait_path = tcx.def_path_str(trait_id);
+        if trait_path.starts_with("core::") || trait_path.starts_with("std::") {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_callable_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn)
+}
+
+/// Expandable and related type signature hit
+fn is_expandable_graph_node<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: LocalDefId,
+    def_id: DefId,
+    related_types: &UnionRelatedTypes<'tcx>,
+    field_pointer_types: &FxHashSet<Ty<'tcx>>,
+) -> bool {
+    is_expandable_def(tcx, def_id)
+        && !signature_related_hits(
+            tcx,
+            union_ty,
+            def_id,
+            None,
+            related_types,
+            field_pointer_types,
+        )
+        .is_empty()
+}
+
+/// Check if a function's mir body is available
+fn is_expandable_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let Some(local_def_id) = def_id.as_local() else {
+        return false;
+    };
+    is_callable_def(tcx, def_id) && tcx.is_mir_available(local_def_id.to_def_id())
+}
+
+/// Check if the function signature caller contains a union related type which is one of below:
+/// - the union type itself
+/// - parent struct types including its pointer or reference
+/// - pointer or reference of field types
+/// - void pointer types
+fn signature_related_hits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: LocalDefId,
+    def_id: DefId,
+    args: Option<GenericArgsRef<'tcx>>,
+    related_types: &UnionRelatedTypes<'tcx>,
+    field_pointer_types: &FxHashSet<Ty<'tcx>>,
+) -> Vec<String> {
+    if !is_callable_def(tcx, def_id) {
+        return Vec::new();
+    }
+
+    let poly_sig = tcx.fn_sig(def_id);
+    let sig = match args {
+        Some(args) => poly_sig.instantiate(tcx, args).skip_binder(),
+        None => poly_sig.instantiate_identity().skip_binder(),
+    };
+    let mut hits = Vec::new();
+    for (idx, ty) in sig.inputs().iter().enumerate() {
+        if is_related_type(
+            tcx,
+            union_ty,
+            *ty,
+            related_types,
+            field_pointer_types,
+            false,
+        ) {
+            hits.push(format!("arg{idx}:{ty:?}"));
+        }
+    }
+    let out_ty = sig.output();
+    if is_related_type(
+        tcx,
+        union_ty,
+        out_ty,
+        related_types,
+        field_pointer_types,
+        false,
+    ) {
+        hits.push(format!("ret:{out_ty:?}"));
+    }
+    hits
+}
+
+// TODO: Logic check
+fn is_related_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: LocalDefId,
+    ty: Ty<'tcx>,
+    related_types: &UnionRelatedTypes<'tcx>,
+    field_pointer_types: &FxHashSet<Ty<'tcx>>,
+    under_ptr_or_ref: bool,
+) -> bool {
+    if related_types.field_types.contains(&ty) {
+        return under_ptr_or_ref;
+    }
+    if under_ptr_or_ref && field_pointer_types.contains(&ty) {
+        return true;
+    }
+
+    match ty.kind() {
+        ty::Adt(adt_def, substs) => {
+            if let Some(local_def_id) = adt_def.did().as_local()
+                && (local_def_id == union_ty || related_types.parent_types.contains(&local_def_id))
+            {
+                return true;
+            }
+            if under_ptr_or_ref && is_c_void_def(tcx, adt_def.did()) {
+                return true;
+            }
+            substs.types().any(|t| {
+                is_related_type(tcx, union_ty, t, related_types, field_pointer_types, false)
+            })
+        }
+        ty::Ref(_, inner, _) => is_related_type(
+            tcx,
+            union_ty,
+            *inner,
+            related_types,
+            field_pointer_types,
+            true,
+        ),
+        ty::RawPtr(t, _) => {
+            is_related_type(tcx, union_ty, *t, related_types, field_pointer_types, true)
+        }
+        ty::Tuple(tys) => tys
+            .iter()
+            .any(|t| is_related_type(tcx, union_ty, t, related_types, field_pointer_types, false)),
+        ty::Array(t, _) | ty::Slice(t) => is_related_type(
+            tcx,
+            union_ty,
+            *t,
+            related_types,
+            field_pointer_types,
+            under_ptr_or_ref,
+        ),
+        _ => false,
+    }
+}
+
+fn is_c_void_def(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let path = tcx.def_path_str(def_id);
+    path == "libc::c_void" || path == "std::ffi::c_void" || path == "core::ffi::c_void"
+}
+
+fn collect_field_pointer_types<'tcx>(field_tys: &FxHashSet<Ty<'tcx>>) -> FxHashSet<Ty<'tcx>> {
+    let mut pointee_tys = FxHashSet::default();
+    for &field_ty in field_tys {
+        collect_pointee_related_types(field_ty, &mut pointee_tys);
+    }
+    pointee_tys
+}
+
+fn collect_pointee_related_types<'tcx>(ty: Ty<'tcx>, out: &mut FxHashSet<Ty<'tcx>>) {
+    match ty.kind() {
+        ty::Array(inner, _) | ty::Slice(inner) | ty::Ref(_, inner, _) | ty::RawPtr(inner, _) => {
+            out.insert(*inner);
+            collect_pointee_related_types(*inner, out);
+        }
+        ty::Tuple(tys) => {
+            for t in tys.iter() {
+                collect_pointee_related_types(t, out);
+            }
+        }
+        ty::Adt(_, substs) => {
+            for t in substs.types() {
+                collect_pointee_related_types(t, out);
+            }
+        }
+        _ => {}
+    }
+}
