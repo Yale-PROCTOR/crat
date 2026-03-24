@@ -510,7 +510,7 @@ fn main() {
 
                 if res.needs_bytemuck {
                     // ensure that bytemuck with derive feature is added if needed
-                    // i.e. bytemuck = { version = "1.24.0", features = ["derive"] }
+                    // i.e. bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics"] }
                     union_replacer::punning::utils::ensure_bytemuck_with_derive(&dir);
                 } else if !had_bytemuck {
                     // remove the dependency if it is unnecessary

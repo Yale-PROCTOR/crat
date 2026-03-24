@@ -122,6 +122,20 @@ TRANSFORMATIONS: Dict[str, Transformation] = {
     #     pass_="union",
     #     config=CONFIG_ROOT / "union",
     # ),
+    "punning": Transformation(
+        dir=BENCH_ROOT / "rs-punning",
+        order="extern",
+        analysis=None,
+        pass_="punning",
+        config=CONFIG_ROOT / "punning",
+    ),
+    "punning-post": Transformation(
+        dir=BENCH_ROOT / "rs-punning-post",
+        order="punning",
+        analysis=None,
+        pass_="unsafe,unexpand,split,bin",
+        config=CONFIG_ROOT / "post",
+    ),
 }
 ANALYSES: Dict[str, Analysis] = {
     # "union": Analysis(
