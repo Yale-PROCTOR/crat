@@ -35,6 +35,8 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("rt"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("libstd_sys_internals"), tcx),
     ]);
     if config.keep_allows {
         krate.attrs.extend([

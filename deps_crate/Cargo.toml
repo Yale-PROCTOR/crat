@@ -9,4 +9,4 @@ c2rust-asm-casts = "0.2"
 f128 = "0.2"
 num-traits = "0.2"
 tempfile = "3.19"
-bytemuck = { version = "1.24.0", features = ["derive"] }
+bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics"] }

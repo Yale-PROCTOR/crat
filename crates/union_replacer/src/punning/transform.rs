@@ -142,11 +142,6 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // Step 1: derive bytemuck traits for user-defined field types
     let derive_plan = build_bytemuck_derive_plan(tcx, &overlapping_tys, &union_field_classes);
-    if !derive_plan.per_type.is_empty() {
-        krate
-            .attrs
-            .extend(utils::attr!("#![feature(rt, libstd_sys_internals)]"));
-    }
     let mut derive_visitor = BytemuckDeriveVisitor::new(tcx, &ast_to_hir, derive_plan);
     derive_visitor.visit_crate(&mut krate);
 
