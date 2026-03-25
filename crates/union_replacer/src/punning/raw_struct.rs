@@ -135,13 +135,22 @@ impl<'a, 'tcx> RawStructVisitor<'a, 'tcx> {
             let get_mut = format!("get_{}_mut", field.field_name);
             let set = format!("set_{}", field.field_name);
             let size_expr = format!("core::mem::size_of::<{ty_s}>()");
+            let field_size = self
+                .tcx
+                .layout_of(
+                    rustc_middle::ty::TypingEnv::fully_monomorphized()
+                        .as_query_input(field.field_ty),
+                )
+                .unwrap()
+                .size
+                .bytes();
 
             match field.class {
                 FieldTypeClass::Pod => methods.push_str(&format!(
                     " pub fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
                       pub fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
                       pub fn {get_mut}(&mut self) -> &mut {ty_s} {{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }} \
-                      pub fn {set}(&mut self, value: {ty_s}) {{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }} "
+                      pub const fn {set}(&mut self, value: {ty_s}) {{ let bytes: [u8; {field_size}] = bytemuck::must_cast(value); self.raw.split_at_mut({field_size}).0.copy_from_slice(&bytes); }} "
                 )),
                 FieldTypeClass::AnyBitPattern => methods.push_str(&format!(
                     " pub fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
@@ -149,15 +158,22 @@ impl<'a, 'tcx> RawStructVisitor<'a, 'tcx> {
                       pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} "
                 )),
                 FieldTypeClass::NoUninit(is_raw_ptr) => {
-                    let set_body = if is_raw_ptr {
-                        "let addr = value as usize; let bytes = bytemuck::bytes_of(&addr); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string()
+                    if is_raw_ptr {
+                        let set_body = "let addr = value as usize; let bytes = bytemuck::bytes_of(&addr); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string();
+                        methods.push_str(&format!(
+                            "pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
+                            pub fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
+                        ));
+
                     } else {
-                        "let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string()
-                    };
-                    methods.push_str(&format!(
-                        " pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
-                          pub fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
-                    ));
+                        let set_body = format!(
+                            "let bytes: [u8; {field_size}] = bytemuck::must_cast(value); self.raw.split_at_mut({field_size}).0.copy_from_slice(&bytes);",
+                        );
+                        methods.push_str(&format!(
+                            "pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
+                            pub const fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
+                        ));
+                    }
                 }
                 FieldTypeClass::Other => {}
             }
@@ -173,7 +189,7 @@ impl<'a, 'tcx> RawStructVisitor<'a, 'tcx> {
     ) -> rustc_ast::ptr::P<Item> {
         let mut methods = String::new();
         methods.push_str(&format!(
-            "fn new() -> Self {{ Self {{ raw: [0u8; {}] }} }}",
+            "const fn new() -> Self {{ Self {{ raw: [0u8; {}] }} }}",
             info.size
         ));
 
@@ -184,9 +200,16 @@ impl<'a, 'tcx> RawStructVisitor<'a, 'tcx> {
             let ty_s = utils::ir::mir_ty_to_string(field.field_ty, self.tcx);
             let new_field = format!("new_{}", field.field_name);
             let set_field = format!("set_{}", field.field_name);
-            methods.push_str(&format!(
-                " pub fn {new_field}(value: {ty_s}) -> Self {{ let mut u = Self::new(); u.{set_field}(value); u }} "
-            ));
+
+            if let FieldTypeClass::NoUninit(true) = field.class {
+                methods.push_str(&format!(
+                    " pub fn {new_field}(value: {ty_s}) -> Self {{ let mut u = Self::new(); u.{set_field}(value); u }} "
+                ));
+            } else {
+                methods.push_str(&format!(
+                    " pub const fn {new_field}(value: {ty_s}) -> Self {{ let mut u = Self::new(); u.{set_field}(value); u }} "
+                ));
+            }
         }
 
         rustc_ast::ptr::P(utils::item!("impl {} {{ {} }}", union_name, methods))

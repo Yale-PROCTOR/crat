@@ -216,9 +216,10 @@ pub fn ensure_bytemuck_with_derive(dir: &Path) {
     }
 
     let deps = doc["dependencies"].as_table_mut().unwrap();
-    deps["bytemuck"] =
-        Item::from_str(r#"{ version = "1.24.0", features = ["derive", "min_const_generics"] }"#)
-            .unwrap();
+    deps["bytemuck"] = Item::from_str(
+        r#"{ version = "1.24.0", features = ["derive", "min_const_generics", "must_cast"] }"#,
+    )
+    .unwrap();
 
     fs::write(path, doc.to_string()).unwrap();
 }
