@@ -36,6 +36,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // for debug
     let print_mir = false;
+    let print_reaching_write = true;
     let verbose_debug = false;
     let print_result = true;
 
@@ -100,20 +101,21 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
     let related_types_map =
         collect_union_related_types(&tcx, &analysis_target_tys, &ty_visitor, verbose_debug);
     let seed_functions = collect_union_seed_functions(tcx, &related_types_map, verbose_debug);
-    let call_contexts =
+    let call_info =
         build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose_debug);
 
     // Analyze union uses and detect overlapping unions
     let union_uses = analyze(
         tcx,
         &analysis_target_tys,
-        &call_contexts,
+        &call_info.contexts,
+        &call_info.return_locs,
         print_mir,
         verbose_debug,
         &config.c_exposed_fns,
     );
-    let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_contexts);
-    if verbose_debug {
+    let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_info.contexts);
+    if print_reaching_write {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
     let overlapping_tys = determine_overlapping_unions(

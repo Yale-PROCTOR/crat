@@ -8,8 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        AggregateKind, Body, Local, Location, Operand, Place, PlaceElem, Rvalue, Statement,
-        StatementKind, Terminator, TerminatorKind,
+        AggregateKind, Body, Local, Location, Operand, Place, PlaceElem,
+        RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MirVisitor},
     },
     ty::{Ty, TyCtxt, TyKind},
@@ -19,7 +19,7 @@ use typed_arena::Arena;
 use utils::ty_shape;
 
 use super::{
-    callgraph::UnionCallContext,
+    callgraph::{ReturnLocs, UnionCallContext},
     model::{self, ArgEffectKind},
     utils::{print_all_local_bodies_with_points_to, with_body},
 };
@@ -28,6 +28,7 @@ pub fn analyze(
     tcx: TyCtxt,
     target_union_tys: &[LocalDefId],
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
+    return_locs: &ReturnLocs,
     print_mir: bool,
     verbose: bool,
     c_exposed_fns: &FxHashSet<String>,
@@ -55,7 +56,14 @@ pub fn analyze(
         println!("\nUnion use analysis result:");
     }
 
-    identify_union_uses(tcx, target_union_tys, may_points_to, call_contexts, verbose)
+    identify_union_uses(
+        tcx,
+        target_union_tys,
+        may_points_to,
+        call_contexts,
+        return_locs,
+        verbose,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -165,6 +173,22 @@ pub struct UnionWrite {
     pub field: UnionAccessField,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CopyPoint {
+    Entry(LocalDefId),
+    Location {
+        def_id: LocalDefId,
+        location: Location,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CopySource {
+    pub point: CopyPoint,
+    pub source_instance: UnionMemoryInstance,
+    pub source_site: UnionAccessSite,
+}
+
 pub fn format_access(tcx: TyCtxt<'_>, union_ty: DefId, access: &impl HasUnionField) -> String {
     access.union_field().format_for_union(tcx, union_ty)
 }
@@ -206,6 +230,8 @@ pub struct UnionInstanceUses {
     pub reads: FxHashMap<LocalDefId, Vec<UnionRead>>,
     /// Write operations grouped by function for this union memory instance.
     pub writes: FxHashMap<LocalDefId, Vec<UnionWrite>>,
+    /// Value-copy boundaries whose source writes should be inherited by this instance.
+    pub copies: Vec<CopySource>,
 }
 
 #[derive(Default)]
@@ -235,6 +261,10 @@ impl std::fmt::Debug for UnionInstanceUses {
             for loc in writes.iter().map(|w| w.site.location) {
                 writeln!(f, "\t\t{loc:?}")?;
             }
+        }
+        writeln!(f, "COPY_INIT:")?;
+        for copy in &self.copies {
+            writeln!(f, "\t\t{copy:?}")?;
         }
         Ok(())
     }
@@ -280,6 +310,7 @@ fn identify_union_uses(
     target_union_tys: &[LocalDefId],
     result: andersen::AnalysisResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
+    return_locs: &ReturnLocs,
     verbose: bool,
 ) -> UnionUseResult {
     let target_union_ty_set: FxHashSet<DefId> = target_union_tys
@@ -343,6 +374,7 @@ fn identify_union_uses(
     // Collect union instance accesses and classify them
     // - collect accesses using the finalized instance-to-type map
     let mut all_accesses: Vec<DetectedAccess> = Vec::new();
+    let mut all_copies: Vec<PendingCopy> = Vec::new();
 
     for &def_id in &target_fns {
         if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
@@ -352,7 +384,7 @@ fn identify_union_uses(
             continue;
         }
 
-        let accesses = with_body(tcx, def_id, |body| {
+        let (accesses, copies) = with_body(tcx, def_id, |body| {
             let mut collector = BodyUnionAccessCollector::new(
                 tcx,
                 body,
@@ -361,11 +393,13 @@ fn identify_union_uses(
                 &union_instances,
                 &instance_to_union_ty,
                 &union_layouts,
+                return_locs,
             );
             collector.visit_body(body);
-            collector.accesses
+            (collector.accesses, collector.copies)
         });
         all_accesses.extend(accesses);
+        all_copies.extend(copies);
     }
 
     // Pass 3
@@ -408,6 +442,21 @@ fn identify_union_uses(
                     })
             }
         }
+    }
+
+    for copy_init in all_copies {
+        union_uses
+            .entry(copy_init.union_ty)
+            .or_default()
+            .instances
+            .entry(copy_init.target_instance)
+            .or_default()
+            .copies
+            .push(CopySource {
+                point: copy_init.point,
+                source_instance: copy_init.source_instance,
+                source_site: copy_init.source_site,
+            });
     }
 
     let res = UnionUseResult { uses: union_uses };
@@ -636,6 +685,15 @@ struct DetectedAccess {
     resolved_union_ty: DefId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PendingCopy {
+    point: CopyPoint,
+    target_instance: UnionMemoryInstance,
+    source_instance: UnionMemoryInstance,
+    union_ty: DefId,
+    source_site: UnionAccessSite,
+}
+
 /// Collect union accesses and classify them
 struct BodyUnionAccessCollector<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
@@ -645,12 +703,15 @@ struct BodyUnionAccessCollector<'tcx, 'a> {
     union_instances: &'a [UnionMemoryInstance],
     instance_to_union_ty: &'a FxHashMap<UnionMemoryInstance, DefId>,
     union_layouts: &'a FxHashMap<DefId, UnionLayout>,
+    return_locs: &'a ReturnLocs,
     seen: FxHashSet<DetectedAccess>,
     accesses: Vec<DetectedAccess>,
     init_lhs: FxHashMap<Location, Local>,
     skip_store_locations: FxHashSet<Location>,
     local_known_union_fields:
         FxHashMap<Local, FxHashMap<KnownUnionPath, (DefId, UnionAccessField)>>,
+    seen_copies: FxHashSet<PendingCopy>,
+    copies: Vec<PendingCopy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -721,6 +782,19 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
                         def_id: self.def_id,
                         location,
                     };
+                    self.record_copy(
+                        self.body,
+                        self.def_id,
+                        *src,
+                        self.body,
+                        self.def_id,
+                        *dst_place,
+                        CopyPoint::Location {
+                            def_id: self.def_id,
+                            location,
+                        },
+                        site,
+                    );
                     if let Some(known_fields) =
                         self.local_known_union_fields.get(&src.local).cloned()
                     {
@@ -832,6 +906,11 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
 
     /// Priority 2: classify ordinary MIR place accesses not already handled above.
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        if self.skip_store_locations.contains(&location) {
+            return;
+        }
+
+
         // Ignore lhs of union init (already handled in visit_statement)
         if self.skip_store_locations.contains(&location)
             && matches!(
@@ -875,28 +954,131 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
 
     /// Priority 3: synthesize accesses for extern calls without MIR bodies.
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &terminator.kind
+            && let Some(callee) = self.resolve_callee(func)
+            && let Some(callee_local) = callee.as_local()
+            && self.tcx.is_mir_available(callee)
+        {
+            with_body(self.tcx, callee_local, |callee_body| {
+                for (param_local, arg) in callee_body.args_iter().zip(args.iter()) {
+                    let Some(arg_place) = arg.node.place() else {
+                        continue;
+                    };
+                    self.record_copy(
+                        self.body,
+                        self.def_id,
+                        arg_place,
+                        callee_body,
+                        callee_local,
+                        Place::from(param_local),
+                        CopyPoint::Entry(callee_local),
+                        UnionAccessSite {
+                            def_id: self.def_id,
+                            location,
+                        },
+                    );
+                }
+
+                for &ret_loc in self.return_locs.get(&callee_local).into_iter().flatten() {
+                    self.record_copy(
+                        callee_body,
+                        callee_local,
+                        Place::from(RETURN_PLACE),
+                        self.body,
+                        self.def_id,
+                        *destination,
+                        CopyPoint::Location {
+                            def_id: self.def_id,
+                            location,
+                        },
+                        UnionAccessSite {
+                            def_id: callee_local,
+                            location: ret_loc,
+                        },
+                    );
+                }
+            });
+        }
+
         // Handle modelled functions
         if let TerminatorKind::Call { func, args, .. } = &terminator.kind
             && let Some(callee) = self.resolve_callee(func)
             && !self.tcx.is_mir_available(callee)
             && let Some(fn_model) = model::lookup_fn_model(self.tcx, callee)
         {
-            for effect in fn_model.arg_effects {
-                let Some(arg) = args.get(effect.arg_index) else {
+            let site = UnionAccessSite {
+                def_id: self.def_id,
+                location,
+            };
+            let mut handled_copy = false;
+
+            'copy_effects: for effect in fn_model.copy_effects {
+                let Some(dst_arg) = args.get(effect.dst_arg_index) else {
                     continue;
                 };
-                let Some(place) = arg.node.place() else {
+                let Some(src_arg) = args.get(effect.src_arg_index) else {
                     continue;
                 };
-                let kind = match effect.kind {
-                    ArgEffectKind::Read => AccessKind::Read,
-                    ArgEffectKind::Write => AccessKind::Write,
+                let Some(mut dst_place) = dst_arg.node.place() else {
+                    continue;
                 };
-                let site = UnionAccessSite {
-                    def_id: self.def_id,
-                    location,
+                let Some(mut src_place) = src_arg.node.place() else {
+                    continue;
                 };
-                self.push_access(place, kind, site, effect.deref_count, None);
+
+                for _ in 0..effect.deref_count {
+                    if projected_ty(dst_place.ty(self.body, self.tcx).ty, PlaceElem::Deref).is_none()
+                        || projected_ty(src_place.ty(self.body, self.tcx).ty, PlaceElem::Deref)
+                            .is_none()
+                    {
+                        continue 'copy_effects;
+                    }
+                    dst_place = dst_place.project_deeper(&[PlaceElem::Deref], self.tcx);
+                    src_place = src_place.project_deeper(&[PlaceElem::Deref], self.tcx);
+                }
+
+                let source_ty = src_place.ty(self.body, self.tcx).ty;
+                let target_ty = dst_place.ty(self.body, self.tcx).ty;
+                if source_ty != target_ty || union_paths_in(self.tcx, source_ty).is_empty() {
+                    continue;
+                }
+
+                self.record_copy(
+                    self.body,
+                    self.def_id,
+                    src_place,
+                    self.body,
+                    self.def_id,
+                    dst_place,
+                    CopyPoint::Location {
+                        def_id: self.def_id,
+                        location,
+                    },
+                    site,
+                );
+                handled_copy = true;
+                self.skip_store_locations.insert(location);
+            }
+
+            if !handled_copy {
+                for effect in fn_model.arg_effects {
+                    let Some(arg) = args.get(effect.arg_index) else {
+                        continue;
+                    };
+                    let Some(place) = arg.node.place() else {
+                        continue;
+                    };
+                    let kind = match effect.kind {
+                        ArgEffectKind::Read => AccessKind::Read,
+                        ArgEffectKind::Write => AccessKind::Write,
+                    };
+                    self.push_access(place, kind, site, effect.deref_count, None);
+                }
             }
         }
         self.super_terminator(terminator, location);
@@ -912,6 +1094,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         union_instances: &'a [UnionMemoryInstance],
         instance_to_union_ty: &'a FxHashMap<UnionMemoryInstance, DefId>,
         union_layouts: &'a FxHashMap<DefId, UnionLayout>,
+        return_locs: &'a ReturnLocs,
     ) -> Self {
         Self {
             tcx,
@@ -921,36 +1104,33 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             union_instances,
             instance_to_union_ty,
             union_layouts,
+            return_locs,
             seen: FxHashSet::default(),
             accesses: Vec::new(),
             init_lhs: FxHashMap::default(),
             skip_store_locations: FxHashSet::default(),
             local_known_union_fields: FxHashMap::default(),
+            seen_copies: FxHashSet::default(),
+            copies: Vec::new(),
         }
     }
 
-    fn alias_target_locs(
+    fn aliasing_instances(
         &self,
-        place: Place<'tcx>,
-        implicit_deref_count: usize,
-    ) -> Vec<andersen::Loc> {
-        alias_target_locs_with_tys(
-            self.result,
-            self.body,
-            self.tcx,
-            self.def_id,
-            place,
-            implicit_deref_count,
-        )
-    }
-
-    fn find_aliasing_union_instances(
-        &self,
+        body: &Body<'tcx>,
+        def_id: LocalDefId,
         place: Place<'tcx>,
         implicit_deref_count: usize,
     ) -> Vec<UnionMemoryInstance> {
         let mut out = vec![];
-        for target in self.alias_target_locs(place, implicit_deref_count) {
+        for target in alias_target_locs_with_tys(
+            self.result,
+            body,
+            self.tcx,
+            def_id,
+            place,
+            implicit_deref_count,
+        ) {
             let target_end = self.result.ends[target];
             for instance in self.union_instances {
                 if ranges_overlap(target, target_end, instance.root, instance.end) {
@@ -962,6 +1142,74 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         let mut seen = FxHashSet::default();
         out.retain(|i| seen.insert(*i));
         out
+    }
+
+    fn record_copy(
+        &mut self,
+        source_body: &Body<'tcx>,
+        source_def_id: LocalDefId,
+        source_place: Place<'tcx>,
+        target_body: &Body<'tcx>,
+        target_def_id: LocalDefId,
+        target_place: Place<'tcx>,
+        point: CopyPoint,
+        source_site: UnionAccessSite,
+    ) {
+        let source_ty = source_place.ty(source_body, self.tcx).ty;
+        let target_ty = target_place.ty(target_body, self.tcx).ty;
+        if source_ty != target_ty {
+            return;
+        }
+
+        let union_paths = union_paths_in(self.tcx, source_ty);
+        if union_paths.is_empty() {
+            return;
+        }
+
+        for (path, union_ty) in union_paths {
+            let Some(source_union_place) = project_path(source_place, source_body, self.tcx, &path)
+            else {
+                continue;
+            };
+            let Some(target_union_place) = project_path(target_place, target_body, self.tcx, &path)
+            else {
+                continue;
+            };
+
+            let source_instances =
+                self.aliasing_instances(source_body, source_def_id, source_union_place, 0);
+            let target_instances =
+                self.aliasing_instances(target_body, target_def_id, target_union_place, 0);
+
+            for source_instance in source_instances.iter().copied() {
+                if self
+                    .instance_to_union_ty
+                    .get(&source_instance)
+                    .is_some_and(|mapped| *mapped != union_ty)
+                {
+                    continue;
+                }
+                for target_instance in target_instances.iter().copied() {
+                    if self
+                        .instance_to_union_ty
+                        .get(&target_instance)
+                        .is_some_and(|mapped| *mapped != union_ty)
+                    {
+                        continue;
+                    }
+                    let copy_init = PendingCopy {
+                        point,
+                        target_instance,
+                        source_instance,
+                        union_ty,
+                        source_site,
+                    };
+                    if self.seen_copies.insert(copy_init) {
+                        self.copies.push(copy_init);
+                    }
+                }
+            }
+        }
     }
 
     fn union_field_at_offset(offset: usize, offsets: &[usize]) -> Option<usize> {
@@ -1289,9 +1537,15 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         else {
             return UnionAccessField::Top;
         };
-
         let mut found_bit_mask = 0u64;
-        for target in self.alias_target_locs(place, implicit_deref_count) {
+        for target in alias_target_locs_with_tys(
+            self.result,
+            self.body,
+            self.tcx,
+            self.def_id,
+            place,
+            implicit_deref_count,
+        ) {
             let target_end = self.result.ends[target];
             if !ranges_overlap(target, target_end, instance.root, instance.end) {
                 continue;
@@ -1407,7 +1661,8 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         implicit_deref_count: usize,
         type_field: Option<(DefId, UnionAccessField)>,
     ) {
-        let instances = self.find_aliasing_union_instances(place, implicit_deref_count);
+        let instances =
+            self.aliasing_instances(self.body, self.def_id, place, implicit_deref_count);
         if instances.is_empty() {
             return;
         }
@@ -1488,6 +1743,64 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             None
         }
     }
+}
+
+fn union_paths_in<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(KnownUnionPath, DefId)> {
+    fn walk<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        path: &mut KnownUnionPath,
+        out: &mut Vec<(KnownUnionPath, DefId)>,
+    ) {
+        let TyKind::Adt(adt, args) = ty.kind() else {
+            return;
+        };
+        if adt.is_union() {
+            out.push((path.clone(), adt.did()));
+            return;
+        }
+        if !adt.is_struct() {
+            return;
+        }
+        for (field_idx, field) in adt.all_fields().enumerate() {
+            path.push(KnownUnionPathElem::Field(field_idx));
+            walk(tcx, field.ty(tcx, args), path, out);
+            path.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    walk(tcx, ty, &mut path, &mut out);
+    out
+}
+
+fn project_path<'tcx>(
+    mut place: Place<'tcx>,
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    path: &[KnownUnionPathElem],
+) -> Option<Place<'tcx>> {
+    for elem in path {
+        match elem {
+            KnownUnionPathElem::Deref => {
+                place = place.project_deeper(&[PlaceElem::Deref], tcx);
+            }
+            KnownUnionPathElem::Field(field_idx) => {
+                let ty = place.ty(body, tcx).ty;
+                let TyKind::Adt(adt, args) = ty.kind() else {
+                    return None;
+                };
+                let field_def = adt.all_fields().nth(*field_idx)?;
+                let field_ty = field_def.ty(tcx, args);
+                place = place.project_deeper(
+                    &[PlaceElem::Field(FieldIdx::from_usize(*field_idx), field_ty)],
+                    tcx,
+                );
+            }
+        }
+    }
+    Some(place)
 }
 
 fn project_nodes(

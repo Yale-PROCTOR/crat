@@ -36,12 +36,20 @@ pub struct CallIndex {
     pub return_entries_of: FxHashMap<CallSite, Vec<(LocalDefId, Location)>>,
 }
 
+pub type ReturnLocs = FxHashMap<LocalDefId, Vec<Location>>;
+
 #[derive(Clone, Default)]
 pub struct UnionCallContext {
     pub callgraph: CallGraph,
     /// Flattened local function list in the callgraph.
     pub target_fns: Vec<LocalDefId>,
     pub call_index: CallIndex,
+}
+
+#[derive(Clone, Default)]
+pub struct UnionCallInfo {
+    pub contexts: FxHashMap<LocalDefId, UnionCallContext>,
+    pub return_locs: ReturnLocs,
 }
 
 struct BodyUnionUseCollector<'tcx, 'a> {
@@ -207,12 +215,13 @@ pub fn build_union_call_contexts<'tcx>(
     seed_functions: &SeedFuncs,
     related_types_map: &FxHashMap<LocalDefId, UnionRelatedTypes<'tcx>>,
     verbose: bool,
-) -> FxHashMap<LocalDefId, UnionCallContext> {
+) -> UnionCallInfo {
     // Debug step option
     let verbose_callgraph_steps = false;
 
     let mut callee_cache: FxHashMap<DefId, Vec<DirectCallee<'tcx>>> = FxHashMap::default();
     let mut union_contexts = FxHashMap::default();
+    let mut return_locs = ReturnLocs::default();
 
     for (&union_ty, seeds) in seed_functions {
         let related_types = related_types_map
@@ -240,7 +249,6 @@ pub fn build_union_call_contexts<'tcx>(
 
         let mut graph: FxHashMap<DefId, FxHashSet<DefId>> = FxHashMap::default();
         let mut call_index = CallIndex::default();
-        let mut return_cache: FxHashMap<LocalDefId, Vec<Location>> = FxHashMap::default();
 
         if verbose && verbose_callgraph_steps {
             let parent_names = related_types
@@ -413,7 +421,7 @@ pub fn build_union_call_contexts<'tcx>(
         for (&callsite, callees) in &call_index.callees_of {
             let mut entries = Vec::new();
             for &callee in callees {
-                let returns = return_cache
+                let returns = return_locs
                     .entry(callee)
                     .or_insert_with(|| collect_return_locations(tcx, callee));
                 for &ret in returns.iter() {
@@ -457,7 +465,10 @@ pub fn build_union_call_contexts<'tcx>(
         }
     }
 
-    union_contexts
+    UnionCallInfo {
+        contexts: union_contexts,
+        return_locs,
+    }
 }
 
 pub fn _build_union_callgraphs<'tcx>(
@@ -467,6 +478,7 @@ pub fn _build_union_callgraphs<'tcx>(
     verbose: bool,
 ) -> FxHashMap<LocalDefId, CallGraph> {
     build_union_call_contexts(tcx, seed_functions, related_types_map, verbose)
+        .contexts
         .into_iter()
         .map(|(union_ty, ctx)| (union_ty, ctx.callgraph))
         .collect()
