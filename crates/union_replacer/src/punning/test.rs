@@ -257,7 +257,7 @@ mod tests {
         }
         "#;
 
-        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
         }
         "#;
 
-        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]

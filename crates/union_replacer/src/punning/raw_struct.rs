@@ -265,6 +265,7 @@ enum FieldAccessKind {
 enum Step {
     Field(String),
     Index(String),
+    Method(String, Vec<String>, bool),
 }
 
 impl<'tcx> UnionUseRewriteVisitor<'tcx> {
@@ -297,7 +298,10 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
         Some(utils::ir::mir_ty_to_string(ty, self.tcx))
     }
 
-    fn infer_field_access_kind(&self, expr: &Expr) -> FieldAccessKind {
+    fn infer_field_access_kind(&self, expr: &Expr, mut_required: bool) -> FieldAccessKind {
+        if mut_required {
+            return FieldAccessKind::MutRef;
+        }
         let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
             return FieldAccessKind::Value;
         };
@@ -317,6 +321,11 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
             }
         }
         FieldAccessKind::Value
+    }
+
+    fn tail_needs_mut(&self, tail: &[Step]) -> bool {
+        tail.iter()
+            .any(|step| matches!(step, Step::Method(_, _, true)))
     }
 
     /// Return: (base, field, tail)
@@ -343,6 +352,22 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
                 tail.push(Step::Index(pprust::expr_to_string(index)));
                 Some((base_s, field_name, tail))
             }
+            ExprKind::MethodCall(call) => {
+                let (base_s, field_name, mut tail) = self.chain(&call.receiver)?;
+                let args = call
+                    .args
+                    .iter()
+                    .map(|arg| pprust::expr_to_string(arg))
+                    .collect();
+                let receiver_mut =
+                    self.infer_field_access_kind(&call.receiver, false) == FieldAccessKind::MutRef;
+                tail.push(Step::Method(
+                    call.seg.ident.name.as_str().to_string(),
+                    args,
+                    receiver_mut,
+                ));
+                Some((base_s, field_name, tail))
+            }
             ExprKind::Paren(inner) => self.chain(inner),
             _ => None,
         }
@@ -361,6 +386,13 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
                     s.push('[');
                     s.push_str(index);
                     s.push(']');
+                }
+                Step::Method(name, args, _) => {
+                    s.push('.');
+                    s.push_str(name);
+                    s.push('(');
+                    s.push_str(&args.join(", "));
+                    s.push(')');
                 }
             }
         }
@@ -385,7 +417,7 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
             None
         };
         let field_access_kind = if matches!(expr.kind, ExprKind::Field(_, _)) {
-            Some(self.infer_field_access_kind(expr))
+            Some(self.infer_field_access_kind(expr, false))
         } else {
             None
         };
@@ -524,7 +556,7 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
             let access_s = self.access(
                 &base_s,
                 &field_name,
-                self.infer_field_access_kind(expr),
+                self.infer_field_access_kind(expr, self.tail_needs_mut(&tail)),
                 &tail,
             );
             *expr = utils::expr!("{}", access_s);
