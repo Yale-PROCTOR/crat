@@ -261,6 +261,12 @@ enum FieldAccessKind {
     MutRef,
 }
 
+#[derive(Debug, Clone)]
+enum Step {
+    Field(String),
+    Index(String),
+}
+
 impl<'tcx> UnionUseRewriteVisitor<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, ast_to_hir: AstToHir, target_unions: &[LocalDefId]) -> Self {
         let target_unions = target_unions.iter().copied().collect();
@@ -312,12 +318,74 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
         }
         FieldAccessKind::Value
     }
+
+    /// Return: (base, field, tail)
+    /// - base: union struct expression
+    /// - field: field projection
+    /// - tail: rest of the projections
+    fn chain(&self, expr: &Expr) -> Option<(String, String, Vec<Step>)> {
+        match &expr.kind {
+            ExprKind::Field(base, field_ident) => {
+                if self.is_target_union_expr(base) {
+                    Some((
+                        pprust::expr_to_string(base),
+                        field_ident.name.as_str().to_string(),
+                        Vec::new(),
+                    ))
+                } else {
+                    let (base_s, field_name, mut tail) = self.chain(base)?;
+                    tail.push(Step::Field(field_ident.name.as_str().to_string()));
+                    Some((base_s, field_name, tail))
+                }
+            }
+            ExprKind::Index(base, index, _) => {
+                let (base_s, field_name, mut tail) = self.chain(base)?;
+                tail.push(Step::Index(pprust::expr_to_string(index)));
+                Some((base_s, field_name, tail))
+            }
+            ExprKind::Paren(inner) => self.chain(inner),
+            _ => None,
+        }
+    }
+
+    /// Tail to string
+    fn tail(&self, tail: &[Step]) -> String {
+        let mut s = String::new();
+        for step in tail {
+            match step {
+                Step::Field(name) => {
+                    s.push('.');
+                    s.push_str(name);
+                }
+                Step::Index(index) => {
+                    s.push('[');
+                    s.push_str(index);
+                    s.push(']');
+                }
+            }
+        }
+        s
+    }
+
+    fn access(&self, base: &str, field: &str, kind: FieldAccessKind, tail: &[Step]) -> String {
+        let head = match kind {
+            FieldAccessKind::Value => format!("{base}.get_{field}()"),
+            FieldAccessKind::Ref => format!("{base}.get_{field}_ref()"),
+            FieldAccessKind::MutRef => format!("{base}.get_{field}_mut()"),
+        };
+        format!("{}{}", head, self.tail(tail))
+    }
 }
 
 impl MutVisitor for UnionUseRewriteVisitor<'_> {
     fn visit_expr(&mut self, expr: &mut Expr) {
-        let struct_target_union_ty_s = if matches!(expr.kind, ExprKind::Struct(_)) {
+        let target_union = if matches!(expr.kind, ExprKind::Struct(_)) {
             self.target_union_ty_string(expr)
+        } else {
+            None
+        };
+        let field_access_kind = if matches!(expr.kind, ExprKind::Field(_, _)) {
+            Some(self.infer_field_access_kind(expr))
         } else {
             None
         };
@@ -332,7 +400,7 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
                 }
 
                 // U { f: v } -> U::new_f(v)
-                if let Some(union_ty_s) = struct_target_union_ty_s
+                if let Some(union_ty_s) = target_union
                     && se.fields.len() == 1
                     && matches!(se.rest, rustc_ast::StructRest::None)
                 {
@@ -343,32 +411,67 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
                 }
                 return;
             }
-            ExprKind::AddrOf(borrow_kind, mutability, inner) => {
-                if matches!(borrow_kind, rustc_ast::BorrowKind::Ref)
-                    && matches!(mutability, rustc_ast::Mutability::Mut)
-                    && let ExprKind::Field(base, field_ident) = &mut inner.kind
-                {
-                    self.visit_expr(base);
-                    if self.is_target_union_expr(base) {
-                        let base_s = pprust::expr_to_string(base);
-                        *expr = utils::expr!("{}.get_{}_mut()", base_s, field_ident.name);
-                        return;
-                    }
-                }
+            ExprKind::Field(base, field_ident) => {
+                let target_union = if matches!(base.kind, ExprKind::Struct(_)) {
+                    self.target_union_ty_string(base)
+                } else {
+                    None
+                };
 
-                if matches!(borrow_kind, rustc_ast::BorrowKind::Ref)
-                    && matches!(mutability, rustc_ast::Mutability::Not)
-                    && let ExprKind::Field(base, field_ident) = &mut inner.kind
+                if let Some(union_ty_s) = target_union
+                    && let ExprKind::Struct(se) = &mut base.kind
                 {
-                    self.visit_expr(base);
-                    if self.is_target_union_expr(base) {
-                        let base_s = pprust::expr_to_string(base);
-                        *expr = utils::expr!("{}.get_{}_ref()", base_s, field_ident.name);
+                    for field in &mut se.fields {
+                        self.visit_expr(&mut field.expr);
+                    }
+                    if let rustc_ast::StructRest::Base(rest) = &mut se.rest {
+                        self.visit_expr(rest);
+                    }
+
+                    if se.fields.len() == 1 && matches!(se.rest, rustc_ast::StructRest::None) {
+                        let init = &se.fields[0];
+                        let init_name = init.ident.name;
+                        let value_s = pprust::expr_to_string(&init.expr);
+                        let new_s = format!("{union_ty_s}::new_{init_name}({value_s})");
+                        let access_s = match field_access_kind.unwrap() {
+                            FieldAccessKind::Value => {
+                                format!("{new_s}.get_{}()", field_ident.name)
+                            }
+                            FieldAccessKind::Ref => {
+                                format!("{new_s}.get_{}_ref()", field_ident.name)
+                            }
+                            FieldAccessKind::MutRef => {
+                                format!("{new_s}.get_{}_mut()", field_ident.name)
+                            }
+                        };
+                        *expr = utils::expr!("{}", access_s);
                         return;
                     }
                 }
 
                 mut_visit::walk_expr(self, expr);
+            }
+            ExprKind::AddrOf(borrow_kind, mutability, inner) => {
+                // &u.f or &mut u.f -> u.get_f_ref() or u.get_f_mut()
+                if matches!(borrow_kind, rustc_ast::BorrowKind::Ref)
+                    && let Some((base_s, field_name, tail)) = self.chain(inner)
+                {
+                    let access_s = if matches!(mutability, rustc_ast::Mutability::Mut) {
+                        self.access(&base_s, &field_name, FieldAccessKind::MutRef, &tail)
+                    } else {
+                        self.access(&base_s, &field_name, FieldAccessKind::Ref, &tail)
+                    };
+                    if tail.is_empty() {
+                        *expr = utils::expr!("{}", access_s);
+                    } else if matches!(mutability, rustc_ast::Mutability::Mut) {
+                        *expr = utils::expr!("&mut {}", access_s);
+                    } else {
+                        *expr = utils::expr!("&{}", access_s);
+                    }
+                    return;
+                }
+
+                self.visit_expr(inner);
                 return;
             }
             ExprKind::Assign(lhs, rhs, _) => {
@@ -377,29 +480,18 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
                 self.visit_expr(lhs);
                 self.assign_lhs_depth -= 1;
 
-                if let ExprKind::Field(base, field_ident) = &lhs.kind
-                    && self.is_target_union_expr(base)
-                {
-                    let base_s = pprust::expr_to_string(base);
+                if let Some((base_s, field_name, tail)) = self.chain(lhs) {
                     let rhs_s = pprust::expr_to_string(rhs);
-                    *expr = utils::expr!("{}.set_{}({})", base_s, field_ident.name, rhs_s);
+                    // u.f = v -> u.set_f(v)
+                    if tail.is_empty() {
+                        *expr = utils::expr!("{}.set_{}({})", base_s, field_name, rhs_s);
+                    } else {
+                        // u.f.g = v or u.f[i] = v -> u.get_f_mut().g = v or u.get_f_mut()[i] = v
+                        let lhs_s =
+                            self.access(&base_s, &field_name, FieldAccessKind::MutRef, &tail);
+                        *expr = utils::expr!("{} = {}", lhs_s, rhs_s);
+                    }
                     return;
-                }
-
-                if let ExprKind::Index(lhs_base, index, _) = &lhs.kind
-                    && let ExprKind::Field(base, field_ident) = &lhs_base.kind
-                    && self.is_target_union_expr(base)
-                {
-                    let base_s = pprust::expr_to_string(base);
-                    let idx_s = pprust::expr_to_string(index);
-                    let rhs_s = pprust::expr_to_string(rhs);
-                    *expr = utils::expr!(
-                        "{}.get_{}_mut()[{}] = {}",
-                        base_s,
-                        field_ident.name,
-                        idx_s,
-                        rhs_s
-                    );
                 }
                 return;
             }
@@ -409,39 +501,16 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
                 self.visit_expr(lhs);
                 self.assign_lhs_depth -= 1;
 
-                if let ExprKind::Field(base, field_ident) = &lhs.kind
-                    && self.is_target_union_expr(base)
-                {
-                    let base_s = pprust::expr_to_string(base);
+                if let Some((base_s, field_name, tail)) = self.chain(lhs) {
                     let rhs_s = pprust::expr_to_string(rhs);
-                    *expr = utils::expr!(
-                        "*{}.get_{}_mut() {} {}",
-                        base_s,
-                        field_ident.name,
-                        op.node.as_str(),
-                        rhs_s
-                    );
+                    let lhs_s = self.access(&base_s, &field_name, FieldAccessKind::MutRef, &tail);
+                    if tail.is_empty() {
+                        *expr = utils::expr!("*{} {} {}", lhs_s, op.node.as_str(), rhs_s);
+                    } else {
+                        *expr = utils::expr!("{} {} {}", lhs_s, op.node.as_str(), rhs_s);
+                    }
                     return;
                 }
-
-                if let ExprKind::Index(lhs_base, index, _) = &lhs.kind
-                    && let ExprKind::Field(base, field_ident) = &lhs_base.kind
-                    && self.is_target_union_expr(base)
-                {
-                    let base_s = pprust::expr_to_string(base);
-                    let idx_s = pprust::expr_to_string(index);
-                    let rhs_s = pprust::expr_to_string(rhs);
-                    *expr = utils::expr!(
-                        "{}.get_{}_mut()[{}] {} {}",
-                        base_s,
-                        field_ident.name,
-                        idx_s,
-                        op.node.as_str(),
-                        rhs_s
-                    );
-                    return;
-                }
-
                 return;
             }
             _ => mut_visit::walk_expr(self, expr),
@@ -451,21 +520,14 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
             return;
         }
 
-        if let ExprKind::Field(base, field_ident) = &expr.kind
-            && self.is_target_union_expr(base)
-        {
-            let base_s = pprust::expr_to_string(base);
-            match self.infer_field_access_kind(expr) {
-                FieldAccessKind::Value => {
-                    *expr = utils::expr!("{}.get_{}()", base_s, field_ident.name);
-                }
-                FieldAccessKind::Ref => {
-                    *expr = utils::expr!("{}.get_{}_ref()", base_s, field_ident.name);
-                }
-                FieldAccessKind::MutRef => {
-                    *expr = utils::expr!("{}.get_{}_mut()", base_s, field_ident.name);
-                }
-            }
+        if let Some((base_s, field_name, tail)) = self.chain(expr) {
+            let access_s = self.access(
+                &base_s,
+                &field_name,
+                self.infer_field_access_kind(expr),
+                &tail,
+            );
+            *expr = utils::expr!("{}", access_s);
         }
     }
 }
