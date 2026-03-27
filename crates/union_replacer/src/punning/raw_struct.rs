@@ -328,6 +328,24 @@ impl<'tcx> UnionUseRewriteVisitor<'tcx> {
             .any(|step| matches!(step, Step::Method(_, _, true)))
     }
 
+    fn method_needs_mut(&self, expr: &Expr) -> bool {
+        let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+            return false;
+        };
+        let owner = hir_expr.hir_id.owner.def_id;
+        let typeck = self.tcx.typeck(owner);
+        let Some(def_id) = typeck.type_dependent_def_id(hir_expr.hir_id) else {
+            return false;
+        };
+
+        let sig = self.tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+        let Some(receiver_ty) = sig.inputs().first().copied() else {
+            return false;
+        };
+
+        matches!(receiver_ty.kind(), TyKind::Ref(_, _, mutbl) if mutbl.is_mut())
+    }
+
     /// Return: (base, field, tail)
     /// - base: union struct expression
     /// - field: field projection
@@ -421,6 +439,11 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
         } else {
             None
         };
+        let method_needs_mut = if matches!(expr.kind, ExprKind::MethodCall(_)) {
+            self.method_needs_mut(expr)
+        } else {
+            false
+        };
 
         match &mut expr.kind {
             ExprKind::Struct(se) => {
@@ -506,6 +529,22 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
                 self.visit_expr(inner);
                 return;
             }
+            ExprKind::MethodCall(call) => {
+                for arg in &mut call.args {
+                    self.visit_expr(arg);
+                }
+                if let Some((base_s, field_name, tail)) = self.chain(&call.receiver) {
+                    let kind = self.infer_field_access_kind(
+                        &call.receiver,
+                        method_needs_mut || self.tail_needs_mut(&tail),
+                    );
+                    let access_s = self.access(&base_s, &field_name, kind, &tail);
+                    call.receiver = Box::new(utils::expr!("{}", access_s));
+                } else {
+                    self.visit_expr(&mut call.receiver);
+                }
+                return;
+            }
             ExprKind::Assign(lhs, rhs, _) => {
                 self.visit_expr(rhs);
                 self.assign_lhs_depth += 1;
@@ -556,7 +595,7 @@ impl MutVisitor for UnionUseRewriteVisitor<'_> {
             let access_s = self.access(
                 &base_s,
                 &field_name,
-                self.infer_field_access_kind(expr, self.tail_needs_mut(&tail)),
+                self.infer_field_access_kind(expr, method_needs_mut || self.tail_needs_mut(&tail)),
                 &tail,
             );
             *expr = utils::expr!("{}", access_s);

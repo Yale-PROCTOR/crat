@@ -124,7 +124,7 @@ pub fn lookup_fn_model(tcx: TyCtxt<'_>, callee: DefId) -> Option<FnModel> {
             Some(FnModel {
                 arg_effects: &[read_effect!(0, 1)],
                 copy_effects: &[],
-            ret_alias: None,
+                ret_alias: None,
             })
         }
         "strstr" => Some(FnModel {
