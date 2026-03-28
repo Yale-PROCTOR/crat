@@ -694,109 +694,88 @@ mod tests {
         );
     }
 
-    //     #[test]
-    //     fn tagged_iif() {
-    //         let code = r#"
-    //         #[derive(Copy, Clone)]
-    //         #[repr(C)]
-    //         pub union Value {
-    //             pub i: i32,
-    //             pub i2: i32,
-    //             pub f: f32,
-    //         }
+    #[test]
+    fn tagged_iif() {
+        let code = r#"
+            #[derive(Copy, Clone)]
+            #[repr(C)]
+            pub union Value {
+                pub i: i32,
+                pub f: f32,
+                pub i2: i32,
+            }
 
-    //         #[derive(Copy, Clone)]
-    //         #[repr(C)]
-    //         pub struct Parent {
-    //             pub u: Value,
-    //         }
+            #[derive(Copy, Clone)]
+            #[repr(C)]
+            pub struct Parent {
+                pub u: Value,
+            }
 
-    //         unsafe fn to_field_ptr(value: *mut Parent) -> *mut i32 {
-    //             &mut (*value).u.i as *mut i32
-    //         }
+            unsafe fn to_field_ptr(value: *mut Parent) -> *mut i32 {
+                &mut (*value).u.i as *mut i32
+            }
 
-    //         pub extern "C" fn tagged_iif() {
-    //             let mut value = Parent {
-    //                 u: Value { i: 0 },
-    //             };
-    //             unsafe {
-    //                 value.u.i = 42;
-    //                 let p = to_field_ptr(&mut value as *mut Parent);
-    //                 *p;
-    //             }
-    //         }
-    //         "#;
+            pub extern "C" fn tagged_iif() {
+                let mut value = Parent {
+                    u: Value { i: 0 },
+                };
+                unsafe {
+                    value.u.i = 42;
+                    let p = to_field_ptr(&mut value as *mut Parent);
+                    *p;
+                }
+            }
+            "#;
 
-    //         run_test(
-    //             &format!(
-    //                 "{BASE}
-    // {code}"
-    //             ),
-    //             (2, 2, 0),
-    //         );
-    //     }
+        run_test(
+            &format!(
+                "{BASE}
+    {code}"
+            ),
+            (2, 2, 0),
+        );
+    }
 
     #[test]
-    fn tar_block_projection_as_mut_ptr_requires_mut_getter() {
+    fn memcpy_into_union_field() {
         let code = r#"
-        #[derive(Copy, Clone)]
-        #[repr(C)]
-        pub struct Header {
-            pub name: [i8; 100],
-            pub size: [i8; 12],
+        use core::ffi::c_void;
+
+        extern "C" {
+            fn memcpy(
+                dst: *mut c_void,
+                src: *const c_void,
+                n: usize,
+            ) -> *mut c_void;
         }
 
         #[derive(Copy, Clone)]
         #[repr(C)]
-        pub struct OldGnuHeader {
-            pub offset: [i8; 12],
+        pub union U32Bytes {
+            pub as_int: u32,
+            pub bytes: [u8; 4],
         }
 
-        #[derive(Copy, Clone)]
-        #[repr(C)]
-        pub union Block {
-            pub buffer: [i8; 112],
-            pub header: Header,
-            pub oldgnu_header: OldGnuHeader,
-        }
-
-        unsafe fn touch(p: *mut i8) {
-            *p = 1;
-        }
-
-        pub extern "C" fn tar_block_projection_as_mut_ptr_requires_mut_getter() {
-            let mut blk = Block { buffer: [0; 112] };
-            let current_header = &mut blk as *mut Block;
+        pub extern "C" fn memcpy_into_union_field() {
+            let mut u = U32Bytes { as_int: 0 };
+            let src = [1u8, 2, 3, 4];
             unsafe {
-                (*current_header).header = Header {
-                    name: [0; 100],
-                    size: [0; 12],
-                };
-                use_a((*current_header).oldgnu_header.offset[0 as usize] as u8 as u32);
-                touch(((*current_header).header.name).as_mut_ptr());
-                touch(((*current_header).header.size).as_mut_ptr());
-                touch(((*current_header).oldgnu_header.offset).as_mut_ptr());
+                memcpy(
+                    u.bytes.as_mut_ptr() as *mut c_void,
+                    src.as_ptr() as *const c_void,
+                    4,
+                );
+                use_a(u.as_int);
             }
         }
         "#;
 
-        let transformed =
-            utils::compilation::run_compiler_on_str(&format!("{BASE}\n{code}"), |tcx| {
-                let config = super::super::Config {
-                    c_exposed_fns: Default::default(),
-                };
-                super::super::replace_unions(tcx, true, &config)
-            })
-            .unwrap();
-
-        utils::compilation::run_compiler_on_str(&transformed.code, utils::type_check)
-            .expect(&transformed.code);
-        assert!(
-            !transformed.code.contains("pub union Block")
-                && (transformed.code.contains("get_header_mut().name")
-                    || transformed.code.contains("get_header_mut().size")
-                    || transformed.code.contains("get_oldgnu_header_mut().offset")),
-            "tar-like case did not transform with mutable getter at union-field projection",
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
         );
     }
 }

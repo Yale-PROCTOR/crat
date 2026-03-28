@@ -113,24 +113,14 @@ pub fn print_reaching_writes<'tcx>(
         println!("\t{}:", tcx.def_path_str(union_ty));
 
         for instance in type_uses.instances.keys() {
-            println!(
-                "\t\tInstance L{}..=L{}:",
-                instance.root.index(),
-                instance.end.index()
-            );
-
             let Some(reaching) = type_result.instances.get(instance) else {
-                println!("\t\t\t(no reads)");
                 continue;
             };
 
             let reads = reaching.iter().collect::<Vec<_>>();
-
             if reads.is_empty() {
-                println!("\t\t\t(no reads)");
                 continue;
             }
-
             for (read, writes) in reads {
                 let read_field = format_access(tcx, union_ty, read);
                 let read_fields = read.field.to_fields(tcx, union_ty);

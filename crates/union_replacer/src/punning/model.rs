@@ -184,6 +184,11 @@ pub fn lookup_fn_model(tcx: TyCtxt<'_>, callee: DefId) -> Option<FnModel> {
             copy_effects: &[],
             ret_alias: None,
         }),
+        "ioctl" => Some(FnModel {
+            arg_effects: &[write_effect!(2, 1)],
+            copy_effects: &[],
+            ret_alias: None,
+        }),
         "write" | "tape_buffered_write" => Some(FnModel {
             arg_effects: &[read_effect!(1, 1)],
             copy_effects: &[],

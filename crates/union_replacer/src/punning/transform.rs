@@ -36,7 +36,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // for debug
     let print_mir = false;
-    let print_reaching_write = false;
+    let print_reaching_write = true;
     let verbose_debug = false;
     let print_result = true;
 
