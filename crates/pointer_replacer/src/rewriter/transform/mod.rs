@@ -6617,6 +6617,7 @@ mod tests {
     use super::*;
     use crate::{
         analyses::{self, mir_variable_grouping::SourceVarGroups},
+        rewriter::{replace_local_borrows, Config},
         utils::rustc::RustProgram,
     };
 
@@ -6945,6 +6946,159 @@ mod tests {
         scalar_rejection_hint: Option<&'static str>,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SafetyAllocKind {
+        Scalar,
+        Array,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SafetySiteShape {
+        DirectLocalRoot,
+        AllocatorWrapperPrincipalLocal,
+        NonOutermostLocalRoot,
+    }
+
+    #[derive(Clone, Debug)]
+    struct TrackedSemanticAllocSite {
+        hir_id: HirId,
+        fn_name: String,
+        binding_name: String,
+        rhs_snippet: String,
+        kind: SafetyAllocKind,
+        outermost: bool,
+        shape: SafetySiteShape,
+        deref_count: usize,
+        free_count: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct SplitKindCounts {
+        scalar: usize,
+        array: usize,
+    }
+
+    impl SplitKindCounts {
+        fn bump(&mut self, kind: SafetyAllocKind) {
+            self.bump_by(kind, 1);
+        }
+
+        fn bump_by(&mut self, kind: SafetyAllocKind, amount: usize) {
+            match kind {
+                SafetyAllocKind::Scalar => self.scalar += amount,
+                SafetyAllocKind::Array => self.array += amount,
+            }
+        }
+
+        fn total(self) -> usize {
+            self.scalar + self.array
+        }
+    }
+
+    impl std::ops::AddAssign for SplitKindCounts {
+        fn add_assign(&mut self, rhs: Self) {
+            self.scalar += rhs.scalar;
+            self.array += rhs.array;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct SafetyBeforeStats {
+        allocation_sites: SplitKindCounts,
+        dereferences: SplitKindCounts,
+        frees: SplitKindCounts,
+    }
+
+    impl SafetyBeforeStats {
+        fn record_site(&mut self, site: &TrackedSemanticAllocSite) {
+            self.allocation_sites.bump(site.kind);
+            self.dereferences.bump_by(site.kind, site.deref_count);
+            self.frees.bump_by(site.kind, site.free_count);
+        }
+    }
+
+    impl std::ops::AddAssign for SafetyBeforeStats {
+        fn add_assign(&mut self, rhs: Self) {
+            self.allocation_sites += rhs.allocation_sites;
+            self.dereferences += rhs.dereferences;
+            self.frees += rhs.frees;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct BridgeCallCounts {
+        leak: usize,
+        from_raw: usize,
+        into_raw: usize,
+    }
+
+    impl std::ops::AddAssign for BridgeCallCounts {
+        fn add_assign(&mut self, rhs: Self) {
+            self.leak += rhs.leak;
+            self.from_raw += rhs.from_raw;
+            self.into_raw += rhs.into_raw;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct RewrittenUnsafeStats {
+        dereferences: usize,
+        frees: usize,
+        bridge_calls: BridgeCallCounts,
+    }
+
+    impl std::ops::AddAssign for RewrittenUnsafeStats {
+        fn add_assign(&mut self, rhs: Self) {
+            self.dereferences += rhs.dereferences;
+            self.frees += rhs.frees;
+            self.bridge_calls += rhs.bridge_calls;
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct OutermostReasonRecord {
+        reason: &'static str,
+        example: String,
+        usage_subreasons: Vec<&'static str>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PointerSafetyProjectRecord {
+        project: String,
+        before_total: SafetyBeforeStats,
+        before_outermost: SafetyBeforeStats,
+        safe_box_sites: SplitKindCounts,
+        after: RewrittenUnsafeStats,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PointerSafetyAnalysisResult {
+        before_total: SafetyBeforeStats,
+        before_outermost: SafetyBeforeStats,
+        safe_box_sites: SplitKindCounts,
+        tracked_sites: Vec<TrackedSemanticAllocSite>,
+        outermost_reasons: Vec<OutermostReasonRecord>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TrackedBindingSpecs {
+        by_fn: FxHashMap<String, FxHashSet<String>>,
+    }
+
+    fn hir_is_direct_allocator_root(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+        let Some(name) = hir_call_name(expr) else {
+            return false;
+        };
+        match (name, hir_unwrap_casts(expr).kind) {
+            (name, hir::ExprKind::Call(_, _)) if name == Symbol::intern("malloc") => true,
+            (name, hir::ExprKind::Call(_, _)) if name == Symbol::intern("calloc") => true,
+            (name, hir::ExprKind::Call(_, args)) if name == Symbol::intern("realloc") => {
+                matches!(args, [ptr, _] if hir_is_null_like_ptr_arg(tcx, ptr))
+            }
+            _ => false,
+        }
+    }
+
     fn hir_is_direct_malloc_or_calloc(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
         matches!(
             hir_call_name(expr),
@@ -6962,6 +7116,587 @@ mod tests {
             .ok()
             .map(|snippet| snippet.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|| "<snippet unavailable>".to_string())
+    }
+
+    fn classify_semantic_allocator_kind<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs: &'tcx hir::Expr<'tcx>,
+    ) -> SafetyAllocKind {
+        if hir_supports_scalar_box_allocator_root(tcx, lhs_inner_ty, rhs)
+            || matches!(
+                hir_raw_bridge_info(tcx, lhs_inner_ty, rhs, None, None),
+                Some(RawBridgeInfo::Scalar)
+            )
+        {
+            SafetyAllocKind::Scalar
+        } else {
+            SafetyAllocKind::Array
+        }
+    }
+
+    fn root_of_raw_expr(
+        expr: &hir::Expr<'_>,
+        root_of_local: &FxHashMap<HirId, HirId>,
+    ) -> Option<HirId> {
+        let expr = hir_unwrap_casts(expr);
+        match expr.kind {
+            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                let hir::def::Res::Local(hir_id) = path.res else {
+                    return None;
+                };
+                root_of_local.get(&hir_id).copied()
+            }
+            hir::ExprKind::MethodCall(seg, receiver, _, _)
+                if matches!(
+                    seg.ident.name.as_str(),
+                    "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
+                ) =>
+            {
+                root_of_raw_expr(receiver, root_of_local)
+            }
+            _ => None,
+        }
+    }
+
+    fn unwrap_body_tail<'tcx>(mut expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+        while let hir::ExprKind::Block(block, _) = expr.kind {
+            let Some(tail) = block.expr else {
+                break;
+            };
+            expr = tail;
+        }
+        expr
+    }
+
+    fn box_bridge_call_kind(expr: &hir::Expr<'_>) -> Option<&'static str> {
+        let hir::ExprKind::Call(callee, _) = hir_unwrap_casts(expr).kind else {
+            return None;
+        };
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(callee).kind
+        else {
+            return None;
+        };
+        let segments = &path.segments;
+        if segments.len() < 2 {
+            return None;
+        }
+        let owner = segments[segments.len() - 2].ident.name.as_str();
+        let method = segments[segments.len() - 1].ident.name.as_str();
+        if owner != "Box" {
+            return None;
+        }
+        match method {
+            "leak" => Some("leak"),
+            "from_raw" => Some("from_raw"),
+            "into_raw" => Some("into_raw"),
+            _ => None,
+        }
+    }
+
+    fn bridge_call_counts_from_source(source: &str) -> BridgeCallCounts {
+        BridgeCallCounts {
+            leak: source.matches("Box::leak(").count(),
+            from_raw: source.matches("Box::from_raw(").count(),
+            into_raw: source.matches("Box::into_raw(").count(),
+        }
+    }
+
+    fn tracked_binding_specs_from_sites(sites: &[TrackedSemanticAllocSite]) -> TrackedBindingSpecs {
+        let mut specs = TrackedBindingSpecs::default();
+        for site in sites {
+            specs
+                .by_fn
+                .entry(site.fn_name.clone())
+                .or_default()
+                .insert(site.binding_name.clone());
+        }
+        specs
+    }
+
+    fn collect_rewritten_tracked_unsafe_stats(
+        tcx: TyCtxt<'_>,
+        tracked_bindings: &TrackedBindingSpecs,
+    ) -> RewrittenUnsafeStats {
+        struct Visitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+            tracked_bindings: &'a FxHashSet<String>,
+            free_like_wrappers: &'a FxHashSet<LocalDefId>,
+            root_of_local: FxHashMap<HirId, HirId>,
+            stats: RewrittenUnsafeStats,
+        }
+
+        impl<'a, 'tcx> Visitor<'a, 'tcx> {
+            fn maybe_seed_tracked_binding(&mut self, hir_id: HirId) {
+                if !self.typeck.node_type(hir_id).is_raw_ptr() {
+                    return;
+                }
+                let binding_name = self.tcx.hir_name(hir_id).to_string();
+                if self.tracked_bindings.contains(&binding_name) {
+                    self.root_of_local.insert(hir_id, hir_id);
+                }
+            }
+
+            fn assign_or_clear_local_alias(
+                &mut self,
+                lhs_hir_id: HirId,
+                lhs_ty: ty::Ty<'tcx>,
+                rhs: &'tcx hir::Expr<'tcx>,
+            ) {
+                if !lhs_ty.is_raw_ptr() {
+                    return;
+                }
+                if let Some(root) = root_of_raw_expr(rhs, &self.root_of_local) {
+                    self.root_of_local.insert(lhs_hir_id, root);
+                } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                    self.root_of_local.remove(&lhs_hir_id);
+                }
+            }
+        }
+
+        impl<'tcx> hir::intravisit::Visitor<'tcx> for Visitor<'_, 'tcx> {
+            type NestedFilter = OnlyBodies;
+
+            fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                self.tcx
+            }
+
+            fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+                if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                    && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                {
+                    self.maybe_seed_tracked_binding(hir_id);
+                    if let Some(init) = let_stmt.init {
+                        let lhs_ty = self.typeck.node_type(hir_id);
+                        self.assign_or_clear_local_alias(hir_id, lhs_ty, init);
+                    }
+                }
+                hir::intravisit::walk_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let Some(kind) = box_bridge_call_kind(expr) {
+                    match kind {
+                        "leak" => self.stats.bridge_calls.leak += 1,
+                        "from_raw" => self.stats.bridge_calls.from_raw += 1,
+                        "into_raw" => self.stats.bridge_calls.into_raw += 1,
+                        _ => {}
+                    }
+                }
+
+                if let hir::ExprKind::Unary(hir::UnOp::Deref, inner) = expr.kind
+                    && self.tcx.typeck(expr.hir_id.owner).expr_ty(inner).is_raw_ptr()
+                    && root_of_raw_expr(inner, &self.root_of_local).is_some()
+                {
+                    self.stats.dereferences += 1;
+                }
+
+                if let hir::ExprKind::Call(_, args) = expr.kind
+                    && args.len() == 1
+                    && (hir_call_matches_foreign_name(self.tcx, expr, "free")
+                        || hir_called_local_fn(self.tcx, expr)
+                            .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id)))
+                    && self.tcx.typeck(expr.hir_id.owner).expr_ty(&args[0]).is_raw_ptr()
+                    && root_of_raw_expr(&args[0], &self.root_of_local).is_some()
+                {
+                    self.stats.frees += 1;
+                }
+
+                if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                    && let hir::def::Res::Local(lhs_hir_id) = path.res
+                {
+                    let lhs_ty = self.typeck.expr_ty(lhs);
+                    self.assign_or_clear_local_alias(lhs_hir_id, lhs_ty, rhs);
+                }
+
+                hir::intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let free_like_wrappers = collect_local_free_wrappers(tcx);
+        let mut stats = RewrittenUnsafeStats::default();
+        let crate_hir = tcx.hir_crate(());
+        for maybe_owner in crate_hir.owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let hir::OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            let hir::ItemKind::Fn { body, .. } = item.kind else {
+                continue;
+            };
+            let fn_name = tcx.item_name(item.owner_id.def_id.to_def_id()).to_string();
+            let Some(fn_tracked_bindings) = tracked_bindings.by_fn.get(&fn_name) else {
+                continue;
+            };
+            let mut visitor = Visitor {
+                tcx,
+                typeck: tcx.typeck(item.owner_id.def_id),
+                tracked_bindings: fn_tracked_bindings,
+                free_like_wrappers: &free_like_wrappers,
+                root_of_local: FxHashMap::default(),
+                stats: RewrittenUnsafeStats::default(),
+            };
+            visitor.visit_body(tcx.hir_body(body));
+            stats += visitor.stats;
+        }
+        stats
+    }
+
+    fn analyze_local_allocator_roots(
+        tcx: TyCtxt<'_>,
+        did: LocalDefId,
+        alloc_wrappers: &FxHashMap<LocalDefId, AllocWrapperInfo>,
+        free_like_wrappers: &FxHashSet<LocalDefId>,
+    ) -> Vec<TrackedSemanticAllocSite> {
+        #[derive(Clone, Debug)]
+        struct RootState {
+            site: TrackedSemanticAllocSite,
+            stored_to_projection: bool,
+            returned: bool,
+        }
+
+        struct Visitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            did: LocalDefId,
+            typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+            free_like_wrappers: &'a FxHashSet<LocalDefId>,
+            root_of_local: FxHashMap<HirId, HirId>,
+            states: FxHashMap<HirId, RootState>,
+        }
+
+        impl<'a, 'tcx> Visitor<'a, 'tcx> {
+            fn register_root(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>, lhs_ty: ty::Ty<'tcx>) {
+                let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                    return;
+                };
+                let state = RootState {
+                    site: TrackedSemanticAllocSite {
+                        hir_id,
+                        fn_name: self
+                            .tcx
+                            .item_name(self.did.to_def_id())
+                            .to_string(),
+                        binding_name: self.tcx.hir_name(hir_id).to_string(),
+                        rhs_snippet: normalized_hir_snippet(self.tcx, rhs),
+                        kind: classify_semantic_allocator_kind(self.tcx, lhs_inner_ty, rhs),
+                        outermost: false,
+                        shape: SafetySiteShape::NonOutermostLocalRoot,
+                        deref_count: 0,
+                        free_count: 0,
+                    },
+                    stored_to_projection: false,
+                    returned: false,
+                };
+                self.root_of_local.insert(hir_id, hir_id);
+                self.states.insert(hir_id, state);
+            }
+
+            fn assign_or_clear_local_alias(
+                &mut self,
+                lhs_hir_id: HirId,
+                lhs_ty: ty::Ty<'tcx>,
+                rhs: &'tcx hir::Expr<'tcx>,
+            ) {
+                if !lhs_ty.is_raw_ptr() {
+                    return;
+                }
+                if let Some(root) = root_of_raw_expr(rhs, &self.root_of_local) {
+                    self.root_of_local.insert(lhs_hir_id, root);
+                } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                    self.root_of_local.remove(&lhs_hir_id);
+                }
+            }
+
+            fn mark_projection_escape(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+                if let Some(root) = root_of_raw_expr(rhs, &self.root_of_local)
+                    && let Some(state) = self.states.get_mut(&root)
+                {
+                    state.stored_to_projection = true;
+                }
+            }
+
+            fn mark_returned(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                if let Some(root) = root_of_raw_expr(expr, &self.root_of_local)
+                    && let Some(state) = self.states.get_mut(&root)
+                {
+                    state.returned = true;
+                }
+            }
+
+            fn record_raw_deref(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                let hir::ExprKind::Unary(hir::UnOp::Deref, inner) = expr.kind else {
+                    return;
+                };
+                if !self.typeck.expr_ty(inner).is_raw_ptr() {
+                    return;
+                }
+                let Some(root) = root_of_raw_expr(inner, &self.root_of_local) else {
+                    return;
+                };
+                if let Some(state) = self.states.get_mut(&root) {
+                    state.site.deref_count += 1;
+                }
+            }
+
+            fn record_free_like_use(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                let hir::ExprKind::Call(_, args) = expr.kind else {
+                    return;
+                };
+                let [arg] = args else {
+                    return;
+                };
+                let is_free_like = hir_call_matches_foreign_name(self.tcx, expr, "free")
+                    || hir_called_local_fn(self.tcx, expr)
+                        .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id));
+                if !is_free_like {
+                    return;
+                }
+                let Some(root) = root_of_raw_expr(arg, &self.root_of_local) else {
+                    return;
+                };
+                if let Some(state) = self.states.get_mut(&root) {
+                    state.site.free_count += 1;
+                }
+            }
+        }
+
+        impl<'tcx> hir::intravisit::Visitor<'tcx> for Visitor<'_, 'tcx> {
+            type NestedFilter = OnlyBodies;
+
+            fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                self.tcx
+            }
+
+            fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+                if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                    && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                    && let Some(init) = let_stmt.init
+                {
+                    let lhs_ty = self.typeck.node_type(hir_id);
+                    if hir_is_direct_allocator_root(self.tcx, init) {
+                        self.register_root(hir_id, init, lhs_ty);
+                    } else {
+                        self.assign_or_clear_local_alias(hir_id, lhs_ty, init);
+                    }
+                }
+                hir::intravisit::walk_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                self.record_raw_deref(expr);
+                self.record_free_like_use(expr);
+
+                match expr.kind {
+                    hir::ExprKind::Assign(lhs, rhs, _) => {
+                        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                            && let hir::def::Res::Local(lhs_hir_id) = path.res
+                        {
+                            let lhs_ty = self.typeck.expr_ty(lhs);
+                            if hir_is_direct_allocator_root(self.tcx, rhs) {
+                                self.register_root(lhs_hir_id, rhs, lhs_ty);
+                            } else {
+                                self.assign_or_clear_local_alias(lhs_hir_id, lhs_ty, rhs);
+                            }
+                        } else {
+                            self.mark_projection_escape(rhs);
+                        }
+                    }
+                    hir::ExprKind::Ret(Some(ret)) => self.mark_returned(ret),
+                    _ => {}
+                }
+
+                hir::intravisit::walk_expr(self, expr);
+            }
+
+            fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
+                hir::intravisit::walk_body(self, body);
+                self.mark_returned(unwrap_body_tail(body.value));
+            }
+        }
+
+        let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+            return Vec::new();
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            return Vec::new();
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = Visitor {
+            tcx,
+            did,
+            typeck: tcx.typeck(did),
+            free_like_wrappers,
+            root_of_local: FxHashMap::default(),
+            states: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+
+        let wrapper_principal_root = if alloc_wrappers.contains_key(&did) {
+            visitor
+                .states
+                .iter()
+                .find_map(|(hir_id, state)| state.returned.then_some(*hir_id))
+        } else {
+            None
+        };
+
+        let mut sites = visitor
+            .states
+            .into_iter()
+            .map(|(hir_id, mut state)| {
+                if Some(hir_id) == wrapper_principal_root {
+                    state.site.outermost = true;
+                    state.site.shape = SafetySiteShape::AllocatorWrapperPrincipalLocal;
+                } else if alloc_wrappers.contains_key(&did) {
+                    state.site.outermost = false;
+                    state.site.shape = SafetySiteShape::NonOutermostLocalRoot;
+                } else if !state.stored_to_projection {
+                    state.site.outermost = true;
+                    state.site.shape = SafetySiteShape::DirectLocalRoot;
+                } else {
+                    state.site.outermost = false;
+                    state.site.shape = SafetySiteShape::NonOutermostLocalRoot;
+                }
+                state.site
+            })
+            .collect::<Vec<_>>();
+        sites.sort_by_key(|site| (site.fn_name.clone(), site.binding_name.clone()));
+        sites
+    }
+
+    fn collect_semantic_allocator_sites(
+        tcx: TyCtxt<'_>,
+        input: &RustProgram<'_>,
+    ) -> Vec<TrackedSemanticAllocSite> {
+        let alloc_wrappers = collect_local_allocator_wrappers(tcx);
+        let free_like_wrappers = collect_local_free_wrappers(tcx);
+        let mut sites = Vec::new();
+        for did in &input.functions {
+            sites.extend(analyze_local_allocator_roots(
+                tcx,
+                *did,
+                &alloc_wrappers,
+                &free_like_wrappers,
+            ));
+        }
+        sites
+    }
+
+    fn tracked_site_example(project: &str, site: &TrackedSemanticAllocSite) -> String {
+        format!(
+            "{project}::{}::{} => {}",
+            site.fn_name, site.binding_name, site.rhs_snippet
+        )
+    }
+
+    fn analyze_pointer_safety_for_program(
+        tcx: TyCtxt<'_>,
+        project: &str,
+    ) -> PointerSafetyAnalysisResult {
+        let (input, analysis) = build_analysis(tcx);
+        let tracked_sites = collect_semantic_allocator_sites(tcx, &input);
+        let initial_ptr_kinds = collect_diffs(&input, &analysis);
+        let (_sig_decs, final_ptr_kinds, reason_map, usage_subreason_map) =
+            simulate_transform_reasons(tcx, &input, &analysis);
+
+        let mut before_total = SafetyBeforeStats::default();
+        let mut before_outermost = SafetyBeforeStats::default();
+        let mut safe_box_sites = SplitKindCounts::default();
+        let mut outermost_reasons = Vec::new();
+
+        let mir_local_maps = input
+            .functions
+            .iter()
+            .map(|did| (*did, utils::ir::map_thir_to_mir(*did, false, tcx)))
+            .collect::<FxHashMap<_, _>>();
+
+        for site in &tracked_sites {
+            before_total.record_site(site);
+            if site.outermost {
+                before_outermost.record_site(site);
+            }
+
+            if !site.outermost {
+                continue;
+            }
+
+            let final_kind = final_ptr_kinds.get(&site.hir_id).copied();
+            match final_kind {
+                Some(PtrKind::OptBox) => {
+                    safe_box_sites.bump(SafetyAllocKind::Scalar);
+                    continue;
+                }
+                Some(PtrKind::OptBoxedSlice) => {
+                    safe_box_sites.bump(SafetyAllocKind::Array);
+                    continue;
+                }
+                _ => {}
+            }
+
+            let initial_kind = initial_ptr_kinds.get(&site.hir_id).copied();
+            let reason = if matches!(initial_kind, Some(PtrKind::Raw(_))) {
+                let did = site.hir_id.owner.def_id;
+                let hir_to_mir = mir_local_maps
+                    .get(&did)
+                    .expect("expected THIR->MIR map for tracked site");
+                let local = *hir_to_mir
+                    .binding_to_local
+                    .get(&site.hir_id)
+                    .expect("expected tracked site local mapping");
+                let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                classify_initial_raw_reason(&analysis, did, local, &body.local_decls[local], tcx)
+            } else {
+                reason_map
+                    .get(&site.hir_id)
+                    .and_then(|reasons| reasons.first().copied())
+                    .unwrap_or("other")
+            };
+
+            outermost_reasons.push(OutermostReasonRecord {
+                reason,
+                example: tracked_site_example(project, site),
+                usage_subreasons: if reason == "unsupported_box_usage" {
+                    usage_subreason_map
+                        .get(&site.hir_id)
+                        .cloned()
+                        .unwrap_or_else(|| vec!["unknown_usage"])
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+
+        PointerSafetyAnalysisResult {
+            before_total,
+            before_outermost,
+            safe_box_sites,
+            tracked_sites,
+            outermost_reasons,
+        }
+    }
+
+    fn analyze_pointer_safety_for_code(code: &str) -> (PointerSafetyAnalysisResult, RewrittenUnsafeStats) {
+        let result = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            analyze_pointer_safety_for_program(tcx, "<snippet>")
+        })
+        .unwrap();
+        let tracked_bindings = tracked_binding_specs_from_sites(&result.tracked_sites);
+        let (rewritten, _) =
+            ::utils::compilation::run_compiler_on_str(code, |tcx| {
+                replace_local_borrows(&Config::default(), tcx)
+            })
+            .unwrap();
+        let mut after =
+            ::utils::compilation::run_compiler_on_str(&rewritten, |tcx| {
+                collect_rewritten_tracked_unsafe_stats(tcx, &tracked_bindings)
+            })
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        after.bridge_calls = bridge_call_counts_from_source(&rewritten);
+        (result, after)
     }
 
     fn classify_scalar_allocator_rejection<'tcx>(
@@ -7706,6 +8441,208 @@ mod tests {
         );
     }
 
+    fn fmt_split_counts(counts: SplitKindCounts) -> String {
+        format!(
+            "scalar={} array={} total={}",
+            counts.scalar,
+            counts.array,
+            counts.total()
+        )
+    }
+
+    #[test]
+    #[ignore = "diagnostic B02 pointer safety before/after stats"]
+    fn b02_corpus_pointer_safety_before_after_stats() {
+        let root = b02_root();
+        let projects = b02_project_dirs(&root);
+        assert!(
+            !projects.is_empty(),
+            "expected B02 projects under `{}`",
+            root.display()
+        );
+
+        let mut totals_before = SafetyBeforeStats::default();
+        let mut totals_before_outermost = SafetyBeforeStats::default();
+        let mut totals_after = RewrittenUnsafeStats::default();
+        let mut totals_safe_boxes = SplitKindCounts::default();
+        let mut reason_buckets: BTreeMap<&'static str, Bucket> = BTreeMap::new();
+        let mut usage_subreason_buckets: BTreeMap<&'static str, Bucket> = BTreeMap::new();
+        let mut project_records = Vec::with_capacity(projects.len());
+
+        for project_dir in projects {
+            let rel_project = project_dir
+                .strip_prefix(&root)
+                .unwrap_or(project_dir.as_path())
+                .display()
+                .to_string();
+            let lib_rel = ::utils::find_lib_path(&project_dir).unwrap_or_else(|err| {
+                panic!("failed to locate lib path for `{rel_project}`: {err}")
+            });
+            let lib_path = project_dir.join(&lib_rel);
+
+            let analysis = ::utils::compilation::run_compiler_on_path(&lib_path, |tcx| {
+                analyze_pointer_safety_for_program(tcx, &rel_project)
+            })
+            .unwrap_or_else(|_| panic!("failed to analyze `{}`", lib_path.display()));
+            let tracked_bindings = tracked_binding_specs_from_sites(&analysis.tracked_sites);
+            let (rewritten, _) = ::utils::compilation::run_compiler_on_path(&lib_path, |tcx| {
+                replace_local_borrows(&Config::default(), tcx)
+            })
+            .unwrap_or_else(|_| panic!("failed to rewrite `{}`", lib_path.display()));
+            let mut after = ::utils::compilation::run_compiler_on_str(
+                &rewritten,
+                |tcx| collect_rewritten_tracked_unsafe_stats(tcx, &tracked_bindings),
+            )
+            .unwrap_or_else(|_| panic!("failed to compile rewritten `{}`", lib_path.display()));
+            after.bridge_calls = bridge_call_counts_from_source(&rewritten);
+
+            totals_before += analysis.before_total;
+            totals_before_outermost += analysis.before_outermost;
+            totals_after += after;
+            totals_safe_boxes += analysis.safe_box_sites;
+
+            for reason_record in &analysis.outermost_reasons {
+                push_bucket(
+                    &mut reason_buckets,
+                    reason_record.reason,
+                    reason_record.example.clone(),
+                );
+                if reason_record.reason == "unsupported_box_usage" {
+                    for subreason in &reason_record.usage_subreasons {
+                        push_bucket(
+                            &mut usage_subreason_buckets,
+                            subreason,
+                            reason_record.example.clone(),
+                        );
+                    }
+                }
+            }
+
+            project_records.push(PointerSafetyProjectRecord {
+                project: rel_project,
+                before_total: analysis.before_total,
+                before_outermost: analysis.before_outermost,
+                safe_box_sites: analysis.safe_box_sites,
+                after,
+            });
+        }
+
+        eprintln!(
+            "B02 pointer safety before/after stats across {} projects:",
+            project_records.len()
+        );
+        eprintln!("before_total_begin");
+        eprintln!(
+            "before_total::allocation_sites={}",
+            fmt_split_counts(totals_before.allocation_sites)
+        );
+        eprintln!(
+            "before_total::unsafe_dereferences={}",
+            fmt_split_counts(totals_before.dereferences)
+        );
+        eprintln!(
+            "before_total::unsafe_frees={}",
+            fmt_split_counts(totals_before.frees)
+        );
+        eprintln!("before_total_end");
+
+        eprintln!("before_outermost_begin");
+        eprintln!(
+            "before_outermost::allocation_sites={}",
+            fmt_split_counts(totals_before_outermost.allocation_sites)
+        );
+        eprintln!(
+            "before_outermost::unsafe_dereferences={}",
+            fmt_split_counts(totals_before_outermost.dereferences)
+        );
+        eprintln!(
+            "before_outermost::unsafe_frees={}",
+            fmt_split_counts(totals_before_outermost.frees)
+        );
+        eprintln!("before_outermost_end");
+
+        eprintln!("after_begin");
+        eprintln!(
+            "after::safe_box_sites={}",
+            fmt_split_counts(totals_safe_boxes)
+        );
+        eprintln!(
+            "after::unsafe_dereferences_left_from_tracked_sites={}",
+            totals_after.dereferences
+        );
+        eprintln!(
+            "after::unsafe_frees_left_from_tracked_sites={}",
+            totals_after.frees
+        );
+        eprintln!(
+            "after::bridge_calls=Box::leak:{} Box::from_raw:{} Box::into_raw:{}",
+            totals_after.bridge_calls.leak,
+            totals_after.bridge_calls.from_raw,
+            totals_after.bridge_calls.into_raw,
+        );
+        eprintln!("after_end");
+
+        eprintln!("outermost_not_safe_reason_breakdown_begin");
+        for (reason, bucket) in &reason_buckets {
+            eprintln!("outermost_not_safe::{reason}={}", bucket.count);
+            for example in &bucket.examples {
+                eprintln!("  example: {example}");
+            }
+        }
+        eprintln!("outermost_not_safe_reason_breakdown_end");
+
+        eprintln!("outermost_not_safe_usage_subreasons_begin");
+        for (reason, bucket) in &usage_subreason_buckets {
+            eprintln!("outermost_not_safe_usage::{reason}={}", bucket.count);
+            for example in &bucket.examples {
+                eprintln!("  example: {example}");
+            }
+        }
+        eprintln!("outermost_not_safe_usage_subreasons_end");
+
+        eprintln!("per_project_summary_begin");
+        for record in &project_records {
+            eprintln!(
+                "{}: before_total_alloc={} before_outermost_alloc={} safe_boxes={} after_tracked_raw_deref_left={} after_tracked_raw_free_left={} bridge(leak={},from_raw={},into_raw={})",
+                record.project,
+                fmt_split_counts(record.before_total.allocation_sites),
+                fmt_split_counts(record.before_outermost.allocation_sites),
+                fmt_split_counts(record.safe_box_sites),
+                record.after.dereferences,
+                record.after.frees,
+                record.after.bridge_calls.leak,
+                record.after.bridge_calls.from_raw,
+                record.after.bridge_calls.into_raw,
+            );
+        }
+        eprintln!("per_project_summary_end");
+
+        assert!(
+            totals_before.allocation_sites.total() > 0,
+            "expected at least one tracked allocation site in B02"
+        );
+        assert!(
+            totals_before_outermost.allocation_sites.total() > 0,
+            "expected at least one outermost allocation site in B02"
+        );
+        assert!(
+            totals_safe_boxes.total() <= totals_before_outermost.allocation_sites.total(),
+            "safe box sites should not exceed outermost allocation sites"
+        );
+        for bucket in reason_buckets.values() {
+            assert!(
+                !bucket.examples.is_empty(),
+                "non-empty reason bucket should record an example"
+            );
+        }
+        for bucket in usage_subreason_buckets.values() {
+            assert!(
+                !bucket.examples.is_empty(),
+                "non-empty usage-subreason bucket should record an example"
+            );
+        }
+    }
+
     fn find_struct_ty<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> ty::Ty<'tcx> {
         tcx.hir_crate(())
             .owners
@@ -7789,6 +8726,195 @@ mod tests {
                 })
             })
             .expect("expected matching local hir id")
+    }
+
+    #[test]
+    fn pointer_safety_stats_count_scalar_outermost_root_and_safe_box_free_consumption() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_scalar() {
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
+    *p = 7;
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+
+        let (analysis, after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(
+            analysis.before_total,
+            SafetyBeforeStats {
+                allocation_sites: SplitKindCounts { scalar: 1, array: 0 },
+                dereferences: SplitKindCounts { scalar: 1, array: 0 },
+                frees: SplitKindCounts { scalar: 1, array: 0 },
+            }
+        );
+        assert_eq!(analysis.before_outermost, analysis.before_total);
+        assert_eq!(
+            analysis.safe_box_sites,
+            SplitKindCounts { scalar: 1, array: 0 }
+        );
+        assert_eq!(after.dereferences, 0);
+        assert_eq!(after.frees, 0);
+        assert_eq!(after.bridge_calls, BridgeCallCounts::default());
+    }
+
+    #[test]
+    fn pointer_safety_stats_count_array_outermost_root_and_safe_boxed_slice_free_consumption() {
+        let code = r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_array() {
+    let mut p: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *p.offset(1) = 7;
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+
+        let (analysis, after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(
+            analysis.before_total,
+            SafetyBeforeStats {
+                allocation_sites: SplitKindCounts { scalar: 0, array: 1 },
+                dereferences: SplitKindCounts { scalar: 0, array: 1 },
+                frees: SplitKindCounts { scalar: 0, array: 1 },
+            }
+        );
+        assert_eq!(analysis.before_outermost, analysis.before_total);
+        assert_eq!(
+            analysis.safe_box_sites,
+            SplitKindCounts { scalar: 0, array: 1 }
+        );
+        assert_eq!(after.dereferences, 0);
+        assert_eq!(after.frees, 0);
+        assert_eq!(after.bridge_calls, BridgeCallCounts::default());
+    }
+
+    #[test]
+    fn pointer_safety_stats_mark_allocator_wrapper_principal_local_as_outermost() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_one() -> *mut i32 {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>());
+    p
+}
+"#;
+
+        let (analysis, _after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(analysis.tracked_sites.len(), 1);
+        let site = &analysis.tracked_sites[0];
+        assert_eq!(site.shape, SafetySiteShape::AllocatorWrapperPrincipalLocal);
+        assert!(site.outermost);
+        assert_eq!(analysis.before_total.allocation_sites.total(), 1);
+        assert_eq!(analysis.before_outermost.allocation_sites.total(), 1);
+    }
+
+    #[test]
+    fn pointer_safety_stats_mark_field_stored_root_as_non_outermost() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    let data: *mut i32 = malloc(std::mem::size_of::<i32>());
+    (*owner).data = data;
+}
+"#;
+
+        let (analysis, _after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(analysis.tracked_sites.len(), 1);
+        let site = &analysis.tracked_sites[0];
+        assert_eq!(site.shape, SafetySiteShape::NonOutermostLocalRoot);
+        assert!(!site.outermost);
+        assert_eq!(analysis.before_total.allocation_sites.total(), 1);
+        assert_eq!(analysis.before_outermost.allocation_sites.total(), 0);
+    }
+
+    #[test]
+    fn pointer_safety_stats_capture_scalar_raw_bridge_calls() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn free_nested() {
+    let mut p: *mut *mut i32 =
+        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+
+        let (analysis, after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(analysis.safe_box_sites.total(), 0);
+        assert_eq!(after.frees, 0);
+        assert_eq!(after.bridge_calls.leak, 0);
+        assert_eq!(after.bridge_calls.from_raw, 1);
+        assert_eq!(after.bridge_calls.into_raw, 1);
+    }
+
+    #[test]
+    fn pointer_safety_stats_capture_array_raw_bridge_calls() {
+        let code = r#"
+extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_chars(len: usize) {
+    let buf: *mut core::ffi::c_char =
+        realloc(std::ptr::null_mut::<core::ffi::c_void>(), len) as *mut core::ffi::c_char;
+    free(buf as *mut core::ffi::c_void);
+}
+"#;
+
+        let (analysis, after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(analysis.safe_box_sites.total(), 0);
+        assert_eq!(after.frees, 0);
+        assert_eq!(after.bridge_calls.leak, 1);
+        assert_eq!(after.bridge_calls.from_raw, 1);
+        assert_eq!(after.bridge_calls.into_raw, 0);
+    }
+
+    #[test]
+    fn pointer_safety_stats_ignore_untracked_remaining_raw_dereferences() {
+        let code = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn mixed(arg: *mut i32) -> i32 {
+    let mut p: *mut i32 = malloc(std::mem::size_of::<i32>());
+    *p = 7;
+    *arg
+}
+"#;
+
+        let (analysis, after) = analyze_pointer_safety_for_code(code);
+        assert_eq!(
+            analysis.before_total,
+            SafetyBeforeStats {
+                allocation_sites: SplitKindCounts { scalar: 1, array: 0 },
+                dereferences: SplitKindCounts { scalar: 1, array: 0 },
+                frees: SplitKindCounts::default(),
+            }
+        );
+        assert_eq!(after.dereferences, 0);
     }
 
     #[test]

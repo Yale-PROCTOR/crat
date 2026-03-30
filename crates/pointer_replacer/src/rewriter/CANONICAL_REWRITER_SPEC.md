@@ -640,6 +640,21 @@ If no local-path kind match applies:
     - rewrites each crate's library entry through `replace_local_borrows`
     - compiles the rewritten output
     - prints a per-project census of raw-pointer type counts before/after plus added `Option<Box<T>>` and `Option<Box<[T]>>` type counts
+  - the ignored B02 safety-stats harness:
+    - lives in `crates/pointer_replacer/src/rewriter/transform/mod.rs`
+    - `rewriter::transform::tests::b02_corpus_pointer_safety_before_after_stats`
+    - uses a semantic site model rather than token counts
+    - counts transform-relevant allocator roots (`malloc` / `calloc` / `realloc(null_like, ...)`) and attributes raw dereferences / free-like teardown to those roots through local-alias tracking
+    - defines `outermost` using the current rewrite surface only:
+      - direct local-bound allocator roots that do not escape into projection storage
+      - principal returned locals of recognized allocator-wrapper bodies
+    - counts unsafe dereferences via semantic raw-access occurrences rooted at raw deref uses
+    - counts unsafe frees via direct foreign `free(...)` and recognized local free-wrapper calls
+    - recompiles the rewritten output and reports:
+      - safe-boxed outermost sites (`OptBox` / `OptBoxedSlice`)
+      - remaining raw dereferences and frees attributable only to aliases of the originally tracked allocator sites
+      - newly introduced `Box::leak`, `Box::from_raw`, and `Box::into_raw` calls
+    - prints unre-written outermost-site reason totals and `unsupported_box_usage` subreason totals with concrete examples
   - the direct token census currently reads `malloc=86`, `calloc=19`, `free=253`
   - M8 remains planning metadata only; M9 and M10 reduced wrapper-generalization-backed allocator sites without expanding the rewrite surface beyond the current outermost-only policy
 - Remaining allocator-site classifier schema:
@@ -735,6 +750,7 @@ If no local-path kind match applies:
 - `cargo test -p pointer_replacer`
 - `cargo test -p pointer_replacer b02_corpus_rewrite_sweep_records_option_box_rewrites -- --ignored --nocapture`
 - `cargo test -p pointer_replacer b02_corpus_pointer_translation_compile_gate -- --ignored --nocapture`
+- `cargo test -p pointer_replacer b02_corpus_pointer_safety_before_after_stats -- --ignored --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
