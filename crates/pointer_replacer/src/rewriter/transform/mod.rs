@@ -724,7 +724,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 rust_program.tcx,
                 &ptr_kinds,
                 &free_like_wrappers,
-                &local_raw_free_summaries,
+                &local_raw_param_summaries,
             );
             let old_len = forced_raw_bindings.len();
             forced_raw_bindings.extend(unsupported_box_input_bindings);
@@ -2451,14 +2451,14 @@ impl<'tcx> TransformVisitor<'tcx> {
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         if !need_cast {
             utils::expr!(
-                "({}){}.as_{}()",
+                "unsafe {{ ({}){}.as_{}() }}",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "ref" },
             )
         } else {
             utils::expr!(
-                "(({}){} as *{} {}).as_{}()",
+                "unsafe {{ (({}){} as *{} {}).as_{}() }}",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
@@ -3232,11 +3232,22 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                     } else if is_data_container || is_plain_slice {
                         // Base is a data container (Vec, array) — return a re-sliced expression.
-                        e = utils::expr!(
-                            "({})[({}) as usize..]",
-                            pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
-                        );
+                        let base_str = pprust::expr_to_string(&e);
+                        if is_array {
+                            e = utils::expr!(
+                                "(&{}({}))[({}) as usize..]",
+                                if current_mut { "mut " } else { "" },
+                                base_str,
+                                pprust::expr_to_string(offset),
+                            );
+                            is_plain_slice = true;
+                        } else {
+                            e = utils::expr!(
+                                "({})[({}) as usize..]",
+                                base_str,
+                                pprust::expr_to_string(offset),
+                            );
+                        }
                     } else if m && is_mut_cursor_base {
                         e = utils::expr!(
                             "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
@@ -4215,6 +4226,7 @@ fn fn_output_has_nonowning_local_consumers(
         }
 
         fn expr_target_kind(&self, expr: &'tcx hir::Expr<'tcx>) -> Option<PtrKind> {
+            let expr = hir_unwrap_casts(expr);
             if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind
                 && let Res::Local(hir_id) = path.res
             {
@@ -4225,10 +4237,12 @@ fn fn_output_has_nonowning_local_consumers(
         }
 
         fn call_targets_callee(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            let expr = hir_unwrap_casts(expr);
             let hir::ExprKind::Call(func, _) = expr.kind else {
                 return false;
             };
-            let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind else {
+            let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(func).kind
+            else {
                 return false;
             };
             let Res::Def(_, def_id) = path.res else {
@@ -5579,7 +5593,14 @@ fn collect_local_raw_param_summaries(
 
         fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
             intravisit::walk_body(self, body);
-            if let Some(param_index) = self.param_index(body.value) {
+            let mut tail = body.value;
+            while let hir::ExprKind::Block(block, _) = tail.kind {
+                let Some(expr) = block.expr else {
+                    break;
+                };
+                tail = expr;
+            }
+            if let Some(param_index) = self.param_index(tail) {
                 self.mark_escape(param_index);
             }
         }
@@ -6233,6 +6254,31 @@ fn collect_unsupported_box_usage_bindings(
             self.byte_view_roots.insert(lhs_hir_id, root);
             self.bindings.insert(root);
         }
+
+        fn collect_owning_roots_in_expr(&self, expr: &'tcx hir::Expr<'tcx>) -> FxHashSet<HirId> {
+            struct RootCollector<'a, 'tcx, 'me> {
+                visitor: &'me UnsupportedBoxUsageVisitor<'a, 'tcx>,
+                roots: FxHashSet<HirId>,
+            }
+
+            impl<'tcx> Visitor<'tcx> for RootCollector<'_, 'tcx, '_> {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    if let Some(hir_id) = hir_unwrapped_local_id(expr)
+                        && let Some(root) = self.visitor.owning_root_of(hir_id)
+                    {
+                        self.roots.insert(root);
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut collector = RootCollector {
+                visitor: self,
+                roots: FxHashSet::default(),
+            };
+            collector.visit_expr(expr);
+            collector.roots
+        }
     }
 
     impl<'tcx> Visitor<'tcx> for UnsupportedBoxUsageVisitor<'_, 'tcx> {
@@ -6290,6 +6336,13 @@ fn collect_unsupported_box_usage_bindings(
                 if !direct_box_consume {
                     self.bindings.insert(root);
                 }
+            } else if let hir::ExprKind::Call(_, args) = expr.kind
+                && (hir_call_matches_foreign_name(self.tcx, expr, "free")
+                    || hir_called_local_fn(self.tcx, expr)
+                        .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id)))
+                && let [arg] = args
+            {
+                self.bindings.extend(self.collect_owning_roots_in_expr(arg));
             }
 
             intravisit::walk_expr(self, expr);
@@ -7924,6 +7977,8 @@ mod tests {
         let mut ptr_kinds = collect_diffs(input, analysis);
         let free_like_wrappers = collect_local_free_wrappers(tcx);
         let local_raw_free_summaries = collect_local_raw_free_summaries(tcx, &free_like_wrappers);
+        let local_raw_param_summaries =
+            collect_local_raw_param_summaries(tcx, &free_like_wrappers);
         let mut reason_map: FxHashMap<HirId, Vec<&'static str>> = FxHashMap::default();
         let mut usage_subreason_map: FxHashMap<HirId, Vec<&'static str>> = FxHashMap::default();
         let mut forced_raw_bindings = downgrade_unsupported_allocator_box_kinds(tcx, &ptr_kinds);
@@ -7956,13 +8011,13 @@ mod tests {
                 tcx,
                 &ptr_kinds,
                 &free_like_wrappers,
-                &local_raw_free_summaries,
+                &local_raw_param_summaries,
             );
             let unsupported_box_usage_bindings = collect_unsupported_box_usage_bindings(
                 tcx,
                 &ptr_kinds,
                 &free_like_wrappers,
-                &local_raw_free_summaries,
+                &local_raw_param_summaries,
             );
 
             let mut record_new = |bindings: &FxHashSet<HirId>, reason: &'static str| {

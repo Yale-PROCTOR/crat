@@ -1321,7 +1321,6 @@ pub unsafe fn multiply_with_log(a: i32, b: i32) -> (i32, *mut i8) {
             "let mut log_msg: *mut i8 = std::ptr::null_mut();",
             "log_msg =",
             "create_result_string(bytemuck::cast_slice",
-            ") as *mut i8;",
         ],
         &[
             "Option<&mut i8>",
@@ -1785,7 +1784,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &[".as_ref()", "Option<&i32>"],
+        &["unsafe {", ".as_ref()", "Option<&i32>"],
         &[],
     );
 }
@@ -2025,8 +2024,29 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["as *const i16", ".as_ref()", "Option<&i16>"],
+        &["unsafe {", "as *const i16", ".as_ref()", "Option<&i16>"],
         &["bytemuck"],
+    );
+}
+
+#[test]
+fn test_rewriter_wraps_raw_to_opt_ref_call_boundary_in_safe_context() {
+    run_test(
+        r#"
+pub fn foo() -> i32 {
+    let mut x: i32 = 42;
+    let mut p: *mut i32 = &mut x;
+    let mut r: *mut i32 = &mut x;
+    unsafe {
+        *p = 10;
+        *r = 20;
+    }
+    let mut q: *mut i32 = p;
+    unsafe { *q }
+}
+"#,
+        &["Option<&i32>", "unsafe {", ".as_ref()"],
+        &[],
     );
 }
 
