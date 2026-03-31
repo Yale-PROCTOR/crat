@@ -485,25 +485,22 @@ mod tests {
     }
 
     #[test]
-    fn ip_raw() {
+    fn ip2() {
         let code = r#"
         #[derive(Copy, Clone)]
         #[repr(C)]
         pub union Ipv4 {
-            pub as_int: u32,
             pub octet: [u8; 4],
+            pub as_int: u32,
         }
 
-        unsafe fn local_host(p: *mut u8) {
-            *p = 127;
-            *p.add(1) = 0;
-            *p.add(2) = 0;
-            *p.add(3) = 1;
+        unsafe fn local_host(p: &mut [u8; 4]) {
+            *p = [127, 0, 0, 1];
         }
 
-        pub extern "C" fn ip() {
+        pub extern "C" fn ip2() {
             let mut ip = Ipv4 { as_int: 0 };
-            unsafe { local_host(ip.octet.as_mut_ptr()); }
+            unsafe { local_host(&mut ip.octet); }
             unsafe { use_a(ip.as_int); }
         }
         "#;

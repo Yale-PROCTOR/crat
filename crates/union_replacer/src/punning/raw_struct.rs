@@ -84,20 +84,21 @@ struct UnionTransformInfo<'tcx> {
     fields: Vec<UnionFieldClassification<'tcx>>,
 }
 
-pub struct RawStructVisitor<'tcx> {
+pub struct RawStructVisitor<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    union_infos: FxHashMap<String, UnionTransformInfo<'tcx>>,
+    ast_to_hir: &'a AstToHir,
+    union_infos: FxHashMap<LocalDefId, UnionTransformInfo<'tcx>>,
 }
 
-impl<'tcx> RawStructVisitor<'tcx> {
+impl<'a, 'tcx> RawStructVisitor<'a, 'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
+        ast_to_hir: &'a AstToHir,
         union_tys: &[LocalDefId],
         field_classes: FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
     ) -> Self {
         let mut union_infos = FxHashMap::default();
         for &union_ty in union_tys {
-            let name = tcx.item_name(union_ty.to_def_id()).as_str().to_string();
             let ty = tcx.type_of(union_ty).instantiate_identity();
             let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, union_ty);
             let layout = tcx.layout_of(typing_env.as_query_input(ty)).unwrap();
@@ -105,7 +106,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
             let align = layout.align.abi.bytes();
             let fields = field_classes.get(&union_ty).cloned().unwrap_or_default();
             union_infos.insert(
-                name,
+                union_ty,
                 UnionTransformInfo {
                     size,
                     align,
@@ -113,7 +114,11 @@ impl<'tcx> RawStructVisitor<'tcx> {
                 },
             );
         }
-        Self { tcx, union_infos }
+        Self {
+            tcx,
+            ast_to_hir,
+            union_infos,
+        }
     }
 
     fn make_access_impl_item(
@@ -133,15 +138,15 @@ impl<'tcx> RawStructVisitor<'tcx> {
 
             match field.class {
                 FieldTypeClass::Pod => methods.push_str(&format!(
-                    " fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
-                      fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
-                      fn {get_mut}(&mut self) -> &mut {ty_s} {{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }} \
-                      fn {set}(&mut self, value: {ty_s}) {{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }} "
+                    " pub fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      pub fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      pub fn {get_mut}(&mut self) -> &mut {ty_s} {{ let n = {size_expr}; bytemuck::from_bytes_mut::<{ty_s}>(&mut self.raw[..n]) }} \
+                      pub fn {set}(&mut self, value: {ty_s}) {{ let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes); }} "
                 )),
                 FieldTypeClass::AnyBitPattern => methods.push_str(&format!(
-                    " fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
-                      fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
-                      unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} "
+                    " pub fn {get}(&self) -> {ty_s} {{ let n = {size_expr}; *bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      pub fn {get_ref}(&self) -> &{ty_s} {{ let n = {size_expr}; bytemuck::from_bytes::<{ty_s}>(&self.raw[..n]) }} \
+                      pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} "
                 )),
                 FieldTypeClass::NoUninit(is_raw_ptr) => {
                     let set_body = if is_raw_ptr {
@@ -150,8 +155,8 @@ impl<'tcx> RawStructVisitor<'tcx> {
                         "let bytes = bytemuck::bytes_of(&value); self.raw[..bytes.len()].copy_from_slice(bytes);".to_string()
                     };
                     methods.push_str(&format!(
-                        " unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
-                          fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
+                        " pub unsafe fn {get_mut}(&mut self) -> &mut {ty_s} {{ &mut *(self.raw.as_mut_ptr() as *mut {ty_s}) }} \
+                          pub fn {set}(&mut self, value: {ty_s}) {{ {set_body} }} "
                     ));
                 }
                 FieldTypeClass::Other => {}
@@ -180,7 +185,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
             let new_field = format!("new_{}", field.field_name);
             let set_field = format!("set_{}", field.field_name);
             methods.push_str(&format!(
-                " fn {new_field}(value: {ty_s}) -> Self {{ let mut u = Self::new(); u.{set_field}(value); u }} "
+                " pub fn {new_field}(value: {ty_s}) -> Self {{ let mut u = Self::new(); u.{set_field}(value); u }} "
             ));
         }
 
@@ -188,7 +193,7 @@ impl<'tcx> RawStructVisitor<'tcx> {
     }
 }
 
-impl MutVisitor for RawStructVisitor<'_> {
+impl MutVisitor for RawStructVisitor<'_, '_> {
     fn flat_map_item(
         &mut self,
         item: rustc_ast::ptr::P<Item>,
@@ -197,7 +202,11 @@ impl MutVisitor for RawStructVisitor<'_> {
             ItemKind::Union(ident, _, _) => ident.name.as_str().to_string(),
             _ => return mut_visit::walk_flat_map_item(self, item),
         };
-        let Some(info) = self.union_infos.get(&union_name) else {
+        let Some(hir_item) = self.ast_to_hir.get_item(item.id, self.tcx) else {
+            return mut_visit::walk_flat_map_item(self, item);
+        };
+        let local_def_id = hir_item.owner_id.def_id;
+        let Some(info) = self.union_infos.get(&local_def_id) else {
             return mut_visit::walk_flat_map_item(self, item);
         };
 

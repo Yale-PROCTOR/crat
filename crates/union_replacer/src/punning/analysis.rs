@@ -692,7 +692,7 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
             && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue
             && (!dst_place.projection.is_empty() || !src.projection.is_empty())
             && let Some((dst_union_ty, dst_path)) = self.union_path_of_place(*dst_place)
-            && let Some((src_union_ty, src_field)) = self.resolve_field_from_known_state(*src)
+            && let Some((src_union_ty, src_field)) = self.known_field(*src)
             && src_union_ty == dst_union_ty
         {
             let site = UnionAccessSite {
@@ -758,7 +758,7 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
                             && field_adt.is_union()
                             && let Some((src_union_ty, src_field)) = operands
                                 .get(field_idx)
-                                .and_then(|op| self.get_known_field_for_local_operand(op))
+                                .and_then(|op| self.operand_known_field(op))
                             && src_union_ty == field_adt.did()
                         {
                             let union_field_place = dst_place
@@ -777,7 +777,7 @@ impl<'tcx> MirVisitor<'tcx> for BodyUnionAccessCollector<'tcx, '_> {
 
                         let Some(src_paths) = operands
                             .get(field_idx)
-                            .and_then(|op| self.get_known_fields_from_operand(op))
+                            .and_then(|op| self.operand_known_fields(op))
                         else {
                             continue;
                         };
@@ -1020,19 +1020,12 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
             if union_ty.is_some_and(|union_ty| union_ty != adt.did()) {
                 return None;
             }
-            if place.projection.is_empty()
-                && let Some((known_union_ty, known_field)) =
-                    self.get_known_field_for_local(place.local)
-                && known_union_ty == adt.did()
-            {
-                return Some(known_field);
-            }
             return Some(UnionAccessField::Top);
         }
         None
     }
 
-    fn get_known_field_for_local(&self, local: Local) -> Option<(DefId, UnionAccessField)> {
+    fn local_known_field(&self, local: Local) -> Option<(DefId, UnionAccessField)> {
         self.local_known_union_fields
             .get(&local)
             .and_then(|paths| paths.get(&Vec::new()).copied())
@@ -1100,10 +1093,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         self.set_known_field_for_path(place.local, path, (union_ty, field));
     }
 
-    fn get_known_field_for_local_operand(
-        &self,
-        op: &Operand<'tcx>,
-    ) -> Option<(DefId, UnionAccessField)> {
+    fn operand_known_field(&self, op: &Operand<'tcx>) -> Option<(DefId, UnionAccessField)> {
         let place = match *op {
             Operand::Copy(place) | Operand::Move(place) => place,
             Operand::Constant(_) => return None,
@@ -1111,10 +1101,10 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         if !place.projection.is_empty() {
             return None;
         }
-        self.get_known_field_for_local(place.local)
+        self.local_known_field(place.local)
     }
 
-    fn get_known_fields_from_operand(
+    fn operand_known_fields(
         &self,
         op: &Operand<'tcx>,
     ) -> Option<FxHashMap<KnownUnionPath, (DefId, UnionAccessField)>> {
@@ -1129,10 +1119,7 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
     }
 
     /// Field fallback priority 2: reuse statement-propagated field state for this place.
-    fn resolve_field_from_known_state(
-        &self,
-        place: Place<'tcx>,
-    ) -> Option<(DefId, UnionAccessField)> {
+    fn known_field(&self, place: Place<'tcx>) -> Option<(DefId, UnionAccessField)> {
         let (union_ty, path) = self.union_path_of_place(place)?;
         if let Some(field) = self.resolve_field_from_syntax(place, Some(union_ty))
             && !matches!(field, UnionAccessField::Top)
@@ -1201,48 +1188,42 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         })
     }
 
-    fn get_known_field_for_instance(
+    fn unique_known<I>(&self, states: I) -> Option<(DefId, UnionAccessField)>
+    where I: IntoIterator<Item = (DefId, UnionAccessField)> {
+        let mut found = None;
+        for state in states {
+            match found {
+                None => found = Some(state),
+                Some(prev) if prev == state => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    fn local_union_field(&self, local: Local, union_ty: DefId) -> Option<UnionAccessField> {
+        self.unique_known(
+            self.local_known_union_fields
+                .get(&local)?
+                .values()
+                .copied()
+                .filter(|(known_union_ty, _)| *known_union_ty == union_ty),
+        )
+        .map(|(_, field)| field)
+    }
+
+    fn instance_known_field(
         &self,
         local: Local,
         instance: UnionMemoryInstance,
     ) -> Option<(DefId, UnionAccessField)> {
-        let path_map = self.local_known_union_fields.get(&local)?;
-        let mut found: Option<(DefId, UnionAccessField)> = None;
-
-        for (path, state) in path_map {
-            if !self.local_path_aliases_instance(local, path, instance) {
-                continue;
-            }
-            match found {
-                None => found = Some(*state),
-                Some(prev) if prev == *state => {}
-                Some(_) => return None,
-            }
-        }
-
-        found
-    }
-
-    fn get_known_field_for_union_ty(
-        &self,
-        local: Local,
-        union_ty: DefId,
-    ) -> Option<UnionAccessField> {
-        let path_map = self.local_known_union_fields.get(&local)?;
-        let mut found: Option<UnionAccessField> = None;
-
-        for (known_union_ty, known_field) in path_map.values() {
-            if *known_union_ty != union_ty {
-                continue;
-            }
-            match found {
-                None => found = Some(*known_field),
-                Some(prev) if prev == *known_field => {}
-                Some(_) => return None,
-            }
-        }
-
-        found
+        self.unique_known(
+            self.local_known_union_fields
+                .get(&local)?
+                .iter()
+                .filter(|(path, _)| self.local_path_aliases_instance(local, path, instance))
+                .map(|(_, state)| *state),
+        )
     }
 
     fn place_for_local_field_path(
@@ -1296,6 +1277,11 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         let Some(union_ty) = self.instance_to_union_ty.get(&instance).copied() else {
             return UnionAccessField::Top;
         };
+        if let Some(field) =
+            self.resolve_field_from_access_ty(union_ty, place, implicit_deref_count)
+        {
+            return field;
+        }
         let Some(offsets) = self
             .union_layouts
             .get(&union_ty)
@@ -1327,29 +1313,83 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         UnionAccessField::from_bit_mask(found_bit_mask)
     }
 
+    fn known_access_field(
+        &self,
+        place: Place<'tcx>,
+        instance: UnionMemoryInstance,
+        union_ty: DefId,
+        implicit_deref_count: usize,
+    ) -> Option<UnionAccessField> {
+        if implicit_deref_count != 0 {
+            return None;
+        }
+        if place.projection.is_empty()
+            && let Some(field) = self.local_union_field(place.local, union_ty)
+        {
+            return Some(field);
+        }
+        if let Some((known_union_ty, known_field)) = self.known_field(place)
+            && known_union_ty == union_ty
+        {
+            return Some(known_field);
+        }
+        if place.projection.is_empty()
+            && let Some((known_union_ty, known_field)) =
+                self.instance_known_field(place.local, instance)
+            && known_union_ty == union_ty
+        {
+            return Some(known_field);
+        }
+        None
+    }
+
+    fn resolve_field_from_access_ty(
+        &self,
+        union_ty: DefId,
+        place: Place<'tcx>,
+        implicit_deref_count: usize,
+    ) -> Option<UnionAccessField> {
+        let mut access_ty = place.ty(self.body, self.tcx).ty;
+        for _ in 0..implicit_deref_count {
+            access_ty = projected_ty(access_ty, PlaceElem::Deref)?;
+        }
+
+        let adt = self.tcx.adt_def(union_ty);
+        let mut matched = None;
+        for (index, field) in adt.all_fields().enumerate() {
+            let field_ty = self.tcx.type_of(field.did).instantiate_identity();
+            if !field_matches_access_ty(field_ty, access_ty) {
+                continue;
+            }
+            match matched {
+                None => matched = Some(index),
+                Some(_) => return None,
+            }
+        }
+
+        matched.map(UnionAccessField::Field)
+    }
+
     fn resolve_field_for_access(
         &self,
         place: Place<'tcx>,
         instance: UnionMemoryInstance,
         implicit_deref_count: usize,
     ) -> Option<(DefId, UnionAccessField)> {
-        let instance_union_ty = self.instance_to_union_ty.get(&instance).copied();
-        let union_ty = instance_union_ty?;
-        if implicit_deref_count == 0
-            && place.projection.is_empty()
-            && let Some(known_field) = self.get_known_field_for_union_ty(place.local, union_ty)
+        let union_ty = self.instance_to_union_ty.get(&instance).copied()?;
+        let syntax_field = self.resolve_field_from_syntax(place, Some(union_ty));
+        if let Some(field) = syntax_field
+            && !matches!(field, UnionAccessField::Top)
         {
-            return Some((union_ty, known_field));
+            return Some((union_ty, field));
         }
-        if let Some(syntax_field) = self.resolve_field_from_syntax(place, instance_union_ty) {
-            return Some((union_ty, syntax_field));
-        }
-        if implicit_deref_count == 0
-            && let Some((known_union_ty, known_field)) =
-                self.get_known_field_for_instance(place.local, instance)
-            && known_union_ty == union_ty
+        if let Some(field) =
+            self.known_access_field(place, instance, union_ty, implicit_deref_count)
         {
-            return Some((union_ty, known_field));
+            return Some((union_ty, field));
+        }
+        if let Some(field) = syntax_field {
+            return Some((union_ty, field));
         }
         Some((
             union_ty,
@@ -1511,9 +1551,15 @@ fn project_nodes_with_tys<'tcx>(
         if let Some(offset) = field_offset_for_ty(tcx, base_ty, field.index()) {
             next = nodes
                 .into_iter()
-                .map(|node| LocNode {
-                    prefix: node.prefix,
-                    index: node.index + offset,
+                .filter_map(|node| {
+                    let index = node.index + offset;
+                    if index > result.ends[node.index] {
+                        return None;
+                    }
+                    Some(LocNode {
+                        prefix: node.prefix,
+                        index,
+                    })
                 })
                 .collect();
         }
@@ -1618,6 +1664,17 @@ fn ty_len<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> usize {
             len.max(1)
         }
         _ => 1,
+    }
+}
+
+fn field_matches_access_ty<'tcx>(field_ty: Ty<'tcx>, access_ty: Ty<'tcx>) -> bool {
+    if field_ty == access_ty {
+        return true;
+    }
+
+    match field_ty.kind() {
+        TyKind::Array(elem, _) | TyKind::Slice(elem) => *elem == access_ty,
+        _ => false,
     }
 }
 

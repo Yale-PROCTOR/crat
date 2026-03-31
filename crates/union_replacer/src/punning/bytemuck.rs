@@ -6,6 +6,7 @@ use rustc_ast::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind, TypeVisitableExt};
 use rustc_span::def_id::{DefId, LocalDefId};
+use utils::ir::AstToHir;
 
 use super::raw_struct::UnionFieldClassification;
 
@@ -50,7 +51,7 @@ pub enum BytemuckDerive {
 
 #[derive(Debug, Default, Clone)]
 pub struct BytemuckDerivePlan {
-    pub per_type: FxHashMap<String, FxHashSet<BytemuckDerive>>,
+    pub per_type: FxHashMap<LocalDefId, FxHashSet<BytemuckDerive>>,
 }
 
 pub struct BytemuckTypeClassifier<'tcx> {
@@ -295,7 +296,7 @@ impl<'tcx> BytemuckDerivePlanBuilder<'tcx> {
                 if !derives.is_empty() {
                     self.plan
                         .per_type
-                        .entry(self.tcx.item_name(local_def_id.to_def_id()).to_string())
+                        .entry(local_def_id)
                         .or_default()
                         .extend(derives);
                 }
@@ -311,33 +312,42 @@ impl<'tcx> BytemuckDerivePlanBuilder<'tcx> {
 }
 
 /// Visitor for bytemuck derives
-pub struct BytemuckDeriveVisitor {
-    derives_by_type: FxHashMap<String, Vec<BytemuckDerive>>,
+pub struct BytemuckDeriveVisitor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &'a AstToHir,
+    derives_by_type: FxHashMap<LocalDefId, Vec<BytemuckDerive>>,
 }
 
-impl BytemuckDeriveVisitor {
-    pub fn new(plan: BytemuckDerivePlan) -> Self {
+impl<'a, 'tcx> BytemuckDeriveVisitor<'a, 'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, ast_to_hir: &'a AstToHir, plan: BytemuckDerivePlan) -> Self {
         let derives_by_type = plan
             .per_type
             .into_iter()
-            .map(|(name, derives)| {
+            .map(|(local_def_id, derives)| {
                 let derives = derives.into_iter().collect::<Vec<_>>();
-                (name, derives)
+                (local_def_id, derives)
             })
             .collect();
-        Self { derives_by_type }
+        Self {
+            tcx,
+            ast_to_hir,
+            derives_by_type,
+        }
     }
 }
 
-impl MutVisitor for BytemuckDeriveVisitor {
+impl MutVisitor for BytemuckDeriveVisitor<'_, '_> {
     fn visit_item(&mut self, item: &mut Item) {
         mut_visit::walk_item(self, item);
 
-        let type_name = match &item.kind {
-            ItemKind::Struct(ident, _, _) => ident.name.as_str().to_string(),
-            _ => return,
+        if !matches!(&item.kind, ItemKind::Struct(..)) {
+            return;
+        }
+        let Some(hir_item) = self.ast_to_hir.get_item(item.id, self.tcx) else {
+            return;
         };
-        let Some(derives) = self.derives_by_type.get(&type_name) else {
+        let local_def_id = hir_item.owner_id.def_id;
+        let Some(derives) = self.derives_by_type.get(&local_def_id) else {
             return;
         };
 
