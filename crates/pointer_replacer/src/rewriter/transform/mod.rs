@@ -2849,11 +2849,17 @@ impl<'tcx> TransformVisitor<'tcx> {
                 && let PtrExprProj::Offset(offset) = pe.projs[0]
             {
                 // if there are only offsets, we can use the original slice and let the cursor handle the offsets
+                let cursor_base = if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice))
+                {
+                    self.opt_boxed_slice_view_expr(pe.base, m)
+                } else {
+                    pe.base.clone()
+                };
                 utils::expr!(
                     "{}::with_pos({}{}, ({}) as usize)",
                     cursor_ty,
                     reference,
-                    pprust::expr_to_string(pe.base),
+                    pprust::expr_to_string(&cursor_base),
                     pprust::expr_to_string(offset),
                 )
             } else {
@@ -3164,6 +3170,16 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn projected_base_mutability(&self, pe: &PtrExpr<'_, 'tcx>, fallback: bool) -> bool {
+        match self.behind_subscripts(pe.hir_base) {
+            PathOrDeref::Deref(hir_id) => self
+                .effective_ptr_kind(hir_id)
+                .or_else(|| self.ptr_kinds.get(&hir_id).copied())
+                .map_or(fallback, |kind| kind.is_mut()),
+            PathOrDeref::Path | PathOrDeref::Other => fallback,
+        }
+    }
+
     fn is_base_not_a_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
         match pe.base_kind {
             PtrExprBaseKind::Path(_) | PtrExprBaseKind::Alloca | PtrExprBaseKind::Array => true,
@@ -3190,7 +3206,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let current_mut = self.ptr_source_kind(pe).map_or_else(
             || match pe.base_ty.kind() {
                 ty::TyKind::RawPtr(_, m) => m.is_mut(),
-                ty::TyKind::Array(..) => true,
+                ty::TyKind::Array(..) => self.projected_base_mutability(pe, m),
                 _ => m,
             },
             |kind| kind.is_mut(),

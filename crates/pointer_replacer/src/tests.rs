@@ -3281,6 +3281,81 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
 }
 
 #[test]
+fn test_opt_boxed_slice_offset_cursor_uses_slice_view_base() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn consume(mut end: *mut i32, mut count: i32) -> i32 {
+    let mut sum: i32 = 0;
+    while count > 0 {
+        sum += *end;
+        end = end.offset(-1);
+        count -= 1;
+    }
+    sum
+}
+
+pub unsafe fn demo() -> i32 {
+    let mut array_size: i32 = 5;
+    let mut data_array: *mut i32 =
+        malloc(array_size as usize * std::mem::size_of::<i32>()) as *mut i32;
+    if data_array.is_null() {
+        return -1;
+    }
+    let mut i: i32 = 0;
+    while i < array_size {
+        *data_array.offset(i as isize) = i + 1;
+        i += 1;
+    }
+    let mut last_element: *mut i32 =
+        data_array.offset((array_size as isize) + -(1 as isize));
+    let sum = consume(last_element, array_size);
+    free(data_array as *mut core::ffi::c_void);
+    sum
+}
+"#,
+        &["SliceCursor::with_pos(", ".as_deref().unwrap_or(&[])"],
+        &["SliceCursor::with_pos(&data_array"],
+    );
+}
+
+#[test]
+fn test_shared_array_field_offset_stays_shared() {
+    run_test(
+        r#"
+extern "C" {
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize)
+        -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct buffer_t {
+    pub data: [u8; 256],
+    pub length: usize,
+}
+
+pub unsafe fn copy_tail(
+    mut src: *const buffer_t,
+    mut split_pos: usize,
+    mut dst: *mut buffer_t,
+) {
+    memcpy(
+        ((*dst).data).as_mut_ptr() as *mut core::ffi::c_void,
+        (*src).data.as_ptr().offset(split_pos as isize) as *const core::ffi::c_void,
+        1,
+    );
+}
+"#,
+        &["(&((*(src).as_deref().unwrap()).data))[("],
+        &["&mut ((*(src).as_deref().unwrap()).data)"],
+    );
+}
+
+#[test]
 fn test_cursor_mut_to_ref_preserves_pos() {
     run_test(
         r#"
