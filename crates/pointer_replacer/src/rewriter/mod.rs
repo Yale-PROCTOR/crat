@@ -42,6 +42,8 @@ pub struct Analysis {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
+    #[serde(default)]
+    pub verbose: bool,
     #[cfg(test)]
     pub force_ownership_analysis_failure: bool,
 }
@@ -134,6 +136,7 @@ fn maybe_solidified_ownership<'tcx>(
         return None;
     }
 
+    let _verbose_guard = crate::analyses::ownership::whole_program::set_verbose(_config.verbose);
     let crate_ctxt = CrateCtxt::new(input);
     <WholeProgramAnalysis as OwnershipAnalysisKind>::analyze(crate_ctxt, output_params)
         .ok()

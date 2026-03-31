@@ -1,6 +1,9 @@
 mod state;
 
-use std::ops::Range;
+use std::{
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::bail;
 use either::Either::{self, Left, Right};
@@ -34,6 +37,25 @@ use crate::analyses::{
 
 /// whole program analysis
 pub enum WholeProgramAnalysis {}
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub struct VerboseGuard(bool);
+
+pub fn set_verbose(enabled: bool) -> VerboseGuard {
+    VerboseGuard(VERBOSE.swap(enabled, Ordering::Relaxed))
+}
+
+impl Drop for VerboseGuard {
+    fn drop(&mut self) {
+        VERBOSE.store(self.0, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
 
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAnalysis {
     type DB = Z3Database;
@@ -160,11 +182,13 @@ fn solve_body<'tcx>(
 
     let mut rn = Renamer::new(body, ssa_state, crate_ctxt.tcx);
 
-    print!(
-        "Solving {} with precision {}... ",
-        crate_ctxt.tcx.def_path_str(body.source.def_id()),
-        std::cmp::min(precision, crate_ctxt.struct_ctxt.max_ptr_chased()),
-    );
+    if verbose() {
+        print!(
+            "Solving {} with precision {}... ",
+            crate_ctxt.tcx.def_path_str(body.source.def_id()),
+            std::cmp::min(precision, crate_ctxt.struct_ctxt.max_ptr_chased()),
+        );
+    }
 
     let mut infer_cx = InferCtxt::new(
         crate_ctxt,
@@ -182,13 +206,17 @@ fn solve_body<'tcx>(
 
     match database.solver.check() {
         z3::SatResult::Unsat => {
-            println!("\u{274C}");
+            if verbose() {
+                println!("\u{274C}");
+            }
             database.solver.pop(1);
             Ok((results, precision - 1))
         }
         z3::SatResult::Unknown => bail!("z3 status: unknown"),
         z3::SatResult::Sat => {
-            println!("\u{2705}");
+            if verbose() {
+                println!("\u{2705}");
+            }
             Ok((results, precision))
         }
     }
@@ -268,12 +296,14 @@ fn solve_crate(
     };
 
     let intermediate_results = (model, fn_locals, global_assumptions);
-    show_fn_sigs(
-        &intermediate_results.0,
-        &intermediate_results.1,
-        crate_ctxt.tcx,
-        crate_ctxt.fns(),
-    );
+    if verbose() {
+        show_fn_sigs(
+            &intermediate_results.0,
+            &intermediate_results.1,
+            crate_ctxt.tcx,
+            crate_ctxt.fns(),
+        );
+    }
 
     Ok(intermediate_results)
 }

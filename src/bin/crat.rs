@@ -113,6 +113,10 @@ struct Args {
     )]
     unexpand_use_print: bool,
 
+    // Pointer
+    #[arg(long, help = "Enable verbose ownership solver output for the pointer pass")]
+    pointer_verbose: bool,
+
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -226,6 +230,7 @@ fn main() {
     config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
+    config.pointer.verbose |= args.pointer_verbose;
     config.passes.extend(args.pass);
     if args.analysis.is_some() {
         config.analysis = args.analysis;
