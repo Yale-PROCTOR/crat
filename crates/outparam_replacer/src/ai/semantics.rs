@@ -674,11 +674,20 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
             ("", "num", _, "wrapping_neg") => args[0].neg(),
-            (_, "f64", _, m) if m.starts_with("is_") => AbsValue::top_bool(),
+            (_, "f64" | "f32" | "float", _, m) if m.starts_with("is_") => AbsValue::top_bool(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
                 let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
                 reads.extend(reads2);
+                let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
+                writes.extend(writes2);
+                let bases = self
+                    .get_write_bases_of_ptr(&args[0].ptrv)
+                    .unwrap_or_default();
+                call_kind = CallKind::RustEffect(Some(bases));
+                args[0].clone()
+            }
+            ("", "unix", _, "memset") => {
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
                 let bases = self
@@ -711,7 +720,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 | "MulAssign" | "RemAssign" | "ShlAssign" | "ShrAssign" | "SubAssign",
                 _,
             )
-            | ("", "cast", "ToPrimitive", "to_i64") => {
+            | ("", "cast", "ToPrimitive", "to_i64" | "to_f64") => {
                 let reads0 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
                 reads.extend(reads0);
                 AbsValue::top()
@@ -1089,7 +1098,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 }
             },
             ConstValue::ZeroSized => match ty.kind() {
-                TyKind::Tuple(_) => AbsValue::alpha_list(vec![]),
+                TyKind::Tuple(_) | TyKind::Array(_, _) => AbsValue::alpha_list(vec![]),
                 TyKind::FnDef(def_id, _) => AbsValue::alpha_fn(*def_id),
                 _ => unreachable!("{:?}", ty),
             },
