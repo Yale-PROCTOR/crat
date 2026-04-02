@@ -409,9 +409,11 @@ fn write_merged_rust_file(
     variants: &[(usize, PathBuf)],
 ) -> Result<(), String> {
     let mut shared_inner_attrs: Option<Vec<String>> = None;
+    let mut ordered_items = Vec::new();
+    let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
     let mut merged = String::new();
 
-    for (index, path) in variants {
+    for (variant_index, (_, path)) in variants.iter().enumerate() {
         let parsed = parse_rust_file(path)?;
         if let Some(existing) = shared_inner_attrs.as_ref() {
             if existing != &parsed.inner_attrs {
@@ -423,9 +425,25 @@ fn write_merged_rust_file(
             shared_inner_attrs = Some(parsed.inner_attrs.clone());
         }
 
-        let cfg = cfg_attribute(&translations[*index].features);
+        let mut seen_in_variant = BTreeSet::new();
         for item in parsed.items {
+            if !seen_in_variant.insert(item.clone()) {
+                continue;
+            }
+
+            let variants_for_item = item_variants.entry(item.clone()).or_default();
+            if variants_for_item.is_empty() {
+                ordered_items.push(item.clone());
+            }
+            variants_for_item.insert(variant_index);
+        }
+    }
+
+    for item in ordered_items {
+        if let Some(cfg) = merged_cfg_attribute(&item, &item_variants, translations, variants) {
             writeln!(merged, "{cfg}").unwrap();
+            writeln!(merged, "{item}").unwrap();
+        } else {
             writeln!(merged, "{item}").unwrap();
         }
     }
@@ -447,6 +465,28 @@ fn write_merged_rust_file(
     fs::write(output_path, code).map_err(|e| format!("failed to write {output_path:?}: {e}"))
 }
 
+fn merged_cfg_attribute(
+    item: &str,
+    item_variants: &BTreeMap<String, BTreeSet<usize>>,
+    translations: &[Translation],
+    variants: &[(usize, PathBuf)],
+) -> Option<String> {
+    let variant_indexes = item_variants.get(item).unwrap();
+    if variant_indexes.len() == variants.len() {
+        return None;
+    }
+
+    let conditions = variant_indexes
+        .iter()
+        .map(|variant_index| {
+            let translation_index = variants[*variant_index].0;
+            cfg_condition(&translations[translation_index].features)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("#[cfg(any({conditions}))]"))
+}
+
 fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
     let source = fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
     let krate = std::panic::catch_unwind(|| utils::ast::parse_crate(source))
@@ -466,11 +506,11 @@ fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
     Ok(ParsedRustFile { inner_attrs, items })
 }
 
-fn cfg_attribute(features: &[String]) -> String {
+fn cfg_condition(features: &[String]) -> String {
     let clauses = features
         .iter()
         .map(|feature| format!("feature = {feature:?}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("#[cfg(all({clauses}))]")
+    format!("all({clauses})")
 }
