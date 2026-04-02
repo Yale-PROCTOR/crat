@@ -2,6 +2,7 @@
 members = [
   "crates/finders",
   "crates/io_replacer",
+  "crates/merger",
   "crates/outparam_replacer",
   "crates/passes",
   "crates/pointer_replacer",
@@ -30,6 +31,7 @@ tracing = "0.1.41"
 [dependencies]
 finders = { path = "crates/finders" }
 io_replacer = { path = "crates/io_replacer" }
+merger = { path = "crates/merger" }
 outparam_replacer = { path = "crates/outparam_replacer" }
 passes = { path = "crates/passes" }
 pointer_replacer = { path = "crates/pointer_replacer" }
