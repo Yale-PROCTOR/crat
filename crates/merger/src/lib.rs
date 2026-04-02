@@ -3,6 +3,8 @@
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 
+mod cofactor;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -17,6 +19,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
+use crate::cofactor::{Expr, Solver, Universe};
+
 #[derive(Deserialize)]
 struct RawTranslation {
     dir: PathBuf,
@@ -27,7 +31,6 @@ struct RawTranslation {
 struct Translation {
     dir: PathBuf,
     config: BTreeMap<String, String>,
-    feature_by_param: BTreeMap<String, String>,
     features: Vec<String>,
 }
 
@@ -110,7 +113,6 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         }
 
         let mut config = BTreeMap::new();
-        let mut feature_by_param = BTreeMap::new();
         let mut features = Vec::with_capacity(entry.config.len());
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
@@ -125,7 +127,6 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
                 feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
             }
             config.insert(param.clone(), raw_value);
-            feature_by_param.insert(param, feature.clone());
             features.push(feature);
         }
         if !seen_feature_sets.insert(features.clone()) {
@@ -136,7 +137,6 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         translations.push(Translation {
             dir,
             config,
-            feature_by_param,
             features,
         });
     }
@@ -487,76 +487,149 @@ fn merged_cfg_attribute(
         return None;
     }
 
-    if let Some(common_condition) =
-        simplified_cfg_condition(variant_indexes, translations, variants)
-    {
-        return Some(format!("#[cfg({common_condition})]"));
-    }
-
-    let conditions = variant_indexes
-        .iter()
-        .map(|variant_index| {
-            let translation_index = variants[*variant_index].0;
-            cfg_condition(&translations[translation_index].features)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("#[cfg(any({conditions}))]"))
+    let condition = simplified_cfg_condition(variant_indexes, translations, variants);
+    Some(format!("#[cfg({condition})]"))
 }
 
 fn simplified_cfg_condition(
     variant_indexes: &BTreeSet<usize>,
     translations: &[Translation],
     variants: &[(usize, PathBuf)],
-) -> Option<String> {
-    let mut variant_iter = variant_indexes.iter();
-    let first_variant = *variant_iter.next()?;
-    let first_translation = &translations[variants[first_variant].0];
-    let mut common_params = first_translation.config.clone();
-
-    for variant_index in variant_iter {
-        let translation = &translations[variants[*variant_index].0];
-        common_params.retain(|param, value| translation.config.get(param) == Some(value));
-    }
-
-    let filtered_count = filtered_combination_count(&common_params, translations, variants);
-    if filtered_count != variant_indexes.len() {
-        return None;
-    }
-
-    let features = common_params
+) -> String {
+    let params = translations[variants[0].0]
+        .config
         .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let value_lists = params
+        .iter()
         .map(|param| {
-            first_translation
-                .feature_by_param
-                .get(param)
-                .cloned()
-                .unwrap()
+            variants
+                .iter()
+                .map(|(translation_index, _)| {
+                    translations[*translation_index].config[param].clone()
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    Some(cfg_condition(&features))
-}
+    let value_indexes = value_lists
+        .iter()
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (value.clone(), index))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let feature_lists = params
+        .iter()
+        .zip(&value_lists)
+        .map(|(param, values)| {
+            values
+                .iter()
+                .map(|value| {
+                    make_feature_name(param, value).expect("existing config value is valid")
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
-fn filtered_combination_count(
-    common_params: &BTreeMap<String, String>,
-    translations: &[Translation],
-    variants: &[(usize, PathBuf)],
-) -> usize {
-    let mut values_by_param = BTreeMap::<String, BTreeSet<&str>>::new();
-    for (translation_index, _) in variants {
-        for (param, value) in &translations[*translation_index].config {
-            values_by_param
-                .entry(param.clone())
-                .or_default()
-                .insert(value.as_str());
-        }
+    let universe = Universe::new(value_lists.iter().map(Vec::len).collect());
+    let coords = universe.all_coordinates();
+    let mut target = universe.empty_bits(&coords);
+    for &variant_index in variant_indexes {
+        let translation = &translations[variants[variant_index].0];
+        let tuple = params
+            .iter()
+            .enumerate()
+            .map(|(coord, param)| value_indexes[coord][&translation.config[param]])
+            .collect::<Vec<_>>();
+        universe.set_tuple_bit(&coords, &mut target, &tuple);
     }
 
-    values_by_param
-        .into_iter()
-        .filter(|(param, _)| !common_params.contains_key(param))
-        .map(|(_, values)| values.len())
-        .product()
+    let expr = Solver::new(&universe).solve(target);
+    lower_cfg_expr(&expr, &feature_lists)
+}
+
+fn lower_cfg_expr(expr: &Expr, feature_lists: &[Vec<String>]) -> String {
+    match expr {
+        Expr::True => "all()".to_string(),
+        Expr::False => "any()".to_string(),
+        Expr::Lit { coord, values } => lower_cfg_literal(*coord, values, feature_lists),
+        Expr::Not(expr) => format!("not({})", lower_cfg_expr(expr, feature_lists)),
+        Expr::And(args) => lower_cfg_operator("all", args, feature_lists),
+        Expr::Or(args) => lower_cfg_operator("any", args, feature_lists),
+    }
+}
+
+fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<String>]) -> String {
+    let args = args
+        .iter()
+        .map(|arg| lower_cfg_expr(arg, feature_lists))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({args})")
+}
+
+fn lower_cfg_literal(
+    coord: usize,
+    values: &BTreeSet<usize>,
+    feature_lists: &[Vec<String>],
+) -> String {
+    let domain_size = feature_lists[coord].len();
+    if values.is_empty() {
+        return "any()".to_string();
+    }
+    if values.len() == domain_size {
+        return "all()".to_string();
+    }
+    if values.len() == 1 {
+        return feature_clause(&feature_lists[coord][*values.iter().next().unwrap()]);
+    }
+
+    let positive_cost = values.len() + 1;
+    let excluded = (0..domain_size)
+        .filter(|value| !values.contains(value))
+        .collect::<Vec<_>>();
+    let negative_cost = match excluded.len() {
+        0 => 1,
+        1 => 2,
+        count => count + 2,
+    };
+
+    if positive_cost <= negative_cost {
+        let clauses = values
+            .iter()
+            .map(|value| feature_clause(&feature_lists[coord][*value]))
+            .collect::<Vec<_>>();
+        lower_cfg_primitive_or(&clauses)
+    } else if excluded.len() == 1 {
+        format!(
+            "not({})",
+            feature_clause(&feature_lists[coord][excluded[0]])
+        )
+    } else {
+        let clauses = excluded
+            .into_iter()
+            .map(|value| feature_clause(&feature_lists[coord][value]))
+            .collect::<Vec<_>>();
+        format!("not({})", lower_cfg_primitive_or(&clauses))
+    }
+}
+
+fn lower_cfg_primitive_or(clauses: &[String]) -> String {
+    match clauses {
+        [] => "any()".to_string(),
+        [clause] => clause.clone(),
+        _ => format!("any({})", clauses.join(", ")),
+    }
+}
+
+fn feature_clause(feature: &str) -> String {
+    format!("feature = {feature:?}")
 }
 
 fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
@@ -578,11 +651,55 @@ fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
     Ok(ParsedRustFile { inner_attrs, items })
 }
 
-fn cfg_condition(features: &[String]) -> String {
-    let clauses = features
-        .iter()
-        .map(|feature| format!("feature = {feature:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("all({clauses})")
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
+
+    use super::{Translation, merged_cfg_attribute};
+
+    fn translation(config: &[(&str, &str)]) -> Translation {
+        let config = config
+            .iter()
+            .map(|(param, value)| (param.to_string(), value.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let features = config
+            .iter()
+            .map(|(param, value)| {
+                super::make_feature_name(param, value).expect("test config is valid")
+            })
+            .collect::<Vec<_>>();
+
+        Translation {
+            dir: PathBuf::new(),
+            config,
+            features,
+        }
+    }
+
+    #[test]
+    fn merged_cfg_attribute_uses_cofactor_simplification() {
+        let translations = vec![
+            translation(&[("os", "linux"), ("arch", "x86")]),
+            translation(&[("os", "linux"), ("arch", "arm")]),
+            translation(&[("os", "mac"), ("arch", "x86")]),
+            translation(&[("os", "mac"), ("arch", "arm")]),
+        ];
+        let variants = vec![
+            (0, PathBuf::from("linux-x86.rs")),
+            (1, PathBuf::from("linux-arm.rs")),
+            (2, PathBuf::from("mac-x86.rs")),
+            (3, PathBuf::from("mac-arm.rs")),
+        ];
+        let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
+        item_variants.insert(
+            "fn shared() {}".to_string(),
+            [0usize, 1usize].into_iter().collect(),
+        );
+
+        let cfg = merged_cfg_attribute("fn shared() {}", &item_variants, &translations, &variants);
+        assert_eq!(cfg, Some("#[cfg(feature = \"os_linux\")]".to_string()));
+    }
 }
