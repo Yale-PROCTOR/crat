@@ -26,6 +26,8 @@ struct RawTranslation {
 
 struct Translation {
     dir: PathBuf,
+    config: BTreeMap<String, String>,
+    feature_by_param: BTreeMap<String, String>,
     features: Vec<String>,
 }
 
@@ -107,6 +109,8 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
             return Err(format!("{dir:?} is not a directory"));
         }
 
+        let mut config = BTreeMap::new();
+        let mut feature_by_param = BTreeMap::new();
         let mut features = Vec::with_capacity(entry.config.len());
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
@@ -118,8 +122,10 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
                     ));
                 }
             } else {
-                feature_map.insert(feature.clone(), (param, raw_value));
+                feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
             }
+            config.insert(param.clone(), raw_value);
+            feature_by_param.insert(param, feature.clone());
             features.push(feature);
         }
         if !seen_feature_sets.insert(features.clone()) {
@@ -127,7 +133,12 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
                 "duplicate configuration detected for translation directory {dir:?}"
             ));
         }
-        translations.push(Translation { dir, features });
+        translations.push(Translation {
+            dir,
+            config,
+            feature_by_param,
+            features,
+        });
     }
 
     Ok(translations)
@@ -476,6 +487,12 @@ fn merged_cfg_attribute(
         return None;
     }
 
+    if let Some(common_condition) =
+        simplified_cfg_condition(variant_indexes, translations, variants)
+    {
+        return Some(format!("#[cfg({common_condition})]"));
+    }
+
     let conditions = variant_indexes
         .iter()
         .map(|variant_index| {
@@ -485,6 +502,61 @@ fn merged_cfg_attribute(
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!("#[cfg(any({conditions}))]"))
+}
+
+fn simplified_cfg_condition(
+    variant_indexes: &BTreeSet<usize>,
+    translations: &[Translation],
+    variants: &[(usize, PathBuf)],
+) -> Option<String> {
+    let mut variant_iter = variant_indexes.iter();
+    let first_variant = *variant_iter.next()?;
+    let first_translation = &translations[variants[first_variant].0];
+    let mut common_params = first_translation.config.clone();
+
+    for variant_index in variant_iter {
+        let translation = &translations[variants[*variant_index].0];
+        common_params.retain(|param, value| translation.config.get(param) == Some(value));
+    }
+
+    let filtered_count = filtered_combination_count(&common_params, translations, variants);
+    if filtered_count != variant_indexes.len() {
+        return None;
+    }
+
+    let features = common_params
+        .keys()
+        .map(|param| {
+            first_translation
+                .feature_by_param
+                .get(param)
+                .cloned()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    Some(cfg_condition(&features))
+}
+
+fn filtered_combination_count(
+    common_params: &BTreeMap<String, String>,
+    translations: &[Translation],
+    variants: &[(usize, PathBuf)],
+) -> usize {
+    let mut values_by_param = BTreeMap::<String, BTreeSet<&str>>::new();
+    for (translation_index, _) in variants {
+        for (param, value) in &translations[*translation_index].config {
+            values_by_param
+                .entry(param.clone())
+                .or_default()
+                .insert(value.as_str());
+        }
+    }
+
+    values_by_param
+        .into_iter()
+        .filter(|(param, _)| !common_params.contains_key(param))
+        .map(|(_, values)| values.len())
+        .product()
 }
 
 fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
