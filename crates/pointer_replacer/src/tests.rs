@@ -783,10 +783,19 @@ pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
     out
 }
 "#,
-        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &[
+            "pub unsafe fn copy_and_sum(src: &[i32], count: usize) -> i32",
+            "let mut dest: Option<Box<[i32]>>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "memcpy(((dest).as_deref_mut().unwrap_or(&mut [])).as_mut_ptr() as *mut _,",
+            "drop((dest).take());",
+        ],
         &[
             "malloc(count * std::mem::size_of::<i32>())",
             "free(dest as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "slice_from_raw_parts_mut",
+            "Box::from_raw(",
         ],
     );
 }
@@ -857,8 +866,20 @@ pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
     helper(out)
 }
 "#,
-        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
-        &["malloc(len)", "free(buf as *mut core::ffi::c_void);"],
+        &[
+            "pub unsafe fn helper(out: &[i8]) -> i32",
+            "let mut buf: Option<Box<[i8]>>",
+            "collect::<Vec<i8>>().into_boxed_slice()",
+            "puts(((buf).as_deref_mut().unwrap_or(&mut [])).as_mut_ptr());",
+            "drop((buf).take());",
+        ],
+        &[
+            "malloc(len)",
+            "free(buf as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "slice_from_raw_parts_mut",
+            "Box::from_raw(",
+        ],
     );
 }
 
@@ -952,10 +973,18 @@ pub unsafe fn helper() -> i32 {
     result
 }
 "#,
-        &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
+        &[
+            "let mut s: Option<Box<crate::State>>",
+            "Some(Box::new(crate::State { value: <i32 as Default>::default() }))",
+            "touch((s).as_deref_mut().map_or(std::ptr::null_mut::<crate::State>(),",
+            "drop((s).take());",
+        ],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(s as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "slice_from_raw_parts_mut",
+            "Box::from_raw(",
         ],
     );
 }

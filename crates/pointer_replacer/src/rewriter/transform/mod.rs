@@ -66,7 +66,17 @@ enum AllocWrapperInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalRawParamSummary {
     BorrowOnly,
+    ReturnedToOwningOutput,
     Escapes,
+}
+
+impl LocalRawParamSummary {
+    fn preserves_owning_call_boundary(self) -> bool {
+        matches!(
+            self,
+            LocalRawParamSummary::BorrowOnly | LocalRawParamSummary::ReturnedToOwningOutput
+        )
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -695,8 +705,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
-        let local_raw_param_summaries =
-            collect_local_raw_param_summaries(rust_program.tcx, &free_like_wrappers);
+        let local_raw_param_summaries = collect_local_raw_param_summaries(
+            rust_program.tcx,
+            &sig_decs,
+            &free_like_wrappers,
+        );
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
@@ -5475,11 +5488,13 @@ fn collect_local_raw_free_summaries(
 
 fn collect_local_raw_param_summaries(
     tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
     free_like_wrappers: &FxHashSet<LocalDefId>,
 ) -> FxHashMap<(LocalDefId, usize), LocalRawParamSummary> {
     #[derive(Default)]
     struct ParamFacts {
         direct_escape: bool,
+        returned_to_owning_output: bool,
         deps: FxHashSet<(LocalDefId, usize)>,
     }
 
@@ -5522,6 +5537,7 @@ fn collect_local_raw_param_summaries(
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
         raw_params_by_fn: &'a FxHashMap<LocalDefId, FxHashMap<HirId, usize>>,
         current_raw_params: &'a FxHashMap<HirId, usize>,
+        returns_owning_output: bool,
         facts: FxHashMap<usize, ParamFacts>,
     }
 
@@ -5533,6 +5549,13 @@ fn collect_local_raw_param_summaries(
 
         fn mark_escape(&mut self, param_index: usize) {
             self.facts.entry(param_index).or_default().direct_escape = true;
+        }
+
+        fn mark_returned_to_owning_output(&mut self, param_index: usize) {
+            self.facts
+                .entry(param_index)
+                .or_default()
+                .returned_to_owning_output = true;
         }
 
         fn add_dep(&mut self, param_index: usize, dep: (LocalDefId, usize)) {
@@ -5560,7 +5583,11 @@ fn collect_local_raw_param_summaries(
                 }
                 hir::ExprKind::Ret(Some(ret)) => {
                     if let Some(param_index) = self.param_index(ret) {
-                        self.mark_escape(param_index);
+                        if self.returns_owning_output {
+                            self.mark_returned_to_owning_output(param_index);
+                        } else {
+                            self.mark_escape(param_index);
+                        }
                     }
                 }
                 hir::ExprKind::Call(_, args) => {
@@ -5617,7 +5644,11 @@ fn collect_local_raw_param_summaries(
                 tail = expr;
             }
             if let Some(param_index) = self.param_index(tail) {
-                self.mark_escape(param_index);
+                if self.returns_owning_output {
+                    self.mark_returned_to_owning_output(param_index);
+                } else {
+                    self.mark_escape(param_index);
+                }
             }
         }
     }
@@ -5634,11 +5665,15 @@ fn collect_local_raw_param_summaries(
             continue;
         };
         let body = tcx.hir_body(body);
+        let returns_owning_output = sig_decs.data.get(def_id).is_some_and(|sig_dec| {
+            matches!(sig_dec.output_dec, Some(PtrKind::OptBox | PtrKind::OptBoxedSlice))
+        });
         let mut visitor = RawParamSummaryVisitor {
             tcx,
             free_like_wrappers,
             raw_params_by_fn: &raw_params_by_fn,
             current_raw_params: raw_params,
+            returns_owning_output,
             facts: FxHashMap::default(),
         };
         visitor.visit_body(body);
@@ -5647,6 +5682,10 @@ fn collect_local_raw_param_summaries(
                 .entry((*def_id, param_index))
                 .or_default()
                 .direct_escape |= facts.direct_escape;
+            facts_by_param
+                .entry((*def_id, param_index))
+                .or_default()
+                .returned_to_owning_output |= facts.returned_to_owning_output;
             facts_by_param
                 .entry((*def_id, param_index))
                 .or_default()
@@ -5670,6 +5709,8 @@ fn collect_local_raw_param_summaries(
                     .any(|dep| summaries.get(dep) != Some(&LocalRawParamSummary::BorrowOnly))
             {
                 LocalRawParamSummary::Escapes
+            } else if facts.returned_to_owning_output {
+                LocalRawParamSummary::ReturnedToOwningOutput
             } else {
                 LocalRawParamSummary::BorrowOnly
             };
@@ -6328,10 +6369,11 @@ fn collect_unsupported_box_usage_bindings(
                     let Some(root) = self.owning_root_of(hir_id) else {
                         continue;
                     };
-                    if self
+                    if !self
                         .local_raw_param_summaries
                         .get(&(local_callee, arg_index))
-                        != Some(&LocalRawParamSummary::BorrowOnly)
+                        .copied()
+                        .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
                     {
                         self.bindings.insert(root);
                     }
@@ -7994,7 +8036,7 @@ mod tests {
         let free_like_wrappers = collect_local_free_wrappers(tcx);
         let local_raw_free_summaries = collect_local_raw_free_summaries(tcx, &free_like_wrappers);
         let local_raw_param_summaries =
-            collect_local_raw_param_summaries(tcx, &free_like_wrappers);
+            collect_local_raw_param_summaries(tcx, &sig_decs, &free_like_wrappers);
         let mut reason_map: FxHashMap<HirId, Vec<&'static str>> = FxHashMap::default();
         let mut usage_subreason_map: FxHashMap<HirId, Vec<&'static str>> = FxHashMap::default();
         let mut forced_raw_bindings = downgrade_unsupported_allocator_box_kinds(tcx, &ptr_kinds);
@@ -8222,10 +8264,11 @@ mod tests {
                         let Some(root) = self.owning_root_of(hir_id) else {
                             continue;
                         };
-                        if self
+                        if !self
                             .local_raw_param_summaries
                             .get(&(local_callee, arg_index))
-                            != Some(&LocalRawParamSummary::BorrowOnly)
+                            .copied()
+                            .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
                         {
                             self.record(root, "local_callee_non_borrow_only");
                         }
