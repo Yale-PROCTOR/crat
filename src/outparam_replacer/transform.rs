@@ -221,6 +221,10 @@ pub fn transform(
             path.push(name.as_str());
         }
         path.set_extension("rs");
+        path_to_mod_id.insert(path.clone(), mod_id);
+        // also handle the mod.rs convention (<module>/mod.rs)
+        path.set_extension("");
+        path.push("mod.rs");
         path_to_mod_id.insert(path, mod_id);
     });
 

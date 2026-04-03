@@ -147,7 +147,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 self.map_fn_decl_block_to_body(&mut sig.decl, body.as_mut().unwrap(), hbody);
             }
             ItemKind::Mod(_, ident, mod_kind) => {
-                let ModKind::Loaded(items, _, _, _) = mod_kind else { panic!() };
+                let ModKind::Loaded(items, _, _, _) = mod_kind else { return };
                 let hir::ItemKind::Mod(hident, hmod) = hitem.kind else { panic!() };
                 assert_eq!(*ident, hident);
                 // We assume that submodules exist only in expanded ASTs.
