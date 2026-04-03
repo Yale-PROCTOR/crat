@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rustc_ast::AttrStyle;
+use rustc_ast::{AttrStyle, ItemKind};
 use rustc_ast_pretty::pprust;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,7 +41,36 @@ struct SharedFile {
 
 struct ParsedRustFile {
     inner_attrs: Vec<String>,
-    items: Vec<String>,
+    items: Vec<ParsedItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ItemBucket {
+    Use,
+    ExternCrate,
+    ForeignMod,
+    Mod,
+    Other,
+    Global,
+    Type,
+    Trait,
+    Impl,
+    Fn,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedItem {
+    text: String,
+    bucket: ItemBucket,
+    group_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrderedItem {
+    text: String,
+    bucket: ItemBucket,
+    group_name: Option<String>,
+    first_seen: usize,
 }
 
 pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String> {
@@ -423,6 +452,7 @@ fn write_merged_rust_file(
     let mut ordered_items = Vec::new();
     let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
     let mut merged = String::new();
+    let mut next_first_seen = 0usize;
 
     for (variant_index, (_, path)) in variants.iter().enumerate() {
         let parsed = parse_rust_file(path)?;
@@ -438,24 +468,31 @@ fn write_merged_rust_file(
 
         let mut seen_in_variant = BTreeSet::new();
         for item in parsed.items {
-            if !seen_in_variant.insert(item.clone()) {
+            if !seen_in_variant.insert(item.text.clone()) {
                 continue;
             }
 
-            let variants_for_item = item_variants.entry(item.clone()).or_default();
+            let variants_for_item = item_variants.entry(item.text.clone()).or_default();
             if variants_for_item.is_empty() {
-                ordered_items.push(item.clone());
+                ordered_items.push(OrderedItem {
+                    text: item.text.clone(),
+                    bucket: item.bucket,
+                    group_name: item.group_name,
+                    first_seen: next_first_seen,
+                });
+                next_first_seen += 1;
             }
             variants_for_item.insert(variant_index);
         }
     }
 
-    for item in ordered_items {
-        if let Some(cfg) = merged_cfg_attribute(&item, &item_variants, translations, variants) {
+    for item in reorder_items(ordered_items) {
+        if let Some(cfg) = merged_cfg_attribute(&item.text, &item_variants, translations, variants)
+        {
             writeln!(merged, "{cfg}").unwrap();
-            writeln!(merged, "{item}").unwrap();
+            writeln!(merged, "{}", item.text).unwrap();
         } else {
-            writeln!(merged, "{item}").unwrap();
+            writeln!(merged, "{}", item.text).unwrap();
         }
     }
 
@@ -632,10 +669,85 @@ fn feature_clause(feature: &str) -> String {
     format!("feature = {feature:?}")
 }
 
+fn reorder_items(items: Vec<OrderedItem>) -> Vec<OrderedItem> {
+    let mut grouped_items = BTreeMap::<(ItemBucket, String), Vec<OrderedItem>>::new();
+    let mut ungrouped_items = Vec::new();
+
+    for item in items {
+        if should_group_bucket(item.bucket) {
+            let name = item
+                .group_name
+                .clone()
+                .expect("grouped item buckets must carry a name");
+            grouped_items
+                .entry((item.bucket, name))
+                .or_default()
+                .push(item);
+        } else {
+            ungrouped_items.push(item);
+        }
+    }
+
+    let mut group_order = grouped_items
+        .into_iter()
+        .map(|((bucket, _), mut items)| {
+            items.sort_by_key(|item| item.first_seen);
+            let first_seen = items[0].first_seen;
+            (bucket, first_seen, items)
+        })
+        .collect::<Vec<_>>();
+    group_order.sort_by_key(|(bucket, first_seen, _)| (*bucket, *first_seen));
+
+    ungrouped_items.sort_by_key(|item| (item.bucket, item.first_seen));
+
+    let mut ordered = Vec::with_capacity(
+        ungrouped_items.len()
+            + group_order
+                .iter()
+                .map(|(_, _, items)| items.len())
+                .sum::<usize>(),
+    );
+    let mut ungrouped_items = ungrouped_items.into_iter().peekable();
+    let mut group_order = group_order.into_iter().peekable();
+
+    for bucket in [
+        ItemBucket::Use,
+        ItemBucket::ExternCrate,
+        ItemBucket::ForeignMod,
+        ItemBucket::Mod,
+        ItemBucket::Other,
+        ItemBucket::Global,
+        ItemBucket::Type,
+        ItemBucket::Trait,
+        ItemBucket::Impl,
+        ItemBucket::Fn,
+    ] {
+        while matches!(ungrouped_items.peek(), Some(item) if item.bucket == bucket) {
+            ordered.push(ungrouped_items.next().unwrap());
+        }
+        while matches!(group_order.peek(), Some((group_bucket, _, _)) if *group_bucket == bucket) {
+            ordered.extend(group_order.next().unwrap().2);
+        }
+    }
+
+    ordered
+}
+
+fn should_group_bucket(bucket: ItemBucket) -> bool {
+    matches!(
+        bucket,
+        ItemBucket::Global | ItemBucket::Type | ItemBucket::Trait | ItemBucket::Fn
+    )
+}
+
 fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
     let source = fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
-    let krate = std::panic::catch_unwind(|| utils::ast::parse_crate(source))
-        .map_err(|_| format!("failed to parse {path:?}"))?;
+    parse_rust_source(&source).map_err(|_| format!("failed to parse {path:?}"))
+}
+
+fn parse_rust_source(source: &str) -> Result<ParsedRustFile, ()> {
+    let krate =
+        std::panic::catch_unwind(|| utils::ast::parse_crate(source.to_string())).map_err(|_| ())?;
 
     let inner_attrs = krate
         .attrs
@@ -646,9 +758,39 @@ fn parse_rust_file(path: &Path) -> Result<ParsedRustFile, String> {
     let items = krate
         .items
         .iter()
-        .map(|item| pprust::item_to_string(item))
+        .map(|item| ParsedItem {
+            text: pprust::item_to_string(item),
+            bucket: classify_item_kind(&item.kind),
+            group_name: grouped_item_name(item),
+        })
         .collect();
     Ok(ParsedRustFile { inner_attrs, items })
+}
+
+fn classify_item_kind(kind: &ItemKind) -> ItemBucket {
+    match kind {
+        ItemKind::Use(..) => ItemBucket::Use,
+        ItemKind::ExternCrate(..) => ItemBucket::ExternCrate,
+        ItemKind::ForeignMod(..) => ItemBucket::ForeignMod,
+        ItemKind::Mod(..) => ItemBucket::Mod,
+        ItemKind::Static(..) | ItemKind::Const(..) => ItemBucket::Global,
+        ItemKind::TyAlias(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::Struct(..) => {
+            ItemBucket::Type
+        }
+        ItemKind::Trait(..) | ItemKind::TraitAlias(..) => ItemBucket::Trait,
+        ItemKind::Impl(..) => ItemBucket::Impl,
+        ItemKind::Fn(..) => ItemBucket::Fn,
+        _ => ItemBucket::Other,
+    }
+}
+
+fn grouped_item_name(item: &rustc_ast::Item) -> Option<String> {
+    match classify_item_kind(&item.kind) {
+        ItemBucket::Global | ItemBucket::Type | ItemBucket::Trait | ItemBucket::Fn => {
+            item.kind.ident().map(|ident| ident.name.to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -658,7 +800,7 @@ mod tests {
         path::PathBuf,
     };
 
-    use super::{Translation, merged_cfg_attribute};
+    use super::{ItemBucket, OrderedItem, Translation, merged_cfg_attribute, reorder_items};
 
     fn translation(config: &[(&str, &str)]) -> Translation {
         let config = config
@@ -677,6 +819,27 @@ mod tests {
             config,
             features,
         }
+    }
+
+    fn ordered_item(
+        text: &str,
+        bucket: ItemBucket,
+        group_name: Option<&str>,
+        first_seen: usize,
+    ) -> OrderedItem {
+        OrderedItem {
+            text: text.to_string(),
+            bucket,
+            group_name: group_name.map(str::to_string),
+            first_seen,
+        }
+    }
+
+    fn reordered_item_texts(items: Vec<OrderedItem>) -> Vec<String> {
+        reorder_items(items)
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
     }
 
     #[test]
@@ -701,5 +864,155 @@ mod tests {
 
         let cfg = merged_cfg_attribute("fn shared() {}", &item_variants, &translations, &variants);
         assert_eq!(cfg, Some("#[cfg(feature = \"os_linux\")]".to_string()));
+    }
+
+    #[test]
+    fn reorder_items_uses_bucket_order() {
+        let items = reordered_item_texts(vec![
+            ordered_item("fn zeta() {}", ItemBucket::Fn, Some("zeta"), 0),
+            ordered_item("impl Foo {}", ItemBucket::Impl, None, 1),
+            ordered_item("trait Worker {}", ItemBucket::Trait, Some("Worker"), 2),
+            ordered_item("type Alias = i32;", ItemBucket::Type, Some("Alias"), 3),
+            ordered_item("struct Foo;", ItemBucket::Type, Some("Foo"), 4),
+            ordered_item(
+                "const VALUE: i32 = 1;",
+                ItemBucket::Global,
+                Some("VALUE"),
+                5,
+            ),
+            ordered_item("mod inner {}", ItemBucket::Mod, None, 6),
+            ordered_item(
+                "unsafe extern \"C\" {\n    fn foreign();\n}",
+                ItemBucket::ForeignMod,
+                None,
+                7,
+            ),
+            ordered_item("extern crate core;", ItemBucket::ExternCrate, None, 8),
+            ordered_item("use std::fmt;", ItemBucket::Use, None, 9),
+        ]);
+
+        assert_eq!(
+            items,
+            vec![
+                "use std::fmt;",
+                "extern crate core;",
+                "unsafe extern \"C\" {\n    fn foreign();\n}",
+                "mod inner {}",
+                "const VALUE: i32 = 1;",
+                "type Alias = i32;",
+                "struct Foo;",
+                "trait Worker {}",
+                "impl Foo {}",
+                "fn zeta() {}",
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_items_groups_types_traits_and_functions_by_name() {
+        let items = reordered_item_texts(vec![
+            ordered_item(
+                "fn zebra() {\n    let _ = 0;\n}",
+                ItemBucket::Fn,
+                Some("zebra"),
+                0,
+            ),
+            ordered_item(
+                "fn apple() {\n    let _ = 1;\n}",
+                ItemBucket::Fn,
+                Some("apple"),
+                1,
+            ),
+            ordered_item("trait Beta {}", ItemBucket::Trait, Some("Beta"), 2),
+            ordered_item("type Shared = i32;", ItemBucket::Type, Some("Shared"), 3),
+            ordered_item("struct Pair;", ItemBucket::Type, Some("Pair"), 4),
+            ordered_item(
+                "trait AliasName = Clone;",
+                ItemBucket::Trait,
+                Some("AliasName"),
+                5,
+            ),
+            ordered_item(
+                "fn apple() {\n    let _ = 2;\n}",
+                ItemBucket::Fn,
+                Some("apple"),
+                6,
+            ),
+            ordered_item("enum Shared {}", ItemBucket::Type, Some("Shared"), 7),
+            ordered_item(
+                "trait AliasName = Copy;",
+                ItemBucket::Trait,
+                Some("AliasName"),
+                8,
+            ),
+            ordered_item(
+                "union Pair {\n    field: i32,\n}",
+                ItemBucket::Type,
+                Some("Pair"),
+                9,
+            ),
+            ordered_item(
+                "fn zebra() {\n    let _ = 3;\n}",
+                ItemBucket::Fn,
+                Some("zebra"),
+                10,
+            ),
+        ]);
+
+        assert_eq!(
+            items,
+            vec![
+                "type Shared = i32;",
+                "enum Shared {}",
+                "struct Pair;",
+                "union Pair {\n    field: i32,\n}",
+                "trait Beta {}",
+                "trait AliasName = Clone;",
+                "trait AliasName = Copy;",
+                "fn zebra() {\n    let _ = 0;\n}",
+                "fn zebra() {\n    let _ = 3;\n}",
+                "fn apple() {\n    let _ = 1;\n}",
+                "fn apple() {\n    let _ = 2;\n}",
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_items_groups_globals_by_name() {
+        let items = reordered_item_texts(vec![
+            ordered_item("const BETA: i32 = 1;", ItemBucket::Global, Some("BETA"), 0),
+            ordered_item(
+                "static ALPHA: i32 = 2;",
+                ItemBucket::Global,
+                Some("ALPHA"),
+                1,
+            ),
+            ordered_item(
+                "const ALPHA: i32 = 3;",
+                ItemBucket::Global,
+                Some("ALPHA"),
+                2,
+            ),
+            ordered_item("const BETA: i32 = 4;", ItemBucket::Global, Some("BETA"), 3),
+            ordered_item("fn run() {}", ItemBucket::Fn, Some("run"), 4),
+            ordered_item(
+                "macro_rules! demo { () => {}; }",
+                ItemBucket::Other,
+                None,
+                5,
+            ),
+        ]);
+
+        assert_eq!(
+            items,
+            vec![
+                "macro_rules! demo { () => {}; }",
+                "const BETA: i32 = 1;",
+                "const BETA: i32 = 4;",
+                "static ALPHA: i32 = 2;",
+                "const ALPHA: i32 = 3;",
+                "fn run() {}",
+            ]
+        );
     }
 }
