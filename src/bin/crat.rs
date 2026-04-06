@@ -114,7 +114,10 @@ struct Args {
     unexpand_use_print: bool,
 
     // Pointer
-    #[arg(long, help = "Enable verbose ownership solver output for the pointer pass")]
+    #[arg(
+        long,
+        help = "Enable verbose ownership solver output for the pointer pass"
+    )]
     pointer_verbose: bool,
 
     #[arg(short, long, help = "Enable verbose output")]

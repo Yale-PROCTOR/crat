@@ -705,11 +705,8 @@ impl<'tcx> TransformVisitor<'tcx> {
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
-        let local_raw_param_summaries = collect_local_raw_param_summaries(
-            rust_program.tcx,
-            &sig_decs,
-            &free_like_wrappers,
-        );
+        let local_raw_param_summaries =
+            collect_local_raw_param_summaries(rust_program.tcx, &sig_decs, &free_like_wrappers);
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
@@ -2862,12 +2859,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                 && let PtrExprProj::Offset(offset) = pe.projs[0]
             {
                 // if there are only offsets, we can use the original slice and let the cursor handle the offsets
-                let cursor_base = if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice))
-                {
-                    self.opt_boxed_slice_view_expr(pe.base, m)
-                } else {
-                    pe.base.clone()
-                };
+                let cursor_base =
+                    if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice)) {
+                        self.opt_boxed_slice_view_expr(pe.base, m)
+                    } else {
+                        pe.base.clone()
+                    };
                 utils::expr!(
                     "{}::with_pos({}{}, ({}) as usize)",
                     cursor_ty,
@@ -5666,7 +5663,10 @@ fn collect_local_raw_param_summaries(
         };
         let body = tcx.hir_body(body);
         let returns_owning_output = sig_decs.data.get(def_id).is_some_and(|sig_dec| {
-            matches!(sig_dec.output_dec, Some(PtrKind::OptBox | PtrKind::OptBoxedSlice))
+            matches!(
+                sig_dec.output_dec,
+                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
+            )
         });
         let mut visitor = RawParamSummaryVisitor {
             tcx,
@@ -6722,7 +6722,7 @@ mod tests {
     use super::*;
     use crate::{
         analyses::{self, mir_variable_grouping::SourceVarGroups},
-        rewriter::{replace_local_borrows, Config},
+        rewriter::{Config, replace_local_borrows},
         utils::rustc::RustProgram,
     };
 
@@ -7145,7 +7145,11 @@ mod tests {
                 }
 
                 if let hir::ExprKind::Unary(hir::UnOp::Deref, inner) = expr.kind
-                    && self.tcx.typeck(expr.hir_id.owner).expr_ty(inner).is_raw_ptr()
+                    && self
+                        .tcx
+                        .typeck(expr.hir_id.owner)
+                        .expr_ty(inner)
+                        .is_raw_ptr()
                     && root_of_raw_expr(inner, &self.root_of_local).is_some()
                 {
                     self.stats.dereferences += 1;
@@ -7156,7 +7160,11 @@ mod tests {
                     && (hir_call_matches_foreign_name(self.tcx, expr, "free")
                         || hir_called_local_fn(self.tcx, expr)
                             .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id)))
-                    && self.tcx.typeck(expr.hir_id.owner).expr_ty(&args[0]).is_raw_ptr()
+                    && self
+                        .tcx
+                        .typeck(expr.hir_id.owner)
+                        .expr_ty(&args[0])
+                        .is_raw_ptr()
                     && root_of_raw_expr(&args[0], &self.root_of_local).is_some()
                 {
                     self.stats.frees += 1;
@@ -7228,17 +7236,19 @@ mod tests {
         }
 
         impl<'a, 'tcx> Visitor<'a, 'tcx> {
-            fn register_root(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>, lhs_ty: ty::Ty<'tcx>) {
+            fn register_root(
+                &mut self,
+                hir_id: HirId,
+                rhs: &'tcx hir::Expr<'tcx>,
+                lhs_ty: ty::Ty<'tcx>,
+            ) {
                 let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
                     return;
                 };
                 let state = RootState {
                     site: TrackedSemanticAllocSite {
                         hir_id,
-                        fn_name: self
-                            .tcx
-                            .item_name(self.did.to_def_id())
-                            .to_string(),
+                        fn_name: self.tcx.item_name(self.did.to_def_id()).to_string(),
                         binding_name: self.tcx.hir_name(hir_id).to_string(),
                         rhs_snippet: normalized_hir_snippet(self.tcx, rhs),
                         kind: classify_semantic_allocator_kind(self.tcx, lhs_inner_ty, rhs),
@@ -7538,22 +7548,22 @@ mod tests {
         }
     }
 
-    fn analyze_pointer_safety_for_code(code: &str) -> (PointerSafetyAnalysisResult, RewrittenUnsafeStats) {
+    fn analyze_pointer_safety_for_code(
+        code: &str,
+    ) -> (PointerSafetyAnalysisResult, RewrittenUnsafeStats) {
         let result = ::utils::compilation::run_compiler_on_str(code, |tcx| {
             analyze_pointer_safety_for_program(tcx, "<snippet>")
         })
         .unwrap();
         let tracked_bindings = tracked_binding_specs_from_sites(&result.tracked_sites);
-        let (rewritten, _) =
-            ::utils::compilation::run_compiler_on_str(code, |tcx| {
-                replace_local_borrows(&Config::default(), tcx)
-            })
-            .unwrap();
-        let mut after =
-            ::utils::compilation::run_compiler_on_str(&rewritten, |tcx| {
-                collect_rewritten_tracked_unsafe_stats(tcx, &tracked_bindings)
-            })
-            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        let mut after = ::utils::compilation::run_compiler_on_str(&rewritten, |tcx| {
+            collect_rewritten_tracked_unsafe_stats(tcx, &tracked_bindings)
+        })
+        .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
         after.bridge_calls = bridge_call_counts_from_source(&rewritten);
         (result, after)
     }
@@ -7984,15 +7994,27 @@ pub unsafe fn free_scalar() {
         assert_eq!(
             analysis.before_total,
             SafetyBeforeStats {
-                allocation_sites: SplitKindCounts { scalar: 1, array: 0 },
-                dereferences: SplitKindCounts { scalar: 1, array: 0 },
-                frees: SplitKindCounts { scalar: 1, array: 0 },
+                allocation_sites: SplitKindCounts {
+                    scalar: 1,
+                    array: 0
+                },
+                dereferences: SplitKindCounts {
+                    scalar: 1,
+                    array: 0
+                },
+                frees: SplitKindCounts {
+                    scalar: 1,
+                    array: 0
+                },
             }
         );
         assert_eq!(analysis.before_outermost, analysis.before_total);
         assert_eq!(
             analysis.safe_box_sites,
-            SplitKindCounts { scalar: 1, array: 0 }
+            SplitKindCounts {
+                scalar: 1,
+                array: 0
+            }
         );
         assert_eq!(after.dereferences, 0);
         assert_eq!(after.frees, 0);
@@ -8018,15 +8040,27 @@ pub unsafe fn free_array() {
         assert_eq!(
             analysis.before_total,
             SafetyBeforeStats {
-                allocation_sites: SplitKindCounts { scalar: 0, array: 1 },
-                dereferences: SplitKindCounts { scalar: 0, array: 1 },
-                frees: SplitKindCounts { scalar: 0, array: 1 },
+                allocation_sites: SplitKindCounts {
+                    scalar: 0,
+                    array: 1
+                },
+                dereferences: SplitKindCounts {
+                    scalar: 0,
+                    array: 1
+                },
+                frees: SplitKindCounts {
+                    scalar: 0,
+                    array: 1
+                },
             }
         );
         assert_eq!(analysis.before_outermost, analysis.before_total);
         assert_eq!(
             analysis.safe_box_sites,
-            SplitKindCounts { scalar: 0, array: 1 }
+            SplitKindCounts {
+                scalar: 0,
+                array: 1
+            }
         );
         assert_eq!(after.dereferences, 0);
         assert_eq!(after.frees, 0);
@@ -8146,8 +8180,14 @@ pub unsafe fn mixed(arg: *mut i32) -> i32 {
         assert_eq!(
             analysis.before_total,
             SafetyBeforeStats {
-                allocation_sites: SplitKindCounts { scalar: 1, array: 0 },
-                dereferences: SplitKindCounts { scalar: 1, array: 0 },
+                allocation_sites: SplitKindCounts {
+                    scalar: 1,
+                    array: 0
+                },
+                dereferences: SplitKindCounts {
+                    scalar: 1,
+                    array: 0
+                },
                 frees: SplitKindCounts::default(),
             }
         );
