@@ -482,29 +482,3 @@ fn main() {
 "#;
     run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
 }
-
-#[test]
-fn test_main_unsafe_block_preserved_when_args_conversion_is_unsafe() {
-    let code = r#"
-pub fn main_0(mut argv: Option<&mut *mut core::ffi::c_char>) -> i32 {
-    if argv.is_some() { 0 } else { 1 }
-}
-
-pub fn main() {
-    let mut args: Vec<*mut core::ffi::c_char> = Vec::new();
-    args.push(::std::ptr::null_mut());
-    unsafe {
-        ::std::process::exit(main_0(args.as_mut_ptr().as_mut()) as i32)
-    }
-}
-"#;
-    run_transformation_test(
-        code,
-        false,
-        &[
-            "unsafe {",
-            "::std::process::exit(main_0(args.as_mut_ptr().as_mut()) as i32)",
-        ],
-        &[],
-    );
-}

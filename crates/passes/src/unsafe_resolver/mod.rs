@@ -271,7 +271,6 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
                 && let [stmt] = &mut block.stmts[..]
                 && let ast::StmtKind::Expr(expr1) = &mut stmt.kind
                 && let ast::ExprKind::Call(_, args) = &expr1.kind
-                && let Some(hir_expr1) = self.ast_to_hir.get_expr(expr1.id, self.tcx)
                 && let [arg] = &args[..]
                 && let ast::ExprKind::Call(callee, _) = &arg.kind
                 && let Some(hir_callee) = self.ast_to_hir.get_expr(callee.id, self.tcx)
@@ -279,7 +278,6 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
                 && let Res::Def(_, def_id) = path.res
                 && let Some(def_id) = def_id.as_local()
                 && !self.unsafe_fns.contains(&def_id)
-                && !expr_requires_unsafe(hir_expr1, self.tcx)
             {
                 **expr0 = utils::ast::take_expr(expr1);
             }
@@ -592,23 +590,6 @@ impl unsafety::UnsafetyHandler for UnsafetyHandler {
         }
         self.is_unsafe = true;
     }
-}
-
-#[derive(Default)]
-struct UnsafeSpanHandler {
-    spans: Vec<Span>,
-}
-
-impl unsafety::UnsafetyHandler for UnsafeSpanHandler {
-    fn handle_unsafety(&mut self, _: unsafety::UnsafeOpKind, span: Span, _: TyCtxt<'_>) {
-        self.spans.push(span);
-    }
-}
-
-fn expr_requires_unsafe(expr: &hir::Expr<'_>, tcx: TyCtxt<'_>) -> bool {
-    let mut handler = UnsafeSpanHandler::default();
-    unsafety::check_unsafety(expr.hir_id.owner.def_id, &mut handler, tcx);
-    handler.spans.into_iter().any(|span| expr.span.contains(span))
 }
 
 fn find_unsafe_fns(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
