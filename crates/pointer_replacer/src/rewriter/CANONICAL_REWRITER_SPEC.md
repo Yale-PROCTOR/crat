@@ -629,21 +629,10 @@ If no local-path kind match applies:
 ### 8.4 B02 test suite
 - Historical note:
   - earlier revisions used a corpus-backed B02 harness under `crates/pointer_replacer/src/analyses/B02_tests/`
-  - the current checked-in tree reintroduces a corpus-backed rewrite sweep as an ignored rewriter-local test:
-    - `crates/pointer_replacer/src/rewriter/mod.rs`
-    - `rewriter::tests::b02_corpus_rewrite_sweep_records_option_box_rewrites`
-  - current checked-in validation for this branch is represented by the direct regressions in `tests.rs`, white-box transform tests, and the ignored B02 rewrite sweep
+  - current checked-in validation for this branch is represented by the direct regressions in `tests.rs` and the white-box transform tests
     - `primary_unlock_wrapper_generalization=33`
     - `alloc_policy_status:admissible_current_policy=5`
-  - the ignored B02 sweep:
-    - walks every `B02-translated-rust/*/*` crate with a `Cargo.toml`
-    - rewrites each crate's library entry through `replace_local_borrows`
-    - compiles the rewritten output
-    - prints a per-project census of raw-pointer type counts before/after plus added `Option<Box<T>>` and `Option<Box<[T]>>` type counts
-  - the ignored B02 safety-stats harness:
-    - lives in `crates/pointer_replacer/src/rewriter/transform/mod.rs`
-    - `rewriter::transform::tests::b02_corpus_pointer_safety_before_after_stats`
-    - uses a semantic site model rather than token counts
+  - corpus-backed sweeps over local `B02-translated-rust/*/*` trees are not part of the checked-in test suite
     - counts transform-relevant allocator roots (`malloc` / `calloc` / `realloc(null_like, ...)`) and attributes raw dereferences / free-like teardown to those roots through local-alias tracking
     - defines `outermost` using the current rewrite surface only:
       - direct local-bound allocator roots that do not escape into projection storage
@@ -748,9 +737,6 @@ If no local-path kind match applies:
 
 ### 8.5 Standard commands used for validation
 - `cargo test -p pointer_replacer`
-- `cargo test -p pointer_replacer b02_corpus_rewrite_sweep_records_option_box_rewrites -- --ignored --nocapture`
-- `cargo test -p pointer_replacer b02_corpus_pointer_translation_compile_gate -- --ignored --nocapture`
-- `cargo test -p pointer_replacer b02_corpus_pointer_safety_before_after_stats -- --ignored --nocapture`
 - `cargo test -p pointer_replacer ownership_analysis::malloc_source_marks_return_as_owning`
 - `cargo test -p pointer_replacer ownership_analysis::free_sink_clears_ownership_before_return`
 - `cargo test -p pointer_replacer ownership_analysis::solidify_marks_return_local_as_owning_for_malloc`
