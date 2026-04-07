@@ -120,9 +120,11 @@ fn conservative<'tcx>(
             if let Some(aliased_with) = local_aliases.get(&arg) {
                 for &local in aliased_with {
                     if !body.args_iter().any(|a| a == local) {
-                        let def_path_str = tcx.def_path_str(body_did);
                         #[cfg(debug_assertions)]
-                        eprintln!("@{def_path_str}: {arg:?} removed because it aliases {local:?}");
+                        eprintln!(
+                            "@{}: {arg:?} removed because it aliases {local:?}",
+                            tcx.def_path_str(body_did)
+                        );
                         output_params.remove(arg);
                         break;
                     }
@@ -174,10 +176,10 @@ fn iterate<'tcx>(
             .unwrap_or(false);
 
         if !aliases_non_params {
-            let def_path_str = tcx.def_path_str(body_did);
             #[cfg(debug_assertions)]
             eprintln!(
-                "@{def_path_str}: {arg:?} added because it aliases a transitive output position temporary"
+                "@{}: {arg:?} added because it aliases a transitive output position temporary",
+                tcx.def_path_str(body_did)
             );
             changed = changed || output_params.insert(arg);
         }

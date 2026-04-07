@@ -69,19 +69,6 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         &self.model.raw[start.index()..end.index()]
     }
 
-    #[cfg(test)]
-    pub fn fn_sig(
-        &self,
-        r#fn: &DefId,
-        tcx: rustc_middle::ty::TyCtxt,
-    ) -> impl Iterator<Item = &[Qualifier]> {
-        let fn_result = self.fn_results(r#fn);
-        let body = &tcx
-            .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
-            .borrow();
-        fn_result.results().take(body.arg_count + 1)
-    }
-
     pub fn place_result<'tcx>(&self, body: &Body<'tcx>, place: &Place<'tcx>) -> &[Qualifier] {
         let mut ptr_kinds = self
             .fn_results(&body.source.def_id())
@@ -119,13 +106,6 @@ pub struct FnResult<'me, Domain> {
 }
 
 impl<'me, Domain> FnResult<'me, Domain> {
-    #[cfg(test)]
-    pub fn results(self) -> impl Iterator<Item = &'me [Domain]> {
-        self.locals
-            .array_windows()
-            .map(|&[start, end]| &self.model.raw[start.index()..end.index()])
-    }
-
     pub fn local_result(self, local: Local) -> &'me [Domain] {
         let (start, end) = (self.locals[local.index()], self.locals[local.index() + 1]);
         &self.model.raw[start.index()..end.index()]

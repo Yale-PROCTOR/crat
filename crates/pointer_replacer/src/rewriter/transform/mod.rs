@@ -6793,7 +6793,6 @@ mod tests {
         hir_id: HirId,
         fn_name: String,
         binding_name: String,
-        rhs_snippet: String,
         kind: SafetyAllocKind,
         outermost: bool,
         shape: SafetySiteShape,
@@ -6885,19 +6884,11 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct OutermostReasonRecord {
-        reason: &'static str,
-        example: String,
-        usage_subreasons: Vec<&'static str>,
-    }
-
-    #[derive(Clone, Debug)]
     struct PointerSafetyAnalysisResult {
         before_total: SafetyBeforeStats,
         before_outermost: SafetyBeforeStats,
         safe_box_sites: SplitKindCounts,
         tracked_sites: Vec<TrackedSemanticAllocSite>,
-        outermost_reasons: Vec<OutermostReasonRecord>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -6917,25 +6908,6 @@ mod tests {
             }
             _ => false,
         }
-    }
-
-    fn hir_is_direct_malloc_or_calloc(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
-        matches!(
-            hir_call_name(expr),
-            Some(name) if name == Symbol::intern("malloc") || name == Symbol::intern("calloc")
-        ) && !matches!(
-            hir_call_name(expr),
-            Some(name) if name == Symbol::intern("realloc") && hir_is_null_like_ptr_arg(tcx, expr)
-        )
-    }
-
-    fn normalized_hir_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> String {
-        tcx.sess
-            .source_map()
-            .span_to_snippet(expr.span)
-            .ok()
-            .map(|snippet| snippet.split_whitespace().collect::<Vec<_>>().join(" "))
-            .unwrap_or_else(|| "<snippet unavailable>".to_string())
     }
 
     fn classify_semantic_allocator_kind<'tcx>(
@@ -7211,7 +7183,6 @@ mod tests {
                         hir_id,
                         fn_name: self.tcx.item_name(self.did.to_def_id()).to_string(),
                         binding_name: self.tcx.hir_name(hir_id).to_string(),
-                        rhs_snippet: normalized_hir_snippet(self.tcx, rhs),
                         kind: classify_semantic_allocator_kind(self.tcx, lhs_inner_ty, rhs),
                         outermost: false,
                         shape: SafetySiteShape::NonOutermostLocalRoot,
@@ -7416,27 +7387,16 @@ mod tests {
         sites
     }
 
-    fn tracked_site_example(project: &str, site: &TrackedSemanticAllocSite) -> String {
-        format!(
-            "{project}::{}::{} => {}",
-            site.fn_name, site.binding_name, site.rhs_snippet
-        )
-    }
-
-    fn analyze_pointer_safety_for_program(
-        tcx: TyCtxt<'_>,
-        project: &str,
-    ) -> PointerSafetyAnalysisResult {
+    fn analyze_pointer_safety_for_program(tcx: TyCtxt<'_>) -> PointerSafetyAnalysisResult {
         let (input, analysis) = build_analysis(tcx);
         let tracked_sites = collect_semantic_allocator_sites(tcx, &input);
         let initial_ptr_kinds = collect_diffs(&input, &analysis);
-        let (_sig_decs, final_ptr_kinds, reason_map, usage_subreason_map) =
+        let (_sig_decs, final_ptr_kinds, _reason_map, _usage_subreason_map) =
             simulate_transform_reasons(tcx, &input, &analysis);
 
         let mut before_total = SafetyBeforeStats::default();
         let mut before_outermost = SafetyBeforeStats::default();
         let mut safe_box_sites = SplitKindCounts::default();
-        let mut outermost_reasons = Vec::new();
 
         let mir_local_maps = input
             .functions
@@ -7467,8 +7427,10 @@ mod tests {
                 _ => {}
             }
 
-            let initial_kind = initial_ptr_kinds.get(&site.hir_id).copied();
-            let reason = if matches!(initial_kind, Some(PtrKind::Raw(_))) {
+            if matches!(
+                initial_ptr_kinds.get(&site.hir_id).copied(),
+                Some(PtrKind::Raw(_))
+            ) {
                 let did = site.hir_id.owner.def_id;
                 let hir_to_mir = mir_local_maps
                     .get(&did)
@@ -7478,26 +7440,14 @@ mod tests {
                     .get(&site.hir_id)
                     .expect("expected tracked site local mapping");
                 let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-                classify_initial_raw_reason(&analysis, did, local, &body.local_decls[local], tcx)
-            } else {
-                reason_map
-                    .get(&site.hir_id)
-                    .and_then(|reasons| reasons.first().copied())
-                    .unwrap_or("other")
-            };
-
-            outermost_reasons.push(OutermostReasonRecord {
-                reason,
-                example: tracked_site_example(project, site),
-                usage_subreasons: if reason == "unsupported_box_usage" {
-                    usage_subreason_map
-                        .get(&site.hir_id)
-                        .cloned()
-                        .unwrap_or_else(|| vec!["unknown_usage"])
-                } else {
-                    Vec::new()
-                },
-            });
+                let _ = classify_initial_raw_reason(
+                    &analysis,
+                    did,
+                    local,
+                    &body.local_decls[local],
+                    tcx,
+                );
+            }
         }
 
         PointerSafetyAnalysisResult {
@@ -7505,7 +7455,6 @@ mod tests {
             before_outermost,
             safe_box_sites,
             tracked_sites,
-            outermost_reasons,
         }
     }
 
@@ -7513,7 +7462,7 @@ mod tests {
         code: &str,
     ) -> (PointerSafetyAnalysisResult, RewrittenUnsafeStats) {
         let result = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            analyze_pointer_safety_for_program(tcx, "<snippet>")
+            analyze_pointer_safety_for_program(tcx)
         })
         .unwrap();
         let tracked_bindings = tracked_binding_specs_from_sites(&result.tracked_sites);

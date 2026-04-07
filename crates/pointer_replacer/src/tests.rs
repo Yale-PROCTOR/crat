@@ -208,6 +208,7 @@ pub unsafe fn foo() -> *mut i32 {
     );
 }
 
+#[test]
 fn test_rewriter_keeps_explicit_fn_pointer_return_signature_raw() {
     run_test(
         r#"
@@ -1748,6 +1749,7 @@ pub unsafe fn caller() -> *mut i32 {
     );
 }
 
+#[test]
 fn test_rewriter_mixed_return_shapes_do_not_infer_box_signature() {
     run_test(
         r#"

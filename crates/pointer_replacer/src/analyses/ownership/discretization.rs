@@ -42,12 +42,3 @@ impl<Idx: Copy> StructFields<Idx> {
         self.0.content(did, f)
     }
 }
-
-impl<Idx: Copy> FnLocals<Idx> {
-    /// [`locals()`] returns a slice of [`Range<Var>`] that is in lock-step with [`local_decls`]
-    /// #[inline]
-    #[cfg(test)]
-    pub fn locals(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
-        self.0.contents_iter(did)
-    }
-}
