@@ -3,12 +3,17 @@
 #![feature(box_patterns)]
 #![feature(min_specialization)]
 #![feature(allocator_api)]
+#![feature(step_trait)]
+#![feature(trusted_step)]
+#![feature(impl_trait_in_assoc_type)]
 #![warn(unused_extern_crates)]
 
+extern crate either;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_const_eval;
+extern crate rustc_data_structures;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;

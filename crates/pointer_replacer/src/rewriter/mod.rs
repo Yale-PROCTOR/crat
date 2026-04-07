@@ -14,6 +14,11 @@ use crate::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
         offset_sign::sign::OffsetSignResult,
+        output_params::OutputParams,
+        ownership::{
+            AnalysisKind as OwnershipAnalysisKind, CrateCtxt, solidify::SolidifiedOwnershipSchemes,
+            whole_program::WholeProgramAnalysis,
+        },
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -29,12 +34,18 @@ pub struct Analysis {
     mutability_result: MutabilityResult,
     fatness_result: FatnessResult,
     aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
+    output_params: OutputParams,
+    ownership_schemes: Option<SolidifiedOwnershipSchemes>,
     offset_sign_result: OffsetSignResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
+    #[serde(default)]
+    pub verbose: bool,
+    #[cfg(test)]
+    pub force_ownership_analysis_failure: bool,
 }
 
 pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
@@ -75,6 +86,9 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+    let output_params =
+        analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+    let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
     let (mutable_references, shared_references) =
@@ -93,6 +107,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         mutability_result,
         fatness_result,
         aliases,
+        output_params,
+        ownership_schemes,
         offset_sign_result,
     };
 
@@ -108,6 +124,23 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     }
 
     (code, visitor.bytemuck.get())
+}
+
+fn maybe_solidified_ownership<'tcx>(
+    _config: &Config,
+    input: &RustProgram<'tcx>,
+    output_params: &OutputParams,
+) -> Option<SolidifiedOwnershipSchemes> {
+    #[cfg(test)]
+    if _config.force_ownership_analysis_failure {
+        return None;
+    }
+
+    let _verbose_guard = crate::analyses::ownership::whole_program::set_verbose(_config.verbose);
+    let crate_ctxt = CrateCtxt::new(input);
+    <WholeProgramAnalysis as OwnershipAnalysisKind>::analyze(crate_ctxt, output_params)
+        .ok()
+        .map(|results| results.solidify(input))
 }
 
 fn find_param_aliases<'tcx>(

@@ -4,8 +4,13 @@
 
 ## Setup
 
-There is no specific requirement to build and run Crat. Just make sure that you
-have Cargo installed.
+To build and run ownership analysis, install the Z3 development package and Cargo.
+
+On Ubuntu/Debian:
+
+```bash
+apt-get install libz3-dev
+```
 
 ## Preparation
 
@@ -78,7 +83,7 @@ To compile and run benchmark programs, the following packages and tools are
 required:
 
 ```bash
-apt-get install curl freeglut3-dev gcc git less libao-dev libasound2-dev \
+apt-get install curl freeglut3-dev g++ gcc git less libao-dev libasound2-dev \
   libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libc6-dev \
   libcrypt-dev libcurl4-gnutls-dev libev-dev libevent-dev libfftw3-dev \
   libfuse-dev libfuse3-dev libgcrypt20-dev libgl-dev libglu1-mesa-dev \
@@ -98,7 +103,7 @@ pip install pytest cram
 In addition, the username should be `ubuntu`, and using Ubuntu 20.04 is
 recommended.
 
-You may use the `kaistplrg/crat-test-user:1.1.2` Docker image, which meets the
+You may use the `kaistplrg/crat-test-user:1.2.0` Docker image, which meets the
 above requirements.
 
 Benchmark programs are under `benchmarks/rs`. Each directory corresponds to each

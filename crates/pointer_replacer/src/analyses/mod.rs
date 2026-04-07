@@ -5,4 +5,6 @@ mod liveness;
 mod mir;
 pub mod mir_variable_grouping;
 pub mod offset_sign;
+pub(crate) mod output_params;
+pub mod ownership;
 pub mod type_qualifier;

@@ -3,3 +3,4 @@ benchmarks/**/Cargo.lock
 benchmarks/analyses/
 benchmarks/tmp
 benchmarks/rs-*
+.z3-trace

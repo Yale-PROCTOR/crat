@@ -1,4 +1,4 @@
-use small_vec::{SmallVec, smallvec_inline};
+// SmallVec lattice impls removed to avoid requiring const_smallvec support.
 
 pub trait Lattice: Eq + HasBottom + HasTop {
     #[allow(unused)]
@@ -88,41 +88,5 @@ impl Lattice for bool {
         }
 
         false
-    }
-}
-
-impl<const N: usize, L> HasBottom for SmallVec<[L; N]>
-where L: Lattice
-{
-    const BOTTOM: Self = smallvec_inline![L::BOTTOM; N];
-}
-
-impl<const N: usize, L> HasTop for SmallVec<[L; N]>
-where L: Lattice
-{
-    const TOP: Self = smallvec_inline![L::TOP; N];
-}
-
-impl<const N: usize, L> Lattice for SmallVec<[L; N]>
-where L: Lattice
-{
-    fn join(&mut self, other: &Self) -> bool {
-        assert_eq!(self.len(), other.len());
-
-        let mut changed = false;
-        for (a, b) in itertools::izip!(self, other) {
-            changed |= a.join(b);
-        }
-        changed
-    }
-
-    fn meet(&mut self, other: &Self) -> bool {
-        assert_eq!(self.len(), other.len());
-
-        let mut changed = false;
-        for (a, b) in itertools::izip!(self, other) {
-            changed |= a.meet(b);
-        }
-        changed
     }
 }
