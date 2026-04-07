@@ -13,28 +13,16 @@ mod vec_vec;
 use rustc_middle::mir::Body;
 use serde::{Deserialize, Serialize};
 
-use self::infer::InferCtxt;
 use crate::{
     analyses::{
         output_params::OutputParams,
         ownership::ssa::{
-            AnalysisResults,
-            constraint::{CadicalDatabase, Database, Gen, infer::Renamer},
-            consume::{Consume, Voidable, initial_definitions},
-            dom::compute_dominance_frontier,
-            state::SSAState,
+            constraint::Database,
+            consume::{Consume, Voidable},
         },
     },
     utils::rustc::RustProgram,
 };
-
-pub trait OwnershipSchemes<'analysis>:
-    AnalysisResults<'analysis, Value = Ownership, Param = Param<&'analysis [Ownership]>>
-{
-}
-
-impl<'analysis, Results> OwnershipSchemes<'analysis> for Results where Results: AnalysisResults<'analysis, Value = Ownership, Param = Param<&'analysis [Ownership]>>
-{}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Ownership {
@@ -109,7 +97,7 @@ impl<Value> Param<Value> {
         }
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn expect_output(self) -> Consume<Value> {
         match self {
             Param::Output(consume) => consume,
@@ -118,7 +106,7 @@ impl<Value> Param<Value> {
     }
 
     #[inline]
-    pub fn to_input(self) -> Value {
+    pub fn into_input(self) -> Value {
         match self {
             Param::Output(Consume { r#use, .. }) => r#use,
             Param::Normal(normal) => normal,
@@ -126,7 +114,7 @@ impl<Value> Param<Value> {
     }
 
     #[inline]
-    pub fn to_output(self) -> Option<Value> {
+    pub fn into_output(self) -> Option<Value> {
         if let Param::Output(Consume { def, .. }) = self {
             Some(def)
         } else {
@@ -182,67 +170,6 @@ impl<'tcx> CrateCtxt<'tcx> {
     #[inline]
     pub fn fns(&self) -> &[rustc_hir::def_id::DefId] {
         self.fn_ctxt.fns()
-    }
-
-    #[inline]
-    pub fn structs(&self) -> &[rustc_hir::def_id::DefId] {
-        self.struct_ctxt.structs_in_post_order()
-    }
-}
-
-pub enum Modular {}
-impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for Modular {
-    type DB = ();
-    type InterCtxt = ();
-    type Results = ();
-
-    fn analyze(_: CrateCtxt, _: &OutputParams) -> anyhow::Result<Self::Results> {
-        // TODO implement this
-        anyhow::bail!("modular analysis is not implemented")
-    }
-}
-
-pub enum IntraProcedural {}
-impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for IntraProcedural {
-    type DB = CadicalDatabase;
-    type InterCtxt = ();
-    type Results = ();
-
-    fn analyze(crate_ctxt: CrateCtxt, _: &OutputParams) -> anyhow::Result<Self::Results> {
-        // let mut databases = Vec::with_capacity(crate_ctxt.fns().len());
-        for &did in crate_ctxt.fns() {
-            println!("solving {:?}", did);
-            let body = &*crate_ctxt
-                .tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
-                .borrow();
-
-            let dominance_frontier = compute_dominance_frontier(body);
-            let definitions = initial_definitions(body, &crate_ctxt);
-            let ssa_state = SSAState::new(body, &dominance_frontier, definitions);
-            let mut rn = Renamer::new(body, ssa_state, crate_ctxt.tcx);
-
-            let mut var_gen = Gen::new();
-            let mut database = CadicalDatabase::new();
-            let global_assumptions =
-                crate::analyses::ownership::ssa::constraint::GlobalAssumptions::new(
-                    &crate_ctxt,
-                    &mut var_gen,
-                    &mut database,
-                );
-            let mut infer_cx = InferCtxt::new(
-                &crate_ctxt,
-                0,
-                body,
-                &mut database,
-                &mut var_gen,
-                (),
-                &global_assumptions,
-            );
-
-            rn.go::<Self>(&mut infer_cx);
-        }
-        Ok(())
     }
 }
 

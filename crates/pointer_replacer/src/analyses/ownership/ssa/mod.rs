@@ -1,8 +1,5 @@
 use rustc_hir::def_id::DefId;
-use rustc_middle::{
-    mir::{Local, Location},
-    ty::TyCtxt,
-};
+use rustc_middle::mir::{Local, Location};
 
 use self::consume::Consume;
 
@@ -31,5 +28,4 @@ pub trait AnalysisResults<'a> {
     fn fn_results(&'a self, r#fn: DefId) -> Option<Self::FnResults>;
 
     fn fn_sig(&'a self, r#fn: DefId) -> Self::FnSig;
-    fn print_fn_sigs(&'a self, tcx: TyCtxt, fns: &[DefId]);
 }

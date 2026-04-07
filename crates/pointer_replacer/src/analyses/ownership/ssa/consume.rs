@@ -17,6 +17,8 @@ use crate::analyses::ownership::{
     vec_vec::{VecVec, VecVecConstruction},
 };
 
+type ConsumeEntry = SmallVec<[(Local, Consume<SSAIdx>); 2]>;
+
 /// TODO unify call argument temporaries and deref copy temporaries as proxy
 /// temporaries
 pub struct Definitions {
@@ -24,7 +26,7 @@ pub struct Definitions {
     ///
     /// We've made an assumption that a local can only be used or defined
     /// once in a statement/terminator
-    pub consumes: VecVec<SmallVec<[(Local, Consume<SSAIdx>); 2]>>,
+    pub consumes: VecVec<ConsumeEntry>,
     pub def_sites: IndexVec<Local, DenseBitSet<BasicBlock>>,
     /// Caching the results of calling [local_has_non_zero_measure]
     pub locals_with_defs: DenseBitSet<Local>,
@@ -63,16 +65,6 @@ impl<T: Voidable> Consume<T> {
     #[inline]
     pub fn is_use(&self) -> bool {
         !self.r#use.is_void() && self.def.is_void()
-    }
-
-    #[inline]
-    pub fn is_invalid(&self) -> bool {
-        self.r#use.is_void() && self.def.is_void()
-    }
-
-    #[inline]
-    pub fn valid(self) -> Option<Self> {
-        (!self.is_invalid()).then_some(self)
     }
 
     /// Invalid argument preserving map. This is so because `f` may not work on invalid
@@ -131,20 +123,20 @@ const _: () = assert!(0 == std::mem::size_of::<Consume<()>>());
 #[derive(Clone, Copy, Debug)]
 pub enum RichLocation {
     Entry,
-    Phi(BasicBlock),
-    Mir(Location),
+    Phi,
+    Mir,
 }
 
 impl From<Location> for RichLocation {
-    fn from(location: Location) -> Self {
-        RichLocation::Mir(location)
+    fn from(_: Location) -> Self {
+        RichLocation::Mir
     }
 }
 
 /// In ownership analysis, use happens only at definition
 pub struct ConsumeChain {
     /// ssa index for each consumption
-    pub consumes: VecVec<SmallVec<[(Local, Consume<SSAIdx>); 2]>>,
+    pub consumes: VecVec<ConsumeEntry>,
     /// location of each definition
     ///
     /// Those locals with empty entries definitely do not contain pointers
@@ -167,11 +159,11 @@ impl ConsumeChain {
             .local_decls
             .indices()
             .map(|local| {
-                maybe_owning
-                    .contains(local)
-                    .then(|| IndexVec::from_raw(vec![RichLocation::Entry]))
-                    .unwrap_or_default()
-                // .unwrap_or_else(IndexVec::new)
+                if maybe_owning.contains(local) {
+                    IndexVec::from_raw(vec![RichLocation::Entry])
+                } else {
+                    IndexVec::default()
+                }
             })
             .collect();
 
@@ -198,12 +190,12 @@ impl ConsumeChain {
     }
 
     #[inline]
-    pub fn of_block(&self, block: BasicBlock) -> &[SmallVec<[(Local, Consume<SSAIdx>); 2]>] {
+    pub fn of_block(&self, block: BasicBlock) -> &[ConsumeEntry] {
         &self.consumes[block.index()]
     }
 
     #[inline]
-    pub fn of_location(&self, location: Location) -> &SmallVec<[(Local, Consume<SSAIdx>); 2]> {
+    pub fn of_location(&self, location: Location) -> &ConsumeEntry {
         let Location {
             block,
             statement_index,
@@ -262,8 +254,8 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
     struct Vis<'me, 'tcx> {
         call_arg_temps: &'me SsoHashSet<Local>,
         maybe_consume_sites: &'me mut IndexVec<Local, DenseBitSet<BasicBlock>>,
-        consumes: &'me mut VecVecConstruction<SmallVec<[(Local, Consume<SSAIdx>); 2]>>,
-        consumes_in_cur_stmt: SmallVec<[(Local, Consume<SSAIdx>); 2]>,
+        consumes: &'me mut VecVecConstruction<ConsumeEntry>,
+        consumes_in_cur_stmt: ConsumeEntry,
         body: &'me Body<'tcx>,
         tcx: TyCtxt<'tcx>,
         crate_ctxt: &'me CrateCtxt<'tcx>,
@@ -422,10 +414,10 @@ fn place_not_reachable_to_union<'tcx>(place: &Place<'tcx>, body: &Body<'tcx>) ->
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(_, ty) => {
-                if let Some(adt_def) = base_ty.ty_adt_def() {
-                    if adt_def.is_union() {
-                        return false;
-                    }
+                if let Some(adt_def) = base_ty.ty_adt_def()
+                    && adt_def.is_union()
+                {
+                    return false;
                 };
                 base_ty = ty
             }

@@ -152,11 +152,11 @@ impl NameState {
             .local_decls
             .indices()
             .map(|local| {
-                has_def
-                    .contains(local)
-                    .then(|| vec![SSAIdx::INIT])
-                    .unwrap_or_default()
-                // .unwrap_or_else(Vec::new)
+                if has_def.contains(local) {
+                    vec![SSAIdx::INIT]
+                } else {
+                    vec![]
+                }
             })
             .collect();
         // let stack = IndexVec::from_elem(vec![SSAIdx::INIT], &body.local_decls);
@@ -182,12 +182,8 @@ impl NameState {
 
     #[inline]
     pub fn get_name(&self, var: Local) -> SSAIdx {
-        self.try_get_name(var).unwrap_or_else(|| {
-            panic!(
-                "internal error: cannot find fresh name supply for {:?}",
-                var
-            )
-        })
+        self.try_get_name(var)
+            .unwrap_or_else(|| panic!("internal error: cannot find fresh name supply for {var:?}"))
     }
 
     /// Get the newest version for a variable. If `None` is returned,
@@ -202,6 +198,6 @@ impl NameState {
         // tracing::debug!("popping {:?}~{:?}", var, ssa_idx);
         self.stack[var]
             .pop()
-            .unwrap_or_else(|| panic!("internal error: poping non existing version for {:?}", var))
+            .unwrap_or_else(|| panic!("internal error: poping non existing version for {var:?}"))
     }
 }

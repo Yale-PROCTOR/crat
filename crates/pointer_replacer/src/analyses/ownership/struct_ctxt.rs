@@ -123,11 +123,11 @@ impl<'tcx> StructCtxt<'tcx> {
                 while let TyKind::Array(inner_ty, _) = ty.kind() {
                     ty = *inner_ty;
                 }
-                if let TyKind::Adt(sub_adt_def, _) = ty.kind() {
-                    if let Some(&to_idx) = node_idx.get(&sub_adt_def.did()) {
-                        let from_idx = node_idx[did];
-                        graph.add_edge(from_idx, to_idx, ());
-                    }
+                if let TyKind::Adt(sub_adt_def, _) = ty.kind()
+                    && let Some(&to_idx) = node_idx.get(&sub_adt_def.did())
+                {
+                    let from_idx = node_idx[did];
+                    graph.add_edge(from_idx, to_idx, ());
                 }
             }
         }
@@ -180,11 +180,6 @@ impl<'tcx> StructCtxt<'tcx> {
 
     pub fn did_idx(&self, did: &DefId) -> usize {
         self.did_idx[did]
-    }
-
-    #[inline]
-    pub fn structs_in_post_order(&self) -> &[DefId] {
-        &self.post_order[..]
     }
 
     #[inline]

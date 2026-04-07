@@ -136,15 +136,11 @@ where
     struct_ctxt: RestrictedStructCtxt<'infercx, 'tcx>,
     fn_body_sig: FnBodySig<LocalSig>,
     deref_copy: Option<Consume<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
-    call_args: Vec<(
-        Local,
-        (
-            Consume<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>,
-            bool,
-        ),
-    )>,
+    call_args: Vec<CallArg<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
     global_assumptions: &'infercx GlobalAssumptions,
 }
+
+type CallArg<LocalSig> = (Local, (Consume<LocalSig>, bool));
 
 impl<'infercx, 'db, 'tcx, Analysis> InferCtxt<'infercx, 'db, 'tcx, Analysis>
 where
@@ -244,12 +240,12 @@ where
                 break;
             }
 
-            if let TyKind::Adt(adt_def, subst) = ty.kind() {
-                if struct_ctxt.is_struct_of_concerned(&adt_def.did()) {
-                    for field_def in adt_def.all_fields() {
-                        let field_ty = field_def.ty(tcx, subst);
-                        dominate(field_ty, dom, vars, precision, database, struct_ctxt, tcx)
-                    }
+            if let TyKind::Adt(adt_def, subst) = ty.kind()
+                && struct_ctxt.is_struct_of_concerned(&adt_def.did())
+            {
+                for field_def in adt_def.all_fields() {
+                    let field_ty = field_def.ty(tcx, subst);
+                    dominate(field_ty, dom, vars, precision, database, struct_ctxt, tcx)
                 }
             }
         }
@@ -541,11 +537,7 @@ where
             body.local_decls[base].local_info.as_ref(),
             ClearCrossCrate::Set(local_info) if matches!(local_info.as_ref(), LocalInfo::DerefTemp)
         ) {
-            if let Some(consume) = infer_cx.deref_copy.take() {
-                consume
-            } else {
-                return None;
-            }
+            infer_cx.deref_copy.take()?
         } else {
             return None;
         };
@@ -572,7 +564,7 @@ where
             ty,
             lhs_result.transpose(),
             rhs_result.transpose(),
-            &infer_cx.struct_ctxt,
+            infer_cx.struct_ctxt,
             infer_cx.database,
             |lhs, rhs, database| {
                 database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
@@ -746,7 +738,7 @@ where
             &infer_cx.inter_ctxt,
             infer_cx.global_assumptions,
             infer_cx.struct_ctxt.unrestricted,
-            &mut infer_cx.database,
+            infer_cx.database,
             body,
             locals.by_ref().take(body.arg_count + 1),
         );
@@ -782,15 +774,14 @@ where
 
 /// [`measure`] could be either [`FnCtxt`] or [`StructTopology`]. This is because
 /// ptr_chased is relative but precision is absolute.
-fn fit<'tcx, T, U, DB>(
+fn fit<'tcx, T, U>(
     adt_def: AdtDef,
     mut fitter: impl Iterator<Item = T>,
     fitter_precision: Precision,
     mut fittee: impl Iterator<Item = U>,
     delta: Precision,
     measurable: impl Measurable<'tcx>,
-    database: &mut DB,
-    mut on_matched: impl FnMut(T, U, &mut DB),
+    mut on_matched: impl FnMut(T, U),
 ) {
     let fitter_ptr_chased = measurable.max_ptr_chased() - fitter_precision;
 
@@ -805,7 +796,7 @@ fn fit<'tcx, T, U, DB>(
                 );
                 return;
             };
-            on_matched(fitter, fittee, database);
+            on_matched(fitter, fittee);
             count += 1;
         }
 
@@ -877,8 +868,7 @@ fn matcher<'tcx, T, U, DB>(
                 rhs_result,
                 delta,
                 measurable,
-                database,
-                on_matched,
+                |lhs, rhs| on_matched(lhs, rhs, database),
             )
         } else {
             fit(
@@ -888,8 +878,7 @@ fn matcher<'tcx, T, U, DB>(
                 lhs_result,
                 delta,
                 measurable,
-                database,
-                |rhs, lhs, database| on_matched(lhs, rhs, database),
+                |rhs, lhs| on_matched(lhs, rhs, database),
             )
         }
     }

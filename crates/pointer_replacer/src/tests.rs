@@ -3749,8 +3749,8 @@ pub unsafe fn foo() -> *mut i32 {
     fn param_helpers_cover_normal_and_output_variants() {
         let normal = Param::Normal(7u8);
         assert!(!normal.is_output());
-        assert_eq!(normal.clone().to_input(), 7);
-        assert_eq!(normal.clone().to_output(), None);
+        assert_eq!(normal.clone().into_input(), 7);
+        assert_eq!(normal.clone().into_output(), None);
         assert_eq!(normal.clone().expect_normal(), 7);
 
         let output = Param::Output(Consume {
@@ -3758,8 +3758,8 @@ pub unsafe fn foo() -> *mut i32 {
             def: 13u8,
         });
         assert!(output.is_output());
-        assert_eq!(output.clone().to_input(), 11);
-        assert_eq!(output.clone().to_output(), Some(13));
+        assert_eq!(output.clone().into_input(), 11);
+        assert_eq!(output.clone().into_output(), Some(13));
         let consume = output.clone().expect_output();
         assert_eq!(consume.r#use, 11);
         assert_eq!(consume.def, 13);

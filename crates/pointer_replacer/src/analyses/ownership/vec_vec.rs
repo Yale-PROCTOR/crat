@@ -51,41 +51,9 @@ impl<I> VecVec<I> {
             n_cur_items: 0,
         }
     }
-
-    pub fn with_data_capacity(size: usize) -> VecVecConstruction<I> {
-        let mut indices = Vec::new();
-        indices.push(0);
-        let data = Vec::with_capacity(size);
-        let vec_array = VecVec { indices, data };
-        VecVecConstruction {
-            vec_vec: vec_array,
-            start_index: 0,
-            n_cur_items: 0,
-        }
-    }
-
-    #[inline]
-    pub fn repack<U, F>(self, f: F) -> VecVec<U>
-    where F: Fn(I) -> U {
-        let indices = self.indices;
-        let data = self.data.into_iter().map(f).collect();
-        VecVec { indices, data }
-    }
 }
 
 impl<I, A: Allocator + Copy> VecVec<I, A> {
-    pub fn new_in(len: usize, alloc: A) -> VecVecConstruction<I, A> {
-        let mut indices = Vec::with_capacity_in(len + 1, alloc);
-        indices.push(0);
-        let data = Vec::new_in(alloc);
-        let vec_array = VecVec { indices, data };
-        VecVecConstruction {
-            vec_vec: vec_array,
-            start_index: 0,
-            n_cur_items: 0,
-        }
-    }
-
     #[inline]
     pub fn everything(&self) -> &[I] {
         &self.data
@@ -96,11 +64,7 @@ impl<I, A: Allocator + Copy> VecVec<I, A> {
         &mut self.data
     }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.indices.len() - 1
-    }
-
+    #[cfg(test)]
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &[I]> {
         self.indices
@@ -123,6 +87,7 @@ impl<I, A: Allocator> VecVecConstruction<I, A> {
         self.n_cur_items += 1;
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn push_vec(&mut self, items: impl Iterator<Item = I>) {
         debug_assert_eq!(self.n_cur_items, 0);

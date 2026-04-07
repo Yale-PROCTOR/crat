@@ -26,32 +26,31 @@ where
     ) {
         let def_path = self.tcx.def_path(callee);
         // if it is a library call in core::ptr
-        if matches!(def_path
-            .data
-            .get(0)
-            .map(|d| match d.data {
-                rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr" => true,
-                _ => false,
-            }), Some(cond) if cond)
-        {
+        if matches!(
+            def_path.data.first().map(|d| matches!(
+                d.data,
+                rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr"
+            )),
+            Some(true)
+        ) {
             // if it is core::ptr::<..>::..
-            if let Some(d) = def_path.data.get(3) {
-                if let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data {
-                    match s.as_str() {
-                        "is_null" => {
-                            self.call_is_null(args);
-                            return;
-                        }
-                        "offset" => {
-                            self.call_offset(destination, args);
-                            return;
-                        }
-                        "addr" => {
-                            self.call_addr(args);
-                            return;
-                        }
-                        _ => {}
+            if let Some(d) = def_path.data.get(3)
+                && let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data
+            {
+                match s.as_str() {
+                    "is_null" => {
+                        self.call_is_null(args);
+                        return;
                     }
+                    "offset" => {
+                        self.call_offset(destination, args);
+                        return;
+                    }
+                    "addr" => {
+                        self.call_addr(args);
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }

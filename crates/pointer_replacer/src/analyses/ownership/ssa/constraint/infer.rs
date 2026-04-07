@@ -102,83 +102,6 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         body: &'a Body<'tcx>,
     );
 }
-#[derive(Debug)]
-pub enum Pure {}
-impl<'infercx, 'db, 'tcx: 'infercx> InferMode<'infercx, 'db, 'tcx> for Pure {
-    type Ctxt = ();
-    type LocalSig = ();
-
-    fn call_arg((): &mut Self::Ctxt, _: Local, _: Consume<Self::LocalSig>, _: bool) {}
-
-    fn define_phi_node((): &mut Self::Ctxt, _: Local, _: Ty, _: SSAIdx) {}
-
-    fn join_phi_nodes<'a>(
-        (): &'a mut Self::Ctxt,
-        _: impl Iterator<Item = (Local, &'a mut PhiNode)>,
-    ) {
-    }
-
-    #[inline]
-    fn interpret_consume(
-        (): &mut Self::Ctxt,
-        _: &Body<'tcx>,
-        _: &Place<'tcx>,
-        _: Option<Consume<SSAIdx>>,
-    ) -> Option<Consume<()>> {
-        None
-    }
-
-    fn copy_for_deref((): &mut Self::Ctxt, _: Option<Consume<Self::LocalSig>>) {}
-
-    #[inline]
-    fn transfer<const ENSURE_MOVE: bool>(
-        (): &mut Self::Ctxt,
-        _: Ty,
-        Consume { r#use: (), def: () }: Consume<Self::LocalSig>,
-        Consume { r#use: (), def: () }: Consume<Self::LocalSig>,
-    ) {
-    }
-
-    #[inline]
-    fn cast<const ENSURE_MOVE: bool>(
-        (): &mut Self::Ctxt,
-        _: Ty,
-        Consume { r#use: (), def: () }: Consume<Self::LocalSig>,
-        Consume { r#use: (), def: () }: Consume<Self::LocalSig>,
-    ) {
-    }
-
-    fn unknown_sink((): &mut Self::Ctxt, _: Consume<Self::LocalSig>) {}
-
-    fn assume((): &mut Self::Ctxt, (): Self::LocalSig, _: bool) {}
-
-    fn call(
-        (): &mut Self::Ctxt,
-        _: Option<Consume<Self::LocalSig>>,
-        // _: Self::CallArgs,
-        _: &[Spanned<Operand<'tcx>>],
-        _: &Operand<'tcx>,
-    ) {
-    }
-
-    fn r#return<'a>(
-        (): &mut Self::Ctxt,
-        locals: impl Iterator<Item = (Local, Option<SSAIdx>)> + 'a,
-        _: &'a Body<'tcx>,
-    ) {
-        for _ in locals {}
-    }
-
-    fn cast_to_c_void(
-        (): &mut Self::Ctxt,
-        consume: Consume<Self::LocalSig>,
-    ) -> Consume<Self::LocalSig> {
-        consume
-    }
-
-    fn lend((): &mut Self::Ctxt, _: Consume<Self::LocalSig>) {}
-}
-
 pub struct Renamer<'rn, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'rn Body<'tcx>,
@@ -299,7 +222,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             let ssa_idx = self.state.name_state.generate_fresh_name(local);
             phi_node.lhs = ssa_idx;
             assert_eq!(
-                self.state.consume_chain.locs[local].push(RichLocation::Phi(bb)),
+                self.state.consume_chain.locs[local].push(RichLocation::Phi),
                 ssa_idx
             );
             tracing::debug!("defining {:?} at Phi({:?}), def: {:?}", local, bb, ssa_idx);
@@ -546,11 +469,11 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 let mut rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
 
-                if let TyKind::RawPtr(pointee_ty, _) = ty.kind() {
-                    if &format!("{pointee_ty}") == "libc::c_void" {
-                        rhs_consume =
-                            rhs_consume.map(|consume| Infer::cast_to_c_void(infer_cx, consume));
-                    }
+                if let TyKind::RawPtr(pointee_ty, _) = ty.kind()
+                    && format!("{pointee_ty}") == "libc::c_void"
+                {
+                    rhs_consume =
+                        rhs_consume.map(|consume| Infer::cast_to_c_void(infer_cx, consume));
                 }
                 let rhs_consume = rhs_consume;
 
@@ -694,7 +617,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 if let Some(lhs_consume) = lhs_consume {
                     Infer::unknown_source(infer_cx, lhs_consume);
                 }
-                let _ = consume_place_at::<Infer>(&rhs, self.body, location, self, infer_cx);
+                let _ = consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
             }
             Rvalue::NullaryOp(_, _) | Rvalue::ShallowInitBox(_, _) | Rvalue::ThreadLocalRef(_) => {
                 if let Some(lhs_consume) =

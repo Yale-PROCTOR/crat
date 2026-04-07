@@ -42,7 +42,7 @@ pub(super) fn initial_inter_ctxt(
                 database,
                 crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
             )
-            .map(|sigs| Param::Normal(sigs));
+            .map(Param::Normal);
 
             let args = local_decls
                 .take(body.arg_count)
@@ -82,7 +82,7 @@ pub(super) fn initial_inter_ctxt(
                             database,
                             crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
                         )
-                        .map(|sigs| Param::Normal(sigs))
+                        .map(Param::Normal)
                     }
                 })
                 .collect();

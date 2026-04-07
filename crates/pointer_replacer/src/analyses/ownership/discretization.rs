@@ -12,7 +12,7 @@ pub struct Discretization<Idx> {
 }
 
 impl<Idx: Copy> Discretization<Idx> {
-    #[inline]
+    #[cfg(test)]
     pub fn contents_iter(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
         let idx = self.did_idx[did];
         self.contents[idx]
@@ -32,7 +32,7 @@ pub struct FnLocals<Idx>(pub Discretization<Idx>);
 
 impl<Idx: Copy> StructFields<Idx> {
     /// [`fields()`] returns a slice of [`Range<T>`] that is in lock-step with [`all_fields()`]
-    #[inline]
+    #[cfg(test)]
     pub fn fields(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
         self.0.contents_iter(did)
     }
@@ -46,12 +46,8 @@ impl<Idx: Copy> StructFields<Idx> {
 impl<Idx: Copy> FnLocals<Idx> {
     /// [`locals()`] returns a slice of [`Range<Var>`] that is in lock-step with [`local_decls`]
     /// #[inline]
+    #[cfg(test)]
     pub fn locals(&self, did: &DefId) -> impl Iterator<Item = Range<Idx>> + '_ {
         self.0.contents_iter(did)
-    }
-
-    #[inline]
-    pub fn local(&self, did: &DefId, local: usize) -> Range<Idx> {
-        self.0.content(did, local)
     }
 }

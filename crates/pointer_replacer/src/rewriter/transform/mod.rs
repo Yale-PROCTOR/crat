@@ -847,11 +847,8 @@ impl<'tcx> TransformVisitor<'tcx> {
         hir_expr: &'tcx hir::Expr<'tcx>,
         args: &[P<Expr>],
     ) -> Option<Expr> {
-        let Some((hir_id, _harg)) =
-            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)
-        else {
-            return None;
-        };
+        let (hir_id, _harg) =
+            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)?;
         if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
             && matches!(
                 self.effective_ptr_kind(hir_id),
@@ -861,14 +858,10 @@ impl<'tcx> TransformVisitor<'tcx> {
             let local_name = self.tcx.hir_name(hir_id).to_string();
             return Some(utils::expr!("drop(({local_name}).take())"));
         }
-        let Some(info) = self.raw_bridge_bindings.get(&hir_id) else {
-            return None;
-        };
+        let info = self.raw_bridge_bindings.get(&hir_id)?;
         let [arg] = args else { return None };
         let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
-        let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(arg_ty) else {
-            return None;
-        };
+        let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
         let arg_str = pprust::expr_to_string(arg);
         let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
         Some(match info {
@@ -1891,7 +1884,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 (PtrCtx::Rhs(PtrKind::OptBox), other)
                 | (PtrCtx::Rhs(PtrKind::OptBoxedSlice), other) => {
-                    panic!("unsupported M4A box target/source combination: {:?}", other);
+                    panic!("unsupported M4A box target/source combination: {other:?}");
                 }
             }
         }
@@ -3785,7 +3778,7 @@ fn hir_size_of_call_matches_expected<'tcx>(
     let Some(args) = seg.args else {
         return false;
     };
-    let [hir::GenericArg::Type(hir_ty)] = &args.args[..] else {
+    let [hir::GenericArg::Type(hir_ty)] = args.args else {
         return false;
     };
     let matched_ty = tcx.typeck(hir_ty.hir_id.owner).node_type(hir_ty.hir_id);
@@ -3866,19 +3859,16 @@ fn hir_is_casted_local(rhs: &hir::Expr<'_>, target: HirId) -> bool {
 
 fn hir_is_byte_view_self_update(target: HirId, rhs: &hir::Expr<'_>) -> bool {
     let rhs = hir_unwrap_casts(rhs);
-    match rhs.kind {
+    matches!(
+        rhs.kind,
         hir::ExprKind::MethodCall(seg, receiver, args, _)
             if hir_unwrapped_local_id(receiver) == Some(target)
                 && args.len() == 1
                 && matches!(
                     seg.ident.name.as_str(),
                     "offset" | "add" | "wrapping_offset"
-                ) =>
-        {
-            true
-        }
-        _ => false,
-    }
+                )
+    )
 }
 
 fn hir_is_literal_one(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
@@ -3974,23 +3964,6 @@ fn hir_is_unsupported_scalar_box_allocator_root<'tcx>(
                 || name == Symbol::intern("calloc")
                 || name == Symbol::intern("realloc")
     ) && !hir_supports_scalar_box_allocator_root(tcx, lhs_inner_ty, rhs)
-}
-
-fn fn_has_unsupported_scalar_box_assignment<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    target_hir_id: HirId,
-    lhs_inner_ty: ty::Ty<'tcx>,
-) -> bool {
-    fn_has_unsupported_box_assignment(
-        tcx,
-        &SigDecisions {
-            data: FxHashMap::default(),
-        },
-        &FxHashMap::default(),
-        target_hir_id,
-        PtrKind::OptBox,
-        lhs_inner_ty,
-    )
 }
 
 fn fn_has_unsupported_box_assignment<'tcx>(
@@ -4818,12 +4791,8 @@ fn hir_raw_bridge_info<'tcx>(
         }
     }
 
-    let Some(alloc_wrappers) = alloc_wrappers else {
-        return None;
-    };
-    let Some(def_id) = hir_called_local_fn(tcx, rhs) else {
-        return None;
-    };
+    let alloc_wrappers = alloc_wrappers?;
+    let def_id = hir_called_local_fn(tcx, rhs)?;
     let wrapper = alloc_wrappers.get(&def_id)?;
     let hir::ExprKind::Call(_, args) = rhs.kind else {
         return None;
@@ -4872,9 +4841,7 @@ fn raw_wrapper_info_from_rhs<'tcx>(
     let hir::ExprKind::Call(_, args) = rhs.kind else {
         return None;
     };
-    let Some(name) = hir_call_name(rhs) else {
-        return None;
-    };
+    let name = hir_call_name(rhs)?;
     let scalar_ctx = WrapperScalarDagContext {
         tcx,
         param_positions,
@@ -4903,7 +4870,7 @@ fn raw_wrapper_info_from_rhs<'tcx>(
             .all(|hir_id| param_positions.contains_key(&hir_id))
     };
 
-    match (name, &args[..]) {
+    match (name, args) {
         (name, [bytes]) if name == Symbol::intern("malloc") => {
             if let Some(bytes_param) = param_index(bytes) {
                 Some(AllocWrapperInfo::Bytes { bytes_param })
@@ -4935,10 +4902,9 @@ fn raw_wrapper_info_from_rhs<'tcx>(
                     ptr_param,
                     bytes_param,
                 })
-            } else if hir_is_null_like_ptr_arg(tcx, ptr) && param_index(bytes).is_some() {
-                raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &[ptr, bytes], None)
-                    .map(AllocWrapperInfo::Fixed)
-            } else if mentions_only_params(ptr) && mentions_only_params(bytes) {
+            } else if (hir_is_null_like_ptr_arg(tcx, ptr) && param_index(bytes).is_some())
+                || (mentions_only_params(ptr) && mentions_only_params(bytes))
+            {
                 raw_bridge_info_from_call(tcx, lhs_inner_ty, name, &[ptr, bytes], None)
                     .map(AllocWrapperInfo::Fixed)
             } else {
@@ -5373,11 +5339,6 @@ fn collect_local_raw_free_summaries(
     }
 
     impl<'tcx> RawFreeSummaryVisitor<'_, 'tcx> {
-        fn param_index(&self, expr: &'tcx hir::Expr<'tcx>) -> Option<usize> {
-            let hir_id = hir_unwrapped_local_id(expr)?;
-            self.current_raw_params.get(&hir_id).copied()
-        }
-
         fn mark_free(&mut self, param_index: usize) {
             self.facts.entry(param_index).or_default().direct_free = true;
         }

@@ -131,20 +131,6 @@ impl GlobalAssumptions {
             .array_windows()
             .map(|&[start, end]| start..end)
     }
-
-    pub fn show(&self, struct_ctxt: &StructCtxt) {
-        for (&did, fields) in
-            itertools::izip!(struct_ctxt.post_order.iter(), self.struct_fields.iter())
-        {
-            let mut index = 0;
-            println!("{:?}: {{", did);
-            fields.array_windows().for_each(|&[start, end]| {
-                println!("  {index}: {:?}", start..end);
-                index += 1;
-            });
-            println!("}}");
-        }
-    }
 }
 
 impl Voidable for Range<Var> {
@@ -202,9 +188,13 @@ impl std::fmt::Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Constraint::Linear { x, y, z } => f.write_fmt(format_args!("{x} + {y} = {z}")),
-            Constraint::Assume { x, sign } => sign
-                .then(|| f.write_fmt(format_args!("{x} = 1")))
-                .unwrap_or_else(|| f.write_fmt(format_args!("{x} = 0"))),
+            Constraint::Assume { x, sign } => {
+                if sign {
+                    f.write_fmt(format_args!("{x} = 1"))
+                } else {
+                    f.write_fmt(format_args!("{x} = 0"))
+                }
+            }
             Constraint::Equal { x, y } => f.write_fmt(format_args!("{x} = {y}")),
             Constraint::LessEqual { x, y } => f.write_fmt(format_args!("{x} <= {y}")),
             Constraint::EqMin { x, y, z } => f.write_fmt(format_args!("{x} = min({y}, {z})")),
@@ -228,48 +218,9 @@ pub trait Mode {
     fn store_eq_min(store: Self::Store<'_>, x: Var, y: Var, z: Var);
 }
 
-pub struct Emit;
-impl Mode for Emit {
-    type Store<'a> = &'a mut Vec<Constraint>;
-
-    #[inline]
-    fn store_linear(store: Self::Store<'_>, x: Var, y: Var, z: Var) {
-        store.push(Constraint::Linear { x, y, z })
-    }
-
-    #[inline]
-    fn store_assumption(store: Self::Store<'_>, x: Var, sign: bool) {
-        store.push(Constraint::Assume { x, sign })
-    }
-
-    fn store_equal(store: Self::Store<'_>, x: Var, y: Var) {
-        store.push(Constraint::Equal { x, y })
-    }
-
-    fn store_less_equal(store: Self::Store<'_>, x: Var, y: Var) {
-        store.push(Constraint::LessEqual { x, y })
-    }
-
-    fn store_eq_min(store: Self::Store<'_>, x: Var, y: Var, z: Var) {
-        store.push(Constraint::EqMin { x, y, z })
-    }
-}
-
 macro_rules! tracing_for {
     (Debug, $args:tt) => {
         tracing::debug!($args)
-    };
-    (Info, $args:tt) => {
-        tracing::info!($args)
-    };
-    (Warn, $args:tt) => {
-        tracing::warn!($args)
-    };
-    (Error, $args:tt) => {
-        tracing::error!($args)
-    };
-    (Print, $args:tt) => {
-        println!($args)
     };
 }
 
@@ -310,15 +261,11 @@ macro_rules! make_logging_mode {
 }
 
 make_logging_mode!(Debug);
-make_logging_mode!(Info);
-make_logging_mode!(Warn);
-make_logging_mode!(Error);
-make_logging_mode!(Print);
 
 pub trait Database {
     #[inline]
     fn new_vars(&mut self, var_gen: &mut Gen, size: u32) -> Range<Var> {
-        var_gen.new_sigs(size as u32)
+        var_gen.new_sigs(size)
     }
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var);
@@ -341,11 +288,6 @@ pub trait Database {
         self.push_less_equal_impl(x, y);
         Infer::store_less_equal(store, x, y);
     }
-    fn push_approx_linear_impl(&mut self, x: Var, y: Var, z: Var);
-    fn push_approx_linear<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, y: Var, z: Var) {
-        self.push_approx_linear_impl(x, y, z);
-        Infer::store_linear(store, x, y, z);
-    }
 
     fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var);
     fn push_eq_min<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, y: Var, z: Var) {
@@ -363,78 +305,7 @@ impl Database for () {
 
     fn push_less_equal_impl(&mut self, _: Var, _: Var) {}
 
-    fn push_approx_linear_impl(&mut self, _: Var, _: Var, _: Var) {}
-
     fn push_eq_min_impl(&mut self, _: Var, _: Var, _: Var) {}
-}
-
-pub struct CadicalDatabase {
-    pub solver: cadical::Solver,
-}
-
-impl CadicalDatabase {
-    pub fn new() -> Self {
-        CadicalDatabase {
-            solver: cadical::Solver::new(),
-        }
-    }
-}
-
-impl Database for CadicalDatabase {
-    #[inline]
-    fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
-        self.solver
-            .add_clause([-x.into_lit(), -y.into_lit()].into_iter());
-        self.solver
-            .add_clause([-x.into_lit(), z.into_lit()].into_iter());
-        self.solver
-            .add_clause([x.into_lit(), y.into_lit(), -z.into_lit()].into_iter());
-        self.solver
-            .add_clause([-y.into_lit(), z.into_lit()].into_iter());
-    }
-
-    #[inline]
-    fn push_assume_impl(&mut self, x: Var, sign: bool) {
-        let mut lit = x.into_lit();
-        if !sign {
-            lit = -lit
-        };
-        self.solver.add_clause(std::iter::once(lit));
-    }
-
-    #[inline]
-    fn push_equal_impl(&mut self, x: Var, y: Var) {
-        // self.solver
-        //     .add_clause([-x.into_lit(), y.into_lit()].into_iter());
-        // self.solver
-        //     .add_clause([x.into_lit(), -y.into_lit()].into_iter());
-        self.push_less_equal_impl(x, y);
-        self.push_less_equal_impl(y, x)
-    }
-
-    #[inline]
-    fn push_less_equal_impl(&mut self, x: Var, y: Var) {
-        self.solver
-            .add_clause([-x.into_lit(), y.into_lit()].into_iter());
-    }
-
-    fn push_approx_linear_impl(&mut self, x: Var, y: Var, z: Var) {
-        self.solver
-            .add_clause([-x.into_lit(), -y.into_lit()].into_iter());
-        self.solver
-            .add_clause([-x.into_lit(), z.into_lit()].into_iter());
-        self.solver
-            .add_clause([-y.into_lit(), z.into_lit()].into_iter());
-    }
-
-    fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
-        self.solver
-            .add_clause([-x.into_lit(), y.into_lit()].into_iter());
-        self.solver
-            .add_clause([-x.into_lit(), z.into_lit()].into_iter());
-        self.solver
-            .add_clause([x.into_lit(), -y.into_lit(), -z.into_lit()].into_iter());
-    }
 }
 
 pub struct Z3Database {
@@ -467,10 +338,10 @@ impl Database for Z3Database {
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, &!y]));
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
-        self.solver.assert(&z3::ast::Bool::or(&[x, y, &!z]));
-        self.solver.assert(&z3::ast::Bool::or(&[&!y, z]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, &!y]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
+        self.solver.assert(z3::ast::Bool::or(&[x, y, &!z]));
+        self.solver.assert(z3::ast::Bool::or(&[&!y, z]));
     }
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
@@ -487,20 +358,13 @@ impl Database for Z3Database {
 
     fn push_less_equal_impl(&mut self, x: Var, y: Var) {
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, y]));
-    }
-
-    fn push_approx_linear_impl(&mut self, x: Var, y: Var, z: Var) {
-        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, &!y]));
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
-        self.solver.assert(&z3::ast::Bool::or(&[&!y, z]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
     }
 
     fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, &y]));
-        self.solver.assert(&z3::ast::Bool::or(&[&!x, z]));
-        self.solver.assert(&z3::ast::Bool::or(&[x, &!y, &!z]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
+        self.solver.assert(z3::ast::Bool::or(&[x, &!y, &!z]));
     }
 }

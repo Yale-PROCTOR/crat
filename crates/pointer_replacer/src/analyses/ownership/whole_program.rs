@@ -9,10 +9,7 @@ use anyhow::bail;
 use either::Either::{self, Left, Right};
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_middle::{
-    mir::{Body, Local, Location},
-    ty::TyCtxt,
-};
+use rustc_middle::mir::{Body, Local, Location};
 
 use self::state::{initial_inter_ctxt, initial_ssa_state, refine_state};
 use super::{AnalysisKind, Ownership, Precision, total_deref_level};
@@ -117,56 +114,25 @@ impl<'tcx> WholeProgramResults<'tcx> {
             .map(|range| &self.model[range.start.index()..range.end.index()])
     }
 
+    #[cfg(test)]
     pub fn precision(&self, did: &DefId) -> Precision {
         self.fn_locals.fn_summaries[did].1
     }
+}
 
-    pub fn trace(&self, tcx: TyCtxt) {
-        for &did in &self.struct_ctxt.post_order {
-            tracing::debug!("{}: {{", tcx.def_path_str(did));
-            for (field_def, field_results) in
-                itertools::izip!(tcx.adt_def(did).all_fields(), self.fields(&did))
-            {
-                tracing::debug!("   {}: {:?}", field_def.ident(tcx), field_results);
-            }
-            tracing::debug!("}}");
-        }
-
-        for did in self.fn_locals.fn_summaries.keys() {
-            let body = &*tcx
-                .mir_drops_elaborated_and_const_checked(did.expect_local())
-                .borrow();
-            tracing::debug!("@{}", tcx.def_path_str(*did));
-            for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
-                for index in 0..bb_data.statements.len() + bb_data.terminator.iter().count() {
-                    let location = Location {
-                        block: bb,
-                        statement_index: index,
-                    };
-                    let result = self
-                        .fn_results(*did)
-                        .unwrap()
-                        .location_results(location)
-                        .map(|(local, result)| format!("{:?}: {:?}", local, result))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    tracing::debug!("@{:?}: {result}", location);
-                }
-            }
-        }
-    }
+struct SolveBodyCtxt<'a, 'tcx> {
+    crate_ctxt: &'a CrateCtxt<'tcx>,
+    inter_ctxt: &'a InterCtxt,
+    global_assumptions: &'a GlobalAssumptions,
+    var_gen: &'a mut Gen,
+    database: &'a mut Z3Database,
 }
 
 fn solve_body<'tcx>(
     body: &Body<'tcx>,
     ssa_state: SSAState,
-    crate_ctxt: &CrateCtxt<'tcx>,
     precision: Precision,
-    inter_ctxt: <WholeProgramAnalysis as AnalysisKind>::InterCtxt,
-    global_assumptions: &GlobalAssumptions,
-    var_gen: &mut Gen,
-    database: &mut Z3Database,
+    ctxt: SolveBodyCtxt<'_, 'tcx>,
 ) -> anyhow::Result<(FnSummary, Precision)> {
     if precision == 0 {
         return Ok((
@@ -177,6 +143,14 @@ fn solve_body<'tcx>(
             precision,
         ));
     }
+
+    let SolveBodyCtxt {
+        crate_ctxt,
+        inter_ctxt,
+        global_assumptions,
+        var_gen,
+        database,
+    } = ctxt;
 
     database.solver.push();
 
@@ -248,12 +222,14 @@ fn solve_crate(
                 let fn_summary = solve_body(
                     body,
                     ssa_state,
-                    crate_ctxt,
                     required_precision,
-                    &inter_ctxt,
-                    &global_assumptions,
-                    &mut var_gen,
-                    &mut database,
+                    SolveBodyCtxt {
+                        crate_ctxt,
+                        inter_ctxt: &inter_ctxt,
+                        global_assumptions: &global_assumptions,
+                        var_gen: &mut var_gen,
+                        database: &mut database,
+                    },
                 )?;
                 fn_summaries.insert(did, fn_summary);
             }
@@ -275,12 +251,14 @@ fn solve_crate(
                 let fn_summary = solve_body(
                     body,
                     ssa_state,
-                    crate_ctxt,
                     precision,
-                    &inter_ctxt,
-                    &global_assumptions,
-                    &mut var_gen,
-                    &mut database,
+                    SolveBodyCtxt {
+                        crate_ctxt,
+                        inter_ctxt: &inter_ctxt,
+                        global_assumptions: &global_assumptions,
+                        var_gen: &mut var_gen,
+                        database: &mut database,
+                    },
                 )?;
                 fn_summaries.insert(did, fn_summary);
             }
@@ -295,17 +273,7 @@ fn solve_crate(
         fn_summaries,
     };
 
-    let intermediate_results = (model, fn_locals, global_assumptions);
-    if verbose() {
-        show_fn_sigs(
-            &intermediate_results.0,
-            &intermediate_results.1,
-            crate_ctxt.tcx,
-            crate_ctxt.fns(),
-        );
-    }
-
-    Ok(intermediate_results)
+    Ok((model, fn_locals, global_assumptions))
 }
 
 fn retrieve_model(database: Z3Database, var_gen: Gen) -> Vec<Ownership> {
@@ -353,10 +321,6 @@ impl<'analysis_results, 'tcx: 'analysis_results> AnalysisResults<'analysis_resul
     fn fn_sig(&'analysis_results self, r#fn: DefId) -> Self::FnSig {
         get_fn_sig(&self.model, &self.fn_locals, r#fn)
     }
-
-    fn print_fn_sigs(&'analysis_results self, tcx: TyCtxt, fns: &[DefId]) {
-        show_fn_sigs(&self.model, &self.fn_locals, tcx, fns);
-    }
 }
 
 fn get_fn_sig<'a>(
@@ -376,48 +340,6 @@ fn get_fn_sig<'a>(
     });
 
     std::iter::once(ret).chain(args)
-}
-
-fn show_fn_sigs(model: &[Ownership], fn_locals: &FnLocals, tcx: TyCtxt, fns: &[DefId]) {
-    fn display_value<Value: std::fmt::Display>(value: &[Value]) -> String {
-        value
-            .iter()
-            .map(|value| format!("{value}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    for &did in fns {
-        let mut fn_sig = get_fn_sig(model, fn_locals, did);
-        let ret = fn_sig.next().unwrap();
-        let ret = if let Some(sig) = ret {
-            // format!("{:?}", sig)
-            display_value(sig.expect_normal())
-        } else {
-            "_".to_owned()
-        };
-        let args = fn_sig
-            .map(|sig| {
-                if let Some(sig) = sig {
-                    match sig {
-                        Param::Output(output_param) => {
-                            "&uniq ".to_owned()
-                                + &display_value(&output_param.r#use[1..])
-                                + " ↓ &uniq "
-                                + &display_value(&output_param.def[1..])
-                        }
-                        Param::Normal(param) => display_value(param),
-                    }
-                } else {
-                    "_".to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let fn_path = tcx.def_path_str(did);
-        println!("{fn_path}: ({args}) -> {ret}")
-    }
 }
 
 impl<'a, 'tcx> FnResults<'a>

@@ -49,7 +49,7 @@ where 'tcx: 'infercx
         tcx: TyCtxt<'tcx>,
         inter_ctxt: &Self::InterCtxt,
         global_assumptions: &GlobalAssumptions,
-        struct_ctxt: &StructCtxt,
+        struct_ctxt: &StructCtxt<'tcx>,
         database: &mut Self::DB,
         body: &Body<'tcx>,
         args: impl Iterator<Item = Option<Range<Var>>>,
@@ -107,113 +107,112 @@ where 'tcx: 'infercx
         let ret = params.next().unwrap();
 
         // dest = ret ~> rho(dest) = 0, rho(dest') = rho(ret)
-        if let Some(ret) = ret.clone() {
-            if let Some(dest) = destination {
-                let output_ty = fn_sig.output().skip_binder();
+        if let Some(ret) = ret.clone()
+            && let Some(dest) = destination
+        {
+            let output_ty = fn_sig.output().skip_binder();
 
-                let ret = ret.expect_normal();
+            let ret = ret.expect_normal();
 
-                matcher(
-                    output_ty,
-                    dest.transpose(),
-                    ret,
-                    &infer_cx.struct_ctxt.unrestricted,
-                    infer_cx.database,
-                    |dest, ret, database| {
-                        database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
-                            (),
-                            dest.r#use,
-                            false,
-                        );
-                        database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
-                            (),
-                            dest.def,
-                            ret,
-                        );
-                    },
-                );
-            }
+            matcher(
+                output_ty,
+                dest.transpose(),
+                ret,
+                infer_cx.struct_ctxt.unrestricted,
+                infer_cx.database,
+                |dest, ret, database| {
+                    database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        dest.r#use,
+                        false,
+                    );
+                    database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        dest.def,
+                        ret,
+                    );
+                },
+            );
         }
 
         let params_args = izip!(params, args, fn_sig.inputs().skip_binder()); // params.zip(args.iter());
 
         // para = arg ~> rho(para') + rho(arg') = rho(arg)
         for (param, arg, &ty) in params_args {
-            if let Some(param) = param.clone() {
-                if let Some((arg, is_ref)) = arg.clone() {
-                    match param {
-                        crate::analyses::ownership::Param::Output(output_param) => {
-                            let mut output_param = output_param.transpose();
-                            assert!(output_param.size_hint().1.unwrap() > 0);
-                            let ty = if is_ref {
-                                let _ = output_param.next().unwrap();
-                                ty.builtin_deref(true).unwrap()
-                            } else {
-                                ty
-                            };
-                            let arg = arg.transpose();
+            if let Some(param) = param.clone()
+                && let Some((arg, is_ref)) = arg.clone()
+            {
+                match param {
+                    crate::analyses::ownership::Param::Output(output_param) => {
+                        let mut output_param = output_param.transpose();
+                        assert!(output_param.size_hint().1.unwrap() > 0);
+                        let ty = if is_ref {
+                            let _ = output_param.next().unwrap();
+                            ty.builtin_deref(true).unwrap()
+                        } else {
+                            ty
+                        };
+                        let arg = arg.transpose();
 
-                            matcher(
-                                ty,
-                                output_param,
-                                arg,
-                                &infer_cx.struct_ctxt.unrestricted,
-                                infer_cx.database,
-                                |param, arg, database| {
-                                    database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                        (),
-                                        param.r#use,
-                                        arg.r#use,
-                                    );
-                                    database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                        (),
-                                        param.def,
-                                        arg.def,
-                                    );
-                                },
-                            );
-                        }
-                        crate::analyses::ownership::Param::Normal(param) => {
-                            let mut param = param;
-                            let ty = if is_ref {
-                                tracing::debug!(
-                                    "bad output parameter analysis for {}!",
-                                    infer_cx.tcx.def_path_str(callee)
+                        matcher(
+                            ty,
+                            output_param,
+                            arg,
+                            infer_cx.struct_ctxt.unrestricted,
+                            infer_cx.database,
+                            |param, arg, database| {
+                                database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    param.r#use,
+                                    arg.r#use,
                                 );
-                                let _ = param.next().unwrap();
-                                ty.builtin_deref(true).unwrap()
-                            } else {
-                                ty
-                            };
-
-                            // FIXME working around type cast
-                            let mut arg = arg;
-                            if let Some(pointee_ty) = ty.builtin_deref(true) {
-                                if format!("{pointee_ty}").ends_with("c_void") {
-                                    arg.r#use = arg.r#use.start..arg.r#use.start + 1u32;
-                                    arg.def = arg.def.start..arg.def.start + 1u32;
-                                }
-                            }
-                            let arg = arg;
-
-                            let arg = arg.transpose();
-
-                            matcher(
-                                ty,
-                                param,
-                                arg,
-                                &infer_cx.struct_ctxt.unrestricted,
-                                infer_cx.database,
-                                |param, arg, database| {
-                                    database.push_linear::<crate::analyses::ownership::ssa::constraint::Debug>(
-                                        (),
-                                        param,
-                                        arg.def,
-                                        arg.r#use,
-                                    );
-                                },
+                                database.push_equal::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    param.def,
+                                    arg.def,
+                                );
+                            },
+                        );
+                    }
+                    crate::analyses::ownership::Param::Normal(param) => {
+                        let mut param = param;
+                        let ty = if is_ref {
+                            tracing::debug!(
+                                "bad output parameter analysis for {}!",
+                                infer_cx.tcx.def_path_str(callee)
                             );
+                            let _ = param.next().unwrap();
+                            ty.builtin_deref(true).unwrap()
+                        } else {
+                            ty
+                        };
+
+                        // FIXME working around type cast
+                        let mut arg = arg;
+                        if let Some(pointee_ty) = ty.builtin_deref(true)
+                            && format!("{pointee_ty}").ends_with("c_void")
+                        {
+                            arg.r#use = arg.r#use.start..arg.r#use.start + 1u32;
+                            arg.def = arg.def.start..arg.def.start + 1u32;
                         }
+
+                        let arg = arg.transpose();
+
+                        matcher(
+                            ty,
+                            param,
+                            arg,
+                            infer_cx.struct_ctxt.unrestricted,
+                            infer_cx.database,
+                            |param, arg, database| {
+                                database.push_linear::<crate::analyses::ownership::ssa::constraint::Debug>(
+                                    (),
+                                    param,
+                                    arg.def,
+                                    arg.r#use,
+                                );
+                            },
+                        );
                     }
                 }
             }
@@ -243,7 +242,7 @@ where 'tcx: 'infercx
             match (input, sigs) {
                 (Some(input), Some(sigs)) => {
                     let is_output = sigs.is_output();
-                    let input_sigs = sigs.clone().to_input();
+                    let input_sigs = sigs.clone().into_input();
                     assert_eq!(
                         input.size_hint().1.unwrap(),
                         input_sigs.size_hint().1.unwrap()
@@ -261,51 +260,52 @@ where 'tcx: 'infercx
 
                     if !is_output {
                         let mut input = input;
-
-                        apply_global_assumptions(
-                            ty,
-                            None,
-                            &mut std::iter::empty(),
-                            &mut input,
+                        GlobalAssumptionApplier {
                             global_assumptions,
                             struct_ctxt,
                             database,
                             tcx,
+                        }
+                        .apply(
+                            ty,
+                            None,
+                            &mut std::iter::empty(),
+                            &mut input,
                             precision,
                         );
                     } else {
                         let monotonicity = fn_ctxt.monotonicity(body.source.def_id());
                         let mut input_sigs = input_sigs;
-                        let mut output_sigs = sigs.clone().to_output().unwrap();
+                        let mut output_sigs = sigs.clone().into_output().unwrap();
+                        let mut applier = GlobalAssumptionApplier {
+                            global_assumptions,
+                            struct_ctxt,
+                            database,
+                            tcx,
+                        };
 
-                        if !matches!(monotonicity, FlatSet::Bottom) {
-                            if !matches!(monotonicity, FlatSet::Elem(Monotonicity::Dealloc)) {
-                                apply_global_assumptions(
-                                    ty,
-                                    None,
-                                    &mut std::iter::empty(),
-                                    &mut output_sigs,
-                                    global_assumptions,
-                                    struct_ctxt,
-                                    database,
-                                    tcx,
-                                    precision,
-                                );
-                            }
+                        if !matches!(monotonicity, FlatSet::Bottom)
+                            && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Dealloc))
+                        {
+                            applier.apply(
+                                ty,
+                                None,
+                                &mut std::iter::empty(),
+                                &mut output_sigs,
+                                precision,
+                            );
+                        }
 
-                            if !matches!(monotonicity, FlatSet::Elem(Monotonicity::Alloc)) {
-                                apply_global_assumptions(
-                                    ty,
-                                    None,
-                                    &mut std::iter::empty(),
-                                    &mut input_sigs,
-                                    global_assumptions,
-                                    struct_ctxt,
-                                    database,
-                                    tcx,
-                                    precision,
-                                );
-                            }
+                        if !matches!(monotonicity, FlatSet::Bottom)
+                            && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Alloc))
+                        {
+                            applier.apply(
+                                ty,
+                                None,
+                                &mut std::iter::empty(),
+                                &mut input_sigs,
+                                precision,
+                            );
                         }
                     }
                 }
@@ -319,7 +319,7 @@ where 'tcx: 'infercx
         tcx: TyCtxt<'tcx>,
         inter_ctxt: &Self::InterCtxt,
         global_assumptions: &GlobalAssumptions,
-        struct_ctxt: &StructCtxt,
+        struct_ctxt: &StructCtxt<'tcx>,
         database: &mut Self::DB,
         body: &Body<'tcx>,
         mut args: impl Iterator<Item = Option<Range<Var>>>,
@@ -345,22 +345,18 @@ where 'tcx: 'infercx
             let measure = param.size_hint().1.unwrap() as u32;
             let precision = struct_ctxt.absolute_precision(ty, measure);
 
-            apply_global_assumptions(
-                ty,
-                None,
-                &mut std::iter::empty(),
-                &mut param,
+            GlobalAssumptionApplier {
                 global_assumptions,
                 struct_ctxt,
                 database,
                 tcx,
-                precision,
-            )
+            }
+            .apply(ty, None, &mut std::iter::empty(), &mut param, precision)
         }
 
         for (param, arg) in fn_sig.args.iter().cloned().zip(args) {
             if let Some((param, arg)) = param.zip(arg) {
-                if let Some(param) = param.to_output() {
+                if let Some(param) = param.into_output() {
                     // if output then output
                     assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
                     for (arg, param) in arg.zip(param) {
@@ -402,67 +398,66 @@ where
     }
 }
 
-fn apply_global_assumptions<'tcx>(
-    ty: Ty<'tcx>,
-    mut dom: Option<Var>,
-    field_ctxt: &mut dyn Iterator<Item = Var>,
-    input: &mut impl Iterator<Item = Var>,
-    global_assumptions: &GlobalAssumptions,
-    struct_ctxt: &StructCtxt,
-    database: &mut impl Database,
+struct GlobalAssumptionApplier<'ga, 'sc, 'db, 'tcx, DB> {
+    global_assumptions: &'ga GlobalAssumptions,
+    struct_ctxt: &'sc StructCtxt<'tcx>,
+    database: &'db mut DB,
     tcx: TyCtxt<'tcx>,
-    mut precision: u8,
-) {
-    if precision == 0 {
-        return;
-    }
+}
 
-    let mut ty = ty;
-    loop {
-        if let Some(inner_ty) = ty.builtin_index() {
-            ty = inner_ty;
-            continue;
+impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, 'tcx, DB> {
+    fn apply(
+        &mut self,
+        ty: Ty<'tcx>,
+        mut dom: Option<Var>,
+        field_ctxt: &mut dyn Iterator<Item = Var>,
+        input: &mut impl Iterator<Item = Var>,
+        mut precision: u8,
+    ) {
+        if precision == 0 {
+            return;
         }
-        if let Some(ty_mut) = ty.builtin_deref(true) {
-            let input = input.next().unwrap();
-            if let Some((field, dom)) = field_ctxt.next().zip(dom) {
-                database.push_eq_min::<crate::analyses::ownership::ssa::constraint::Debug>(
-                    (),
-                    input,
-                    field,
-                    dom,
-                );
-            }
-            dom = Some(input);
-            precision -= 1;
-            if precision == 0 {
-                return;
-            }
-            ty = ty_mut;
-            continue;
-        }
-        break;
-    }
 
-    if let TyKind::Adt(adt_def, subst) = ty.kind() {
-        assert!(field_ctxt.next().is_none());
-        if struct_ctxt.is_struct_of_concerned(&adt_def.did())
-            && struct_ctxt.measure_adt(*adt_def, 0) > 0
-        {
-            let fields = global_assumptions.fields(struct_ctxt, &adt_def.did());
-            for (mut field_ctxt, field_def) in itertools::izip!(fields, adt_def.all_fields()) {
-                let field_ty = field_def.ty(tcx, subst);
-                apply_global_assumptions(
-                    field_ty,
-                    dom,
-                    &mut field_ctxt,
-                    input,
-                    global_assumptions,
-                    struct_ctxt,
-                    database,
-                    tcx,
-                    precision,
-                )
+        let mut ty = ty;
+        loop {
+            if let Some(inner_ty) = ty.builtin_index() {
+                ty = inner_ty;
+                continue;
+            }
+            if let Some(ty_mut) = ty.builtin_deref(true) {
+                let input = input.next().unwrap();
+                if let Some((field, dom)) = field_ctxt.next().zip(dom) {
+                    self.database
+                        .push_eq_min::<crate::analyses::ownership::ssa::constraint::Debug>(
+                            (),
+                            input,
+                            field,
+                            dom,
+                        );
+                }
+                dom = Some(input);
+                precision -= 1;
+                if precision == 0 {
+                    return;
+                }
+                ty = ty_mut;
+                continue;
+            }
+            break;
+        }
+
+        if let TyKind::Adt(adt_def, subst) = ty.kind() {
+            assert!(field_ctxt.next().is_none());
+            if self.struct_ctxt.is_struct_of_concerned(&adt_def.did())
+                && self.struct_ctxt.measure_adt(*adt_def, 0) > 0
+            {
+                let fields = self
+                    .global_assumptions
+                    .fields(self.struct_ctxt, &adt_def.did());
+                for (mut field_ctxt, field_def) in itertools::izip!(fields, adt_def.all_fields()) {
+                    let field_ty = field_def.ty(self.tcx, subst);
+                    self.apply(field_ty, dom, &mut field_ctxt, input, precision)
+                }
             }
         }
     }

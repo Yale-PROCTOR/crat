@@ -346,9 +346,7 @@ fn infer_returned_local_box_kind<'tcx>(
             let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
                 return None;
             };
-            let Some(src_local) = src.as_local() else {
-                return None;
-            };
+            let src_local = src.as_local()?;
             match candidate {
                 Some(prev) if prev != src_local => return None,
                 None => candidate = Some(src_local),

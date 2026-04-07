@@ -11,10 +11,9 @@ use rustc_middle::{
 use rustc_type_ir::TyKind::FnDef;
 use smallvec::SmallVec;
 
-use crate::analyses::{
-    lattice::{FlatSet, Lattice},
-    ownership::vec_vec::VecVec,
-};
+use crate::analyses::lattice::{FlatSet, Lattice};
+#[cfg(test)]
+use crate::analyses::ownership::vec_vec::VecVec;
 
 pub struct FnSig<T> {
     pub ret: T,
@@ -22,10 +21,6 @@ pub struct FnSig<T> {
 }
 
 impl<T> FnSig<T> {
-    pub fn new(ret: T, args: SmallVec<[T; 4]>) -> Self {
-        FnSig { ret, args }
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         std::iter::once(&self.ret).chain(self.args.iter())
     }
@@ -56,7 +51,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for FnSig<T> {
             &self
                 .args
                 .iter()
-                .map(|data| format!("{:?}", data))
+                .map(|data| format!("{data:?}"))
                 .collect::<Vec<_>>()
                 .join(", "),
         )?;
@@ -111,6 +106,7 @@ impl<'me, 'tcx> Visitor<'tcx> for MonotonicityChecker<'me, 'tcx> {
 }
 
 pub struct CallGraph {
+    #[cfg(test)]
     post_order: VecVec<DefId>,
     ranked_by_n_alloc_deallocs: Vec<DefId>,
     monotonicity: FxHashMap<DefId, FlatSet<Monotonicity>>,
@@ -128,24 +124,25 @@ impl CallGraph {
         for &did in functions {
             let caller_idx = node_idx[&did];
             CallGraphConstruction {
-                caller: did,
                 caller_idx,
                 graph: &mut graph,
                 node_idx: &node_idx,
             }
             .visit_body(
-                &*tcx
-                    .mir_drops_elaborated_and_const_checked(did.expect_local())
+                &tcx.mir_drops_elaborated_and_const_checked(did.expect_local())
                     .borrow(),
             );
         }
 
-        let mut tarjan_scc = TarjanScc::new();
-        let mut post_order = VecVec::with_indices_capacity(functions.len());
-        tarjan_scc.run(&graph, |nodes| {
-            post_order.push_vec(nodes.iter().map(|&idx| graph[idx]));
-        });
-        let post_order = post_order.done();
+        #[cfg(test)]
+        let post_order = {
+            let mut tarjan_scc = TarjanScc::new();
+            let mut post_order = VecVec::with_indices_capacity(functions.len());
+            tarjan_scc.run(&graph, |nodes| {
+                post_order.push_vec(nodes.iter().map(|&idx| graph[idx]));
+            });
+            post_order.done()
+        };
 
         let mut n_alloc_deallocs = rustc_hash::FxHashMap::default();
         n_alloc_deallocs.reserve(functions.len());
@@ -162,15 +159,14 @@ impl CallGraph {
                     if let Some(func) = func.constant() {
                         let ty = func.ty();
                         let &FnDef(callee, _) = ty.kind() else { unreachable!() };
-                        if let Some(local_did) = callee.as_local() {
-                            if let rustc_hir::Node::ForeignItem(foreign_item) =
+                        if let Some(local_did) = callee.as_local()
+                            && let rustc_hir::Node::ForeignItem(foreign_item) =
                                 tcx.hir_node_by_def_id(local_did)
-                            {
-                                match foreign_item.ident.as_str() {
-                                    "free" => self.1 += 10,
-                                    "malloc" | "calloc" | "realloc" => self.1 += 1,
-                                    _ => {}
-                                }
+                        {
+                            match foreign_item.ident.as_str() {
+                                "free" => self.1 += 10,
+                                "malloc" | "calloc" | "realloc" => self.1 += 1,
+                                _ => {}
                             }
                         }
                     }
@@ -189,6 +185,7 @@ impl CallGraph {
 
         let mut monotonicity = FxHashMap::default();
         monotonicity.reserve(functions.len());
+        let mut tarjan_scc = TarjanScc::new();
         tarjan_scc.run(&graph, |nodes| {
             monotonicity.extend(nodes.iter().map(|&node| (graph[node], FlatSet::Top)));
             loop {
@@ -220,6 +217,7 @@ impl CallGraph {
         });
 
         CallGraph {
+            #[cfg(test)]
             post_order,
             ranked_by_n_alloc_deallocs,
             monotonicity,
@@ -235,13 +233,13 @@ impl CallGraph {
         &self.ranked_by_n_alloc_deallocs
     }
 
+    #[cfg(test)]
     pub fn sccs(&self) -> impl Iterator<Item = &[DefId]> {
         self.post_order.iter()
     }
 }
 
 struct CallGraphConstruction<'me> {
-    caller: DefId,
     caller_idx: NodeIndex,
     graph: &'me mut DiGraph<DefId, ()>,
     node_idx: &'me FxHashMap<DefId, NodeIndex>,

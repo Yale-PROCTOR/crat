@@ -36,14 +36,6 @@ pub struct TypeQualifiers<Qualifier> {
     model: IndexVec<Var, Qualifier>,
 }
 
-fn display_value<Value: std::fmt::Display>(value: &[Value]) -> String {
-    value
-        .iter()
-        .map(|value| format!("{value}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 impl<Qualifier> TypeQualifiers<Qualifier> {
     pub fn new(
         struct_fields: discretization::StructFields<Var>,
@@ -65,6 +57,7 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         }
     }
 
+    #[cfg(test)]
     pub fn struct_results(&self, r#struct: &DefId) -> impl Iterator<Item = &[Qualifier]> {
         self.struct_fields
             .fields(r#struct)
@@ -76,71 +69,23 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         &self.model.raw[start.index()..end.index()]
     }
 
+    #[cfg(test)]
     pub fn fn_sig(
         &self,
         r#fn: &DefId,
         tcx: rustc_middle::ty::TyCtxt,
     ) -> impl Iterator<Item = &[Qualifier]> {
         let fn_result = self.fn_results(r#fn);
-        let body = &*tcx
+        let body = &tcx
             .mir_drops_elaborated_and_const_checked(r#fn.expect_local())
             .borrow();
         fn_result.results().take(body.arg_count + 1)
     }
 
-    fn print_fn_sigs(&self, tcx: rustc_middle::ty::TyCtxt, fns: &[DefId])
-    where Qualifier: std::fmt::Display {
-        for did in fns {
-            let mut fn_sig = self.fn_sig(did, tcx);
-            let ret = fn_sig.next().unwrap();
-            let ret = display_value(ret);
-            let args = fn_sig.map(display_value).collect::<Vec<_>>().join(", ");
-
-            let fn_path = tcx.def_path_str(*did);
-            println!("{fn_path}: ({args}) -> {ret}")
-        }
-    }
-
-    fn print_struct_sigs(&self, tcx: rustc_middle::ty::TyCtxt, structs: &[DefId])
-    where Qualifier: std::fmt::Display {
-        for did in structs {
-            let struct_results = self.struct_results(did);
-            let struct_ty = tcx.type_of(*did).skip_binder();
-            let rustc_middle::ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else {
-                unreachable!()
-            };
-            println!("{} {{", tcx.def_path_str(*did));
-            for (field_def, qualifiers) in adt_def.all_fields().zip(struct_results) {
-                println!(
-                    "  {}: {},",
-                    field_def.ident(tcx).as_str(),
-                    display_value(qualifiers)
-                );
-            }
-            println!("}}");
-        }
-    }
-
-    pub fn print_results(&self, program: &RustProgram)
-    where Qualifier: std::fmt::Display {
-        let structs = program
-            .structs
-            .iter()
-            .map(|did| did.to_def_id())
-            .collect::<Vec<_>>();
-        let fns = program
-            .functions
-            .iter()
-            .map(|did| did.to_def_id())
-            .collect::<Vec<_>>();
-        self.print_struct_sigs(program.tcx, &structs);
-        self.print_fn_sigs(program.tcx, &fns);
-    }
-
     pub fn place_result<'tcx>(&self, body: &Body<'tcx>, place: &Place<'tcx>) -> &[Qualifier] {
-        let mut ptr_kinds = &self
+        let mut ptr_kinds = self
             .fn_results(&body.source.def_id())
-            .local_result(place.local)[..];
+            .local_result(place.local);
         let mut ptr_kinds_index = 0;
         let mut ty = body.local_decls[place.local].ty;
         for proj in place.projection {
@@ -174,6 +119,7 @@ pub struct FnResult<'me, Domain> {
 }
 
 impl<'me, Domain> FnResult<'me, Domain> {
+    #[cfg(test)]
     pub fn results(self) -> impl Iterator<Item = &'me [Domain]> {
         self.locals
             .array_windows()
@@ -185,8 +131,6 @@ impl<'me, Domain> FnResult<'me, Domain> {
         &self.model.raw[start.index()..end.index()]
     }
 }
-
-pub type SolidifiedFnResult<'me> = FnResult<'me, Ownership>;
 
 impl<'tcx> WholeProgramResults<'tcx> {
     pub fn solidify(&self, program: &RustProgram<'tcx>) -> SolidifiedOwnershipSchemes {
@@ -214,7 +158,7 @@ impl<'tcx> WholeProgramResults<'tcx> {
             for ownership in fields_ownership {
                 model.extend(ownership.iter().copied());
                 vars.push_inner(next);
-                next = next + ownership.len();
+                next += ownership.len();
                 assert_eq!(model.next_index(), next);
             }
             vars.push_inner(next);
@@ -260,10 +204,8 @@ impl<'tcx> WholeProgramResults<'tcx> {
             }
 
             for (param, ownership) in self.fn_sig(*r#fn).zip(&mut locals) {
-                if matches!(param, Some(param) if param.is_output()) {
-                    if !ownership.is_empty() {
-                        ownership[0] = Ownership::Owning
-                    }
+                if matches!(param, Some(param) if param.is_output()) && !ownership.is_empty() {
+                    ownership[0] = Ownership::Owning
                 }
             }
 
@@ -388,7 +330,7 @@ impl<'tcx> WholeProgramResults<'tcx> {
 
             for local in locals {
                 vars.push_inner(next);
-                next = next + local.len();
+                next += local.len();
                 model.extend(local.into_iter());
                 assert_eq!(model.next_index(), next);
             }
@@ -689,25 +631,23 @@ struct SanityCheck<'me, 'tcx> {
 
 impl<'me, 'tcx> Visitor<'tcx> for SanityCheck<'me, 'tcx> {
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
-        if let Rvalue::CopyForDeref(place) = rvalue {
-            if matches!(self
+        if let Rvalue::CopyForDeref(place) = rvalue
+            && matches!(self
                 .solidifed
                 .place_result(self.body, &Place::from(place.local))
                 .chunks(2)
                 .next(),
                 Some(&[ownership1, ownership2]) if ownership1.is_owning() && ownership2.is_owning())
-            {
-                if let Some(flowing) = self.ownership_schemes.local_result(place.local, location) {
-                    if flowing.r#use.len() >= 2
-                        && !(flowing.r#use[1].is_owning() && flowing.def[1].is_owning())
-                    {
-                        self.err_locations.push(location);
-                    }
-                }
-            }
+            && let Some(flowing) = self.ownership_schemes.local_result(place.local, location)
+            && flowing.r#use.len() >= 2
+            && !(flowing.r#use[1].is_owning() && flowing.def[1].is_owning())
+        {
+            self.err_locations.push(location);
         }
-
-        self.super_rvalue(rvalue, location)
+        if let Rvalue::CopyForDeref(..) = rvalue {
+        } else {
+            self.super_rvalue(rvalue, location)
+        }
     }
 
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
@@ -721,15 +661,12 @@ impl<'me, 'tcx> Visitor<'tcx> for SanityCheck<'me, 'tcx> {
                 PlaceContext::MutatingUse(MutatingUseContext::Projection)
                     | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection)
             )
+            && let Some(flowing) = self.ownership_schemes.local_result(local, location)
+            && (flowing.is_use() && !flowing.r#use[0].is_owning()
+                || !(flowing.is_use()
+                    || flowing.r#use[0].is_owning() && flowing.def[0].is_owning()))
         {
-            if let Some(flowing) = self.ownership_schemes.local_result(local, location) {
-                if flowing.is_use() && !flowing.r#use[0].is_owning()
-                    || !flowing.is_use()
-                        && !(flowing.r#use[0].is_owning() && flowing.def[0].is_owning())
-                {
-                    self.err_locations.push(location);
-                }
-            }
+            self.err_locations.push(location);
         }
     }
 }
