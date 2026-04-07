@@ -123,8 +123,9 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
 
     let base_dir = translations_json.parent().unwrap_or_else(|| Path::new("."));
     let expected_keys: BTreeSet<String> = raw[0].config.keys().cloned().collect();
+    let varying_params = varying_params(&raw, &expected_keys)?;
     let mut feature_map = BTreeMap::<String, (String, String)>::new();
-    let mut seen_feature_sets = BTreeSet::<Vec<String>>::new();
+    let mut seen_configs = BTreeSet::<BTreeMap<String, String>>::new();
     let mut translations = Vec::with_capacity(raw.len());
 
     for (index, entry) in raw.into_iter().enumerate() {
@@ -142,23 +143,25 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         }
 
         let mut config = BTreeMap::new();
-        let mut features = Vec::with_capacity(entry.config.len());
+        let mut features = Vec::with_capacity(varying_params.len());
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
-            let feature = make_feature_name(&param, &raw_value)?;
-            if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
-                if existing_param != &param || existing_value != &raw_value {
-                    return Err(format!(
-                        "feature name collision: {feature:?} maps to both {existing_param}={existing_value} and {param}={raw_value}"
-                    ));
+            if varying_params.contains(&param) {
+                let feature = make_feature_name(&param, &raw_value)?;
+                if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
+                    if existing_param != &param || existing_value != &raw_value {
+                        return Err(format!(
+                            "feature name collision: {feature:?} maps to both {existing_param}={existing_value} and {param}={raw_value}"
+                        ));
+                    }
+                } else {
+                    feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
                 }
-            } else {
-                feature_map.insert(feature.clone(), (param.clone(), raw_value.clone()));
+                features.push(feature);
             }
             config.insert(param.clone(), raw_value);
-            features.push(feature);
         }
-        if !seen_feature_sets.insert(features.clone()) {
+        if !seen_configs.insert(config.clone()) {
             return Err(format!(
                 "duplicate configuration detected for translation directory {dir:?}"
             ));
@@ -171,6 +174,36 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
     }
 
     Ok(translations)
+}
+
+fn varying_params(
+    raw: &[RawTranslation],
+    expected_keys: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mut value_sets = expected_keys
+        .iter()
+        .cloned()
+        .map(|param| (param, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for entry in raw {
+        for param in expected_keys {
+            let value = entry
+                .config
+                .get(param)
+                .ok_or_else(|| format!("missing configuration parameter {param:?}"))?;
+            let value = config_value_to_string(param, value)?;
+            value_sets
+                .get_mut(param)
+                .expect("expected key was pre-populated")
+                .insert(value);
+        }
+    }
+
+    Ok(value_sets
+        .into_iter()
+        .filter_map(|(param, values)| (values.len() > 1).then_some(param))
+        .collect())
 }
 
 fn resolve_dir(base_dir: &Path, dir: &Path) -> PathBuf {
@@ -533,11 +566,7 @@ fn simplified_cfg_condition(
     translations: &[Translation],
     variants: &[(usize, PathBuf)],
 ) -> String {
-    let params = translations[variants[0].0]
-        .config
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
+    let params = varying_config_params(translations, variants);
     let value_lists = params
         .iter()
         .map(|param| {
@@ -667,6 +696,25 @@ fn lower_cfg_primitive_or(clauses: &[String]) -> String {
 
 fn feature_clause(feature: &str) -> String {
     format!("feature = {feature:?}")
+}
+
+fn varying_config_params(
+    translations: &[Translation],
+    variants: &[(usize, PathBuf)],
+) -> Vec<String> {
+    translations[variants[0].0]
+        .config
+        .keys()
+        .filter(|param| {
+            variants
+                .iter()
+                .map(|(translation_index, _)| &translations[*translation_index].config[*param])
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        })
+        .cloned()
+        .collect()
 }
 
 fn reorder_items(items: Vec<OrderedItem>) -> Vec<OrderedItem> {
@@ -800,18 +848,19 @@ mod tests {
         path::PathBuf,
     };
 
-    use super::{ItemBucket, OrderedItem, Translation, merged_cfg_attribute, reorder_items};
+    use super::{
+        ItemBucket, OrderedItem, Translation, make_feature_name, merged_cfg_attribute,
+        reorder_items,
+    };
 
-    fn translation(config: &[(&str, &str)]) -> Translation {
-        let config = config
-            .iter()
-            .map(|(param, value)| (param.to_string(), value.to_string()))
-            .collect::<BTreeMap<_, _>>();
+    fn translation_with_features(
+        config: BTreeMap<String, String>,
+        varying_params: &BTreeSet<String>,
+    ) -> Translation {
         let features = config
             .iter()
-            .map(|(param, value)| {
-                super::make_feature_name(param, value).expect("test config is valid")
-            })
+            .filter(|(param, _)| varying_params.contains(*param))
+            .map(|(param, value)| make_feature_name(param, value).expect("test config is valid"))
             .collect::<Vec<_>>();
 
         Translation {
@@ -845,10 +894,34 @@ mod tests {
     #[test]
     fn merged_cfg_attribute_uses_cofactor_simplification() {
         let translations = vec![
-            translation(&[("os", "linux"), ("arch", "x86")]),
-            translation(&[("os", "linux"), ("arch", "arm")]),
-            translation(&[("os", "mac"), ("arch", "x86")]),
-            translation(&[("os", "mac"), ("arch", "arm")]),
+            translation_with_features(
+                [("os", "linux"), ("arch", "x86")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+            ),
+            translation_with_features(
+                [("os", "linux"), ("arch", "arm")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+            ),
+            translation_with_features(
+                [("os", "mac"), ("arch", "x86")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+            ),
+            translation_with_features(
+                [("os", "mac"), ("arch", "arm")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &["os".to_string(), "arch".to_string()].into_iter().collect(),
+            ),
         ];
         let variants = vec![
             (0, PathBuf::from("linux-x86.rs")),
@@ -864,6 +937,42 @@ mod tests {
 
         let cfg = merged_cfg_attribute("fn shared() {}", &item_variants, &translations, &variants);
         assert_eq!(cfg, Some("#[cfg(feature = \"os_linux\")]".to_string()));
+    }
+
+    #[test]
+    fn merged_cfg_attribute_omits_globally_constant_parameters() {
+        let varying_params = ["arch".to_string()].into_iter().collect();
+        let translations = vec![
+            translation_with_features(
+                [("os", "linux"), ("arch", "x86")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+            ),
+            translation_with_features(
+                [("os", "linux"), ("arch", "arm")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+            ),
+        ];
+        let variants = vec![
+            (0, PathBuf::from("linux-x86.rs")),
+            (1, PathBuf::from("linux-arm.rs")),
+        ];
+        let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
+        item_variants.insert(
+            "fn x86_only() {}".to_string(),
+            [0usize].into_iter().collect(),
+        );
+
+        let cfg =
+            merged_cfg_attribute("fn x86_only() {}", &item_variants, &translations, &variants);
+        assert_eq!(cfg, Some("#[cfg(feature = \"arch_x86\")]".to_string()));
+        assert_eq!(translations[0].features, vec!["arch_x86".to_string()]);
+        assert_eq!(translations[1].features, vec!["arch_arm".to_string()]);
     }
 
     #[test]
