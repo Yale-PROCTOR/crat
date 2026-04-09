@@ -196,7 +196,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
-                    (vec![new_state], writes, vec![])
+                    (vec![new_state], writes, vec![CallKind::TOP])
                 };
                 let locations = if new_states.is_empty() {
                     vec![]
@@ -444,7 +444,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | "strlen"
             | "strspn"
             | "strerror"
-            | "__errno_location" => CallKind::CPure,
+            | "__errno_location"
+            | "fabs" => CallKind::CPure,
             _ => CallKind::CEffect,
         };
 
