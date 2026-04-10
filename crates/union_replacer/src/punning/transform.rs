@@ -36,7 +36,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // for debug
     let print_mir = false;
-    let print_reaching_write = true;
+    let print_reaching_write = false;
     let verbose_debug = false;
     let print_result = true;
 
@@ -114,7 +114,8 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
         verbose_debug,
         &config.c_exposed_fns,
     );
-    let reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_info.contexts);
+    let mut reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_info.contexts);
+    apply_syn_filter(tcx, &union_uses, &mut reaching_writes);
     if print_reaching_write {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
@@ -252,6 +253,82 @@ fn build_allowed_rw<'tcx>(
     }
 
     allowed
+}
+
+fn filter_syn(fs: &mut FxHashSet<usize>, m: u64) {
+    fs.retain(|i| *i < u64::BITS as usize && (m & (1u64 << *i)) != 0);
+}
+
+fn to_field(fs: &FxHashSet<usize>) -> Option<super::analysis::UnionAccessField> {
+    if fs.is_empty() {
+        return None;
+    }
+    if fs.len() == 1 {
+        return fs
+            .iter()
+            .next()
+            .copied()
+            .map(super::analysis::UnionAccessField::Field);
+    }
+    let mut m = 0u64;
+    for &i in fs {
+        if i >= u64::BITS as usize {
+            return Some(super::analysis::UnionAccessField::Top);
+        }
+        m |= 1u64 << i;
+    }
+    Some(super::analysis::UnionAccessField::Fields(m))
+}
+
+fn filter_field(
+    tcx: TyCtxt<'_>,
+    union_ty: rustc_span::def_id::DefId,
+    field: super::analysis::UnionAccessField,
+    syn: u64,
+) -> Option<super::analysis::UnionAccessField> {
+    let mut fs = field.to_fields(tcx, union_ty);
+    filter_syn(&mut fs, syn);
+    to_field(&fs)
+}
+
+fn apply_syn_filter(tcx: TyCtxt<'_>, union_uses: &UnionUseResult, rw: &mut ReverseCfgResult) {
+    for (&union_ty, ty_result) in &mut rw.uses {
+        let syn = union_uses.syn.get(&union_ty).copied().unwrap_or(0);
+
+        for reads in ty_result.instances.values_mut() {
+            let mut next = FxHashMap::default();
+
+            for (read, writes) in reads.drain() {
+                let Some(read_field) = filter_field(tcx, union_ty, read.field, syn) else {
+                    continue;
+                };
+
+                let mut next_writes = Vec::new();
+                for write in writes {
+                    let Some(write_field) = filter_field(tcx, union_ty, write.field, syn) else {
+                        continue;
+                    };
+                    next_writes.push(super::analysis::UnionWrite {
+                        field: write_field,
+                        ..write
+                    });
+                }
+                if next_writes.is_empty() {
+                    continue;
+                }
+
+                let read = super::analysis::UnionRead {
+                    field: read_field,
+                    ..read
+                };
+                next.entry(read)
+                    .or_insert_with(Vec::new)
+                    .extend(next_writes);
+            }
+
+            *reads = next;
+        }
+    }
 }
 
 fn determine_overlapping_unions(

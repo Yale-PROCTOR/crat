@@ -185,7 +185,7 @@ pub fn lookup_fn_model(tcx: TyCtxt<'_>, callee: DefId) -> Option<FnModel> {
             ret_alias: None,
         }),
         "ioctl" => Some(FnModel {
-            arg_effects: &[write_effect!(2, 1)],
+            arg_effects: &[read_effect!(2, 1), write_effect!(2, 1)], // to be conservative
             copy_effects: &[],
             ret_alias: None,
         }),
