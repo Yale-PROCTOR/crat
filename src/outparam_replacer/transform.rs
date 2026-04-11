@@ -541,7 +541,16 @@ pub fn transform(
     );
 
     if config.simplify {
-        println!("{counter:#?}");
+        println!("{} {} {} {} {} {} {} {}",
+            counter.removed_value_defs,
+            counter.removed_pointer_defs,
+            counter.removed_pointer_uses,
+            counter.direct_returns,
+            counter.success_returns,
+            counter.failure_returns,
+            counter.removed_flag_sets,
+            counter.removed_flag_defs,
+        );
     }
 
     res.apply();
