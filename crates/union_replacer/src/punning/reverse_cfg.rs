@@ -59,6 +59,7 @@ pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
+    allowed_rw: &FxHashMap<LocalDefId, (FxHashSet<usize>, FxHashSet<usize>)>,
 ) -> ReverseCfgResult {
     let mut result = FxHashMap::default();
 
@@ -69,6 +70,10 @@ pub fn analyze_reaching_writes<'tcx>(
         let Some(call_context) = call_contexts.get(&local_union_ty) else {
             continue;
         };
+        let Some((allowed_reads, allowed_writes)) = allowed_rw.get(&local_union_ty) else {
+            continue;
+        };
+        let syn_mask = union_uses.syn.get(&union_ty).copied().unwrap_or(0);
 
         let instance_indices = type_uses
             .instances
@@ -85,10 +90,24 @@ pub fn analyze_reaching_writes<'tcx>(
 
         let mut instances = FxHashMap::default();
         for (&instance, instance_uses) in &type_uses.instances {
-            let reaching = analyze_instance_reaching_writes(&mut analyzer, instance, instance_uses);
-            instances.insert(instance, reaching);
+            match analyze_instance_reaching_writes(
+                &mut analyzer,
+                union_ty,
+                syn_mask,
+                allowed_reads,
+                allowed_writes,
+                instance,
+                instance_uses,
+            ) {
+                InstanceAnalyzeOutcome::Completed(reaching) => {
+                    instances.insert(instance, reaching);
+                }
+                InstanceAnalyzeOutcome::EarlyReject => {
+                    instances.clear();
+                    break;
+                }
+            }
         }
-
         result.insert(union_ty, InstanceResult { instances });
     }
 
@@ -166,11 +185,20 @@ pub fn print_reaching_writes<'tcx>(
     }
 }
 
+enum InstanceAnalyzeOutcome {
+    Completed(ReadToWrites),
+    EarlyReject,
+}
+
 fn analyze_instance_reaching_writes<'tcx>(
     analyzer: &mut ReachingWriteAnalyzer<'_, 'tcx>,
+    union_ty: DefId,
+    syn_mask: u64,
+    allowed_reads: &FxHashSet<usize>,
+    allowed_writes: &FxHashSet<usize>,
     instance: UnionMemoryInstance,
     instance_uses: &UnionInstanceUses,
-) -> ReadToWrites {
+) -> InstanceAnalyzeOutcome {
     let reads = instance_uses
         .reads
         .values()
@@ -189,9 +217,94 @@ fn analyze_instance_reaching_writes<'tcx>(
                 active_callsite: None,
             },
         );
+
+        if should_early_reject(
+            analyzer.tcx,
+            union_ty,
+            syn_mask,
+            allowed_reads,
+            allowed_writes,
+            &read,
+            &writes,
+        ) {
+            return InstanceAnalyzeOutcome::EarlyReject;
+        }
+
         result.insert(read, writes);
     }
-    result
+
+    InstanceAnalyzeOutcome::Completed(result)
+}
+
+fn should_early_reject<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: DefId,
+    syn_mask: u64,
+    allowed_reads: &FxHashSet<usize>,
+    allowed_writes: &FxHashSet<usize>,
+    read: &UnionRead,
+    writes: &[UnionWrite],
+) -> bool {
+    let mut read_fields = read.field.to_fields(tcx, union_ty);
+    apply_syn_mask(&mut read_fields, syn_mask);
+    if read_fields.is_empty() {
+        return false;
+    }
+
+    for write in writes {
+        let mut write_fields = write.field.to_fields(tcx, union_ty);
+        apply_syn_mask(&mut write_fields, syn_mask);
+        if write_fields.is_empty() {
+            continue;
+        }
+        if !has_distinct_type_pair(tcx, union_ty, &write_fields, &read_fields) {
+            continue;
+        }
+
+        let allowed_pair =
+            read_fields.is_subset(allowed_reads) && write_fields.is_subset(allowed_writes);
+        if !allowed_pair {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn apply_syn_mask(fields: &mut FxHashSet<usize>, syn_mask: u64) {
+    fields.retain(|idx| *idx < u64::BITS as usize && (syn_mask & (1u64 << *idx)) != 0);
+}
+
+fn has_distinct_type_pair(
+    tcx: TyCtxt<'_>,
+    union_ty: DefId,
+    write_fields: &FxHashSet<usize>,
+    read_fields: &FxHashSet<usize>,
+) -> bool {
+    for &write_idx in write_fields {
+        let Some(write_ty) = union_field_ty(
+            tcx,
+            union_ty,
+            super::analysis::UnionAccessField::Field(write_idx),
+        ) else {
+            continue;
+        };
+
+        for &read_idx in read_fields {
+            let Some(read_ty) = union_field_ty(
+                tcx,
+                union_ty,
+                super::analysis::UnionAccessField::Field(read_idx),
+            ) else {
+                continue;
+            };
+
+            if write_ty != read_ty {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl<'a, 'tcx> ReachingWriteAnalyzer<'a, 'tcx> {

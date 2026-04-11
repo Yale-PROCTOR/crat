@@ -1,8 +1,10 @@
+use std::time::Instant;
+
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{DefId, LocalDefId};
 use serde::Deserialize;
 use utils::ir::AstToHir;
 
@@ -31,6 +33,45 @@ pub struct TransformationResult {
     pub union_use_stats: (usize, usize, usize),
 }
 
+#[derive(Debug, Clone)]
+struct TransformTiming {
+    base: Instant,
+    marks: Vec<(&'static str, u128)>,
+}
+
+impl TransformTiming {
+    #[inline]
+    fn maybe_new(enabled: bool) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        Some(Self {
+            base: Instant::now(),
+            marks: vec![("base", 0)],
+        })
+    }
+
+    #[inline]
+    fn mark(&mut self, label: &'static str) {
+        self.marks.push((label, self.base.elapsed().as_millis()));
+    }
+
+    fn format_marks(&self) -> String {
+        self.marks
+            .iter()
+            .map(|(label, ms)| format!("{label}:{ms}ms"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[inline]
+fn record_timing_point(timing: &mut Option<TransformTiming>, label: &'static str) {
+    if let Some(timing) = timing.as_mut() {
+        timing.mark(label);
+    }
+}
+
 pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> TransformationResult {
     let mut krate = utils::ast::expanded_ast(tcx);
 
@@ -38,7 +79,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
     let print_mir = false;
     let print_reaching_write = false;
     let verbose_debug = false;
-    let print_result = true;
+    let print_result = false;
 
     // Collect union types
     let (union_tys, ty_visitor) = collect_local_union_types(&tcx, verbose_debug);
@@ -55,6 +96,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
     }
 
     // Classify field types and determine allowed read/write sets
+    let mut timing = TransformTiming::maybe_new(print_result);
     let union_field_classes = classify_union_field_types(tcx, &union_tys, verbose_debug);
     let allowed_rw = build_allowed_rw(&union_field_classes);
 
@@ -87,8 +129,9 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
     if analysis_target_tys.is_empty() {
         utils::ast::remove_unnecessary_items_from_ast(&mut krate);
         let code = pprust::crate_to_string_for_macros(&krate);
+        record_timing_point(&mut timing, "early_return");
         if print_result {
-            print_union_use_stats(all_local_union_count, 0, 0);
+            print_union_use_stats(all_local_union_count, 0, 0, timing.as_ref());
         }
         return TransformationResult {
             code,
@@ -105,7 +148,8 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
         build_union_call_contexts(tcx, &seed_functions, &related_types_map, verbose_debug);
 
     // Analyze union uses and detect overlapping unions
-    let union_uses = analyze(
+    record_timing_point(&mut timing, "before_analysis");
+    let mut union_uses = analyze(
         tcx,
         &analysis_target_tys,
         &call_info.contexts,
@@ -114,8 +158,12 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
         verbose_debug,
         &config.c_exposed_fns,
     );
-    let mut reaching_writes = analyze_reaching_writes(tcx, &union_uses, &call_info.contexts);
+    let _single_syn_unions = single_syntax_field_unions(&mut union_uses);
+    record_timing_point(&mut timing, "points_to_done");
+    let mut reaching_writes =
+        analyze_reaching_writes(tcx, &union_uses, &call_info.contexts, &allowed_rw);
     apply_syn_filter(tcx, &union_uses, &mut reaching_writes);
+    record_timing_point(&mut timing, "reaching_writes_done");
     if print_reaching_write {
         print_reaching_writes(tcx, &union_uses, &reaching_writes);
     }
@@ -126,8 +174,8 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
         &allowed_rw,
         verbose_debug,
     );
+    record_timing_point(&mut timing, "analysis_done");
     let needs_bytemuck = needs_bytemuck(&overlapping_tys, &union_field_classes);
-
     // Analysis done
     if verbose || print_result {
         if !overlapping_tys.is_empty() {
@@ -142,22 +190,23 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // transform the AST
     let ast_to_hir: AstToHir = utils::ast::make_ast_to_hir(&mut krate, tcx);
-
+    record_timing_point(&mut timing, "preprocess_start");
     // Step 1: derive bytemuck traits for user-defined field types
     let derive_plan = build_bytemuck_derive_plan(tcx, &overlapping_tys, &union_field_classes);
     let mut derive_visitor = BytemuckDeriveVisitor::new(tcx, &ast_to_hir, derive_plan);
     derive_visitor.visit_crate(&mut krate);
-
+    record_timing_point(&mut timing, "preprocess_done");
     // Step 2: replace unions with raw structs
     let mut raw_struct_visitor =
         RawStructVisitor::new(tcx, &ast_to_hir, &overlapping_tys, union_field_classes);
     raw_struct_visitor.visit_crate(&mut krate);
-
+    record_timing_point(&mut timing, "ty_rewrite_done");
     // Step 3: update union uses
     let mut use_visitor = UnionUseRewriteVisitor::new(tcx, ast_to_hir, &overlapping_tys);
     use_visitor.visit_crate(&mut krate);
 
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+    record_timing_point(&mut timing, "transform_done");
 
     let str = pprust::crate_to_string_for_macros(&krate);
     if verbose {
@@ -169,6 +218,7 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
             all_local_union_count,
             analysis_target_count,
             overlapping_tys.len(),
+            timing.as_ref(),
         );
     }
 
@@ -183,8 +233,34 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
     }
 }
 
-fn print_union_use_stats(benchmark_all_local: usize, benchmark_targets: usize, overlapping: usize) {
+fn print_union_use_stats(
+    benchmark_all_local: usize,
+    benchmark_targets: usize,
+    overlapping: usize,
+    timing: Option<&TransformTiming>,
+) {
     println!("STATS,{benchmark_all_local},{benchmark_targets},{overlapping}");
+    if let Some(timing) = timing {
+        println!("{}", timing.format_marks());
+    }
+}
+
+fn single_syntax_field_unions(union_uses: &mut UnionUseResult) -> Vec<DefId> {
+    let mut single_syn_unions = Vec::new();
+    let syn = &union_uses.syn;
+    union_uses.uses.retain(|union_ty, _| {
+        let is_single_syntax_field = syn.get(union_ty).is_some_and(|mask| mask.count_ones() == 1);
+        if is_single_syntax_field {
+            single_syn_unions.push(*union_ty);
+        }
+        !is_single_syntax_field
+    });
+
+    for union_ty in &single_syn_unions {
+        union_uses.syn.remove(union_ty);
+    }
+
+    single_syn_unions
 }
 
 fn is_nested_union(tcx: TyCtxt<'_>, union_ty: LocalDefId) -> bool {
