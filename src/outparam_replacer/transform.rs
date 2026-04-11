@@ -541,7 +541,8 @@ pub fn transform(
     );
 
     if config.simplify {
-        println!("{} {} {} {} {} {} {} {}",
+        println!(
+            "{} {} {} {} {} {} {} {}",
             counter.removed_value_defs,
             counter.removed_pointer_defs,
             counter.removed_pointer_uses,
