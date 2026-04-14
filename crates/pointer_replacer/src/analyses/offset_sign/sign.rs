@@ -1215,10 +1215,7 @@ fn collect_caller_summaries<'tcx>(
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
         let addr_takens = collect_addr_takens(&body);
-        let branch_conditions = branch_conditions
-            .get(&def_id)
-            .cloned()
-            .unwrap_or_default();
+        let branch_conditions = branch_conditions.get(&def_id).cloned().unwrap_or_default();
         let mut cursor = Signedness {
             tcx,
             local_tys,
@@ -1294,10 +1291,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
 
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
         let addr_takens = collect_addr_takens(&body);
-        let branch_conditions = branch_conditions
-            .get(&def_id)
-            .cloned()
-            .unwrap_or_default();
+        let branch_conditions = branch_conditions.get(&def_id).cloned().unwrap_or_default();
         let mut cursor = Signedness {
             tcx,
             local_tys,
