@@ -13,8 +13,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
-        self, Body, Local, Location, Operand, Place, Rvalue, StatementKind, TerminatorEdges,
-        TerminatorKind, visit::Visitor as MVisitor,
+        self, BasicBlock, Body, Local, Location, Operand, Place, Rvalue, StatementKind,
+        SwitchTargetValue, TerminatorEdges, TerminatorKind, visit::Visitor as MVisitor,
     },
     ty::{self, ScalarInt, Ty, TyCtxt},
 };
@@ -401,6 +401,117 @@ impl JoinSemiLattice for SignState {
     }
 }
 
+impl AbsValue {
+    /// greatest lower bound in the lattice (narrows sign information)
+    fn meet(self, other: Self) -> Self {
+        use AbsValue::*;
+        if self == other {
+            return self;
+        }
+        match (self, other) {
+            (Bottom, _) | (_, Bottom) => Bottom,
+            (Top, v) | (v, Top) => v,
+            (NonNeg, NonPos) | (NonPos, NonNeg) => Zero,
+            (NonNeg, Pos) | (Pos, NonNeg) => Pos,
+            (NonNeg, Neg) | (Neg, NonNeg) => Bottom,
+            (NonNeg, Zero) | (Zero, NonNeg) => Zero,
+            (NonNeg, ConstI(c)) | (ConstI(c), NonNeg) => {
+                if c >= 0 {
+                    ConstI(c)
+                } else {
+                    Bottom
+                }
+            }
+            (NonNeg, ConstU(c)) | (ConstU(c), NonNeg) => ConstU(c),
+            (NonPos, Neg) | (Neg, NonPos) => Neg,
+            (NonPos, Pos) | (Pos, NonPos) => Bottom,
+            (NonPos, Zero) | (Zero, NonPos) => Zero,
+            (NonPos, ConstI(c)) | (ConstI(c), NonPos) => {
+                if c <= 0 {
+                    ConstI(c)
+                } else {
+                    Bottom
+                }
+            }
+            (NonPos, ConstU(c)) | (ConstU(c), NonPos) => {
+                if c == 0 {
+                    Zero
+                } else {
+                    Bottom
+                }
+            }
+            (Pos, Neg) | (Neg, Pos) => Bottom,
+            (Pos, Zero) | (Zero, Pos) => Bottom,
+            (Pos, ConstI(c)) | (ConstI(c), Pos) => {
+                if c > 0 {
+                    ConstI(c)
+                } else {
+                    Bottom
+                }
+            }
+            (Pos, ConstU(c)) | (ConstU(c), Pos) => {
+                if c > 0 {
+                    ConstU(c)
+                } else {
+                    Bottom
+                }
+            }
+            (Neg, Zero) | (Zero, Neg) => Bottom,
+            (Neg, ConstI(c)) | (ConstI(c), Neg) => {
+                if c < 0 {
+                    ConstI(c)
+                } else {
+                    Bottom
+                }
+            }
+            (Neg, ConstU(_)) | (ConstU(_), Neg) => Bottom,
+            (Zero, ConstI(c)) | (ConstI(c), Zero) => {
+                if c == 0 {
+                    Zero
+                } else {
+                    Bottom
+                }
+            }
+            (Zero, ConstU(c)) | (ConstU(c), Zero) => {
+                if c == 0 {
+                    Zero
+                } else {
+                    Bottom
+                }
+            }
+            (ConstI(a), ConstI(b)) => {
+                if a == b {
+                    ConstI(a)
+                } else {
+                    Bottom
+                }
+            }
+            (ConstU(a), ConstU(b)) => {
+                if a == b {
+                    ConstU(a)
+                } else {
+                    Bottom
+                }
+            }
+            (ConstI(a), ConstU(b)) => {
+                if a >= 0 && a as u128 == b {
+                    ConstU(b)
+                } else {
+                    Bottom
+                }
+            }
+            (ConstU(a), ConstI(b)) => {
+                if b >= 0 && a == b as u128 {
+                    ConstU(a)
+                } else {
+                    Bottom
+                }
+            }
+            _ => Bottom,
+        }
+    }
+}
+
 impl<C> DebugWithContext<C> for SignState {
     fn fmt_with(&self, _ctxt: &C, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.0)
@@ -427,11 +538,16 @@ pub struct Signedness<'a, 'tcx> {
     pub local_tys: IndexVec<Local, ty::Ty<'tcx>>,
     /// locals whose address is taken via MIR references/raw pointers
     pub addr_takens: &'a FxHashSet<Local>,
+    /// joined abstract values from all known callers, keyed by param local
+    pub caller_param_vals: FxHashMap<Local, AbsValue>,
+    /// per-block branch conditions extracted from SwitchInt terminators
+    pub branch_conditions: FxHashMap<BasicBlock, BranchCondition>,
 }
 
 impl<'tcx> Analysis<'tcx> for Signedness<'_, 'tcx> {
     type Direction = Forward;
     type Domain = SignState;
+    type SwitchIntData = BranchCondition;
 
     const NAME: &'static str = "signedness";
 
@@ -439,10 +555,16 @@ impl<'tcx> Analysis<'tcx> for Signedness<'_, 'tcx> {
         SignState(IndexVec::from_elem(AbsValue::Bottom, &body.local_decls))
     }
 
-    /// initalize function arguments from their declared type (e.g., unsigned args are NonNeg)
+    /// initialize function arguments: use caller-provided abstract values when available,
+    /// falling back to type-based defaults (unsigned → NonNeg, signed → Top)
     fn initialize_start_block(&self, body: &Body<'tcx>, state: &mut Self::Domain) {
         for arg in body.args_iter() {
-            state.0[arg] = abs_value_for_ty(body.local_decls[arg].ty);
+            let type_val = abs_value_for_ty(body.local_decls[arg].ty);
+            state.0[arg] = self
+                .caller_param_vals
+                .get(&arg)
+                .map(|&caller_val| refine_param_val(type_val, caller_val))
+                .unwrap_or(type_val);
         }
     }
 
@@ -494,6 +616,54 @@ impl<'tcx> Analysis<'tcx> for Signedness<'_, 'tcx> {
         }
         terminator.edges()
     }
+
+    fn get_switch_int_data(
+        &mut self,
+        block: BasicBlock,
+        discr: &mir::Operand<'tcx>,
+    ) -> Option<Self::SwitchIntData> {
+        // only handle bool discriminants (comparisons produce bool)
+        let (Operand::Copy(place) | Operand::Move(place)) = discr else { return None };
+        if !place.projection.is_empty() || !self.local_tys[place.local].is_bool() {
+            return None;
+        }
+        self.branch_conditions.get(&block).cloned()
+    }
+
+    fn apply_switch_int_edge_effect(
+        &mut self,
+        data: &mut Self::SwitchIntData,
+        state: &mut Self::Domain,
+        value: SwitchTargetValue,
+    ) {
+        let rhs_val = match data.rhs {
+            BranchRhs::Val(v) => v,
+            BranchRhs::Local(l) => state.0[l],
+        };
+        // for bool SwitchInt: Normal(0) = false branch, Otherwise/Normal(1) = true branch
+        let is_true = bool_switch_target_is_true(value);
+        if let Some(narrowed) = sign_from_comparison(data.op, rhs_val, is_true) {
+            for &constrained in &data.constrained_locals {
+                let current = state.0[constrained];
+                state.0[constrained] = current.meet(narrowed);
+            }
+        }
+    }
+}
+
+/// refine a type-based abstract value using caller-provided information
+fn refine_param_val(type_val: AbsValue, caller_val: AbsValue) -> AbsValue {
+    match type_val {
+        // signed integer: accept any caller refinement
+        AbsValue::Top => caller_val,
+        // unsigned integer: only accept caller values that are non-negative
+        AbsValue::NonNeg => match caller_val {
+            AbsValue::Zero | AbsValue::Pos | AbsValue::NonNeg | AbsValue::ConstU(_) => caller_val,
+            AbsValue::ConstI(c) if c >= 0 => caller_val,
+            _ => type_val,
+        },
+        _ => type_val,
+    }
 }
 
 /// helpers
@@ -513,6 +683,211 @@ fn abs_value_for_ty(ty: ty::Ty<'_>) -> AbsValue {
     } else {
         AbsValue::Bottom
     }
+}
+
+/// rhs of a branch comparison: either a precomputed constant or a local to evaluate at edge time
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchRhs {
+    Val(AbsValue),
+    Local(Local),
+}
+
+/// a comparison condition extracted from a block whose SwitchInt discriminant was computed as `constrained OP rhs`;
+/// used to narrow the sign of `constrained` on each outgoing edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCondition {
+    constrained_locals: Vec<Local>,
+    op: mir::BinOp,
+    rhs: BranchRhs,
+}
+
+fn bool_switch_target_is_true(value: SwitchTargetValue) -> bool {
+    matches!(
+        value,
+        SwitchTargetValue::Otherwise | SwitchTargetValue::Normal(1)
+    )
+}
+
+/// return the narrowed sign of `constrained` given `constrained OP rhs` holds.
+fn sign_from_comparison(op: mir::BinOp, rhs: AbsValue, is_true: bool) -> Option<AbsValue> {
+    use AbsValue::*;
+    // negate the operator for the false branch
+    let op = if is_true {
+        op
+    } else {
+        match op {
+            mir::BinOp::Gt => mir::BinOp::Le,
+            mir::BinOp::Ge => mir::BinOp::Lt,
+            mir::BinOp::Lt => mir::BinOp::Ge,
+            mir::BinOp::Le => mir::BinOp::Gt,
+            _ => return None,
+        }
+    };
+    match op {
+        mir::BinOp::Gt => match rhs {
+            Zero => Some(Pos),
+            ConstI(c) if c >= 0 => Some(Pos),
+            ConstU(_) => Some(Pos),
+            Neg | NonPos => Some(NonNeg),
+            ConstI(c) if c < 0 => Some(NonNeg),
+            _ => None,
+        },
+        mir::BinOp::Ge => match rhs {
+            Zero => Some(NonNeg),
+            ConstI(c) if c > 0 => Some(Pos),
+            ConstU(c) if c > 0 => Some(Pos),
+            Pos => Some(Pos),
+            _ => None,
+        },
+        mir::BinOp::Lt => match rhs {
+            Zero => Some(Neg),
+            ConstI(c) if c <= 0 => Some(Neg),
+            Pos | NonNeg => Some(NonPos),
+            ConstI(c) if c > 0 => Some(NonPos),
+            ConstU(_) => Some(NonPos),
+            _ => None,
+        },
+        mir::BinOp::Le => match rhs {
+            Zero => Some(NonPos),
+            ConstI(c) if c < 0 => Some(Neg),
+            Neg => Some(Neg),
+            _ => None,
+        },
+        mir::BinOp::Eq => match rhs {
+            Zero => Some(Zero),
+            Pos | ConstI(_) | ConstU(_) => Some(rhs),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// flip a comparison operator (swap lhs and rhs), e.g. Gt becomes Lt
+fn flip_cmp_op(op: mir::BinOp) -> mir::BinOp {
+    match op {
+        mir::BinOp::Gt => mir::BinOp::Lt,
+        mir::BinOp::Ge => mir::BinOp::Le,
+        mir::BinOp::Lt => mir::BinOp::Gt,
+        mir::BinOp::Le => mir::BinOp::Ge,
+        other => other,
+    }
+}
+
+/// build an undirected copy graph for plain local-to-local copy/move assignments in one block.
+fn build_copy_graph(stmts: &[mir::Statement<'_>]) -> FxHashMap<Local, FxHashSet<Local>> {
+    let mut graph: FxHashMap<Local, FxHashSet<Local>> = FxHashMap::default();
+    for stmt in stmts {
+        if let StatementKind::Assign(box (
+            lhs,
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src)),
+        )) = &stmt.kind
+            && lhs.projection.is_empty()
+            && src.projection.is_empty()
+        {
+            graph.entry(lhs.local).or_default().insert(src.local);
+            graph.entry(src.local).or_default().insert(lhs.local);
+        }
+    }
+    graph
+}
+
+/// return all locals in the same copy-equivalence class as `seed`.
+fn copy_equivalence_locals(
+    seed: Local,
+    copy_graph: &FxHashMap<Local, FxHashSet<Local>>,
+) -> Vec<Local> {
+    let mut worklist = vec![seed];
+    let mut visited: FxHashSet<Local> = FxHashSet::default();
+    while let Some(local) = worklist.pop() {
+        if !visited.insert(local) {
+            continue;
+        }
+        if let Some(neighbors) = copy_graph.get(&local) {
+            worklist.extend(neighbors.iter().copied());
+        }
+    }
+    let mut locals = visited.into_iter().collect::<Vec<_>>();
+    locals.sort_by_key(|l| l.as_usize());
+    locals
+}
+
+/// for each basic block whose SwitchInt discriminant, record the comparison condition
+/// so the analysis can narrow the local's sign on each edge
+fn collect_branch_conditions<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> FxHashMap<BasicBlock, BranchCondition> {
+    let mut map = FxHashMap::default();
+
+    for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::SwitchInt { discr, .. } = &bb_data.terminator().kind else {
+            continue;
+        };
+        let (Operand::Copy(discr_place) | Operand::Move(discr_place)) = discr else { continue };
+        if !discr_place.projection.is_empty() {
+            continue;
+        }
+        let discr_local = discr_place.local;
+        let copy_graph = build_copy_graph(&bb_data.statements);
+
+        // find the assignment `discr_local = l_op OP r_op` in this block's statements
+        for stmt in bb_data.statements.iter().rev() {
+            let StatementKind::Assign(box (lhs_place, Rvalue::BinaryOp(op, box (l_op, r_op)))) =
+                &stmt.kind
+            else {
+                continue;
+            };
+            if lhs_place.local != discr_local || !lhs_place.projection.is_empty() {
+                continue;
+            }
+            if !matches!(
+                op,
+                mir::BinOp::Gt | mir::BinOp::Ge | mir::BinOp::Lt | mir::BinOp::Le | mir::BinOp::Eq
+            ) {
+                break;
+            }
+
+            // try to identify (constrained_local, normalized_op, rhs) with constrained on the left.
+            // resolve through simple copies so `_4 = copy _2; _cond = Gt(_4, 0)` constrains `_2`.
+            let cond = match (l_op, r_op) {
+                (Operand::Copy(lp) | Operand::Move(lp), _) if lp.projection.is_empty() => {
+                    let rhs = match r_op {
+                        Operand::Constant(c) => BranchRhs::Val(eval_constant_operand(c, tcx)),
+                        Operand::Copy(rp) | Operand::Move(rp) if rp.projection.is_empty() => {
+                            BranchRhs::Local(rp.local)
+                        }
+                        _ => break,
+                    };
+                    let constrained_locals = copy_equivalence_locals(lp.local, &copy_graph);
+                    Some(BranchCondition {
+                        constrained_locals,
+                        op: *op,
+                        rhs,
+                    })
+                }
+                (_, Operand::Copy(rp) | Operand::Move(rp)) if rp.projection.is_empty() => {
+                    let lhs_val = match l_op {
+                        Operand::Constant(c) => BranchRhs::Val(eval_constant_operand(c, tcx)),
+                        _ => break,
+                    };
+                    let constrained_locals = copy_equivalence_locals(rp.local, &copy_graph);
+                    // normalize so constrained is on the left by flipping the operator
+                    Some(BranchCondition {
+                        constrained_locals,
+                        op: flip_cmp_op(*op),
+                        rhs: lhs_val,
+                    })
+                }
+                _ => None,
+            };
+
+            if let Some(c) = cond {
+                map.insert(bb, c);
+            }
+            break;
+        }
+    }
+    map
 }
 
 fn collect_addr_takens<'tcx>(body: &Body<'tcx>) -> FxHashSet<Local> {
@@ -817,16 +1192,100 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
     }
 }
 
+/// maps (callee_def_id, param_local) to the join of all caller arguments
+type CallerSummary = FxHashMap<(LocalDefId, Local), AbsValue>;
+type BranchConditions = FxHashMap<LocalDefId, FxHashMap<BasicBlock, BranchCondition>>;
+
+fn build_branch_conditions<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> BranchConditions {
+    let mut cache: BranchConditions = FxHashMap::default();
+    for &def_id in &rust_program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        cache.insert(def_id, collect_branch_conditions(&body, tcx));
+    }
+    cache
+}
+
+/// phase 0: run intraprocedural analysis with type-based defaults, then visit every
+/// call site to record the abstract value of each argument for the callee's parameter.
+fn collect_caller_summaries<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    branch_condition_cache: &BranchConditions,
+) -> CallerSummary {
+    use rustc_mir_dataflow::Analysis as _;
+    let mut summary: CallerSummary = FxHashMap::default();
+
+    for &def_id in &rust_program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
+        let addr_takens = collect_addr_takens(&body);
+        let branch_conditions = branch_condition_cache
+            .get(&def_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut cursor = Signedness {
+            tcx,
+            local_tys,
+            addr_takens: &addr_takens,
+            caller_param_vals: FxHashMap::default(),
+            branch_conditions,
+        }
+        .iterate_to_fixpoint(tcx, &body, None)
+        .into_results_cursor(&body);
+
+        for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
+            let TerminatorKind::Call { func, args, .. } = &bb_data.terminator().kind else {
+                continue;
+            };
+            let Operand::Constant(box constant) = func else { continue };
+            let ty::TyKind::FnDef(callee_id, _) = constant.const_.ty().kind() else { continue };
+            let Some(local_callee_id) = callee_id.as_local() else { continue };
+            let name = tcx.def_path(*callee_id).to_string_no_crate_verbose();
+            if is_pointer_offset_like_call(&name) {
+                continue;
+            }
+
+            let location = Location {
+                block: bb,
+                statement_index: bb_data.statements.len(),
+            };
+            cursor.seek_before_primary_effect(location);
+            let state = cursor.get();
+
+            for (idx, arg) in args.iter().enumerate() {
+                let arg_val = eval_operand(&arg.node, &state.0, tcx);
+                if arg_val == AbsValue::Bottom {
+                    continue; // non-integer argument, skip
+                }
+                let param = Local::from_usize(idx + 1); // skip return slot (_0)
+                let entry = summary
+                    .entry((local_callee_id, param))
+                    .or_insert(AbsValue::Bottom);
+                entry.join(&arg_val);
+            }
+        }
+    }
+    summary
+}
+
 /// main entry point for offset sign analysis
 pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult {
     use rustc_mir_dataflow::Analysis as _;
 
+    let tcx = rust_program.tcx;
+    let branch_condition_cache = build_branch_conditions(rust_program, tcx);
+
+    // phase 0: collect per-parameter caller argument summaries
+    let caller_summary = collect_caller_summaries(rust_program, tcx, &branch_condition_cache);
+
     let mut graph: SignGraph = FxHashMap::default();
     let mut tainted: FxHashSet<Node> = FxHashSet::default();
     let mut access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>> = FxHashMap::default();
-    let tcx = rust_program.tcx;
 
-    // phase 1: analyze signedness and collect taints
+    // phase 1: re-run analysis with caller-refined parameter initializations
     for &def_id in &rust_program.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
 
@@ -834,12 +1293,24 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
             graph.insert((def_id, local), FxHashSet::default());
         }
 
+        // extract per-function caller param vals; empty = no known callers = type-based fallback
+        let caller_param_vals: FxHashMap<Local, AbsValue> = body
+            .args_iter()
+            .filter_map(|arg| caller_summary.get(&(def_id, arg)).map(|&v| (arg, v)))
+            .collect();
+
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
         let addr_takens = collect_addr_takens(&body);
+        let branch_conditions = branch_condition_cache
+            .get(&def_id)
+            .cloned()
+            .unwrap_or_default();
         let mut cursor = Signedness {
             tcx,
             local_tys,
             addr_takens: &addr_takens,
+            caller_param_vals,
+            branch_conditions,
         }
         .iterate_to_fixpoint(tcx, &body, None)
         .into_results_cursor(&body);
