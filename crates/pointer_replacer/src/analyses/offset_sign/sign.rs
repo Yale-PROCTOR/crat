@@ -685,15 +685,14 @@ fn abs_value_for_ty(ty: ty::Ty<'_>) -> AbsValue {
     }
 }
 
-/// rhs of a branch comparison: either a precomputed constant or a local to evaluate at edge time
+/// rhs of a branch comparison: either a precomputed constant or a local to evaluate at edge
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchRhs {
     Val(AbsValue),
     Local(Local),
 }
 
-/// a comparison condition extracted from a block whose SwitchInt discriminant was computed as `constrained OP rhs`;
-/// used to narrow the sign of `constrained` on each outgoing edge.
+/// a comparison condition extracted from a block whose SwitchInt discriminant was computed as `constrained OP rhs`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCondition {
     constrained_locals: Vec<Local>,
@@ -728,8 +727,6 @@ fn sign_from_comparison(op: mir::BinOp, rhs: AbsValue, is_true: bool) -> Option<
             Zero => Some(Pos),
             ConstI(c) if c >= 0 => Some(Pos),
             ConstU(_) => Some(Pos),
-            Neg | NonPos => Some(NonNeg),
-            ConstI(c) if c < 0 => Some(NonNeg),
             _ => None,
         },
         mir::BinOp::Ge => match rhs {
@@ -742,9 +739,6 @@ fn sign_from_comparison(op: mir::BinOp, rhs: AbsValue, is_true: bool) -> Option<
         mir::BinOp::Lt => match rhs {
             Zero => Some(Neg),
             ConstI(c) if c <= 0 => Some(Neg),
-            Pos | NonNeg => Some(NonPos),
-            ConstI(c) if c > 0 => Some(NonPos),
-            ConstU(_) => Some(NonPos),
             _ => None,
         },
         mir::BinOp::Le => match rhs {
@@ -754,9 +748,8 @@ fn sign_from_comparison(op: mir::BinOp, rhs: AbsValue, is_true: bool) -> Option<
             _ => None,
         },
         mir::BinOp::Eq => match rhs {
-            Zero => Some(Zero),
-            Pos | ConstI(_) | ConstU(_) => Some(rhs),
-            _ => None,
+            Top | Bottom => None,
+            _ => Some(rhs),
         },
         _ => None,
     }
@@ -1200,12 +1193,12 @@ fn build_branch_conditions<'tcx>(
     rust_program: &RustProgram<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> BranchConditions {
-    let mut cache: BranchConditions = FxHashMap::default();
+    let mut conds: BranchConditions = FxHashMap::default();
     for &def_id in &rust_program.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
-        cache.insert(def_id, collect_branch_conditions(&body, tcx));
+        conds.insert(def_id, collect_branch_conditions(&body, tcx));
     }
-    cache
+    conds
 }
 
 /// phase 0: run intraprocedural analysis with type-based defaults, then visit every
@@ -1213,7 +1206,7 @@ fn build_branch_conditions<'tcx>(
 fn collect_caller_summaries<'tcx>(
     rust_program: &RustProgram<'tcx>,
     tcx: TyCtxt<'tcx>,
-    branch_condition_cache: &BranchConditions,
+    branch_conditions: &BranchConditions,
 ) -> CallerSummary {
     use rustc_mir_dataflow::Analysis as _;
     let mut summary: CallerSummary = FxHashMap::default();
@@ -1222,7 +1215,7 @@ fn collect_caller_summaries<'tcx>(
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
         let addr_takens = collect_addr_takens(&body);
-        let branch_conditions = branch_condition_cache
+        let branch_conditions = branch_conditions
             .get(&def_id)
             .cloned()
             .unwrap_or_default();
@@ -1276,10 +1269,10 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
     use rustc_mir_dataflow::Analysis as _;
 
     let tcx = rust_program.tcx;
-    let branch_condition_cache = build_branch_conditions(rust_program, tcx);
+    let branch_conditions = build_branch_conditions(rust_program, tcx);
 
     // phase 0: collect per-parameter caller argument summaries
-    let caller_summary = collect_caller_summaries(rust_program, tcx, &branch_condition_cache);
+    let caller_summary = collect_caller_summaries(rust_program, tcx, &branch_conditions);
 
     let mut graph: SignGraph = FxHashMap::default();
     let mut tainted: FxHashSet<Node> = FxHashSet::default();
@@ -1301,7 +1294,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
 
         let local_tys = body.local_decls.iter().map(|d| d.ty).collect();
         let addr_takens = collect_addr_takens(&body);
-        let branch_conditions = branch_condition_cache
+        let branch_conditions = branch_conditions
             .get(&def_id)
             .cloned()
             .unwrap_or_default();
