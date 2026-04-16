@@ -768,6 +768,83 @@ fn assignop_loop_is_safe() {
     );
 }
 
+/// branch condition narrowing: p.offset(x) inside `if x > 0 { }` is safe
+#[test]
+fn branch_gt_zero_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            if x > 0 {
+                let _ = *p.offset(x as isize);
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(x) inside if x > 0 should be safe (x is Pos)"
+    );
+}
+
+/// branch condition: p.offset(x) outside a guard still needs cursor
+#[test]
+fn branch_signed_param_outside_guard_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            let _ = *p.offset(x as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "p.offset(x) with unconstrained i32 x should need cursor"
+    );
+}
+
+/// ternary pattern: count = if param > 0 { param } else { 5 }
+/// count is always positive, so p.offset(count) is safe
+#[test]
+fn branch_ternary_always_positive_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, param: i32) {
+            let count = if param > 0 { param } else { 5 };
+            let _ = *p.offset(count as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(count) where count = if param > 0 {{ param }} else {{ 5 }} should be safe"
+    );
+}
+
+/// caller passes positive constant, callee uses it inside a guard: safe
+#[test]
+fn branch_caller_positive_callee_guarded_safe() {
+    let map = run_analysis(
+        "
+        unsafe fn inner(p: *const i32, shift: i32) {
+            if shift > 0 {
+                let _ = *p.offset(shift as isize);
+            }
+        }
+        pub unsafe fn outer(p: *const i32) {
+            inner(p, 3);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "inner", "p"),
+        None,
+        "inner: shift=3 from caller, used inside if shift>0, should be safe"
+    );
+}
+
 /// root_local fix: `(*s).buf.offset(n)` — root_local detects (*deref).field and
 /// returns None, so `s` is never attributed any offset and never flagged.
 #[test]
@@ -789,5 +866,89 @@ fn struct_field_deref_not_flagged() {
         needs_cursor(&map, "use_field", "s"),
         Some(true),
         "s: struct pointer — (*s).buf.offset should not be attributed to s"
+    );
+}
+
+/// false-edge narrowing: else branch of `if x < 0` implies x >= 0, so offset is safe.
+#[test]
+fn branch_false_edge_ge_zero_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            if x < 0 {
+                let _ = 0;
+            } else {
+                let _ = *p.offset(x as isize);
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(x) in else branch of if x < 0 should be safe (x is NonNeg)"
+    );
+}
+
+/// local-vs-local condition: if x > y and y == 0, then x is positive on true branch.
+#[test]
+fn branch_local_rhs_zero_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            let y: i32 = 0;
+            if x > y {
+                let _ = *p.offset(x as isize);
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(x) inside if x > y with y=0 should be safe"
+    );
+}
+
+/// flipped extraction: `0 < x` should normalize to `x > 0` and narrow x to positive.
+#[test]
+fn branch_flipped_constant_lhs_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            if 0 < x {
+                let _ = *p.offset(x as isize);
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "p.offset(x) inside if 0 < x should be safe"
+    );
+}
+
+/// copy-cycle robustness: copy-equivalence collection should not loop and should
+/// narrow all alias locals together on the guarded branch.
+#[test]
+fn branch_copy_cycle_aliases_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, x: i32) {
+            let mut a = x;
+            let mut b = x;
+            a = b;
+            b = a;
+            if a > 0 {
+                let _ = *p.offset(b as isize);
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "copy-related aliases in guarded branch should stay non-negative for offset use"
     );
 }
