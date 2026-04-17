@@ -69,6 +69,29 @@ impl TransferedTerminator {
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
+    fn switch_target_key_from_int(&self, v: i128, discr: &Operand<'tcx>) -> u128 {
+        let bits = match discr.ty(self.local_decl, self.tcx).kind() {
+            TyKind::Int(int_ty) => int_ty
+                .bit_width()
+                .map(u64::from)
+                .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
+            TyKind::Uint(uint_ty) => uint_ty
+                .bit_width()
+                .map(u64::from)
+                .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
+            TyKind::Bool => 1,
+            TyKind::Char => 32,
+            _ => 128,
+        };
+
+        let mask = if bits >= 128 {
+            u128::MAX
+        } else {
+            (1_u128 << bits) - 1
+        };
+        (v as u128) & mask
+    }
+
     pub fn transfer_statement(
         &mut self,
         stmt: &Statement<'tcx>,
@@ -114,7 +137,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .gamma()
                         .unwrap()
                         .iter()
-                        .map(|b| targets.target_for_value(*b as _).start_location())
+                        .map(|b| {
+                            let key = self.switch_target_key_from_int(*b, discr);
+                            targets.target_for_value(key).start_location()
+                        })
                         .collect()
                 } else if !v.uintv.is_bot() && !v.uintv.is_top() {
                     v.uintv
