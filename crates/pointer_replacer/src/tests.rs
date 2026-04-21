@@ -3330,7 +3330,7 @@ pub unsafe fn consume(mut end: *mut i32, mut count: i32) -> i32 {
     sum
 }
 
-pub unsafe fn demo() -> i32 {
+pub unsafe fn foo() -> i32 {
     let mut array_size: i32 = 5;
     let mut data_array: *mut i32 =
         malloc(array_size as usize * std::mem::size_of::<i32>()) as *mut i32;
@@ -3349,8 +3349,96 @@ pub unsafe fn demo() -> i32 {
     sum
 }
 "#,
-        &["SliceCursor::with_pos(", ".as_deref().unwrap_or(&[])"],
+        &[
+            "let mut data_array: Option<Box<[i32]>>",
+            "SliceCursor::with_pos(",
+            ".as_deref().unwrap_or(&[])",
+        ],
         &["SliceCursor::with_pos(&data_array"],
+    );
+}
+
+#[test]
+fn test_owned_malloc_array_negative_offset_borrows_boxed_slice_as_cursor() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut data_array: *mut i32 = malloc(5 * std::mem::size_of::<i32>()) as *mut i32;
+    if data_array.is_null() {
+        return -1;
+    }
+    let mut i: i32 = 0;
+    while i < 5 {
+        *data_array.offset(i as isize) = i + 1;
+        i += 1;
+    }
+    let mut tail: *mut i32 = data_array.offset(4 as isize);
+    *tail.offset(-2 as isize)
+}
+"#,
+        &[
+            "let mut data_array: Option<Box<[i32]>>",
+            "SliceCursor::with_pos(",
+            ".as_deref().unwrap_or(&[])",
+        ],
+        &[
+            "let mut data_array: *mut i32",
+            "let mut tail: *mut i32",
+            "SliceCursor::with_pos(&data_array",
+        ],
+    );
+}
+
+#[test]
+fn test_inline_offset_call_arg_borrows_boxed_slice_as_cursor() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn consume(mut end: *mut i32, mut count: i32) -> i32 {
+    let mut sum: i32 = 0;
+    while count > 0 {
+        sum += *end;
+        end = end.offset(-1);
+        count -= 1;
+    }
+    sum
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut array_size: i32 = 5;
+    let mut data_array: *mut i32 =
+        malloc(array_size as usize * std::mem::size_of::<i32>()) as *mut i32;
+    if data_array.is_null() {
+        return -1;
+    }
+    let mut i: i32 = 0;
+    while i < array_size {
+        *data_array.offset(i as isize) = i + 1;
+        i += 1;
+    }
+    let sum = consume(data_array.offset((array_size as isize) + -(1 as isize)), array_size);
+    free(data_array as *mut core::ffi::c_void);
+    sum
+}
+"#,
+        &[
+            "let mut data_array: Option<Box<[i32]>>",
+            "consume(crate::slice_cursor::SliceCursor::with_pos(",
+            ".as_deref().unwrap_or(&[])",
+        ],
+        &[
+            "let mut last_element:",
+            "SliceCursor::with_pos(&data_array",
+            "consume(data_array.offset(",
+        ],
     );
 }
 
