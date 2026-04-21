@@ -449,6 +449,28 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
             );
         }
 
+        // Post-process direct_returns: if rhs is "*name" for a simplified output param,
+        // replace with "name___v" since the pointer variable is being eliminated.
+        if config.simplify {
+            let deref_to_val: Vec<(String, String)> = index_map
+                .values()
+                .filter(|p| p.simplify_ref_decl)
+                .map(|p| (format!("*{}", p.name), format!("{}___v", p.name)))
+                .collect();
+            if !deref_to_val.is_empty() {
+                for param in index_map.values_mut() {
+                    for rhs in param.direct_returns.values_mut() {
+                        for (deref_expr, val_name) in &deref_to_val {
+                            if rhs == deref_expr {
+                                *rhs = val_name.clone();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // given the analysis result, decide how to transform the return type
         let mut return_tys: IndexVec<RetIdx, ReturnTyItem> = IndexVec::new();
 

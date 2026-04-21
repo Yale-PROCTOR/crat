@@ -69,6 +69,29 @@ impl TransferedTerminator {
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
+    fn switch_target_key_from_int(&self, v: i128, discr: &Operand<'tcx>) -> u128 {
+        let bits = match discr.ty(self.local_decl, self.tcx).kind() {
+            TyKind::Int(int_ty) => int_ty
+                .bit_width()
+                .map(u64::from)
+                .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
+            TyKind::Uint(uint_ty) => uint_ty
+                .bit_width()
+                .map(u64::from)
+                .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
+            TyKind::Bool => 1,
+            TyKind::Char => 32,
+            _ => 128,
+        };
+
+        let mask = if bits >= 128 {
+            u128::MAX
+        } else {
+            (1_u128 << bits) - 1
+        };
+        (v as u128) & mask
+    }
+
     pub fn transfer_statement(
         &mut self,
         stmt: &Statement<'tcx>,
@@ -114,7 +137,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .gamma()
                         .unwrap()
                         .iter()
-                        .map(|b| targets.target_for_value(*b as _).start_location())
+                        .map(|b| {
+                            let key = self.switch_target_key_from_int(*b, discr);
+                            targets.target_for_value(key).start_location()
+                        })
                         .collect()
                 } else if !v.uintv.is_bot() && !v.uintv.is_top() {
                     v.uintv
@@ -196,7 +222,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
-                    (vec![new_state], writes, vec![])
+                    (vec![new_state], writes, vec![CallKind::TOP])
                 };
                 let locations = if new_states.is_empty() {
                     vec![]
@@ -444,7 +470,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | "strlen"
             | "strspn"
             | "strerror"
-            | "__errno_location" => CallKind::CPure,
+            | "__errno_location"
+            | "fabs" => CallKind::CPure,
             _ => CallKind::CEffect,
         };
 
@@ -674,11 +701,20 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
             ("", "num", _, "wrapping_neg") => args[0].neg(),
-            (_, "f64", _, m) if m.starts_with("is_") => AbsValue::top_bool(),
+            (_, "f64" | "f32" | "float", _, m) if m.starts_with("is_") => AbsValue::top_bool(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
                 let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
                 reads.extend(reads2);
+                let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
+                writes.extend(writes2);
+                let bases = self
+                    .get_write_bases_of_ptr(&args[0].ptrv)
+                    .unwrap_or_default();
+                call_kind = CallKind::RustEffect(Some(bases));
+                args[0].clone()
+            }
+            ("", "unix", _, "memset") => {
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
                 let bases = self
@@ -711,7 +747,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 | "MulAssign" | "RemAssign" | "ShlAssign" | "ShrAssign" | "SubAssign",
                 _,
             )
-            | ("", "cast", "ToPrimitive", "to_i64") => {
+            | ("", "cast", "ToPrimitive", "to_i64" | "to_f64") => {
                 let reads0 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
                 reads.extend(reads0);
                 AbsValue::top()
@@ -1089,7 +1125,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 }
             },
             ConstValue::ZeroSized => match ty.kind() {
-                TyKind::Tuple(_) => AbsValue::alpha_list(vec![]),
+                TyKind::Tuple(_) | TyKind::Array(_, _) => AbsValue::alpha_list(vec![]),
                 TyKind::FnDef(def_id, _) => AbsValue::alpha_fn(*def_id),
                 _ => unreachable!("{:?}", ty),
             },
