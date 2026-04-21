@@ -73,11 +73,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let bits = match discr.ty(self.local_decl, self.tcx).kind() {
             TyKind::Int(int_ty) => int_ty
                 .bit_width()
-                .map(u64::from)
                 .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
             TyKind::Uint(uint_ty) => uint_ty
                 .bit_width()
-                .map(u64::from)
                 .unwrap_or_else(|| self.tcx.data_layout.pointer_size.bits()),
             TyKind::Bool => 1,
             TyKind::Char => 32,
