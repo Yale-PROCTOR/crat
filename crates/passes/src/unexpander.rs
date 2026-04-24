@@ -637,4 +637,56 @@ fn f() {
             &["write_fmt", "format_args"],
         )
     }
+
+    // bytemuck tests skip type checking
+    // #[derive(bytemuck::...)] requires the proc macro crate
+    fn run_bytemuck_test(code: &str, includes: &[&str], excludes: &[&str]) {
+        let config = super::Config { use_print: true };
+        let s = utils::compilation::run_compiler_on_str(code, |tcx| super::unexpand(config, tcx))
+            .unwrap();
+        for include in includes {
+            assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+        }
+        for exclude in excludes {
+            assert!(
+                !s.contains(exclude),
+                "Expected not to find `{exclude}` in:\n{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bytemuck_pod() {
+        run_bytemuck_test(
+            r#"
+mod bytemuck {
+    pub unsafe trait Zeroable {}
+    pub unsafe trait Pod: Zeroable {}
+}
+#[repr(C)]
+struct S { x: f32, y: f32 }
+unsafe impl bytemuck::Zeroable for S {}
+unsafe impl bytemuck::Pod for S {}
+            "#,
+            &["#[derive(bytemuck::Zeroable, bytemuck::Pod)]"],
+            &["unsafe impl bytemuck"],
+        )
+    }
+
+    #[test]
+    fn test_bytemuck_anybitpattern() {
+        run_bytemuck_test(
+            r#"
+mod bytemuck {
+    pub unsafe trait Zeroable {}
+    pub unsafe trait AnyBitPattern: Zeroable {}
+}
+struct T { x: f32 }
+unsafe impl bytemuck::Zeroable for T {}
+unsafe impl bytemuck::AnyBitPattern for T {}
+            "#,
+            &["#[derive(bytemuck::AnyBitPattern)]"],
+            &["unsafe impl bytemuck", "derive(bytemuck::Zeroable"],
+        )
+    }
 }
