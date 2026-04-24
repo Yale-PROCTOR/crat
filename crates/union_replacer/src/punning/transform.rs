@@ -184,7 +184,9 @@ pub fn replace_unions(tcx: TyCtxt<'_>, verbose: bool, config: &Config) -> Transf
 
     // Analysis Step 2: Safety Condition Checking
     let safety_passed_tys = safety_check(tcx, &union_uses, &allowed_rw);
-    println!("Safety check passed: {}", safety_passed_tys.len());
+    if verbose || verbose_debug {
+        println!("Safety check passed: {}", safety_passed_tys.len());
+    }
 
     let safety_passed_set = safety_passed_tys
         .iter()
