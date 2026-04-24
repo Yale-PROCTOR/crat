@@ -55,12 +55,16 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         "thread_local_internals",
         "coverage_attribute",
         "builtin_syntax",
+        "rt",
+        "libstd_sys_internals",
     ]
     .into_iter()
     .collect();
     if !visitor.ctx.use_intrinsics {
         unnecessary_attributes.insert("core_intrinsics");
     }
+    unnecessary_attributes.insert("rt");
+    unnecessary_attributes.insert("libstd_sys_internals");
 
     krate.attrs.retain(|attr| {
         if let AttrKind::Normal(attr) = &attr.kind
@@ -97,6 +101,22 @@ impl MutVisitor for AstVisitor<'_> {
         if utils::ast::is_automatically_derived(&item.attrs) {
             return smallvec![];
         }
+        if let ItemKind::Impl(imp) = &item.kind
+            && let Some(of_trait) = &imp.of_trait
+            && of_trait
+                .path
+                .segments
+                .iter()
+                .any(|s| s.ident.name.as_str() == "bytemuck")
+        {
+            return smallvec![];
+        }
+        if let ItemKind::Const(const_item) = &item.kind
+            && const_item.ident.name == kw::Underscore
+            && !self.ctx.bytemuck_traits.is_empty()
+        {
+            return smallvec![];
+        }
         mut_visit::walk_flat_map_item(self, item)
     }
 
@@ -113,6 +133,26 @@ impl MutVisitor for AstVisitor<'_> {
                     }
                     let attr = utils::ast::make_outer_attribute(sym::derive, *t, self.tcx);
                     item.attrs.push(attr);
+                }
+            }
+            if let Some(bytemuck_traits) = self.ctx.bytemuck_traits.get(local_def_id) {
+                let has_any_bit_pattern = bytemuck_traits
+                    .iter()
+                    .any(|t| t == "bytemuck::AnyBitPattern");
+                let mut seen = FxHashSet::default();
+                let mut parts: Vec<&str> = Vec::new();
+                for t in bytemuck_traits {
+                    // AnyBitPattern derive internally generates a Zeroable impl
+                    if has_any_bit_pattern && t == "bytemuck::Zeroable" {
+                        continue;
+                    }
+                    if seen.insert(t.as_str()) {
+                        parts.push(t.as_str());
+                    }
+                }
+                if !parts.is_empty() {
+                    let derive_list = parts.join(", ");
+                    item.attrs.extend(utils::attr!("#[derive({derive_list})]"));
                 }
             }
         }
@@ -372,6 +412,7 @@ fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
 #[derive(Default)]
 struct Ctx {
     derived_traits: FxHashMap<LocalDefId, Vec<Symbol>>,
+    bytemuck_traits: FxHashMap<LocalDefId, Vec<String>>,
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
     use_intrinsics: bool,
     use_transmute: bool,
@@ -441,6 +482,28 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
                 }
             }
         }
+        if !utils::ast::is_automatically_derived(&item.attrs)
+            && let ItemKind::Impl(imp) = &item.kind
+            && let Some(of_trait) = &imp.of_trait
+            && of_trait
+                .path
+                .segments
+                .iter()
+                .any(|s| s.ident.name.as_str() == "bytemuck")
+            && let Some(hir_item) = self.ast_to_hir.get_item(item.id, self.tcx)
+            && let hir::ItemKind::Impl(hir_imp) = hir_item.kind
+            && let hir::TyKind::Path(QPath::Resolved(_, self_ty)) = hir_imp.self_ty.kind
+            && let Res::Def(_, def_id) = self_ty.res
+            && let Some(local_def_id) = def_id.as_local()
+        {
+            let trait_name = of_trait.path.segments.last().unwrap().ident.name;
+            self.ctx
+                .bytemuck_traits
+                .entry(local_def_id)
+                .or_default()
+                .push(format!("bytemuck::{trait_name}"));
+        }
+
         visit::walk_item(self, item);
     }
 
