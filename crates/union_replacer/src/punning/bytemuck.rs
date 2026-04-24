@@ -243,12 +243,12 @@ impl<'tcx> BytemuckTypeClassifier<'tcx> {
 /// This function must be called after the analysis
 pub fn build_bytemuck_derive_plan<'tcx>(
     tcx: TyCtxt<'tcx>,
-    overlapping_tys: &[LocalDefId],
+    punning_tys: &[LocalDefId],
     field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
 ) -> BytemuckDerivePlan {
     let mut builder = BytemuckDerivePlanBuilder::new(tcx);
 
-    for &union_ty in overlapping_tys {
+    for &union_ty in punning_tys {
         let Some(fields) = field_classes.get(&union_ty) else {
             continue;
         };

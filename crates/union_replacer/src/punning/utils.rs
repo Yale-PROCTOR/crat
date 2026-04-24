@@ -13,10 +13,10 @@ use toml_edit::{DocumentMut, Item, Table};
 use super::raw_struct::UnionFieldClassification;
 
 pub fn needs_bytemuck<'tcx>(
-    overlapping_tys: &[LocalDefId],
+    punning_tys: &[LocalDefId],
     union_field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
 ) -> bool {
-    overlapping_tys.iter().any(|union_ty| {
+    punning_tys.iter().any(|union_ty| {
         union_field_classes
             .get(union_ty)
             .is_some_and(|fields| fields.iter().any(|f| !f.class.is_other()))

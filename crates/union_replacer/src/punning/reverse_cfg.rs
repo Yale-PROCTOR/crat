@@ -18,6 +18,7 @@ pub type ReadToWrites = FxHashMap<UnionRead, Vec<UnionWrite>>;
 
 pub struct ReverseCfgResult {
     pub uses: FxHashMap<DefId, InstanceResult>,
+    pub punning: FxHashSet<DefId>,
 }
 
 #[derive(Default)]
@@ -59,18 +60,19 @@ pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
-    allowed_rw: &FxHashMap<LocalDefId, (FxHashSet<usize>, FxHashSet<usize>)>,
+    target_union_tys: &FxHashSet<DefId>,
 ) -> ReverseCfgResult {
     let mut result = FxHashMap::default();
+    let mut punning = FxHashSet::default();
 
     for (&union_ty, type_uses) in &union_uses.uses {
         let Some(local_union_ty) = union_ty.as_local() else {
             continue;
         };
-        let Some(call_context) = call_contexts.get(&local_union_ty) else {
+        if !target_union_tys.contains(&union_ty) {
             continue;
-        };
-        let Some((allowed_reads, allowed_writes)) = allowed_rw.get(&local_union_ty) else {
+        }
+        let Some(call_context) = call_contexts.get(&local_union_ty) else {
             continue;
         };
         let syn_mask = union_uses.syn.get(&union_ty).copied().unwrap_or(0);
@@ -89,29 +91,37 @@ pub fn analyze_reaching_writes<'tcx>(
         };
 
         let mut instances = FxHashMap::default();
+        let mut punning_detected = false;
         for (&instance, instance_uses) in &type_uses.instances {
             match analyze_instance_reaching_writes(
                 &mut analyzer,
                 union_ty,
                 syn_mask,
-                allowed_reads,
-                allowed_writes,
                 instance,
                 instance_uses,
             ) {
                 InstanceAnalyzeOutcome::Completed(reaching) => {
                     instances.insert(instance, reaching);
                 }
-                InstanceAnalyzeOutcome::EarlyReject => {
-                    instances.clear();
+                InstanceAnalyzeOutcome::PunningDetected => {
+                    punning_detected = true;
                     break;
                 }
             }
         }
-        result.insert(union_ty, InstanceResult { instances });
+
+        if punning_detected {
+            punning.insert(union_ty);
+            result.insert(union_ty, InstanceResult::default());
+        } else {
+            result.insert(union_ty, InstanceResult { instances });
+        }
     }
 
-    ReverseCfgResult { uses: result }
+    ReverseCfgResult {
+        uses: result,
+        punning,
+    }
 }
 
 pub fn print_reaching_writes<'tcx>(
@@ -187,15 +197,13 @@ pub fn print_reaching_writes<'tcx>(
 
 enum InstanceAnalyzeOutcome {
     Completed(ReadToWrites),
-    EarlyReject,
+    PunningDetected,
 }
 
 fn analyze_instance_reaching_writes<'tcx>(
     analyzer: &mut ReachingWriteAnalyzer<'_, 'tcx>,
     union_ty: DefId,
     syn_mask: u64,
-    allowed_reads: &FxHashSet<usize>,
-    allowed_writes: &FxHashSet<usize>,
     instance: UnionMemoryInstance,
     instance_uses: &UnionInstanceUses,
 ) -> InstanceAnalyzeOutcome {
@@ -218,16 +226,8 @@ fn analyze_instance_reaching_writes<'tcx>(
             },
         );
 
-        if should_early_reject(
-            analyzer.tcx,
-            union_ty,
-            syn_mask,
-            allowed_reads,
-            allowed_writes,
-            &read,
-            &writes,
-        ) {
-            return InstanceAnalyzeOutcome::EarlyReject;
+        if has_punning_read_write_pair(analyzer.tcx, union_ty, syn_mask, &read, &writes) {
+            return InstanceAnalyzeOutcome::PunningDetected;
         }
 
         result.insert(read, writes);
@@ -236,12 +236,10 @@ fn analyze_instance_reaching_writes<'tcx>(
     InstanceAnalyzeOutcome::Completed(result)
 }
 
-fn should_early_reject<'tcx>(
+fn has_punning_read_write_pair<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_ty: DefId,
     syn_mask: u64,
-    allowed_reads: &FxHashSet<usize>,
-    allowed_writes: &FxHashSet<usize>,
     read: &UnionRead,
     writes: &[UnionWrite],
 ) -> bool {
@@ -257,13 +255,7 @@ fn should_early_reject<'tcx>(
         if write_fields.is_empty() {
             continue;
         }
-        if !has_distinct_type_pair(tcx, union_ty, &write_fields, &read_fields) {
-            continue;
-        }
-
-        let allowed_pair =
-            read_fields.is_subset(allowed_reads) && write_fields.is_subset(allowed_writes);
-        if !allowed_pair {
+        if has_distinct_type_pair(tcx, union_ty, &write_fields, &read_fields) {
             return true;
         }
     }
