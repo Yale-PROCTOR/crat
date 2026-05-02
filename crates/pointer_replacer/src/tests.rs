@@ -5,6 +5,17 @@ fn rewrite_with_config(code: &str, config: &Config) -> (String, bool) {
         .unwrap()
 }
 
+fn rewrite_struct_arrays_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_struct_arrays(config, tcx))
+        .unwrap()
+}
+
+fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, bool) {
+    let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
+    let input = if changed { pre.as_str() } else { code };
+    rewrite_with_config(input, config)
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);
@@ -3472,6 +3483,263 @@ pub unsafe fn copy_tail(
         &["(&((*(src).as_deref().unwrap()).data))[("],
         &["&mut ((*(src).as_deref().unwrap()).data)"],
     );
+}
+
+#[test]
+fn test_replace_local_borrows_does_not_run_struct_array_field_pre_stage() {
+    let code = r#"
+#[repr(C)]
+pub struct Elem {
+    pub x: i32,
+}
+impl Copy for Elem {}
+impl Clone for Elem {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Group {
+    pub a: Elem,
+    pub b: Elem,
+    pub c: Elem,
+    pub tag: i32,
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut s: Group = Group {
+        a: Elem { x: 1 },
+        b: Elem { x: 2 },
+        c: Elem { x: 3 },
+        tag: 4,
+    };
+    let mut p: *mut Elem = &raw mut s.a;
+    let mut q: *mut Elem = p as *mut Elem;
+    (*q.offset(1)).x = 7;
+    s.b.x
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    assert!(!s.contains("pub a: [Elem; 3]"), "{s}");
+    assert!(s.contains("pub b: Elem"), "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn test_struct_array_field_run_from_field_rooted_offset() {
+    let code = r#"
+#[repr(C)]
+pub struct Elem {
+    pub x: i32,
+}
+impl Copy for Elem {}
+impl Clone for Elem {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Group {
+    pub a: Elem,
+    pub b: Elem,
+    pub c: Elem,
+    pub tag: i32,
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut s: Group = Group {
+        a: Elem { x: 1 },
+        b: Elem { x: 2 },
+        c: Elem { x: 3 },
+        tag: 4,
+    };
+    let mut p: *mut Elem = &raw mut s.a;
+    let mut q: *mut Elem = p as *mut Elem;
+    (*q.offset(1)).x = 7;
+    s.b.x
+}
+"#;
+    let (s, bytemuck) = rewrite_struct_arrays_then_pointer(code, &Config::default());
+    assert!(!bytemuck);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in [
+        "pub a: [Elem; 3]",
+        "a: [Elem { x: 1 }, Elem { x: 2 }, Elem { x: 3 }]",
+        "s.a[1].x",
+    ] {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in ["pub b: Elem", "s.b.x"] {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_struct_array_rejects_offset_with_different_pointee_type() {
+    let code = r#"
+#[repr(C)]
+pub struct Group {
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+pub unsafe fn foo(s: *mut Group) {
+    let p: *mut i32 = &raw mut (*s).a;
+    let q: *mut i64 = p as *mut i64;
+    let _r = q.offset(1);
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub a: i32"), "{s}");
+    assert!(s.contains("pub b: i32"), "{s}");
+    assert!(s.contains("pub c: i32"), "{s}");
+    assert!(!s.contains("pub a: [i32; 3]"), "{s}");
+}
+
+#[test]
+fn test_struct_array_rejects_offset_with_same_size_different_pointee_type() {
+    let code = r#"
+#[repr(C)]
+pub struct Pair {
+    pub key: i32,
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Header {
+    pub length: usize,
+    pub capacity: usize,
+    pub payload: *mut core::ffi::c_void,
+}
+
+pub unsafe fn foo(items: *mut Pair) -> usize {
+    let header = items.offset(-1) as *mut Header;
+    (*header).length + (*header).capacity
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub length: usize"), "{s}");
+    assert!(s.contains("pub capacity: usize"), "{s}");
+    assert!(!s.contains("pub length: [usize; 2]"), "{s}");
+}
+
+#[test]
+fn test_struct_array_rejects_nested_array_element_type() {
+    let code = r#"
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct c2v {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct c2Poly {
+    pub count: i32,
+    pub verts: [c2v; 8],
+    pub norms: [c2v; 8],
+}
+
+pub unsafe fn foo(poly: *mut c2Poly) {
+    let p: *mut [c2v; 8] = &raw mut (*poly).verts;
+    let _q = p.offset(1);
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub verts: [c2v; 8]"), "{s}");
+    assert!(s.contains("pub norms: [c2v; 8]"), "{s}");
+    assert!(!s.contains("pub verts: [[c2v; 8]; 2]"), "{s}");
+}
+
+#[test]
+fn test_struct_array_rejects_whole_struct_byte_inspection() {
+    let code = r#"
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct house_t {
+    pub floors: i32,
+    pub bedrooms: i32,
+    pub bathrooms: f64,
+}
+
+extern "C" {
+    fn print_hex(p: *mut core::ffi::c_uchar, n: core::ffi::c_int);
+}
+
+pub unsafe fn foo() {
+    let mut house = house_t {
+        floors: 2,
+        bedrooms: 3,
+        bathrooms: 1.5,
+    };
+    print_hex(
+        &mut house as *mut house_t as *mut core::ffi::c_uchar,
+        ::core::mem::size_of::<house_t>() as core::ffi::c_int,
+    );
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub floors: i32"), "{s}");
+    assert!(s.contains("pub bedrooms: i32"), "{s}");
+    assert!(!s.contains("pub floors: [i32; 2]"), "{s}");
+}
+
+#[test]
+fn test_struct_array_rejects_partial_literal_group() {
+    let code = r#"
+#[repr(C)]
+pub struct Group {
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+pub unsafe fn foo(s: *mut Group) {
+    let _partial = Group { a: 1, ..*s };
+    let p: *mut i32 = &raw mut (*s).a;
+    let _q = p.offset(1);
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub a: i32"), "{s}");
+    assert!(s.contains("pub b: i32"), "{s}");
+    assert!(s.contains("pub c: i32"), "{s}");
+}
+
+#[test]
+fn test_struct_array_rejects_offset_of_escape() {
+    let code = r#"
+#[repr(C)]
+pub struct Group {
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+pub unsafe fn foo(s: *mut Group) -> usize {
+    let p: *mut i32 = &raw mut (*s).a;
+    let _q = p.offset(1);
+    ::core::mem::offset_of!(Group, b)
+}
+"#;
+    let (s, changed) = rewrite_struct_arrays_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("pub a: i32"), "{s}");
+    assert!(s.contains("pub b: i32"), "{s}");
+    assert!(s.contains("pub c: i32"), "{s}");
+    assert!(!s.contains("pub a: [i32; 3]"), "{s}");
 }
 
 #[test]
