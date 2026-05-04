@@ -164,7 +164,7 @@ mod tests {
         }
         "#;
 
-        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -257,7 +257,105 @@ mod tests {
         }
         "#;
 
-        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn call_by_value_parent_read() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+            pub i: i32,
+        }
+
+        fn read_parent(p: ParentOverlap) -> u32 {
+            unsafe { p.u.a }
+        }
+
+        pub extern "C" fn call_by_value_parent_read() {
+            let mut p = ParentOverlap { u: OverlapU { a: 0 }, i: 1 };
+            unsafe {
+                p.u.b = [1, 2, 3, 4];
+            }
+            use_a(read_parent(p));
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn return_by_value_read() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        fn make_u() -> OverlapU {
+            let mut u = OverlapU { a: 0 };
+            unsafe {
+                u.b = [9, 8, 7, 6];
+            }
+            u
+        }
+
+        pub extern "C" fn return_by_value_read() {
+            let u = make_u();
+            unsafe {
+                use_a(u.a);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
+    fn return_parent_by_value_read() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+            pub i: i32,
+        }
+
+        fn make_parent() -> ParentOverlap {
+            let mut p = ParentOverlap { u: OverlapU { a: 0 }, i: 1 };
+            unsafe {
+                p.u.b = [4, 3, 2, 1];
+            }
+            p
+        }
+
+        pub extern "C" fn return_parent_by_value_read() {
+            let p = make_parent();
+            unsafe {
+                use_a(p.u.a);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -321,7 +419,7 @@ mod tests {
         }
         "#;
 
-        run_test(&format!("{BASE}\n{code}"), (2, 2, 0));
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
     }
 
     #[test]
@@ -502,6 +600,173 @@ mod tests {
             let mut ip = Ipv4 { as_int: 0 };
             unsafe { local_host(&mut ip.octet); }
             unsafe { use_a(ip.as_int); }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 1),
+        );
+    }
+
+    #[test]
+    fn tagged_ii() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Value {
+            pub i: i32,
+            pub i2: i32,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct Parent {
+            pub u: Value,
+        }
+
+        unsafe fn to_field_ptr(value: *mut Parent) -> *mut i32 {
+            &mut (*value).u.i as *mut i32
+        }
+
+        pub extern "C" fn tagged_ii() {
+            let mut value = Parent {
+                u: Value { i: 0 },
+            };
+            unsafe {
+                value.u.i = 42;
+                let p = to_field_ptr(&mut value as *mut Parent);
+                *p;
+            }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 0),
+        );
+    }
+
+    #[test]
+    fn tagged_if() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union Value {
+            pub i: i32,
+            pub f: f32,
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct Parent {
+            pub u: Value,
+        }
+
+        unsafe fn to_field_ptr(value: *mut Parent) -> *mut i32 {
+            &mut (*value).u.i as *mut i32
+        }
+
+        pub extern "C" fn tagged_if() {
+            let mut value = Parent {
+                u: Value { i: 0 },
+            };
+            unsafe {
+                value.u.i = 42;
+                let p = to_field_ptr(&mut value as *mut Parent);
+                *p;
+            }
+        }
+        "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+{code}"
+            ),
+            (2, 2, 0),
+        );
+    }
+
+    #[test]
+    fn tagged_iif() {
+        let code = r#"
+            #[derive(Copy, Clone)]
+            #[repr(C)]
+            pub union Value {
+                pub i: i32,
+                pub f: f32,
+                pub i2: i32,
+            }
+
+            #[derive(Copy, Clone)]
+            #[repr(C)]
+            pub struct Parent {
+                pub u: Value,
+            }
+
+            unsafe fn to_field_ptr(value: *mut Parent) -> *mut i32 {
+                &mut (*value).u.i as *mut i32
+            }
+
+            pub extern "C" fn tagged_iif() {
+                let mut value = Parent {
+                    u: Value { i: 0 },
+                };
+                unsafe {
+                    value.u.i = 42;
+                    let p = to_field_ptr(&mut value as *mut Parent);
+                    *p;
+                }
+            }
+            "#;
+
+        run_test(
+            &format!(
+                "{BASE}
+    {code}"
+            ),
+            (2, 2, 0),
+        );
+    }
+
+    #[test]
+    fn memcpy_into_union_field() {
+        let code = r#"
+        use core::ffi::c_void;
+
+        extern "C" {
+            fn memcpy(
+                dst: *mut c_void,
+                src: *const c_void,
+                n: usize,
+            ) -> *mut c_void;
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union U32Bytes {
+            pub as_int: u32,
+            pub bytes: [u8; 4],
+        }
+
+        pub extern "C" fn memcpy_into_union_field() {
+            let mut u = U32Bytes { as_int: 0 };
+            let src = [1u8, 2, 3, 4];
+            unsafe {
+                memcpy(
+                    u.bytes.as_mut_ptr() as *mut c_void,
+                    src.as_ptr() as *const c_void,
+                    4,
+                );
+                use_a(u.as_int);
+            }
         }
         "#;
 

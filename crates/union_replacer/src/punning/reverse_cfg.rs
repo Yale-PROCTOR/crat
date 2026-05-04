@@ -7,8 +7,8 @@ use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
     analysis::{
-        UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUseResult, UnionWrite,
-        format_access, union_field_ty,
+        CopyPoint, CopySource, UnionInstanceUses, UnionMemoryInstance, UnionRead, UnionUseResult,
+        UnionWrite, format_access, union_field_ty,
     },
     callgraph::{CallIndex, CallSite, UnionCallContext},
     utils::with_body,
@@ -18,6 +18,7 @@ pub type ReadToWrites = FxHashMap<UnionRead, Vec<UnionWrite>>;
 
 pub struct ReverseCfgResult {
     pub uses: FxHashMap<DefId, InstanceResult>,
+    pub punning: FxHashSet<DefId>,
 }
 
 #[derive(Default)]
@@ -42,36 +43,85 @@ struct SearchState {
 
 #[derive(Default)]
 struct InstanceIndex {
-    reads: Vec<UnionRead>,
     writes_by_loc: FxHashMap<(LocalDefId, Location), Vec<UnionWrite>>,
+    copies_by_loc: FxHashMap<(LocalDefId, Location), Vec<CopySource>>,
+    entry_copies: FxHashMap<LocalDefId, Vec<CopySource>>,
+}
+
+struct ReachingWriteAnalyzer<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    call_index: &'a CallIndex,
+    indices: &'a FxHashMap<UnionMemoryInstance, InstanceIndex>,
+    cache: FxHashMap<(UnionMemoryInstance, SearchState), Vec<UnionWrite>>,
+    active: FxHashSet<(UnionMemoryInstance, SearchState)>,
 }
 
 pub fn analyze_reaching_writes<'tcx>(
     tcx: TyCtxt<'tcx>,
     union_uses: &UnionUseResult,
     call_contexts: &FxHashMap<LocalDefId, UnionCallContext>,
+    target_union_tys: &FxHashSet<DefId>,
 ) -> ReverseCfgResult {
     let mut result = FxHashMap::default();
+    let mut punning = FxHashSet::default();
 
     for (&union_ty, type_uses) in &union_uses.uses {
         let Some(local_union_ty) = union_ty.as_local() else {
             continue;
         };
+        if !target_union_tys.contains(&union_ty) {
+            continue;
+        }
         let Some(call_context) = call_contexts.get(&local_union_ty) else {
             continue;
         };
+        let syn_mask = union_uses.syn.get(&union_ty).copied().unwrap_or(0);
+
+        let instance_indices = type_uses
+            .instances
+            .iter()
+            .map(|(&instance, instance_uses)| (instance, build_instance_index(instance_uses)))
+            .collect::<FxHashMap<_, _>>();
+        let mut analyzer = ReachingWriteAnalyzer {
+            tcx,
+            call_index: &call_context.call_index,
+            indices: &instance_indices,
+            cache: FxHashMap::default(),
+            active: FxHashSet::default(),
+        };
 
         let mut instances = FxHashMap::default();
+        let mut punning_detected = false;
         for (&instance, instance_uses) in &type_uses.instances {
-            let reaching =
-                analyze_instance_reaching_writes(tcx, instance_uses, &call_context.call_index);
-            instances.insert(instance, reaching);
+            match analyze_instance_reaching_writes(
+                &mut analyzer,
+                union_ty,
+                syn_mask,
+                instance,
+                instance_uses,
+            ) {
+                InstanceAnalyzeOutcome::Completed(reaching) => {
+                    instances.insert(instance, reaching);
+                }
+                InstanceAnalyzeOutcome::PunningDetected => {
+                    punning_detected = true;
+                    break;
+                }
+            }
         }
 
-        result.insert(union_ty, InstanceResult { instances });
+        if punning_detected {
+            punning.insert(union_ty);
+            result.insert(union_ty, InstanceResult::default());
+        } else {
+            result.insert(union_ty, InstanceResult { instances });
+        }
     }
 
-    ReverseCfgResult { uses: result }
+    ReverseCfgResult {
+        uses: result,
+        punning,
+    }
 }
 
 pub fn print_reaching_writes<'tcx>(
@@ -92,24 +142,14 @@ pub fn print_reaching_writes<'tcx>(
         println!("\t{}:", tcx.def_path_str(union_ty));
 
         for instance in type_uses.instances.keys() {
-            println!(
-                "\t\tInstance L{}..=L{}:",
-                instance.root.index(),
-                instance.end.index()
-            );
-
             let Some(reaching) = type_result.instances.get(instance) else {
-                println!("\t\t\t(no reads)");
                 continue;
             };
 
             let reads = reaching.iter().collect::<Vec<_>>();
-
             if reads.is_empty() {
-                println!("\t\t\t(no reads)");
                 continue;
             }
-
             for (read, writes) in reads {
                 let read_field = format_access(tcx, union_ty, read);
                 let read_fields = read.field.to_fields(tcx, union_ty);
@@ -155,151 +195,301 @@ pub fn print_reaching_writes<'tcx>(
     }
 }
 
-fn analyze_instance_reaching_writes<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance_uses: &UnionInstanceUses,
-    call_index: &CallIndex,
-) -> ReadToWrites {
-    let instance_index = build_instance_index(instance_uses);
+enum InstanceAnalyzeOutcome {
+    Completed(ReadToWrites),
+    PunningDetected,
+}
 
-    let reads = instance_index.reads.clone();
+fn analyze_instance_reaching_writes<'tcx>(
+    analyzer: &mut ReachingWriteAnalyzer<'_, 'tcx>,
+    union_ty: DefId,
+    syn_mask: u64,
+    instance: UnionMemoryInstance,
+    instance_uses: &UnionInstanceUses,
+) -> InstanceAnalyzeOutcome {
+    let reads = instance_uses
+        .reads
+        .values()
+        .flat_map(|reads| reads.iter().copied())
+        .collect::<Vec<_>>();
 
     let mut result = FxHashMap::default();
     for read in reads {
-        let writes = collect_reaching_writes_for_read(tcx, read, &instance_index, call_index);
-        result.insert(read, writes);
-    }
-    result
-}
+        let writes = analyzer.collect_reaching_writes(
+            instance,
+            SearchState {
+                point: SearchPoint::Location {
+                    def_id: read.site.def_id,
+                    location: read.site.location,
+                },
+                active_callsite: None,
+            },
+        );
 
-fn collect_reaching_writes_for_read<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    read: UnionRead,
-    instance_index: &InstanceIndex,
-    call_index: &CallIndex,
-) -> Vec<UnionWrite> {
-    let mut found = FxHashSet::default();
-    let mut visited = FxHashSet::default();
-    let mut entered_callsites = FxHashSet::default();
-    let mut worklist = vec![SearchState {
-        point: SearchPoint::Location {
-            def_id: read.site.def_id,
-            location: read.site.location,
-        },
-        active_callsite: None,
-    }];
-
-    while let Some(state) = worklist.pop() {
-        if !visited.insert(state) {
-            continue;
+        if has_punning_read_write_pair(analyzer.tcx, union_ty, syn_mask, &read, &writes) {
+            return InstanceAnalyzeOutcome::PunningDetected;
         }
 
-        match state.point {
-            SearchPoint::Entry(def_id) => {
-                if let Some(active_callsite) = state.active_callsite {
-                    // Check if that callsite is a write
-                    if let Some(writes) = instance_index
-                        .writes_by_loc
-                        .get(&(active_callsite.caller, active_callsite.call_location))
-                    {
-                        found.extend(writes.iter().copied());
-                    }
-                    // Spread to the callsite
-                    with_body(tcx, active_callsite.caller, |body| {
-                        for point in previous_points(
-                            body,
-                            active_callsite.caller,
-                            active_callsite.call_location,
-                        ) {
-                            worklist.push(SearchState {
-                                point,
-                                active_callsite: None,
-                            });
-                        }
-                    });
-                    continue;
-                }
+        result.insert(read, writes);
+    }
 
-                // If no callsites were specified, spread to all callers
-                if let Some(callers) = call_index.callers_of.get(&def_id) {
-                    for &callsite in callers {
-                        if !entered_callsites.insert(callsite) {
-                            continue;
-                        }
-                        // Check if that callsite is a write
+    InstanceAnalyzeOutcome::Completed(result)
+}
+
+fn has_punning_read_write_pair<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    union_ty: DefId,
+    syn_mask: u64,
+    read: &UnionRead,
+    writes: &[UnionWrite],
+) -> bool {
+    let mut read_fields = read.field.to_fields(tcx, union_ty);
+    apply_syn_mask(&mut read_fields, syn_mask);
+    if read_fields.is_empty() {
+        return false;
+    }
+
+    for write in writes {
+        let mut write_fields = write.field.to_fields(tcx, union_ty);
+        apply_syn_mask(&mut write_fields, syn_mask);
+        if write_fields.is_empty() {
+            continue;
+        }
+        if has_distinct_type_pair(tcx, union_ty, &write_fields, &read_fields) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn apply_syn_mask(fields: &mut FxHashSet<usize>, syn_mask: u64) {
+    fields.retain(|idx| *idx < u64::BITS as usize && (syn_mask & (1u64 << *idx)) != 0);
+}
+
+fn has_distinct_type_pair(
+    tcx: TyCtxt<'_>,
+    union_ty: DefId,
+    write_fields: &FxHashSet<usize>,
+    read_fields: &FxHashSet<usize>,
+) -> bool {
+    for &write_idx in write_fields {
+        let Some(write_ty) = union_field_ty(
+            tcx,
+            union_ty,
+            super::analysis::UnionAccessField::Field(write_idx),
+        ) else {
+            continue;
+        };
+
+        for &read_idx in read_fields {
+            let Some(read_ty) = union_field_ty(
+                tcx,
+                union_ty,
+                super::analysis::UnionAccessField::Field(read_idx),
+            ) else {
+                continue;
+            };
+
+            if write_ty != read_ty {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+impl<'a, 'tcx> ReachingWriteAnalyzer<'a, 'tcx> {
+    fn collect_reaching_writes(
+        &mut self,
+        instance: UnionMemoryInstance,
+        start: SearchState,
+    ) -> Vec<UnionWrite> {
+        let key = (instance, start);
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        if !self.active.insert(key) {
+            return Vec::new();
+        }
+
+        let Some(instance_index) = self.indices.get(&instance) else {
+            self.active.remove(&key);
+            return Vec::new();
+        };
+
+        let mut found = FxHashSet::default();
+        let mut visited = FxHashSet::default();
+        let mut entered_callsites = FxHashSet::default();
+        let mut worklist = vec![start];
+
+        while let Some(state) = worklist.pop() {
+            if !visited.insert(state) {
+                continue;
+            }
+
+            match state.point {
+                SearchPoint::Entry(def_id) => {
+                    if let Some(copies) = instance_index.entry_copies.get(&def_id).cloned() {
+                        self.apply_copies(&mut found, &copies, None);
+                        continue;
+                    }
+
+                    if let Some(active_callsite) = state.active_callsite {
                         if let Some(writes) = instance_index
                             .writes_by_loc
-                            .get(&(callsite.caller, callsite.call_location))
+                            .get(&(active_callsite.caller, active_callsite.call_location))
                         {
                             found.extend(writes.iter().copied());
                         }
-                        // Spread to the callsite
-                        with_body(tcx, callsite.caller, |body| {
-                            for point in
-                                previous_points(body, callsite.caller, callsite.call_location)
-                            {
+                        if let Some(copies) = instance_index
+                            .copies_by_loc
+                            .get(&(active_callsite.caller, active_callsite.call_location))
+                            .cloned()
+                        {
+                            self.apply_copies(&mut found, &copies, Some(active_callsite));
+                            continue;
+                        }
+                        with_body(self.tcx, active_callsite.caller, |body| {
+                            for point in previous_points(
+                                body,
+                                active_callsite.caller,
+                                active_callsite.call_location,
+                            ) {
                                 worklist.push(SearchState {
                                     point,
                                     active_callsite: None,
                                 });
                             }
                         });
+                        continue;
                     }
-                }
-            }
-            SearchPoint::Location { def_id, location } => {
-                // If current location is a write, add it to the results and stop analysis for current path
-                if let Some(writes) = instance_index.writes_by_loc.get(&(def_id, location)) {
-                    found.extend(writes.iter().copied());
-                    continue;
-                }
 
-                // Check if current location is a callsite
-                let callsite = CallSite {
-                    caller: def_id,
-                    call_location: location,
-                };
-                if call_index.callees_of.contains_key(&callsite) {
-                    if entered_callsites.insert(callsite)
-                        && let Some(entries) = call_index.return_entries_of.get(&callsite)
-                    {
-                        // Spread to all return points of each callee
-                        for &(callee, return_location) in entries {
-                            worklist.push(SearchState {
-                                point: SearchPoint::Location {
-                                    def_id: callee,
-                                    location: return_location,
-                                },
-                                active_callsite: Some(callsite),
+                    if let Some(callers) = self.call_index.callers_of.get(&def_id) {
+                        for &callsite in callers {
+                            if !entered_callsites.insert(callsite) {
+                                continue;
+                            }
+                            if let Some(writes) = instance_index
+                                .writes_by_loc
+                                .get(&(callsite.caller, callsite.call_location))
+                            {
+                                found.extend(writes.iter().copied());
+                            }
+                            if let Some(copies) = instance_index
+                                .copies_by_loc
+                                .get(&(callsite.caller, callsite.call_location))
+                                .cloned()
+                            {
+                                self.apply_copies(&mut found, &copies, Some(callsite));
+                                continue;
+                            }
+                            with_body(self.tcx, callsite.caller, |body| {
+                                for point in
+                                    previous_points(body, callsite.caller, callsite.call_location)
+                                {
+                                    worklist.push(SearchState {
+                                        point,
+                                        active_callsite: None,
+                                    });
+                                }
                             });
                         }
                     }
-                    continue;
                 }
-
-                with_body(tcx, def_id, |body| {
-                    for point in previous_points(body, def_id, location) {
-                        worklist.push(SearchState {
-                            point,
-                            active_callsite: state.active_callsite,
-                        });
+                SearchPoint::Location { def_id, location } => {
+                    if let Some(writes) = instance_index.writes_by_loc.get(&(def_id, location)) {
+                        found.extend(writes.iter().copied());
+                        continue;
                     }
-                });
+
+                    let callsite = CallSite {
+                        caller: def_id,
+                        call_location: location,
+                    };
+                    if let Some(copies) = instance_index
+                        .copies_by_loc
+                        .get(&(def_id, location))
+                        .cloned()
+                    {
+                        let copy_callsite = if self.call_index.callees_of.contains_key(&callsite) {
+                            Some(callsite)
+                        } else {
+                            state.active_callsite
+                        };
+                        self.apply_copies(&mut found, &copies, copy_callsite);
+                        continue;
+                    }
+
+                    if self.call_index.callees_of.contains_key(&callsite) {
+                        if entered_callsites.insert(callsite)
+                            && let Some(entries) = self.call_index.return_entries_of.get(&callsite)
+                        {
+                            for &(callee, return_location) in entries {
+                                worklist.push(SearchState {
+                                    point: SearchPoint::Location {
+                                        def_id: callee,
+                                        location: return_location,
+                                    },
+                                    active_callsite: Some(callsite),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    with_body(self.tcx, def_id, |body| {
+                        for point in previous_points(body, def_id, location) {
+                            worklist.push(SearchState {
+                                point,
+                                active_callsite: state.active_callsite,
+                            });
+                        }
+                    });
+                }
             }
+        }
+
+        let out = found.into_iter().collect::<Vec<_>>();
+        self.active.remove(&key);
+        self.cache.insert(key, out.clone());
+        out
+    }
+
+    fn apply_copies(
+        &mut self,
+        found: &mut FxHashSet<UnionWrite>,
+        copies: &[CopySource],
+        active_callsite: Option<CallSite>,
+    ) {
+        for copy in copies {
+            found.extend(self.copy_writes(*copy, active_callsite));
         }
     }
 
-    found.into_iter().collect::<Vec<_>>()
+    fn copy_writes(
+        &mut self,
+        copy: CopySource,
+        active_callsite: Option<CallSite>,
+    ) -> Vec<UnionWrite> {
+        self.collect_reaching_writes(
+            copy.source_instance,
+            SearchState {
+                point: SearchPoint::Location {
+                    def_id: copy.source_site.def_id,
+                    location: copy.source_site.location,
+                },
+                active_callsite,
+            },
+        )
+    }
 }
 
 fn build_instance_index(instance_uses: &UnionInstanceUses) -> InstanceIndex {
     let mut index = InstanceIndex {
-        reads: instance_uses
-            .reads
-            .values()
-            .flat_map(|reads| reads.iter().copied())
-            .collect(),
         writes_by_loc: FxHashMap::default(),
+        copies_by_loc: FxHashMap::default(),
+        entry_copies: FxHashMap::default(),
     };
 
     for (&def_id, writes) in &instance_uses.writes {
@@ -309,6 +499,25 @@ fn build_instance_index(instance_uses: &UnionInstanceUses) -> InstanceIndex {
                 .entry((def_id, write.site.location))
                 .or_default()
                 .push(write);
+        }
+    }
+
+    for &copy_init in &instance_uses.copies {
+        match copy_init.point {
+            CopyPoint::Entry(def_id) => {
+                index
+                    .entry_copies
+                    .entry(def_id)
+                    .or_default()
+                    .push(copy_init);
+            }
+            CopyPoint::Location { def_id, location } => {
+                index
+                    .copies_by_loc
+                    .entry((def_id, location))
+                    .or_default()
+                    .push(copy_init);
+            }
         }
     }
 

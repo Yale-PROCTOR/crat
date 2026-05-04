@@ -13,10 +13,10 @@ use toml_edit::{DocumentMut, Item, Table};
 use super::raw_struct::UnionFieldClassification;
 
 pub fn needs_bytemuck<'tcx>(
-    overlapping_tys: &[LocalDefId],
+    punning_tys: &[LocalDefId],
     union_field_classes: &FxHashMap<LocalDefId, Vec<UnionFieldClassification<'tcx>>>,
 ) -> bool {
-    overlapping_tys.iter().any(|union_ty| {
+    punning_tys.iter().any(|union_ty| {
         union_field_classes
             .get(union_ty)
             .is_some_and(|fields| fields.iter().any(|f| !f.class.is_other()))
@@ -216,9 +216,10 @@ pub fn ensure_bytemuck_with_derive(dir: &Path) {
     }
 
     let deps = doc["dependencies"].as_table_mut().unwrap();
-    deps["bytemuck"] =
-        Item::from_str(r#"{ version = "1.24.0", features = ["derive", "min_const_generics"] }"#)
-            .unwrap();
+    deps["bytemuck"] = Item::from_str(
+        r#"{ version = "1.24.0", features = ["derive", "min_const_generics", "must_cast"] }"#,
+    )
+    .unwrap();
 
     fs::write(path, doc.to_string()).unwrap();
 }
