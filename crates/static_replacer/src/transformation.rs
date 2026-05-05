@@ -8,7 +8,10 @@ use rustc_hir::{
     def_id::LocalDefId,
     intravisit,
 };
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{
+    hir::nested_filter,
+    ty::{self, Ty, TyCtxt},
+};
 use rustc_span::{Symbol, sym};
 use utils::{expr, item};
 
@@ -102,6 +105,17 @@ impl<'tcx> AstVisitor<'tcx> {
         }
     }
 
+    fn has_only_new_shared_borrows(&self, had_previous_borrows: bool) -> bool {
+        !had_previous_borrows
+            && !self.borrows.is_empty()
+            && self.borrows.values().all(|is_mut| !*is_mut)
+    }
+
+    fn hir_expr_type_contains_ref_or_raw_ptr(&self, expr: &hir::Expr<'_>) -> bool {
+        let typeck = self.tcx.typeck(expr.hir_id.owner);
+        ty_contains_ref_or_raw_ptr(typeck.expr_ty(expr))
+    }
+
     fn get_hir_parent(&self, hir_id: HirId) -> hir::Node<'tcx> {
         for (_, node) in self.tcx.hir_parent_iter(hir_id) {
             if let hir::Node::Expr(e) = node
@@ -149,6 +163,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        let had_previous_borrows = !self.borrows.is_empty();
         mut_visit::walk_expr(self, expr);
 
         let hir_expr = some_or!(self.ast_to_hir.get_expr(expr.id, self.tcx), return);
@@ -340,6 +355,18 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
         match self.get_hir_parent(hir_expr.hir_id) {
             hir::Node::Expr(e) => {
+                if self.has_only_new_shared_borrows(had_previous_borrows)
+                    && match e.kind {
+                        hir::ExprKind::Call(_, args) => {
+                            args.iter().any(|arg| arg.hir_id == hir_expr.hir_id)
+                        }
+                        _ => false,
+                    }
+                    && !self.hir_expr_type_contains_ref_or_raw_ptr(hir_expr)
+                {
+                    self.introduce_borrow(expr);
+                }
+
                 if let hir::ExprKind::If(p, _, _) | hir::ExprKind::Ret(Some(p)) = e.kind
                     && std::iter::once(hir_expr.hir_id)
                         .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
@@ -390,6 +417,16 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             }
             _ => {}
         }
+    }
+}
+
+fn ty_contains_ref_or_raw_ptr(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::Ref(..) | ty::RawPtr(..) => true,
+        ty::Array(ty, _) | ty::Slice(ty) => ty_contains_ref_or_raw_ptr(*ty),
+        ty::Tuple(tys) => tys.iter().any(ty_contains_ref_or_raw_ptr),
+        ty::Adt(_, args) => args.types().any(ty_contains_ref_or_raw_ptr),
+        _ => false,
     }
 }
 
@@ -842,6 +879,117 @@ unsafe fn g(x: &mut [i32; 10]) -> i32 { x[0] }
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow("],
             &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_call_arg_read() {
+        let code = r#"
+struct Node { id: i32, active: i32 }
+impl Copy for Node {}
+impl Clone for Node { fn clone(&self) -> Self { *self } }
+static mut S: [Node; 10] = [Node { id: 0, active: 0 }; 10];
+unsafe fn f() -> *mut Node { S.as_mut_ptr() }
+unsafe fn g() -> i32 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < 10 {
+        if S[i].active != 0 {
+            sum += h(S[i].id);
+        }
+        i += 1;
+    }
+    sum
+}
+unsafe fn h(x: i32) -> i32 { x }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", "h(S.with_borrow("],
+            &["static mut", "S.with_borrow(|S_ref| sum += h"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_option_ref_call_arg() {
+        let code = r#"
+struct Hooks { allocate: Option<unsafe fn(usize) -> *mut u8> }
+static mut global_hooks: Hooks = Hooks { allocate: None };
+unsafe fn f() -> usize {
+    global_hooks.allocate = None;
+    new_item(Some(&global_hooks))
+}
+unsafe fn new_item(hooks: Option<&Hooks>) -> usize {
+    if hooks.is_some() { 1 } else { 0 }
+}
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                "global_hooks.with_borrow(|global_hooks_ref|",
+                "new_item(Some(global_hooks_ref))",
+            ],
+            &[
+                "static mut",
+                "new_item(global_hooks.with_borrow(|global_hooks_ref| Some(global_hooks_ref)))",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_refcell_function_pointer_field_call() {
+        let code = r#"
+struct Hooks { deallocate: Option<unsafe fn(*mut u8)> }
+static mut global_hooks: Hooks = Hooks { deallocate: None };
+unsafe fn f(ptr: *mut u8) {
+    touch(&mut global_hooks);
+    global_hooks.deallocate = None;
+    if global_hooks.deallocate.is_some() {
+        (global_hooks.deallocate).unwrap()(ptr);
+    }
+}
+unsafe fn touch(hooks: &mut Hooks) {}
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                "global_hooks.with_borrow(|global_hooks_ref|",
+                "(global_hooks_ref.deallocate).unwrap()(ptr)",
+            ],
+            &[
+                "static mut",
+                "(global_hooks_ref.deallocate).unwrap()(global_hooks.with_borrow(",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_refcell_reference_arg_keeps_later_args_in_scope() {
+        let code = r#"
+static mut S: [i32; 2] = [0; 2];
+unsafe fn f() {
+    g(S.as_mut_ptr());
+    h(std::slice::from_ref(&S[0]), S[1]);
+}
+unsafe fn g(x: *mut i32) { *x = 1; }
+unsafe fn h(x: &[i32], y: i32) -> i32 { x[0] + y }
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                "S.with_borrow(|S_ref| h(std::slice::from_ref(&S_ref[0]), S_ref[1]))",
+            ],
+            &[
+                "static mut",
+                "h(std::slice::from_ref(&S.with_borrow(",
+                "S.with_borrow(|S_ref| S_ref[1])",
+            ],
         );
     }
 }
