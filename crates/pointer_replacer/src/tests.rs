@@ -2811,8 +2811,12 @@ pub unsafe fn complexmode(
     result
 }
 "#,
-        &["let mut log_msg___v: *mut i8"],
-        &["let mut log_msg___v: *const i8"],
+        &[
+            "let mut log_msg___v: *mut i8",
+            "let mut log_message: *mut i8",
+            "log_message)).unwrap() = rv___t.1",
+        ],
+        &["let mut log_msg___v: *const i8", "let mut log_message: &"],
     );
 }
 
