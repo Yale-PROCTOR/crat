@@ -359,16 +359,16 @@ impl MutVisitor for TransformVisitor<'_> {
             let arg = expr_to_parenthesized_string(unwrap_cast(arg));
             match flag.ident.as_str() {
                 "_ISalnum" => {
-                    *expr = expr!("(({arg} as u8 as char).is_alphanumeric() as i32)");
+                    *expr = expr!("(({arg} as u8 as char).is_ascii_alphanumeric() as i32)");
                 }
                 "_ISalpha" => {
-                    *expr = expr!("(({arg} as u8 as char).is_alphabetic() as i32)");
+                    *expr = expr!("(({arg} as u8 as char).is_ascii_alphabetic() as i32)");
                 }
                 "_ISlower" => {
-                    *expr = expr!("(({arg} as u8 as char).is_lowercase() as i32)");
+                    *expr = expr!("(({arg} as u8 as char).is_ascii_lowercase() as i32)");
                 }
                 "_ISupper" => {
-                    *expr = expr!("(({arg} as u8 as char).is_uppercase() as i32)");
+                    *expr = expr!("(({arg} as u8 as char).is_ascii_uppercase() as i32)");
                 }
                 "_ISdigit" => {
                     *expr = expr!("(({arg} as u8 as char).is_ascii_digit() as i32)");
@@ -383,7 +383,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     *expr = expr!("(({arg} as u8 as char).is_ascii_graphic() as i32)");
                 }
                 "_ISspace" => {
-                    *expr = expr!("(({arg} as u8 as char).is_whitespace() as i32)");
+                    *expr = expr!(
+                        "(matches!({arg} as u8, b' ' | b'\\t' | b'\\n' | b'\\r' | 0x0b | 0x0c) as i32)"
+                    );
                 }
                 "_ISblank" => {
                     *expr = expr!("matches!({arg} as u8 as char, ' ' | '\\t') as i32");
