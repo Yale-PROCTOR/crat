@@ -186,9 +186,11 @@ impl TransformVisitor<'_, '_, '_> {
                                 format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
                             }
                         }
-                        _ => {
-                            format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
-                        }
+                        _ => self
+                            .cstr_from_struct_first_field(arg, &arg_str)
+                            .unwrap_or_else(|| {
+                                format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
+                            }),
                     };
                     if self.config.assume_to_str_ok {
                         write!(args, "{cstr}.to_str().unwrap(), ").unwrap();
@@ -297,6 +299,30 @@ impl TransformVisitor<'_, '_, '_> {
             format!("crate::c_lib::rs_vfprintf({stream_str}, {fmt}, {args})"),
             stream,
         )
+    }
+
+    fn cstr_from_struct_first_field(&self, arg: &Expr, arg_str: &str) -> Option<String> {
+        let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_arg.hir_id.owner);
+        let ty = typeck.expr_ty(hir_arg).peel_refs();
+        let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() else {
+            return None;
+        };
+        if !adt_def.is_struct() {
+            return None;
+        }
+        let field = adt_def.all_fields().next()?;
+        let field_ty = field.ty(self.tcx, generic_args);
+        let ty::TyKind::RawPtr(pointee, _) = field_ty.kind() else {
+            return None;
+        };
+        if *pointee != self.tcx.types.i8 && *pointee != self.tcx.types.u8 {
+            return None;
+        }
+        let field_name = field.ident(self.tcx).name;
+        Some(format!(
+            "std::ffi::CStr::from_ptr(({arg_str}).{field_name} as _)"
+        ))
     }
 }
 
