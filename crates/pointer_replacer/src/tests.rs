@@ -2522,7 +2522,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 
 /// addr_of with Slice context, non-bytemuck cast: different-size numerics
 /// (c_int vs c_short) with .offset() usage.
-/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 100000)`.
+/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 1_000_000)`.
 #[test]
 fn test_addr_of_slice_cast() {
     run_test(

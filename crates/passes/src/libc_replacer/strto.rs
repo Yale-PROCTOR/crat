@@ -42,7 +42,7 @@ impl super::TransformVisitor<'_> {
 
         utils::expr!(
             "crate::c_lib::strtod(
-                std::slice::from_raw_parts(({nptr_str}) as _, 100000),
+                std::slice::from_raw_parts(({nptr_str}) as _, 1_000_000),
                 ({endptr_str} as *mut *const u8).as_mut(),
                 {error},
             )"
@@ -95,7 +95,7 @@ impl super::TransformVisitor<'_> {
 
         utils::expr!(
             "crate::c_lib::strtol(
-                std::slice::from_raw_parts(({nptr_str}) as _, 100000),
+                std::slice::from_raw_parts(({nptr_str}) as _, 1_000_000),
                 ({endptr_str} as *mut *const u8).as_mut(),
                 {base_str},
                 {error},
@@ -149,7 +149,7 @@ impl super::TransformVisitor<'_> {
 
         utils::expr!(
             "crate::c_lib::strtoul(
-                std::slice::from_raw_parts(({nptr_str}) as _, 100000),
+                std::slice::from_raw_parts(({nptr_str}) as _, 1_000_000),
                 ({endptr_str} as *mut *const u8).as_mut(),
                 {base_str},
                 {error},
@@ -175,7 +175,7 @@ impl super::TransformVisitor<'_> {
             }
         }
 
-        utils::expr!("crate::c_lib::atof(std::slice::from_raw_parts(({s_str}) as _, 100000))")
+        utils::expr!("crate::c_lib::atof(std::slice::from_raw_parts(({s_str}) as _, 1_000_000))")
     }
 
     pub fn transform_atoi(&mut self, s: &Expr) -> Expr {
@@ -195,7 +195,7 @@ impl super::TransformVisitor<'_> {
             }
         }
 
-        utils::expr!("crate::c_lib::atoi(std::slice::from_raw_parts(({s_str}) as _, 100000))")
+        utils::expr!("crate::c_lib::atoi(std::slice::from_raw_parts(({s_str}) as _, 1_000_000))")
     }
 }
 

@@ -1533,7 +1533,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                     } else {
                         *ptr = utils::expr!(
-                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} _, 100000)",
+                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} _, 1_000_000)",
                             if m { "_mut" } else { "" },
                             if m { "mut" } else { "const" },
                             pprust::expr_to_string(e),
@@ -2696,14 +2696,14 @@ impl<'tcx> TransformVisitor<'tcx> {
             // we assume that the pointer is not null when such methods are called
             if !need_cast {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){}, 100000)",
+                    "std::slice::from_raw_parts{}(({}){}, 1_000_000)",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
                 )
             } else {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){} as *{} _, 100000)",
+                    "std::slice::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
@@ -2716,7 +2716,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         &{1}[]
                     }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3}, 100000)
+                        std::slice::from_raw_parts{2}(({0}){3}, 1_000_000)
                     }}",
                     pprust::expr_to_string(e),
                     if m { "mut " } else { "" },
@@ -2728,7 +2728,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         &{1}[]
                     }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, 100000)
+                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, 1_000_000)
                     }}",
                     pprust::expr_to_string(e),
                     if m { "mut " } else { "" },
@@ -2744,7 +2744,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
-                        std::slice::from_raw_parts{}(_x{}, 100000)
+                        std::slice::from_raw_parts{}(_x{}, 1_000_000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -2759,7 +2759,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
-                        std::slice::from_raw_parts{}(_x{} as *{} _, 100000)
+                        std::slice::from_raw_parts{}(_x{} as *{} _, 1_000_000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -2794,7 +2794,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             // we assume that the pointer is not null when such methods are called
             if !need_cast {
                 utils::expr!(
-                    "{}::from_raw_parts{}(({}){}, 100000)",
+                    "{}::from_raw_parts{}(({}){}, 1_000_000)",
                     cursor_ty,
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
@@ -2802,7 +2802,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 )
             } else {
                 utils::expr!(
-                    "{}::from_raw_parts{}(({}){} as *{} _, 100000)",
+                    "{}::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
                     cursor_ty,
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
@@ -2816,7 +2816,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        {1}::from_raw_parts{2}(({0}){3}, 100000)
+                        {1}::from_raw_parts{2}(({0}){3}, 1_000_000)
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -2828,7 +2828,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, 100000)
+                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, 1_000_000)
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -2844,7 +2844,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        {}::from_raw_parts{}(_x{}, 100000)
+                        {}::from_raw_parts{}(_x{}, 1_000_000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -2860,7 +2860,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        {}::from_raw_parts{}(_x{} as *{} _, 100000)
+                        {}::from_raw_parts{}(_x{} as *{} _, 1_000_000)
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -2920,7 +2920,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         } else {
             // can be used for deref, so type must be specified
             utils::expr!(
-                "std::slice::from_raw_parts{0}(({1}).as{0}_ptr() as *{2} {3}, 100000)",
+                "std::slice::from_raw_parts{0}(({1}).as{0}_ptr() as *{2} {3}, 1_000_000)",
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
                 if m { "mut" } else { "const" },
@@ -3017,7 +3017,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             )
         } else {
             utils::expr!(
-                "{}::from_raw_parts{}(({}).as_{}ptr() as *{} {}, 100000)",
+                "{}::from_raw_parts{}(({}).as_{}ptr() as *{} {}, 1_000_000)",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
@@ -3055,7 +3055,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             )
         } else {
             utils::expr!(
-                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 100000)",
+                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 1_000_000)",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),

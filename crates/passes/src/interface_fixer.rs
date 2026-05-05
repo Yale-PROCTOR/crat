@@ -73,7 +73,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         ParamFixKind::Slice => {
                             write!(
                                 call,
-                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1024) }}, ",
+                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1_000_000) }}, ",
                                 if fix.mutability.is_mut() { "mut " } else { "" },
                                 if fix.mutability.is_mut() { "_mut" } else { "" },
                             )
@@ -83,13 +83,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             if fix.mutability.is_mut() {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1_000_000)) }}, ",
                                 )
                                 .unwrap();
                             } else {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1_000_000)) }}, ",
                                 )
                                 .unwrap();
                             }
