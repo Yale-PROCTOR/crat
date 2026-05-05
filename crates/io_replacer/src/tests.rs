@@ -340,7 +340,12 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["crate::c_lib::rs_fgets", "TT", "Read"],
+        &[
+            "crate::c_lib::rs_fgets",
+            "TT",
+            "Read",
+            "if available.is_empty() {\n                if let Some(eof) = eof { *eof = 1; }\n                break;",
+        ],
         &["FILE"],
     );
 }
