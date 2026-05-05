@@ -6252,9 +6252,9 @@ fn collect_raw_local_assignment_bindings(
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> FxHashSet<HirId> {
     struct RawLocalBindingVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         bindings: FxHashSet<HirId>,
-        _marker: std::marker::PhantomData<TyCtxt<'tcx>>,
     }
 
     impl<'tcx> Visitor<'tcx> for RawLocalBindingVisitor<'_, 'tcx> {
@@ -6265,6 +6265,12 @@ fn collect_raw_local_assignment_bindings(
                 && let hir::ExprKind::Path(hir::QPath::Resolved(_, rhs_path)) = rhs.kind
                 && let Res::Local(rhs_hir_id) = rhs_path.res
                 && matches!(self.ptr_kinds.get(&rhs_hir_id), Some(PtrKind::Raw(_)))
+            {
+                self.bindings.insert(lhs_hir_id);
+            }
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(lhs_hir_id) = hir_deref_addr_of_local(lhs)
+                && self.tcx.typeck(rhs.hir_id.owner).expr_ty(rhs).is_raw_ptr()
             {
                 self.bindings.insert(lhs_hir_id);
             }
@@ -6286,14 +6292,26 @@ fn collect_raw_local_assignment_bindings(
         };
         let body = tcx.hir_body(body);
         let mut visitor = RawLocalBindingVisitor {
+            tcx,
             ptr_kinds,
             bindings: FxHashSet::default(),
-            _marker: std::marker::PhantomData,
         };
         visitor.visit_expr(body.value);
         bindings.extend(visitor.bindings);
     }
     bindings
+}
+
+fn hir_deref_addr_of_local(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let hir::ExprKind::Unary(hir::UnOp::Deref, addr_of) = expr.kind else {
+        return None;
+    };
+    let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, pointee) =
+        utils::hir::unwrap_drop_temps(addr_of).kind
+    else {
+        return None;
+    };
+    hir_unwrapped_local_id(pointee)
 }
 
 fn hir_rhs_supports_box_target<'tcx>(
