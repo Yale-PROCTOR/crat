@@ -543,6 +543,14 @@ fn main() {
                 }
             }
             Pass::Pointer => {
+                let (s, changed) = run_compiler_on_path(&file, |tcx| {
+                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
+                })
+                .unwrap();
+                if changed {
+                    std::fs::write(&file, s).unwrap();
+                }
+
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::replace_local_borrows(&config.pointer, tcx)
                 })

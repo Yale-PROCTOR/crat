@@ -26,6 +26,7 @@ use crate::{
 
 mod collector;
 mod decision;
+mod struct_array_field_pre;
 mod transform;
 
 pub struct Analysis {
@@ -53,6 +54,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
+    let input = collect_input(tcx);
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let andersen_config = andersen::Config {
@@ -62,27 +64,6 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
     let aliases = find_param_aliases(&pre_points_to, &points_to, tcx);
-
-    let mut functions = vec![];
-    let mut structs = vec![];
-    for maybe_owner in tcx.hir_crate(()).owners.iter() {
-        let Some(owner) = maybe_owner.as_owner() else {
-            continue;
-        };
-        let OwnerNode::Item(item) = owner.node() else {
-            continue;
-        };
-        match item.kind {
-            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
-            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
-            _ => {}
-        };
-    }
-    let input = RustProgram {
-        tcx,
-        functions,
-        structs,
-    };
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
@@ -124,6 +105,57 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     }
 
     (code, visitor.bytemuck.get())
+}
+
+pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let input = collect_input(tcx);
+    let arena = typed_arena::Arena::new();
+    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let andersen_config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
+    };
+    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    let points_to = andersen::post_analyze(&andersen_config, pre_points_to, points_to, &tss, tcx);
+
+    let candidates = analyses::struct_array_field::find_candidates(&input, &points_to);
+    let changed = struct_array_field_pre::apply_struct_array_transform(
+        &mut krate,
+        &candidates,
+        tcx,
+        &ast_to_hir,
+    );
+
+    (pprust::crate_to_string_for_macros(&krate), changed)
+}
+
+fn collect_input(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+    let mut functions = vec![];
+    let mut structs = vec![];
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        match item.kind {
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+            _ => {}
+        };
+    }
+
+    RustProgram {
+        tcx,
+        functions,
+        structs,
+    }
 }
 
 fn maybe_solidified_ownership<'tcx>(

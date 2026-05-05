@@ -22,12 +22,13 @@ extern crate rustc_mir_dataflow;
 extern crate rustc_span;
 extern crate rustc_type_ir;
 extern crate smallvec;
+extern crate thin_vec;
 
 mod analyses;
 mod rewriter;
 mod utils;
 
-pub use rewriter::{Config, replace_local_borrows};
+pub use rewriter::{Config, replace_local_borrows, rewrite_struct_arrays};
 
 #[cfg(test)]
 mod tests;
