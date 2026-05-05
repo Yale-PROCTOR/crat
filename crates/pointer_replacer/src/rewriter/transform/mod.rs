@@ -700,8 +700,13 @@ enum PtrCtx {
 
 #[derive(Clone, Copy, Debug)]
 enum AllocatorRoot<'a> {
-    Malloc { bytes: &'a Expr },
-    Calloc { count: &'a Expr },
+    Malloc {
+        bytes: &'a Expr,
+    },
+    Calloc {
+        count: &'a Expr,
+        elem_size: &'a Expr,
+    },
 }
 
 impl<'tcx> TransformVisitor<'tcx> {
@@ -2109,7 +2114,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         let name = path.segments.last()?.ident.name.as_str();
         match (name, &args[..]) {
             ("malloc", [bytes]) => Some(AllocatorRoot::Malloc { bytes }),
-            ("calloc", [count, _elem_size]) => Some(AllocatorRoot::Calloc { count }),
+            ("calloc", [count, elem_size]) => Some(AllocatorRoot::Calloc { count, elem_size }),
             ("realloc", [ptr, bytes]) if is_null_like_ptr_arg(ptr) => {
                 Some(AllocatorRoot::Malloc { bytes })
             }
@@ -2207,11 +2212,12 @@ impl<'tcx> TransformVisitor<'tcx> {
                 *ptr = utils::expr!("Some(Box::new({default_expr_str}))");
                 Some(PtrKind::OptBox)
             }
-            (PtrKind::OptBoxedSlice, AllocatorRoot::Calloc { count }) => {
+            (PtrKind::OptBoxedSlice, AllocatorRoot::Calloc { count, elem_size }) => {
                 *ptr = utils::expr!(
-                    "Some(std::iter::repeat_with(|| {0}).take(({1}) as usize).collect::<Vec<{2}>>().into_boxed_slice())",
+                    "Some(std::iter::repeat_with(|| {0}).take((({1}) * ({2}) / std::mem::size_of::<{3}>()) as usize).collect::<Vec<{3}>>().into_boxed_slice())",
                     default_expr_str,
                     pprust::expr_to_string(count),
+                    pprust::expr_to_string(elem_size),
                     ty,
                 );
                 Some(PtrKind::OptBoxedSlice)
