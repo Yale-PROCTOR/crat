@@ -1553,12 +1553,16 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
 
         if pe.as_ptr && self.is_base_not_a_raw_ptr(&pe) {
-            let base = self.projected_expr(&pe, pe.as_mut_ptr, false);
-            let raw_expr = utils::expr!(
-                "({}).as_{}ptr()",
-                pprust::expr_to_string(&base),
-                if pe.as_mut_ptr { "mut_" } else { "" },
-            );
+            let raw_expr = if is_array_field_ptr_arithmetic(&pe) {
+                e.clone()
+            } else {
+                let base = self.projected_expr(&pe, pe.as_mut_ptr, false);
+                utils::expr!(
+                    "({}).as_{}ptr()",
+                    pprust::expr_to_string(&base),
+                    if pe.as_mut_ptr { "mut_" } else { "" },
+                )
+            };
             match ctx {
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     if !need_cast {
@@ -3981,6 +3985,19 @@ fn ty_is_byte_sized_raw_inner(ty: ty::Ty<'_>) -> bool {
         ty.kind(),
         ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
     )
+}
+
+fn is_array_field_ptr_arithmetic(pe: &PtrExpr<'_, '_>) -> bool {
+    pe.as_ptr
+        && pe.as_mut_ptr
+        && pe.base_ty.is_array()
+        && matches!(unwrap_paren(pe.base).kind, ExprKind::Field(..))
+        && pe.projs.iter().any(|proj| {
+            matches!(
+                proj,
+                PtrExprProj::Offset(_) | PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..)
+            )
+        })
 }
 
 fn hir_is_casted_local(rhs: &hir::Expr<'_>, target: HirId) -> bool {
