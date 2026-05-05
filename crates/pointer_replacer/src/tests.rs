@@ -797,6 +797,54 @@ pub unsafe fn caller() {
 }
 
 #[test]
+fn test_rewriter_keeps_initialized_allocator_wrapper_call_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct BufferArray {
+    pub buffers: *mut i32,
+    pub count: i32,
+}
+
+pub unsafe fn alloc_array(count: i32) -> *mut BufferArray {
+    let arr: *mut BufferArray =
+        malloc(std::mem::size_of::<BufferArray>()) as *mut BufferArray;
+    if arr.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*arr).buffers = malloc((count as usize) * std::mem::size_of::<i32>()) as *mut i32;
+    (*arr).count = count;
+    arr
+}
+
+pub unsafe fn free_array(arr: *mut BufferArray) {
+    free((*arr).buffers as *mut core::ffi::c_void);
+    free(arr as *mut core::ffi::c_void);
+}
+
+pub unsafe fn caller(count: i32) {
+    let arr: *mut BufferArray = alloc_array(count);
+    if arr.is_null() {
+        return;
+    }
+    *(*arr).buffers = 1;
+    free_array(arr);
+}
+"#,
+        &[
+            "alloc_array(count)",
+            "(*arr.as_deref_mut().unwrap()).buffers =\n        malloc((count as usize) * std::mem::size_of::<i32>())",
+        ],
+        &["let mut arr: *mut crate::BufferArray = Box::into_raw(Box::new"],
+    );
+}
+
+#[test]
 fn test_rewriter_generalizes_wrapper_with_internal_free_after_foreign_use() {
     run_test(
         r#"

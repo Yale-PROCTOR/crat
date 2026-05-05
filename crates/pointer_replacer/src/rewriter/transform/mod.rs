@@ -4589,6 +4589,25 @@ fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
     Some(hir_id)
 }
 
+fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
+    struct LocalUseVisitor {
+        locals: Vec<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let Some(hir_id) = hir_unwrapped_local_id(expr) {
+                self.locals.push(hir_id);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = LocalUseVisitor { locals: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.locals
+}
+
 fn hir_expr_verbatim_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
     tcx.sess.source_map().span_to_snippet(expr.span).ok()
 }
@@ -5130,6 +5149,18 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                 }
             }
 
+            fn mark_disqualified_for_lhs_use(&mut self, hir_id: HirId) {
+                if let Some(root) = self.root_of.get(&hir_id).copied()
+                    && self
+                        .candidates
+                        .get(&root)
+                        .is_some_and(|candidate| candidate.byte_view_aliases.contains(&hir_id))
+                {
+                    return;
+                }
+                self.mark_disqualified(hir_id);
+            }
+
             fn mark_returned(&mut self, hir_id: HirId) {
                 if let Some(root) = self.root_of.get(&hir_id).copied() {
                     if self
@@ -5247,8 +5278,18 @@ fn collect_local_allocator_wrappers(tcx: TyCtxt<'_>) -> FxHashMap<LocalDefId, Al
                                 }
                             }
                             self.record_scalar_local(lhs_hir_id, rhs);
-                        } else if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
-                            self.mark_disqualified(rhs_hir_id);
+                        } else {
+                            for lhs_hir_id in hir_local_ids_in_expr(lhs) {
+                                self.mark_disqualified_for_lhs_use(lhs_hir_id);
+                            }
+                            if let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) {
+                                self.mark_disqualified(rhs_hir_id);
+                            }
+                        }
+                    }
+                    hir::ExprKind::AssignOp(_, lhs, _) => {
+                        for lhs_hir_id in hir_local_ids_in_expr(lhs) {
+                            self.mark_disqualified_for_lhs_use(lhs_hir_id);
                         }
                     }
                     hir::ExprKind::Ret(Some(ret)) => {
@@ -5885,6 +5926,13 @@ fn collect_raw_bridge_bindings(
             }
         }
 
+        fn disqualify_lhs_use(&mut self, hir_id: HirId) {
+            if self.byte_view_aliases.contains(&hir_id) {
+                return;
+            }
+            self.disqualify_local(hir_id);
+        }
+
         fn update_local_from_rhs(
             &mut self,
             lhs_hir_id: HirId,
@@ -5982,6 +6030,13 @@ fn collect_raw_bridge_bindings(
                 && hir_unwrapped_local_id(lhs).is_none()
             {
                 self.disqualify_local(rhs_hir_id);
+            }
+            if let hir::ExprKind::Assign(lhs, _, _) | hir::ExprKind::AssignOp(_, lhs, _) = expr.kind
+                && hir_unwrapped_local_id(lhs).is_none()
+            {
+                for lhs_hir_id in hir_local_ids_in_expr(lhs) {
+                    self.disqualify_lhs_use(lhs_hir_id);
+                }
             }
             if let hir::ExprKind::Call(_, args) = expr.kind {
                 let free_arg = hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
