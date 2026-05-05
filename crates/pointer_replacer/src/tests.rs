@@ -219,6 +219,29 @@ pub unsafe fn foo() -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_rewrites_byte_calloc_size_to_opt_boxed_slice_len() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
+    let p: *mut core::ffi::c_char = calloc(1, len) as *mut core::ffi::c_char;
+    *p.offset(len.wrapping_sub(1) as isize) = 0;
+    p
+}
+"#,
+        &[
+            "pub unsafe fn make_buf(len: usize) -> Option<Box<[i8]>>",
+            ".take(((1) * (len) /",
+            "std::mem::size_of::<i8>()) as",
+        ],
+        &["Box::leak(", "Box::into_raw(", "calloc(1, len)"],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_malloc_array_to_opt_boxed_slice() {
     run_test(
         r#"
