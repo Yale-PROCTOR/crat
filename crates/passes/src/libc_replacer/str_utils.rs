@@ -33,14 +33,14 @@ impl super::TransformVisitor<'_> {
                 let array1 = pprust::expr_to_string(array1);
                 let array2 = pprust::expr_to_string(array2);
                 return Some(utils::expr!(
-                    "(&mut ({array1}))[..({n_str})].copy_from_slice(&({array2})[..({n_str})])"
+                    "{{ let ___n = ({n_str}) as usize; let ___dst = (&mut ({array1}))[..___n].as_mut_ptr(); let ___src = &(&({array2}))[..]; let ___len = ___src.iter().position(|&___c| ___c == 0).map_or(___src.len(), |___i| ___i + 1).min(___n); unsafe {{ std::ptr::write_bytes(___dst, 0, ___n); std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len); }} }}"
                 ));
             } else if ty1 == self.tcx.types.u8 || ty1 == self.tcx.types.i8 {
                 self.bytemuck = true;
                 let array1 = pprust::expr_to_string(array1);
                 let array2 = pprust::expr_to_string(array2);
                 return Some(utils::expr!(
-                    "(&mut ({array1}))[..({n_str})].copy_from_slice(bytemuck::cast_slice(&({array2})[..({n_str})]))"
+                    "{{ let ___n = ({n_str}) as usize; let ___dst = (&mut ({array1}))[..___n].as_mut_ptr(); let ___src = bytemuck::cast_slice(&(&({array2}))[..]); let ___len = ___src.iter().position(|&___c| ___c == 0).map_or(___src.len(), |___i| ___i + 1).min(___n); unsafe {{ std::ptr::write_bytes(___dst, 0, ___n); std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len); }} }}"
                 ));
             }
         }

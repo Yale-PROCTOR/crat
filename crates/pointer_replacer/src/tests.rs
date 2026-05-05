@@ -99,6 +99,33 @@ pub unsafe fn foo() -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_field_stored_malloc_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    let data: *mut i32 = malloc(std::mem::size_of::<i32>());
+    *data = 7;
+    (*owner).data = data;
+}
+"#,
+        &[
+            "malloc(std::mem::size_of::<i32>())",
+            "(*owner).data = data;",
+        ],
+        &["Option<Box<i32>>", "Some(Box::new("],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_malloc_casted_sizeof_local_struct_to_opt_box() {
     run_test(
         r#"

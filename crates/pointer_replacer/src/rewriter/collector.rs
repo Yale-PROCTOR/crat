@@ -15,6 +15,7 @@ pub fn collect_diffs<'tcx>(
     analysis: &Analysis,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
+    let non_outermost_owning_locals = collect_non_outermost_owning_hir_locals(rust_program);
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
 
@@ -53,15 +54,59 @@ pub fn collect_diffs<'tcx>(
         // skip inputs if used as fn ptr
         {
             let aliases = aliases.and_then(|aliases| aliases.get(&local));
-            if let Some(ptr_kind) = decision_maker.decide(local, decl, aliases)
+            if let Some(mut ptr_kind) = decision_maker.decide(local, decl, aliases)
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
+                if non_outermost_owning_locals.contains(hir_id)
+                    && matches!(ptr_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+                {
+                    ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
+                }
                 ptr_kinds.insert(*hir_id, ptr_kind);
             }
         }
     }
 
     ptr_kinds
+}
+
+fn collect_non_outermost_owning_hir_locals(rust_program: &RustProgram) -> FxHashSet<HirId> {
+    fn local_path_id(expr: &rustc_hir::Expr<'_>) -> Option<HirId> {
+        if let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind
+            && let Res::Local(hir_id) = path.res
+        {
+            Some(hir_id)
+        } else if let ExprKind::Cast(inner, _) = expr.kind {
+            local_path_id(inner)
+        } else {
+            None
+        }
+    }
+
+    struct NonOutermostCollector {
+        locals: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for NonOutermostCollector {
+        fn visit_expr(&mut self, ex: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+            if let ExprKind::Assign(lhs, rhs, _) = ex.kind
+                && !matches!(lhs.kind, ExprKind::Path(QPath::Resolved(_, path)) if matches!(path.res, Res::Local(_)))
+                && let Some(hir_id) = local_path_id(rhs)
+            {
+                self.locals.insert(hir_id);
+            }
+            walk_expr(self, ex);
+        }
+    }
+
+    let mut collector = NonOutermostCollector {
+        locals: FxHashSet::default(),
+    };
+    for def_id in rust_program.functions.iter() {
+        let body = rust_program.tcx.hir_body_owned_by(*def_id);
+        collector.visit_body(body);
+    }
+    collector.locals
 }
 
 pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
