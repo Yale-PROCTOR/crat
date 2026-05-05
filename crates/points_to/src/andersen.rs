@@ -1075,9 +1075,10 @@ fn compute_bitfield_writes<'tcx>(
     let local_def_id = some_or!(def_id.as_local(), return);
     let (local_def_id, method) = some_or!(receiver_and_method(local_def_id, tcx), return);
     let field = some_or!(method.strip_prefix("set_"), return);
+    let bitfield = some_or!(tss.bitfields.get(&local_def_id), return);
+    let idx = some_or!(bitfield.name_to_idx.get(field).copied(), return);
     let TyKind::Ref(_, ty, _) = args[0].node.ty(ctx.locals, tcx).kind() else { unreachable!() };
     let TyShape::Struct(_, fs, _) = tss.tys[ty] else { unreachable!() };
-    let idx = tss.bitfields[&local_def_id].name_to_idx[field];
     let offset = fs[idx.as_usize()].0;
     let lhs = args[0].node.place().unwrap();
     assert!(lhs.projection.is_empty());
