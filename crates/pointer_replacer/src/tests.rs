@@ -359,7 +359,7 @@ pub unsafe fn foo() {
         &[
             "pub unsafe fn keep_raw() -> *mut i32",
             "Option<Box<i32>>",
-            "map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *mut i32",
             "let fp: unsafe fn() -> *mut i32 = keep_raw;",
         ],
         &[],
@@ -391,7 +391,7 @@ pub unsafe fn foo() {
             "as_deref_mut().unwrap_or(&mut [])",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
-        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
+        &["-> Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 
@@ -1725,7 +1725,7 @@ pub unsafe fn caller() -> *mut i32 {
         &[
             "fn alloc_one() -> *mut i32",
             "let mut p: Option<Box<i32>>",
-            "as_deref_mut().map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *mut i32",
         ],
         &[],
     );
@@ -1756,7 +1756,7 @@ pub unsafe fn caller() -> *mut i32 {
             "as_deref_mut().unwrap_or(&mut [])",
             "let f: unsafe fn() -> *mut i32 = alloc_arr;",
         ],
-        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
+        &["-> Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 
@@ -1780,7 +1780,7 @@ pub unsafe fn maybe_alloc(flag: bool) -> *mut i32 {
         &[
             "fn maybe_alloc(flag: bool) -> *const i32",
             "std::ptr::null()",
-            "as_deref().map_or(std::ptr::null::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *const i32",
         ],
         &["-> Option<Box<i32>>"],
     );
