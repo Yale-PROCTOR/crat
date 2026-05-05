@@ -376,6 +376,18 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             hir::Node::Stmt(_) | hir::Node::LetStmt(_) => {
                 self.introduce_borrow(expr);
             }
+            hir::Node::Block(block) => {
+                let mut parent = self.get_hir_parent(block.hir_id);
+                if let hir::Node::Expr(e) = parent
+                    && matches!(e.kind, hir::ExprKind::Block(..))
+                {
+                    parent = self.get_hir_parent(e.hir_id);
+                }
+                if !matches!(parent, hir::Node::Expr(e) if matches!(e.kind, hir::ExprKind::If(..)))
+                {
+                    self.introduce_borrow(expr);
+                }
+            }
             _ => {}
         }
     }
@@ -409,7 +421,7 @@ fn find_context<'a, 'tcx>(
                                 expr = parent;
                                 mutated = true;
                             }
-                            "as_ptr" => {
+                            "as_ptr" | "offset" => {
                                 expr = parent;
                             }
                             "is_null" | "is_none" | "is_some" | "unwrap" | "expect" => {}
@@ -791,6 +803,23 @@ unsafe fn f() {
         run_test(
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_field_offset() {
+        let code = r#"
+struct S { p: *const u8, i: usize }
+static mut S: S = S { p: 0 as *const u8, i: 0 };
+unsafe fn f() -> *const u8 {
+    S.i = 1;
+    S.p.offset(S.i as isize)
+}
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow("],
             &["static mut"],
         );
     }
