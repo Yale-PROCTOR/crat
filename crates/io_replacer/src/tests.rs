@@ -431,6 +431,28 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_printf_struct_string_key() {
+    run_test(
+        r#"
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Entry {
+    key: *mut libc::c_char,
+    value: libc::c_int,
+}
+unsafe fn f(mut entry: Entry) {
+    printf(
+        b"%s %d\0" as *const u8 as *const libc::c_char,
+        entry,
+        entry.value,
+    );
+}"#,
+        &["std::ffi::CStr::from_ptr((entry).key as _)", "write!"],
+        &["printf"],
+    );
+}
+
+#[test]
 fn test_vfprintf() {
     run_test(
         r#"
