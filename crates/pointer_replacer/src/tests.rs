@@ -99,6 +99,33 @@ pub unsafe fn foo() -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_field_stored_malloc_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    let data: *mut i32 = malloc(std::mem::size_of::<i32>());
+    *data = 7;
+    (*owner).data = data;
+}
+"#,
+        &[
+            "malloc(std::mem::size_of::<i32>())",
+            "(*owner).data = data;",
+        ],
+        &["Option<Box<i32>>", "Some(Box::new("],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_malloc_casted_sizeof_local_struct_to_opt_box() {
     run_test(
         r#"
@@ -188,6 +215,29 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::into_raw(",
             "calloc(4, std::mem::size_of::<i32>())",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_byte_calloc_size_to_opt_boxed_slice_len() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
+    let p: *mut core::ffi::c_char = calloc(1, len) as *mut core::ffi::c_char;
+    *p.offset(len.wrapping_sub(1) as isize) = 0;
+    p
+}
+"#,
+        &[
+            "pub unsafe fn make_buf(len: usize) -> Option<Box<[i8]>>",
+            ".take(((1) * (len) /",
+            "std::mem::size_of::<i8>()) as",
+        ],
+        &["Box::leak(", "Box::into_raw(", "calloc(1, len)"],
     );
 }
 
@@ -359,7 +409,7 @@ pub unsafe fn foo() {
         &[
             "pub unsafe fn keep_raw() -> *mut i32",
             "Option<Box<i32>>",
-            "map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *mut i32",
             "let fp: unsafe fn() -> *mut i32 = keep_raw;",
         ],
         &[],
@@ -391,7 +441,7 @@ pub unsafe fn foo() {
             "as_deref_mut().unwrap_or(&mut [])",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
-        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
+        &["-> Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 
@@ -766,6 +816,54 @@ pub unsafe fn caller() {
 "#,
         &["Box::leak(", "slice_from_raw_parts_mut", "Box::from_raw("],
         &["malloc(64)", "free_msg(msg as *mut core::ffi::c_void);"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_initialized_allocator_wrapper_call_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct BufferArray {
+    pub buffers: *mut i32,
+    pub count: i32,
+}
+
+pub unsafe fn alloc_array(count: i32) -> *mut BufferArray {
+    let arr: *mut BufferArray =
+        malloc(std::mem::size_of::<BufferArray>()) as *mut BufferArray;
+    if arr.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*arr).buffers = malloc((count as usize) * std::mem::size_of::<i32>()) as *mut i32;
+    (*arr).count = count;
+    arr
+}
+
+pub unsafe fn free_array(arr: *mut BufferArray) {
+    free((*arr).buffers as *mut core::ffi::c_void);
+    free(arr as *mut core::ffi::c_void);
+}
+
+pub unsafe fn caller(count: i32) {
+    let arr: *mut BufferArray = alloc_array(count);
+    if arr.is_null() {
+        return;
+    }
+    *(*arr).buffers = 1;
+    free_array(arr);
+}
+"#,
+        &[
+            "alloc_array(count)",
+            "(*arr.as_deref_mut().unwrap()).buffers =\n        malloc((count as usize) * std::mem::size_of::<i32>())",
+        ],
+        &["let mut arr: *mut crate::BufferArray = Box::into_raw(Box::new"],
     );
 }
 
@@ -1725,7 +1823,7 @@ pub unsafe fn caller() -> *mut i32 {
         &[
             "fn alloc_one() -> *mut i32",
             "let mut p: Option<Box<i32>>",
-            "as_deref_mut().map_or(std::ptr::null_mut::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *mut i32",
         ],
         &[],
     );
@@ -1756,7 +1854,7 @@ pub unsafe fn caller() -> *mut i32 {
             "as_deref_mut().unwrap_or(&mut [])",
             "let f: unsafe fn() -> *mut i32 = alloc_arr;",
         ],
-        &["-> Option<Box<[i32]>>", "Box::into_raw(", "Box::leak("],
+        &["-> Option<Box<[i32]>>", "Box::into_raw("],
     );
 }
 
@@ -1780,7 +1878,7 @@ pub unsafe fn maybe_alloc(flag: bool) -> *mut i32 {
         &[
             "fn maybe_alloc(flag: bool) -> *const i32",
             "std::ptr::null()",
-            "as_deref().map_or(std::ptr::null::<i32>(), |_x| _x)",
+            "Box::into_raw(_x) as *const i32",
         ],
         &["-> Option<Box<i32>>"],
     );
@@ -2447,7 +2545,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 
 /// addr_of with Slice context, non-bytemuck cast: different-size numerics
 /// (c_int vs c_short) with .offset() usage.
-/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 100000)`.
+/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 1_000_000)`.
 #[test]
 fn test_addr_of_slice_cast() {
     run_test(
@@ -2713,8 +2811,12 @@ pub unsafe fn complexmode(
     result
 }
 "#,
-        &["let mut log_msg___v: *mut i8"],
-        &["let mut log_msg___v: *const i8"],
+        &[
+            "let mut log_msg___v: *mut i8",
+            "let mut log_message: *mut i8",
+            "log_message)).unwrap() = rv___t.1",
+        ],
+        &["let mut log_msg___v: *const i8", "let mut log_message: &"],
     );
 }
 

@@ -40,3 +40,77 @@ pub unsafe extern "C" fn foo(mut p: *mut s, mut q: *mut s) {
         &[],
     );
 }
+
+#[test]
+fn test_strncpy_from_short_slice_caps_copy_len() {
+    run_test(
+        r#"
+extern "C" {
+    fn strncpy(__dest: *mut i8, __src: *const i8, __n: usize) -> *mut i8;
+}
+
+pub unsafe fn copy_name(mut src: &[i8]) {
+    let mut dst = [1i8; 64];
+    strncpy(dst.as_mut_ptr(), src.as_ptr(), 63);
+}
+        "#,
+        &[
+            "std::ptr::write_bytes(___dst, 0, ___n)",
+            "std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len)",
+            "position(|&___c|",
+            "___c == 0",
+            ".min(___n)",
+        ],
+        &["copy_from_slice(&src[..63])"],
+    );
+}
+
+#[test]
+fn test_ctype_masks_use_ascii_classification() {
+    run_test(
+        r#"
+pub const _ISalnum: core::ffi::c_uint = 8;
+pub const _ISalpha: core::ffi::c_uint = 1024;
+pub const _ISspace: core::ffi::c_uint = 8192;
+
+extern "C" {
+    fn __ctype_b_loc() -> *mut *const core::ffi::c_ushort;
+}
+
+pub unsafe fn foo(mut c: core::ffi::c_char) -> core::ffi::c_int {
+    let mut n = 0;
+    if *(*__ctype_b_loc()).offset(c as core::ffi::c_int as isize) as core::ffi::c_int
+        & _ISalnum as core::ffi::c_int as core::ffi::c_ushort as core::ffi::c_int
+        != 0
+    {
+        n += 1;
+    }
+    if *(*__ctype_b_loc()).offset(c as core::ffi::c_int as isize) as core::ffi::c_int
+        & _ISalpha as core::ffi::c_int as core::ffi::c_ushort as core::ffi::c_int
+        != 0
+    {
+        n += 1;
+    }
+    if *(*__ctype_b_loc()).offset(c as core::ffi::c_int as isize) as core::ffi::c_int
+        & _ISspace as core::ffi::c_int as core::ffi::c_ushort as core::ffi::c_int
+        != 0
+    {
+        n += 1;
+    }
+    n
+}
+        "#,
+        &[
+            ".is_ascii_alphanumeric()",
+            ".is_ascii_alphabetic()",
+            "matches!",
+            "0x0b",
+        ],
+        &[
+            ".is_alphanumeric()",
+            ".is_alphabetic()",
+            ".is_whitespace()",
+            ".is_ascii_whitespace()",
+        ],
+    );
+}

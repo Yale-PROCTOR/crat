@@ -79,6 +79,9 @@ pub(crate) fn rs_fgets<R: std::io::BufRead>(
             }
         };
         if available.is_empty() {
+            if let Some(eof) = eof {
+                *eof = 1;
+            }
             break;
         }
         s[pos] = available[0] as i8;

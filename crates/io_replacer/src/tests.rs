@@ -340,7 +340,12 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["crate::c_lib::rs_fgets", "TT", "Read"],
+        &[
+            "crate::c_lib::rs_fgets",
+            "TT",
+            "Read",
+            "if available.is_empty() {\n                if let Some(eof) = eof { *eof = 1; }\n                break;",
+        ],
         &["FILE"],
     );
 }
@@ -427,6 +432,28 @@ unsafe fn f(mut stream: *mut FILE) {
 }"#,
         &["write!", "i32", "TT", "Write"],
         &["fprintf", "%d"],
+    );
+}
+
+#[test]
+fn test_printf_struct_string_key() {
+    run_test(
+        r#"
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Entry {
+    key: *mut libc::c_char,
+    value: libc::c_int,
+}
+unsafe fn f(mut entry: Entry) {
+    printf(
+        b"%s %d\0" as *const u8 as *const libc::c_char,
+        entry,
+        entry.value,
+    );
+}"#,
+        &["std::ffi::CStr::from_ptr((entry).key as _)", "write!"],
+        &["printf"],
     );
 }
 

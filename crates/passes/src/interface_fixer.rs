@@ -10,7 +10,7 @@ use rustc_hir::{
     intravisit,
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use serde::Deserialize;
 use utils::ir::AstToHir;
 
@@ -73,7 +73,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         ParamFixKind::Slice => {
                             write!(
                                 call,
-                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1024) }}, ",
+                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1_000_000) }}, ",
                                 if fix.mutability.is_mut() { "mut " } else { "" },
                                 if fix.mutability.is_mut() { "_mut" } else { "" },
                             )
@@ -83,13 +83,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             if fix.mutability.is_mut() {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1_000_000)) }}, ",
                                 )
                                 .unwrap();
                             } else {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1024)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1_000_000)) }}, ",
                                 )
                                 .unwrap();
                             }
@@ -108,6 +108,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
             let ItemKind::Fn(f) = &mut items[0].kind else { panic!() };
             f.ident.name = *name;
+            items[0]
+                .attrs
+                .retain(|attr| !attr.has_name(sym::export_name));
         }
 
         items
@@ -174,7 +177,14 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
         if let hir::ItemKind::Fn { ident, body, .. } = item.kind
             && let name = ident.name.as_str()
-            && self.config.c_exposed_fns.contains(name)
+            && (self.config.c_exposed_fns.contains(name)
+                || self
+                    .tcx
+                    .get_attrs(item.owner_id.def_id.to_def_id(), sym::export_name)
+                    .any(|attr| {
+                        attr.value_str()
+                            .is_some_and(|s| self.config.c_exposed_fns.contains(s.as_str()))
+                    }))
         {
             let body = self.tcx.hir_body(body);
             let typeck = self.tcx.typeck(item.owner_id.def_id);
@@ -231,5 +241,33 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
         }
 
         intravisit::walk_item(self, item);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashSet;
+
+    #[test]
+    fn wraps_exposed_export_name_function() {
+        let code = r#"
+#[export_name = "match"]
+pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> i32 {
+    (test[0] == reference[0]) as i32 + bins
+}
+"#;
+        let config = super::Config {
+            c_exposed_fns: FxHashSet::from_iter(["match".to_string()]),
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+
+        assert!(transformed.contains("fn match_0_internal"));
+        assert!(transformed.contains("fn match_0(test: *const f64"));
+        assert_eq!(transformed.matches("#[export_name = \"match\"]").count(), 1);
     }
 }

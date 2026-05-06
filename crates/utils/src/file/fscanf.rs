@@ -4,8 +4,15 @@ pub fn parse_specs(mut remaining: &[u8]) -> Vec<ConversionSpec> {
         let res = parse_format(remaining);
         if let Some(rem) = res.remaining {
             remaining = rem;
-            specs.push(res.conversion_spec.unwrap());
+            let mut conversion_spec = res.conversion_spec.unwrap();
+            conversion_spec.leading_space = res.prefix.iter().any(u8::is_ascii_whitespace);
+            specs.push(conversion_spec);
         } else {
+            if res.prefix.iter().any(u8::is_ascii_whitespace)
+                && let Some(last) = specs.last_mut()
+            {
+                last.trailing_space = true;
+            }
             break specs;
         }
     }
@@ -148,6 +155,8 @@ fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     width,
                     length,
                     conversion,
+                    leading_space: false,
+                    trailing_space: false,
                 }),
                 remaining: Some(&s[last_idx + 1..]),
             }
@@ -343,6 +352,8 @@ pub struct ConversionSpec {
     pub width: Option<usize>,
     pub length: Option<LengthMod>,
     pub conversion: Conversion,
+    pub leading_space: bool,
+    pub trailing_space: bool,
 }
 
 impl std::fmt::Display for ConversionSpec {
@@ -385,7 +396,9 @@ fn test_scanf_parse() {
             assign: true,
             width: None,
             length: None,
-            conversion: Conversion::Int10
+            conversion: Conversion::Int10,
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -394,7 +407,9 @@ fn test_scanf_parse() {
             assign: true,
             width: None,
             length: Some(LengthMod::Long),
-            conversion: Conversion::Int10
+            conversion: Conversion::Int10,
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -403,7 +418,9 @@ fn test_scanf_parse() {
             assign: true,
             width: None,
             length: Some(LengthMod::Char),
-            conversion: Conversion::Int10
+            conversion: Conversion::Int10,
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -412,7 +429,9 @@ fn test_scanf_parse() {
             assign: true,
             width: Some(10),
             length: None,
-            conversion: Conversion::Str
+            conversion: Conversion::Str,
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -421,7 +440,9 @@ fn test_scanf_parse() {
             assign: false,
             width: None,
             length: None,
-            conversion: Conversion::Str
+            conversion: Conversion::Str,
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -433,7 +454,9 @@ fn test_scanf_parse() {
             conversion: Conversion::ScanSet(ScanSet {
                 negative: false,
                 chars: vec![b'a', b'b', b'c', b'd']
-            })
+            }),
+            leading_space: false,
+            trailing_space: false,
         }
     );
     assert_eq!(
@@ -445,7 +468,16 @@ fn test_scanf_parse() {
             conversion: Conversion::ScanSet(ScanSet {
                 negative: true,
                 chars: vec![b'\n']
-            })
+            }),
+            leading_space: false,
+            trailing_space: false,
         }
     );
+
+    let specs = parse_specs(b"%d %3[A-Z] ");
+    assert_eq!(specs.len(), 2);
+    assert!(!specs[0].leading_space);
+    assert!(!specs[0].trailing_space);
+    assert!(specs[1].leading_space);
+    assert!(specs[1].trailing_space);
 }
