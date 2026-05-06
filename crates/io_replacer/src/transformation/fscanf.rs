@@ -201,10 +201,7 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     )
     .unwrap();
     let mut body = String::new();
-    let consume_whitespace = !matches!(
-        specs[0].conversion,
-        Conversion::Seq | Conversion::ScanSet(_)
-    );
+    let consume_whitespace = specs[0].leading_space || skips_leading_whitespace(&specs[0]);
     writeln!(
         body,
         "    if is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), {consume_whitespace}) {{
@@ -231,6 +228,9 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
         }
         match &spec.conversion {
             Conversion::ScanSet(scan_set) => {
+                if spec.leading_space {
+                    write!(name, "_lead_ws").unwrap();
+                }
                 write!(name, "_{}", !scan_set.negative).unwrap();
                 for c in &scan_set.chars {
                     if c.is_ascii_digit() || c.is_ascii_lowercase() {
@@ -244,6 +244,9 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
             Conversion::S => write!(name, "_big_s").unwrap(),
             Conversion::Percent => write!(name, "_percent").unwrap(),
             conv => write!(name, "_{conv}").unwrap(),
+        }
+        if spec.trailing_space {
+            write!(name, "_trail_ws").unwrap();
         }
 
         let assign = if !spec.assign {
@@ -338,6 +341,13 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
             Conversion::Percent => todo!(),
         };
         let width = spec.width;
+        if spec.leading_space && !skips_leading_whitespace(spec) {
+            writeln!(
+                body,
+                "    let _ = is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), true);",
+            )
+            .unwrap();
+        }
         writeln!(
             body,
             "    let _v = {f}(&mut stream, {width:?}, err.as_deref_mut(), eof.as_deref_mut(){call_args});",
@@ -352,6 +362,13 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     }}"
         )
         .unwrap();
+        if spec.trailing_space {
+            writeln!(
+                body,
+                "    let _ = is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), true);",
+            )
+            .unwrap();
+        }
     }
     writeln!(body, "    count").unwrap();
     let code = format!(
@@ -365,6 +382,10 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
         lib_items,
         num_traits,
     }
+}
+
+fn skips_leading_whitespace(spec: &ConversionSpec) -> bool {
+    !matches!(spec.conversion, Conversion::Seq | Conversion::ScanSet(_))
 }
 
 pub(super) static IS_EOF: &str = r#"
@@ -399,10 +420,28 @@ fn parse_scan_set<R: std::io::BufRead>(
     pos: bool,
     set: &[u8],
 ) -> Option<Vec<i8>> {
+    fn scan_set_contains(set: &[u8], c: u8) -> bool {
+        let mut i = 0;
+        while i < set.len() {
+            if i + 2 < set.len() && set[i + 1] == b'-' && set[i] <= set[i + 2] {
+                if (set[i]..=set[i + 2]).contains(&c) {
+                    return true;
+                }
+                i += 3;
+            } else {
+                if set[i] == c {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
+    }
+
     let mut v: Vec<i8> = Vec::new();
     while width.is_none_or(|lim| v.len() < lim) {
         let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
-        if c == 0xff || set.contains(&c) != pos {
+        if c == 0xff || scan_set_contains(set, c) != pos {
             break;
         }
         v.push(c as i8);

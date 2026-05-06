@@ -486,7 +486,7 @@ fn main() {
             Pass::Libc => {
                 let res = run_compiler_on_path(&file, libc_replacer::replace_libc).unwrap();
                 std::fs::write(&file, res.code).unwrap();
-                if res.bytemuck {
+                if res.bytemuck && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
                 if res.num_traits {
@@ -535,7 +535,7 @@ fn main() {
                 if res.dependencies.tempfile.get() {
                     utils::add_dependency(&dir, "tempfile", "3.19.1");
                 }
-                if res.dependencies.bytemuck.get() {
+                if res.dependencies.bytemuck.get() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
                 if res.dependencies.num_traits.get() {
@@ -556,7 +556,7 @@ fn main() {
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
-                if bytemuck {
+                if bytemuck && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
             }

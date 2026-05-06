@@ -93,7 +93,7 @@ fn parse_integer<R: std::io::BufRead>(
     match u64::from_str_radix(&num, base) {
         Ok(v) => {
             if !signed {
-                (Some(v), false)
+                (Some(if negative { v.wrapping_neg() } else { v }), false)
             } else if !negative {
                 if v > i64::MAX as u64 {
                     (Some(i64::MAX as u64), true)
