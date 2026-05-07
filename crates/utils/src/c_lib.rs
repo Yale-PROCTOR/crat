@@ -250,3 +250,203 @@ fn parse_float<R: std::io::BufRead, F: num_traits::Float + num_traits::Num>(
     (Some(f), erange)
 }
 "#;
+
+pub static IS_EOF: &str = r#"
+fn is_eof<R: std::io::BufRead>(mut stream: R, mut err: Option<&mut i32>, mut eof: Option<&mut i32>, consume_whitespace: bool) -> bool {
+    if consume_whitespace {
+        while peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()).is_ascii_whitespace() {
+            stream.consume(1);
+        }
+    }
+    peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == 0xff
+}
+"#;
+
+pub static PARSE_DECIMAL: &str = r#"
+fn parse_decimal<R: std::io::BufRead>(
+    mut stream: R,
+    width: Option<usize>,
+    mut err: Option<&mut i32>,
+    mut eof: Option<&mut i32>,
+) -> Option<u64> {
+    parse_integer(&mut stream, 10, true, width, err.as_deref_mut(), eof.as_deref_mut()).0
+}
+"#;
+
+pub static PARSE_F64: &str = r#"
+fn parse_f64<R: std::io::BufRead>(
+    stream: R,
+    width: Option<usize>,
+    err: Option<&mut i32>,
+    eof: Option<&mut i32>,
+) -> Option<f64> {
+    parse_float(
+        stream,
+        width,
+        err,
+        eof,
+    ).0
+}
+"#;
+
+pub static XU8: &str = r#"
+pub(crate) struct Xu8(pub(crate) u8);
+impl std::fmt::LowerHex for Xu8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+"#;
+
+pub static XU16: &str = r#"
+pub(crate) struct Xu16(pub(crate) u16);
+impl std::fmt::LowerHex for Xu16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+"#;
+
+pub static XU32: &str = r#"
+pub(crate) struct Xu32(pub(crate) u32);
+impl std::fmt::LowerHex for Xu32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+"#;
+
+pub static XU64: &str = r#"
+pub(crate) struct Xu64(pub(crate) u64);
+impl std::fmt::LowerHex for Xu64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+"#;
+
+pub static GF64: &str = r#"
+pub(crate) struct Gf64(pub(crate) f64);
+impl std::fmt::Display for Gf64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.0;
+        if v.is_nan() {
+            return f.write_str("nan");
+        }
+        if v.is_infinite() {
+            return f.write_str(if v.is_sign_negative() { "-inf" } else { "inf" });
+        }
+        let sign = if v.is_sign_negative() { "-" } else { "" };
+        let abs = v.abs();
+        let p = match f.precision() {
+            Some(0) => 1,
+            Some(n) => n,
+            None => 6,
+        };
+        let x = if abs == 0.0 {
+            0
+        } else {
+            abs.log10().floor() as i32
+        };
+        let s = if x >= -4 && x < p as i32 {
+            let frac_prec = (p as i32 - (x + 1)).max(0) as usize;
+            let mut s = std::fmt::format(format_args!("{abs:.frac_prec$}"));
+            if !f.alternate() && s.contains('.') {
+                while s.ends_with('0') {
+                    s.pop();
+                }
+                if s.ends_with('.') {
+                    s.pop();
+                }
+            }
+            s
+        } else {
+            let exp_prec = p.saturating_sub(1);
+            let s_full = std::fmt::format(format_args!("{abs:.exp_prec$e}"));
+            let idx = s_full.find('e').unwrap();
+            let mut mant = s_full[..idx].to_string();
+            let exp = &s_full[idx + 1..];
+            if !f.alternate() && mant.contains('.') {
+                while mant.ends_with('0') {
+                    mant.pop();
+                }
+                if mant.ends_with('.') {
+                    mant.pop();
+                }
+            }
+            let (sign_e, digits) = if let Some(digits) = exp.strip_prefix('-') {
+                ('-', digits)
+            } else {
+                (
+                    '+',
+                    if let Some(digits) = exp.strip_prefix('+') {
+                        digits
+                    } else {
+                        exp
+                    },
+                )
+            };
+            let digits = if digits.len() < 2 {
+                std::fmt::format(format_args!("0{digits}"))
+            } else {
+                digits.to_string()
+            };
+            std::fmt::format(format_args!("{mant}e{sign_e}{digits}"))
+        };
+        f.write_str(sign)?;
+        f.write_str(&s)
+    }
+}
+"#;

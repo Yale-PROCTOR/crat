@@ -1,15 +1,23 @@
-use rustc_ast::{token, *};
+use rustc_ast::{
+    token,
+    visit::{self, Visitor},
+    *,
+};
 use rustc_ast_pretty::pprust;
+use rustc_hir::{
+    self as hir,
+    def::{DefKind, Res},
+};
 
 use crate::libc_replacer::LibItem;
 
 impl super::TransformVisitor<'_> {
     pub(super) fn c_byte_slice(&mut self, s: &Expr) -> Option<String> {
         if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
-            let array = pprust::expr_to_string(array);
-            if array.contains("with_borrow(") || array.contains("with_borrow_mut(") {
+            if expr_has_with_borrow_call(array) {
                 return None;
             }
+            let array = pprust::expr_to_string(array);
             if ty == self.tcx.types.u8 {
                 return Some(format!("&({array})"));
             } else if ty == self.tcx.types.i8 {
@@ -28,11 +36,22 @@ impl super::TransformVisitor<'_> {
     }
 
     pub(super) fn c_byte_slice_mut(&mut self, s: &Expr) -> Option<String> {
+        self.c_byte_slice_mut_rejecting_methods(s, &[])
+    }
+
+    pub(super) fn c_byte_slice_mut_rejecting_methods(
+        &mut self,
+        s: &Expr,
+        method_names: &[&str],
+    ) -> Option<String> {
         let (array, ty) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx)?;
-        let array = pprust::expr_to_string(array);
-        if array.contains("with_borrow(") || array.contains("with_borrow_mut(") {
+        if self.expr_is_static(array) {
             return None;
         }
+        if expr_has_with_borrow_call(array) || expr_has_method_call(array, method_names) {
+            return None;
+        }
+        let array = pprust::expr_to_string(array);
         if ty == self.tcx.types.u8 {
             Some(format!("&mut ({array})"))
         } else if ty == self.tcx.types.i8 {
@@ -174,6 +193,59 @@ impl super::TransformVisitor<'_> {
             ).count()"
         ))
     }
+
+    fn expr_is_static(&self, expr: &Expr) -> bool {
+        self.ast_to_hir
+            .get_expr(expr.id, self.tcx)
+            .is_some_and(|hir_expr| {
+                matches!(
+                    hir_expr.kind,
+                    hir::ExprKind::Path(hir::QPath::Resolved(
+                        _,
+                        hir::Path {
+                            res: Res::Def(DefKind::Static { .. }, _),
+                            ..
+                        }
+                    ))
+                )
+            })
+    }
+}
+
+fn expr_has_with_borrow_call(expr: &Expr) -> bool {
+    expr_has_method_call(expr, &["with_borrow", "with_borrow_mut"])
+}
+
+fn expr_has_method_call(expr: &Expr, names: &[&str]) -> bool {
+    struct Finder<'a> {
+        names: &'a [&'a str],
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Finder<'_> {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let ExprKind::MethodCall(call) = &expr.kind
+                && self
+                    .names
+                    .iter()
+                    .any(|name| call.seg.ident.name.as_str() == *name)
+            {
+                self.found = true;
+                return;
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = Finder {
+        names,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
 }
 
 fn same_ptr_receiver_root(s1: &Expr, s2: &Expr) -> bool {
