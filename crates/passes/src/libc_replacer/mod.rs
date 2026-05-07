@@ -1,12 +1,13 @@
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
+    visit::{self, Visitor},
     *,
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{TyCtxt, TyKind};
 use thin_vec::ThinVec;
 use utils::{ast::unwrap_paren, expr};
 
@@ -51,6 +52,7 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items: FxHashSet::default(),
         bytemuck: false,
         num_traits: false,
+        current_fn_has_raw_deref: false,
     };
     visitor.visit_crate(&mut krate);
 
@@ -105,6 +107,7 @@ struct TransformVisitor<'tcx> {
     lib_items: FxHashSet<LibItem>,
     bytemuck: bool,
     num_traits: bool,
+    current_fn_has_raw_deref: bool,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -130,6 +133,13 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 
     fn visit_item(&mut self, item: &mut Item) {
+        let old_current_fn_has_raw_deref = self.current_fn_has_raw_deref;
+        if let ItemKind::Fn(f) = &item.kind
+            && let Some(body) = &f.body
+        {
+            self.current_fn_has_raw_deref = fn_body_has_raw_deref(body, &self.ast_to_hir, self.tcx);
+        }
+
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(f) = &mut item.kind
@@ -149,6 +159,8 @@ impl MutVisitor for TransformVisitor<'_> {
             stmts.append(&mut body.stmts);
             body.stmts = stmts;
         }
+
+        self.current_fn_has_raw_deref = old_current_fn_has_raw_deref;
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
@@ -413,6 +425,12 @@ impl MutVisitor for TransformVisitor<'_> {
                         *expr = e;
                     }
                 }
+                "memmove" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memmove(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
                 "memcmp" => {
                     let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_memcmp(arg1, arg2, arg3) {
@@ -500,6 +518,40 @@ impl MutVisitor for TransformVisitor<'_> {
             }
         }
     }
+}
+
+fn fn_body_has_raw_deref(body: &Block, ast_to_hir: &utils::ir::AstToHir, tcx: TyCtxt<'_>) -> bool {
+    struct Finder<'a, 'tcx> {
+        ast_to_hir: &'a utils::ir::AstToHir,
+        tcx: TyCtxt<'tcx>,
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Finder<'_, '_> {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let ExprKind::Unary(UnOp::Deref, inner) = &expr.kind
+                && let Some(hir_expr) = self.ast_to_hir.get_expr(inner.id, self.tcx)
+            {
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                if matches!(typeck.expr_ty(hir_expr).kind(), TyKind::RawPtr(..)) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = Finder {
+        ast_to_hir,
+        tcx,
+        found: false,
+    };
+    finder.visit_block(body);
+    finder.found
 }
 
 impl TransformVisitor<'_> {
