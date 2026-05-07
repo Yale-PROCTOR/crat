@@ -223,7 +223,22 @@ impl MutVisitor for TransformVisitor<'_> {
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.exp()");
                 }
+                "sin" | "sinf" | "sinl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.sin()");
+                }
+                "cos" | "cosf" | "cosl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.cos()");
+                }
                 "fabs" | "fabsf" | "fabsl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.abs()");
+                }
+                "abs" | "labs" | "llabs" => {
                     let [arg] = args.as_slice() else { panic!() };
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.abs()");
@@ -245,10 +260,22 @@ impl MutVisitor for TransformVisitor<'_> {
                     let arg2 = pprust::expr_to_string(arg2);
                     *expr = expr!("{arg1}.powf({arg2})");
                 }
+                "atan2" | "atan2f" | "atan2l" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    let arg1 = expr_to_parenthesized_string(arg1);
+                    let arg2 = pprust::expr_to_string(arg2);
+                    *expr = expr!("{arg1}.atan2({arg2})");
+                }
                 "sqrt" | "sqrtf" | "sqrtl" => {
                     let [arg] = args.as_slice() else { panic!() };
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.sqrt()");
+                }
+                "difftime" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    let arg1 = expr_to_parenthesized_string(arg1);
+                    let arg2 = expr_to_parenthesized_string(arg2);
+                    *expr = expr!("({arg1} as f64 - {arg2} as f64)");
                 }
                 "div" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };

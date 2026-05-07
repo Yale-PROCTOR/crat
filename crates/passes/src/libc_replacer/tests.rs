@@ -114,3 +114,30 @@ pub unsafe fn foo(mut c: core::ffi::c_char) -> core::ffi::c_int {
         ],
     );
 }
+
+#[test]
+fn test_trig_abs_and_difftime_calls_use_safe_replacements() {
+    run_test(
+        r#"
+extern "C" {
+    fn abs(__x: core::ffi::c_int) -> core::ffi::c_int;
+    fn sin(__x: core::ffi::c_double) -> core::ffi::c_double;
+    fn cos(__x: core::ffi::c_double) -> core::ffi::c_double;
+    fn atan2(__y: core::ffi::c_double, __x: core::ffi::c_double) -> core::ffi::c_double;
+    fn difftime(__time1: core::ffi::c_long, __time0: core::ffi::c_long) -> core::ffi::c_double;
+}
+
+pub unsafe fn foo(mut i: core::ffi::c_int, mut x: f64, mut y: f64) -> f64 {
+    abs(i) as f64 + sin(x) + cos(y) + atan2(y, x) + difftime(i as core::ffi::c_long, 0)
+}
+        "#,
+        &[
+            "i.abs()",
+            "x.sin()",
+            "y.cos()",
+            "y.atan2(x)",
+            "(i as core::ffi::c_long) as f64 - 0 as f64",
+        ],
+        &["abs(i)", "sin(x)", "cos(y)", "atan2(y, x)", "difftime(i"],
+    );
+}
