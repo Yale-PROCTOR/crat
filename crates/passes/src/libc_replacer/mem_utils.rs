@@ -4,6 +4,8 @@ use rustc_hir::def_id::LocalDefId;
 use rustc_span::{Symbol, sym};
 use utils::ast::unwrap_cast_and_paren;
 
+use crate::libc_replacer::LibItem;
+
 impl<'tcx> super::TransformVisitor<'tcx> {
     pub fn transform_memcpy(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
         let (array1, ty1) = utils::ir::array_of_as_ptr(s1, &self.ast_to_hir, self.tcx)?;
@@ -60,6 +62,26 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         }
     }
 
+    pub fn transform_memcmp(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
+        let s1 = self.c_byte_slice(s1)?;
+        let s2 = self.c_byte_slice(s2)?;
+        let n = pprust::expr_to_string(n);
+        self.lib_items.insert(LibItem::Memcmp);
+        Some(utils::expr!(
+            "crate::c_lib::memcmp({s1}, {s2}, ({n}) as usize)"
+        ))
+    }
+
+    pub fn transform_memchr(&mut self, s: &Expr, c: &Expr, n: &Expr) -> Option<Expr> {
+        let s = self.c_byte_slice(s)?;
+        let c = pprust::expr_to_string(c);
+        let n = pprust::expr_to_string(n);
+        self.lib_items.insert(LibItem::Memchr);
+        Some(utils::expr!(
+            "crate::c_lib::memchr({s}, ({c}) as u8, ({n}) as usize)"
+        ))
+    }
+
     fn get_len_from_size(
         &self,
         size_expr: &Expr,
@@ -100,6 +122,28 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         None
     }
 }
+
+pub const MEMCMP: &str = r#"
+pub fn memcmp(s1: &[u8], s2: &[u8], n: usize) -> i32 {
+    for i in 0..n {
+        let c1 = s1[i];
+        let c2 = s2[i];
+        if c1 != c2 {
+            return c1 as i32 - c2 as i32;
+        }
+    }
+    0
+}
+"#;
+
+pub const MEMCHR: &str = r#"
+pub fn memchr(s: &[u8], c: u8, n: usize) -> *mut std::ffi::c_void {
+    s[..n]
+        .iter()
+        .position(|&x| x == c)
+        .map_or(std::ptr::null_mut(), |i| s[i..].as_ptr() as *mut std::ffi::c_void)
+}
+"#;
 
 fn get_fn_name_from_expr(expr: &Expr) -> Option<Symbol> {
     if let ExprKind::Path(_, path) = &expr.kind

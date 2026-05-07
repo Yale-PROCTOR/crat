@@ -66,6 +66,80 @@ pub unsafe fn copy_name(mut src: &[i8]) {
 }
 
 #[test]
+fn test_string_compare_copy_and_concat_use_c_lib_helpers() {
+    run_test(
+        r#"
+extern "C" {
+    fn strcmp(__s1: *const i8, __s2: *const i8) -> i32;
+    fn strncmp(__s1: *const i8, __s2: *const i8, __n: usize) -> i32;
+    fn strcpy(__dest: *mut i8, __src: *const i8) -> *mut i8;
+    fn strcat(__dest: *mut i8, __src: *const i8) -> *mut i8;
+    fn strncat(__dest: *mut i8, __src: *const i8, __n: usize) -> *mut i8;
+}
+
+pub unsafe fn foo(mut src: &[i8]) -> i32 {
+    let mut dst = [0i8; 32];
+    strcpy(dst.as_mut_ptr(), src.as_ptr());
+    strcat(dst.as_mut_ptr(), b"-\0" as *const u8 as *const i8);
+    strncat(dst.as_mut_ptr(), b"xxy\0" as *const u8 as *const i8, 2);
+    strcmp(dst.as_ptr(), b"abc-xx\0" as *const u8 as *const i8)
+        + strncmp(dst.as_ptr(), src.as_ptr(), 3)
+}
+        "#,
+        &[
+            "crate::c_lib::strcpy",
+            "crate::c_lib::strcat",
+            "crate::c_lib::strncat",
+            "crate::c_lib::strcmp",
+            "crate::c_lib::strncmp",
+        ],
+        &[
+            "strcmp(dst.as_ptr",
+            "strncmp(dst.as_ptr",
+            "strcpy(dst.as_mut_ptr",
+            "strcat(dst.as_mut_ptr",
+            "strncat(dst.as_mut_ptr",
+        ],
+    );
+}
+
+#[test]
+fn test_string_and_memory_searches_use_safe_replacements() {
+    run_test(
+        r#"
+extern "C" {
+    fn strchr(__s: *const i8, __c: i32) -> *mut i8;
+    fn strrchr(__s: *const i8, __c: i32) -> *mut i8;
+    fn strstr(__haystack: *const i8, __needle: *const i8) -> *mut i8;
+    fn memchr(__s: *const core::ffi::c_void, __c: i32, __n: usize) -> *mut core::ffi::c_void;
+    fn memcmp(__s1: *const core::ffi::c_void, __s2: *const core::ffi::c_void, __n: usize) -> i32;
+}
+
+pub unsafe fn foo(mut s: &[i8], mut bytes: &[u8]) -> i32 {
+    (!strchr(s.as_ptr(), 'x' as i32).is_null()) as i32
+        + (!strrchr(s.as_ptr(), 'y' as i32).is_null()) as i32
+        + (!strstr(s.as_ptr(), b"zz\0" as *const u8 as *const i8).is_null()) as i32
+        + (!memchr(bytes.as_ptr() as *const _, 7, bytes.len()).is_null()) as i32
+        + memcmp(bytes.as_ptr() as *const _, b"abc\0" as *const u8 as *const _, 3)
+}
+        "#,
+        &[
+            "from_bytes_until_nul",
+            "crate::c_lib::strstr",
+            "crate::c_lib::memchr",
+            "crate::c_lib::memcmp",
+        ],
+        &[
+            "strchr(s.as_ptr",
+            "strrchr(s.as_ptr",
+            "strstr(s.as_ptr",
+            "memchr(bytes.as_ptr",
+            "memcmp(bytes.as_ptr",
+        ],
+    );
+}
+
+#[test]
 fn test_ctype_masks_use_ascii_classification() {
     run_test(
         r#"
