@@ -140,6 +140,26 @@ pub unsafe fn foo(mut s: &[i8], mut bytes: &[u8]) -> i32 {
 }
 
 #[test]
+fn test_strcspn_accepts_byte_string_reject_set() {
+    run_test(
+        r#"
+extern "C" {
+    fn strcspn(__s: *const i8, __reject: *const i8) -> usize;
+}
+
+pub unsafe fn foo() -> usize {
+    let mut input = [0i8; 16];
+    input[0] = b'a' as i8;
+    input[1] = b'\n' as i8;
+    strcspn(input.as_ptr(), b"\n\0" as *const u8 as *const i8)
+}
+        "#,
+        &["from_bytes_until_nul", "b\"\\n\\0\"", "take_while"],
+        &["strcspn(input.as_ptr"],
+    );
+}
+
+#[test]
 fn test_ctype_masks_use_ascii_classification() {
     run_test(
         r#"
@@ -186,6 +206,37 @@ pub unsafe fn foo(mut c: core::ffi::c_char) -> core::ffi::c_int {
             ".is_whitespace()",
             ".is_ascii_whitespace()",
         ],
+    );
+}
+
+#[test]
+fn test_exit_and_time_calls_use_safe_replacements() {
+    run_test(
+        r#"
+type time_t = i64;
+
+extern "C" {
+    fn exit(__status: i32);
+    fn time(__timer: *mut time_t) -> time_t;
+}
+
+pub unsafe fn foo() -> time_t {
+    let mut current_time: time_t = 0;
+    time(&raw mut current_time);
+    let now: time_t = time(std::ptr::null_mut());
+    if now < current_time {
+        exit(1);
+    }
+    now
+}
+        "#,
+        &[
+            "std::process::exit",
+            "std::time::SystemTime::now()",
+            "std::time::UNIX_EPOCH",
+            "current_time = ___time",
+        ],
+        &["time(&raw", "time(std::ptr::null_mut", "exit(1);"],
     );
 }
 

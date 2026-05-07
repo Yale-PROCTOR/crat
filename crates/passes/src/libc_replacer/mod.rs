@@ -292,6 +292,17 @@ impl MutVisitor for TransformVisitor<'_> {
                 "abort" => {
                     *expr = expr!("std::process::abort()");
                 }
+                "exit" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = pprust::expr_to_string(arg);
+                    *expr = expr!("std::process::exit(({arg}) as i32)");
+                }
+                "time" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_time(expr.id, arg) {
+                        *expr = e;
+                    }
+                }
                 "strtod" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };
                     let num = self
@@ -487,6 +498,39 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+impl TransformVisitor<'_> {
+    fn transform_time(&self, call_id: NodeId, timer: &Expr) -> Option<Expr> {
+        let hir_expr = self.ast_to_hir.get_expr(call_id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let ty = utils::ir::mir_ty_to_string(typeck.expr_ty(hir_expr), self.tcx);
+        let current_time = format!(
+            "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as {ty}"
+        );
+
+        match &utils::ast::unwrap_cast_and_paren(timer).kind {
+            ExprKind::Call(func, args) if args.is_empty() => {
+                if let ExprKind::Path(_, path) = &func.kind
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| seg.ident.as_str() == "null_mut")
+                {
+                    Some(expr!("{current_time}"))
+                } else {
+                    None
+                }
+            }
+            ExprKind::AddrOf(BorrowKind::Raw | BorrowKind::Ref, Mutability::Mut, place) => {
+                let place = pprust::expr_to_string(place);
+                Some(expr!(
+                    "{{ let ___time = {current_time}; {place} = ___time; ___time }}"
+                ))
+            }
+            _ => None,
         }
     }
 }
