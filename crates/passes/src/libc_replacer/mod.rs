@@ -331,6 +331,24 @@ impl MutVisitor for TransformVisitor<'_> {
                     let [arg] = args.as_slice() else { panic!() };
                     *expr = self.transform_strlen(arg);
                 }
+                "strcmp" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcmp(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strncmp" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strncmp(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "strcpy" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcpy(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
                 "strncpy" => {
                     if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                         && let rustc_hir::Node::Stmt(stmt) =
@@ -339,6 +357,36 @@ impl MutVisitor for TransformVisitor<'_> {
                         && let [arg1, arg2, arg3] = args.as_slice()
                         && let Some(e) = self.transform_strncpy(arg1, arg2, arg3)
                     {
+                        *expr = e;
+                    }
+                }
+                "strcat" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcat(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strncat" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strncat(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "strchr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strchr(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strrchr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strrchr(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strstr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strstr(arg1, arg2) {
                         *expr = e;
                     }
                 }
@@ -351,6 +399,18 @@ impl MutVisitor for TransformVisitor<'_> {
                 "memcpy" => {
                     let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_memcpy(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memcmp" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memcmp(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memchr" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memchr(arg1, arg2, arg3) {
                         *expr = e;
                     }
                 }
@@ -477,6 +537,16 @@ enum LibItem {
     Peek,
     ParseFloat,
     ParseInteger,
+    Strcmp,
+    Strncmp,
+    Strcpy,
+    Strcat,
+    Strncat,
+    Strchr,
+    Strrchr,
+    Strstr,
+    Memcmp,
+    Memchr,
 }
 
 impl LibItem {
@@ -490,6 +560,16 @@ impl LibItem {
             LibItem::Peek => "peek",
             LibItem::ParseFloat => "parse_float",
             LibItem::ParseInteger => "parse_integer",
+            LibItem::Strcmp => "strcmp",
+            LibItem::Strncmp => "strncmp",
+            LibItem::Strcpy => "strcpy",
+            LibItem::Strcat => "strcat",
+            LibItem::Strncat => "strncat",
+            LibItem::Strchr => "strchr",
+            LibItem::Strrchr => "strrchr",
+            LibItem::Strstr => "strstr",
+            LibItem::Memcmp => "memcmp",
+            LibItem::Memchr => "memchr",
         }
     }
 
@@ -503,6 +583,16 @@ impl LibItem {
             LibItem::Peek => utils::c_lib::PEEK,
             LibItem::ParseFloat => utils::c_lib::PARSE_FLOAT,
             LibItem::ParseInteger => utils::c_lib::PARSE_INTEGER,
+            LibItem::Strcmp => str_utils::STRCMP,
+            LibItem::Strncmp => str_utils::STRNCMP,
+            LibItem::Strcpy => str_utils::STRCPY,
+            LibItem::Strcat => str_utils::STRCAT,
+            LibItem::Strncat => str_utils::STRNCAT,
+            LibItem::Strchr => str_utils::STRCHR,
+            LibItem::Strrchr => str_utils::STRRCHR,
+            LibItem::Strstr => str_utils::STRSTR,
+            LibItem::Memcmp => mem_utils::MEMCMP,
+            LibItem::Memchr => mem_utils::MEMCHR,
         }
     }
 }
