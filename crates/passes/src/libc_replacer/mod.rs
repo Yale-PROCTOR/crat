@@ -15,6 +15,7 @@ use crate::libc_replacer::errno::ErrorCode;
 
 mod errno;
 mod mem_utils;
+mod stdio_string;
 mod str_utils;
 mod strto;
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
         errno_calls,
         source_nums,
         lib_items: FxHashSet::default(),
+        parsing_fns: FxHashMap::default(),
         bytemuck: false,
         num_traits: false,
         current_fn_has_raw_deref: false,
@@ -71,19 +73,28 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
             .filter_map(|item| {
                 if let ItemKind::Fn(f) = &item.kind {
                     Some(f.ident.name.as_str().to_string())
+                } else if let ItemKind::Struct(ident, ..) = &item.kind {
+                    Some(ident.name.as_str().to_string())
                 } else {
                     None
                 }
             })
             .collect();
+        for (name, code) in visitor.parsing_fns {
+            if !items.contains(name.as_str()) {
+                push_c_lib_items(lib_items, &code);
+            }
+        }
         for item in visitor.lib_items {
             if !items.contains(item.as_str()) {
-                let item = utils::item!("{}", item.get_impl());
-                lib_items.push(P(item));
+                push_c_lib_items(lib_items, item.get_impl());
             }
         }
     } else {
         let mut code = "mod c_lib {".to_string();
+        for (_, item) in visitor.parsing_fns {
+            code.push_str(&item);
+        }
         for item in visitor.lib_items {
             code.push_str(item.get_impl());
         }
@@ -99,12 +110,21 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
     }
 }
 
+fn push_c_lib_items(items: &mut ThinVec<P<Item>>, code: &str) {
+    let item = utils::item!("mod __crat_tmp {{ {code} }}");
+    let ItemKind::Mod(_, _, ModKind::Loaded(mut new_items, _, _, _)) = item.kind else {
+        unreachable!()
+    };
+    items.append(&mut new_items);
+}
+
 struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: utils::ir::AstToHir,
     errno_calls: errno::ErrnoCalls,
     source_nums: FxHashMap<HirId, usize>,
     lib_items: FxHashSet<LibItem>,
+    parsing_fns: FxHashMap<String, String>,
     bytemuck: bool,
     num_traits: bool,
     current_fn_has_raw_deref: bool,
@@ -419,6 +439,28 @@ impl MutVisitor for TransformVisitor<'_> {
                         *expr = e;
                     }
                 }
+                "sprintf" => {
+                    if args.len() >= 2
+                        && let Some(e) = self.transform_sprintf(&args[0], &args[1], &args[2..])
+                    {
+                        *expr = e;
+                    }
+                }
+                "snprintf" => {
+                    if args.len() >= 3
+                        && let Some(e) =
+                            self.transform_snprintf(&args[0], &args[1], &args[2], &args[3..])
+                    {
+                        *expr = e;
+                    }
+                }
+                "sscanf" => {
+                    if args.len() >= 2
+                        && let Some(e) = self.transform_sscanf(&args[0], &args[1], &args[2..])
+                    {
+                        *expr = e;
+                    }
+                }
                 "memcpy" => {
                     let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_memcpy(arg1, arg2, arg3) {
@@ -631,8 +673,16 @@ enum LibItem {
     Atof,
     Atoi,
     Peek,
+    IsEof,
+    ParseDecimal,
+    ParseF64,
     ParseFloat,
     ParseInteger,
+    Xu8,
+    Xu16,
+    Xu32,
+    Xu64,
+    Gf64,
     Strcmp,
     Strncmp,
     Strcpy,
@@ -654,8 +704,16 @@ impl LibItem {
             LibItem::Atof => "atof",
             LibItem::Atoi => "atoi",
             LibItem::Peek => "peek",
+            LibItem::IsEof => "is_eof",
+            LibItem::ParseDecimal => "parse_decimal",
+            LibItem::ParseF64 => "parse_f64",
             LibItem::ParseFloat => "parse_float",
             LibItem::ParseInteger => "parse_integer",
+            LibItem::Xu8 => "Xu8",
+            LibItem::Xu16 => "Xu16",
+            LibItem::Xu32 => "Xu32",
+            LibItem::Xu64 => "Xu64",
+            LibItem::Gf64 => "Gf64",
             LibItem::Strcmp => "strcmp",
             LibItem::Strncmp => "strncmp",
             LibItem::Strcpy => "strcpy",
@@ -677,8 +735,16 @@ impl LibItem {
             LibItem::Atof => strto::ATOF,
             LibItem::Atoi => strto::ATOI,
             LibItem::Peek => utils::c_lib::PEEK,
+            LibItem::IsEof => utils::c_lib::IS_EOF,
+            LibItem::ParseDecimal => utils::c_lib::PARSE_DECIMAL,
+            LibItem::ParseF64 => utils::c_lib::PARSE_F64,
             LibItem::ParseFloat => utils::c_lib::PARSE_FLOAT,
             LibItem::ParseInteger => utils::c_lib::PARSE_INTEGER,
+            LibItem::Xu8 => utils::c_lib::XU8,
+            LibItem::Xu16 => utils::c_lib::XU16,
+            LibItem::Xu32 => utils::c_lib::XU32,
+            LibItem::Xu64 => utils::c_lib::XU64,
+            LibItem::Gf64 => utils::c_lib::GF64,
             LibItem::Strcmp => str_utils::STRCMP,
             LibItem::Strncmp => str_utils::STRNCMP,
             LibItem::Strcpy => str_utils::STRCPY,

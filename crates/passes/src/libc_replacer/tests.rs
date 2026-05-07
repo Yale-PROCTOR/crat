@@ -136,6 +136,57 @@ pub unsafe fn foo(mut src: &[i8]) -> i32 {
 }
 
 #[test]
+fn test_string_stdio_rewrites_safe_slice_calls() {
+    run_test(
+        r#"
+extern "C" {
+    fn sprintf(__s: *mut i8, __format: *const i8, ...) -> i32;
+    fn snprintf(__s: *mut i8, __maxlen: usize, __format: *const i8, ...) -> i32;
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut input: &[i8], mut n: i32) -> i32 {
+    let mut buf = [0i8; 64];
+    let a = sprintf(buf.as_mut_ptr(), b"x%d\0" as *const u8 as *const i8, n);
+    let b = snprintf(buf.as_mut_ptr(), 64, b"%04x\0" as *const u8 as *const i8, n);
+    let c = sscanf(input.as_ptr(), b"%d\0" as *const u8 as *const i8, &raw mut n);
+    a + b + c
+}
+        "#,
+        &[
+            "std::fmt::format(format_args!",
+            "std::io::Cursor::new",
+            "crate::c_lib::sscanf_scan_d",
+            "crate::c_lib::Xu32",
+        ],
+        &[
+            "sprintf(buf.as_mut_ptr",
+            "snprintf(buf.as_mut_ptr",
+            "sscanf(input.as_ptr",
+        ],
+    );
+}
+
+#[test]
+fn test_string_stdio_skips_raw_and_unsupported_calls() {
+    run_test(
+        r#"
+extern "C" {
+    fn sprintf(__s: *mut i8, __format: *const i8, ...) -> i32;
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut out: *mut i8, mut input: &[i8], mut n: i32, mut consumed: usize) {
+    sprintf(out, b"%d\0" as *const u8 as *const i8, n);
+    sscanf(input.as_ptr(), b"%d%zn\0" as *const u8 as *const i8, &raw mut n, &raw mut consumed);
+}
+        "#,
+        &["sprintf(out", "sscanf(input.as_ptr"],
+        &["std::io::Cursor::new"],
+    );
+}
+
+#[test]
 fn test_string_and_memory_searches_use_safe_replacements() {
     run_test(
         r#"
