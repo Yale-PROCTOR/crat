@@ -42,6 +42,38 @@ pub unsafe extern "C" fn foo(mut p: *mut s, mut q: *mut s) {
 }
 
 #[test]
+fn test_offset_memory_calls_use_slice_replacements() {
+    run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+    fn memmove(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+    fn memset(__s: *mut core::ffi::c_void, __c: core::ffi::c_int, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(mut src: &[u8], mut dst: &mut [u8]) {
+    memcpy(dst.as_mut_ptr().offset(2) as *mut _, src.as_ptr().offset(1) as *const _, 4);
+    memmove(dst.as_mut_ptr().offset(1) as *mut _, dst.as_ptr() as *const _, 4);
+    memset(dst.as_mut_ptr().offset(6) as *mut _, 0, 2);
+}
+        "#,
+        &[
+            "copy_from_slice",
+            "let ___tmp",
+            ".to_vec()",
+            ".fill",
+            "(2) as",
+            "(6) as usize..",
+        ],
+        &[
+            "memcpy(dst.as_mut_ptr",
+            "memmove(dst.as_mut_ptr",
+            "memset(dst.as_mut_ptr",
+        ],
+    );
+}
+
+#[test]
 fn test_strncpy_from_short_slice_caps_copy_len() {
     run_test(
         r#"

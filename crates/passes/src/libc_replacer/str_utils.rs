@@ -128,7 +128,7 @@ impl super::TransformVisitor<'_> {
     }
 
     pub fn transform_strncat(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
-        if same_ptr_receiver_root(s1, s2) || n_mentions_ptr_receiver_root(s1, n) {
+        if same_ptr_receiver_root(s1, s2) {
             return None;
         }
         let s1 = self.c_byte_slice_mut(s1)?;
@@ -136,7 +136,7 @@ impl super::TransformVisitor<'_> {
         let n = pprust::expr_to_string(n);
         self.lib_items.insert(LibItem::Strncat);
         Some(utils::expr!(
-            "crate::c_lib::strncat({s1}, {s2}, ({n}) as usize) as *mut i8"
+            "{{ let ___n = ({n}) as usize; crate::c_lib::strncat({s1}, {s2}, ___n) as *mut i8 }}"
         ))
     }
 
@@ -180,10 +180,6 @@ fn same_ptr_receiver_root(s1: &Expr, s2: &Expr) -> bool {
     ptr_receiver_root(s1)
         .zip(ptr_receiver_root(s2))
         .is_some_and(|(s1, s2)| s1 == s2)
-}
-
-fn n_mentions_ptr_receiver_root(s: &Expr, n: &Expr) -> bool {
-    ptr_receiver_root(s).is_some_and(|root| pprust::expr_to_string(n).contains(&root))
 }
 
 fn ptr_receiver_root(s: &Expr) -> Option<String> {
