@@ -14,6 +14,26 @@ fn analyze(code: &str) -> EnumAnalysis {
     utils::compilation::run_compiler_on_str(&code, analyze_enums).unwrap()
 }
 
+fn transform(code: &str) -> String {
+    let code = format!(
+        r#"
+            #![allow(dead_code)]
+            #![allow(non_camel_case_types)]
+            #![allow(non_snake_case)]
+            #![allow(non_upper_case_globals)]
+
+            {code}
+            "#
+    );
+    utils::compilation::run_compiler_on_str(&code, replace_enums).unwrap()
+}
+
+fn transform_and_compile(code: &str) -> String {
+    let code = transform(code);
+    utils::compilation::run_compiler_on_str(&code, utils::type_check).unwrap();
+    code
+}
+
 fn enum_by_name<'a>(analysis: &'a EnumAnalysis, tcx: TyCtxt<'_>, name: &str) -> &'a EnumInfo {
     analysis
         .enums
@@ -591,4 +611,218 @@ fn unknown_enum_required_source_rejects() {
             );
         },
     );
+}
+
+#[test]
+fn transform_simple_c_enum() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const C: E = 2;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f() -> E {
+                A
+            }
+            "#,
+    );
+
+    assert!(code.contains("#[repr(u32)]"));
+    assert!(code.contains("#![feature(coverage_attribute)]"));
+    assert!(code.contains("#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]"));
+    assert!(code.contains("pub enum E"));
+    assert!(code.contains("A = 0u32"));
+    assert!(code.contains("B = 1u32"));
+    assert!(code.contains("C = 2u32"));
+    assert!(code.find("A = 0u32").unwrap() < code.find("B = 1u32").unwrap());
+    assert!(code.find("B = 1u32").unwrap() < code.find("C = 2u32").unwrap());
+    assert!(code.contains("pub use E::A;"));
+    assert!(code.contains("pub use E::B;"));
+    assert!(code.contains("pub use E::C;"));
+    assert!(!code.contains("type E ="));
+    assert!(!code.contains("pub const A"));
+    assert!(!code.contains("pub const B"));
+    assert!(!code.contains("pub const C"));
+}
+
+#[test]
+fn transform_signed_repr() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_int;
+            pub const POS: E = 1;
+            pub const NEG: E = -1;
+            pub const ZERO: E = 0;
+
+            pub unsafe extern "C" fn f() -> E {
+                NEG
+            }
+            "#,
+    );
+
+    assert!(code.contains("#[repr(i32)]"));
+    assert!(code.contains("NEG = -1i32"));
+    assert!(code.contains("ZERO = 0i32"));
+    assert!(code.contains("POS = 1i32"));
+    assert!(code.find("NEG = -1i32").unwrap() < code.find("ZERO = 0i32").unwrap());
+    assert!(code.find("ZERO = 0i32").unwrap() < code.find("POS = 1i32").unwrap());
+}
+
+#[test]
+fn transform_inserts_enum_to_integer_casts() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn takes_int(x: core::ffi::c_uint) -> core::ffi::c_uint {
+                x
+            }
+
+            pub unsafe extern "C" fn f() -> core::ffi::c_uint {
+                let e: E = B;
+                let mut i: core::ffi::c_uint = e;
+                i = i + A + e;
+                if e == 1 as core::ffi::c_uint {
+                    i = i + takes_int(e);
+                }
+                return e;
+            }
+            "#,
+    );
+
+    assert!(code.contains("as u32"));
+    assert!(code.contains("takes_int((e) as u32)"));
+    assert!(code.contains("return (e) as u32;"));
+}
+
+#[test]
+fn transform_rewrites_cast_targets_to_repr() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(x: u8) -> core::ffi::c_uint {
+                x as E as core::ffi::c_uint
+            }
+            "#,
+    );
+
+    assert!(code.contains("x as u32 as core::ffi::c_uint"));
+    assert!(!code.contains("x as E as core::ffi::c_uint"));
+}
+
+#[test]
+fn transform_avoids_unnecessary_casts() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(x: E) -> E {
+                let y: E = x;
+                if y == A {
+                    y
+                } else {
+                    B
+                }
+            }
+            "#,
+    );
+
+    assert!(!code.contains(" as u32"));
+}
+
+#[test]
+fn transform_preserves_rejected_aliases() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const ALSO_A: E = 0;
+
+            pub unsafe extern "C" fn f() -> E {
+                A
+            }
+            "#,
+    );
+
+    assert!(code.contains("type E ="));
+    assert!(code.contains("pub const A"));
+    assert!(code.contains("pub const ALSO_A"));
+    assert!(!code.contains("enum E"));
+}
+
+#[test]
+fn transform_exports_variants_inside_module() {
+    let mut code = transform(
+        r#"
+            pub mod m {
+                pub type E = core::ffi::c_uint;
+                pub const A: E = 0;
+                pub const B: E = 1;
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub enum E"));
+    assert!(code.contains("pub use E::A;"));
+    assert!(code.contains("pub use E::B;"));
+    code.push_str(
+        r#"
+            pub fn use_exported_variants() {
+                let _ = m::E::A;
+                let _ = m::A;
+            }
+            "#,
+    );
+    utils::compilation::run_compiler_on_str(&code, utils::type_check).unwrap();
+}
+
+#[test]
+fn transform_preserves_visibility() {
+    let code = transform_and_compile(
+        r#"
+            type Private = core::ffi::c_uint;
+            const PRIVATE_A: Private = 0;
+
+            pub(crate) type CrateVisible = core::ffi::c_uint;
+            pub(crate) const CRATE_A: CrateVisible = 0;
+
+            pub type Public = core::ffi::c_uint;
+            pub const PUBLIC_A: Public = 0;
+            "#,
+    );
+
+    assert!(code.contains("enum Private"));
+    assert!(code.contains("use Private::PRIVATE_A;"));
+    assert!(code.contains("pub(crate) enum CrateVisible"));
+    assert!(code.contains("pub(crate) use CrateVisible::CRATE_A;"));
+    assert!(code.contains("pub enum Public"));
+    assert!(code.contains("pub use Public::PUBLIC_A;"));
+}
+
+#[test]
+fn transform_alias_through_pointer_compiles() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub type EP = *mut E;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(p: EP) -> E {
+                *p = B;
+                *p
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub enum E"));
+    assert!(code.contains("pub type EP = *mut E;"));
 }
