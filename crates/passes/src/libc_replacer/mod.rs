@@ -1,12 +1,13 @@
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
+    visit::{self, Visitor},
     *,
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{TyCtxt, TyKind};
 use thin_vec::ThinVec;
 use utils::{ast::unwrap_paren, expr};
 
@@ -14,6 +15,7 @@ use crate::libc_replacer::errno::ErrorCode;
 
 mod errno;
 mod mem_utils;
+mod stdio_string;
 mod str_utils;
 mod strto;
 #[cfg(test)]
@@ -49,8 +51,10 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
         errno_calls,
         source_nums,
         lib_items: FxHashSet::default(),
+        parsing_fns: FxHashMap::default(),
         bytemuck: false,
         num_traits: false,
+        current_fn_has_raw_deref: false,
     };
     visitor.visit_crate(&mut krate);
 
@@ -69,19 +73,28 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
             .filter_map(|item| {
                 if let ItemKind::Fn(f) = &item.kind {
                     Some(f.ident.name.as_str().to_string())
+                } else if let ItemKind::Struct(ident, ..) = &item.kind {
+                    Some(ident.name.as_str().to_string())
                 } else {
                     None
                 }
             })
             .collect();
+        for (name, code) in visitor.parsing_fns {
+            if !items.contains(name.as_str()) {
+                push_c_lib_items(lib_items, &code);
+            }
+        }
         for item in visitor.lib_items {
             if !items.contains(item.as_str()) {
-                let item = utils::item!("{}", item.get_impl());
-                lib_items.push(P(item));
+                push_c_lib_items(lib_items, item.get_impl());
             }
         }
     } else {
         let mut code = "mod c_lib {".to_string();
+        for (_, item) in visitor.parsing_fns {
+            code.push_str(&item);
+        }
         for item in visitor.lib_items {
             code.push_str(item.get_impl());
         }
@@ -97,14 +110,24 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
     }
 }
 
+fn push_c_lib_items(items: &mut ThinVec<P<Item>>, code: &str) {
+    let item = utils::item!("mod __crat_tmp {{ {code} }}");
+    let ItemKind::Mod(_, _, ModKind::Loaded(mut new_items, _, _, _)) = item.kind else {
+        unreachable!()
+    };
+    items.append(&mut new_items);
+}
+
 struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: utils::ir::AstToHir,
     errno_calls: errno::ErrnoCalls,
     source_nums: FxHashMap<HirId, usize>,
     lib_items: FxHashSet<LibItem>,
+    parsing_fns: FxHashMap<String, String>,
     bytemuck: bool,
     num_traits: bool,
+    current_fn_has_raw_deref: bool,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -130,6 +153,13 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 
     fn visit_item(&mut self, item: &mut Item) {
+        let old_current_fn_has_raw_deref = self.current_fn_has_raw_deref;
+        if let ItemKind::Fn(f) = &item.kind
+            && let Some(body) = &f.body
+        {
+            self.current_fn_has_raw_deref = fn_body_has_raw_deref(body, &self.ast_to_hir, self.tcx);
+        }
+
         mut_visit::walk_item(self, item);
 
         if let ItemKind::Fn(f) = &mut item.kind
@@ -149,6 +179,8 @@ impl MutVisitor for TransformVisitor<'_> {
             stmts.append(&mut body.stmts);
             body.stmts = stmts;
         }
+
+        self.current_fn_has_raw_deref = old_current_fn_has_raw_deref;
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
@@ -223,7 +255,22 @@ impl MutVisitor for TransformVisitor<'_> {
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.exp()");
                 }
+                "sin" | "sinf" | "sinl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.sin()");
+                }
+                "cos" | "cosf" | "cosl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.cos()");
+                }
                 "fabs" | "fabsf" | "fabsl" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = expr_to_parenthesized_string(arg);
+                    *expr = expr!("{arg}.abs()");
+                }
+                "abs" | "labs" | "llabs" => {
                     let [arg] = args.as_slice() else { panic!() };
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.abs()");
@@ -245,10 +292,22 @@ impl MutVisitor for TransformVisitor<'_> {
                     let arg2 = pprust::expr_to_string(arg2);
                     *expr = expr!("{arg1}.powf({arg2})");
                 }
+                "atan2" | "atan2f" | "atan2l" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    let arg1 = expr_to_parenthesized_string(arg1);
+                    let arg2 = pprust::expr_to_string(arg2);
+                    *expr = expr!("{arg1}.atan2({arg2})");
+                }
                 "sqrt" | "sqrtf" | "sqrtl" => {
                     let [arg] = args.as_slice() else { panic!() };
                     let arg = expr_to_parenthesized_string(arg);
                     *expr = expr!("{arg}.sqrt()");
+                }
+                "difftime" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    let arg1 = expr_to_parenthesized_string(arg1);
+                    let arg2 = expr_to_parenthesized_string(arg2);
+                    *expr = expr!("({arg1} as f64 - {arg2} as f64)");
                 }
                 "div" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };
@@ -264,6 +323,17 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
                 "abort" => {
                     *expr = expr!("std::process::abort()");
+                }
+                "exit" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    let arg = pprust::expr_to_string(arg);
+                    *expr = expr!("std::process::exit(({arg}) as i32)");
+                }
+                "time" => {
+                    let [arg] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_time(expr.id, arg) {
+                        *expr = e;
+                    }
                 }
                 "strtod" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };
@@ -304,6 +374,24 @@ impl MutVisitor for TransformVisitor<'_> {
                     let [arg] = args.as_slice() else { panic!() };
                     *expr = self.transform_strlen(arg);
                 }
+                "strcmp" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcmp(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strncmp" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strncmp(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "strcpy" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcpy(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
                 "strncpy" => {
                     if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                         && let rustc_hir::Node::Stmt(stmt) =
@@ -315,15 +403,85 @@ impl MutVisitor for TransformVisitor<'_> {
                         *expr = e;
                     }
                 }
+                "strcat" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strcat(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strncat" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strncat(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "strchr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strchr(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strrchr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strrchr(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
+                "strstr" => {
+                    let [arg1, arg2] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_strstr(arg1, arg2) {
+                        *expr = e;
+                    }
+                }
                 "strcspn" => {
                     let [arg1, arg2] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_strcspn(arg1, arg2) {
                         *expr = e;
                     }
                 }
+                "sprintf" => {
+                    if args.len() >= 2
+                        && let Some(e) = self.transform_sprintf(&args[0], &args[1], &args[2..])
+                    {
+                        *expr = e;
+                    }
+                }
+                "snprintf" => {
+                    if args.len() >= 3
+                        && let Some(e) =
+                            self.transform_snprintf(&args[0], &args[1], &args[2], &args[3..])
+                    {
+                        *expr = e;
+                    }
+                }
+                "sscanf" => {
+                    if args.len() >= 2
+                        && let Some(e) = self.transform_sscanf(&args[0], &args[1], &args[2..])
+                    {
+                        *expr = e;
+                    }
+                }
                 "memcpy" => {
                     let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
                     if let Some(e) = self.transform_memcpy(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memmove" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memmove(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memcmp" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memcmp(arg1, arg2, arg3) {
+                        *expr = e;
+                    }
+                }
+                "memchr" => {
+                    let [arg1, arg2, arg3] = args.as_slice() else { panic!() };
+                    if let Some(e) = self.transform_memchr(arg1, arg2, arg3) {
                         *expr = e;
                     }
                 }
@@ -404,6 +562,73 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 }
 
+fn fn_body_has_raw_deref(body: &Block, ast_to_hir: &utils::ir::AstToHir, tcx: TyCtxt<'_>) -> bool {
+    struct Finder<'a, 'tcx> {
+        ast_to_hir: &'a utils::ir::AstToHir,
+        tcx: TyCtxt<'tcx>,
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Finder<'_, '_> {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let ExprKind::Unary(UnOp::Deref, inner) = &expr.kind
+                && let Some(hir_expr) = self.ast_to_hir.get_expr(inner.id, self.tcx)
+            {
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                if matches!(typeck.expr_ty(hir_expr).kind(), TyKind::RawPtr(..)) {
+                    self.found = true;
+                    return;
+                }
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = Finder {
+        ast_to_hir,
+        tcx,
+        found: false,
+    };
+    finder.visit_block(body);
+    finder.found
+}
+
+impl TransformVisitor<'_> {
+    fn transform_time(&self, call_id: NodeId, timer: &Expr) -> Option<Expr> {
+        let hir_expr = self.ast_to_hir.get_expr(call_id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let ty = utils::ir::mir_ty_to_string(typeck.expr_ty(hir_expr), self.tcx);
+        let current_time = format!(
+            "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as {ty}"
+        );
+
+        match &utils::ast::unwrap_cast_and_paren(timer).kind {
+            ExprKind::Call(func, args) if args.is_empty() => {
+                if let ExprKind::Path(_, path) = &func.kind
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| seg.ident.as_str() == "null_mut")
+                {
+                    Some(expr!("{current_time}"))
+                } else {
+                    None
+                }
+            }
+            ExprKind::AddrOf(BorrowKind::Raw | BorrowKind::Ref, Mutability::Mut, place) => {
+                let place = pprust::expr_to_string(place);
+                Some(expr!(
+                    "{{ let ___time = {current_time}; {place} = ___time; ___time }}"
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn expr_to_parenthesized_string(expr: &Expr) -> String {
     let s = pprust::expr_to_string(expr);
     if need_paren(expr) {
@@ -448,8 +673,26 @@ enum LibItem {
     Atof,
     Atoi,
     Peek,
+    IsEof,
+    ParseDecimal,
+    ParseF64,
     ParseFloat,
     ParseInteger,
+    Xu8,
+    Xu16,
+    Xu32,
+    Xu64,
+    Gf64,
+    Strcmp,
+    Strncmp,
+    Strcpy,
+    Strcat,
+    Strncat,
+    Strchr,
+    Strrchr,
+    Strstr,
+    Memcmp,
+    Memchr,
 }
 
 impl LibItem {
@@ -461,8 +704,26 @@ impl LibItem {
             LibItem::Atof => "atof",
             LibItem::Atoi => "atoi",
             LibItem::Peek => "peek",
+            LibItem::IsEof => "is_eof",
+            LibItem::ParseDecimal => "parse_decimal",
+            LibItem::ParseF64 => "parse_f64",
             LibItem::ParseFloat => "parse_float",
             LibItem::ParseInteger => "parse_integer",
+            LibItem::Xu8 => "Xu8",
+            LibItem::Xu16 => "Xu16",
+            LibItem::Xu32 => "Xu32",
+            LibItem::Xu64 => "Xu64",
+            LibItem::Gf64 => "Gf64",
+            LibItem::Strcmp => "strcmp",
+            LibItem::Strncmp => "strncmp",
+            LibItem::Strcpy => "strcpy",
+            LibItem::Strcat => "strcat",
+            LibItem::Strncat => "strncat",
+            LibItem::Strchr => "strchr",
+            LibItem::Strrchr => "strrchr",
+            LibItem::Strstr => "strstr",
+            LibItem::Memcmp => "memcmp",
+            LibItem::Memchr => "memchr",
         }
     }
 
@@ -474,8 +735,26 @@ impl LibItem {
             LibItem::Atof => strto::ATOF,
             LibItem::Atoi => strto::ATOI,
             LibItem::Peek => utils::c_lib::PEEK,
+            LibItem::IsEof => utils::c_lib::IS_EOF,
+            LibItem::ParseDecimal => utils::c_lib::PARSE_DECIMAL,
+            LibItem::ParseF64 => utils::c_lib::PARSE_F64,
             LibItem::ParseFloat => utils::c_lib::PARSE_FLOAT,
             LibItem::ParseInteger => utils::c_lib::PARSE_INTEGER,
+            LibItem::Xu8 => utils::c_lib::XU8,
+            LibItem::Xu16 => utils::c_lib::XU16,
+            LibItem::Xu32 => utils::c_lib::XU32,
+            LibItem::Xu64 => utils::c_lib::XU64,
+            LibItem::Gf64 => utils::c_lib::GF64,
+            LibItem::Strcmp => str_utils::STRCMP,
+            LibItem::Strncmp => str_utils::STRNCMP,
+            LibItem::Strcpy => str_utils::STRCPY,
+            LibItem::Strcat => str_utils::STRCAT,
+            LibItem::Strncat => str_utils::STRNCAT,
+            LibItem::Strchr => str_utils::STRCHR,
+            LibItem::Strrchr => str_utils::STRRCHR,
+            LibItem::Strstr => str_utils::STRSTR,
+            LibItem::Memcmp => mem_utils::MEMCMP,
+            LibItem::Memchr => mem_utils::MEMCHR,
         }
     }
 }

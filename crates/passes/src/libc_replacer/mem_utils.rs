@@ -1,40 +1,103 @@
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
 use rustc_hir::def_id::LocalDefId;
+use rustc_middle::ty;
 use rustc_span::{Symbol, sym};
 use utils::ast::unwrap_cast_and_paren;
 
+use crate::libc_replacer::LibItem;
+
 impl<'tcx> super::TransformVisitor<'tcx> {
     pub fn transform_memcpy(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
-        let (array1, ty1) = utils::ir::array_of_as_ptr(s1, &self.ast_to_hir, self.tcx)?;
-        let (array2, ty2) = utils::ir::array_of_as_ptr(s2, &self.ast_to_hir, self.tcx)?;
+        let ptr1 = self.array_of_ptr_or_offset(s1)?;
+        let ptr2 = self.array_of_ptr_or_offset(s2)?;
         let hir_n = self.ast_to_hir.get_expr(n.id, self.tcx)?;
-        if ty1 == ty2
-            && let Some(len_expr) = self.get_len_from_size(n, ty1, hir_n.hir_id.owner.def_id)
+        if ptr1.ty == ptr2.ty
+            && let Some(len_expr) = self.get_len_from_size(n, ptr1.ty, hir_n.hir_id.owner.def_id)
+        {
+            if self.current_fn_has_raw_deref && (!ptr1.is_plain() || !ptr2.is_plain()) {
+                return None;
+            }
+            let array1 = ptr1.slice(true);
+            let array2 = ptr2.slice(false);
+            let len = pprust::expr_to_string(&len_expr);
+            if ptr1.same_array(&ptr2) {
+                Some(utils::expr!(
+                    "{{ let ___tmp = ({array2})[..({len}) as usize].to_vec(); ({array1})[..({len}) as usize].copy_from_slice(&___tmp); }}"
+                ))
+            } else {
+                Some(utils::expr!(
+                    "({array1})[..({len}) as usize].copy_from_slice(&({array2})[..({len}) as usize])"
+                ))
+            }
+        } else if is_numeric_or_numeric_array(ptr1.ty) && is_numeric_or_numeric_array(ptr2.ty) {
+            if self.current_fn_has_raw_deref
+                && (!ptr1.is_plain()
+                    || !ptr2.is_plain()
+                    || !ptr1.ty.is_numeric()
+                    || !ptr2.ty.is_numeric())
+            {
+                return None;
+            }
+            self.bytemuck = true;
+            let array1 = if ptr1.ty == self.tcx.types.u8 {
+                ptr1.slice(true)
+            } else {
+                ptr1.byte_slice(true)
+            };
+            let array2 = if ptr2.ty == self.tcx.types.u8 {
+                ptr2.slice(false)
+            } else {
+                ptr2.byte_slice(false)
+            };
+            let n = pprust::expr_to_string(n);
+            if ptr1.same_array(&ptr2) {
+                Some(utils::expr!(
+                    "{{ let ___tmp = ({array2})[..({n}) as usize].to_vec(); ({array1})[..({n}) as usize].copy_from_slice(&___tmp); }}"
+                ))
+            } else {
+                Some(utils::expr!(
+                    "({array1})[..({n}) as usize].copy_from_slice(&({array2})[..({n}) as usize])",
+                ))
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn transform_memmove(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
+        if self.current_fn_has_raw_deref {
+            return None;
+        }
+
+        let ptr1 = self.array_of_ptr_or_offset(s1)?;
+        let ptr2 = self.array_of_ptr_or_offset(s2)?;
+        let hir_n = self.ast_to_hir.get_expr(n.id, self.tcx)?;
+        if ptr1.ty == ptr2.ty
+            && ptr1.ty.is_numeric()
+            && let Some(len_expr) = self.get_len_from_size(n, ptr1.ty, hir_n.hir_id.owner.def_id)
         {
             Some(utils::expr!(
-                "((&mut ({0}))[..({2}) as usize]).copy_from_slice(&(&({1}))[..({2}) as usize])",
-                pprust::expr_to_string(array1),
-                pprust::expr_to_string(array2),
+                "{{ let ___tmp = ({0})[..({2}) as usize].to_vec(); ({1})[..({2}) as usize].copy_from_slice(&___tmp); }}",
+                ptr2.slice(false),
+                ptr1.slice(true),
                 pprust::expr_to_string(&len_expr)
             ))
-        } else if ty1.is_numeric() && ty2.is_numeric() {
+        } else if is_numeric_or_numeric_array(ptr1.ty) && is_numeric_or_numeric_array(ptr2.ty) {
             self.bytemuck = true;
-            let array1 = pprust::expr_to_string(array1);
-            let array1 = if ty1 == self.tcx.types.u8 {
-                format!("(&mut ({array1}))")
+            let array1 = if ptr1.ty == self.tcx.types.u8 {
+                ptr1.slice(true)
             } else {
-                format!("bytemuck::cast_slice_mut::<_, u8>(&mut ({array1}))")
+                ptr1.byte_slice(true)
             };
-            let array2 = pprust::expr_to_string(array2);
-            let array2 = if ty2 == self.tcx.types.u8 {
-                format!("(&({array2}))")
+            let array2 = if ptr2.ty == self.tcx.types.u8 {
+                ptr2.slice(false)
             } else {
-                format!("bytemuck::cast_slice(&({array2}))")
+                ptr2.byte_slice(false)
             };
             let n = pprust::expr_to_string(n);
             Some(utils::expr!(
-                "{array1}[..({n}) as usize].copy_from_slice(&{array2}[..({n}) as usize])",
+                "{{ let ___tmp = ({array2})[..({n}) as usize].to_vec(); ({array1})[..({n}) as usize].copy_from_slice(&___tmp); }}"
             ))
         } else {
             None
@@ -42,22 +105,47 @@ impl<'tcx> super::TransformVisitor<'tcx> {
     }
 
     pub fn transform_memset(&mut self, s: &Expr, c: &Expr, n: &Expr) -> Option<Expr> {
-        let (array, ty) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx)?;
-        let array = pprust::expr_to_string(array);
+        let ptr = self.array_of_ptr_or_offset(s)?;
+        if self.current_fn_has_raw_deref
+            && (!ptr.is_plain() || (!ptr.ty.is_numeric() && !is_i8_or_u8(ptr.ty, self.tcx)))
+        {
+            return None;
+        }
         let c = pprust::expr_to_string(c);
         let n = pprust::expr_to_string(n);
-        if ty == self.tcx.types.u8 || ty == self.tcx.types.i8 {
+        if ptr.ty == self.tcx.types.u8 || ptr.ty == self.tcx.types.i8 {
+            let array = ptr.slice(true);
             Some(utils::expr!(
-                "(&mut ({array}))[..({n}) as usize].fill(({c}) as {ty})"
+                "{array}[..({n}) as usize].fill(({c}) as {0})",
+                ptr.ty
             ))
-        } else if ty.is_numeric() {
+        } else if is_numeric_or_numeric_array(ptr.ty) {
             self.bytemuck = true;
-            Some(utils::expr!(
-                "bytemuck::cast_slice_mut::<_, u8>(&mut ({array}))[..({n}) as usize].fill(({c}) as u8)"
-            ))
+            let array = ptr.byte_slice(true);
+            Some(utils::expr!("{array}[..({n}) as usize].fill(({c}) as u8)"))
         } else {
             None
         }
+    }
+
+    pub fn transform_memcmp(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
+        let s1 = self.c_byte_slice(s1)?;
+        let s2 = self.c_byte_slice(s2)?;
+        let n = pprust::expr_to_string(n);
+        self.lib_items.insert(LibItem::Memcmp);
+        Some(utils::expr!(
+            "crate::c_lib::memcmp({s1}, {s2}, ({n}) as usize)"
+        ))
+    }
+
+    pub fn transform_memchr(&mut self, s: &Expr, c: &Expr, n: &Expr) -> Option<Expr> {
+        let s = self.c_byte_slice(s)?;
+        let c = pprust::expr_to_string(c);
+        let n = pprust::expr_to_string(n);
+        self.lib_items.insert(LibItem::Memchr);
+        Some(utils::expr!(
+            "crate::c_lib::memchr({s}, ({c}) as u8, ({n}) as usize)"
+        ))
     }
 
     fn get_len_from_size(
@@ -99,7 +187,106 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         }
         None
     }
+
+    fn array_of_ptr_or_offset<'e>(&self, expr: &'e Expr) -> Option<ArrayPtr<'e, 'tcx>> {
+        if let Some((array, ty)) = utils::ir::array_of_as_ptr(expr, &self.ast_to_hir, self.tcx) {
+            return Some(ArrayPtr {
+                array,
+                ty,
+                offset: None,
+            });
+        }
+
+        if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind
+            && call.seg.ident.name == sym::offset
+            && call.args.len() == 1
+            && let Some((array, ty)) =
+                utils::ir::array_of_as_ptr(&call.receiver, &self.ast_to_hir, self.tcx)
+        {
+            Some(ArrayPtr {
+                array,
+                ty,
+                offset: Some(&call.args[0]),
+            })
+        } else {
+            None
+        }
+    }
 }
+
+struct ArrayPtr<'e, 'tcx> {
+    array: &'e Expr,
+    ty: ty::Ty<'tcx>,
+    offset: Option<&'e Expr>,
+}
+
+impl ArrayPtr<'_, '_> {
+    fn slice(&self, mutable: bool) -> String {
+        let array = pprust::expr_to_string(self.array);
+        let borrow = if mutable { "&mut" } else { "&" };
+        if let Some(offset) = self.offset {
+            let offset = pprust::expr_to_string(offset);
+            format!("({borrow} ({array}))[({offset}) as usize..]")
+        } else {
+            format!("({borrow} ({array}))")
+        }
+    }
+
+    fn byte_slice(&self, mutable: bool) -> String {
+        let slice = self.slice(mutable);
+        let cast = if mutable {
+            "bytemuck::cast_slice_mut::<_, u8>"
+        } else {
+            "bytemuck::cast_slice::<_, u8>"
+        };
+        format!("{cast}({slice})")
+    }
+
+    fn same_array(&self, other: &Self) -> bool {
+        pprust::expr_to_string(self.array) == pprust::expr_to_string(other.array)
+    }
+
+    fn is_plain(&self) -> bool {
+        self.offset.is_none()
+    }
+}
+
+fn is_numeric_or_numeric_array(ty: ty::Ty<'_>) -> bool {
+    if ty.is_numeric() {
+        return true;
+    }
+    if let ty::TyKind::Array(elem, _) = ty.kind() {
+        is_numeric_or_numeric_array(*elem)
+    } else {
+        false
+    }
+}
+
+fn is_i8_or_u8<'tcx>(ty: ty::Ty<'tcx>, tcx: ty::TyCtxt<'tcx>) -> bool {
+    ty == tcx.types.i8 || ty == tcx.types.u8
+}
+
+pub const MEMCMP: &str = r#"
+pub fn memcmp(s1: &[u8], s2: &[u8], n: usize) -> i32 {
+    for i in 0..n {
+        let c1 = s1[i];
+        let c2 = s2[i];
+        if c1 != c2 {
+            return c1 as i32 - c2 as i32;
+        }
+    }
+    0
+}
+"#;
+
+pub const MEMCHR: &str = r#"
+pub fn memchr(s: &[u8], c: u8, n: usize) -> *mut std::ffi::c_void {
+    s[..n]
+        .iter()
+        .position(|&x| x == c)
+        .map_or(std::ptr::null_mut(), |i| s[i..].as_ptr() as *mut std::ffi::c_void)
+}
+"#;
 
 fn get_fn_name_from_expr(expr: &Expr) -> Option<Symbol> {
     if let ExprKind::Path(_, path) = &expr.kind
