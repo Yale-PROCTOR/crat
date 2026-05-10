@@ -4,6 +4,7 @@ mod lattice;
 mod liveness;
 mod mir;
 pub mod mir_variable_grouping;
+pub mod nullity;
 pub mod offset_sign;
 pub(crate) mod output_params;
 pub mod ownership;
