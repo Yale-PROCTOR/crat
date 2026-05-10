@@ -101,6 +101,16 @@ impl MutVisitor for TransformVisitor<'_> {
                     .zip(&mut fn_item.sig.decl.inputs)
                 {
                     match input_dec {
+                        Some(PtrKind::Ref(m)) => {
+                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
+                                        ty = local_decl.ty
+                                    )
+                                });
+                            *param.ty = mk_ref_ty(inner_ty, *m, self.tcx);
+                        }
                         Some(PtrKind::OptRef(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
                                 .unwrap_or_else(|| {
@@ -110,6 +120,16 @@ impl MutVisitor for TransformVisitor<'_> {
                                     )
                                 });
                             *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
+                        }
+                        Some(PtrKind::Box) => {
+                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
+                                        ty = local_decl.ty
+                                    )
+                                });
+                            *param.ty = mk_box_ty(inner_ty, self.tcx);
                         }
                         Some(PtrKind::OptBox) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -152,6 +172,16 @@ impl MutVisitor for TransformVisitor<'_> {
                             *param.ty = mk_cursor_ty(inner_ty, *m, self.tcx);
                             self.slice_cursor.set(true);
                         }
+                        Some(PtrKind::BoxedSlice) => {
+                            let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Expected pointer type, got {ty:?} in {local_decl:?}",
+                                        ty = local_decl.ty
+                                    )
+                                });
+                            *param.ty = mk_boxed_slice_ty(inner_ty, self.tcx);
+                        }
                         Some(PtrKind::OptBoxedSlice) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
                                 .unwrap_or_else(|| {
@@ -177,7 +207,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) else {
                         return output_dec;
                     };
-                    if matches!(output_dec, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+                    if output_dec.is_owning_box_like()
                         && fn_tail_returns_unsupported_box_binding(
                             self.tcx,
                             &self.sig_decs,
@@ -199,9 +229,12 @@ impl MutVisitor for TransformVisitor<'_> {
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
                         *ret_ty = P(match output_dec {
+                            PtrKind::Ref(m) => mk_ref_ty(inner_ty, m, self.tcx),
                             PtrKind::OptRef(m) => mk_opt_ref_ty(inner_ty, m, self.tcx),
+                            PtrKind::Box => mk_box_ty(inner_ty, self.tcx),
                             PtrKind::OptBox => mk_opt_box_ty(inner_ty, self.tcx),
                             PtrKind::Raw(m) => mk_raw_ptr_ty(inner_ty, m, self.tcx),
+                            PtrKind::BoxedSlice => mk_boxed_slice_ty(inner_ty, self.tcx),
                             PtrKind::OptBoxedSlice => mk_opt_boxed_slice_ty(inner_ty, self.tcx),
                             PtrKind::Slice(m) => mk_slice_ty(inner_ty, m, self.tcx),
                             PtrKind::SliceCursor(m) => {
@@ -299,13 +332,13 @@ impl MutVisitor for TransformVisitor<'_> {
             {
                 lhs_kind = PtrKind::Raw(lhs_mutability.is_mut());
             }
-            if matches!(lhs_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+            if lhs_kind.is_owning_box_like()
                 && let Some(init) = let_stmt.init
                 && !self.rhs_supports_box_target(init, lhs_kind, lhs_inner_ty)
             {
                 lhs_kind = PtrKind::Raw(true);
             }
-            if matches!(lhs_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+            if lhs_kind.is_owning_box_like()
                 && self.fn_has_unsupported_box_assignment(hir_id, lhs_kind, lhs_inner_ty)
             {
                 lhs_kind = PtrKind::Raw(true);
@@ -316,11 +349,20 @@ impl MutVisitor for TransformVisitor<'_> {
             }
 
             match lhs_kind {
+                PtrKind::Ref(m) => {
+                    local.ty = Some(P(mk_ref_ty(lhs_inner_ty, m, self.tcx)));
+                }
                 PtrKind::OptRef(m) => {
                     local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
                 }
+                PtrKind::Box => {
+                    local.ty = Some(P(mk_box_ty(lhs_inner_ty, self.tcx)));
+                }
                 PtrKind::OptBox => {
                     local.ty = Some(P(mk_opt_box_ty(lhs_inner_ty, self.tcx)));
+                }
+                PtrKind::BoxedSlice => {
+                    local.ty = Some(P(mk_boxed_slice_ty(lhs_inner_ty, self.tcx)));
                 }
                 PtrKind::OptBoxedSlice => {
                     local.ty = Some(P(mk_opt_boxed_slice_ty(lhs_inner_ty, self.tcx)));
@@ -388,11 +430,11 @@ impl MutVisitor for TransformVisitor<'_> {
                 ) {
                     lhs_kind = PtrKind::Raw(m.is_mut());
                 }
-                if matches!(lhs_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+                if lhs_kind.is_owning_box_like()
                     && !self.rhs_supports_box_target(hir_rhs, lhs_kind, lhs_inner_ty)
                 {
                     lhs_kind = PtrKind::Raw(true);
-                } else if matches!(lhs_kind, PtrKind::OptBox) {
+                } else if matches!(lhs_kind, PtrKind::Box | PtrKind::OptBox) {
                     if hir_is_unsupported_scalar_box_allocator_root(self.tcx, lhs_inner_ty, hir_rhs)
                     {
                         lhs_kind = PtrKind::Raw(true);
@@ -450,8 +492,11 @@ impl MutVisitor for TransformVisitor<'_> {
                         }
                     }
                     PtrKind::Slice(_)
+                    | PtrKind::Ref(_)
                     | PtrKind::OptRef(_)
+                    | PtrKind::Box
                     | PtrKind::OptBox
+                    | PtrKind::BoxedSlice
                     | PtrKind::OptBoxedSlice
                     | PtrKind::Raw(_) => {
                         if let Some(lhs_hir_id) = lhs_hir_id
@@ -541,6 +586,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     && let Some(ptr_kind) = self.effective_ptr_kind(hir_id)
                 {
                     match ptr_kind {
+                        PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice => {
+                            *expr = utils::expr!("false");
+                        }
                         PtrKind::OptRef(_) => {
                             seg.ident.name = Symbol::intern("is_none");
                         }
@@ -660,6 +708,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
+                            PtrKind::Ref(_) | PtrKind::Box => {}
                             PtrKind::OptRef(_) => {
                                 **e = utils::expr!("{}.unwrap()", pprust::expr_to_string(e));
                             }
@@ -676,6 +725,9 @@ impl MutVisitor for TransformVisitor<'_> {
                                     pprust::expr_to_string(e),
                                     if m { "_mut" } else { "" },
                                 );
+                            }
+                            PtrKind::BoxedSlice => {
+                                *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
                             }
                             PtrKind::Slice(_) => {
                                 *expr = utils::expr!("({})[0]", pprust::expr_to_string(e));
@@ -882,8 +934,16 @@ impl<'tcx> TransformVisitor<'tcx> {
             && pe.projs.is_empty()
         {
             match self.ptr_source_kind(&pe) {
+                Some(PtrKind::Box) => {
+                    *rhs = self.raw_from_box_return(pe.base, m, lhs_inner_ty, rhs_inner_ty);
+                    return;
+                }
                 Some(PtrKind::OptBox) => {
                     *rhs = self.raw_from_opt_box_return(pe.base, m, lhs_inner_ty, rhs_inner_ty);
+                    return;
+                }
+                Some(PtrKind::BoxedSlice) => {
+                    *rhs = self.raw_from_boxed_slice_return(pe.base, m, lhs_inner_ty, rhs_inner_ty);
                     return;
                 }
                 Some(PtrKind::OptBoxedSlice) => {
@@ -911,11 +971,19 @@ impl<'tcx> TransformVisitor<'tcx> {
         if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
             && matches!(
                 self.effective_ptr_kind(hir_id),
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
+                Some(PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
             )
         {
             let local_name = self.tcx.hir_name(hir_id).to_string();
-            return Some(utils::expr!("drop(({local_name}).take())"));
+            return match self.effective_ptr_kind(hir_id) {
+                Some(PtrKind::Box | PtrKind::BoxedSlice) => {
+                    Some(utils::expr!("drop({local_name})"))
+                }
+                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                    Some(utils::expr!("drop(({local_name}).take())"))
+                }
+                _ => None,
+            };
         }
         let info = self.raw_bridge_bindings.get(&hir_id)?;
         let [arg] = args else { return None };
@@ -974,12 +1042,12 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
 
         match target_kind {
-            PtrKind::OptBox => {
+            PtrKind::Box | PtrKind::OptBox => {
                 if hir_supports_scalar_box_allocator_root(self.tcx, lhs_inner_ty, hir_uncast) {
                     return true;
                 }
             }
-            PtrKind::OptBoxedSlice => {
+            PtrKind::BoxedSlice | PtrKind::OptBoxedSlice => {
                 if hir_is_supported_boxed_slice_allocator_root(self.tcx, hir_uncast) {
                     return true;
                 }
@@ -987,13 +1055,17 @@ impl<'tcx> TransformVisitor<'tcx> {
             _ => return true,
         }
 
-        if self.forced_local_callee_output_kind(hir_expr) == Some(target_kind) {
+        let callee_output = self.forced_local_callee_output_kind(hir_expr);
+        if callee_output == Some(target_kind)
+            || callee_output == Some(target_kind.optional_variant())
+        {
             return true;
         }
 
         if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind
             && let Res::Local(hir_id) = path.res
-            && self.effective_ptr_kind(hir_id) == Some(target_kind)
+            && let Some(rhs_kind) = self.effective_ptr_kind(hir_id)
+            && (rhs_kind == target_kind || rhs_kind == target_kind.optional_variant())
         {
             return true;
         }
@@ -1102,6 +1174,13 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         if is_null_ptr_constructor(&allocator_root_expr) {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                    *ptr = utils::expr!("panic!()");
+                    return match ctx {
+                        PtrCtx::Rhs(kind) => kind,
+                        PtrCtx::Deref(_) => unreachable!(),
+                    };
+                }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     self.slice_cursor.set(true);
                     *ptr = if m {
@@ -1139,6 +1218,13 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         }
 
+        if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice)) = ctx {
+            debug_assert!(!kind.is_optional());
+            self.transform_ptr(ptr, hir_ptr, PtrCtx::Rhs(kind.optional_variant()));
+            *ptr = utils::expr!("({}).unwrap()", pprust::expr_to_string(ptr));
+            return kind;
+        }
+
         if let PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) = ctx {
             let lhs_ty = self
                 .tcx
@@ -1167,6 +1253,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             let lhs_inner_ty =
                 unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or(rhs_inner_ty);
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                    unreachable!("non-optional pointer targets are handled before raw fallback")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
                     if lhs_ty != rhs_ty {
                         *ptr = utils::expr!(
@@ -1216,6 +1305,13 @@ impl<'tcx> TransformVisitor<'tcx> {
         if pe.is_zero() {
             // rhs_ty will be `usize`, not a pointer, so we early return here
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                    *ptr = utils::expr!("panic!()");
+                    return match ctx {
+                        PtrCtx::Rhs(kind) => kind,
+                        PtrCtx::Deref(_) => unreachable!(),
+                    };
+                }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     self.slice_cursor.set(true);
                     *ptr = if m {
@@ -1257,6 +1353,9 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         if pe.cast_int {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                    unreachable!("non-optional pointer targets are handled before casts")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     let mut base = pe.base.clone();
                     // Rewrite inner pointer before integer casting
@@ -1295,8 +1394,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                 matches!(
                     self.effective_ptr_kind(hir_id),
                     Some(
-                        PtrKind::OptRef(_)
+                        PtrKind::Ref(_)
+                            | PtrKind::OptRef(_)
+                            | PtrKind::Box
                             | PtrKind::OptBox
+                            | PtrKind::BoxedSlice
                             | PtrKind::OptBoxedSlice
                             | PtrKind::Slice(_)
                             | PtrKind::SliceCursor(_)
@@ -1316,12 +1418,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                 )
             }) {
                 let m = match ctx {
+                    PtrCtx::Rhs(PtrKind::Ref(m)) => m,
                     PtrCtx::Rhs(PtrKind::Raw(m))
                     | PtrCtx::Rhs(PtrKind::OptRef(m))
                     | PtrCtx::Rhs(PtrKind::Slice(m))
                     | PtrCtx::Rhs(PtrKind::SliceCursor(m))
                     | PtrCtx::Deref(m) => m,
-                    PtrCtx::Rhs(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                    PtrCtx::Rhs(
+                        PtrKind::Box
+                        | PtrKind::OptBox
+                        | PtrKind::BoxedSlice
+                        | PtrKind::OptBoxedSlice,
+                    ) => {
                         panic!("unsupported M4A box target for addr_of arithmetic")
                     }
                 };
@@ -1360,6 +1468,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 // Final wrapping depends on the target context
                 match ctx {
+                    PtrCtx::Rhs(PtrKind::Ref(_)) => {
+                        unreachable!("non-optional pointer targets are handled before addr_of")
+                    }
                     PtrCtx::Deref(m) | PtrCtx::Rhs(PtrKind::Slice(m)) => {
                         // slice to slice
                         *ptr = self.plain_slice_from_slice(
@@ -1406,12 +1517,20 @@ impl<'tcx> TransformVisitor<'tcx> {
                         );
                         return PtrKind::Raw(m);
                     }
-                    PtrCtx::Rhs(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                    PtrCtx::Rhs(
+                        PtrKind::Box
+                        | PtrKind::OptBox
+                        | PtrKind::BoxedSlice
+                        | PtrKind::OptBoxedSlice,
+                    ) => {
                         panic!("unsupported M4A box target for addr_of slice wrapping")
                     }
                 }
             }
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_)) => {
+                    unreachable!("non-optional pointer targets are handled before addr_of")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     if !need_cast && !ty_updated {
                         *ptr = utils::expr!(
@@ -1546,7 +1665,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     }
                     return PtrKind::Slice(m);
                 }
-                PtrCtx::Rhs(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                PtrCtx::Rhs(
+                    PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice,
+                ) => {
                     panic!("unsupported M4A box target for addr_of")
                 }
             }
@@ -1564,6 +1685,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                 )
             };
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_)) => {
+                    unreachable!("non-optional pointer targets are handled before as_ptr")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     if !need_cast {
                         *ptr = raw_expr;
@@ -1607,7 +1731,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     );
                     return PtrKind::Slice(m);
                 }
-                PtrCtx::Rhs(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                PtrCtx::Rhs(
+                    PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice,
+                ) => {
                     panic!("unsupported M4A box target for as_ptr")
                 }
             }
@@ -1615,6 +1741,9 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         if !pe.as_ptr && matches!(pe.base_ty.kind(), ty::TyKind::Array(..)) {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_)) => {
+                    unreachable!("non-optional pointer targets are handled before array base")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     let base = self.projected_expr(&pe, m, false);
                     *ptr = utils::expr!(
@@ -1667,7 +1796,9 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
-                PtrCtx::Rhs(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                PtrCtx::Rhs(
+                    PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice,
+                ) => {
                     panic!("unsupported M5 box target for array base")
                 }
             }
@@ -1680,6 +1811,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                         let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
                         *ptr = utils::expr!("{} as *mut {}", pprust::expr_to_string(ptr), inner_ty);
                     }
+                    return PtrKind::Raw(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Ref(m1)) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.raw_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
@@ -1703,11 +1839,27 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.opt_ref_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::OptRef(m);
                 }
+                (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::Ref(m1)) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr =
+                        self.opt_ref_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
+                    return PtrKind::OptRef(m);
+                }
+                (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::Box) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.opt_ref_from_box(pe.base, m, lhs_inner_ty, rhs_inner_ty, def_id);
+                    return PtrKind::OptRef(m);
+                }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::OptBox) => {
                     assert!(pe.projs.is_empty());
                     *ptr =
                         self.opt_ref_from_opt_box(pe.base, m, lhs_inner_ty, rhs_inner_ty, def_id);
                     return PtrKind::OptRef(m);
+                }
+                (PtrCtx::Deref(m), PtrKind::Ref(m1)) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.ref_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
+                    return PtrKind::Ref(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
                     assert!(pe.projs.is_empty());
@@ -1716,6 +1868,17 @@ impl<'tcx> TransformVisitor<'tcx> {
                         pe.base,
                         m,
                         m1,
+                        lhs_inner_ty,
+                        rhs_inner_ty,
+                        def_id,
+                    );
+                    return PtrKind::OptRef(m);
+                }
+                (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::BoxedSlice) => {
+                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    *ptr = self.opt_ref_from_slice_or_cursor(
+                        &base,
+                        m,
                         lhs_inner_ty,
                         rhs_inner_ty,
                         def_id,
@@ -1800,10 +1963,30 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.slice_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::Ref(m1)) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.slice_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
+                    return PtrKind::Slice(m);
+                }
+                (PtrCtx::Deref(_m), PtrKind::Box) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.box_from_box(pe.base, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Box;
+                }
                 (PtrCtx::Deref(_m), PtrKind::OptBox) => {
                     assert!(pe.projs.is_empty());
                     *ptr = self.opt_box_from_opt_box(pe.base, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::OptBox;
+                }
+                (PtrCtx::Deref(m), PtrKind::BoxedSlice) => {
+                    if pe.projs.is_empty() {
+                        *ptr =
+                            self.boxed_slice_from_boxed_slice(pe.base, lhs_inner_ty, rhs_inner_ty);
+                        return PtrKind::BoxedSlice;
+                    }
+                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Slice(m);
                 }
                 (PtrCtx::Deref(m), PtrKind::OptBoxedSlice) => {
                     if pe.projs.is_empty() {
@@ -1824,6 +2007,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let base = self.projected_expr(&pe, m, false);
                     // can be used for deref, so type must be specified
                     *ptr = self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Slice(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::BoxedSlice) => {
+                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::OptBoxedSlice) => {
@@ -1848,6 +2036,19 @@ impl<'tcx> TransformVisitor<'tcx> {
                     self.slice_cursor.set(true);
                     // to keep offsets, we use `e` instead of `pe.base`
                     *ptr = self.cursor_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::SliceCursor(m);
+                }
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Ref(m1)) => {
+                    self.slice_cursor.set(true);
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.cursor_from_ref(pe.base, &pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::SliceCursor(m);
+                }
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::BoxedSlice) => {
+                    self.slice_cursor.set(true);
+                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    *ptr =
+                        self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::SliceCursor(m);
                 }
                 (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::OptBoxedSlice) => {
@@ -1891,12 +2092,26 @@ impl<'tcx> TransformVisitor<'tcx> {
                 (PtrCtx::Rhs(PtrKind::SliceCursor(_) | PtrKind::Slice(_)), PtrKind::OptRef(_)) => {
                     panic!()
                 }
-                (PtrCtx::Rhs(PtrKind::Slice(_) | PtrKind::SliceCursor(_)), PtrKind::OptBox) => {
+                (
+                    PtrCtx::Rhs(PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
+                    PtrKind::Box | PtrKind::OptBox,
+                ) => {
                     panic!("unsupported M4A slice/cursor target from scalar owning box");
+                }
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Box) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = self.raw_from_box(pe.base, m, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptBox) => {
                     assert!(pe.projs.is_empty());
                     *ptr = self.raw_from_opt_box(pe.base, m, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
+                }
+                (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::BoxedSlice) => {
+                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    *ptr =
+                        self.raw_from_slice_or_cursor(&base, m, true, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptBoxedSlice) => {
@@ -1912,6 +2127,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                     );
                     return PtrKind::Raw(m);
                 }
+                (PtrCtx::Rhs(PtrKind::OptBox), PtrKind::Box) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = utils::expr!("Some({})", pprust::expr_to_string(pe.base));
+                    return PtrKind::OptBox;
+                }
                 (PtrCtx::Rhs(PtrKind::OptBox), PtrKind::OptBox) => {
                     assert!(pe.projs.is_empty());
                     *ptr = if matches!(pe.base_kind, PtrExprBaseKind::Path(Res::Local(_))) {
@@ -1925,6 +2145,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                     assert!(pe.projs.is_empty());
                     *ptr = self.opt_box_from_raw(pe.base, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::OptBox;
+                }
+                (PtrCtx::Rhs(PtrKind::OptBoxedSlice), PtrKind::BoxedSlice) => {
+                    assert!(pe.projs.is_empty());
+                    *ptr = utils::expr!("Some({})", pprust::expr_to_string(pe.base));
+                    return PtrKind::OptBoxedSlice;
                 }
                 (PtrCtx::Rhs(PtrKind::OptBoxedSlice), PtrKind::OptBoxedSlice) => {
                     assert!(pe.projs.is_empty());
@@ -1949,11 +2174,17 @@ impl<'tcx> TransformVisitor<'tcx> {
                 | (PtrCtx::Rhs(PtrKind::OptBoxedSlice), other) => {
                     panic!("unsupported M4A box target/source combination: {other:?}");
                 }
+                (PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice), _) => {
+                    unreachable!("non-optional pointer targets are handled before source matching")
+                }
             }
         }
 
         if pe.base_kind == PtrExprBaseKind::ByteStr {
             match ctx {
+                PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                    unreachable!("non-optional pointer targets are handled before byte strings")
+                }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     return PtrKind::Raw(m);
                 }
@@ -2035,6 +2266,9 @@ impl<'tcx> TransformVisitor<'tcx> {
             m1
         };
         match ctx {
+            PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
+                unreachable!("non-optional pointer targets are handled before final raw fallback")
+            }
             PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
                 if m && !m1 {
                     let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
@@ -2191,6 +2425,14 @@ impl<'tcx> TransformVisitor<'tcx> {
         )
     }
 
+    fn boxed_slice_view_expr(&self, e: &Expr, m: bool) -> Expr {
+        utils::expr!(
+            "&{}({})[..]",
+            if m { "mut " } else { "" },
+            pprust::expr_to_string(e),
+        )
+    }
+
     fn try_materialize_box_allocator_root(
         &self,
         ptr: &mut Expr,
@@ -2216,6 +2458,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                 *ptr = utils::expr!("Some(Box::new({default_expr_str}))");
                 Some(PtrKind::OptBox)
             }
+            (PtrKind::Box, _)
+                if hir_expr.is_some_and(|hir_expr| {
+                    hir_supports_scalar_box_allocator_root(self.tcx, lhs_inner_ty, hir_expr)
+                }) || expr_supports_scalar_opt_box_allocator_root(
+                    self.tcx,
+                    expr,
+                    lhs_inner_ty,
+                ) =>
+            {
+                *ptr = utils::expr!("Box::new({default_expr_str})");
+                Some(PtrKind::Box)
+            }
             (PtrKind::OptBoxedSlice, AllocatorRoot::Calloc { count, elem_size }) => {
                 *ptr = utils::expr!(
                     "Some(std::iter::repeat_with(|| {0}).take((({1}) * ({2}) / std::mem::size_of::<{3}>()) as usize).collect::<Vec<{3}>>().into_boxed_slice())",
@@ -2226,6 +2480,16 @@ impl<'tcx> TransformVisitor<'tcx> {
                 );
                 Some(PtrKind::OptBoxedSlice)
             }
+            (PtrKind::BoxedSlice, AllocatorRoot::Calloc { count, elem_size }) => {
+                *ptr = utils::expr!(
+                    "std::iter::repeat_with(|| {0}).take((({1}) * ({2}) / std::mem::size_of::<{3}>()) as usize).collect::<Vec<{3}>>().into_boxed_slice()",
+                    default_expr_str,
+                    pprust::expr_to_string(count),
+                    pprust::expr_to_string(elem_size),
+                    ty,
+                );
+                Some(PtrKind::BoxedSlice)
+            }
             (PtrKind::OptBoxedSlice, AllocatorRoot::Malloc { bytes }) => {
                 *ptr = utils::expr!(
                     "Some(std::iter::repeat_with(|| {0}).take((({1}) / std::mem::size_of::<{2}>()) as usize).collect::<Vec<{2}>>().into_boxed_slice())",
@@ -2234,6 +2498,15 @@ impl<'tcx> TransformVisitor<'tcx> {
                     ty,
                 );
                 Some(PtrKind::OptBoxedSlice)
+            }
+            (PtrKind::BoxedSlice, AllocatorRoot::Malloc { bytes }) => {
+                *ptr = utils::expr!(
+                    "std::iter::repeat_with(|| {0}).take((({1}) / std::mem::size_of::<{2}>()) as usize).collect::<Vec<{2}>>().into_boxed_slice()",
+                    default_expr_str,
+                    pprust::expr_to_string(bytes),
+                    ty,
+                );
+                Some(PtrKind::BoxedSlice)
             }
             _ => None,
         }
@@ -2417,6 +2690,200 @@ impl<'tcx> TransformVisitor<'tcx> {
                 lhs_ty,
             )
         }
+    }
+
+    fn raw_from_ref(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let source_mut = if m1 { "mut" } else { "const" };
+        let target_mut = if m { "mut" } else { "const" };
+        if lhs_inner_ty == rhs_inner_ty && m == m1 {
+            utils::expr!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(e),
+                target_mut,
+                lhs_ty,
+            )
+        } else {
+            utils::expr!(
+                "({}) as *{} {} as *{} {}",
+                pprust::expr_to_string(e),
+                source_mut,
+                rhs_ty,
+                target_mut,
+                lhs_ty,
+            )
+        }
+    }
+
+    fn raw_from_box(
+        &self,
+        e: &Expr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let view = if m {
+            utils::expr!("({}).as_mut()", pprust::expr_to_string(e))
+        } else {
+            utils::expr!("({}).as_ref()", pprust::expr_to_string(e))
+        };
+        self.raw_from_ref(&view, m, m, lhs_inner_ty, rhs_inner_ty)
+    }
+
+    fn raw_from_box_return(
+        &self,
+        e: &Expr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        if lhs_inner_ty == rhs_inner_ty {
+            utils::expr!(
+                "Box::into_raw({}) as *{} {}",
+                pprust::expr_to_string(e),
+                if m { "mut" } else { "const" },
+                lhs_ty,
+            )
+        } else {
+            utils::expr!(
+                "Box::into_raw({}) as *{} {} as *{} {}",
+                pprust::expr_to_string(e),
+                if m { "mut" } else { "const" },
+                rhs_ty,
+                if m { "mut" } else { "const" },
+                lhs_ty,
+            )
+        }
+    }
+
+    fn raw_from_boxed_slice_return(
+        &self,
+        e: &Expr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
+        let ptr_mut = if m { "mut" } else { "const" };
+        if lhs_inner_ty == rhs_inner_ty {
+            utils::expr!("Box::leak({}).{}()", pprust::expr_to_string(e), ptr_method,)
+        } else {
+            utils::expr!(
+                "Box::leak({}).{}() as *{} {} as *{} {}",
+                pprust::expr_to_string(e),
+                ptr_method,
+                ptr_mut,
+                rhs_ty,
+                ptr_mut,
+                lhs_ty,
+            )
+        }
+    }
+
+    fn ref_from_ref(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> Expr {
+        if lhs_inner_ty == rhs_inner_ty {
+            if m == m1 {
+                return e.clone();
+            }
+            if !m && m1 {
+                return utils::expr!("&*({})", pprust::expr_to_string(e));
+            }
+        }
+        let opt = self.opt_ref_from_ref(e, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
+        utils::expr!("({}).unwrap()", pprust::expr_to_string(&opt))
+    }
+
+    fn opt_ref_from_ref(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let e_str = pprust::expr_to_string(e);
+        if !need_cast {
+            utils::expr!("Some(&{}*({}))", if m && m1 { "mut " } else { "" }, e_str,)
+        } else if lhs_inner_ty.is_numeric()
+            && rhs_inner_ty.is_numeric()
+            && self.same_size(lhs_inner_ty, rhs_inner_ty, def_id)
+        {
+            self.bytemuck.set(true);
+            utils::expr!(
+                "Some(bytemuck::cast_{}::<_, {}>(&{}*({})))",
+                if m && m1 { "mut" } else { "ref" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                if m && m1 { "mut " } else { "" },
+                e_str,
+            )
+        } else {
+            let raw = self.raw_from_ref(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+            self.opt_ref_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+        }
+    }
+
+    fn opt_ref_from_box(
+        &self,
+        e: &Expr,
+        m: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> Expr {
+        let view = if m {
+            utils::expr!("({}).as_mut()", pprust::expr_to_string(e))
+        } else {
+            utils::expr!("({}).as_ref()", pprust::expr_to_string(e))
+        };
+        self.opt_ref_from_ref(&view, m, m, lhs_inner_ty, rhs_inner_ty, def_id)
+    }
+
+    fn box_from_box(
+        &self,
+        e: &Expr,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        assert_eq!(
+            lhs_inner_ty, rhs_inner_ty,
+            "M4A does not support casted Box<_> reinterpretation"
+        );
+        e.clone()
+    }
+
+    fn boxed_slice_from_boxed_slice(
+        &self,
+        e: &Expr,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        assert_eq!(
+            lhs_inner_ty, rhs_inner_ty,
+            "M4A does not support casted Box<[_]> reinterpretation"
+        );
+        e.clone()
     }
 
     fn opt_ref_from_opt_box(
@@ -2781,6 +3248,41 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn slice_from_ref(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let e_str = pprust::expr_to_string(e);
+        if !need_cast {
+            utils::expr!(
+                "std::slice::from_{}(&{}*({}))",
+                if m && m1 { "mut" } else { "ref" },
+                if m && m1 { "mut " } else { "" },
+                e_str,
+            )
+        } else if lhs_inner_ty.is_numeric()
+            && rhs_inner_ty.is_numeric()
+            && self.same_size(lhs_inner_ty, rhs_inner_ty, def_id)
+        {
+            self.bytemuck.set(true);
+            utils::expr!(
+                "std::slice::from_{0}(bytemuck::cast_{0}(&{1}*({2})))",
+                if m && m1 { "mut" } else { "ref" },
+                if m && m1 { "mut " } else { "" },
+                e_str,
+            )
+        } else {
+            let raw = self.raw_from_ref(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+            self.slice_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+        }
+    }
+
     fn cursor_from_raw(
         &self,
         e: &Expr,
@@ -2883,6 +3385,26 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn cursor_from_ref(
+        &self,
+        e: &Expr,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let slice = self.slice_from_ref(
+            e,
+            m,
+            m1,
+            lhs_inner_ty,
+            rhs_inner_ty,
+            pe.hir_base.hir_id.owner.def_id,
+        );
+        self.cursor_from_plain_slice(&slice, pe, m, lhs_inner_ty, lhs_inner_ty)
+    }
+
     // slice -> slice
     fn plain_slice_from_slice(
         &self,
@@ -2897,7 +3419,12 @@ impl<'tcx> TransformVisitor<'tcx> {
             matches!(pe.base_kind, PtrExprBaseKind::Path(Res::Local(_)))
                 && matches!(
                     self.ptr_source_kind(pe),
-                    Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_) | PtrKind::OptBoxedSlice)
+                    Some(
+                        PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
+                            | PtrKind::BoxedSlice
+                            | PtrKind::OptBoxedSlice,
+                    )
                 )
                 && pe.projs.is_empty();
         let get_reference = |use_ref| {
@@ -2967,7 +3494,12 @@ impl<'tcx> TransformVisitor<'tcx> {
             matches!(pe.base_kind, PtrExprBaseKind::Path(Res::Local(_)))
                 && matches!(
                     self.ptr_source_kind(pe),
-                    Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_) | PtrKind::OptBoxedSlice)
+                    Some(
+                        PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
+                            | PtrKind::BoxedSlice
+                            | PtrKind::OptBoxedSlice,
+                    )
                 )
                 && pe.projs.is_empty();
         let get_reference = |use_ref| {
@@ -2991,12 +3523,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                 && let PtrExprProj::Offset(offset) = pe.projs[0]
             {
                 // if there are only offsets, we can use the original slice and let the cursor handle the offsets
-                let cursor_base =
-                    if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice)) {
-                        self.opt_boxed_slice_view_expr(pe.base, m)
-                    } else {
-                        pe.base.clone()
-                    };
+                let cursor_base = if matches!(self.ptr_source_kind(pe), Some(PtrKind::BoxedSlice)) {
+                    self.boxed_slice_view_expr(pe.base, m)
+                } else if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice)) {
+                    self.opt_boxed_slice_view_expr(pe.base, m)
+                } else {
+                    pe.base.clone()
+                };
                 utils::expr!(
                     "{}::with_pos({}{}, ({}) as usize)",
                     cursor_ty,
@@ -3096,8 +3629,11 @@ impl<'tcx> TransformVisitor<'tcx> {
             && let Res::Local(hir_id) = path.res
         {
             match self.effective_ptr_kind(hir_id) {
+                Some(PtrKind::Ref(m)) => Some(m),
                 Some(PtrKind::OptRef(m)) => Some(m),
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => Some(true),
+                Some(
+                    PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice,
+                ) => Some(true),
                 Some(PtrKind::Slice(m)) | Some(PtrKind::SliceCursor(m)) => Some(m),
                 Some(PtrKind::Raw(m)) => Some(m),
                 None => None,
@@ -3331,8 +3867,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                     matches!(
                         self.effective_ptr_kind(hir_id)
                             .unwrap_or(self.ptr_kinds[&hir_id]),
-                        PtrKind::OptRef(_)
+                        PtrKind::Ref(_)
+                            | PtrKind::OptRef(_)
+                            | PtrKind::Box
                             | PtrKind::OptBox
+                            | PtrKind::BoxedSlice
                             | PtrKind::OptBoxedSlice
                             | PtrKind::Slice(_)
                             | PtrKind::SliceCursor(_)
@@ -3536,6 +4075,13 @@ fn unwrap_ptr_or_arr_from_mir_ty<'tcx>(
 }
 
 #[inline]
+fn mk_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    let m = if mutability { "mut " } else { "" };
+    utils::ty!("&{m}{ty}")
+}
+
+#[inline]
 fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
     let ty = mir_ty_to_string(ty, tcx);
     let m = if mutability { "mut " } else { "" };
@@ -3543,9 +4089,21 @@ fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) ->
 }
 
 #[inline]
+fn mk_box_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    utils::ty!("Box<{ty}>")
+}
+
+#[inline]
 fn mk_opt_box_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
     let ty = mir_ty_to_string(ty, tcx);
     utils::ty!("Option<Box<{ty}>>")
+}
+
+#[inline]
+fn mk_boxed_slice_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
+    let ty = mir_ty_to_string(ty, tcx);
+    utils::ty!("Box<[{ty}]>")
 }
 
 #[inline]
@@ -4296,11 +4854,12 @@ fn downgrade_unsupported_box_inputs(
         };
         let body = tcx.hir_body(body);
         for (idx, param) in body.params.iter().enumerate() {
-            let Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) =
-                sig_dec.input_decs.get(idx).copied().flatten()
-            else {
+            let Some(kind) = sig_dec.input_decs.get(idx).copied().flatten() else {
                 continue;
             };
+            if !kind.is_owning_box_like() {
+                continue;
+            }
             let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
                 continue;
             };
@@ -4323,10 +4882,12 @@ fn downgrade_unsupported_box_outputs<'tcx>(
 ) -> bool {
     let mut to_raw = Vec::new();
     for (did, sig_dec) in &sig_decs.data {
-        let Some(output_kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) = sig_dec.output_dec
-        else {
+        let Some(output_kind) = sig_dec.output_dec else {
             continue;
         };
+        if !output_kind.is_owning_box_like() {
+            continue;
+        }
         let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
         let Some((inner_ty, _)) =
             unwrap_ptr_from_mir_ty(body.local_decls[rustc_middle::mir::Local::from_u32(0)].ty)
@@ -4496,7 +5057,7 @@ fn effective_callee_output_kind(
         else {
             return Some(output_dec);
         };
-        if matches!(output_dec, PtrKind::OptBox | PtrKind::OptBoxedSlice)
+        if output_dec.is_owning_box_like()
             && (fn_tail_returns_unsupported_box_binding(
                 tcx, sig_decs, ptr_kinds, def_id, output_dec, inner_ty,
             ) || fn_output_has_nonowning_local_consumers(tcx, ptr_kinds, def_id, output_dec))
@@ -5817,10 +6378,9 @@ fn collect_local_raw_param_summaries(
         };
         let body = tcx.hir_body(body);
         let returns_owning_output = sig_decs.data.get(def_id).is_some_and(|sig_dec| {
-            matches!(
-                sig_dec.output_dec,
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
-            )
+            sig_dec
+                .output_dec
+                .is_some_and(|kind| kind.is_owning_box_like())
         });
         let mut visitor = RawParamSummaryVisitor {
             tcx,
@@ -6328,12 +6888,12 @@ fn hir_rhs_supports_box_target<'tcx>(
     }
 
     match target_kind {
-        PtrKind::OptBox => {
+        PtrKind::Box | PtrKind::OptBox => {
             if hir_supports_scalar_box_allocator_root(tcx, lhs_inner_ty, hir_uncast) {
                 return true;
             }
         }
-        PtrKind::OptBoxedSlice => {
+        PtrKind::BoxedSlice | PtrKind::OptBoxedSlice => {
             if hir_is_supported_boxed_slice_allocator_root(tcx, hir_uncast) {
                 return true;
             }
@@ -6342,14 +6902,16 @@ fn hir_rhs_supports_box_target<'tcx>(
     }
 
     if let hir::ExprKind::Call(..) = hir_expr.kind
-        && hir_callee_output_kind(tcx, sig_decs, ptr_kinds, hir_expr) == Some(target_kind)
+        && let Some(output_kind) = hir_callee_output_kind(tcx, sig_decs, ptr_kinds, hir_expr)
+        && (output_kind == target_kind || output_kind == target_kind.optional_variant())
     {
         return true;
     }
 
     if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind
         && let Res::Local(hir_id) = path.res
-        && ptr_kinds.get(&hir_id).copied() == Some(target_kind)
+        && let Some(rhs_kind) = ptr_kinds.get(&hir_id).copied()
+        && (rhs_kind == target_kind || rhs_kind == target_kind.optional_variant())
     {
         return true;
     }
@@ -6374,8 +6936,8 @@ fn collect_unsupported_box_target_bindings(
             if let hir::StmtKind::Let(let_stmt) = stmt.kind
                 && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
                 && let Some(init) = let_stmt.init
-                && let Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) =
-                    self.ptr_kinds.get(&hir_id).copied()
+                && let Some(kind) = self.ptr_kinds.get(&hir_id).copied()
+                && kind.is_owning_box_like()
             {
                 let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
                 let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
@@ -6397,8 +6959,8 @@ fn collect_unsupported_box_target_bindings(
             if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
                 && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
                 && let Res::Local(hir_id) = path.res
-                && let Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) =
-                    self.ptr_kinds.get(&hir_id).copied()
+                && let Some(kind) = self.ptr_kinds.get(&hir_id).copied()
+                && kind.is_owning_box_like()
             {
                 let lhs_ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(lhs);
                 let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
@@ -6459,10 +7021,11 @@ fn collect_unsupported_box_usage_bindings(
 
     impl<'tcx> UnsupportedBoxUsageVisitor<'_, 'tcx> {
         fn owning_root_of(&self, hir_id: HirId) -> Option<HirId> {
-            if matches!(
-                self.ptr_kinds.get(&hir_id),
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
-            ) {
+            if self
+                .ptr_kinds
+                .get(&hir_id)
+                .is_some_and(PtrKind::is_owning_box_like)
+            {
                 Some(hir_id)
             } else {
                 self.byte_view_roots.get(&hir_id).copied()
@@ -6573,10 +7136,10 @@ fn collect_unsupported_box_usage_bindings(
                 let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
                 let direct_box_consume = is_direct_free
                     && hir_id == root
-                    && matches!(
-                        self.ptr_kinds.get(&hir_id),
-                        Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
-                    );
+                    && self
+                        .ptr_kinds
+                        .get(&hir_id)
+                        .is_some_and(PtrKind::is_owning_box_like);
                 if !direct_box_consume {
                     self.bindings.insert(root);
                 }
@@ -6641,7 +7204,10 @@ fn downgrade_unsupported_allocator_box_kinds(
             let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
                 return;
             };
-            if self.ptr_kinds.get(&hir_id).copied() != Some(PtrKind::OptBox) {
+            if !matches!(
+                self.ptr_kinds.get(&hir_id).copied(),
+                Some(PtrKind::Box | PtrKind::OptBox)
+            ) {
                 return;
             }
             if !matches!(
@@ -6986,6 +7552,7 @@ mod tests {
         let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
         offset_sign_result.access_signs =
             source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+        let nullity_result = analyses::nullity::analyze(&input);
         let analysis = super::super::Analysis {
             promoted_mut_ref_result,
             promoted_shared_ref_result,
@@ -6995,6 +7562,7 @@ mod tests {
             output_params,
             ownership_schemes,
             offset_sign_result,
+            nullity_result,
         };
 
         (input, analysis)
@@ -7641,11 +8209,11 @@ mod tests {
 
             let final_kind = final_ptr_kinds.get(&site.hir_id).copied();
             match final_kind {
-                Some(PtrKind::OptBox) => {
+                Some(PtrKind::Box | PtrKind::OptBox) => {
                     safe_box_sites.bump(SafetyAllocKind::Scalar);
                     continue;
                 }
-                Some(PtrKind::OptBoxedSlice) => {
+                Some(PtrKind::BoxedSlice | PtrKind::OptBoxedSlice) => {
                     safe_box_sites.bump(SafetyAllocKind::Array);
                     continue;
                 }
@@ -7899,10 +8467,11 @@ mod tests {
             }
 
             fn owning_root_of(&self, hir_id: HirId) -> Option<HirId> {
-                if matches!(
-                    self.ptr_kinds.get(&hir_id),
-                    Some(PtrKind::OptBox | PtrKind::OptBoxedSlice)
-                ) {
+                if self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .is_some_and(PtrKind::is_owning_box_like)
+                {
                     Some(hir_id)
                 } else {
                     self.byte_view_roots.get(&hir_id).copied()

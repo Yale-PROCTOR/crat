@@ -57,9 +57,7 @@ pub fn collect_diffs<'tcx>(
             if let Some(mut ptr_kind) = decision_maker.decide(local, decl, aliases)
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
-                if non_outermost_owning_locals.contains(hir_id)
-                    && matches!(ptr_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice)
-                {
+                if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
                 }
                 ptr_kinds.insert(*hir_id, ptr_kind);
