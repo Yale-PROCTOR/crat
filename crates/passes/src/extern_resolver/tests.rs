@@ -333,6 +333,66 @@ fn run_extern_test(code: &str, config: super::Config, includes: &[&str], exclude
     }
 }
 
+fn run_const_test(code1: &str, code2: &str, same: bool) {
+    let code = format!("mod a {{ {code1} }} mod b {{ {code2} }}");
+    utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let res = super::resolve(false, false, tcx);
+        assert!(!res.equiv_consts.is_empty());
+        for classes in res.equiv_consts.values() {
+            if same {
+                assert_eq!(classes.0.len(), 1);
+            } else {
+                for class in &classes.0 {
+                    assert_eq!(class.len(), 1);
+                }
+            }
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_const() {
+    let code1 = "
+    pub const B: core::ffi::c_uint = 1;
+";
+    let code2 = "
+    pub const B: core::ffi::c_uint = 1;
+";
+    run_const_test(code1, code2, true);
+}
+
+#[test]
+fn test_const_diff_body() {
+    let code1 = "
+    pub const B: core::ffi::c_uint = 1;
+";
+    let code2 = "
+    pub const B: core::ffi::c_uint = 2;
+";
+    run_const_test(code1, code2, false);
+}
+
+#[test]
+fn test_const_resolved_use() {
+    run_extern_test(
+        "
+    mod a {
+        pub const B: core::ffi::c_uint = 1;
+    }
+    mod b {
+        pub const B: core::ffi::c_uint = 1;
+        pub unsafe extern \"C\" fn bar() -> core::ffi::c_uint {
+            return B;
+        }
+    }
+",
+        super::Config::default(),
+        &["use crate::a::B;"],
+        &["mod b {\n        pub const B"],
+    );
+}
+
 #[test]
 fn test_ignore_param_type() {
     run_extern_test(
