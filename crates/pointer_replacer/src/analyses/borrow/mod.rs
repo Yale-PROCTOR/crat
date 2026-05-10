@@ -1,6 +1,6 @@
 //! Borrow inference
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::VecDeque};
 
 use errors::{Errors, compute_errors};
 use invalidates::{Invalidates, compute_invalidates};
@@ -9,7 +9,7 @@ use killed::{Killed, compute_killed};
 use loan_liveness::{LoanLiveness, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::{
     IndexVec,
@@ -769,67 +769,67 @@ pub fn demote_pointers_iterative(
 
     let tcx = program.tcx;
 
-    // TODO: super dumb fixed pointer iteration. Need to switch to worklist
-    let mut any_func_changed = true;
-    while any_func_changed {
-        any_func_changed = false;
-        for f in program.functions.iter() {
-            let body = &*program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(f)
-                .borrow();
+    for &f in &program.functions {
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        demoted.insert(f, DenseBitSet::new_empty(body.local_decls.len()));
+    }
 
-            let inference = borrow_inference(tcx, *f, global_borrow_ctxt);
-            let BorrowInferenceResults {
-                borrow_set, errors, ..
-            } = inference;
+    let mut worklist: VecDeque<LocalDefId> = program.functions.iter().copied().collect();
+    let mut in_worklist: FxHashSet<LocalDefId> = worklist.iter().copied().collect();
 
-            let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
-            for row in errors.rows() {
-                if let Some(loans) = errors.row(row) {
-                    invalid_loans.union(loans);
-                }
+    while let Some(f) = worklist.pop_front() {
+        in_worklist.remove(&f);
+
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+
+        let inference = borrow_inference(tcx, f, global_borrow_ctxt);
+        let BorrowInferenceResults {
+            borrow_set, errors, ..
+        } = inference;
+
+        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
+        for row in errors.rows() {
+            if let Some(loans) = errors.row(row) {
+                invalid_loans.union(loans);
             }
-
-            let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
-
-            // for demoted locals
-            // Step 1. merge it with the local of the invalidated loan
-            // Step 2. disable their provenance in the next iteration
-
-            let provenance_set = global_borrow_ctxt.provenances.get_mut(f).unwrap();
-
-            // Step 1
-            for loan in invalid_loans.iter() {
-                let borrow_data = &borrow_set.loans[loan];
-                match borrow_data.assigned {
-                    Borrower::AssignStmt(assigned) => {
-                        demoted_locals.insert(assigned.local);
-                        provenance_set
-                            .tree_borrow_local
-                            .get_mut()
-                            .union(assigned.local, borrow_data.borrowed.local);
-                    }
-                    Borrower::CallArg(..) => unimplemented!(),
-                }
-            }
-
-            // Step 2
-            for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {
-                if demoted_locals.contains(local) && provenance.is_some() {
-                    any_func_changed = true;
-                    *provenance = None;
-                }
-            }
-
-            // demoted.insert(*f, demoted_locals);
-            demoted
-                .entry(*f)
-                .and_modify(|d: &mut DenseBitSet<Local>| {
-                    d.union(&demoted_locals);
-                })
-                .or_insert(demoted_locals);
         }
+
+        if invalid_loans.is_empty() {
+            continue;
+        }
+
+        let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
+
+        let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
+
+        for loan in invalid_loans.iter() {
+            let borrow_data = &borrow_set.loans[loan];
+            match borrow_data.assigned {
+                Borrower::AssignStmt(assigned) => {
+                    demoted_locals.insert(assigned.local);
+                    provenance_set
+                        .tree_borrow_local
+                        .get_mut()
+                        .union(assigned.local, borrow_data.borrowed.local);
+                }
+                Borrower::CallArg(..) => unimplemented!(),
+            }
+        }
+
+        let mut changed = false;
+        for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {
+            if demoted_locals.contains(local) && provenance.is_some() {
+                changed = true;
+                *provenance = None;
+            }
+        }
+
+        if changed && !in_worklist.contains(&f) {
+            worklist.push_back(f);
+            in_worklist.insert(f);
+        }
+
+        demoted.get_mut(&f).unwrap().union(&demoted_locals);
     }
 
     demoted
