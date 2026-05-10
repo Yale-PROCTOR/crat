@@ -12,11 +12,17 @@ use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
     /// reference: &mut T for Ref(true), or &T for Ref(false)
+    Ref(bool),
+    /// optional reference: Option<&mut T> for OptRef(true), or Option<&T> for OptRef(false)
     OptRef(bool),
+    /// owning scalar pointer rewritten to Box<T>
+    Box,
     /// owning scalar pointer rewritten to Option<Box<T>>
     OptBox,
     /// raw pointer: *mut T for Raw(true), or *const T for Raw(false)
     Raw(bool),
+    /// owning array pointer rewritten to Box<[T]>
+    BoxedSlice,
     /// owning array pointer rewritten to Option<Box<[T]>>
     OptBoxedSlice,
     /// plain slice: &mut [T] for Slice(true), or &[T] for Slice(false)
@@ -29,10 +35,44 @@ pub enum PtrKind {
 impl PtrKind {
     pub fn is_mut(&self) -> bool {
         match self {
-            PtrKind::OptRef(m) | PtrKind::Raw(m) | PtrKind::Slice(m) | PtrKind::SliceCursor(m) => {
-                *m
-            }
-            PtrKind::OptBox | PtrKind::OptBoxedSlice => true,
+            PtrKind::Ref(m)
+            | PtrKind::OptRef(m)
+            | PtrKind::Raw(m)
+            | PtrKind::Slice(m)
+            | PtrKind::SliceCursor(m) => *m,
+            PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice => true,
+        }
+    }
+
+    pub fn is_owning_box_like(&self) -> bool {
+        matches!(
+            self,
+            PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice
+        )
+    }
+
+    pub fn is_optional(&self) -> bool {
+        matches!(
+            self,
+            PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice
+        )
+    }
+
+    pub fn non_null_variant(self) -> Self {
+        match self {
+            PtrKind::OptRef(m) => PtrKind::Ref(m),
+            PtrKind::OptBox => PtrKind::Box,
+            PtrKind::OptBoxedSlice => PtrKind::BoxedSlice,
+            other => other,
+        }
+    }
+
+    pub fn optional_variant(self) -> Self {
+        match self {
+            PtrKind::Ref(m) => PtrKind::OptRef(m),
+            PtrKind::Box => PtrKind::OptBox,
+            PtrKind::BoxedSlice => PtrKind::OptBoxedSlice,
+            other => other,
         }
     }
 }
@@ -47,6 +87,7 @@ pub struct DecisionMaker<'tcx> {
     promoted_shared_refs: DenseBitSet<Local>,
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
+    non_null_params: DenseBitSet<Local>,
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
@@ -59,6 +100,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             return decision;
         }
         match decision {
+            Some(PtrKind::Ref(_)) => Some(PtrKind::Ref(false)),
             Some(PtrKind::OptRef(_)) => Some(PtrKind::OptRef(false)),
             Some(PtrKind::Raw(_)) => Some(PtrKind::Raw(false)),
             Some(PtrKind::Slice(_)) => Some(PtrKind::Slice(false)),
@@ -81,7 +123,12 @@ impl<'tcx> DecisionMaker<'tcx> {
             && is_mut
             && matches!(
                 decision,
-                Some(PtrKind::OptRef(true) | PtrKind::Slice(true) | PtrKind::SliceCursor(true))
+                Some(
+                    PtrKind::Ref(true)
+                        | PtrKind::OptRef(true)
+                        | PtrKind::Slice(true)
+                        | PtrKind::SliceCursor(true)
+                )
             )
         {
             Some(PtrKind::Raw(true))
@@ -134,6 +181,7 @@ impl<'tcx> DecisionMaker<'tcx> {
         if let Some(signs) = fn_offset_signs {
             needs_cursor.union(signs);
         }
+        let non_null_params = stable_non_null_params(analysis, did, tcx, mutable_pointers.len());
         DecisionMaker {
             tcx,
             array_pointers,
@@ -143,6 +191,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor,
+            non_null_params,
         }
     }
 
@@ -210,8 +259,50 @@ impl<'tcx> DecisionMaker<'tcx> {
         };
 
         let decision = self.preserve_original_pointer_constness(decision, m.is_mut());
-        self.force_raw_local_struct_borrows(decision, ty, m.is_mut())
+        let decision = self.force_raw_local_struct_borrows(decision, ty, m.is_mut());
+        if self.non_null_params.contains(local) {
+            decision.map(PtrKind::non_null_variant)
+        } else {
+            decision
+        }
     }
+}
+
+fn stable_non_null_params<'tcx>(
+    analysis: &Analysis,
+    did: LocalDefId,
+    tcx: TyCtxt<'tcx>,
+    len: usize,
+) -> DenseBitSet<Local> {
+    let mut non_null_params = DenseBitSet::new_empty(len);
+    let Some(params) = analysis.nullity_result.non_null_params.get(&did) else {
+        return non_null_params;
+    };
+    for param in params.iter() {
+        non_null_params.insert(param);
+    }
+
+    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if place.projection.is_empty() {
+                non_null_params.remove(place.local);
+            }
+            match rvalue {
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                    if place.projection.is_empty() =>
+                {
+                    non_null_params.remove(place.local);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    non_null_params
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -286,6 +377,9 @@ impl SigDecisions {
                 match decision_maker.decide(return_local, return_decl, return_aliases) {
                     Some(kind @ (PtrKind::Raw(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
                         Some(kind)
+                    }
+                    Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => {
+                        Some(kind.optional_variant())
                     }
                     _ => None,
                 };
@@ -376,6 +470,7 @@ fn infer_returned_local_box_kind<'tcx>(
     let aliases = aliases.and_then(|aliases| aliases.get(&local));
     match decision_maker.decide(local, decl, aliases) {
         Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some(kind),
+        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => Some(kind.optional_variant()),
         _ => None,
     }
 }
@@ -413,7 +508,7 @@ mod tests {
         .unwrap();
     }
 
-    fn synthetic_decision_maker<'tcx>(
+    fn synthetic_decision_maker_with_non_null<'tcx>(
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         local: Local,
@@ -424,6 +519,7 @@ mod tests {
         promoted_mut: bool,
         promoted_shared: bool,
         needs_cursor: bool,
+        non_null: bool,
     ) -> DecisionMaker<'tcx> {
         let len = body.local_decls.len();
         let mut mutable_pointers = IndexVec::from_elem_n(false, len);
@@ -448,6 +544,10 @@ mod tests {
         if needs_cursor {
             needs_cursor_set.insert(local);
         }
+        let mut non_null_params = DenseBitSet::new_empty(len);
+        if non_null {
+            non_null_params.insert(local);
+        }
 
         DecisionMaker {
             tcx,
@@ -458,6 +558,7 @@ mod tests {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor: needs_cursor_set,
+            non_null_params,
         }
     }
 
@@ -471,6 +572,30 @@ mod tests {
         promoted_shared: bool,
         mutable: bool,
     ) -> PtrKind {
+        decide_for_param_with_ty_and_non_null(
+            pointer_ty,
+            owning,
+            output,
+            is_array,
+            needs_cursor,
+            promoted_mut,
+            promoted_shared,
+            mutable,
+            false,
+        )
+    }
+
+    fn decide_for_param_with_ty_and_non_null(
+        pointer_ty: &str,
+        owning: bool,
+        output: bool,
+        is_array: bool,
+        needs_cursor: bool,
+        promoted_mut: bool,
+        promoted_shared: bool,
+        mutable: bool,
+        non_null: bool,
+    ) -> PtrKind {
         let mut decision = None;
         let code = format!(
             r#"
@@ -481,7 +606,7 @@ pub unsafe fn foo(p: {pointer_ty}) {{
         );
         with_test_fn_body(&code, |tcx, _did, body| {
             let local = Local::from_u32(1);
-            let decision_maker = synthetic_decision_maker(
+            let decision_maker = synthetic_decision_maker_with_non_null(
                 tcx,
                 body,
                 local,
@@ -492,6 +617,7 @@ pub unsafe fn foo(p: {pointer_ty}) {{
                 promoted_mut,
                 promoted_shared,
                 needs_cursor,
+                non_null,
             );
             let decl = &body.local_decls[local];
             decision = Some(
@@ -597,6 +723,46 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
+    fn non_null_promoted_scalar_param_becomes_ref() {
+        assert_eq!(
+            decide_for_param_with_ty_and_non_null(
+                "*mut i32", false, false, false, false, true, false, true, true,
+            ),
+            PtrKind::Ref(true)
+        );
+        assert_eq!(
+            decide_for_param_with_ty_and_non_null(
+                "*const i32",
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+            ),
+            PtrKind::Ref(false)
+        );
+    }
+
+    #[test]
+    fn non_null_owning_params_become_non_optional() {
+        assert_eq!(
+            decide_for_param_with_ty_and_non_null(
+                "*mut i32", true, false, false, false, false, false, true, true,
+            ),
+            PtrKind::Box
+        );
+        assert_eq!(
+            decide_for_param_with_ty_and_non_null(
+                "*mut i32", true, false, true, false, false, false, true, true,
+            ),
+            PtrKind::BoxedSlice
+        );
+    }
+
+    #[test]
     fn const_array_pointer_does_not_become_mut_slice() {
         assert_eq!(
             decide_for_param_with_ty("*const i32", false, false, true, false, true, false, true),
@@ -614,8 +780,8 @@ pub unsafe fn foo(p: *mut i32, q: *mut i32) {
 "#;
         with_test_fn_body(code, |tcx, _did, body| {
             let local = Local::from_u32(1);
-            let decision_maker = synthetic_decision_maker(
-                tcx, body, local, true, true, true, true, false, false, false,
+            let decision_maker = synthetic_decision_maker_with_non_null(
+                tcx, body, local, true, true, true, true, false, false, false, true,
             );
             let decl = &body.local_decls[local];
             let aliases = FxHashSet::from_iter([Local::from_u32(2)]);

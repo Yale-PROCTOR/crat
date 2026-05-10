@@ -50,6 +50,74 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
+fn test_non_null_param_to_ref() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(p: *const libc::c_int) -> libc::c_int {
+    return *p;
+}
+"#,
+        &["fn foo(p: &i32)", "return *p;"],
+        &["Option<&i32>", "*const libc::c_int"],
+    );
+}
+
+#[test]
+fn test_param_null_check_before_deref_stays_optional() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(p: *const libc::c_int) -> libc::c_int {
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    return *p;
+}
+"#,
+        &["p: Option<&i32>", "p.is_none()"],
+        &["fn foo(p: &i32)"],
+    );
+}
+
+#[test]
+fn test_non_null_param_late_null_check_rewrites_false() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(p: *const libc::c_int) -> libc::c_int {
+    let x = *p;
+    if p.is_null() {
+        return 0 as libc::c_int;
+    }
+    return x;
+}
+"#,
+        &["fn foo(p: &i32)", "if false"],
+        &["p.is_none()", "Option<&i32>"],
+    );
+}
+
+#[test]
+fn test_reassigned_non_null_param_stays_optional() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo(mut p: *const libc::c_int) -> libc::c_int {
+    let x = *p;
+    p = std::ptr::null();
+    if p.is_null() {
+        return x;
+    }
+    return *p;
+}
+"#,
+        &["mut p: Option<&i32>", "p = None", "p.is_none()"],
+        &["fn foo(mut p: &i32)"],
+    );
+}
+
+#[test]
 fn test_rewriter_output_unchanged_when_ownership_analysis_fails() {
     let code = r#"
 use ::libc;
@@ -560,7 +628,7 @@ pub unsafe fn caller() -> i32 {
     return touch_state(s, ((*s).buf).as_mut_ptr());
         }
 	"#,
-        &["pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: Option<&mut i32>)"],
+        &["pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: &mut i32)"],
         &["Option<&mut State>"],
     );
 }
@@ -2642,7 +2710,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 /// Function call with pointer argument — local function, sig_decs lookup succeeds.
-/// bar's parameter is transformed to OptRef, and the call site converts p accordingly.
+/// bar's parameter is proven non-null and the call site unwraps p accordingly.
 #[test]
 fn test_ptr_call_arg() {
     run_test(
@@ -2656,7 +2724,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return bar(p);
 }
 "#,
-        &["Option<&i32>", "as_deref()"],
+        &["fn bar(p: &i32)", "as_deref()).unwrap()"],
         &[],
     );
 }
@@ -3582,8 +3650,8 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["(&((*(src).as_deref().unwrap()).data))[("],
-        &["&mut ((*(src).as_deref().unwrap()).data)"],
+        &["(&((*src).data))[("],
+        &["&mut ((*src).data)"],
     );
 }
 
