@@ -264,7 +264,7 @@ fn reject_wrong_return_expression() {
             pub const B: E = 1;
 
             pub unsafe extern "C" fn f() -> E {
-                1 as core::ffi::c_uint
+                return 1 as core::ffi::c_uint;
             }
             "#,
         |tcx, analysis| {
@@ -274,6 +274,57 @@ fn reject_wrong_return_expression() {
                 has_reject(info, RejectReasonKind::ReturnRequiresEnum)
                     || has_reject(info, RejectReasonKind::CastAssignedToEnum)
             );
+        },
+    );
+}
+
+#[test]
+fn accept_explicit_return_variants_without_tail_expr() {
+    analyze_with_tcx(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(mut cond: core::ffi::c_int) -> E {
+                if cond != 0 as core::ffi::c_int {
+                    return A;
+                }
+                return B;
+            }
+            "#,
+        |tcx, analysis| {
+            let info = enum_by_name(&analysis, tcx, "E");
+            assert!(info.transformable);
+            assert!(info.reject_reasons.is_empty());
+        },
+    );
+}
+
+#[test]
+fn accept_c_bool_style_flag_with_explicit_returns() {
+    analyze_with_tcx(
+        r#"
+            pub type c_bool = core::ffi::c_int;
+            pub const true_0: c_bool = 1 as core::ffi::c_int;
+            pub const false_0: c_bool = 0 as core::ffi::c_int;
+
+            pub unsafe extern "C" fn f(mut cond: core::ffi::c_int) -> c_bool {
+                let mut seen: c_bool = false_0;
+                if cond != 0 as core::ffi::c_int {
+                    seen = true_0;
+                }
+                if seen != 0 as core::ffi::c_int {
+                    return true_0;
+                }
+                return false_0;
+            }
+            "#,
+        |tcx, analysis| {
+            let info = enum_by_name(&analysis, tcx, "c_bool");
+            assert!(info.transformable);
+            assert!(info.reject_reasons.is_empty());
+            assert_eq!(info.enum_to_int_cast_sites.len(), 1);
         },
     );
 }
@@ -528,7 +579,7 @@ fn unknown_enum_required_source_rejects() {
             }
 
             pub unsafe extern "C" fn f() -> E {
-                unknown()
+                return unknown();
             }
             "#,
         |tcx, analysis| {

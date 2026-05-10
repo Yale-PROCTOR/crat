@@ -16,7 +16,15 @@ use rustc_span::{
 };
 
 pub fn replace_enums(tcx: TyCtxt<'_>) {
-    let _ = analyze_enums(tcx);
+    let analysis = analyze_enums(tcx);
+    let total = analysis.enums.len();
+    let transformable = analysis
+        .enums
+        .values()
+        .filter(|info| info.transformable)
+        .count();
+    println!("enum candidates: {total}");
+    println!("transformable enums: {transformable}");
 }
 
 #[derive(Debug, Default)]
@@ -827,10 +835,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for BodyVisitor<'_, 'tcx> {
     }
 
     fn visit_body(&mut self, body: &hir::Body<'tcx>) -> Self::Result {
-        if let Some(ret) = self.current_ret_ty.clone() {
-            self.check_expr_against_type(body.value, &ret, RequiredContext::Return);
-        }
-
         intravisit::walk_body(self, body)
     }
 
