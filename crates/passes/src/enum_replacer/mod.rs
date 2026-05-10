@@ -1,4 +1,10 @@
 use rustc_abi::VariantIdx;
+use rustc_ast::{
+    self as ast,
+    mut_visit::{self, MutVisitor as _},
+    ptr::P,
+};
+use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, BinOpKind, FnRetTy, HirId, PrimTy, QPath,
@@ -13,18 +19,32 @@ use rustc_middle::{
 use rustc_span::{
     Span, Symbol,
     def_id::{DefId, LocalDefId},
+    sym,
 };
+use smallvec::{SmallVec, smallvec};
+use utils::ir::AstToHir;
 
-pub fn replace_enums(tcx: TyCtxt<'_>) {
+pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     let analysis = analyze_enums(tcx);
-    let total = analysis.enums.len();
-    let transformable = analysis
-        .enums
-        .values()
-        .filter(|info| info.transformable)
-        .count();
-    println!("enum candidates: {total}");
-    println!("transformable enums: {transformable}");
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let plan = EnumTransformPlan::new(&analysis);
+    if !plan.replacements.is_empty() {
+        add_coverage_feature(&mut krate, tcx);
+    }
+    let mut visitor = AstVisitor {
+        tcx,
+        ast_to_hir,
+        replacements: plan.replacements,
+        variant_consts: plan.variant_consts,
+        cast_sites: plan.cast_sites,
+        inserted_casts: FxHashSet::default(),
+    };
+    visitor.visit_crate(&mut krate);
+
+    pprust::crate_to_string_for_macros(&krate)
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +117,167 @@ pub enum CastSiteKind {
     ReturnToInteger,
     NumericOperator,
     ComparisonToInteger,
+}
+
+#[derive(Clone, Debug)]
+struct EnumReplacement {
+    repr: String,
+    variants: Vec<VariantReplacement>,
+}
+
+#[derive(Clone, Debug)]
+struct VariantReplacement {
+    name: String,
+    value: String,
+}
+
+#[derive(Default)]
+struct EnumTransformPlan {
+    replacements: FxHashMap<LocalDefId, EnumReplacement>,
+    variant_consts: FxHashMap<LocalDefId, LocalDefId>,
+    cast_sites: FxHashMap<HirId, String>,
+}
+
+impl EnumTransformPlan {
+    fn new(analysis: &EnumAnalysis) -> Self {
+        let mut plan = Self::default();
+
+        for (alias, info) in &analysis.enums {
+            if !info.transformable {
+                continue;
+            }
+
+            let repr = repr_name(info.repr).to_string();
+            let variants = info
+                .variants
+                .iter()
+                .map(|variant| VariantReplacement {
+                    name: variant.name.as_str().to_string(),
+                    value: discriminant_literal(variant.value, &repr),
+                })
+                .collect();
+            plan.replacements.insert(
+                *alias,
+                EnumReplacement {
+                    repr: repr.clone(),
+                    variants,
+                },
+            );
+
+            for variant in &info.variants {
+                plan.variant_consts.insert(variant.const_def_id, *alias);
+            }
+
+            for site in &info.enum_to_int_cast_sites {
+                let entry = plan.cast_sites.entry(site.hir_id).or_insert(repr.clone());
+                debug_assert_eq!(entry, &repr);
+            }
+        }
+
+        plan
+    }
+}
+
+struct AstVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: AstToHir,
+    replacements: FxHashMap<LocalDefId, EnumReplacement>,
+    variant_consts: FxHashMap<LocalDefId, LocalDefId>,
+    cast_sites: FxHashMap<HirId, String>,
+    inserted_casts: FxHashSet<HirId>,
+}
+
+impl AstVisitor<'_> {
+    fn replacement_for_ty(&self, ty: &ast::Ty) -> Option<&EnumReplacement> {
+        let hir_ty = self.ast_to_hir.get_ty(ty.id, self.tcx)?;
+        let hir::TyKind::Path(QPath::Resolved(_, path)) = hir_ty.kind else {
+            return None;
+        };
+        let Res::Def(DefKind::TyAlias, def_id) = path.res else {
+            return None;
+        };
+        self.replacements.get(&def_id.as_local()?)
+    }
+
+    fn replacement_items(
+        &self,
+        item: &ast::Item,
+        replacement: &EnumReplacement,
+    ) -> SmallVec<[P<ast::Item>; 1]> {
+        let ast::ItemKind::TyAlias(box ast::TyAlias { ident, .. }) = &item.kind else { panic!() };
+        let enum_name = ident.name.as_str();
+        let variants = replacement
+            .variants
+            .iter()
+            .map(|variant| format!("{} = {}", variant.name, variant.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut enum_item = P(utils::item!(
+            "#[repr({})] #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] enum {} {{ {} }}",
+            replacement.repr,
+            enum_name,
+            variants
+        ));
+        enum_item.vis = item.vis.clone();
+
+        let mut attrs = item.attrs.clone();
+        attrs.extend(enum_item.attrs.drain(..));
+        enum_item.attrs = attrs;
+
+        let mut items = SmallVec::new();
+        items.push(enum_item);
+
+        for variant in &replacement.variants {
+            let mut use_item = P(utils::item!("use {}::{};", enum_name, variant.name));
+            use_item.vis = item.vis.clone();
+            items.push(use_item);
+        }
+
+        items
+    }
+}
+
+impl mut_visit::MutVisitor for AstVisitor<'_> {
+    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
+        let def_id = self.ast_to_hir.global_map.get(&item.id).copied();
+
+        if let Some(def_id) = def_id
+            && let Some(replacement) = self.replacements.get(&def_id)
+        {
+            return self.replacement_items(&item, replacement);
+        }
+
+        if def_id.is_some_and(|def_id| self.variant_consts.contains_key(&def_id)) {
+            return smallvec![];
+        }
+
+        mut_visit::walk_flat_map_item(self, item)
+    }
+
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        mut_visit::walk_expr(self, expr);
+
+        if let ast::ExprKind::Cast(_, ty) = &mut expr.kind
+            && let Some(repr) = self.replacement_for_ty(ty)
+        {
+            **ty = utils::ty!("{}", repr.repr);
+        }
+
+        let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+            return;
+        };
+        let hir_id = hir_expr.hir_id;
+        let Some(repr) = self.cast_sites.get(&hir_id) else {
+            return;
+        };
+        if !self.inserted_casts.insert(hir_id) {
+            return;
+        }
+
+        let expr_str = pprust::expr_to_string(expr);
+        *expr = utils::expr!("({expr_str}) as {repr}");
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -990,6 +1171,53 @@ fn integer_repr(ty: Ty<'_>) -> Option<IntegerRepr> {
         ty::TyKind::Uint(uint_ty) => Some(IntegerRepr::Unsigned(*uint_ty)),
         _ => None,
     }
+}
+
+fn repr_name(repr: IntegerRepr) -> &'static str {
+    match repr {
+        IntegerRepr::Signed(int_ty) => match int_ty {
+            ty::IntTy::Isize => "isize",
+            ty::IntTy::I8 => "i8",
+            ty::IntTy::I16 => "i16",
+            ty::IntTy::I32 => "i32",
+            ty::IntTy::I64 => "i64",
+            ty::IntTy::I128 => "i128",
+        },
+        IntegerRepr::Unsigned(uint_ty) => match uint_ty {
+            ty::UintTy::Usize => "usize",
+            ty::UintTy::U8 => "u8",
+            ty::UintTy::U16 => "u16",
+            ty::UintTy::U32 => "u32",
+            ty::UintTy::U64 => "u64",
+            ty::UintTy::U128 => "u128",
+        },
+    }
+}
+
+fn discriminant_literal(value: DiscriminantValue, repr: &str) -> String {
+    match value {
+        DiscriminantValue::Signed(value) => format!("{value}{repr}"),
+        DiscriminantValue::Unsigned(value) => format!("{value}{repr}"),
+    }
+}
+
+fn add_coverage_feature(krate: &mut ast::Crate, tcx: TyCtxt<'_>) {
+    if krate.attrs.iter().any(|attr| {
+        let ast::AttrKind::Normal(normal) = &attr.kind else {
+            return false;
+        };
+        attr.has_name(sym::feature)
+            && utils::ast::get_attr_arg(&normal.item.args)
+                .is_some_and(|arg| arg.as_str() == "coverage_attribute")
+    }) {
+        return;
+    }
+
+    krate.attrs.push(utils::ast::make_inner_attribute(
+        sym::feature,
+        Symbol::intern("coverage_attribute"),
+        tcx,
+    ));
 }
 
 fn eval_discriminant(
