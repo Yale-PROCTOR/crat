@@ -41,6 +41,7 @@ pub struct Analysis {
     output_params: OutputParams,
     ownership_schemes: Option<SolidifiedOwnershipSchemes>,
     offset_sign_result: OffsetSignResult,
+    nullity_result: analyses::nullity::NullityResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -85,6 +86,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
         source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+    let nullity_result = analyses::nullity::analyze(&input);
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
@@ -94,9 +96,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         output_params,
         ownership_schemes,
         offset_sign_result,
+        nullity_result,
     };
-
-    let _ = analyses::nullity::analyze(&input);
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
