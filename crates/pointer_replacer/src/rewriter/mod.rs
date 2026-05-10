@@ -4,7 +4,10 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ItemKind, OwnerNode};
-use rustc_middle::{mir::Local, ty::TyCtxt};
+use rustc_middle::{
+    mir::Local,
+    ty::{self, TyCtxt},
+};
 use rustc_span::def_id::LocalDefId;
 use serde::Deserialize;
 use transform::TransformVisitor;
@@ -38,6 +41,7 @@ pub struct Analysis {
     output_params: OutputParams,
     ownership_schemes: Option<SolidifiedOwnershipSchemes>,
     offset_sign_result: OffsetSignResult,
+    nullity_result: analyses::nullity::NullityResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -82,6 +86,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
         source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+    let nullity_result = analyses::nullity::analyze(&input);
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,
@@ -91,6 +96,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         output_params,
         ownership_schemes,
         offset_sign_result,
+        nullity_result,
     };
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
@@ -206,6 +212,45 @@ fn find_param_aliases<'tcx>(
         }
     }
     param_aliases
+}
+
+#[allow(unused)]
+fn print_nullity_counts(
+    input: &RustProgram<'_>,
+    nullity_result: &analyses::nullity::NullityResult,
+) {
+    for &did in &input.functions {
+        let body = input
+            .tcx
+            .mir_drops_elaborated_and_const_checked(did)
+            .borrow();
+        let raw_pointer_params = body
+            .args_iter()
+            .filter(|&local| matches!(body.local_decls[local].ty.kind(), ty::TyKind::RawPtr(..)))
+            .collect::<Vec<_>>();
+        let total = raw_pointer_params.len();
+        if total == 0 {
+            continue;
+        }
+
+        let non_null = nullity_result
+            .non_null_params
+            .get(&did)
+            .map(|params| {
+                raw_pointer_params
+                    .iter()
+                    .filter(|&&local| params.contains(local))
+                    .count()
+            })
+            .unwrap_or(0);
+
+        println!(
+            "crat_nullity\t{}\t{}\t{}",
+            input.tcx.def_path_str(did.to_def_id()),
+            total,
+            non_null
+        );
+    }
 }
 
 fn slice_cursor_mod_str() -> &'static str {
