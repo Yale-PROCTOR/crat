@@ -388,17 +388,6 @@ fn skips_leading_whitespace(spec: &ConversionSpec) -> bool {
     !matches!(spec.conversion, Conversion::Seq | Conversion::ScanSet(_))
 }
 
-pub(super) static IS_EOF: &str = r#"
-fn is_eof<R: std::io::BufRead>(mut stream: R, mut err: Option<&mut i32>, mut eof: Option<&mut i32>, consume_whitespace: bool) -> bool {
-    if consume_whitespace {
-        while peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()).is_ascii_whitespace() {
-            stream.consume(1);
-        }
-    }
-    peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut()) == 0xff
-}
-"#;
-
 pub(super) static PARSE_CHAR: &str = r#"
 fn parse_char<R: std::io::BufRead>(mut stream: R, _width: Option<usize>, mut err: Option<&mut i32>, mut eof: Option<&mut i32>) -> Option<i8> {
     let c = peek(&mut stream, err.as_deref_mut(), eof.as_deref_mut());
@@ -500,22 +489,6 @@ fn parse_f32<R: std::io::BufRead>(
 }
 "#;
 
-pub(super) static PARSE_F64: &str = r#"
-fn parse_f64<R: std::io::BufRead>(
-    stream: R,
-    width: Option<usize>,
-    err: Option<&mut i32>,
-    eof: Option<&mut i32>,
-) -> Option<f64> {
-    parse_float(
-        stream,
-        width,
-        err,
-        eof,
-    ).0
-}
-"#;
-
 pub(super) static PARSE_F128: &str = r#"
 fn parse_f128<R: std::io::BufRead>(
     stream: R,
@@ -529,17 +502,6 @@ fn parse_f128<R: std::io::BufRead>(
         err,
         eof,
     ).0
-}
-"#;
-
-pub(super) static PARSE_DECIMAL: &str = r#"
-fn parse_decimal<R: std::io::BufRead>(
-    mut stream: R,
-    width: Option<usize>,
-    mut err: Option<&mut i32>,
-    mut eof: Option<&mut i32>,
-) -> Option<u64> {
-    parse_integer(&mut stream, 10, true, width, err.as_deref_mut(), eof.as_deref_mut()).0
 }
 "#;
 
