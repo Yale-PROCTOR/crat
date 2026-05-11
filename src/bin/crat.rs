@@ -164,6 +164,7 @@ enum Pass {
     Lock,
     Union,
     Punning,
+    Enum,
     Io,
     Pointer,
     Static,
@@ -526,6 +527,10 @@ fn main() {
                 }
 
                 std::fs::write(&file, res.code).unwrap();
+            }
+            Pass::Enum => {
+                let s = run_compiler_on_path(&file, enum_replacer::replace_enums).unwrap();
+                std::fs::write(&file, s).unwrap();
             }
             Pass::Io => {
                 let res =

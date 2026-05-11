@@ -9,7 +9,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, HirId,
-    def::Res,
+    def::{DefKind, Res},
     def_id::{DefId, LocalModDefId},
     intravisit::{self, VisitorExt},
 };
@@ -100,11 +100,17 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
                 .iter()
                 .all(|def_id| {
                     def_id.as_local().is_some_and(|def_id| {
-                        !used_inv.get(&def_id).is_some_and(|using_items| {
+                        let used_same_module = used_inv.get(&def_id).is_some_and(|using_items| {
                             using_items.iter().any(|item| {
                                 used_items.contains(item) && use_mod == visitor.item_mods.get(item)
                             })
-                        })
+                        });
+                        let used_variant_reexport =
+                            matches!(tcx.def_kind(def_id), DefKind::Ctor(..) | DefKind::Variant)
+                                && used_inv.get(&def_id).is_some_and(|using_items| {
+                                    using_items.iter().any(|item| used_items.contains(item))
+                                });
+                        !used_same_module && !used_variant_reexport
                     })
                 })
                 .then_some(*use_def_id)
