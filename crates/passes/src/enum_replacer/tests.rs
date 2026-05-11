@@ -826,3 +826,251 @@ fn transform_alias_through_pointer_compiles() {
     assert!(code.contains("pub enum E"));
     assert!(code.contains("pub type EP = *mut E;"));
 }
+
+#[test]
+fn transform_rewrites_enum_match() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(e: E) -> core::ffi::c_int {
+                match e as core::ffi::c_uint {
+                    0 => 10,
+                    1 => 20,
+                    _ => 0,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match e {"));
+    assert!(code.contains("crate::E::A => 10"));
+    assert!(code.contains("crate::E::B => 20"));
+    assert!(!code.contains("match e as core::ffi::c_uint"));
+}
+
+#[test]
+fn transform_removes_exhaustive_final_wildcard() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(e: E) -> u32 {
+                match e as u32 {
+                    0 => 10,
+                    1 => 20,
+                    _ => 30,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match e {"));
+    assert!(!code.contains("_ => 30"));
+}
+
+#[test]
+fn transform_keeps_partial_final_wildcard() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 1;
+            pub const C: E = 2;
+
+            pub unsafe extern "C" fn f(e: E) -> u32 {
+                match e as u32 {
+                    0 => 10,
+                    1 => 20,
+                    _ => 30,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match e {"));
+    assert!(code.contains("_ => 30"));
+}
+
+#[test]
+fn transform_rewrites_or_pattern() {
+    let code = transform_and_compile(
+        r#"
+            pub type Token = u32;
+            pub const WORD: Token = 1;
+            pub const IDENT: Token = 6;
+            pub const OTHER: Token = 9;
+
+            pub unsafe extern "C" fn f(token: Token) -> u32 {
+                match token as u32 {
+                    1 | 6 => 10,
+                    9 => 20,
+                    _ => 0,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("crate::Token::WORD | crate::Token::IDENT => 10"));
+}
+
+#[test]
+fn transform_uses_qualified_paths_for_lowercase_variants() {
+    let code = transform_and_compile(
+        r#"
+            pub type c_bool = core::ffi::c_int;
+            pub const false_0: c_bool = 0 as core::ffi::c_int;
+            pub const true_0: c_bool = 1 as core::ffi::c_int;
+
+            pub unsafe extern "C" fn f(b: c_bool) -> core::ffi::c_int {
+                match b as core::ffi::c_int {
+                    0 => 10,
+                    1 => 20,
+                    _ => 0,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("crate::c_bool::false_0 => 10"));
+    assert!(code.contains("crate::c_bool::true_0 => 20"));
+    assert!(!code.contains("{ false_0 => 10"));
+}
+
+#[test]
+fn transform_rewrites_enum_field_match() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub struct S {
+                pub tag: E,
+            }
+
+            pub unsafe extern "C" fn f(s: S) -> core::ffi::c_int {
+                match s.tag as core::ffi::c_uint {
+                    0 => 10,
+                    1 => 20,
+                    _ => 0,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match s.tag {"));
+    assert!(code.contains("crate::E::A => 10"));
+    assert!(code.contains("crate::E::B => 20"));
+}
+
+#[test]
+fn transform_rewrites_signed_cast_target() {
+    let code = transform_and_compile(
+        r#"
+            pub type Operation = core::ffi::c_uint;
+            pub const OP_ADD: Operation = 1;
+            pub const OP_SUB: Operation = 2;
+
+            pub unsafe extern "C" fn f(op: Operation) -> core::ffi::c_int {
+                match op as core::ffi::c_int {
+                    1 => 10,
+                    2 => 20,
+                    _ => 0,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match op {"));
+    assert!(code.contains("crate::Operation::OP_ADD => 10"));
+    assert!(code.contains("crate::Operation::OP_SUB => 20"));
+}
+
+#[test]
+fn skip_non_enum_cast_chain_match() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(mode: u8) -> E {
+                match mode as u32 as core::ffi::c_uint {
+                    0 => A,
+                    _ => B,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match mode as u32 as core::ffi::c_uint"));
+}
+
+#[test]
+fn skip_unknown_numeric_arm() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(e: E) -> u32 {
+                match e as u32 {
+                    0 => 10,
+                    2 => 20,
+                    _ => 30,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match e as u32"));
+    assert!(code.contains("2 => 20"));
+}
+
+#[test]
+fn skip_colliding_casted_discriminants() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u16;
+            pub const A: E = 0;
+            pub const B: E = 256;
+
+            pub unsafe extern "C" fn f(e: E) -> u8 {
+                match e as u8 {
+                    0 => 10,
+                    _ => 20,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("match e as u8"));
+}
+
+#[test]
+fn keep_wildcard_with_guard() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(e: E, cond: bool) -> u32 {
+                match e as u32 {
+                    0 if cond => 10,
+                    1 => 20,
+                    _ => 30,
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("crate::E::A if cond => 10"));
+    assert!(code.contains("_ => 30"));
+}
