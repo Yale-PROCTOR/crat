@@ -344,7 +344,7 @@ fn accept_c_bool_style_flag_with_explicit_returns() {
             let info = enum_by_name(&analysis, tcx, "c_bool");
             assert!(info.transformable);
             assert!(info.reject_reasons.is_empty());
-            assert_eq!(info.enum_to_int_cast_sites.len(), 1);
+            assert!(info.enum_to_int_cast_sites.is_empty());
         },
     );
 }
@@ -417,7 +417,7 @@ fn same_enum_comparisons_need_no_casts() {
 }
 
 #[test]
-fn enum_integer_comparison_records_cast() {
+fn enum_integer_comparison_rewrites_directly() {
     analyze_with_tcx(
         r#"
             pub type E = core::ffi::c_uint;
@@ -435,7 +435,7 @@ fn enum_integer_comparison_records_cast() {
         |tcx, analysis| {
             let info = enum_by_name(&analysis, tcx, "E");
             assert!(info.transformable);
-            assert_eq!(info.enum_to_int_cast_sites.len(), 1);
+            assert!(info.enum_to_int_cast_sites.is_empty());
         },
     );
 }
@@ -696,6 +696,8 @@ fn transform_inserts_enum_to_integer_casts() {
     assert!(code.contains("as u32"));
     assert!(code.contains("takes_int((e) as u32)"));
     assert!(code.contains("return (e) as u32;"));
+    assert!(code.contains("if e == crate::E::B"));
+    assert!(!code.contains("if (e) as u32 == 1"));
 }
 
 #[test]
@@ -736,6 +738,259 @@ fn transform_avoids_unnecessary_casts() {
     );
 
     assert!(!code.contains(" as u32"));
+}
+
+#[test]
+fn transform_rewrites_casted_enum_variant_comparison() {
+    let code = transform_and_compile(
+        r#"
+            pub type Token = core::ffi::c_uint;
+            pub const TOKEN_EOF: Token = 0;
+            pub const TOKEN_WORD: Token = 1;
+
+            pub struct TokenState {
+                pub type_0: Token,
+            }
+
+            pub unsafe extern "C" fn f(token: TokenState) -> core::ffi::c_int {
+                if token.type_0 as core::ffi::c_uint !=
+                    TOKEN_EOF as core::ffi::c_int as core::ffi::c_uint
+                {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("token.type_0 != TOKEN_EOF"));
+    assert!(!code.contains("token.type_0 as core::ffi::c_uint !="));
+    assert!(!code.contains("TOKEN_EOF as core::ffi::c_int as core::ffi::c_uint"));
+}
+
+#[test]
+fn transform_rewrites_enum_literal_comparison() {
+    let code = transform_and_compile(
+        r#"
+            pub type c_bool = core::ffi::c_int;
+            pub const false_0: c_bool = 0 as core::ffi::c_int;
+            pub const true_0: c_bool = 1 as core::ffi::c_int;
+
+            pub unsafe extern "C" fn f(has_decimal_point: c_bool) -> core::ffi::c_int {
+                if (has_decimal_point) as i32 != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("has_decimal_point != crate::c_bool::false_0"));
+    assert!(!code.contains("(has_decimal_point) as i32 != 0"));
+}
+
+#[test]
+fn transform_rewrites_uncast_enum_literal_comparison() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(x: E) -> core::ffi::c_int {
+                if x == 1 as core::ffi::c_uint {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if x == crate::E::B"));
+    assert!(!code.contains("x == 1 as core::ffi::c_uint"));
+    assert!(!code.contains("(x) as u32"));
+}
+
+#[test]
+fn transform_rewrites_literal_on_left() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(x: E) -> core::ffi::c_int {
+                if 0 as core::ffi::c_uint == x as core::ffi::c_uint {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if crate::E::A == x"));
+    assert!(!code.contains("0 as core::ffi::c_uint == x as core::ffi::c_uint"));
+}
+
+#[test]
+fn transform_rewrites_lowercase_literal_variant() {
+    let code = transform_and_compile(
+        r#"
+            pub type c_bool = core::ffi::c_int;
+            pub const false_0: c_bool = 0 as core::ffi::c_int;
+            pub const true_0: c_bool = 1 as core::ffi::c_int;
+
+            pub unsafe extern "C" fn f(x: c_bool) -> core::ffi::c_int {
+                if x == 0 as core::ffi::c_int {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("x == crate::c_bool::false_0"));
+    assert!(!code.contains("if x == false_0"));
+}
+
+#[test]
+fn skip_enum_literal_comparison_unknown_value() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(x: E) -> core::ffi::c_int {
+                if x == 2 as core::ffi::c_uint {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if (x) as u32 == 2 as core::ffi::c_uint"));
+    assert!(!code.contains("x == crate::E::"));
+}
+
+#[test]
+fn skip_enum_literal_comparison_colliding_cast() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u16;
+            pub const A: E = 0;
+            pub const B: E = 256;
+
+            pub unsafe extern "C" fn f(x: E) -> core::ffi::c_int {
+                if x as u8 == 0 as u8 {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if x as u8 == 0 as u8"));
+    assert!(!code.contains("x == crate::E::A"));
+}
+
+#[test]
+fn skip_casted_enum_comparison_different_cast_semantics() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 2147483648;
+
+            pub unsafe extern "C" fn f(x: E, y: E) -> core::ffi::c_int {
+                if x as i32 as i64 == y as u32 as i64 {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if x as i32 as i64 == y as u32 as i64"));
+    assert!(!code.contains("if x == y"));
+}
+
+#[test]
+fn skip_casted_enum_relational_when_order_changes() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = u32;
+            pub const A: E = 0;
+            pub const B: E = 2147483648;
+
+            pub unsafe extern "C" fn f(x: E, y: E) -> core::ffi::c_int {
+                if (x as i32) < (y as i32) {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if (x as i32) < (y as i32)"));
+    assert!(!code.contains("if x < y"));
+}
+
+#[test]
+fn skip_different_enum_comparison() {
+    let code = transform_and_compile(
+        r#"
+            pub type E1 = u32;
+            pub const E1_A: E1 = 0;
+            pub const E1_B: E1 = 1;
+
+            pub type E2 = u32;
+            pub const E2_A: E2 = 0;
+            pub const E2_B: E2 = 1;
+
+            pub unsafe extern "C" fn f(x: E1, y: E2) -> core::ffi::c_int {
+                if x as u32 == y as u32 {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if x as u32 == y as u32"));
+    assert!(!code.contains("if x == y"));
+}
+
+#[test]
+fn skip_non_enum_cast_chain_comparison() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f(mode: u8) -> core::ffi::c_int {
+                if mode as u32 as core::ffi::c_uint != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            "#,
+    );
+
+    assert!(code.contains("if mode as u32 as core::ffi::c_uint != 0"));
 }
 
 #[test]
