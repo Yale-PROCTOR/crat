@@ -172,24 +172,74 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             }
         }
     }
+
+    fn visit_pat(&mut self, pat: &mut Pat) {
+        mut_visit::walk_pat(self, pat);
+
+        if let Some(hir_pat) = self.ast_to_hir.get_pat(pat.id, self.tcx) {
+            match &mut pat.kind {
+                PatKind::Path(None, path) => self.shorten_variant_pat_path(path, hir_pat.hir_id),
+                PatKind::TupleStruct(None, path, _) => {
+                    self.shorten_variant_pat_path(path, hir_pat.hir_id);
+                }
+                PatKind::Struct(None, path, _, _) => {
+                    self.shorten_variant_pat_path(path, hir_pat.hir_id);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl<'tcx> AstVisitor<'tcx> {
+    fn is_available(&self, def_id: LocalDefId, mod_id: LocalModDefId) -> bool {
+        mod_id == self.tcx.parent_module_from_def_id(def_id)
+            || self
+                .imports
+                .get(&mod_id)
+                .is_some_and(|s| s.contains(&def_id))
+    }
+
     fn shorten_path(&self, path: &mut Path, hir_id: hir::HirId) {
         if let Some(&res) = self.ast_to_hir.path_span_to_res.get(&path.span)
             && let Res::Def(_, def_id) = res
             && let Some(local_def_id) = def_id.as_local()
             && let mod_id = self.tcx.parent_module(hir_id)
-            && (mod_id == self.tcx.parent_module_from_def_id(local_def_id)
-                || self
-                    .imports
-                    .get(&mod_id)
-                    .is_some_and(|s| s.contains(&local_def_id)))
+            && self.is_available(local_def_id, mod_id)
             && let Some(last_seg) = path.segments.last().cloned()
         {
             path.segments.clear();
             path.segments.push(last_seg);
         }
+    }
+
+    fn shorten_variant_pat_path(&self, path: &mut Path, hir_id: hir::HirId) {
+        if path.segments.len() < 2 {
+            return;
+        }
+        if let Some(&res) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Some(enum_def_id) = self.enum_def_id_for_variant_res(res)
+            && let mod_id = self.tcx.parent_module(hir_id)
+            && self.is_available(enum_def_id, mod_id)
+        {
+            let enum_seg = path.segments[path.segments.len() - 2].clone();
+            let variant_seg = path.segments[path.segments.len() - 1].clone();
+            path.segments.clear();
+            path.segments.push(enum_seg);
+            path.segments.push(variant_seg);
+        }
+    }
+
+    fn enum_def_id_for_variant_res(&self, res: Res) -> Option<LocalDefId> {
+        let Res::Def(kind, def_id) = res else {
+            return None;
+        };
+        let variant_def_id = match kind {
+            hir::def::DefKind::Variant => def_id,
+            hir::def::DefKind::Ctor(hir::def::CtorOf::Variant, _) => self.tcx.parent(def_id),
+            _ => return None,
+        };
+        self.tcx.parent(variant_def_id).as_local()
     }
 
     fn hir_expr_to_loc(&self, expr: &hir::Expr<'tcx>) -> Option<Location> {
@@ -737,6 +787,24 @@ mod tests {
             "mod m { pub fn g() {} } use crate::m::g; fn f() { crate::m::g(); }",
             &["g()"],
             &["crate::m::g()"],
+        )
+    }
+
+    #[test]
+    fn test_shorten_enum_variant_pat_with_imported_enum() {
+        run_test(
+            "mod m { pub enum E { A, B } } use crate::m::E; fn f(e: E) -> i32 { match e { crate::m::E::A => 1, crate::m::E::B => 2 } }",
+            &["E::A => 1", "E::B => 2"],
+            &["crate::m::E::A", "crate::m::E::B"],
+        )
+    }
+
+    #[test]
+    fn test_shorten_enum_variant_pat_with_local_enum() {
+        run_test(
+            "enum E { A } fn f(e: E) -> i32 { match e { crate::E::A => 1 } }",
+            &["E::A => 1"],
+            &["crate::E::A", "{ A => 1"],
         )
     }
 }
