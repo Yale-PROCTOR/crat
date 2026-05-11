@@ -40,6 +40,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
         replacements: plan.replacements,
         variant_consts: plan.variant_consts,
         cast_sites: plan.cast_sites,
+        match_rewrites: plan.match_rewrites,
         inserted_casts: FxHashSet::default(),
     };
     visitor.visit_crate(&mut krate);
@@ -50,6 +51,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
 #[derive(Debug, Default)]
 pub struct EnumAnalysis {
     pub enums: FxHashMap<LocalDefId, EnumInfo>,
+    match_rewrites: Vec<MatchRewriteSite>,
 }
 
 #[derive(Debug)]
@@ -120,6 +122,31 @@ pub enum CastSiteKind {
 }
 
 #[derive(Clone, Debug)]
+struct MatchRewriteSite {
+    enum_alias: LocalDefId,
+    match_hir_id: HirId,
+    arms: Vec<ArmRewrite>,
+}
+
+#[derive(Clone, Debug)]
+struct MatchRewrite {
+    arms: FxHashMap<HirId, ArmRewriteAction>,
+}
+
+#[derive(Clone, Debug)]
+struct ArmRewrite {
+    arm_hir_id: HirId,
+    action: ArmRewriteAction,
+}
+
+#[derive(Clone, Debug)]
+enum ArmRewriteAction {
+    RewritePattern(Vec<String>),
+    KeepWildcard,
+    RemoveWildcard,
+}
+
+#[derive(Clone, Debug)]
 struct EnumReplacement {
     repr: String,
     variants: Vec<VariantReplacement>,
@@ -136,6 +163,7 @@ struct EnumTransformPlan {
     replacements: FxHashMap<LocalDefId, EnumReplacement>,
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
     cast_sites: FxHashMap<HirId, String>,
+    match_rewrites: FxHashMap<HirId, MatchRewrite>,
 }
 
 impl EnumTransformPlan {
@@ -174,6 +202,27 @@ impl EnumTransformPlan {
             }
         }
 
+        for site in &analysis.match_rewrites {
+            if !analysis
+                .enums
+                .get(&site.enum_alias)
+                .is_some_and(|info| info.transformable)
+            {
+                continue;
+            }
+
+            plan.match_rewrites.insert(
+                site.match_hir_id,
+                MatchRewrite {
+                    arms: site
+                        .arms
+                        .iter()
+                        .map(|arm| (arm.arm_hir_id, arm.action.clone()))
+                        .collect(),
+                },
+            );
+        }
+
         plan
     }
 }
@@ -184,6 +233,7 @@ struct AstVisitor<'tcx> {
     replacements: FxHashMap<LocalDefId, EnumReplacement>,
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
     cast_sites: FxHashMap<HirId, String>,
+    match_rewrites: FxHashMap<HirId, MatchRewrite>,
     inserted_casts: FxHashSet<HirId>,
 }
 
@@ -236,6 +286,48 @@ impl AstVisitor<'_> {
 
         items
     }
+
+    fn rewrite_match_expr(&mut self, expr: &mut ast::Expr) -> bool {
+        let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+            return false;
+        };
+        let Some(rewrite) = self.match_rewrites.get(&hir_expr.hir_id) else {
+            return false;
+        };
+        let ast::ExprKind::Match(scrutinee, arms, _) = &mut expr.kind else {
+            return false;
+        };
+
+        let base = pprust::expr_to_string(utils::ast::unwrap_cast_and_paren(scrutinee));
+        **scrutinee = utils::expr!("{base}");
+
+        let len = arms.len();
+        let mut remove_last = false;
+        for (index, arm) in arms.iter_mut().enumerate() {
+            let Some(hir_arm) = self.ast_to_hir.get_arm(arm.id, self.tcx) else {
+                continue;
+            };
+            let Some(action) = rewrite.arms.get(&hir_arm.hir_id) else {
+                continue;
+            };
+            match action {
+                ArmRewriteAction::RewritePattern(paths) => {
+                    let pat = paths.join(" | ");
+                    arm.pat = Box::new(utils::pat!("{pat}"));
+                }
+                ArmRewriteAction::KeepWildcard => {}
+                ArmRewriteAction::RemoveWildcard => {
+                    remove_last = index + 1 == len;
+                }
+            }
+        }
+
+        if remove_last {
+            arms.pop();
+        }
+
+        true
+    }
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -257,6 +349,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 
     fn visit_expr(&mut self, expr: &mut ast::Expr) {
         mut_visit::walk_expr(self, expr);
+
+        if self.rewrite_match_expr(expr) {
+            return;
+        }
 
         if let ast::ExprKind::Cast(_, ty) = &mut expr.kind
             && let Some(repr) = self.replacement_for_ty(ty)
@@ -610,6 +706,24 @@ enum ExprEnumClass {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CastedIntegerValue {
+    Signed(i128),
+    Unsigned(u128),
+}
+
+#[derive(Clone, Debug)]
+enum NumericPatValues {
+    Values(Vec<CastedIntegerValue>),
+    Wildcard,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EnumCastScrutinee {
+    enum_alias: LocalDefId,
+    target_repr: IntegerRepr,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredContext {
     Let,
@@ -787,6 +901,126 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
         if let Some(rhs) = rhs {
             self.record_enum_value_cast(rhs, kind);
         }
+    }
+
+    fn enum_cast_scrutinee(&self, scrutinee: &'tcx hir::Expr<'tcx>) -> Option<EnumCastScrutinee> {
+        let typeck = self.tcx.typeck(scrutinee.hir_id.owner.def_id);
+        let target_repr = integer_repr(typeck.expr_ty(scrutinee))?;
+
+        let mut base = utils::hir::unwrap_drop_temps(scrutinee);
+        let mut saw_cast = false;
+        loop {
+            match base.kind {
+                hir::ExprKind::Use(expr, _) => {
+                    base = utils::hir::unwrap_drop_temps(expr);
+                }
+                hir::ExprKind::Cast(expr, _) => {
+                    saw_cast = true;
+                    base = utils::hir::unwrap_drop_temps(expr);
+                }
+                _ => break,
+            }
+        }
+        if !saw_cast {
+            return None;
+        }
+
+        let ExprEnumClass::Enum(enum_alias) = self.classify_expr(base) else {
+            return None;
+        };
+        self.analysis
+            .enums
+            .get(&enum_alias)
+            .is_some_and(|info| info.transformable)
+            .then_some(EnumCastScrutinee {
+                enum_alias,
+                target_repr,
+            })
+    }
+
+    fn casted_variant_paths(
+        &self,
+        info: &EnumInfo,
+        target_repr: IntegerRepr,
+    ) -> Option<FxHashMap<CastedIntegerValue, String>> {
+        let mut paths = FxHashMap::default();
+        for variant in &info.variants {
+            let value = cast_discriminant_value(variant.value, info.repr, target_repr, self.tcx)?;
+            let path = format!(
+                "crate::{}::{}",
+                self.tcx.def_path_str(info.alias.to_def_id()),
+                variant.name
+            );
+            if paths.insert(value, path).is_some() {
+                return None;
+            }
+        }
+        Some(paths)
+    }
+
+    fn try_record_match_rewrite(
+        &mut self,
+        expr: &'tcx hir::Expr<'tcx>,
+        scrutinee: &'tcx hir::Expr<'tcx>,
+        arms: &'tcx [hir::Arm<'tcx>],
+    ) {
+        let Some(scrutinee) = self.enum_cast_scrutinee(scrutinee) else {
+            return;
+        };
+        let Some(info) = self.analysis.enums.get(&scrutinee.enum_alias) else {
+            return;
+        };
+        let Some(variant_paths) = self.casted_variant_paths(info, scrutinee.target_repr) else {
+            return;
+        };
+
+        let mut rewrites = Vec::new();
+        let mut covered_variants = FxHashSet::default();
+        let mut has_guard = false;
+        for arm in arms {
+            has_guard |= arm.guard.is_some();
+            match numeric_pat_values(arm.pat, scrutinee.target_repr, self.tcx) {
+                Some(NumericPatValues::Values(values)) => {
+                    let mut paths = Vec::with_capacity(values.len());
+                    for value in values {
+                        let Some(path) = variant_paths.get(&value) else {
+                            return;
+                        };
+                        paths.push(path.clone());
+                        if arm.guard.is_none() {
+                            covered_variants.insert(value);
+                        }
+                    }
+                    rewrites.push(ArmRewrite {
+                        arm_hir_id: arm.hir_id,
+                        action: ArmRewriteAction::RewritePattern(paths),
+                    });
+                }
+                Some(NumericPatValues::Wildcard) => {
+                    rewrites.push(ArmRewrite {
+                        arm_hir_id: arm.hir_id,
+                        action: ArmRewriteAction::KeepWildcard,
+                    });
+                }
+                None => return,
+            }
+        }
+
+        let remove_final_wildcard = !has_guard
+            && covered_variants.len() == variant_paths.len()
+            && arms.last().is_some_and(|arm| arm.guard.is_none())
+            && rewrites
+                .last()
+                .is_some_and(|arm| matches!(&arm.action, ArmRewriteAction::KeepWildcard));
+        if remove_final_wildcard && let Some(last) = rewrites.last_mut() {
+            last.action = ArmRewriteAction::RemoveWildcard;
+        }
+
+        self.analysis.match_rewrites.push(MatchRewriteSite {
+            enum_alias: scrutinee.enum_alias,
+            match_hir_id: expr.hir_id,
+            arms: rewrites,
+        });
     }
 
     fn classify_expr(&self, expr: &'tcx hir::Expr<'tcx>) -> ExprEnumClass {
@@ -1070,6 +1304,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for BodyVisitor<'_, 'tcx> {
             hir::ExprKind::Struct(_, fields, _) => {
                 self.check_struct_fields(expr, fields);
             }
+            hir::ExprKind::Match(scrutinee, arms, hir::MatchSource::Normal) => {
+                self.try_record_match_rewrite(expr, scrutinee, arms);
+            }
             hir::ExprKind::Binary(op, lhs, rhs) => {
                 self.handle_binary(expr, op.node, lhs, rhs);
             }
@@ -1170,6 +1407,142 @@ fn integer_repr(ty: Ty<'_>) -> Option<IntegerRepr> {
         ty::TyKind::Int(int_ty) => Some(IntegerRepr::Signed(*int_ty)),
         ty::TyKind::Uint(uint_ty) => Some(IntegerRepr::Unsigned(*uint_ty)),
         _ => None,
+    }
+}
+
+fn numeric_pat_values(
+    pat: &hir::Pat<'_>,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<NumericPatValues> {
+    match pat.kind {
+        hir::PatKind::Expr(expr) => Some(NumericPatValues::Values(vec![numeric_pat_expr_value(
+            expr,
+            target_repr,
+            tcx,
+        )?])),
+        hir::PatKind::Or(pats) => {
+            let mut values = Vec::new();
+            for pat in pats {
+                match numeric_pat_values(pat, target_repr, tcx)? {
+                    NumericPatValues::Values(pat_values) => values.extend(pat_values),
+                    NumericPatValues::Wildcard => return None,
+                }
+            }
+            Some(NumericPatValues::Values(values))
+        }
+        hir::PatKind::Wild => Some(NumericPatValues::Wildcard),
+        _ => None,
+    }
+}
+
+fn numeric_pat_expr_value(
+    expr: &hir::PatExpr<'_>,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let hir::PatExprKind::Lit { lit, negated } = expr.kind else {
+        return None;
+    };
+    let ast::LitKind::Int(value, _) = lit.node else {
+        return None;
+    };
+    cast_literal_value(value.get(), negated, target_repr, tcx)
+}
+
+fn cast_literal_value(
+    value: u128,
+    negated: bool,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let width = integer_width(target_repr, tcx);
+    match target_repr {
+        IntegerRepr::Signed(_) => {
+            let sign_bit = 1u128 << (width - 1);
+            let max = sign_bit - 1;
+            let value = if negated {
+                if value > sign_bit {
+                    return None;
+                }
+                if value == sign_bit && width == 128 {
+                    i128::MIN
+                } else {
+                    -(value as i128)
+                }
+            } else {
+                if value > max {
+                    return None;
+                }
+                value as i128
+            };
+            Some(CastedIntegerValue::Signed(value))
+        }
+        IntegerRepr::Unsigned(_) => {
+            if negated || value > low_bits_mask(width) {
+                return None;
+            }
+            Some(CastedIntegerValue::Unsigned(value))
+        }
+    }
+}
+
+fn cast_discriminant_value(
+    value: DiscriminantValue,
+    _source_repr: IntegerRepr,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let width = integer_width(target_repr, tcx);
+    let bits = match value {
+        DiscriminantValue::Signed(value) => value as u128,
+        DiscriminantValue::Unsigned(value) => value,
+    } & low_bits_mask(width);
+    Some(match target_repr {
+        IntegerRepr::Signed(_) => CastedIntegerValue::Signed(signed_value_from_bits(bits, width)),
+        IntegerRepr::Unsigned(_) => CastedIntegerValue::Unsigned(bits),
+    })
+}
+
+fn integer_width(repr: IntegerRepr, tcx: TyCtxt<'_>) -> u32 {
+    match repr {
+        IntegerRepr::Signed(int_ty) => match int_ty {
+            ty::IntTy::Isize => tcx.data_layout.pointer_size.bits() as u32,
+            ty::IntTy::I8 => 8,
+            ty::IntTy::I16 => 16,
+            ty::IntTy::I32 => 32,
+            ty::IntTy::I64 => 64,
+            ty::IntTy::I128 => 128,
+        },
+        IntegerRepr::Unsigned(uint_ty) => match uint_ty {
+            ty::UintTy::Usize => tcx.data_layout.pointer_size.bits() as u32,
+            ty::UintTy::U8 => 8,
+            ty::UintTy::U16 => 16,
+            ty::UintTy::U32 => 32,
+            ty::UintTy::U64 => 64,
+            ty::UintTy::U128 => 128,
+        },
+    }
+}
+
+fn low_bits_mask(width: u32) -> u128 {
+    if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+
+fn signed_value_from_bits(bits: u128, width: u32) -> i128 {
+    if width == 128 {
+        bits as i128
+    } else {
+        let sign_bit = 1u128 << (width - 1);
+        if bits & sign_bit == 0 {
+            bits as i128
+        } else {
+            (bits as i128) - (1i128 << width)
+        }
     }
 }
 
