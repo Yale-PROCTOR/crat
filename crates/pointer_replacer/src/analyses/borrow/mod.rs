@@ -260,18 +260,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         let mut loans = vec![];
                         let loan = self.loans.push(BorrowData {
                             location,
-                            // field-sensitive
-                            // borrowed: *place,
-                            // field-insensitive
-                            borrowed: {
-                                let is_indirect = place.is_indirect_first_projection();
-                                let place = Place::from(place.local);
-                                if is_indirect {
-                                    place.project_deeper(&[PlaceElem::Deref], self.tcx)
-                                } else {
-                                    place
-                                }
-                            },
+                            borrowed: *place,
                             assigned: Borrower::AssignStmt(*lhs),
                         });
                         loans.push(loan);
