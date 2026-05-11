@@ -19,6 +19,7 @@ extern crate smallvec;
 extern crate thin_vec;
 
 pub mod bin_file_adder;
+pub mod enum_replacer;
 pub mod expander;
 pub mod extern_resolver;
 pub mod formatter;

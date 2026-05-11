@@ -129,6 +129,7 @@ fn make_resolve_map(
         .values()
         .chain(result.equiv_tys.values())
         .chain(result.equiv_fns.values())
+        .chain(result.equiv_consts.values())
         .chain(result.equiv_statics.values())
         .chain(std::iter::once(&result.equiv_unnameds))
     {
@@ -380,6 +381,8 @@ struct ResolveResult {
     equiv_fns: FxHashMap<Symbol, EquivClasses<LocalDefId>>,
     extern_fns: Vec<(LocalDefId, Vec<EquivClassId>)>,
 
+    equiv_consts: FxHashMap<Symbol, EquivClasses<LocalDefId>>,
+
     equiv_statics: FxHashMap<Symbol, EquivClasses<LocalDefId>>,
     extern_statics: Vec<(LocalDefId, Vec<EquivClassId>)>,
 }
@@ -506,6 +509,16 @@ fn resolve(ignore_return_type: bool, ignore_param_type: bool, tcx: TyCtxt<'_>) -
         extern_fns.push((def_id, link_candidates));
     }
 
+    let mut equiv_consts: FxHashMap<_, EquivClasses<LocalDefId>> = FxHashMap::default();
+    for def_id in hir_data.consts {
+        let name = utils::ir::def_id_to_symbol(def_id, tcx).unwrap();
+        let classes = equiv_consts.entry(name).or_insert_with(EquivClasses::new);
+        classes.insert(def_id, |id1, id2| {
+            cmp.with_equiv_unnameds_update(|cmp| cmp.cmp_type_of(*id1, *id2))
+                && const_body_eq(*id1, *id2, tcx)
+        });
+    }
+
     let mut equiv_statics: FxHashMap<_, EquivClasses<LocalDefId>> = FxHashMap::default();
     for def_id in hir_data.statics {
         let name = utils::ir::def_id_to_symbol(def_id, tcx).unwrap();
@@ -548,9 +561,23 @@ fn resolve(ignore_return_type: bool, ignore_param_type: bool, tcx: TyCtxt<'_>) -
         equiv_tys,
         equiv_fns,
         extern_fns,
+        equiv_consts,
         equiv_statics,
         extern_statics,
     }
+}
+
+fn const_body_eq(def_id1: LocalDefId, def_id2: LocalDefId, tcx: TyCtxt<'_>) -> bool {
+    let hir::Node::Item(item1) = tcx.hir_node_by_def_id(def_id1) else { panic!() };
+    let hir::Node::Item(item2) = tcx.hir_node_by_def_id(def_id2) else { panic!() };
+    let hir::ItemKind::Const(_, _, _, body_id1) = item1.kind else { panic!() };
+    let hir::ItemKind::Const(_, _, _, body_id2) = item2.kind else { panic!() };
+
+    let source_map = tcx.sess.source_map();
+    let body1 = tcx.hir_body(body_id1).value;
+    let body2 = tcx.hir_body(body_id2).value;
+    source_map.span_to_snippet(body1.span).unwrap()
+        == source_map.span_to_snippet(body2.span).unwrap()
 }
 
 fn filter_by_common_def_path(
@@ -839,6 +866,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
         let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();
         if let ast::ItemKind::Fn(..)
+        | ast::ItemKind::Const(..)
         | ast::ItemKind::Static(..)
         | ast::ItemKind::Struct(..)
         | ast::ItemKind::Union(..)
@@ -988,6 +1016,7 @@ impl<'tcx> HirVisitor<'tcx> {
 #[derive(Default)]
 struct HirData {
     fns: Vec<LocalDefId>,
+    consts: Vec<LocalDefId>,
     statics: Vec<LocalDefId>,
     adts: Vec<LocalDefId>,
     tys: Vec<LocalDefId>,
@@ -1006,6 +1035,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) -> Self::Result {
         let vec = match item.kind {
             hir::ItemKind::Fn { .. } => Some(&mut self.data.fns),
+            hir::ItemKind::Const(..) => Some(&mut self.data.consts),
             hir::ItemKind::Static(..) => Some(&mut self.data.statics),
             hir::ItemKind::Struct(..) | hir::ItemKind::Union(..) => Some(&mut self.data.adts),
             hir::ItemKind::TyAlias(..) => Some(&mut self.data.tys),

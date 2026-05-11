@@ -100,6 +100,35 @@ mod b {
 }
 
 #[test]
+fn test_transformation_variant_reexport_used_from_other_module() {
+    let code = r#"
+mod a {
+    pub enum E {
+        A,
+        B,
+    }
+    pub use E::A;
+    pub use E::B;
+}
+mod b {
+    use crate::a::A;
+    pub fn f() -> crate::a::E {
+        A
+    }
+}
+fn main() {
+    b::f();
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["pub use E::A;", "fn f() -> crate::a::E"],
+        &["pub use E::B;"],
+    );
+}
+
+#[test]
 fn test_transformation_unused_method() {
     let code = r#"
 trait A {

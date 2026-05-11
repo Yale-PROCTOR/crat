@@ -2387,6 +2387,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                     .join(", ");
                 utils::expr!("{} {{ {} }}", ty_name, fields)
             }
+            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_enum() => {
+                let ty_name = mir_ty_to_string(ty, self.tcx);
+                let variant_name = fieldless_enum_zero_variant(self.tcx, *adt_def).unwrap();
+                utils::expr!("{}::{}", ty_name, variant_name)
+            }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
                 let ty_name = mir_ty_to_string(ty, self.tcx);
                 utils::expr!(
@@ -5412,6 +5417,9 @@ fn ty_supports_raw_bridge_default_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>
         ty::TyKind::Tuple(elems) => elems
             .iter()
             .all(|elem| ty_supports_raw_bridge_default_expr(tcx, elem)),
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_enum() => {
+            fieldless_enum_zero_variant(tcx, *adt_def).is_some()
+        }
         ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() && adt_def.is_struct() => {
             adt_def
                 .all_fields()
@@ -5419,6 +5427,25 @@ fn ty_supports_raw_bridge_default_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>
         }
         _ => false,
     }
+}
+
+fn fieldless_enum_zero_variant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def: ty::AdtDef<'tcx>,
+) -> Option<Symbol> {
+    if !adt_def.is_enum()
+        || !adt_def
+            .variants()
+            .iter()
+            .all(|variant| variant.fields.is_empty())
+    {
+        return None;
+    }
+
+    adt_def
+        .discriminants(tcx)
+        .find(|(_, discr)| discr.val == 0)
+        .map(|(idx, _)| adt_def.variant(idx).name)
 }
 
 fn raw_array_len_expr_from_bytes<'tcx>(
@@ -9144,6 +9171,68 @@ pub struct UnionHolderProbe {{
 
 pub fn check() {{
     let _: Option<Box<crate::UnionHolderProbe>> = {emitted};
+}}
+"#
+            );
+            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
+                .expect(&check_code);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn raw_bridge_default_materialization_handles_fieldless_enum_fields() {
+        let code = r#"
+#[repr(i32)]
+pub enum StatusCode {
+    STATUS_ERROR = -1,
+    STATUS_SUCCESS = 0,
+    STATUS_WARNING = 1,
+}
+
+#[repr(C)]
+pub struct ComputationResult {
+    pub value: i32,
+    pub status: StatusCode,
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let struct_ty = find_struct_ty(tcx, "ComputationResult");
+            assert!(ty_supports_raw_bridge_default_expr(tcx, struct_ty));
+
+            let visitor = synthetic_transform_visitor(tcx);
+            let raw_expr = visitor.raw_bridge_expr(
+                struct_ty,
+                true,
+                &RawBridgeInfo::Array {
+                    len_expr: "count".to_string(),
+                },
+            );
+            let emitted = pprust::expr_to_string(&raw_expr);
+            assert!(emitted.contains("Box::leak("), "{emitted}");
+            assert!(
+                emitted.contains("status: crate::StatusCode::STATUS_SUCCESS"),
+                "{emitted}"
+            );
+
+            let check_code = format!(
+                r#"
+#[repr(i32)]
+pub enum StatusCode {{
+    STATUS_ERROR = -1,
+    STATUS_SUCCESS = 0,
+    STATUS_WARNING = 1,
+}}
+
+#[repr(C)]
+pub struct ComputationResult {{
+    pub value: i32,
+    pub status: StatusCode,
+}}
+
+pub fn check(count: usize) {{
+    let _: *mut crate::ComputationResult = {emitted};
 }}
 "#
             );
