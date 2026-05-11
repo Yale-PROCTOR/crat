@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use rustc_abi::VariantIdx;
 use rustc_ast::{
     self as ast,
@@ -41,6 +43,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
         variant_consts: plan.variant_consts,
         cast_sites: plan.cast_sites,
         match_rewrites: plan.match_rewrites,
+        comparison_rewrites: plan.comparison_rewrites,
         inserted_casts: FxHashSet::default(),
     };
     visitor.visit_crate(&mut krate);
@@ -52,6 +55,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
 pub struct EnumAnalysis {
     pub enums: FxHashMap<LocalDefId, EnumInfo>,
     match_rewrites: Vec<MatchRewriteSite>,
+    comparison_rewrites: Vec<ComparisonRewriteSite>,
 }
 
 #[derive(Debug)]
@@ -134,6 +138,26 @@ struct MatchRewrite {
 }
 
 #[derive(Clone, Debug)]
+struct ComparisonRewriteSite {
+    enum_alias: LocalDefId,
+    expr_hir_id: HirId,
+    lhs: ComparisonOperandRewrite,
+    rhs: ComparisonOperandRewrite,
+}
+
+#[derive(Clone, Debug)]
+struct ComparisonRewrite {
+    lhs: ComparisonOperandRewrite,
+    rhs: ComparisonOperandRewrite,
+}
+
+#[derive(Clone, Debug)]
+enum ComparisonOperandRewrite {
+    StripCasts,
+    ReplaceWithVariantPath(String),
+}
+
+#[derive(Clone, Debug)]
 struct ArmRewrite {
     arm_hir_id: HirId,
     action: ArmRewriteAction,
@@ -164,6 +188,7 @@ struct EnumTransformPlan {
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
+    comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
 }
 
 impl EnumTransformPlan {
@@ -223,6 +248,24 @@ impl EnumTransformPlan {
             );
         }
 
+        for site in &analysis.comparison_rewrites {
+            if !analysis
+                .enums
+                .get(&site.enum_alias)
+                .is_some_and(|info| info.transformable)
+            {
+                continue;
+            }
+
+            plan.comparison_rewrites.insert(
+                site.expr_hir_id,
+                ComparisonRewrite {
+                    lhs: site.lhs.clone(),
+                    rhs: site.rhs.clone(),
+                },
+            );
+        }
+
         plan
     }
 }
@@ -234,6 +277,7 @@ struct AstVisitor<'tcx> {
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
+    comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
     inserted_casts: FxHashSet<HirId>,
 }
 
@@ -328,6 +372,34 @@ impl AstVisitor<'_> {
 
         true
     }
+
+    fn rewrite_comparison_expr(&mut self, expr: &mut ast::Expr) -> bool {
+        let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+            return false;
+        };
+        let Some(rewrite) = self.comparison_rewrites.get(&hir_expr.hir_id) else {
+            return false;
+        };
+        let ast::ExprKind::Binary(_, lhs, rhs) = &mut expr.kind else {
+            return false;
+        };
+
+        Self::rewrite_comparison_operand(lhs, &rewrite.lhs);
+        Self::rewrite_comparison_operand(rhs, &rewrite.rhs);
+        true
+    }
+
+    fn rewrite_comparison_operand(operand: &mut P<ast::Expr>, rewrite: &ComparisonOperandRewrite) {
+        match rewrite {
+            ComparisonOperandRewrite::StripCasts => {
+                let base = pprust::expr_to_string(utils::ast::unwrap_cast_and_paren(operand));
+                **operand = utils::expr!("{base}");
+            }
+            ComparisonOperandRewrite::ReplaceWithVariantPath(path) => {
+                **operand = utils::expr!("{path}");
+            }
+        }
+    }
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -351,6 +423,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
         mut_visit::walk_expr(self, expr);
 
         if self.rewrite_match_expr(expr) {
+            return;
+        }
+
+        if self.rewrite_comparison_expr(expr) {
             return;
         }
 
@@ -724,6 +800,17 @@ struct EnumCastScrutinee {
     target_repr: IntegerRepr,
 }
 
+#[derive(Clone, Debug)]
+struct EnumComparisonOperand {
+    enum_alias: LocalDefId,
+    cast_chain: Vec<IntegerRepr>,
+}
+
+#[derive(Clone, Debug)]
+struct QualifiedVariant {
+    path: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredContext {
     Let,
@@ -956,6 +1043,222 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             }
         }
         Some(paths)
+    }
+
+    fn enum_comparison_operand(
+        &self,
+        expr: &'tcx hir::Expr<'tcx>,
+    ) -> Option<EnumComparisonOperand> {
+        let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+        let mut base = utils::hir::unwrap_drop_temps(expr);
+        let mut cast_chain = Vec::new();
+
+        loop {
+            match base.kind {
+                hir::ExprKind::Use(expr, _) => {
+                    base = utils::hir::unwrap_drop_temps(expr);
+                }
+                hir::ExprKind::Cast(expr, _) => {
+                    cast_chain.push(integer_repr(typeck.expr_ty(base))?);
+                    base = utils::hir::unwrap_drop_temps(expr);
+                }
+                _ => break,
+            }
+        }
+        cast_chain.reverse();
+
+        let ExprEnumClass::Enum(enum_alias) = self.classify_expr(base) else {
+            return None;
+        };
+        self.analysis
+            .enums
+            .get(&enum_alias)
+            .is_some_and(|info| info.transformable)
+            .then_some(EnumComparisonOperand {
+                enum_alias,
+                cast_chain,
+            })
+    }
+
+    fn casted_variants_for_operand(
+        &self,
+        info: &EnumInfo,
+        cast_chain: &[IntegerRepr],
+    ) -> Option<FxHashMap<CastedIntegerValue, QualifiedVariant>> {
+        let mut variants = FxHashMap::default();
+        for variant in &info.variants {
+            let value =
+                cast_discriminant_through_chain(variant.value, info.repr, cast_chain, self.tcx)?;
+            let path = format!(
+                "crate::{}::{}",
+                self.tcx.def_path_str(info.alias.to_def_id()),
+                variant.name
+            );
+            if variants.insert(value, QualifiedVariant { path }).is_some() {
+                return None;
+            }
+        }
+        Some(variants)
+    }
+
+    fn casted_variant_values_for_operand(
+        &self,
+        info: &EnumInfo,
+        cast_chain: &[IntegerRepr],
+    ) -> Option<Vec<CastedIntegerValue>> {
+        info.variants
+            .iter()
+            .map(|variant| {
+                cast_discriminant_through_chain(variant.value, info.repr, cast_chain, self.tcx)
+            })
+            .collect()
+    }
+
+    fn comparison_casts_compatible(
+        &self,
+        info: &EnumInfo,
+        lhs_cast_chain: &[IntegerRepr],
+        rhs_cast_chain: &[IntegerRepr],
+    ) -> Option<bool> {
+        self.casted_variants_for_operand(info, lhs_cast_chain)?;
+        self.casted_variants_for_operand(info, rhs_cast_chain)?;
+        let lhs_values = self.casted_variant_values_for_operand(info, lhs_cast_chain)?;
+        let rhs_values = self.casted_variant_values_for_operand(info, rhs_cast_chain)?;
+        Some(lhs_values == rhs_values)
+    }
+
+    fn comparison_order_preserved(
+        &self,
+        info: &EnumInfo,
+        cast_chain: &[IntegerRepr],
+    ) -> Option<bool> {
+        let values = self.casted_variant_values_for_operand(info, cast_chain)?;
+        Some(
+            values
+                .windows(2)
+                .all(|values| compare_casted_values(values[0], values[1]) == Some(Ordering::Less)),
+        )
+    }
+
+    fn literal_comparison_target_repr(
+        &self,
+        info: &EnumInfo,
+        enum_operand: &EnumComparisonOperand,
+        literal_expr: &'tcx hir::Expr<'tcx>,
+    ) -> IntegerRepr {
+        enum_operand
+            .cast_chain
+            .last()
+            .copied()
+            .or_else(|| {
+                let typeck = self.tcx.typeck(literal_expr.hir_id.owner.def_id);
+                integer_repr(typeck.expr_ty(literal_expr))
+            })
+            .unwrap_or(info.repr)
+    }
+
+    fn try_record_casted_enum_comparison(
+        &mut self,
+        expr: &'tcx hir::Expr<'tcx>,
+        op: BinOpKind,
+        lhs: &'tcx hir::Expr<'tcx>,
+        rhs: &'tcx hir::Expr<'tcx>,
+    ) -> bool {
+        let Some(lhs_operand) = self.enum_comparison_operand(lhs) else {
+            return false;
+        };
+        let Some(rhs_operand) = self.enum_comparison_operand(rhs) else {
+            return false;
+        };
+        if lhs_operand.enum_alias != rhs_operand.enum_alias {
+            return false;
+        }
+
+        let enum_alias = lhs_operand.enum_alias;
+        let can_rewrite = {
+            let Some(info) = self.analysis.enums.get(&enum_alias) else {
+                return false;
+            };
+            self.comparison_casts_compatible(info, &lhs_operand.cast_chain, &rhs_operand.cast_chain)
+                == Some(true)
+                && (!is_relational_comparison(op)
+                    || self.comparison_order_preserved(info, &lhs_operand.cast_chain) == Some(true))
+        };
+        if !can_rewrite {
+            return false;
+        }
+
+        self.analysis
+            .comparison_rewrites
+            .push(ComparisonRewriteSite {
+                enum_alias,
+                expr_hir_id: expr.hir_id,
+                lhs: ComparisonOperandRewrite::StripCasts,
+                rhs: ComparisonOperandRewrite::StripCasts,
+            });
+        true
+    }
+
+    fn try_record_enum_literal_comparison(
+        &mut self,
+        expr: &'tcx hir::Expr<'tcx>,
+        op: BinOpKind,
+        enum_expr: &'tcx hir::Expr<'tcx>,
+        literal_expr: &'tcx hir::Expr<'tcx>,
+        enum_on_lhs: bool,
+    ) -> bool {
+        let Some(enum_operand) = self.enum_comparison_operand(enum_expr) else {
+            return false;
+        };
+
+        let enum_alias = enum_operand.enum_alias;
+        let variant_path = {
+            let Some(info) = self.analysis.enums.get(&enum_alias) else {
+                return false;
+            };
+            if is_relational_comparison(op)
+                && self.comparison_order_preserved(info, &enum_operand.cast_chain) != Some(true)
+            {
+                return false;
+            }
+
+            let target_repr =
+                self.literal_comparison_target_repr(info, &enum_operand, literal_expr);
+            let variants = match self.casted_variants_for_operand(info, &enum_operand.cast_chain) {
+                Some(variants) => variants,
+                None => return false,
+            };
+            let Some(literal_value) = numeric_expr_value(literal_expr, target_repr, self.tcx)
+            else {
+                return false;
+            };
+            let Some(variant) = variants.get(&literal_value) else {
+                return false;
+            };
+            variant.path.clone()
+        };
+
+        let (lhs, rhs) = if enum_on_lhs {
+            (
+                ComparisonOperandRewrite::StripCasts,
+                ComparisonOperandRewrite::ReplaceWithVariantPath(variant_path),
+            )
+        } else {
+            (
+                ComparisonOperandRewrite::ReplaceWithVariantPath(variant_path),
+                ComparisonOperandRewrite::StripCasts,
+            )
+        };
+
+        self.analysis
+            .comparison_rewrites
+            .push(ComparisonRewriteSite {
+                enum_alias,
+                expr_hir_id: expr.hir_id,
+                lhs,
+                rhs,
+            });
+        true
     }
 
     fn try_record_match_rewrite(
@@ -1211,6 +1514,12 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             ) {
                 return;
             }
+            if self.try_record_casted_enum_comparison(expr, op, lhs, rhs)
+                || self.try_record_enum_literal_comparison(expr, op, lhs, rhs, true)
+                || self.try_record_enum_literal_comparison(expr, op, rhs, lhs, false)
+            {
+                return;
+            }
             self.record_numeric_operand_casts(lhs, Some(rhs), CastSiteKind::ComparisonToInteger);
         } else if is_numeric_binop(op) {
             self.record_numeric_operand_casts(lhs, Some(rhs), CastSiteKind::NumericOperator);
@@ -1450,6 +1759,70 @@ fn numeric_pat_expr_value(
     cast_literal_value(value.get(), negated, target_repr, tcx)
 }
 
+fn numeric_expr_value(
+    expr: &hir::Expr<'_>,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let value = numeric_expr_value_in_expr_type(expr, tcx)?;
+    let expr_repr = expr_integer_repr(expr, tcx).unwrap_or(target_repr);
+    if expr_repr == target_repr {
+        Some(value)
+    } else {
+        cast_integer_value(value, target_repr, tcx)
+    }
+}
+
+fn numeric_expr_value_in_expr_type(
+    expr: &hir::Expr<'_>,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    match expr.kind {
+        hir::ExprKind::Use(expr, _) => numeric_expr_value_in_expr_type(expr, tcx),
+        hir::ExprKind::Cast(inner, _) => {
+            let target_repr = expr_integer_repr(expr, tcx)?;
+            let value = numeric_expr_value_in_expr_type(inner, tcx)?;
+            cast_integer_value(value, target_repr, tcx)
+        }
+        hir::ExprKind::Unary(hir::UnOp::Neg, inner) => numeric_negated_expr_value(expr, inner, tcx),
+        hir::ExprKind::Lit(lit) => {
+            let ast::LitKind::Int(value, _) = lit.node else {
+                return None;
+            };
+            cast_literal_value(value.get(), false, expr_integer_repr(expr, tcx)?, tcx)
+        }
+        _ => None,
+    }
+}
+
+fn numeric_negated_expr_value(
+    neg_expr: &hir::Expr<'_>,
+    expr: &hir::Expr<'_>,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let target_repr = expr_integer_repr(neg_expr, tcx)?;
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    if let hir::ExprKind::Lit(lit) = expr.kind {
+        let ast::LitKind::Int(value, _) = lit.node else {
+            return None;
+        };
+        return cast_literal_value(value.get(), true, target_repr, tcx);
+    }
+
+    let value = numeric_expr_value(expr, target_repr, tcx)?;
+    match value {
+        CastedIntegerValue::Signed(value) => Some(CastedIntegerValue::Signed(value.checked_neg()?)),
+        CastedIntegerValue::Unsigned(_) => None,
+    }
+}
+
+fn expr_integer_repr(expr: &hir::Expr<'_>, tcx: TyCtxt<'_>) -> Option<IntegerRepr> {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    integer_repr(typeck.expr_ty(expr))
+}
+
 fn cast_literal_value(
     value: u128,
     negated: bool,
@@ -1489,19 +1862,66 @@ fn cast_literal_value(
 
 fn cast_discriminant_value(
     value: DiscriminantValue,
-    _source_repr: IntegerRepr,
+    source_repr: IntegerRepr,
+    target_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    cast_discriminant_through_chain(value, source_repr, &[target_repr], tcx)
+}
+
+fn cast_discriminant_through_chain(
+    value: DiscriminantValue,
+    source_repr: IntegerRepr,
+    cast_chain: &[IntegerRepr],
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    let mut value = discriminant_as_casted_integer(value, source_repr, tcx);
+    for target_repr in cast_chain {
+        value = cast_integer_value(value, *target_repr, tcx)?;
+    }
+    Some(value)
+}
+
+fn discriminant_as_casted_integer(
+    value: DiscriminantValue,
+    source_repr: IntegerRepr,
+    tcx: TyCtxt<'_>,
+) -> CastedIntegerValue {
+    let width = integer_width(source_repr, tcx);
+    let bits = match value {
+        DiscriminantValue::Signed(value) => value as u128,
+        DiscriminantValue::Unsigned(value) => value,
+    } & low_bits_mask(width);
+    match source_repr {
+        IntegerRepr::Signed(_) => CastedIntegerValue::Signed(signed_value_from_bits(bits, width)),
+        IntegerRepr::Unsigned(_) => CastedIntegerValue::Unsigned(bits),
+    }
+}
+
+fn cast_integer_value(
+    value: CastedIntegerValue,
     target_repr: IntegerRepr,
     tcx: TyCtxt<'_>,
 ) -> Option<CastedIntegerValue> {
     let width = integer_width(target_repr, tcx);
     let bits = match value {
-        DiscriminantValue::Signed(value) => value as u128,
-        DiscriminantValue::Unsigned(value) => value,
+        CastedIntegerValue::Signed(value) => value as u128,
+        CastedIntegerValue::Unsigned(value) => value,
     } & low_bits_mask(width);
     Some(match target_repr {
         IntegerRepr::Signed(_) => CastedIntegerValue::Signed(signed_value_from_bits(bits, width)),
         IntegerRepr::Unsigned(_) => CastedIntegerValue::Unsigned(bits),
     })
+}
+
+fn compare_casted_values(lhs: CastedIntegerValue, rhs: CastedIntegerValue) -> Option<Ordering> {
+    match (lhs, rhs) {
+        (CastedIntegerValue::Signed(lhs), CastedIntegerValue::Signed(rhs)) => Some(lhs.cmp(&rhs)),
+        (CastedIntegerValue::Unsigned(lhs), CastedIntegerValue::Unsigned(rhs)) => {
+            Some(lhs.cmp(&rhs))
+        }
+        _ => None,
+    }
 }
 
 fn integer_width(repr: IntegerRepr, tcx: TyCtxt<'_>) -> u32 {
@@ -1653,6 +2073,13 @@ fn is_comparison(op: BinOpKind) -> bool {
             | BinOpKind::Le
             | BinOpKind::Gt
             | BinOpKind::Ge
+    )
+}
+
+fn is_relational_comparison(op: BinOpKind) -> bool {
+    matches!(
+        op,
+        BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge
     )
 }
 
