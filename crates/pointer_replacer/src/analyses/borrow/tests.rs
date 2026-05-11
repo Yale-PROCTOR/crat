@@ -181,7 +181,6 @@ fn test_demote_strategy_optimality() {
 }
 
 #[test]
-#[should_panic]
 fn struct_field_collapsed() {
     // p borrows s.a, q borrows s.b — disjoint fields, no real conflict.
 
@@ -201,6 +200,46 @@ fn struct_field_collapsed() {
         demoted,
         Vec::<String>::new(),
         "s.a and s.b are disjoint — nothing should be demoted; got: {demoted:?}"
+    );
+}
+
+#[test]
+#[should_panic]
+fn tb_union_find_over_demotion() {
+    // Miri TB: OK. q as &mut s.1 survives s.0 = 1 (sibling field write).
+    // p gets demoted (s.0 = 1 invalidates its loan, then *p = 3 uses it).
+    // Our analysis: union(p, s) when demoting p. Since q's loan has
+    // borrowed.local == s, and s is now in p's group, q gets spuriously
+    // affected in subsequent iterations.
+    //
+    // The correct post-transformation (verified with Miri -Zmiri-tree-borrows):
+    //   unsafe {
+    //       let mut s = (0i32, 1i32);
+    //       let p = &raw mut s.0;       // stays raw
+    //       let q: &mut i32 = &mut s.1; // promoted
+    //       s.0 = 1;
+    //       *p = 3;
+    //       *q = 4;
+    //       assert_eq!(s, (3, 4));
+    //   }
+    // is NOT UB — writing to s.0 is not a foreign write to q's tag
+    // because they cover disjoint memory offsets.
+    let demoted = run_demote(
+        "
+        unsafe fn f() {
+            let mut s = (0i32, 1i32);
+            let p = &raw mut s.0;
+            let q = &raw mut s.1;
+            s.0 = 1;
+            *p = 3;
+            *q = 4;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "only p should be demoted — q borrows s.1 which is unaffected; got: {demoted:?}"
     );
 }
 
