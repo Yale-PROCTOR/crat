@@ -38,6 +38,7 @@ macro_rules! disallow_interprocedural {
 mod errors;
 mod invalidates;
 mod killed;
+pub mod lifetime_flow;
 mod loan_liveness;
 mod places_conflict;
 mod provenance_liveness;
