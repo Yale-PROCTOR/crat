@@ -101,33 +101,70 @@ fn get_return_provenance_params(code: &str) -> FxHashMap<String, Vec<String>> {
 }
 
 fn get_lifetime_flow_edges(code: &str) -> FxHashMap<String, Vec<(String, String)>> {
+    get_lifetime_flow_facts(code)
+        .into_iter()
+        .map(|(name, facts)| (name, facts.value_flows))
+        .collect()
+}
+
+#[derive(Debug)]
+struct LifetimeFlowFacts {
+    value_flows: Vec<(String, String)>,
+    storage_aliases: Vec<(String, String)>,
+    unknown_targets: Vec<String>,
+}
+
+fn get_lifetime_flow_facts(code: &str) -> FxHashMap<String, LifetimeFlowFacts> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = build_rust_program(tcx);
         let results = lifetime_flow::analyze_program_lifetime_flow(&program);
-        let mut all_edges = FxHashMap::default();
+        let mut all_facts = FxHashMap::default();
 
         for &f in &program.functions {
             let result = &results[&f];
-            let mut edges = vec![];
-            for source in result.summary.value_flows.rows() {
-                let Some(targets) = result.summary.value_flows.row(source) else {
-                    continue;
-                };
-                let source = format_signature_slot(result.summary.slots[source]);
-                for target in targets.iter() {
-                    edges.push((
-                        source.clone(),
-                        format_signature_slot(result.summary.slots[target]),
-                    ));
-                }
-            }
-            edges.sort();
-            all_edges.insert(fn_name(tcx, f), edges);
+            let mut unknown_targets: Vec<_> = result
+                .summary
+                .unknown_targets
+                .iter()
+                .map(|target| format_signature_slot(result.summary.slots[target]))
+                .collect();
+            unknown_targets.sort();
+            all_facts.insert(
+                fn_name(tcx, f),
+                LifetimeFlowFacts {
+                    value_flows: collect_lifetime_flow_edges(&result.summary, false),
+                    storage_aliases: collect_lifetime_flow_edges(&result.summary, true),
+                    unknown_targets,
+                },
+            );
         }
 
-        all_edges
+        all_facts
     })
     .unwrap()
+}
+
+fn collect_lifetime_flow_edges(
+    summary: &lifetime_flow::LifetimeFlowSummary,
+    storage_aliases: bool,
+) -> Vec<(String, String)> {
+    let matrix = if storage_aliases {
+        &summary.storage_aliases
+    } else {
+        &summary.value_flows
+    };
+    let mut edges = vec![];
+    for source in matrix.rows() {
+        let Some(targets) = matrix.row(source) else {
+            continue;
+        };
+        let source = format_signature_slot(summary.slots[source]);
+        for target in targets.iter() {
+            edges.push((source.clone(), format_signature_slot(summary.slots[target])));
+        }
+    }
+    edges.sort();
+    edges
 }
 
 fn format_signature_slot(slot: lifetime_flow::SignatureSlot) -> String {
@@ -136,6 +173,50 @@ fn format_signature_slot(slot: lifetime_flow::SignatureSlot) -> String {
         lifetime_flow::SignatureRoot::Arg(local) => format!("arg{}", local.index()),
     };
     format!("{root}@{}", slot.depth)
+}
+
+fn assert_lifetime_flow_edge(
+    facts: &FxHashMap<String, LifetimeFlowFacts>,
+    function: &str,
+    source: &str,
+    target: &str,
+) {
+    assert!(
+        facts[function]
+            .value_flows
+            .contains(&(source.to_string(), target.to_string())),
+        "{function} should contain value flow {source} -> {target}; got {:?}",
+        facts[function].value_flows
+    );
+}
+
+fn assert_lifetime_storage_alias(
+    facts: &FxHashMap<String, LifetimeFlowFacts>,
+    function: &str,
+    left: &str,
+    right: &str,
+) {
+    assert!(
+        facts[function]
+            .storage_aliases
+            .contains(&(left.to_string(), right.to_string())),
+        "{function} should contain storage alias {left} -> {right}; got {:?}",
+        facts[function].storage_aliases
+    );
+}
+
+fn assert_lifetime_unknown_target(
+    facts: &FxHashMap<String, LifetimeFlowFacts>,
+    function: &str,
+    target: &str,
+) {
+    assert!(
+        facts[function]
+            .unknown_targets
+            .contains(&target.to_string()),
+        "{function} should mark {target} unknown; got {:?}",
+        facts[function].unknown_targets
+    );
 }
 
 #[test]
@@ -251,6 +332,112 @@ fn lifetime_flow_read_output() {
         "read output should flow out arg1@1 to return@0; got {:?}",
         edges["read_out"]
     );
+}
+
+#[test]
+fn lifetime_flow_forwarded_output_reference_aliases_storage() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn forward(out: *mut *mut i32) -> *mut *mut i32 {
+            out
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "forward", "arg1@0", "return@0");
+    assert_lifetime_storage_alias(&facts, "forward", "arg1@1", "return@1");
+    assert_lifetime_storage_alias(&facts, "forward", "return@1", "arg1@1");
+}
+
+#[test]
+fn lifetime_flow_copy_between_output_slots() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn copy_out(src: *mut *mut i32, dst: *mut *mut i32) {
+            *dst = *src;
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "copy_out", "arg1@1", "arg2@1");
+    assert!(
+        !facts["copy_out"]
+            .value_flows
+            .contains(&("arg1@0".to_string(), "arg2@1".to_string())),
+        "copy_out should copy the value behind src, not src itself; got {:?}",
+        facts["copy_out"].value_flows
+    );
+}
+
+#[test]
+fn lifetime_flow_instantiates_callee_return_summary() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn id(x: *mut i32) -> *mut i32 { x }
+
+        unsafe fn wrap(y: *mut i32) -> *mut i32 {
+            id(y)
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "id", "arg1@0", "return@0");
+    assert_lifetime_flow_edge(&facts, "wrap", "arg1@0", "return@0");
+}
+
+#[test]
+fn lifetime_flow_instantiates_callee_output_store_summary() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
+            *out = value;
+        }
+
+        unsafe fn wrap(out: *mut *mut i32, value: *mut i32) {
+            write_out(out, value);
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "write_out", "arg2@0", "arg1@1");
+    assert_lifetime_flow_edge(&facts, "wrap", "arg2@0", "arg1@1");
+}
+
+#[test]
+fn lifetime_flow_external_call_marks_unknown_return_and_nested_arg() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe extern \"C\" {
+            fn external(out: *mut *mut i32) -> *mut i32;
+        }
+
+        unsafe fn call_external(out: *mut *mut i32) -> *mut i32 {
+            external(out)
+        }
+        ",
+    );
+    assert_lifetime_unknown_target(&facts, "call_external", "return@0");
+    assert_lifetime_unknown_target(&facts, "call_external", "arg1@1");
+    assert!(
+        !facts["call_external"]
+            .unknown_targets
+            .contains(&"arg1@0".to_string()),
+        "plain arg@0 reassignment is not caller-visible unknown output; got {:?}",
+        facts["call_external"].unknown_targets
+    );
+}
+
+#[test]
+fn lifetime_flow_mutually_recursive_scc_converges() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn a(x: *mut i32, pick_x: bool) -> *mut i32 {
+            if pick_x { x } else { b(x, pick_x) }
+        }
+
+        unsafe fn b(y: *mut i32, pick_y: bool) -> *mut i32 {
+            a(y, pick_y)
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "a", "arg1@0", "return@0");
+    assert_lifetime_flow_edge(&facts, "b", "arg1@0", "return@0");
 }
 
 #[test]
@@ -395,6 +582,56 @@ fn stored_output_lifetime() {
         demoted,
         vec!["r"],
         "r receives x's borrow through write_out and should be demoted"
+    );
+}
+
+#[test]
+fn wrapped_return_value_lifetime() {
+    let demoted = run_demote(
+        "
+        unsafe fn id(x: *mut i32) -> *mut i32 { x }
+        unsafe fn wrap(y: *mut i32) -> *mut i32 { id(y) }
+
+        unsafe fn f() {
+            let mut x = 0i32;
+            let p = wrap(&raw mut x);
+            x = 1;
+            *p = 2;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "p receives x's borrow through two user-defined calls and should be demoted"
+    );
+}
+
+#[test]
+fn wrapped_stored_output_lifetime() {
+    let demoted = run_demote(
+        "
+        unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
+            *out = value;
+        }
+
+        unsafe fn wrap(out: *mut *mut i32, value: *mut i32) {
+            write_out(out, value);
+        }
+
+        unsafe fn f() {
+            let mut x = 0i32;
+            let mut r: *mut i32 = core::ptr::null_mut();
+            wrap(&raw mut r, &raw mut x);
+            x = 1;
+            *r = 2;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["r"],
+        "r receives x's borrow through a wrapped output store and should be demoted"
     );
 }
 
