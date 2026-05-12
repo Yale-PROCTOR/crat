@@ -100,6 +100,44 @@ fn get_return_provenance_params(code: &str) -> FxHashMap<String, Vec<String>> {
     .unwrap()
 }
 
+fn get_lifetime_flow_edges(code: &str) -> FxHashMap<String, Vec<(String, String)>> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let results = lifetime_flow::analyze_program_lifetime_flow(&program);
+        let mut all_edges = FxHashMap::default();
+
+        for &f in &program.functions {
+            let result = &results[&f];
+            let mut edges = vec![];
+            for source in result.summary.value_flows.rows() {
+                let Some(targets) = result.summary.value_flows.row(source) else {
+                    continue;
+                };
+                let source = format_signature_slot(result.summary.slots[source]);
+                for target in targets.iter() {
+                    edges.push((
+                        source.clone(),
+                        format_signature_slot(result.summary.slots[target]),
+                    ));
+                }
+            }
+            edges.sort();
+            all_edges.insert(fn_name(tcx, f), edges);
+        }
+
+        all_edges
+    })
+    .unwrap()
+}
+
+fn format_signature_slot(slot: lifetime_flow::SignatureSlot) -> String {
+    let root = match slot.root {
+        lifetime_flow::SignatureRoot::Return => "return".to_string(),
+        lifetime_flow::SignatureRoot::Arg(local) => format!("arg{}", local.index()),
+    };
+    format!("{root}@{}", slot.depth)
+}
+
 #[test]
 fn test_proof_of_concept() {
     let demoted = run_demote(
@@ -142,6 +180,77 @@ fn test_inferred_bounds() {
         "only q's provenance flows to f's return value"
     );
     assert!(!params.contains_key("g"), "g has no pointer return type");
+}
+
+#[test]
+fn lifetime_flow_identity_return() {
+    let edges = get_lifetime_flow_edges(
+        "
+        unsafe fn make_ref(x: *mut i32) -> *mut i32 { x }
+        ",
+    );
+    assert!(
+        edges["make_ref"].contains(&("arg1@0".to_string(), "return@0".to_string())),
+        "identity return should flow arg1@0 to return@0; got {:?}",
+        edges["make_ref"]
+    );
+}
+
+#[test]
+fn lifetime_flow_stored_output() {
+    let edges = get_lifetime_flow_edges(
+        "
+        unsafe fn write_out(out: *mut *const i32, value: *const i32) {
+            *out = value;
+        }
+        ",
+    );
+    assert!(
+        edges["write_out"].contains(&("arg2@0".to_string(), "arg1@1".to_string())),
+        "stored output should flow value arg2@0 to out arg1@1; got {:?}",
+        edges["write_out"]
+    );
+    assert!(
+        !edges["write_out"].contains(&("arg2@0".to_string(), "arg1@0".to_string())),
+        "stored output must not flow value into out arg1@0"
+    );
+}
+
+#[test]
+fn lifetime_flow_conditional_return() {
+    let edges = get_lifetime_flow_edges(
+        "
+        unsafe fn pick(x: *mut i32, y: *mut i32, pick_x: bool) -> *mut i32 {
+            if pick_x { x } else { y }
+        }
+        ",
+    );
+    assert!(
+        edges["pick"].contains(&("arg1@0".to_string(), "return@0".to_string())),
+        "x should flow to return; got {:?}",
+        edges["pick"]
+    );
+    assert!(
+        edges["pick"].contains(&("arg2@0".to_string(), "return@0".to_string())),
+        "y should flow to return; got {:?}",
+        edges["pick"]
+    );
+}
+
+#[test]
+fn lifetime_flow_read_output() {
+    let edges = get_lifetime_flow_edges(
+        "
+        unsafe fn read_out(out: *const *const i32) -> *const i32 {
+            *out
+        }
+        ",
+    );
+    assert!(
+        edges["read_out"].contains(&("arg1@1".to_string(), "return@0".to_string())),
+        "read output should flow out arg1@1 to return@0; got {:?}",
+        edges["read_out"]
+    );
 }
 
 #[test]
@@ -244,7 +353,6 @@ fn tb_union_find_over_demotion() {
 }
 
 #[test]
-#[should_panic]
 fn return_value_lifetime() {
     // make_ref returns its input — p aliases a through the call.
 
@@ -263,6 +371,30 @@ fn return_value_lifetime() {
         demoted,
         vec!["p"],
         "p aliases a through make_ref — p should be demoted due to conflict with a = 1"
+    );
+}
+
+#[test]
+fn stored_output_lifetime() {
+    let demoted = run_demote(
+        "
+        unsafe fn write_out(out: *mut *mut i32, value: *mut i32) {
+            *out = value;
+        }
+
+        unsafe fn f() {
+            let mut x = 0i32;
+            let mut r: *mut i32 = core::ptr::null_mut();
+            write_out(&raw mut r, &raw mut x);
+            x = 1;
+            *r = 2;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["r"],
+        "r receives x's borrow through write_out and should be demoted"
     );
 }
 
