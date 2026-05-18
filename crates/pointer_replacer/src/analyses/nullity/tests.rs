@@ -1,3 +1,4 @@
+use points_to::andersen;
 use rustc_hash::FxHashSet;
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::{mir::VarDebugInfoContents, ty::TyCtxt};
@@ -25,7 +26,13 @@ fn build_rust_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     }
 }
 
-fn run_analysis(code: &str) -> FxHashSet<(String, String)> {
+#[derive(Default)]
+struct AnalysisNames {
+    params: FxHashSet<(String, String)>,
+    locals: FxHashSet<(String, String)>,
+}
+
+fn run_analysis(code: &str) -> AnalysisNames {
     let code = format!(
         "
         #![allow(dead_code)]
@@ -40,8 +47,23 @@ fn run_analysis(code: &str) -> FxHashSet<(String, String)> {
 
     ::utils::compilation::run_compiler_on_str(&code, |tcx| {
         let rust_program = build_rust_program(tcx);
-        let result = analyze(&rust_program);
-        let mut params = FxHashSet::default();
+        let arena = typed_arena::Arena::new();
+        let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+        let andersen_config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+        let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+        let points_to = andersen::post_analyze(
+            &andersen_config,
+            pre_points_to,
+            points_to_solutions,
+            &tss,
+            tcx,
+        );
+        let result = analyze(&rust_program, &points_to);
+        let mut names = AnalysisNames::default();
 
         for (&did, non_null_params) in &result.non_null_params {
             let fn_name = tcx.item_name(did.to_def_id()).to_string();
@@ -54,12 +76,32 @@ fn run_analysis(code: &str) -> FxHashSet<(String, String)> {
                     continue;
                 };
                 if var_debug_info.argument_index.is_some() && non_null_params.contains(local) {
-                    params.insert((fn_name.clone(), var_debug_info.name.as_str().to_string()));
+                    names
+                        .params
+                        .insert((fn_name.clone(), var_debug_info.name.as_str().to_string()));
                 }
             }
         }
 
-        params
+        for (&did, non_null_locals) in &result.non_null_locals {
+            let fn_name = tcx.item_name(did.to_def_id()).to_string();
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            for var_debug_info in body.var_debug_info.iter() {
+                let VarDebugInfoContents::Place(place) = &var_debug_info.value else {
+                    continue;
+                };
+                let Some(local) = place.as_local() else {
+                    continue;
+                };
+                if non_null_locals.contains(local) {
+                    names
+                        .locals
+                        .insert((fn_name.clone(), var_debug_info.name.as_str().to_string()));
+                }
+            }
+        }
+
+        names
     })
     .unwrap()
 }
@@ -69,7 +111,27 @@ fn expect_non_null(code: &str, expected: &[(&str, &str)]) {
         .iter()
         .map(|(function, param)| ((*function).to_string(), (*param).to_string()))
         .collect::<FxHashSet<_>>();
-    assert_eq!(run_analysis(code), expected);
+    assert_eq!(run_analysis(code).params, expected);
+}
+
+fn expect_non_null_local_facts(
+    code: &str,
+    expected_present: &[(&str, &str)],
+    expected_absent: &[(&str, &str)],
+) {
+    let locals = run_analysis(code).locals;
+    for (function, local) in expected_present {
+        assert!(
+            locals.contains(&((*function).to_string(), (*local).to_string())),
+            "expected {function}::{local} to be non-null; got {locals:?}",
+        );
+    }
+    for (function, local) in expected_absent {
+        assert!(
+            !locals.contains(&((*function).to_string(), (*local).to_string())),
+            "expected {function}::{local} to be nullable; got {locals:?}",
+        );
+    }
 }
 
 #[test]
@@ -430,5 +492,269 @@ fn unmodeled_libc_call_is_nullable() {
         }
         ",
         &[],
+    );
+}
+
+#[test]
+fn local_address_assignment_is_non_null() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f() {
+            let mut x = 0;
+            let p: *mut i32 = &mut x;
+            let _ = p;
+        }
+        ",
+        &[("f", "p")],
+        &[],
+    );
+}
+
+#[test]
+fn local_malloc_assignment_is_non_null() {
+    expect_non_null_local_facts(
+        "
+        extern \"C\" {
+            fn malloc(size: usize) -> *mut i32;
+        }
+
+        pub unsafe fn f() {
+            let p: *mut i32 = malloc(std::mem::size_of::<i32>());
+            let _ = p;
+        }
+        ",
+        &[("f", "p")],
+        &[],
+    );
+}
+
+#[test]
+fn local_null_then_address_stays_nullable_for_now() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f() {
+            let mut x = 0;
+            let mut p: *mut i32 = std::ptr::null_mut();
+            p = &mut x;
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("f", "p")],
+    );
+}
+
+#[test]
+fn nullable_param_copy_makes_local_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f(p: *mut i32) {
+            let q = p;
+            let _ = q;
+        }
+        ",
+        &[],
+        &[("f", "q")],
+    );
+}
+
+#[test]
+fn non_null_param_copy_keeps_local_non_null() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f(p: *mut i32) -> i32 {
+            let v = *p;
+            let q = p;
+            let _ = q;
+            v
+        }
+        ",
+        &[("f", "q")],
+        &[],
+    );
+}
+
+#[test]
+fn integer_to_pointer_cast_is_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f(n: usize) {
+            let p = n as *mut i32;
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("f", "p")],
+    );
+}
+
+#[test]
+fn pointer_to_pointer_cast_preserves_nullity() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn nullable(p: *mut i32) {
+            let q = p as *const i32;
+            let _ = q;
+        }
+
+        pub unsafe fn non_null() {
+            let mut x = 0;
+            let p = &mut x as *mut i32;
+            let q = p as *const i32;
+            let _ = q;
+        }
+        ",
+        &[("non_null", "q")],
+        &[("nullable", "q")],
+    );
+}
+
+#[test]
+fn load_through_pointer_is_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f(out: *mut *mut i32) {
+            let p = *out;
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("f", "p")],
+    );
+}
+
+#[test]
+fn field_projection_pointer_is_nullable() {
+    expect_non_null_local_facts(
+        "
+        #[repr(C)]
+        pub struct Holder {
+            ptr: *mut i32,
+        }
+
+        pub unsafe fn f(holder: Holder) {
+            let p = holder.ptr;
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("f", "p")],
+    );
+}
+
+#[test]
+fn indirect_null_write_marks_target_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f() {
+            let mut x = 0;
+            let mut p = &mut x as *mut i32;
+            let out = &mut p as *mut *mut i32;
+            *out = std::ptr::null_mut();
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("f", "p")],
+    );
+}
+
+#[test]
+fn indirect_non_null_write_does_not_mark_target_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn f() {
+            let mut x = 0;
+            let mut y = 0;
+            let mut p = &mut x as *mut i32;
+            let out = &mut p as *mut *mut i32;
+            *out = &mut y;
+            let _ = p;
+        }
+        ",
+        &[("f", "p")],
+        &[],
+    );
+}
+
+#[test]
+fn callee_indirect_null_write_side_effect_marks_caller_local_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn set_null(out: *mut *mut i32) {
+            *out = std::ptr::null_mut();
+        }
+
+        pub unsafe fn caller() {
+            let mut x = 0;
+            let mut p = &mut x as *mut i32;
+            set_null(&mut p);
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("caller", "p")],
+    );
+}
+
+#[test]
+fn function_pointer_null_write_side_effect_marks_caller_local_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn set_null(out: *mut *mut i32) {
+            *out = std::ptr::null_mut();
+        }
+
+        pub unsafe fn caller() {
+            let mut x = 0;
+            let mut p = &mut x as *mut i32;
+            let fp: unsafe fn(*mut *mut i32) = set_null;
+            fp(&mut p);
+            let _ = p;
+        }
+        ",
+        &[],
+        &[("caller", "p")],
+    );
+}
+
+#[test]
+fn direct_non_null_return_summary_keeps_call_result_non_null() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn callee() -> *mut i32 {
+            let mut x = 0;
+            &mut x as *mut i32
+        }
+
+        pub unsafe fn caller() {
+            let q = callee();
+            let _ = q;
+        }
+        ",
+        &[("caller", "q")],
+        &[],
+    );
+}
+
+#[test]
+fn direct_nullable_return_summary_marks_call_result_nullable() {
+    expect_non_null_local_facts(
+        "
+        pub unsafe fn callee(flag: bool) -> *mut i32 {
+            if flag {
+                return std::ptr::null_mut();
+            }
+            let mut x = 0;
+            &mut x as *mut i32
+        }
+
+        pub unsafe fn caller(flag: bool) {
+            let q = callee(flag);
+            let _ = q;
+        }
+        ",
+        &[],
+        &[("caller", "q")],
     );
 }
