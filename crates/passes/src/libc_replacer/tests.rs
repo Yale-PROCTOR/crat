@@ -87,13 +87,38 @@ pub unsafe fn copy_name(mut src: &[i8]) {
 }
         "#,
         &[
-            "std::ptr::write_bytes(___dst, 0, ___n)",
-            "std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len)",
+            "___dst.fill(0)",
+            "copy_from_slice(&___src[..___len])",
             "position(|&___c|",
             "___c == 0",
             ".min(___n)",
+            "bytemuck::cast_slice::<_, u8>",
+            "bytemuck::cast_slice_mut::<_, u8>",
         ],
-        &["copy_from_slice(&src[..63])"],
+        &[
+            "std::ptr::write_bytes",
+            "std::ptr::copy_nonoverlapping",
+            "copy_from_slice(&src[..63])",
+        ],
+    );
+}
+
+#[test]
+fn test_strncpy_skips_nested_static_destination() {
+    run_test(
+        r#"
+extern "C" {
+    fn strncpy(__dest: *mut i8, __src: *const i8, __n: usize) -> *mut i8;
+}
+
+static mut COMMON: [[i8; 256]; 100] = [[0; 256]; 100];
+
+pub unsafe fn copy_static(mut src: &[i8], idx: usize) {
+    strncpy(COMMON[idx].as_mut_ptr(), src.as_ptr(), 255);
+}
+        "#,
+        &["strncpy(COMMON[idx].as_mut_ptr()"],
+        &["___dst.fill(0)", "copy_from_slice(&___src[..___len])"],
     );
 }
 
@@ -164,6 +189,42 @@ pub unsafe fn foo(mut input: &[i8], mut n: i32) -> i32 {
             "snprintf(buf.as_mut_ptr",
             "sscanf(input.as_ptr",
         ],
+    );
+}
+
+#[test]
+fn test_string_stdio_rewrites_mut_slice_receiver_without_temp_borrow() {
+    run_test(
+        r#"
+extern "C" {
+    fn snprintf(__s: *mut i8, __maxlen: usize, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut buf: Box<[i8]>, n: i32) -> i32 {
+    snprintf((&mut buf[..]).as_mut_ptr(), 64, b"%d\0" as *const u8 as *const i8, n)
+}
+        "#,
+        &["std::fmt::format(format_args!", "bytemuck::cast_slice_mut"],
+        &["bytemuck::cast_slice_mut(&mut ((&mut", "snprintf((&mut buf"],
+    );
+}
+
+#[test]
+fn test_string_stdio_reborrows_mut_slice_local() {
+    run_test(
+        r#"
+extern "C" {
+    fn sprintf(__s: *mut i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut output_pointer: &mut [u8], n: i32) -> u8 {
+    sprintf(output_pointer.as_mut_ptr() as *mut i8, b"%04x\0" as *const u8 as *const i8, n);
+    output_pointer = &mut output_pointer[1..];
+    output_pointer[0]
+}
+        "#,
+        &["std::fmt::format(format_args!", "&mut *(output_pointer)"],
+        &["let ___dst = ((output_pointer));", "sprintf(output_pointer"],
     );
 }
 

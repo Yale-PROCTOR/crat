@@ -8,6 +8,7 @@ use rustc_hir::{
     self as hir,
     def::{DefKind, Res},
 };
+use rustc_middle::ty;
 
 use crate::libc_replacer::LibItem;
 
@@ -22,7 +23,7 @@ impl super::TransformVisitor<'_> {
                 return Some(format!("&({array})"));
             } else if ty == self.tcx.types.i8 {
                 self.bytemuck = true;
-                return Some(format!("bytemuck::cast_slice(&({array}))"));
+                return Some(format!("bytemuck::cast_slice::<_, u8>(&({array}))"));
             }
         }
 
@@ -45,21 +46,39 @@ impl super::TransformVisitor<'_> {
         method_names: &[&str],
     ) -> Option<String> {
         let (array, ty) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx)?;
-        if self.expr_is_static(array) {
+        if expr_is_static_path(array, &self.ast_to_hir, self.tcx) {
             return None;
         }
         if expr_has_with_borrow_call(array) || expr_has_method_call(array, method_names) {
             return None;
         }
+        let already_mut_ref = self.expr_is_mut_ref(array);
         let array = pprust::expr_to_string(array);
+        let array_ref = if already_mut_ref {
+            format!("&mut *({array})")
+        } else {
+            format!("&mut ({array})")
+        };
         if ty == self.tcx.types.u8 {
-            Some(format!("&mut ({array})"))
+            Some(array_ref)
         } else if ty == self.tcx.types.i8 {
             self.bytemuck = true;
-            Some(format!("bytemuck::cast_slice_mut(&mut ({array}))"))
+            Some(format!("bytemuck::cast_slice_mut::<_, u8>({array_ref})"))
         } else {
             None
         }
+    }
+
+    fn expr_is_mut_ref(&self, expr: &Expr) -> bool {
+        self.ast_to_hir
+            .get_expr(expr.id, self.tcx)
+            .is_some_and(|hir_expr| {
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                matches!(
+                    typeck.expr_ty(hir_expr).kind(),
+                    ty::TyKind::Ref(_, _, mutability) if mutability.is_mut()
+                )
+            })
     }
 
     pub fn transform_strlen(&mut self, s: &Expr) -> Expr {
@@ -84,27 +103,15 @@ impl super::TransformVisitor<'_> {
 
     pub fn transform_strncpy(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
         let n_str = pprust::expr_to_string(n);
-        if let Some((array1, ty1)) = utils::ir::array_of_as_ptr(s1, &self.ast_to_hir, self.tcx)
-            && let Some((array2, ty2)) = utils::ir::array_of_as_ptr(s2, &self.ast_to_hir, self.tcx)
-        {
-            if (ty1 == self.tcx.types.u8 && ty2 == self.tcx.types.u8)
-                || (ty1 == self.tcx.types.i8 && ty2 == self.tcx.types.i8)
-            {
-                let array1 = pprust::expr_to_string(array1);
-                let array2 = pprust::expr_to_string(array2);
-                return Some(utils::expr!(
-                    "{{ let ___n = ({n_str}) as usize; let ___dst = (&mut ({array1}))[..___n].as_mut_ptr(); let ___src = &(&({array2}))[..]; let ___len = ___src.iter().position(|&___c| ___c == 0).map_or(___src.len(), |___i| ___i + 1).min(___n); unsafe {{ std::ptr::write_bytes(___dst, 0, ___n); std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len); }} }}"
-                ));
-            } else if ty1 == self.tcx.types.u8 || ty1 == self.tcx.types.i8 {
-                self.bytemuck = true;
-                let array1 = pprust::expr_to_string(array1);
-                let array2 = pprust::expr_to_string(array2);
-                return Some(utils::expr!(
-                    "{{ let ___n = ({n_str}) as usize; let ___dst = (&mut ({array1}))[..___n].as_mut_ptr(); let ___src = bytemuck::cast_slice(&(&({array2}))[..]); let ___len = ___src.iter().position(|&___c| ___c == 0).map_or(___src.len(), |___i| ___i + 1).min(___n); unsafe {{ std::ptr::write_bytes(___dst, 0, ___n); std::ptr::copy_nonoverlapping(___src.as_ptr(), ___dst, ___len); }} }}"
-                ));
-            }
+        let (dst_array, _) = utils::ir::array_of_as_ptr(s1, &self.ast_to_hir, self.tcx)?;
+        if self.expr_contains_static(dst_array) {
+            return None;
         }
-        None
+        let dst = self.c_byte_slice_mut(s1)?;
+        let src = self.c_byte_slice(s2)?;
+        Some(utils::expr!(
+            "{{ let ___n = ({n_str}) as usize; let ___dst = &mut ({dst})[..___n]; let ___src = &({src})[..]; let ___len = ___src.iter().position(|&___c| ___c == 0).map_or(___src.len(), |___i| ___i + 1).min(___n); ___dst.fill(0); ___dst[..___len].copy_from_slice(&___src[..___len]); }}"
+        ))
     }
 
     pub fn transform_strcmp(&mut self, s1: &Expr, s2: &Expr) -> Option<Expr> {
@@ -194,22 +201,49 @@ impl super::TransformVisitor<'_> {
         ))
     }
 
-    fn expr_is_static(&self, expr: &Expr) -> bool {
-        self.ast_to_hir
-            .get_expr(expr.id, self.tcx)
-            .is_some_and(|hir_expr| {
-                matches!(
-                    hir_expr.kind,
-                    hir::ExprKind::Path(hir::QPath::Resolved(
-                        _,
-                        hir::Path {
-                            res: Res::Def(DefKind::Static { .. }, _),
-                            ..
-                        }
-                    ))
-                )
-            })
+    fn expr_contains_static(&self, expr: &Expr) -> bool {
+        struct Finder<'a, 'tcx> {
+            ast_to_hir: &'a utils::ir::AstToHir,
+            tcx: ty::TyCtxt<'tcx>,
+            found: bool,
+        }
+
+        impl<'ast, 'tcx> Visitor<'ast> for Finder<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'ast Expr) {
+                if self.found {
+                    return;
+                }
+                if expr_is_static_path(expr, self.ast_to_hir, self.tcx) {
+                    self.found = true;
+                    return;
+                }
+                visit::walk_expr(self, expr);
+            }
+        }
+
+        let mut finder = Finder {
+            ast_to_hir: &self.ast_to_hir,
+            tcx: self.tcx,
+            found: false,
+        };
+        finder.visit_expr(expr);
+        finder.found
     }
+}
+
+fn expr_is_static_path(expr: &Expr, ast_to_hir: &utils::ir::AstToHir, tcx: ty::TyCtxt<'_>) -> bool {
+    ast_to_hir.get_expr(expr.id, tcx).is_some_and(|hir_expr| {
+        matches!(
+            hir_expr.kind,
+            hir::ExprKind::Path(hir::QPath::Resolved(
+                _,
+                hir::Path {
+                    res: Res::Def(DefKind::Static { .. }, _),
+                    ..
+                }
+            ))
+        )
+    })
 }
 
 fn expr_has_with_borrow_call(expr: &Expr) -> bool {

@@ -157,10 +157,10 @@ pub unsafe fn foo() -> *mut i32 {
 }
 "#,
         &[
-            "-> Option<Box<i32>>",
-            "Option<Box<i32>>",
+            "-> Box<i32>",
+            "let mut p: Box<i32>",
             "Some(Box::new(<i32 as Default>::default()))",
-            "as_deref_mut().unwrap()",
+            "return (Some(p)).unwrap();",
         ],
         &["Box::<i32>::new(", "Box::into_raw(", "Box::leak("],
     );
@@ -213,8 +213,8 @@ pub unsafe fn make_state() -> *mut State {
 }
 "#,
         &[
-            "pub unsafe fn make_state() -> Option<Box<crate::State>>",
-            "Option<Box<crate::State>>",
+            "pub unsafe fn make_state() -> Box<crate::State>",
+            "let mut state: Box<crate::State>",
             "Some(Box::new(crate::State {",
         ],
         &[
@@ -246,8 +246,8 @@ pub unsafe fn make_state() -> *mut State {
 }
 "#,
         &[
-            "pub unsafe fn make_state() -> Option<Box<crate::State>>",
-            "Option<Box<crate::State>>",
+            "pub unsafe fn make_state() -> Box<crate::State>",
+            "let mut state: Box<crate::State>",
             "Some(Box::new(crate::State {",
         ],
         &[
@@ -273,10 +273,10 @@ pub unsafe fn foo() -> *mut i32 {
 }
 "#,
         &[
-            "pub unsafe fn foo() -> Option<Box<[i32]>>",
-            "Option<Box<[i32]>>",
+            "pub unsafe fn foo() -> Box<[i32]>",
+            "let mut p: Box<[i32]>",
             "collect::<Vec<i32>>().into_boxed_slice()",
-            "as_deref_mut().unwrap_or(&mut [])",
+            "(&mut ((&mut (p)[..])[(1) as usize..]))[0] = 7;",
         ],
         &[
             "Box::leak(",
@@ -301,7 +301,7 @@ pub unsafe fn make_buf(len: usize) -> *mut core::ffi::c_char {
 }
 "#,
         &[
-            "pub unsafe fn make_buf(len: usize) -> Option<Box<[i8]>>",
+            "pub unsafe fn make_buf(len: usize) -> Box<[i8]>",
             ".take(((1) * (len) /",
             "std::mem::size_of::<i8>()) as",
         ],
@@ -324,10 +324,10 @@ pub unsafe fn foo() -> *mut i32 {
 }
 "#,
         &[
-            "pub unsafe fn foo() -> Option<Box<[i32]>>",
-            "Option<Box<[i32]>>",
+            "pub unsafe fn foo() -> Box<[i32]>",
+            "let mut p: Box<[i32]>",
             "collect::<Vec<i32>>().into_boxed_slice()",
-            "as_deref_mut().unwrap_or(&mut [])",
+            "(&mut ((&mut (p)[..])[(1) as usize..]))[0] = 7;",
         ],
         &[
             "Box::leak(",
@@ -362,8 +362,8 @@ pub unsafe fn foo() -> i32 {
 "#,
         &[
             "pub unsafe fn alloc_one() -> *mut i32",
-            "Option<Box<i32>>",
-            "map_or(std::ptr::null_mut::<i32>()",
+            "let mut p: Box<i32>",
+            "Box::into_raw(p) as *mut i32",
         ],
         &[],
     );
@@ -391,7 +391,7 @@ pub unsafe fn foo() -> i32 {
     return take_raw(alloc_one());
 }
 "#,
-        &["-> Option<Box<i32>>", ".as_deref()", "take_raw"],
+        &["-> Box<i32>", ".as_ref()", "take_raw"],
         &[],
     );
 }
@@ -419,9 +419,9 @@ pub unsafe fn foo() -> i32 {
 }
 "#,
         &[
-            "pub unsafe fn alloc_many() -> Option<Box<[i32]>>",
+            "pub unsafe fn alloc_many() -> Box<[i32]>",
             "pub unsafe fn take_raw(p: &[i32])",
-            "return take_raw((alloc_many()).as_deref().unwrap_or(&[]));",
+            "return take_raw(&(alloc_many())[..]);",
         ],
         &["std::slice::from_raw_parts(", "Box::leak("],
     );
@@ -449,7 +449,7 @@ pub unsafe fn foo() -> *mut i32 {
         &[
             "pub unsafe fn id(mut p: Option<Box<i32>>) -> Option<Box<i32>>",
             "pub unsafe fn foo() -> Option<Box<i32>>",
-            "let mut q: Option<Box<i32>> = id((p).take());",
+            "let mut q: Option<Box<i32>> = id(Some(p));",
         ],
         &[],
     );
@@ -476,8 +476,8 @@ pub unsafe fn foo() {
 "#,
         &[
             "pub unsafe fn keep_raw() -> *mut i32",
-            "Option<Box<i32>>",
-            "Box::into_raw(_x) as *mut i32",
+            "let mut p: Box<i32>",
+            "Box::into_raw(p) as *mut i32",
             "let fp: unsafe fn() -> *mut i32 = keep_raw;",
         ],
         &[],
@@ -505,8 +505,8 @@ pub unsafe fn foo() {
 "#,
         &[
             "pub unsafe fn keep_raw_arr() -> *mut i32",
-            "Option<Box<[i32]>>",
-            "as_deref_mut().unwrap_or(&mut [])",
+            "let mut p: Box<[i32]>",
+            "Box::leak(p).as_mut_ptr()",
             "let fp: unsafe fn() -> *mut i32 = keep_raw_arr;",
         ],
         &["-> Option<Box<[i32]>>", "Box::into_raw("],
@@ -534,9 +534,9 @@ pub unsafe fn caller() -> *mut i32 {
 }
 "#,
         &[
-            "fn alloc_one() -> Option<Box<i32>>",
-            "fn caller() -> Option<Box<i32>>",
-            "let mut q: Option<Box<i32>> = alloc_one();",
+            "fn alloc_one() -> Box<i32>",
+            "fn caller() -> Box<i32>",
+            "let mut q: Box<i32> = (Some(alloc_one())).unwrap();",
         ],
         &[],
     );
@@ -557,7 +557,7 @@ pub unsafe fn move_owner() -> *mut i32 {
     return q;
 }
 "#,
-        &["let mut q: Option<Box<i32>> = (p).take();", ".take()"],
+        &["let mut q: Box<i32> = (Some(p)).unwrap();"],
         &[],
     );
 }
@@ -929,7 +929,8 @@ pub unsafe fn caller(count: i32) {
 "#,
         &[
             "alloc_array(count)",
-            "(*arr.as_deref_mut().unwrap()).buffers =\n        malloc((count as usize) * std::mem::size_of::<i32>())",
+            "let mut arr: Box<crate::BufferArray>",
+            "(*arr).buffers =\n        malloc((count as usize) * std::mem::size_of::<i32>())",
         ],
         &["let mut arr: *mut crate::BufferArray = Box::into_raw(Box::new"],
     );
@@ -963,10 +964,10 @@ pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
 "#,
         &[
             "pub unsafe fn copy_and_sum(src: &[i32], count: usize) -> i32",
-            "let mut dest: Option<Box<[i32]>>",
+            "let mut dest: Box<[i32]>",
             "collect::<Vec<i32>>().into_boxed_slice()",
-            "memcpy(((dest).as_deref_mut().unwrap_or(&mut [])).as_mut_ptr() as *mut _,",
-            "drop((dest).take());",
+            "memcpy((&mut (dest)[..]).as_mut_ptr() as *mut _,",
+            "drop(dest);",
         ],
         &[
             "malloc(count * std::mem::size_of::<i32>())",
@@ -975,6 +976,45 @@ pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
             "slice_from_raw_parts_mut",
             "Box::from_raw(",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_boxed_slice_offset_projection() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn copy_and_sum(src: *mut i32, count: i32) -> i32 {
+    let dest: *mut i32 =
+        malloc(count as usize * std::mem::size_of::<i32>()) as *mut i32;
+    if dest.is_null() {
+        return -1;
+    }
+    let mut i = 0;
+    while i < count {
+        *dest.offset(i as isize) = *src.offset(i as isize);
+        i += 1;
+    }
+    let mut sum = 0;
+    let mut j = 0;
+    while j < count {
+        sum += *dest.offset(j as isize);
+        j += 1;
+    }
+    free(dest as *mut core::ffi::c_void);
+    sum
+}
+"#,
+        &[
+            "let mut dest: Box<[i32]>",
+            "[(i as isize) as usize..]",
+            "[(j as isize) as usize..]",
+        ],
+        &["(&mut (dest)[..])[0]", "sum += (&(dest)[..])[0]"],
     );
 }
 
@@ -1046,10 +1086,10 @@ pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
 "#,
         &[
             "pub unsafe fn helper(out: &[i8]) -> i32",
-            "let mut buf: Option<Box<[i8]>>",
+            "let mut buf: Box<[i8]>",
             "collect::<Vec<i8>>().into_boxed_slice()",
-            "puts(((buf).as_deref_mut().unwrap_or(&mut [])).as_mut_ptr());",
-            "drop((buf).take());",
+            "puts((&mut (buf)[..]).as_mut_ptr());",
+            "drop(buf);",
         ],
         &[
             "malloc(len)",
@@ -1152,10 +1192,11 @@ pub unsafe fn helper() -> i32 {
 }
 "#,
         &[
-            "let mut s: Option<Box<crate::State>>",
-            "Some(Box::new(crate::State { value: <i32 as Default>::default() }))",
-            "touch((s).as_deref_mut().map_or(std::ptr::null_mut::<crate::State>(),",
-            "drop((s).take());",
+            "let mut s: Box<crate::State>",
+            "Some(Box::new(crate::State {",
+            "value: <i32 as Default>::default()",
+            "touch(((s).as_mut()) as *mut crate::State)",
+            "drop(s);",
         ],
         &[
             "calloc(1, std::mem::size_of::<State>())",
@@ -1432,10 +1473,10 @@ pub unsafe fn free_state() {
 }
 "#,
         &[
-            "let mut state: Option<Box<crate::State>>",
-            "if state.is_none() { return; }",
-            "(*state.as_deref_mut().unwrap()).value = 7;",
-            "drop((state).take());",
+            "let mut state: Box<crate::State>",
+            "if false { return; }",
+            "(*state).value = 7;",
+            "drop(state);",
         ],
         &[
             "malloc(std::mem::size_of::<State>())",
@@ -1583,9 +1624,9 @@ pub unsafe fn free_many() {
 }
 "#,
         &[
-            "let mut buf: Option<Box<[i32]>>",
-            "if buf.is_none() { return; }",
-            "drop((buf).take());",
+            "let mut buf: Box<[i32]>",
+            "if false { return; }",
+            "drop(buf);",
         ],
         &[
             "malloc(4 * std::mem::size_of::<i32>())",
@@ -1890,8 +1931,8 @@ pub unsafe fn caller() -> *mut i32 {
 "#,
         &[
             "fn alloc_one() -> *mut i32",
-            "let mut p: Option<Box<i32>>",
-            "Box::into_raw(_x) as *mut i32",
+            "let mut p: Box<i32>",
+            "Box::into_raw(p) as *mut i32",
         ],
         &[],
     );
@@ -1918,8 +1959,8 @@ pub unsafe fn caller() -> *mut i32 {
 "#,
         &[
             "fn alloc_arr() -> *mut i32",
-            "Option<Box<[i32]>>",
-            "as_deref_mut().unwrap_or(&mut [])",
+            "let mut p: Box<[i32]>",
+            "Box::leak(p).as_mut_ptr()",
             "let f: unsafe fn() -> *mut i32 = alloc_arr;",
         ],
         &["-> Option<Box<[i32]>>", "Box::into_raw("],
@@ -1946,7 +1987,7 @@ pub unsafe fn maybe_alloc(flag: bool) -> *mut i32 {
         &[
             "fn maybe_alloc(flag: bool) -> *const i32",
             "std::ptr::null()",
-            "Box::into_raw(_x) as *const i32",
+            "Box::into_raw(p) as *const i32",
         ],
         &["-> Option<Box<i32>>"],
     );
@@ -1970,7 +2011,10 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &["null", "Option<&mut"],
+        &[
+            "let mut p: &mut i32",
+            "let mut q: *const i32 = (p) as *mut i32",
+        ],
         &[],
     );
 }
@@ -1992,7 +2036,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &["unsafe {", ".as_ref()", "Option<&i32>"],
+        &["unsafe {", ".as_ref()", "let mut q: &i32"],
         &[],
     );
 }
@@ -2103,7 +2147,11 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["bytemuck::cast_ref", "Option<&u32>", "Option<&mut i32>"],
+        &[
+            "bytemuck::cast_ref",
+            "let mut q: &u32",
+            "let mut p: &mut i32",
+        ],
         &["*mut"],
     );
 }
@@ -2182,7 +2230,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["as *mut _ as *mut _", "null_mut", "Option<&mut i32>"],
+        &["q = (p) as *mut i32 as *mut i16", "let mut p: &mut i32"],
         &["bytemuck"],
     );
 }
@@ -2232,7 +2280,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["unsafe {", "as *const i16", ".as_ref()", "Option<&i16>"],
+        &["unsafe {", "as *const i16", ".as_ref()", "let mut q: &i16"],
         &["bytemuck"],
     );
 }
@@ -2253,7 +2301,7 @@ pub fn foo() -> i32 {
     unsafe { *q }
 }
 "#,
-        &["Option<&i32>", "unsafe {", ".as_ref()"],
+        &["let mut q: &i32", "unsafe {", ".as_ref()"],
         &[],
     );
 }
@@ -2274,11 +2322,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &[
-            "as *const _ as *const i16",
-            "Option<&i16>",
-            "Option<&mut i32>",
-        ],
+        &["as *const i16", "let mut q: &i16", "let mut p: &mut i32"],
         &["bytemuck"],
     );
 }
@@ -2530,7 +2574,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["Some(&mut", "Option<&mut i32>"],
+        &["let mut p: &mut i32", "Some(&mut"],
         &["*mut", "bytemuck"],
     );
 }
@@ -2548,7 +2592,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p as libc::c_int;
 }
 "#,
-        &["bytemuck::cast_ref", "Option<&u32>"],
+        &["bytemuck::cast_ref", "let mut p: &u32"],
         &["*mut"],
     );
 }
@@ -2704,7 +2748,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return 0 as libc::c_int;
 }
 "#,
-        &["Option<&mut i32>", "null_mut"],
+        &["let mut p: &mut i32", "as *mut i32 =="],
         &[],
     );
 }
@@ -2724,7 +2768,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return bar(p);
 }
 "#,
-        &["fn bar(p: &i32)", "as_deref()).unwrap()"],
+        &["fn bar(p: &i32)", "bar((Some(&*(p))).unwrap())"],
         &[],
     );
 }
@@ -2743,8 +2787,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["is_none", "Option<&mut i32>"],
-        &["is_null"],
+        &["if false", "let mut p: &mut i32"],
+        &["is_null", "is_none"],
     );
 }
 
@@ -2800,7 +2844,7 @@ pub unsafe extern "C" fn foo() -> (libc::c_int, *mut libc::c_int) {
     return (0 as libc::c_int, p);
 }
 "#,
-        &["Option<&mut"],
+        &["let mut p: &mut i32", "(p) as *mut i32"],
         &[],
     );
 }
@@ -3008,7 +3052,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["Option<&mut i32>", "Some(&mut"],
+        &["let mut p: &mut i32", "Some(&mut"],
         &["*mut"],
     );
 }
@@ -3028,7 +3072,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["Option<&mut i32>", "Some(&mut"],
+        &["let mut p: &mut i32", "Some(&mut"],
         &["*mut"],
     );
 }
@@ -3531,9 +3575,9 @@ pub unsafe fn foo() -> i32 {
 }
 "#,
         &[
-            "let mut data_array: Option<Box<[i32]>>",
-            "SliceCursor::with_pos(",
-            ".as_deref().unwrap_or(&[])",
+            "let mut data_array: Box<[i32]>",
+            "SliceCursor::with_pos(&(data_array)[..]",
+            "if false { return -1; }",
         ],
         &["SliceCursor::with_pos(&data_array"],
     );
@@ -3562,9 +3606,9 @@ pub unsafe fn foo() -> i32 {
 }
 "#,
         &[
-            "let mut data_array: Option<Box<[i32]>>",
-            "SliceCursor::with_pos(",
-            ".as_deref().unwrap_or(&[])",
+            "let mut data_array: Box<[i32]>",
+            "SliceCursor::with_pos(&(data_array)[..]",
+            "if false { return -1; }",
         ],
         &[
             "let mut data_array: *mut i32",
@@ -3611,9 +3655,9 @@ pub unsafe fn foo() -> i32 {
 }
 "#,
         &[
-            "let mut data_array: Option<Box<[i32]>>",
-            "consume(crate::slice_cursor::SliceCursor::with_pos(",
-            ".as_deref().unwrap_or(&[])",
+            "let mut data_array: Box<[i32]>",
+            "consume(crate::slice_cursor::SliceCursor::with_pos(&(data_array)[..]",
+            "if false { return -1; }",
         ],
         &[
             "let mut last_element:",
