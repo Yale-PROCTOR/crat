@@ -66,8 +66,15 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         c_exposed_fns: config.c_exposed_fns.clone(),
     };
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
-    let points_to = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-    let aliases = find_param_aliases(&pre_points_to, &points_to, tcx);
+    let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+    let points_to = andersen::post_analyze(
+        &andersen_config,
+        pre_points_to,
+        points_to_solutions,
+        &tss,
+        tcx,
+    );
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
@@ -86,7 +93,9 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
         source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-    let nullity_result = analyses::nullity::analyze(&input);
+    let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
+    nullity_result.non_null_locals =
+        source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let analysis_results = Analysis {
         promoted_mut_ref_result,
         promoted_shared_ref_result,

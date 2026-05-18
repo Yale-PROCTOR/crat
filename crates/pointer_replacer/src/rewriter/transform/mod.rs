@@ -1875,12 +1875,14 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::OptRef(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::BoxedSlice) => {
-                    let base = self.boxed_slice_view_expr(pe.base, m);
+                    let (base, source_inner_ty) = self
+                        .projected_boxed_slice_expr(&pe, m)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
                     *ptr = self.opt_ref_from_slice_or_cursor(
                         &base,
                         m,
                         lhs_inner_ty,
-                        rhs_inner_ty,
+                        source_inner_ty,
                         def_id,
                     );
                     return PtrKind::OptRef(m);
@@ -1984,8 +1986,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                             self.boxed_slice_from_boxed_slice(pe.base, lhs_inner_ty, rhs_inner_ty);
                         return PtrKind::BoxedSlice;
                     }
-                    let base = self.boxed_slice_view_expr(pe.base, m);
-                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, rhs_inner_ty);
+                    let (base, source_inner_ty) = self
+                        .projected_boxed_slice_expr(&pe, m)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, source_inner_ty);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Deref(m), PtrKind::OptBoxedSlice) => {
@@ -2010,8 +2014,10 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::BoxedSlice) => {
-                    let base = self.boxed_slice_view_expr(pe.base, m);
-                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, rhs_inner_ty);
+                    let (base, source_inner_ty) = self
+                        .projected_boxed_slice_expr(&pe, m)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, source_inner_ty);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::OptBoxedSlice) => {
@@ -2109,9 +2115,16 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::BoxedSlice) => {
-                    let base = self.boxed_slice_view_expr(pe.base, m);
-                    *ptr =
-                        self.raw_from_slice_or_cursor(&base, m, true, lhs_inner_ty, rhs_inner_ty);
+                    let (base, source_inner_ty) = self
+                        .projected_boxed_slice_expr(&pe, m)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr = self.raw_from_slice_or_cursor(
+                        &base,
+                        m,
+                        true,
+                        lhs_inner_ty,
+                        source_inner_ty,
+                    );
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptBoxedSlice) => {
@@ -2565,26 +2578,44 @@ impl<'tcx> TransformVisitor<'tcx> {
         m: bool,
     ) -> Option<(Expr, ty::Ty<'tcx>)> {
         let mut expr = self.opt_boxed_slice_view_expr(pe.base, m);
+        self.apply_boxed_slice_projections(pe, m, &mut expr)
+    }
+
+    fn projected_boxed_slice_expr(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
+        let mut expr = self.boxed_slice_view_expr(pe.base, m);
+        self.apply_boxed_slice_projections(pe, m, &mut expr)
+    }
+
+    fn apply_boxed_slice_projections(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        expr: &mut Expr,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
         let mut from_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
-                    expr = utils::expr!(
+                    *expr = utils::expr!(
                         "({})[({}) as usize..]",
-                        pprust::expr_to_string(&expr),
+                        pprust::expr_to_string(expr),
                         pprust::expr_to_string(offset),
                     );
                 }
                 PtrExprProj::Cast(ty) if ty.is_usize() => return None,
                 PtrExprProj::Cast(ty) => {
                     let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty)?;
-                    expr = self.plain_slice_from_expr(&expr, m, to_ty, from_ty);
+                    *expr = self.plain_slice_from_expr(expr, m, to_ty, from_ty);
                     from_ty = to_ty;
                 }
                 PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
             }
         }
-        Some((expr, from_ty))
+        Some((expr.clone(), from_ty))
     }
 
     fn raw_from_opt_box(
@@ -3522,19 +3553,31 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         if !need_cast {
             let reference = get_reference(
-                pe.base_kind != PtrExprBaseKind::Alloca && !is_rewritten_slice_like_local,
+                pe.base_kind != PtrExprBaseKind::Alloca
+                    && !is_rewritten_slice_like_local
+                    && !is_slice_ref_expr(e),
             );
             if pe.projs.len() == 1
                 && let PtrExprProj::Offset(offset) = pe.projs[0]
             {
                 // if there are only offsets, we can use the original slice and let the cursor handle the offsets
-                let cursor_base = if matches!(self.ptr_source_kind(pe), Some(PtrKind::BoxedSlice)) {
+                let source_kind = self.ptr_source_kind(pe);
+                let cursor_base = if matches!(source_kind, Some(PtrKind::BoxedSlice)) {
                     self.boxed_slice_view_expr(pe.base, m)
-                } else if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptBoxedSlice)) {
+                } else if matches!(source_kind, Some(PtrKind::OptBoxedSlice)) {
                     self.opt_boxed_slice_view_expr(pe.base, m)
                 } else {
                     pe.base.clone()
                 };
+                let reference = get_reference(
+                    pe.base_kind != PtrExprBaseKind::Alloca
+                        && !is_rewritten_slice_like_local
+                        && !matches!(
+                            source_kind,
+                            Some(PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
+                        )
+                        && !is_slice_ref_expr(&cursor_base),
+                );
                 utils::expr!(
                     "{}::with_pos({}{}, ({}) as usize)",
                     cursor_ty,
@@ -7328,6 +7371,9 @@ fn is_plain_slice_expr(expr: &Expr) -> bool {
     if matches!(expr.kind, ExprKind::Index(..) | ExprKind::Array(..)) {
         return true;
     }
+    if is_slice_ref_expr(expr) {
+        return true;
+    }
     if let ExprKind::MethodCall(call) = &expr.kind
         && matches!(call.seg.ident.name.as_str(), "as_slice" | "as_slice_mut")
     {
@@ -7337,6 +7383,21 @@ fn is_plain_slice_expr(expr: &Expr) -> bool {
         return true;
     }
     false
+}
+
+fn is_slice_ref_expr(expr: &Expr) -> bool {
+    let expr = unwrap_paren(expr);
+    matches!(
+        expr.kind,
+        ExprKind::AddrOf(
+            _,
+            _,
+            box Expr {
+                kind: ExprKind::Index(..),
+                ..
+            },
+        )
+    )
 }
 
 fn hoist_opt_ref_borrow(expr: &mut Expr) {
@@ -7554,8 +7615,16 @@ mod tests {
             c_exposed_fns: FxHashSet::default(),
         };
         let pre_points_to = points_to::andersen::pre_analyze(&andersen_config, &tss, tcx);
-        let points_to = points_to::andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-        let aliases = super::super::find_param_aliases(&pre_points_to, &points_to, tcx);
+        let points_to_solutions =
+            points_to::andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+        let aliases = super::super::find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+        let points_to = points_to::andersen::post_analyze(
+            &andersen_config,
+            pre_points_to,
+            points_to_solutions,
+            &tss,
+            tcx,
+        );
 
         let input = collect_program(tcx);
         let mutability_result =
@@ -7579,7 +7648,9 @@ mod tests {
         let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
         offset_sign_result.access_signs =
             source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-        let nullity_result = analyses::nullity::analyze(&input);
+        let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
+        nullity_result.non_null_locals =
+            source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
         let analysis = super::super::Analysis {
             promoted_mut_ref_result,
             promoted_shared_ref_result,

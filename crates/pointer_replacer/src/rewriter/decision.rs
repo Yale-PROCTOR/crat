@@ -87,7 +87,7 @@ pub struct DecisionMaker<'tcx> {
     promoted_shared_refs: DenseBitSet<Local>,
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
-    non_null_params: DenseBitSet<Local>,
+    non_null_locals: DenseBitSet<Local>,
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
@@ -181,7 +181,12 @@ impl<'tcx> DecisionMaker<'tcx> {
         if let Some(signs) = fn_offset_signs {
             needs_cursor.union(signs);
         }
-        let non_null_params = stable_non_null_params(analysis, did, tcx, mutable_pointers.len());
+        let non_null_locals = analysis
+            .nullity_result
+            .non_null_locals
+            .get(&did)
+            .cloned()
+            .unwrap_or_else(|| DenseBitSet::new_empty(mutable_pointers.len()));
         DecisionMaker {
             tcx,
             array_pointers,
@@ -191,7 +196,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor,
-            non_null_params,
+            non_null_locals,
         }
     }
 
@@ -260,49 +265,12 @@ impl<'tcx> DecisionMaker<'tcx> {
 
         let decision = self.preserve_original_pointer_constness(decision, m.is_mut());
         let decision = self.force_raw_local_struct_borrows(decision, ty, m.is_mut());
-        if self.non_null_params.contains(local) {
+        if self.non_null_locals.contains(local) {
             decision.map(PtrKind::non_null_variant)
         } else {
             decision
         }
     }
-}
-
-fn stable_non_null_params<'tcx>(
-    analysis: &Analysis,
-    did: LocalDefId,
-    tcx: TyCtxt<'tcx>,
-    len: usize,
-) -> DenseBitSet<Local> {
-    let mut non_null_params = DenseBitSet::new_empty(len);
-    let Some(params) = analysis.nullity_result.non_null_params.get(&did) else {
-        return non_null_params;
-    };
-    for param in params.iter() {
-        non_null_params.insert(param);
-    }
-
-    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-    for bb in body.basic_blocks.iter() {
-        for stmt in &bb.statements {
-            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
-                continue;
-            };
-            if place.projection.is_empty() {
-                non_null_params.remove(place.local);
-            }
-            match rvalue {
-                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
-                    if place.projection.is_empty() =>
-                {
-                    non_null_params.remove(place.local);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    non_null_params
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -375,12 +343,13 @@ impl SigDecisions {
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
             let direct_output_dec =
                 match decision_maker.decide(return_local, return_decl, return_aliases) {
-                    Some(kind @ (PtrKind::Raw(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice)) => {
-                        Some(kind)
-                    }
-                    Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => {
-                        Some(kind.optional_variant())
-                    }
+                    Some(
+                        kind @ (PtrKind::Raw(_)
+                        | PtrKind::OptBox
+                        | PtrKind::OptBoxedSlice
+                        | PtrKind::Box
+                        | PtrKind::BoxedSlice),
+                    ) => Some(kind),
                     _ => None,
                 };
             let returned_local_output_dec =
@@ -388,12 +357,18 @@ impl SigDecisions {
             let output_dec = match (direct_output_dec, returned_local_output_dec) {
                 (
                     Some(PtrKind::Raw(_)),
-                    Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)),
+                    Some(
+                        kind @ (PtrKind::OptBox
+                        | PtrKind::OptBoxedSlice
+                        | PtrKind::Box
+                        | PtrKind::BoxedSlice),
+                    ),
                 ) => Some(kind),
                 (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
-                (Some(PtrKind::OptBox), Some(PtrKind::OptBoxedSlice)) => {
-                    Some(PtrKind::OptBoxedSlice)
-                }
+                (
+                    Some(PtrKind::OptBox | PtrKind::Box),
+                    Some(kind @ (PtrKind::OptBoxedSlice | PtrKind::BoxedSlice)),
+                ) => Some(kind),
                 (Some(kind), None) | (None, Some(kind)) => Some(kind),
                 (Some(kind), Some(_)) => Some(kind),
                 (None, None) => None,
@@ -468,8 +443,10 @@ fn infer_returned_local_box_kind<'tcx>(
     let local = candidate?;
     let decl = &body.local_decls[local];
     let aliases = aliases.and_then(|aliases| aliases.get(&local));
+    let return_non_null = decision_maker.non_null_locals.contains(return_local);
     match decision_maker.decide(local, decl, aliases) {
         Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some(kind),
+        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) if return_non_null => Some(kind),
         Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => Some(kind.optional_variant()),
         _ => None,
     }
@@ -508,6 +485,7 @@ mod tests {
         .unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn synthetic_decision_maker_with_non_null<'tcx>(
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -544,9 +522,9 @@ mod tests {
         if needs_cursor {
             needs_cursor_set.insert(local);
         }
-        let mut non_null_params = DenseBitSet::new_empty(len);
+        let mut non_null_locals = DenseBitSet::new_empty(len);
         if non_null {
-            non_null_params.insert(local);
+            non_null_locals.insert(local);
         }
 
         DecisionMaker {
@@ -558,10 +536,11 @@ mod tests {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor: needs_cursor_set,
-            non_null_params,
+            non_null_locals,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decide_for_param_with_ty(
         pointer_ty: &str,
         owning: bool,
@@ -585,6 +564,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decide_for_param_with_ty_and_non_null(
         pointer_ty: &str,
         owning: bool,
