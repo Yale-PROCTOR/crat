@@ -1154,14 +1154,28 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         implicit_deref_count: usize,
     ) -> Vec<UnionMemoryInstance> {
         let mut out = vec![];
-        for target in alias_target_locs_with_tys(
+        let mut targets = alias_target_locs_with_tys(
             self.context.result,
             body,
             self.tcx,
             def_id,
             place,
             implicit_deref_count,
-        ) {
+        );
+        if targets.is_empty()
+            && implicit_deref_count == 0
+            && let Some(union_place) = self.enclosing_union_place(place)
+        {
+            targets = alias_target_locs_with_tys(
+                self.context.result,
+                body,
+                self.tcx,
+                def_id,
+                union_place,
+                0,
+            );
+        }
+        for target in targets {
             let target_end = self.context.result.ends[target];
             for instance in self.context.union_instances {
                 if ranges_overlap(target, target_end, instance.root, instance.end) {
@@ -1173,6 +1187,26 @@ impl<'tcx, 'a> BodyUnionAccessCollector<'tcx, 'a> {
         let mut seen = FxHashSet::default();
         out.retain(|i| seen.insert(*i));
         out
+    }
+
+    fn enclosing_union_place(&self, place: Place<'tcx>) -> Option<Place<'tcx>> {
+        let mut prefix = Place::from(place.local);
+        let mut current_ty = self.body.local_decls[place.local].ty;
+
+        for elem in place.projection.iter() {
+            if let TyKind::Adt(adt, _) = current_ty.kind()
+                && adt.is_union()
+                && matches!(elem, PlaceElem::Field(_, _))
+            {
+                return Some(prefix);
+            }
+
+            let next_ty = projected_ty(current_ty, elem)?;
+            prefix = prefix.project_deeper(&[elem], self.tcx);
+            current_ty = next_ty;
+        }
+
+        None
     }
 
     fn record_copy<'s, 't>(
