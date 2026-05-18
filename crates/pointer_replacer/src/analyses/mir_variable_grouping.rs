@@ -117,6 +117,28 @@ impl SourceVarGroups {
             .filter(|(_, s)| !s.is_empty())
             .collect()
     }
+
+    pub fn postprocess_non_null_locals(
+        &self,
+        non_null_locals: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+        non_null_locals
+            .into_iter()
+            .map(|(did, mut non_null)| {
+                if let Some(groups) = self.inner.get(&did) {
+                    for locals in groups.values() {
+                        if !locals.iter().all(|&local| non_null.contains(local)) {
+                            for &local in locals {
+                                non_null.remove(local);
+                            }
+                        }
+                    }
+                }
+                (did, non_null)
+            })
+            .filter(|(_, s)| !s.is_empty())
+            .collect()
+    }
 }
 
 fn group_locals_by_source_variable<'tcx>(
