@@ -3153,7 +3153,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 // ===== as_ptr + OptRef context tests (lines 567-599) =====
 
 /// as_ptr + OptRef, no cast: single borrow from `.as_mut_ptr()`, no overlap,
-/// no offset → promoted to OptRef. Same types. Output: `Some(&mut (arr)[0])`.
+/// no offset -> promoted to OptRef. Same types. Output uses `first_mut`.
 #[test]
 fn test_as_ptr_ref_no_cast() {
     run_test(
@@ -3166,13 +3166,13 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p;
 }
 "#,
-        &["Option<&mut i32>", ".as_mut()"],
+        &["Option<&mut i32>", ".first_mut()"],
         &["bytemuck"],
     );
 }
 
 /// as_ptr + OptRef, bytemuck cast: single borrow, c_int vs c_uint (same-size numerics).
-/// Output: `Some(bytemuck::cast_mut::<_, u32>(&mut (arr)[0]))`.
+/// Output casts the safe array view and then uses `first_mut`.
 #[test]
 fn test_as_ptr_ref_bytemuck() {
     run_test(
@@ -3185,8 +3185,12 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p as libc::c_int;
 }
 "#,
-        &["Option<&mut u32>", ".as_mut()"],
-        &["bytemuck::cast_"],
+        &[
+            "Option<&mut u32>",
+            "bytemuck::cast_slice_mut",
+            ".first_mut()",
+        ],
+        &["from_raw_parts_mut"],
     );
 }
 
@@ -3226,8 +3230,99 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize) as libc::c_int;
 }
 "#,
+        &["bytemuck::cast_slice_mut", "&mut [u32]"],
         &["from_raw_parts_mut"],
-        &["bytemuck::cast_slice"],
+    );
+}
+
+#[test]
+fn test_as_ptr_call_arg_uses_safe_slice_view() {
+    run_test(
+        r#"
+extern crate alloc;
+
+pub unsafe fn consume(out: *mut i32, input: *const i32) {
+    *out.offset(0) = *input.offset(0);
+}
+
+pub unsafe fn foo() -> i32 {
+    let mut out = vec![0; 4];
+    let input = [1, 2, 3, 4];
+    consume(out.as_mut_ptr(), input.as_ptr());
+    out[0]
+}
+"#,
+        &["consume(&mut (out), &(input));"],
+        &["from_raw_parts", "from_raw_parts_mut"],
+    );
+}
+
+#[test]
+fn test_as_ptr_deref_offset_uses_safe_slice_index() {
+    run_test(
+        r#"
+extern crate alloc;
+
+pub unsafe fn foo(idx: usize) -> i32 {
+    let mut out = vec![0; 4];
+    *out.as_mut_ptr().offset(idx as isize) = 7;
+    out[idx]
+}
+"#,
+        &["as usize..]))[0]"],
+        &[".as_mut()", "from_raw_parts_mut"],
+    );
+}
+
+#[test]
+fn test_addr_of_scalar_byte_slice_uses_bytemuck_bytes_of() {
+    run_test(
+        r#"
+pub type uint64_t = u64;
+
+pub unsafe fn hash(mut key: uint64_t) -> u64 {
+    let mut bytes: *const u8 = &mut key as *mut uint64_t as *mut u8;
+    let mut hash = 0u64;
+    let mut i = 0usize;
+    while i < ::core::mem::size_of::<uint64_t>() {
+        hash += *bytes.offset(i as isize) as u64;
+        i += 1;
+    }
+    hash
+}
+"#,
+        &["let mut bytes: &[u8] = bytemuck::bytes_of(&(key));"],
+        &["from_raw_parts", "&raw const"],
+    );
+}
+
+#[test]
+fn test_array_field_ptr_arithmetic_stays_raw_slice() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Block {
+    pub next: *mut Block,
+    pub storage: [i8; 8],
+}
+
+#[repr(C)]
+pub struct Arena {
+    pub storage: *mut Block,
+    pub remaining: usize,
+}
+
+pub unsafe fn alloc_from_block(a: *mut Arena, len: usize) -> i8 {
+    let mut p: *mut i8 = (*(*a).storage).storage.as_mut_ptr().offset(
+        ((*a).remaining as isize) - (len as isize),
+    );
+    *p = 1;
+    *p.offset(1) = 2;
+    *p.offset(1)
+}
+"#,
+        &["from_raw_parts_mut", ".as_mut_ptr().offset"],
+        &["&mut (&mut"],
     );
 }
 
