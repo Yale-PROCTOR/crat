@@ -498,6 +498,35 @@ mod tests {
     }
 
     #[test]
+    fn pointer_to_parent_union_field() {
+        let code = r#"
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union OverlapU {
+            pub a: u32,
+            pub b: [u8; 4],
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct ParentOverlap {
+            pub u: OverlapU,
+        }
+
+        pub extern "C" fn pointer_to_parent_union_field() {
+            let mut s = ParentOverlap { u: OverlapU { a: 0 } };
+            unsafe {
+                let p = &mut s as *mut ParentOverlap;
+                (*p).u.a = 0x01020304;
+                use_a((*p).u.b[0] as u32);
+            }
+        }
+        "#;
+
+        run_test(&format!("{BASE}\n{code}"), (2, 2, 1));
+    }
+
+    #[test]
     fn pointer_read_padded_field() {
         let code = r#"
         #[derive(Copy, Clone)]
