@@ -10,7 +10,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, HirId,
-    def::Res,
+    def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
@@ -18,7 +18,7 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
-    ir::{AstToHir, mir_ty_to_string},
+    ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
 use super::{
@@ -779,6 +779,69 @@ impl<'tcx> TransformVisitor<'tcx> {
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         loop {
             let mut changed = false;
+            let (local_struct_conflict_changed, local_struct_conflict_bindings) =
+                downgrade_conflicting_local_struct_call_inputs(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_binding_conflict_changed, local_struct_binding_conflict_bindings) =
+                downgrade_conflicting_local_struct_call_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_field_borrow_changed, local_struct_field_borrow_bindings) =
+                downgrade_long_lived_local_struct_field_borrow_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_reborrow_changed, local_struct_reborrow_bindings) =
+                downgrade_local_struct_reborrow_assignment_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_field_mut_ptr_changed, local_struct_field_mut_ptr_bindings) =
+                downgrade_local_struct_field_mut_ptr_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_static_changed, local_struct_static_bindings) =
+                downgrade_static_local_struct_projection_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_foreign_mut_changed, local_struct_foreign_mut_bindings) =
+                downgrade_foreign_mutable_local_struct_call_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            if local_struct_conflict_changed {
+                changed = true;
+            }
+            if local_struct_binding_conflict_changed {
+                changed = true;
+            }
+            if local_struct_field_borrow_changed {
+                changed = true;
+            }
+            if local_struct_reborrow_changed {
+                changed = true;
+            }
+            if local_struct_field_mut_ptr_changed {
+                changed = true;
+            }
+            if local_struct_static_changed {
+                changed = true;
+            }
+            if local_struct_foreign_mut_changed {
+                changed = true;
+            }
             let (box_input_changed, unsupported_box_input_bindings) =
                 downgrade_unsupported_box_inputs(
                     rust_program.tcx,
@@ -804,6 +867,13 @@ impl<'tcx> TransformVisitor<'tcx> {
                 &local_raw_param_summaries,
             );
             let old_len = forced_raw_bindings.len();
+            forced_raw_bindings.extend(local_struct_conflict_bindings);
+            forced_raw_bindings.extend(local_struct_binding_conflict_bindings);
+            forced_raw_bindings.extend(local_struct_field_borrow_bindings);
+            forced_raw_bindings.extend(local_struct_reborrow_bindings);
+            forced_raw_bindings.extend(local_struct_field_mut_ptr_bindings);
+            forced_raw_bindings.extend(local_struct_static_bindings);
+            forced_raw_bindings.extend(local_struct_foreign_mut_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);
@@ -5185,6 +5255,957 @@ fn normalize_forced_raw_bindings(
     }
 }
 
+fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    _ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct ConflictVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> ConflictVisitor<'_, 'tcx> {
+        fn visit_call_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let expr = hir_unwrap_casts(expr);
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                return;
+            };
+
+            let conflicting_inputs = {
+                let Some(sig_dec) = self.sig_decs.data.get(&callee_did) else {
+                    return;
+                };
+                if sig_dec.signature_locked {
+                    return;
+                }
+
+                let arg_local_ids = args
+                    .iter()
+                    .map(|arg| {
+                        hir_local_ids_in_expr(arg)
+                            .into_iter()
+                            .collect::<FxHashSet<_>>()
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut conflicting_inputs = Vec::new();
+                for (idx, arg) in args.iter().enumerate() {
+                    let Some(kind) = sig_dec.input_decs.get(idx).copied().flatten() else {
+                        continue;
+                    };
+                    if !is_borrow_like_decision(kind) {
+                        continue;
+                    }
+                    let Some(root) =
+                        hir_whole_ptr_root_for_local_struct_arg(self.tcx, self.typeck, arg)
+                    else {
+                        continue;
+                    };
+                    if !arg_local_ids.iter().enumerate().any(|(other_idx, locals)| {
+                        other_idx != idx
+                            && locals.contains(&root)
+                            && (kind.is_mut()
+                                || arg_may_mutably_borrow(
+                                    self.tcx,
+                                    self.typeck,
+                                    &args[other_idx],
+                                    sig_dec.input_decs.get(other_idx).copied().flatten(),
+                                ))
+                    }) {
+                        continue;
+                    }
+                    let Some(param_hir_id) = callee_input_param_binding(self.tcx, callee_did, idx)
+                    else {
+                        continue;
+                    };
+                    conflicting_inputs.push((idx, param_hir_id));
+                }
+                conflicting_inputs
+            };
+
+            if conflicting_inputs.is_empty() {
+                return;
+            }
+
+            let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did) else {
+                return;
+            };
+            for (idx, param_hir_id) in conflicting_inputs {
+                if !sig_dec
+                    .input_decs
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .is_some_and(is_borrow_like_decision)
+                {
+                    continue;
+                }
+                sig_dec.input_decs[idx] = Some(PtrKind::Raw(true));
+                self.bindings.insert(param_hir_id);
+                self.changed = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for ConflictVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.visit_call_expr(expr);
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let typeck = tcx.typeck_body(body_id);
+        let mut visitor = ConflictVisitor {
+            tcx,
+            sig_decs,
+            typeck,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_conflicting_local_struct_call_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct BindingConflictVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> BindingConflictVisitor<'_, 'tcx> {
+        fn visit_call_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let expr = hir_unwrap_casts(expr);
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                return;
+            };
+
+            let conflicting_roots = {
+                let callee_sig_dec = hir_called_local_fn(self.tcx, expr)
+                    .and_then(|did| self.sig_decs.data.get(&did));
+                let arg_local_ids = args
+                    .iter()
+                    .map(|arg| {
+                        hir_local_ids_in_expr(arg)
+                            .into_iter()
+                            .collect::<FxHashSet<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let mut roots = FxHashSet::default();
+                for locals in &arg_local_ids {
+                    roots.extend(locals.iter().copied());
+                }
+
+                let mut conflicting_roots = Vec::new();
+                for root in roots {
+                    let Some(kind) = self.ptr_kinds.get(&root).copied() else {
+                        continue;
+                    };
+                    if !is_borrow_like_decision(kind) {
+                        continue;
+                    }
+                    let root_ty = self.tcx.typeck(root.owner).node_type(root);
+                    if !ty_points_to_local_struct(self.tcx, root_ty) {
+                        continue;
+                    }
+
+                    let mut use_count = 0usize;
+                    let mut has_mutable_arg = false;
+                    for (idx, locals) in arg_local_ids.iter().enumerate() {
+                        if !locals.contains(&root) {
+                            continue;
+                        }
+                        use_count += 1;
+                        let input_dec = callee_sig_dec
+                            .and_then(|sig_dec| sig_dec.input_decs.get(idx).copied().flatten());
+                        if arg_may_mutably_borrow(self.tcx, self.typeck, &args[idx], input_dec) {
+                            has_mutable_arg = true;
+                        }
+                    }
+                    if use_count > 1 && (kind.is_mut() || has_mutable_arg) {
+                        conflicting_roots.push(root);
+                    }
+                }
+                conflicting_roots
+            };
+
+            for root in conflicting_roots {
+                if !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, root) {
+                    continue;
+                }
+                self.bindings.insert(root);
+                self.changed = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for BindingConflictVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.visit_call_expr(expr);
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let typeck = tcx.typeck_body(body_id);
+        let mut visitor = BindingConflictVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            typeck,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct FieldBorrowVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        body_local_counts: FxHashMap<HirId, usize>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl FieldBorrowVisitor<'_, '_> {
+        fn local_struct_borrow_root(&self, hir_id: HirId) -> bool {
+            self.ptr_kinds
+                .get(&hir_id)
+                .copied()
+                .is_some_and(is_borrow_like_decision)
+                && ty_points_to_local_struct(
+                    self.tcx,
+                    self.tcx.typeck(hir_id.owner).node_type(hir_id),
+                )
+        }
+
+        fn visit_let_stmt(&mut self, let_stmt: &hir::LetStmt<'_>) {
+            let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind else {
+                return;
+            };
+            let Some(binding_kind) = self.ptr_kinds.get(&binding_hir_id).copied() else {
+                return;
+            };
+            if !is_mutable_borrow_like_decision(binding_kind) {
+                return;
+            }
+            let Some(init) = let_stmt.init else {
+                return;
+            };
+            if !ty_points_to_mutable(self.tcx, self.typeck.expr_ty_adjusted(init)) {
+                return;
+            }
+
+            let mut init_counts: FxHashMap<HirId, usize> = FxHashMap::default();
+            for hir_id in hir_local_ids_in_expr(init) {
+                *init_counts.entry(hir_id).or_default() += 1;
+            }
+            for (root, init_count) in init_counts {
+                if !self.local_struct_borrow_root(root) {
+                    continue;
+                }
+                if !hir_expr_has_field_projection_from_root(init, root) {
+                    continue;
+                }
+                if self.body_local_counts.get(&root).copied().unwrap_or(0) <= init_count {
+                    continue;
+                }
+                if !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, root) {
+                    continue;
+                }
+                self.bindings.insert(root);
+                self.changed = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBorrowVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind {
+                self.visit_let_stmt(let_stmt);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut body_local_counts: FxHashMap<HirId, usize> = FxHashMap::default();
+        for hir_id in hir_local_ids_in_expr(body.value) {
+            *body_local_counts.entry(hir_id).or_default() += 1;
+        }
+        let typeck = tcx.typeck_body(body_id);
+        let mut visitor = FieldBorrowVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            typeck,
+            body_local_counts,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_local_struct_reborrow_assignment_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct ReborrowAssignmentVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl ReborrowAssignmentVisitor<'_, '_> {
+        fn local_struct_borrow_root(&self, hir_id: HirId) -> bool {
+            local_struct_borrow_binding(self.tcx, self.ptr_kinds, hir_id)
+        }
+
+        fn force_raw(&mut self, hir_id: HirId) {
+            if !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, hir_id) {
+                return;
+            }
+            self.bindings.insert(hir_id);
+            self.changed = true;
+        }
+
+        fn visit_assignment(&mut self, lhs: &hir::Expr<'_>, rhs: &hir::Expr<'_>) {
+            let Some(lhs_hir_id) = hir_unwrapped_local_id(lhs) else {
+                return;
+            };
+            let Some(rhs_hir_id) = hir_whole_ptr_root(rhs) else {
+                return;
+            };
+            if lhs_hir_id == rhs_hir_id
+                || !self.local_struct_borrow_root(lhs_hir_id)
+                || !self.local_struct_borrow_root(rhs_hir_id)
+            {
+                return;
+            }
+            self.force_raw(lhs_hir_id);
+            self.force_raw(rhs_hir_id);
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for ReborrowAssignmentVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                self.visit_assignment(lhs, rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut visitor = ReborrowAssignmentVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct FieldMutPtrVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl FieldMutPtrVisitor<'_, '_> {
+        fn force_raw(&mut self, hir_id: HirId) {
+            if !local_struct_borrow_binding(self.tcx, self.ptr_kinds, hir_id)
+                || !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, hir_id)
+            {
+                return;
+            }
+            self.bindings.insert(hir_id);
+            self.changed = true;
+        }
+
+        fn visit_method_call(&mut self, expr: &hir::Expr<'_>) {
+            let hir::ExprKind::MethodCall(seg, receiver, args, _) = expr.kind else {
+                return;
+            };
+            if !args.is_empty() || seg.ident.name.as_str() != "as_mut_ptr" {
+                return;
+            }
+            for root in hir_local_ids_in_expr(receiver) {
+                if hir_expr_has_field_projection_from_root(receiver, root) {
+                    self.force_raw(root);
+                }
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldMutPtrVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.visit_method_call(expr);
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut visitor = FieldMutPtrVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_static_local_struct_projection_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct StaticProjectionVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> StaticProjectionVisitor<'_, 'tcx> {
+        fn maybe_force_binding(&mut self, hir_id: HirId, init: &'tcx hir::Expr<'tcx>) {
+            if !local_struct_borrow_binding(self.tcx, self.ptr_kinds, hir_id)
+                || !hir_expr_uses_mut_local_struct_static(self.tcx, init)
+                || !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, hir_id)
+            {
+                return;
+            }
+            self.bindings.insert(hir_id);
+            self.changed = true;
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for StaticProjectionVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.maybe_force_binding(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(lhs_hir_id) = hir_unwrapped_local_id(lhs)
+            {
+                self.maybe_force_binding(lhs_hir_id, rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut visitor = StaticProjectionVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn downgrade_foreign_mutable_local_struct_call_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> (bool, FxHashSet<HirId>) {
+    struct ForeignMutVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        changed: bool,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl ForeignMutVisitor<'_, '_> {
+        fn force_raw(&mut self, hir_id: HirId) {
+            if !local_struct_borrow_binding(self.tcx, self.ptr_kinds, hir_id)
+                || !force_signature_input_raw_for_binding(self.tcx, self.sig_decs, hir_id)
+            {
+                return;
+            }
+            self.bindings.insert(hir_id);
+            self.changed = true;
+        }
+
+        fn visit_call_expr(&mut self, expr: &hir::Expr<'_>) {
+            let expr = hir_unwrap_casts(expr);
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                return;
+            };
+            if hir_called_local_fn(self.tcx, expr).is_some() {
+                return;
+            }
+            for arg in args {
+                let arg_ty = self.typeck.expr_ty_adjusted(arg);
+                if !ty_points_to_mutable(self.tcx, arg_ty)
+                    || !ty_points_to_local_struct(self.tcx, arg_ty)
+                {
+                    continue;
+                }
+                if let Some(root) = hir_whole_ptr_root(arg) {
+                    self.force_raw(root);
+                }
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for ForeignMutVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.visit_call_expr(expr);
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    let mut changed = false;
+    let mut bindings = FxHashSet::default();
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body: body_id, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let typeck = tcx.typeck_body(body_id);
+        let mut visitor = ForeignMutVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            typeck,
+            changed: false,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if visitor.changed {
+            changed = true;
+        }
+        bindings.extend(visitor.bindings);
+    }
+    (changed, bindings)
+}
+
+fn is_borrow_like_decision(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+    )
+}
+
+fn is_mutable_borrow_like_decision(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Ref(true)
+            | PtrKind::OptRef(true)
+            | PtrKind::Slice(true)
+            | PtrKind::SliceCursor(true)
+    )
+}
+
+fn arg_may_mutably_borrow(
+    tcx: TyCtxt<'_>,
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    arg: &hir::Expr<'_>,
+    decision: Option<PtrKind>,
+) -> bool {
+    decision.is_some_and(is_mutable_borrow_like_decision)
+        || ty_points_to_mutable(tcx, typeck.expr_ty_adjusted(arg))
+}
+
+fn callee_input_param_binding(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> Option<HirId> {
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return None;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return None;
+    };
+    let body = tcx.hir_body(body);
+    let param = body.params.get(idx)?;
+    let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+        return None;
+    };
+    Some(hir_id)
+}
+
+fn force_signature_input_raw_for_binding(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    hir_id: HirId,
+) -> bool {
+    let Some((did, idx)) = param_index_for_binding(tcx, hir_id) else {
+        return true;
+    };
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    if !matches!(sig_dec.input_decs.get(idx), Some(Some(PtrKind::Raw(_)))) {
+        sig_dec.input_decs[idx] = Some(PtrKind::Raw(true));
+    }
+    true
+}
+
+fn param_index_for_binding(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<(LocalDefId, usize)> {
+    let did = hir_id.owner.def_id;
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return None;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return None;
+    };
+    let body = tcx.hir_body(body);
+    body.params
+        .iter()
+        .enumerate()
+        .find_map(|(idx, param)| match param.pat.kind {
+            hir::PatKind::Binding(_, param_hir_id, _, _) if param_hir_id == hir_id => {
+                Some((did, idx))
+            }
+            _ => None,
+        })
+}
+
+fn hir_whole_ptr_root_for_local_struct_arg<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<HirId> {
+    ty_points_to_local_struct(tcx, typeck.expr_ty_adjusted(expr))
+        .then(|| hir_whole_ptr_root(expr))
+        .flatten()
+}
+
+fn ty_points_to_local_struct<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _) => ty_is_local_struct(*inner),
+        ty::TyKind::Adt(adt_def, args) if is_option(adt_def.did(), tcx) => {
+            let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+                return false;
+            };
+            ty_points_to_local_struct(tcx, inner)
+        }
+        _ => false,
+    }
+}
+
+fn local_struct_borrow_binding(
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    hir_id: HirId,
+) -> bool {
+    ptr_kinds
+        .get(&hir_id)
+        .copied()
+        .is_some_and(is_borrow_like_decision)
+        && ty_points_to_local_struct(tcx, tcx.typeck(hir_id.owner).node_type(hir_id))
+}
+
+fn ty_points_to_mutable(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(_, mutability) | ty::TyKind::Ref(_, _, mutability) => {
+            mutability.is_mut()
+        }
+        ty::TyKind::Adt(adt_def, args) if is_option(adt_def.did(), tcx) => {
+            let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+                return false;
+            };
+            ty_points_to_mutable(tcx, inner)
+        }
+        _ => false,
+    }
+}
+
+fn ty_is_local_struct(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+    )
+}
+
+fn ty_contains_local_struct(ty: ty::Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _) => {
+            ty_contains_local_struct(*inner)
+        }
+        ty::TyKind::Array(inner, _) | ty::TyKind::Slice(inner) => ty_contains_local_struct(*inner),
+        ty::TyKind::Adt(adt_def, args) => {
+            adt_def.did().is_local() && adt_def.is_struct()
+                || args.types().any(ty_contains_local_struct)
+        }
+        _ => false,
+    }
+}
+
+fn hir_whole_ptr_root(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = hir_unwrap_casts(expr);
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            let Res::Local(hir_id) = path.res else {
+                return None;
+            };
+            Some(hir_id)
+        }
+        hir::ExprKind::AddrOf(_, _, inner) | hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
+            hir_whole_ptr_root(inner)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.is_empty()
+                && matches!(
+                    seg.ident.name.as_str(),
+                    "as_deref_mut" | "as_deref" | "unwrap" | "unwrap_unchecked"
+                ) =>
+        {
+            hir_whole_ptr_root(receiver)
+        }
+        hir::ExprKind::Call(callee, [arg]) if hir_path_name_is(callee, "Some") => {
+            hir_whole_ptr_root(arg)
+        }
+        _ => None,
+    }
+}
+
+fn hir_path_name_is(expr: &hir::Expr<'_>, name: &str) -> bool {
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(expr).kind else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|seg| seg.ident.name.as_str() == name)
+}
+
+fn hir_expr_has_field_projection_from_root(expr: &hir::Expr<'_>, root: HirId) -> bool {
+    struct FieldProjectionVisitor {
+        root: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::Field(base, _) = expr.kind
+                && hir_local_ids_in_expr(base).contains(&self.root)
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor { root, found: false };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
+fn hir_expr_uses_mut_local_struct_static<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> bool {
+    struct StaticVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        found: bool,
+    }
+
+    impl<'tcx> StaticVisitor<'tcx> {
+        fn is_mut_local_struct_static(&self, def_id: LocalDefId) -> bool {
+            let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(def_id) else {
+                return false;
+            };
+            let hir::ItemKind::Static(mutability, _, _, _) = item.kind else {
+                return false;
+            };
+            mutability.is_mut()
+                && ty_contains_local_struct(self.tcx.type_of(def_id).instantiate_identity())
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for StaticVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(expr).kind
+                && let Res::Def(DefKind::Static { .. }, def_id) = path.res
+                && let Some(local_def_id) = def_id.as_local()
+                && self.is_mut_local_struct_static(local_def_id)
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = StaticVisitor { tcx, found: false };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
 fn downgrade_unsupported_box_inputs(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
@@ -8767,6 +9788,49 @@ mod tests {
 
         loop {
             let mut changed = false;
+            let (local_struct_conflict_changed, local_struct_conflict_bindings) =
+                downgrade_conflicting_local_struct_call_inputs(tcx, &mut sig_decs, &ptr_kinds);
+            let (local_struct_binding_conflict_changed, local_struct_binding_conflict_bindings) =
+                downgrade_conflicting_local_struct_call_bindings(tcx, &mut sig_decs, &ptr_kinds);
+            let (local_struct_field_borrow_changed, local_struct_field_borrow_bindings) =
+                downgrade_long_lived_local_struct_field_borrow_bindings(
+                    tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            let (local_struct_reborrow_changed, local_struct_reborrow_bindings) =
+                downgrade_local_struct_reborrow_assignment_bindings(tcx, &mut sig_decs, &ptr_kinds);
+            let (local_struct_field_mut_ptr_changed, local_struct_field_mut_ptr_bindings) =
+                downgrade_local_struct_field_mut_ptr_bindings(tcx, &mut sig_decs, &ptr_kinds);
+            let (local_struct_static_changed, local_struct_static_bindings) =
+                downgrade_static_local_struct_projection_bindings(tcx, &mut sig_decs, &ptr_kinds);
+            let (local_struct_foreign_mut_changed, local_struct_foreign_mut_bindings) =
+                downgrade_foreign_mutable_local_struct_call_bindings(
+                    tcx,
+                    &mut sig_decs,
+                    &ptr_kinds,
+                );
+            if local_struct_conflict_changed {
+                changed = true;
+            }
+            if local_struct_binding_conflict_changed {
+                changed = true;
+            }
+            if local_struct_field_borrow_changed {
+                changed = true;
+            }
+            if local_struct_reborrow_changed {
+                changed = true;
+            }
+            if local_struct_field_mut_ptr_changed {
+                changed = true;
+            }
+            if local_struct_static_changed {
+                changed = true;
+            }
+            if local_struct_foreign_mut_changed {
+                changed = true;
+            }
             let (box_input_changed, unsupported_box_input_bindings) =
                 downgrade_unsupported_box_inputs(tcx, &mut sig_decs, &local_raw_free_summaries);
             if box_input_changed {
@@ -8802,6 +9866,34 @@ mod tests {
                     }
                 }
             };
+            record_new(
+                &local_struct_conflict_bindings,
+                "local_struct_call_conflict",
+            );
+            record_new(
+                &local_struct_binding_conflict_bindings,
+                "local_struct_call_binding_conflict",
+            );
+            record_new(
+                &local_struct_field_borrow_bindings,
+                "local_struct_field_borrow_conflict",
+            );
+            record_new(
+                &local_struct_reborrow_bindings,
+                "local_struct_reborrow_assignment",
+            );
+            record_new(
+                &local_struct_field_mut_ptr_bindings,
+                "local_struct_field_mut_ptr",
+            );
+            record_new(
+                &local_struct_static_bindings,
+                "local_struct_static_projection",
+            );
+            record_new(
+                &local_struct_foreign_mut_bindings,
+                "local_struct_foreign_mut_call",
+            );
             record_new(&unsupported_box_input_bindings, "unsupported_box_input");
             record_new(&raw_call_result_bindings, "raw_call_result");
             record_new(&raw_local_assignment_bindings, "raw_local_assignment");
@@ -8825,6 +9917,13 @@ mod tests {
             }
 
             let old_len = forced_raw_bindings.len();
+            forced_raw_bindings.extend(local_struct_conflict_bindings);
+            forced_raw_bindings.extend(local_struct_binding_conflict_bindings);
+            forced_raw_bindings.extend(local_struct_field_borrow_bindings);
+            forced_raw_bindings.extend(local_struct_reborrow_bindings);
+            forced_raw_bindings.extend(local_struct_field_mut_ptr_bindings);
+            forced_raw_bindings.extend(local_struct_static_bindings);
+            forced_raw_bindings.extend(local_struct_foreign_mut_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);

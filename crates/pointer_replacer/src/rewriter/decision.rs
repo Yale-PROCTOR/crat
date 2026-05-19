@@ -109,34 +109,6 @@ impl<'tcx> DecisionMaker<'tcx> {
         }
     }
 
-    fn force_raw_local_struct_borrows(
-        &self,
-        decision: Option<PtrKind>,
-        ty: ty::Ty<'tcx>,
-        is_mut: bool,
-    ) -> Option<PtrKind> {
-        let is_local_struct = matches!(
-            ty.kind(),
-            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
-        );
-        if is_local_struct
-            && is_mut
-            && matches!(
-                decision,
-                Some(
-                    PtrKind::Ref(true)
-                        | PtrKind::OptRef(true)
-                        | PtrKind::Slice(true)
-                        | PtrKind::SliceCursor(true)
-                )
-            )
-        {
-            Some(PtrKind::Raw(true))
-        } else {
-            decision
-        }
-    }
-
     pub fn new(analysis: &Analysis, did: LocalDefId, tcx: TyCtxt<'tcx>) -> Self {
         let mutable_pointers = analysis
             .mutability_result
@@ -235,8 +207,6 @@ impl<'tcx> DecisionMaker<'tcx> {
             } else {
                 Some(PtrKind::OptBox)
             }
-        } else if is_local_struct && m.is_mut() {
-            Some(PtrKind::Raw(true))
         } else if self.array_pointers[local] {
             if self.promoted_shared_refs.contains(local) {
                 if self.needs_cursor.contains(local) {
@@ -264,7 +234,6 @@ impl<'tcx> DecisionMaker<'tcx> {
         };
 
         let decision = self.preserve_original_pointer_constness(decision, m.is_mut());
-        let decision = self.force_raw_local_struct_borrows(decision, ty, m.is_mut());
         if self.non_null_locals.contains(local) {
             decision.map(PtrKind::non_null_variant)
         } else {
