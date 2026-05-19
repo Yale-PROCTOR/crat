@@ -604,7 +604,51 @@ pub unsafe fn use_header() -> i32 {
 }
 
 #[test]
-fn test_rewriter_keeps_mutable_local_struct_params_raw() {
+fn test_rewriter_promotes_non_conflicting_local_struct_params() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    value: i32,
+}
+
+pub unsafe fn touch_state(s: *mut State) {
+    (*s).value += 1;
+}
+
+pub unsafe fn caller(s: *mut State) {
+    touch_state(s);
+}
+        "#,
+        &["pub unsafe fn touch_state(mut s: &mut crate::State)"],
+        &["pub unsafe fn touch_state(mut s: *mut crate::State)"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_local_struct_call_conflict_with_scalar_read() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Tree {
+    root_id: i32,
+}
+
+pub unsafe fn tree_print_helper(tree: *mut Tree, root_id: i32) {
+    (*tree).root_id = root_id;
+}
+
+pub unsafe fn caller(tree: *mut Tree) {
+    tree_print_helper(tree, (*tree).root_id);
+}
+        "#,
+        &["pub unsafe fn tree_print_helper(mut tree: *mut crate::Tree, root_id: i32)"],
+        &["pub unsafe fn tree_print_helper(mut tree: &mut crate::Tree"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_local_struct_call_conflict_with_field_borrow() {
     run_test(
         r#"
 extern "C" {
@@ -629,7 +673,193 @@ pub unsafe fn caller() -> i32 {
         }
 	"#,
         &["pub unsafe fn touch_state(mut s: *mut crate::State, mut buf: &mut i32)"],
-        &["Option<&mut State>"],
+        &["pub unsafe fn touch_state(mut s: &crate::State"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_repeated_local_struct_field_call_conflict() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    flags: i32,
+    fp: *mut i32,
+}
+
+pub unsafe fn get_data(flags: i32, fp: *mut i32) -> i32 {
+    if !fp.is_null() {
+        *fp = flags;
+    }
+    flags
+}
+
+pub unsafe fn caller(state: *mut State) -> i32 {
+    get_data((*state).flags, (*state).fp)
+}
+        "#,
+        &["pub unsafe fn caller(mut state: *mut crate::State) -> i32"],
+        &["pub unsafe fn caller(mut state: &mut crate::State) -> i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_long_lived_local_struct_field_borrow_conflict() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    bitdepth: u32,
+    cur_blocksize: u32,
+    subframe_bitdepth: u32,
+    residuals: [i32; 5],
+}
+
+pub unsafe fn decorrelate(t: *mut State) {
+    let residuals_0: *mut i32 = ((*t).residuals).as_mut_ptr();
+    let mut i: u32 = 0;
+    (*t).subframe_bitdepth = (*t).bitdepth;
+    while i < (*t).cur_blocksize && i < 5 {
+        *residuals_0.offset(i as isize) = i as i32;
+        i += 1;
+    }
+}
+        "#,
+        &["pub unsafe fn decorrelate(mut t: *mut crate::State)"],
+        &["pub unsafe fn decorrelate(mut t: &mut crate::State)"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_local_struct_reborrow_assignment_conflict() {
+    run_test(
+        r#"
+extern "C" {
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    next: *mut Node,
+}
+
+pub unsafe fn clear_list(head: *mut Node) {
+    let mut x: *mut Node = head;
+    let mut y: *mut Node = std::ptr::null_mut();
+    while !x.is_null() {
+        y = (*x).next;
+        free(x as *mut core::ffi::c_void);
+        x = y;
+    }
+}
+        "#,
+        &[
+            "let mut x: *mut crate::Node =",
+            "let mut y: *mut crate::Node = std::ptr::null_mut();",
+        ],
+        &["Option<&crate::Node>"],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_local_struct_field_mut_ptr_root() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct ResultItem {
+    value: i32,
+}
+
+impl Copy for ResultItem {}
+
+impl Clone for ResultItem {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct ResultArray {
+    count: i32,
+    data: [ResultItem; 4],
+}
+
+pub unsafe fn compare(arr: *mut ResultArray, idx: i32) -> i32 {
+    let ptr: *mut ResultItem = (*arr).data.as_mut_ptr().offset(idx as isize);
+    return (*ptr).value;
+}
+        "#,
+        &["pub unsafe fn compare(mut arr: *mut crate::ResultArray"],
+        &[
+            "pub unsafe fn compare(arr: &crate::ResultArray",
+            "pub unsafe fn compare(mut arr: &crate::ResultArray",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_static_local_struct_array_projection() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    id: i32,
+}
+
+impl Copy for Node {}
+
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+static mut NODE_STORAGE: [Node; 4] = [Node { id: 0 }; 4];
+
+pub unsafe fn last_node(count: i32) -> i32 {
+    let mut end_ptr: *mut Node = NODE_STORAGE.as_mut_ptr().offset(count as isize);
+    let mut iter: *mut Node = end_ptr;
+    if iter > NODE_STORAGE.as_mut_ptr() {
+        iter = iter.offset(-1);
+    }
+    return (*iter).id;
+}
+        "#,
+        &["let mut end_ptr: *mut crate::Node"],
+        &[
+            "let mut end_ptr: crate::slice_cursor::SliceCursor",
+            "let mut end_ptr: &mut crate::Node",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_downgrades_foreign_mutable_local_struct_call_arg() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Match {
+    start: i32,
+    end: i32,
+}
+
+extern "C" {
+    fn fill_match(matches: *mut Match) -> i32;
+}
+
+pub unsafe fn wrapper(matches: *mut Match) -> i32 {
+    return fill_match(matches);
+}
+
+pub unsafe fn caller(matches: *mut Match) -> i32 {
+    return wrapper(matches);
+}
+        "#,
+        &[
+            "pub unsafe fn wrapper(mut matches: *mut crate::Match) -> i32",
+            "fill_match(matches)",
+        ],
+        &["pub unsafe fn wrapper(matches: Option<&crate::Match>"],
     );
 }
 
@@ -700,7 +930,7 @@ pub unsafe fn dup_tail(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
 }
 
 #[test]
-fn test_rewriter_keeps_struct_field_pointer_tail_raw() {
+fn test_rewriter_promotes_struct_field_pointer_tail_param() {
     run_test(
         r#"
 extern "C" {
@@ -722,7 +952,7 @@ pub unsafe fn get_entries(map: *mut Map) -> *mut i32 {
     return (*map).entries;
 }
 "#,
-        &["pub unsafe fn get_entries(mut map: *mut crate::Map) -> *const i32"],
+        &["pub unsafe fn get_entries(map: &crate::Map) -> *const i32"],
         &["Option<Box<i32>>", "Option<Box<[i32]>>"],
     );
 }
@@ -1195,7 +1425,8 @@ pub unsafe fn helper() -> i32 {
             "let mut s: Box<crate::State>",
             "Some(Box::new(crate::State {",
             "value: <i32 as Default>::default()",
-            "touch(((s).as_mut()) as *mut crate::State)",
+            "unsafe fn touch(mut state: &mut crate::State) -> i32",
+            "let result = touch((Some(&mut *((s).as_mut()))).unwrap());",
             "drop(s);",
         ],
         &[
@@ -2401,7 +2632,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(1 as isize);
 }
 "#,
-        &["from_raw_parts_mut", "as *mut _", "&mut [i32]"],
+        &["from_raw_parts_mut", "as *mut i32", "&mut [i32]"],
         &["bytemuck"],
     );
 }
