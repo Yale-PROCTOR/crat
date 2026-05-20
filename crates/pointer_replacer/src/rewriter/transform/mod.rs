@@ -5252,7 +5252,7 @@ struct LocalStructLetFact {
     binding_hir_id: HirId,
     init_points_to_mutable: bool,
     init_local_counts: FxHashMap<HirId, usize>,
-    init_field_projection_roots: FxHashSet<HirId>,
+    init_non_raw_field_projection_roots: FxHashSet<HirId>,
 }
 
 struct LocalStructReborrowAssignmentFact {
@@ -5367,7 +5367,10 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                     self.typeck.expr_ty_adjusted(init),
                 ),
                 init_local_counts: hir_local_id_counts_in_expr(init),
-                init_field_projection_roots: hir_field_projection_roots_in_expr(init),
+                init_non_raw_field_projection_roots: hir_non_raw_field_projection_roots_in_expr(
+                    self.typeck,
+                    init,
+                ),
             });
             self.body
                 .static_projection_events
@@ -5622,7 +5625,7 @@ fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
                 if !local_struct_borrow_binding(tcx, ptr_kinds, *root) {
                     continue;
                 }
-                if !let_fact.init_field_projection_roots.contains(root) {
+                if !let_fact.init_non_raw_field_projection_roots.contains(root) {
                     continue;
                 }
                 if body.body_local_counts.get(root).copied().unwrap_or(0) <= *init_count {
@@ -5692,8 +5695,12 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
     for body in &facts.bodies {
         for field_mut_ptr in &body.field_mut_ptrs {
             for root in &field_mut_ptr.receiver_local_ids {
+                let Some(root_kind) = ptr_kinds.get(root).copied() else {
+                    continue;
+                };
                 if !field_mut_ptr.receiver_field_projection_roots.contains(root)
                     || !local_struct_borrow_binding(tcx, ptr_kinds, *root)
+                    || is_mutable_borrow_like_decision(root_kind)
                     || !force_signature_input_raw_for_binding(tcx, sig_decs, *root)
                 {
                     continue;
@@ -5969,6 +5976,34 @@ fn hir_field_projection_roots_in_expr(expr: &hir::Expr<'_>) -> FxHashSet<HirId> 
     }
 
     let mut visitor = FieldProjectionVisitor {
+        roots: FxHashSet::default(),
+    };
+    visitor.visit_expr(expr);
+    visitor.roots
+}
+
+fn hir_non_raw_field_projection_roots_in_expr<'tcx>(
+    typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> FxHashSet<HirId> {
+    struct FieldProjectionVisitor<'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        roots: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, _) = expr.kind
+                && !self.typeck.expr_ty_adjusted(expr).is_raw_ptr()
+            {
+                self.roots.extend(hir_local_ids_in_expr(base));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor {
+        typeck,
         roots: FxHashSet::default(),
     };
     visitor.visit_expr(expr);

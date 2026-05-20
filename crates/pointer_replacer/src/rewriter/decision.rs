@@ -200,10 +200,10 @@ impl<'tcx> DecisionMaker<'tcx> {
                 Some(PtrKind::OptBoxedSlice)
             }
         } else if self._owning_pointers[local] {
-            if matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
-                Some(PtrKind::Raw(self.mutable_pointers[local]))
-            } else if self._output_params.contains(local) {
+            if self._output_params.contains(local) {
                 Some(PtrKind::OptRef(true))
+            } else if matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
+                Some(PtrKind::Raw(self.mutable_pointers[local]))
             } else {
                 Some(PtrKind::OptBox)
             }
@@ -603,6 +603,23 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     fn owning_scalar_output_becomes_mut_opt_ref() {
         assert_eq!(
             decide_for_param(true, true, false, false, false, false, true),
+            PtrKind::OptRef(true)
+        );
+    }
+
+    #[test]
+    fn owning_pointer_to_pointer_output_becomes_mut_opt_ref() {
+        assert_eq!(
+            decide_for_param_with_ty(
+                "*mut *const i32",
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true
+            ),
             PtrKind::OptRef(true)
         );
     }

@@ -731,6 +731,29 @@ pub unsafe fn decorrelate(t: *mut State) {
 }
 
 #[test]
+fn test_rewriter_allows_long_lived_raw_pointer_field_borrow() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Image {
+    w: i32,
+    h: i32,
+    pix: *mut u8,
+}
+
+pub unsafe fn premultiply(img: *mut Image) {
+    let data: *mut u8 = (*img).pix;
+    let w = (*img).w;
+    let h = (*img).h;
+    *data.offset((w * h - 1) as isize) = 0;
+}
+        "#,
+        &["pub unsafe fn premultiply(mut img: &mut crate::Image)"],
+        &["pub unsafe fn premultiply(mut img: *mut crate::Image)"],
+    );
+}
+
+#[test]
 fn test_rewriter_downgrades_local_struct_reborrow_assignment_conflict() {
     run_test(
         r#"
@@ -794,6 +817,30 @@ pub unsafe fn compare(arr: *mut ResultArray, idx: i32) -> i32 {
             "pub unsafe fn compare(arr: &crate::ResultArray",
             "pub unsafe fn compare(mut arr: &crate::ResultArray",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_local_struct_field_mut_ptr_on_mut_root() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pos: usize,
+    buffer: [u8; 8],
+}
+
+pub unsafe fn write_byte(d: *mut u8, value: u8) {
+    *d = value;
+}
+
+pub unsafe fn add_sample(m: *mut State, value: u8) {
+    write_byte((*m).buffer.as_mut_ptr().offset((*m).pos as isize), value);
+    (*m).pos += 1;
+}
+        "#,
+        &["pub unsafe fn add_sample(mut m: &mut crate::State"],
+        &["pub unsafe fn add_sample(mut m: *mut crate::State"],
     );
 }
 
