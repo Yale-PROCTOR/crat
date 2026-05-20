@@ -1786,7 +1786,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 _ => {}
             }
-            let raw_expr = if is_array_field_ptr_arithmetic(&pe) {
+            let raw_expr = if let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
+                && let Some(raw_expr) = self.array_field_offset_raw_ptr(&pe, m)
+            {
+                raw_expr
+            } else if is_array_field_ptr_arithmetic(&pe) {
                 e.clone()
             } else {
                 let base = self.projected_expr(&pe, pe.as_mut_ptr, false);
@@ -2695,9 +2699,6 @@ impl<'tcx> TransformVisitor<'tcx> {
         if !self.is_base_not_a_raw_ptr(pe) {
             return None;
         }
-        if is_array_field_ptr_arithmetic(pe) {
-            return None;
-        }
         if want_mut {
             let source_mut = if pe.as_ptr {
                 pe.as_mut_ptr
@@ -2707,6 +2708,22 @@ impl<'tcx> TransformVisitor<'tcx> {
             if !source_mut {
                 return None;
             }
+        }
+
+        if let Some(base) = self.array_field_offset_slice_ref(pe, want_mut) {
+            let source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+            if self.safe_slice_view_cast_allowed(
+                source_inner_ty,
+                target_inner_ty,
+                def_id,
+                allow_resized_numeric_casts,
+            ) {
+                return Some((base, source_inner_ty, true));
+            }
+            return None;
+        }
+        if is_array_field_ptr_arithmetic(pe) {
+            return None;
         }
 
         let mut source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
@@ -2748,6 +2765,78 @@ impl<'tcx> TransformVisitor<'tcx> {
             source_inner_ty,
             is_slice_ref,
         ))
+    }
+
+    fn array_field_offset_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
+        if m && !pe.as_mut_ptr {
+            return None;
+        }
+        let offset = array_field_direct_offset(pe, true)?;
+        if m && !is_int_lit_expr(offset) {
+            return None;
+        }
+        if !self.offset_expr_can_be_slice_index(offset) {
+            return None;
+        }
+        let slice = self.array_field_offset_slice_ref_from_offset(pe, offset, m);
+        let mut raw = utils::expr!(
+            "({}).as_{}ptr()",
+            pprust::expr_to_string(&slice),
+            if m { "mut_" } else { "" },
+        );
+        for proj in &pe.projs[1..] {
+            let PtrExprProj::Cast(ty) = proj else { unreachable!() };
+            let (to_ty, mutability) = unwrap_ptr_from_mir_ty(*ty)?;
+            raw = utils::expr!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(&raw),
+                if mutability.is_mut() { "mut" } else { "const" },
+                mir_ty_to_string(to_ty, self.tcx),
+            );
+        }
+        Some(raw)
+    }
+
+    fn array_field_offset_slice_ref(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
+        let offset = array_field_direct_offset(pe, false)?;
+        if m && !is_int_lit_expr(offset) {
+            return None;
+        }
+        if !self.offset_expr_can_be_slice_index(offset) {
+            return None;
+        }
+        Some(self.array_field_offset_slice_ref_from_offset(pe, offset, m))
+    }
+
+    fn array_field_offset_slice_ref_from_offset(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        offset: &Expr,
+        m: bool,
+    ) -> Expr {
+        utils::expr!(
+            "&{}({})[({}) as usize..]",
+            if m { "mut " } else { "" },
+            pprust::expr_to_string(pe.base),
+            pprust::expr_to_string(offset),
+        )
+    }
+
+    fn offset_expr_can_be_slice_index(&self, offset: &Expr) -> bool {
+        let offset = unwrap_paren(offset);
+        match &offset.kind {
+            ExprKind::Cast(inner, _) => self.offset_expr_can_be_slice_index(inner),
+            ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
+            ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => {
+                let Some(hir_offset) = self.ast_to_hir.get_expr(offset.id, self.tcx) else {
+                    return false;
+                };
+                let typeck = self.tcx.typeck(hir_offset.hir_id.owner);
+                let ty = typeck.expr_ty(hir_offset);
+                ty.is_integral() && !ty.is_signed()
+            }
+            _ => false,
+        }
     }
 
     fn safe_slice_view_cast_allowed(
@@ -4896,6 +4985,39 @@ fn ty_is_byte_sized_raw_inner(ty: ty::Ty<'_>) -> bool {
         ty.kind(),
         ty::TyKind::Int(ty::IntTy::I8) | ty::TyKind::Uint(ty::UintTy::U8)
     )
+}
+
+fn array_field_direct_offset<'a, 'tcx>(
+    pe: &PtrExpr<'a, 'tcx>,
+    allow_casts: bool,
+) -> Option<&'a Expr> {
+    if !pe.as_ptr
+        || !pe.base_ty.is_array()
+        || !matches!(unwrap_paren(pe.base).kind, ExprKind::Field(..))
+    {
+        return None;
+    }
+    let [PtrExprProj::Offset(offset), rest @ ..] = pe.projs.as_slice() else {
+        return None;
+    };
+    if allow_casts {
+        if !rest.iter().all(
+            |proj| matches!(proj, PtrExprProj::Cast(ty) if unwrap_ptr_from_mir_ty(*ty).is_some()),
+        ) {
+            return None;
+        }
+    } else if !rest.is_empty() {
+        return None;
+    }
+    Some(*offset)
+}
+
+fn is_int_lit_expr(expr: &Expr) -> bool {
+    match &unwrap_paren(expr).kind {
+        ExprKind::Cast(inner, _) => is_int_lit_expr(inner),
+        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
+        _ => false,
+    }
 }
 
 fn is_array_field_ptr_arithmetic(pe: &PtrExpr<'_, '_>) -> bool {

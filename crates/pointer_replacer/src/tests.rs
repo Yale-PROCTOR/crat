@@ -3663,6 +3663,86 @@ pub unsafe fn alloc_from_block(a: *mut Arena, len: usize) -> i8 {
     );
 }
 
+#[test]
+fn test_array_field_zero_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub addr: [u32; 8],
+}
+
+pub unsafe fn consume(addr: *mut u32) {
+    *addr.offset(0) = 1;
+    *addr.offset(1) = 2;
+}
+
+pub unsafe fn foo() {
+    let mut info = Info { addr: [0; 8] };
+    consume(info.addr.as_mut_ptr().offset(0));
+}
+"#,
+        &["consume(&mut (info.addr)["],
+        &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_const_offset_raw_arg_uses_slice_suffix_ptr() {
+    run_test(
+        r#"
+extern "C" {
+    fn memset(dst: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub ctr: [u8; 16],
+}
+
+pub unsafe fn foo() {
+    let mut ctx = Ctx { ctr: [0; 16] };
+    memset(ctx.ctr.as_mut_ptr().offset(12) as *mut _, 0, 4);
+}
+"#,
+        &["&mut (ctx.ctr)[(12) as usize..]).as_mut_ptr()"],
+        &[".ctr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_unsigned_offset_raw_arg_uses_slice_suffix_ptr() {
+    run_test(
+        r#"
+extern "C" {
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize)
+        -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub buffer: [u8; 16],
+    pub buffer_pos: u64,
+}
+
+pub unsafe fn foo(n: usize) {
+    let mut out = [0u8; 16];
+    let mut ctx = Ctx {
+        buffer: [0; 16],
+        buffer_pos: 4,
+    };
+    memcpy(
+        out.as_mut_ptr() as *mut _,
+        ctx.buffer.as_mut_ptr().offset(ctx.buffer_pos as isize) as *const _,
+        n,
+    );
+}
+"#,
+        &["&(ctx.buffer)[(ctx.buffer_pos as isize) as usize..]).as_ptr()"],
+        &[".buffer.as_mut_ptr().offset"],
+    );
+}
+
 /// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
 /// Non-numeric rhs_inner_ty → `from_raw_parts_mut`.
 #[test]
@@ -4126,7 +4206,7 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["(&((*src).data))[("],
+        &["&((*src).data)[("],
         &["&mut ((*src).data)"],
     );
 }
