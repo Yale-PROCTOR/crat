@@ -192,10 +192,10 @@ impl<'tcx> DecisionMaker<'tcx> {
         }) {
             Some(PtrKind::Raw(self.mutable_pointers[local]))
         } else if self._owning_pointers[local] && self.array_pointers[local] {
-            if is_local_struct {
-                Some(PtrKind::Raw(self.mutable_pointers[local]))
-            } else if self._output_params.contains(local) {
+            if self._output_params.contains(local) {
                 Some(PtrKind::Slice(true))
+            } else if is_local_struct {
+                Some(PtrKind::Raw(self.mutable_pointers[local]))
             } else {
                 Some(PtrKind::OptBoxedSlice)
             }
