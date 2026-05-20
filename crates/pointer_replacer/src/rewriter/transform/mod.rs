@@ -24,7 +24,7 @@ use utils::{
 use super::{
     Analysis,
     collector::collect_diffs,
-    decision::{PtrKind, SigDecisions},
+    decision::{PtrKind, SigDecision, SigDecisions},
 };
 use crate::utils::rustc::RustProgram;
 
@@ -5741,7 +5741,11 @@ fn downgrade_conflicting_local_struct_call_bindings<'tcx>(
                     }
                     if use_count > 1
                         && has_mutable_arg
-                        && !call_uses_root_only_through_disjoint_mutable_fields(call, root)
+                        && !call_uses_root_only_through_disjoint_field_args(
+                            call,
+                            root,
+                            callee_sig_dec,
+                        )
                     {
                         conflicting_roots.push(root);
                     }
@@ -5971,17 +5975,20 @@ fn call_other_root_uses_are_field_pointer_args(
     found
 }
 
-fn call_uses_root_only_through_disjoint_mutable_fields(
+fn call_uses_root_only_through_disjoint_field_args(
     call: &LocalStructCallFact,
     root: HirId,
+    callee_sig_dec: Option<&SigDecision>,
 ) -> bool {
     let mut fields = FxHashSet::default();
     let mut found = false;
+    let mut has_mutable_borrow_like_arg = false;
+    let mut has_shared_borrow_like_arg = false;
     for (idx, locals) in call.arg_local_ids.iter().enumerate() {
         if !locals.contains(&root) {
             continue;
         }
-        if !call.arg_points_to_mutable[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
+        if !call.arg_points_to_any[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
             return false;
         }
 
@@ -5998,9 +6005,16 @@ fn call_uses_root_only_through_disjoint_mutable_fields(
         if !arg_has_field {
             return false;
         }
+        let input_dec =
+            callee_sig_dec.and_then(|sig_dec| sig_dec.input_decs.get(idx).copied().flatten());
+        if input_dec.is_some_and(is_mutable_borrow_like_decision) {
+            has_mutable_borrow_like_arg = true;
+        } else if input_dec.is_some_and(is_borrow_like_decision) {
+            has_shared_borrow_like_arg = true;
+        }
         found = true;
     }
-    found
+    found && !(has_mutable_borrow_like_arg && has_shared_borrow_like_arg)
 }
 
 fn callee_input_param_binding(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> Option<HirId> {
@@ -10250,6 +10264,50 @@ mod tests {
             .expect("expected matching local hir id")
     }
 
+    fn find_fn_did(tcx: TyCtxt<'_>, fn_name: &str) -> LocalDefId {
+        tcx.hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|maybe_owner| maybe_owner.as_owner())
+            .find_map(|owner| {
+                let OwnerNode::Item(item) = owner.node() else {
+                    return None;
+                };
+                let HirItemKind::Fn { .. } = item.kind else {
+                    return None;
+                };
+                (tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() == fn_name)
+                    .then_some(item.owner_id.def_id)
+            })
+            .expect("expected matching function")
+    }
+
+    fn find_param_hir_id(tcx: TyCtxt<'_>, fn_name: &str, param_name: &str) -> HirId {
+        tcx.hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|maybe_owner| maybe_owner.as_owner())
+            .find_map(|owner| {
+                let OwnerNode::Item(item) = owner.node() else {
+                    return None;
+                };
+                let HirItemKind::Fn { body, .. } = item.kind else {
+                    return None;
+                };
+                if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() != fn_name {
+                    return None;
+                }
+                let body = tcx.hir_body(body);
+                body.params.iter().find_map(|param| {
+                    let hir::PatKind::Binding(_, hir_id, ident, _) = param.pat.kind else {
+                        return None;
+                    };
+                    (ident.name.as_str() == param_name).then_some(hir_id)
+                })
+            })
+            .expect("expected matching param hir id")
+    }
+
     #[test]
     fn pointer_safety_stats_count_scalar_outermost_root_and_safe_box_free_consumption() {
         let code = r#"
@@ -10510,6 +10568,104 @@ pub unsafe fn create_msg(v: i32) -> *mut core::ffi::c_char {
                 .map(|def_id| tcx.item_name(def_id.to_def_id()).as_str().to_owned())
                 .collect::<Vec<_>>();
             assert!(wrappers.contains_key(&did), "{names:?}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn local_struct_call_binding_allows_disjoint_raw_mutable_and_shared_fields() {
+        let code = r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: u8,
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub s: [u8; 65],
+    pub inner: Inner,
+}
+
+pub unsafe fn consume(mut out: *mut u8, mut inner: *const Inner) {
+    let _ = out;
+    let _ = inner;
+}
+
+pub unsafe fn drive(mut ctx: *mut Ctx) {
+    consume((*ctx).s.as_mut_ptr(), &(*ctx).inner);
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let facts = collect_local_struct_downgrade_facts(tcx);
+            let consume_did = find_fn_did(tcx, "consume");
+            let drive_did = find_fn_did(tcx, "drive");
+            let ctx_hir_id = find_param_hir_id(tcx, "drive", "ctx");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                consume_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Raw(true)), Some(PtrKind::OptRef(false))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            sig_decs.data.insert(
+                drive_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::OptRef(true))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            let mut ptr_kinds = FxHashMap::default();
+            ptr_kinds.insert(ctx_hir_id, PtrKind::OptRef(true));
+
+            let (changed, bindings) = downgrade_conflicting_local_struct_call_bindings(
+                tcx,
+                &facts,
+                &mut sig_decs,
+                &ptr_kinds,
+            );
+            assert!(!changed && !bindings.contains(&ctx_hir_id), "{bindings:?}");
+            assert_eq!(
+                sig_decs.data[&drive_did].input_decs[0],
+                Some(PtrKind::OptRef(true))
+            );
+
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                consume_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Slice(true)), Some(PtrKind::OptRef(false))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            sig_decs.data.insert(
+                drive_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::OptRef(true))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+
+            let (changed, bindings) = downgrade_conflicting_local_struct_call_bindings(
+                tcx,
+                &facts,
+                &mut sig_decs,
+                &ptr_kinds,
+            );
+            assert!(changed && bindings.contains(&ctx_hir_id), "{bindings:?}");
+            assert_eq!(
+                sig_decs.data[&drive_did].input_decs[0],
+                Some(PtrKind::Raw(true))
+            );
         })
         .unwrap();
     }
