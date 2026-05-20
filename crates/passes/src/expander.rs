@@ -37,6 +37,7 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("rt"), tcx),
         utils::ast::make_inner_attribute(sym::feature, Symbol::intern("libstd_sys_internals"), tcx),
+        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("structural_match"), tcx),
     ]);
     if config.keep_allows {
         krate.attrs.extend([

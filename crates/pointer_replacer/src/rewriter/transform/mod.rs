@@ -24,7 +24,7 @@ use utils::{
 use super::{
     Analysis,
     collector::collect_diffs,
-    decision::{PtrKind, SigDecisions},
+    decision::{PtrKind, SigDecision, SigDecisions},
 };
 use crate::utils::rustc::RustProgram;
 
@@ -1786,7 +1786,11 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 _ => {}
             }
-            let raw_expr = if is_array_field_ptr_arithmetic(&pe) {
+            let raw_expr = if let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
+                && let Some(raw_expr) = self.array_field_offset_raw_ptr(&pe, m)
+            {
+                raw_expr
+            } else if is_array_field_ptr_arithmetic(&pe) {
                 e.clone()
             } else {
                 let base = self.projected_expr(&pe, pe.as_mut_ptr, false);
@@ -2695,9 +2699,6 @@ impl<'tcx> TransformVisitor<'tcx> {
         if !self.is_base_not_a_raw_ptr(pe) {
             return None;
         }
-        if is_array_field_ptr_arithmetic(pe) {
-            return None;
-        }
         if want_mut {
             let source_mut = if pe.as_ptr {
                 pe.as_mut_ptr
@@ -2707,6 +2708,22 @@ impl<'tcx> TransformVisitor<'tcx> {
             if !source_mut {
                 return None;
             }
+        }
+
+        if let Some(base) = self.array_field_offset_slice_ref(pe, want_mut) {
+            let source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+            if self.safe_slice_view_cast_allowed(
+                source_inner_ty,
+                target_inner_ty,
+                def_id,
+                allow_resized_numeric_casts,
+            ) {
+                return Some((base, source_inner_ty, true));
+            }
+            return None;
+        }
+        if is_array_field_ptr_arithmetic(pe) {
+            return None;
         }
 
         let mut source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
@@ -2748,6 +2765,78 @@ impl<'tcx> TransformVisitor<'tcx> {
             source_inner_ty,
             is_slice_ref,
         ))
+    }
+
+    fn array_field_offset_raw_ptr(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
+        if m && !pe.as_mut_ptr {
+            return None;
+        }
+        let offset = array_field_direct_offset(pe, true)?;
+        if m && !is_int_lit_expr(offset) {
+            return None;
+        }
+        if !self.offset_expr_can_be_slice_index(offset) {
+            return None;
+        }
+        let slice = self.array_field_offset_slice_ref_from_offset(pe, offset, m);
+        let mut raw = utils::expr!(
+            "({}).as_{}ptr()",
+            pprust::expr_to_string(&slice),
+            if m { "mut_" } else { "" },
+        );
+        for proj in &pe.projs[1..] {
+            let PtrExprProj::Cast(ty) = proj else { unreachable!() };
+            let (to_ty, mutability) = unwrap_ptr_from_mir_ty(*ty)?;
+            raw = utils::expr!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(&raw),
+                if mutability.is_mut() { "mut" } else { "const" },
+                mir_ty_to_string(to_ty, self.tcx),
+            );
+        }
+        Some(raw)
+    }
+
+    fn array_field_offset_slice_ref(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
+        let offset = array_field_direct_offset(pe, false)?;
+        if m && !is_int_lit_expr(offset) {
+            return None;
+        }
+        if !self.offset_expr_can_be_slice_index(offset) {
+            return None;
+        }
+        Some(self.array_field_offset_slice_ref_from_offset(pe, offset, m))
+    }
+
+    fn array_field_offset_slice_ref_from_offset(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        offset: &Expr,
+        m: bool,
+    ) -> Expr {
+        utils::expr!(
+            "&{}({})[({}) as usize..]",
+            if m { "mut " } else { "" },
+            pprust::expr_to_string(pe.base),
+            pprust::expr_to_string(offset),
+        )
+    }
+
+    fn offset_expr_can_be_slice_index(&self, offset: &Expr) -> bool {
+        let offset = unwrap_paren(offset);
+        match &offset.kind {
+            ExprKind::Cast(inner, _) => self.offset_expr_can_be_slice_index(inner),
+            ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
+            ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => {
+                let Some(hir_offset) = self.ast_to_hir.get_expr(offset.id, self.tcx) else {
+                    return false;
+                };
+                let typeck = self.tcx.typeck(hir_offset.hir_id.owner);
+                let ty = typeck.expr_ty(hir_offset);
+                ty.is_integral() && !ty.is_signed()
+            }
+            _ => false,
+        }
     }
 
     fn safe_slice_view_cast_allowed(
@@ -4898,6 +4987,39 @@ fn ty_is_byte_sized_raw_inner(ty: ty::Ty<'_>) -> bool {
     )
 }
 
+fn array_field_direct_offset<'a, 'tcx>(
+    pe: &PtrExpr<'a, 'tcx>,
+    allow_casts: bool,
+) -> Option<&'a Expr> {
+    if !pe.as_ptr
+        || !pe.base_ty.is_array()
+        || !matches!(unwrap_paren(pe.base).kind, ExprKind::Field(..))
+    {
+        return None;
+    }
+    let [PtrExprProj::Offset(offset), rest @ ..] = pe.projs.as_slice() else {
+        return None;
+    };
+    if allow_casts {
+        if !rest.iter().all(
+            |proj| matches!(proj, PtrExprProj::Cast(ty) if unwrap_ptr_from_mir_ty(*ty).is_some()),
+        ) {
+            return None;
+        }
+    } else if !rest.is_empty() {
+        return None;
+    }
+    Some(*offset)
+}
+
+fn is_int_lit_expr(expr: &Expr) -> bool {
+    match &unwrap_paren(expr).kind {
+        ExprKind::Cast(inner, _) => is_int_lit_expr(inner),
+        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
+        _ => false,
+    }
+}
+
 fn is_array_field_ptr_arithmetic(pe: &PtrExpr<'_, '_>) -> bool {
     pe.as_ptr
         && pe.as_mut_ptr
@@ -5244,7 +5366,10 @@ impl LocalStructBodyFacts {
 struct LocalStructCallFact {
     callee_did: Option<LocalDefId>,
     arg_local_ids: Vec<FxHashSet<HirId>>,
+    arg_non_field_local_ids: Vec<FxHashSet<HirId>>,
+    arg_field_projection_uses: Vec<Vec<(HirId, Symbol)>>,
     arg_whole_local_struct_roots: Vec<Option<HirId>>,
+    arg_points_to_any: Vec<bool>,
     arg_points_to_mutable: Vec<bool>,
 }
 
@@ -5252,7 +5377,7 @@ struct LocalStructLetFact {
     binding_hir_id: HirId,
     init_points_to_mutable: bool,
     init_local_counts: FxHashMap<HirId, usize>,
-    init_field_projection_roots: FxHashSet<HirId>,
+    init_non_raw_field_projection_roots: FxHashSet<HirId>,
 }
 
 struct LocalStructReborrowAssignmentFact {
@@ -5278,7 +5403,8 @@ fn downgrade_local_struct_bindings<'tcx>(
     let facts = collect_local_struct_downgrade_facts(tcx);
     let mut result = LocalStructDowngradeResult::default();
 
-    let (changed, bindings) = downgrade_conflicting_local_struct_call_inputs(tcx, &facts, sig_decs);
+    let (changed, bindings) =
+        downgrade_conflicting_local_struct_call_inputs(tcx, &facts, sig_decs, ptr_kinds);
     result.changed |= changed;
     result.call_conflict = bindings;
 
@@ -5336,9 +5462,25 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                         .collect::<FxHashSet<_>>()
                 })
                 .collect();
+            let arg_non_field_local_ids = args
+                .iter()
+                .map(|arg| {
+                    hir_local_ids_outside_top_level_field_projections(arg)
+                        .into_iter()
+                        .collect::<FxHashSet<_>>()
+                })
+                .collect();
+            let arg_field_projection_uses = args
+                .iter()
+                .map(|arg| hir_top_level_field_projection_uses_in_expr(arg))
+                .collect();
             let arg_whole_local_struct_roots = args
                 .iter()
                 .map(|arg| hir_whole_ptr_root_for_local_struct_arg(self.tcx, self.typeck, arg))
+                .collect();
+            let arg_points_to_any = args
+                .iter()
+                .map(|arg| ty_points_to_any(self.tcx, self.typeck.expr_ty_adjusted(arg)))
                 .collect();
             let arg_points_to_mutable = args
                 .iter()
@@ -5348,7 +5490,10 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
             self.body.calls.push(LocalStructCallFact {
                 callee_did: hir_called_local_fn(self.tcx, expr),
                 arg_local_ids,
+                arg_non_field_local_ids,
+                arg_field_projection_uses,
                 arg_whole_local_struct_roots,
+                arg_points_to_any,
                 arg_points_to_mutable,
             });
         }
@@ -5367,7 +5512,10 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                     self.typeck.expr_ty_adjusted(init),
                 ),
                 init_local_counts: hir_local_id_counts_in_expr(init),
-                init_field_projection_roots: hir_field_projection_roots_in_expr(init),
+                init_non_raw_field_projection_roots: hir_non_raw_field_projection_roots_in_expr(
+                    self.typeck,
+                    init,
+                ),
             });
             self.body
                 .static_projection_events
@@ -5462,6 +5610,7 @@ fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     facts: &LocalStructDowngradeFacts,
     sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> (bool, FxHashSet<HirId>) {
     let mut changed = false;
     let mut bindings = FxHashSet::default();
@@ -5488,6 +5637,14 @@ fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
                     let Some(root) = *root else {
                         continue;
                     };
+                    if matches!(ptr_kinds.get(&root), Some(PtrKind::Raw(_))) {
+                        continue;
+                    }
+                    if param_index_for_binding(tcx, root).is_some()
+                        && call_other_root_uses_are_field_pointer_args(call, root, idx)
+                    {
+                        continue;
+                    }
                     if !call
                         .arg_local_ids
                         .iter()
@@ -5582,7 +5739,14 @@ fn downgrade_conflicting_local_struct_call_bindings<'tcx>(
                             has_mutable_arg = true;
                         }
                     }
-                    if use_count > 1 && (kind.is_mut() || has_mutable_arg) {
+                    if use_count > 1
+                        && has_mutable_arg
+                        && !call_uses_root_only_through_disjoint_field_args(
+                            call,
+                            root,
+                            callee_sig_dec,
+                        )
+                    {
                         conflicting_roots.push(root);
                     }
                 }
@@ -5622,16 +5786,16 @@ fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
                 if !local_struct_borrow_binding(tcx, ptr_kinds, *root) {
                     continue;
                 }
-                if !let_fact.init_field_projection_roots.contains(root) {
+                if !let_fact.init_non_raw_field_projection_roots.contains(root) {
                     continue;
                 }
                 if body.body_local_counts.get(root).copied().unwrap_or(0) <= *init_count {
                     continue;
                 }
-                if !force_signature_input_raw_for_binding(tcx, sig_decs, *root) {
+                if !force_signature_input_raw_for_binding(tcx, sig_decs, let_fact.binding_hir_id) {
                     continue;
                 }
-                bindings.insert(*root);
+                bindings.insert(let_fact.binding_hir_id);
                 changed = true;
             }
         }
@@ -5692,8 +5856,12 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
     for body in &facts.bodies {
         for field_mut_ptr in &body.field_mut_ptrs {
             for root in &field_mut_ptr.receiver_local_ids {
+                let Some(root_kind) = ptr_kinds.get(root).copied() else {
+                    continue;
+                };
                 if !field_mut_ptr.receiver_field_projection_roots.contains(root)
                     || !local_struct_borrow_binding(tcx, ptr_kinds, *root)
+                    || is_mutable_borrow_like_decision(root_kind)
                     || !force_signature_input_raw_for_binding(tcx, sig_decs, *root)
                 {
                     continue;
@@ -5781,6 +5949,72 @@ fn is_mutable_borrow_like_decision(kind: PtrKind) -> bool {
 
 fn arg_may_mutably_borrow(arg_points_to_mutable: bool, decision: Option<PtrKind>) -> bool {
     decision.is_some_and(is_mutable_borrow_like_decision) || arg_points_to_mutable
+}
+
+fn call_other_root_uses_are_field_pointer_args(
+    call: &LocalStructCallFact,
+    root: HirId,
+    whole_root_arg_idx: usize,
+) -> bool {
+    let mut found = false;
+    for (idx, locals) in call.arg_local_ids.iter().enumerate() {
+        if idx == whole_root_arg_idx || !locals.contains(&root) {
+            continue;
+        }
+        if !call.arg_points_to_any[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
+            return false;
+        }
+        if !call.arg_field_projection_uses[idx]
+            .iter()
+            .any(|(field_root, _)| *field_root == root)
+        {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
+fn call_uses_root_only_through_disjoint_field_args(
+    call: &LocalStructCallFact,
+    root: HirId,
+    callee_sig_dec: Option<&SigDecision>,
+) -> bool {
+    let mut fields = FxHashSet::default();
+    let mut found = false;
+    let mut has_mutable_borrow_like_arg = false;
+    let mut has_shared_borrow_like_arg = false;
+    for (idx, locals) in call.arg_local_ids.iter().enumerate() {
+        if !locals.contains(&root) {
+            continue;
+        }
+        if !call.arg_points_to_any[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
+            return false;
+        }
+
+        let mut arg_has_field = false;
+        for (field_root, field) in &call.arg_field_projection_uses[idx] {
+            if *field_root != root {
+                continue;
+            }
+            arg_has_field = true;
+            if !fields.insert(*field) {
+                return false;
+            }
+        }
+        if !arg_has_field {
+            return false;
+        }
+        let input_dec =
+            callee_sig_dec.and_then(|sig_dec| sig_dec.input_decs.get(idx).copied().flatten());
+        if input_dec.is_some_and(is_mutable_borrow_like_decision) {
+            has_mutable_borrow_like_arg = true;
+        } else if input_dec.is_some_and(is_borrow_like_decision) {
+            has_shared_borrow_like_arg = true;
+        }
+        found = true;
+    }
+    found && !(has_mutable_borrow_like_arg && has_shared_borrow_like_arg)
 }
 
 fn callee_input_param_binding(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> Option<HirId> {
@@ -5871,6 +6105,19 @@ fn local_struct_borrow_binding(
         .copied()
         .is_some_and(is_borrow_like_decision)
         && ty_points_to_local_struct(tcx, tcx.typeck(hir_id.owner).node_type(hir_id))
+}
+
+fn ty_points_to_any<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..) => true,
+        ty::TyKind::Adt(adt_def, args) if is_option(adt_def.did(), tcx) => {
+            let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+                return false;
+            };
+            ty_points_to_any(tcx, inner)
+        }
+        _ => false,
+    }
 }
 
 fn ty_points_to_mutable(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> bool {
@@ -5969,6 +6216,34 @@ fn hir_field_projection_roots_in_expr(expr: &hir::Expr<'_>) -> FxHashSet<HirId> 
     }
 
     let mut visitor = FieldProjectionVisitor {
+        roots: FxHashSet::default(),
+    };
+    visitor.visit_expr(expr);
+    visitor.roots
+}
+
+fn hir_non_raw_field_projection_roots_in_expr<'tcx>(
+    typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> FxHashSet<HirId> {
+    struct FieldProjectionVisitor<'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        roots: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, _) = expr.kind
+                && !self.typeck.expr_ty_adjusted(expr).is_raw_ptr()
+            {
+                self.roots.extend(hir_local_ids_in_expr(base));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor {
+        typeck,
         roots: FxHashSet::default(),
     };
     visitor.visit_expr(expr);
@@ -6371,6 +6646,51 @@ fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
     let mut visitor = LocalUseVisitor { locals: Vec::new() };
     visitor.visit_expr(expr);
     visitor.locals
+}
+
+fn hir_local_ids_outside_top_level_field_projections(expr: &hir::Expr<'_>) -> Vec<HirId> {
+    struct LocalUseVisitor {
+        locals: Vec<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, _) = expr.kind
+                && hir_whole_ptr_root(base).is_some()
+            {
+                return;
+            }
+            if let Some(hir_id) = hir_unwrapped_local_id(expr) {
+                self.locals.push(hir_id);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = LocalUseVisitor { locals: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.locals
+}
+
+fn hir_top_level_field_projection_uses_in_expr(expr: &hir::Expr<'_>) -> Vec<(HirId, Symbol)> {
+    struct FieldProjectionVisitor {
+        uses: Vec<(HirId, Symbol)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, ident) = expr.kind
+                && let Some(root) = hir_whole_ptr_root(base)
+            {
+                self.uses.push((root, ident.name));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor { uses: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.uses
 }
 
 fn hir_expr_verbatim_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
@@ -9944,6 +10264,50 @@ mod tests {
             .expect("expected matching local hir id")
     }
 
+    fn find_fn_did(tcx: TyCtxt<'_>, fn_name: &str) -> LocalDefId {
+        tcx.hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|maybe_owner| maybe_owner.as_owner())
+            .find_map(|owner| {
+                let OwnerNode::Item(item) = owner.node() else {
+                    return None;
+                };
+                let HirItemKind::Fn { .. } = item.kind else {
+                    return None;
+                };
+                (tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() == fn_name)
+                    .then_some(item.owner_id.def_id)
+            })
+            .expect("expected matching function")
+    }
+
+    fn find_param_hir_id(tcx: TyCtxt<'_>, fn_name: &str, param_name: &str) -> HirId {
+        tcx.hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|maybe_owner| maybe_owner.as_owner())
+            .find_map(|owner| {
+                let OwnerNode::Item(item) = owner.node() else {
+                    return None;
+                };
+                let HirItemKind::Fn { body, .. } = item.kind else {
+                    return None;
+                };
+                if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() != fn_name {
+                    return None;
+                }
+                let body = tcx.hir_body(body);
+                body.params.iter().find_map(|param| {
+                    let hir::PatKind::Binding(_, hir_id, ident, _) = param.pat.kind else {
+                        return None;
+                    };
+                    (ident.name.as_str() == param_name).then_some(hir_id)
+                })
+            })
+            .expect("expected matching param hir id")
+    }
+
     #[test]
     fn pointer_safety_stats_count_scalar_outermost_root_and_safe_box_free_consumption() {
         let code = r#"
@@ -10204,6 +10568,104 @@ pub unsafe fn create_msg(v: i32) -> *mut core::ffi::c_char {
                 .map(|def_id| tcx.item_name(def_id.to_def_id()).as_str().to_owned())
                 .collect::<Vec<_>>();
             assert!(wrappers.contains_key(&did), "{names:?}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn local_struct_call_binding_allows_disjoint_raw_mutable_and_shared_fields() {
+        let code = r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: u8,
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub s: [u8; 65],
+    pub inner: Inner,
+}
+
+pub unsafe fn consume(mut out: *mut u8, mut inner: *const Inner) {
+    let _ = out;
+    let _ = inner;
+}
+
+pub unsafe fn drive(mut ctx: *mut Ctx) {
+    consume((*ctx).s.as_mut_ptr(), &(*ctx).inner);
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let facts = collect_local_struct_downgrade_facts(tcx);
+            let consume_did = find_fn_did(tcx, "consume");
+            let drive_did = find_fn_did(tcx, "drive");
+            let ctx_hir_id = find_param_hir_id(tcx, "drive", "ctx");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                consume_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Raw(true)), Some(PtrKind::OptRef(false))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            sig_decs.data.insert(
+                drive_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::OptRef(true))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            let mut ptr_kinds = FxHashMap::default();
+            ptr_kinds.insert(ctx_hir_id, PtrKind::OptRef(true));
+
+            let (changed, bindings) = downgrade_conflicting_local_struct_call_bindings(
+                tcx,
+                &facts,
+                &mut sig_decs,
+                &ptr_kinds,
+            );
+            assert!(!changed && !bindings.contains(&ctx_hir_id), "{bindings:?}");
+            assert_eq!(
+                sig_decs.data[&drive_did].input_decs[0],
+                Some(PtrKind::OptRef(true))
+            );
+
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                consume_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Slice(true)), Some(PtrKind::OptRef(false))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+            sig_decs.data.insert(
+                drive_did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::OptRef(true))],
+                    output_dec: None,
+                    signature_locked: false,
+                },
+            );
+
+            let (changed, bindings) = downgrade_conflicting_local_struct_call_bindings(
+                tcx,
+                &facts,
+                &mut sig_decs,
+                &ptr_kinds,
+            );
+            assert!(changed && bindings.contains(&ctx_hir_id), "{bindings:?}");
+            assert_eq!(
+                sig_decs.data[&drive_did].input_decs[0],
+                Some(PtrKind::Raw(true))
+            );
         })
         .unwrap();
     }
