@@ -5244,7 +5244,10 @@ impl LocalStructBodyFacts {
 struct LocalStructCallFact {
     callee_did: Option<LocalDefId>,
     arg_local_ids: Vec<FxHashSet<HirId>>,
+    arg_non_field_local_ids: Vec<FxHashSet<HirId>>,
+    arg_field_projection_uses: Vec<Vec<(HirId, Symbol)>>,
     arg_whole_local_struct_roots: Vec<Option<HirId>>,
+    arg_points_to_any: Vec<bool>,
     arg_points_to_mutable: Vec<bool>,
 }
 
@@ -5278,7 +5281,8 @@ fn downgrade_local_struct_bindings<'tcx>(
     let facts = collect_local_struct_downgrade_facts(tcx);
     let mut result = LocalStructDowngradeResult::default();
 
-    let (changed, bindings) = downgrade_conflicting_local_struct_call_inputs(tcx, &facts, sig_decs);
+    let (changed, bindings) =
+        downgrade_conflicting_local_struct_call_inputs(tcx, &facts, sig_decs, ptr_kinds);
     result.changed |= changed;
     result.call_conflict = bindings;
 
@@ -5336,9 +5340,25 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                         .collect::<FxHashSet<_>>()
                 })
                 .collect();
+            let arg_non_field_local_ids = args
+                .iter()
+                .map(|arg| {
+                    hir_local_ids_outside_top_level_field_projections(arg)
+                        .into_iter()
+                        .collect::<FxHashSet<_>>()
+                })
+                .collect();
+            let arg_field_projection_uses = args
+                .iter()
+                .map(|arg| hir_top_level_field_projection_uses_in_expr(arg))
+                .collect();
             let arg_whole_local_struct_roots = args
                 .iter()
                 .map(|arg| hir_whole_ptr_root_for_local_struct_arg(self.tcx, self.typeck, arg))
+                .collect();
+            let arg_points_to_any = args
+                .iter()
+                .map(|arg| ty_points_to_any(self.tcx, self.typeck.expr_ty_adjusted(arg)))
                 .collect();
             let arg_points_to_mutable = args
                 .iter()
@@ -5348,7 +5368,10 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
             self.body.calls.push(LocalStructCallFact {
                 callee_did: hir_called_local_fn(self.tcx, expr),
                 arg_local_ids,
+                arg_non_field_local_ids,
+                arg_field_projection_uses,
                 arg_whole_local_struct_roots,
+                arg_points_to_any,
                 arg_points_to_mutable,
             });
         }
@@ -5465,6 +5488,7 @@ fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     facts: &LocalStructDowngradeFacts,
     sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> (bool, FxHashSet<HirId>) {
     let mut changed = false;
     let mut bindings = FxHashSet::default();
@@ -5491,6 +5515,14 @@ fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
                     let Some(root) = *root else {
                         continue;
                     };
+                    if matches!(ptr_kinds.get(&root), Some(PtrKind::Raw(_))) {
+                        continue;
+                    }
+                    if param_index_for_binding(tcx, root).is_some()
+                        && call_other_root_uses_are_field_pointer_args(call, root, idx)
+                    {
+                        continue;
+                    }
                     if !call
                         .arg_local_ids
                         .iter()
@@ -5585,7 +5617,10 @@ fn downgrade_conflicting_local_struct_call_bindings<'tcx>(
                             has_mutable_arg = true;
                         }
                     }
-                    if use_count > 1 && (kind.is_mut() || has_mutable_arg) {
+                    if use_count > 1
+                        && has_mutable_arg
+                        && !call_uses_root_only_through_disjoint_mutable_fields(call, root)
+                    {
                         conflicting_roots.push(root);
                     }
                 }
@@ -5631,10 +5666,10 @@ fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
                 if body.body_local_counts.get(root).copied().unwrap_or(0) <= *init_count {
                     continue;
                 }
-                if !force_signature_input_raw_for_binding(tcx, sig_decs, *root) {
+                if !force_signature_input_raw_for_binding(tcx, sig_decs, let_fact.binding_hir_id) {
                     continue;
                 }
-                bindings.insert(*root);
+                bindings.insert(let_fact.binding_hir_id);
                 changed = true;
             }
         }
@@ -5790,6 +5825,62 @@ fn arg_may_mutably_borrow(arg_points_to_mutable: bool, decision: Option<PtrKind>
     decision.is_some_and(is_mutable_borrow_like_decision) || arg_points_to_mutable
 }
 
+fn call_other_root_uses_are_field_pointer_args(
+    call: &LocalStructCallFact,
+    root: HirId,
+    whole_root_arg_idx: usize,
+) -> bool {
+    let mut found = false;
+    for (idx, locals) in call.arg_local_ids.iter().enumerate() {
+        if idx == whole_root_arg_idx || !locals.contains(&root) {
+            continue;
+        }
+        if !call.arg_points_to_any[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
+            return false;
+        }
+        if !call.arg_field_projection_uses[idx]
+            .iter()
+            .any(|(field_root, _)| *field_root == root)
+        {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
+fn call_uses_root_only_through_disjoint_mutable_fields(
+    call: &LocalStructCallFact,
+    root: HirId,
+) -> bool {
+    let mut fields = FxHashSet::default();
+    let mut found = false;
+    for (idx, locals) in call.arg_local_ids.iter().enumerate() {
+        if !locals.contains(&root) {
+            continue;
+        }
+        if !call.arg_points_to_mutable[idx] || call.arg_non_field_local_ids[idx].contains(&root) {
+            return false;
+        }
+
+        let mut arg_has_field = false;
+        for (field_root, field) in &call.arg_field_projection_uses[idx] {
+            if *field_root != root {
+                continue;
+            }
+            arg_has_field = true;
+            if !fields.insert(*field) {
+                return false;
+            }
+        }
+        if !arg_has_field {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
 fn callee_input_param_binding(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> Option<HirId> {
     let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
         return None;
@@ -5878,6 +5969,19 @@ fn local_struct_borrow_binding(
         .copied()
         .is_some_and(is_borrow_like_decision)
         && ty_points_to_local_struct(tcx, tcx.typeck(hir_id.owner).node_type(hir_id))
+}
+
+fn ty_points_to_any<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..) => true,
+        ty::TyKind::Adt(adt_def, args) if is_option(adt_def.did(), tcx) => {
+            let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+                return false;
+            };
+            ty_points_to_any(tcx, inner)
+        }
+        _ => false,
+    }
 }
 
 fn ty_points_to_mutable(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> bool {
@@ -6406,6 +6510,51 @@ fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
     let mut visitor = LocalUseVisitor { locals: Vec::new() };
     visitor.visit_expr(expr);
     visitor.locals
+}
+
+fn hir_local_ids_outside_top_level_field_projections(expr: &hir::Expr<'_>) -> Vec<HirId> {
+    struct LocalUseVisitor {
+        locals: Vec<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, _) = expr.kind
+                && hir_whole_ptr_root(base).is_some()
+            {
+                return;
+            }
+            if let Some(hir_id) = hir_unwrapped_local_id(expr) {
+                self.locals.push(hir_id);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = LocalUseVisitor { locals: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.locals
+}
+
+fn hir_top_level_field_projection_uses_in_expr(expr: &hir::Expr<'_>) -> Vec<(HirId, Symbol)> {
+    struct FieldProjectionVisitor {
+        uses: Vec<(HirId, Symbol)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, ident) = expr.kind
+                && let Some(root) = hir_whole_ptr_root(base)
+            {
+                self.uses.push((root, ident.name));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor { uses: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.uses
 }
 
 fn hir_expr_verbatim_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
