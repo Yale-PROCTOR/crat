@@ -704,6 +704,62 @@ pub unsafe fn caller(state: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_allows_disjoint_mutable_local_struct_field_call_args() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    a: [i32; 4],
+    b: [i32; 4],
+    c: [i32; 4],
+}
+
+pub unsafe fn fill(a: *mut i32, b: *mut i32, c: *mut i32) {
+    *a = 1;
+    *b = 2;
+    *c = 3;
+}
+
+pub unsafe fn caller(s: *mut State) {
+    fill((*s).a.as_mut_ptr(), (*s).b.as_mut_ptr(), (*s).c.as_mut_ptr());
+}
+        "#,
+        &[
+            "pub unsafe fn fill(mut a: &mut i32, mut b: &mut i32, mut c: &mut i32)",
+            "pub unsafe fn caller(mut s: &mut crate::State)",
+        ],
+        &["pub unsafe fn caller(mut s: *mut crate::State)"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_struct_callee_promoted_for_raw_field_pointer_bridge() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    value: i32,
+    buf: [i32; 4],
+}
+
+pub unsafe fn touch_state(s: *mut State, buf: *const i32) -> i32 {
+    (*s).value += *buf;
+    return (*s).value;
+}
+
+pub unsafe fn caller(s: *mut State) -> i32 {
+    touch_state(s, (*s).buf.as_ptr())
+}
+        "#,
+        &[
+            "pub unsafe fn touch_state(mut s: &mut crate::State, buf: &i32) -> i32",
+            "pub unsafe fn caller(mut s: *mut crate::State) -> i32",
+        ],
+        &["pub unsafe fn touch_state(mut s: *mut crate::State"],
+    );
+}
+
+#[test]
 fn test_rewriter_downgrades_long_lived_local_struct_field_borrow_conflict() {
     run_test(
         r#"
@@ -725,8 +781,11 @@ pub unsafe fn decorrelate(t: *mut State) {
     }
 }
         "#,
+        &[
+            "pub unsafe fn decorrelate(mut t: &mut crate::State)",
+            "let mut residuals_0: *mut i32",
+        ],
         &["pub unsafe fn decorrelate(mut t: *mut crate::State)"],
-        &["pub unsafe fn decorrelate(mut t: &mut crate::State)"],
     );
 }
 
