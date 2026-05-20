@@ -704,6 +704,62 @@ pub unsafe fn caller(state: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_allows_disjoint_mutable_local_struct_field_call_args() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    a: [i32; 4],
+    b: [i32; 4],
+    c: [i32; 4],
+}
+
+pub unsafe fn fill(a: *mut i32, b: *mut i32, c: *mut i32) {
+    *a = 1;
+    *b = 2;
+    *c = 3;
+}
+
+pub unsafe fn caller(s: *mut State) {
+    fill((*s).a.as_mut_ptr(), (*s).b.as_mut_ptr(), (*s).c.as_mut_ptr());
+}
+        "#,
+        &[
+            "pub unsafe fn fill(mut a: &mut i32, mut b: &mut i32, mut c: &mut i32)",
+            "pub unsafe fn caller(mut s: &mut crate::State)",
+        ],
+        &["pub unsafe fn caller(mut s: *mut crate::State)"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_local_struct_callee_promoted_for_raw_field_pointer_bridge() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    value: i32,
+    buf: [i32; 4],
+}
+
+pub unsafe fn touch_state(s: *mut State, buf: *const i32) -> i32 {
+    (*s).value += *buf;
+    return (*s).value;
+}
+
+pub unsafe fn caller(s: *mut State) -> i32 {
+    touch_state(s, (*s).buf.as_ptr())
+}
+        "#,
+        &[
+            "pub unsafe fn touch_state(mut s: &mut crate::State, buf: &i32) -> i32",
+            "pub unsafe fn caller(mut s: *mut crate::State) -> i32",
+        ],
+        &["pub unsafe fn touch_state(mut s: *mut crate::State"],
+    );
+}
+
+#[test]
 fn test_rewriter_downgrades_long_lived_local_struct_field_borrow_conflict() {
     run_test(
         r#"
@@ -725,8 +781,34 @@ pub unsafe fn decorrelate(t: *mut State) {
     }
 }
         "#,
+        &[
+            "pub unsafe fn decorrelate(mut t: &mut crate::State)",
+            "let mut residuals_0: *mut i32",
+        ],
         &["pub unsafe fn decorrelate(mut t: *mut crate::State)"],
-        &["pub unsafe fn decorrelate(mut t: &mut crate::State)"],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_long_lived_raw_pointer_field_borrow() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Image {
+    w: i32,
+    h: i32,
+    pix: *mut u8,
+}
+
+pub unsafe fn premultiply(img: *mut Image) {
+    let data: *mut u8 = (*img).pix;
+    let w = (*img).w;
+    let h = (*img).h;
+    *data.offset((w * h - 1) as isize) = 0;
+}
+        "#,
+        &["pub unsafe fn premultiply(mut img: &mut crate::Image)"],
+        &["pub unsafe fn premultiply(mut img: *mut crate::Image)"],
     );
 }
 
@@ -794,6 +876,30 @@ pub unsafe fn compare(arr: *mut ResultArray, idx: i32) -> i32 {
             "pub unsafe fn compare(arr: &crate::ResultArray",
             "pub unsafe fn compare(mut arr: &crate::ResultArray",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_allows_local_struct_field_mut_ptr_on_mut_root() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pos: usize,
+    buffer: [u8; 8],
+}
+
+pub unsafe fn write_byte(d: *mut u8, value: u8) {
+    *d = value;
+}
+
+pub unsafe fn add_sample(m: *mut State, value: u8) {
+    write_byte((*m).buffer.as_mut_ptr().offset((*m).pos as isize), value);
+    (*m).pos += 1;
+}
+        "#,
+        &["pub unsafe fn add_sample(mut m: &mut crate::State"],
+        &["pub unsafe fn add_sample(mut m: *mut crate::State"],
     );
 }
 
@@ -3557,6 +3663,86 @@ pub unsafe fn alloc_from_block(a: *mut Arena, len: usize) -> i8 {
     );
 }
 
+#[test]
+fn test_array_field_zero_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub addr: [u32; 8],
+}
+
+pub unsafe fn consume(addr: *mut u32) {
+    *addr.offset(0) = 1;
+    *addr.offset(1) = 2;
+}
+
+pub unsafe fn foo() {
+    let mut info = Info { addr: [0; 8] };
+    consume(info.addr.as_mut_ptr().offset(0));
+}
+"#,
+        &["consume(&mut (info.addr)["],
+        &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_const_offset_raw_arg_uses_slice_suffix_ptr() {
+    run_test(
+        r#"
+extern "C" {
+    fn memset(dst: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub ctr: [u8; 16],
+}
+
+pub unsafe fn foo() {
+    let mut ctx = Ctx { ctr: [0; 16] };
+    memset(ctx.ctr.as_mut_ptr().offset(12) as *mut _, 0, 4);
+}
+"#,
+        &["&mut (ctx.ctr)[(12) as usize..]).as_mut_ptr()"],
+        &[".ctr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_unsigned_offset_raw_arg_uses_slice_suffix_ptr() {
+    run_test(
+        r#"
+extern "C" {
+    fn memcpy(dst: *mut core::ffi::c_void, src: *const core::ffi::c_void, n: usize)
+        -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Ctx {
+    pub buffer: [u8; 16],
+    pub buffer_pos: u64,
+}
+
+pub unsafe fn foo(n: usize) {
+    let mut out = [0u8; 16];
+    let mut ctx = Ctx {
+        buffer: [0; 16],
+        buffer_pos: 4,
+    };
+    memcpy(
+        out.as_mut_ptr() as *mut _,
+        ctx.buffer.as_mut_ptr().offset(ctx.buffer_pos as isize) as *const _,
+        n,
+    );
+}
+"#,
+        &["&(ctx.buffer)[(ctx.buffer_pos as isize) as usize..]).as_ptr()"],
+        &[".buffer.as_mut_ptr().offset"],
+    );
+}
+
 /// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
 /// Non-numeric rhs_inner_ty → `from_raw_parts_mut`.
 #[test]
@@ -4020,7 +4206,7 @@ pub unsafe fn copy_tail(
     );
 }
 "#,
-        &["(&((*src).data))[("],
+        &["&((*src).data)[("],
         &["&mut ((*src).data)"],
     );
 }
