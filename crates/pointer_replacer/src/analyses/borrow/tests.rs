@@ -219,6 +219,20 @@ fn assert_lifetime_unknown_target(
     );
 }
 
+fn assert_lifetime_not_unknown_target(
+    facts: &FxHashMap<String, LifetimeFlowFacts>,
+    function: &str,
+    target: &str,
+) {
+    assert!(
+        !facts[function]
+            .unknown_targets
+            .contains(&target.to_string()),
+        "{function} should not mark {target} unknown; got {:?}",
+        facts[function].unknown_targets
+    );
+}
+
 #[test]
 fn test_proof_of_concept() {
     let demoted = run_demote(
@@ -332,6 +346,230 @@ fn lifetime_flow_read_output() {
         "read output should flow out arg1@1 to return@0; got {:?}",
         edges["read_out"]
     );
+}
+
+#[test]
+fn lifetime_flow_pointer_offset_methods_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn offset_ptr(x: *mut i32, k: isize) -> *mut i32 {
+            x.offset(k)
+        }
+
+        unsafe fn add_ptr(x: *mut i32, k: usize) -> *mut i32 {
+            x.add(k)
+        }
+
+        unsafe fn sub_ptr(x: *mut i32, k: usize) -> *mut i32 {
+            x.sub(k)
+        }
+
+        unsafe fn wrapping_add_ptr(x: *mut i32, k: usize) -> *mut i32 {
+            x.wrapping_add(k)
+        }
+
+        unsafe fn wrapping_sub_ptr(x: *mut i32, k: usize) -> *mut i32 {
+            x.wrapping_sub(k)
+        }
+
+        unsafe fn byte_offset_ptr(x: *mut u8, k: isize) -> *mut u8 {
+            x.byte_offset(k)
+        }
+        ",
+    );
+    for function in [
+        "offset_ptr",
+        "add_ptr",
+        "sub_ptr",
+        "wrapping_add_ptr",
+        "wrapping_sub_ptr",
+        "byte_offset_ptr",
+    ] {
+        assert_lifetime_flow_edge(&facts, function, "arg1@0", "return@0");
+        assert_lifetime_not_unknown_target(&facts, function, "return@0");
+    }
+}
+
+#[test]
+fn lifetime_flow_address_of_input_field_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        #[repr(C)]
+        struct State {
+            value: i32,
+        }
+
+        unsafe fn field(state: *mut State) -> *mut i32 {
+            &raw mut (*state).value
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "field", "arg1@0", "return@0");
+    assert!(
+        !facts["field"]
+            .unknown_targets
+            .contains(&"return@0".to_string()),
+        "field address provenance should be explicit, not unknown; got {:?}",
+        facts["field"].unknown_targets
+    );
+}
+
+#[test]
+fn lifetime_flow_address_of_offset_input_field_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        #[repr(C)]
+        struct State {
+            value: i32,
+        }
+
+        unsafe fn field_at(state: *mut State, index: usize) -> *mut i32 {
+            &raw mut (*state.add(index)).value
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "field_at", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "field_at", "return@0");
+}
+
+#[test]
+fn lifetime_flow_slice_suffix_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn suffix(xs: &[i32]) -> *const i32 {
+            xs[1..].as_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "suffix", "arg1@0", "return@0");
+    assert!(
+        !facts["suffix"]
+            .unknown_targets
+            .contains(&"return@0".to_string()),
+        "slice suffix provenance should be explicit, not unknown; got {:?}",
+        facts["suffix"].unknown_targets
+    );
+}
+
+#[test]
+fn lifetime_flow_slice_split_suffix_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn split_suffix(xs: &[i32], index: usize) -> *const i32 {
+            xs.split_at(index).1.as_ptr()
+        }
+
+        unsafe fn split_suffix_mut(xs: &mut [i32], index: usize) -> *mut i32 {
+            xs.split_at_mut(index).1.as_mut_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "split_suffix", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "split_suffix", "return@0");
+    assert_lifetime_flow_edge(&facts, "split_suffix_mut", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "split_suffix_mut", "return@0");
+}
+
+#[test]
+fn lifetime_flow_slice_get_unchecked_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn unchecked_elem(xs: &[i32], index: usize) -> *const i32 {
+            xs.get_unchecked(index) as *const i32
+        }
+
+        unsafe fn unchecked_suffix(xs: &[i32], index: usize) -> *const i32 {
+            xs.get_unchecked(index..).as_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "unchecked_elem", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "unchecked_elem", "return@0");
+    assert_lifetime_flow_edge(&facts, "unchecked_suffix", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "unchecked_suffix", "return@0");
+}
+
+#[test]
+fn lifetime_flow_known_slice_search_pipeline_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        mod c_lib {
+            unsafe extern \"C\" {
+                fn opaque_strrchr(s: *const u8, c: u8) -> *mut u8;
+            }
+
+            pub unsafe fn strrchr(s: &[u8], c: u8) -> *mut u8 {
+                unsafe { opaque_strrchr(s.as_ptr(), c) }
+            }
+        }
+
+        unsafe fn extract(path: &[u8]) -> *const u8 {
+            let found = unsafe { c_lib::strrchr(path, 0) };
+            let search = if found.is_null() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(found, 1_000_000) }
+            };
+            if search.is_empty() {
+                path.as_ptr()
+            } else {
+                search[1..].as_ptr()
+            }
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "extract", "arg1@0", "return@0");
+    assert!(
+        !facts["extract"]
+            .unknown_targets
+            .contains(&"return@0".to_string()),
+        "known slice-search/slice-view provenance should be explicit; got {:?}",
+        facts["extract"].unknown_targets
+    );
+}
+
+#[test]
+fn lifetime_flow_raw_c_string_search_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe extern \"C\" {
+            fn strrchr(s: *const i8, c: i32) -> *mut i8;
+        }
+
+        unsafe fn basename(path: *const i8) -> *const i8 {
+            let found = unsafe { strrchr(path, '/' as i32) };
+            if found.is_null() {
+                path
+            } else {
+                unsafe { found.offset(1) as *const i8 }
+            }
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "basename", "arg1@0", "return@0");
+    assert!(
+        !facts["basename"]
+            .unknown_targets
+            .contains(&"return@0".to_string()),
+        "known C string search provenance should be explicit; got {:?}",
+        facts["basename"].unknown_targets
+    );
+}
+
+#[test]
+fn lifetime_flow_raw_memchr_return_stays_unknown() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe extern \"C\" {
+            fn memchr(s: *const core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void;
+        }
+
+        unsafe fn find(buffer: *const u8, len: usize) -> *const u8 {
+            unsafe { memchr(buffer as *const core::ffi::c_void, 0, len) as *const u8 }
+        }
+        ",
+    );
+    assert_lifetime_unknown_target(&facts, "find", "return@0");
 }
 
 #[test]
