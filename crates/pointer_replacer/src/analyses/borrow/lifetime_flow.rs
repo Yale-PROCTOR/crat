@@ -5,8 +5,8 @@ use rustc_index::{
 };
 use rustc_middle::{
     mir::{
-        BinOp, Body, Local, Location, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Statement,
-        StatementKind, Terminator, visit::Visitor,
+        BinOp, Body, Const, ConstOperand, ConstValue, Local, Location, Operand, Place, PlaceElem,
+        RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator, visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -718,7 +718,15 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         operand: &Operand<'tcx>,
         location: Location,
     ) {
-        for source in self.operand_slots(operand, location) {
+        let sources = self.operand_slots(operand, location);
+        if sources.is_empty() {
+            if self.operand_without_modeled_sources_is_unknown(operand) {
+                self.flow.mark_unknown(target);
+            }
+            return;
+        }
+
+        for source in sources {
             self.flow.add_flow(source, target);
             self.flow.add_descendant_aliases(source, target);
         }
@@ -757,6 +765,48 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 is_slice_like_ref_ty(place.ty(self.body, self.tcx).ty)
             }
             Operand::Constant(_) => false,
+        }
+    }
+
+    fn operand_without_modeled_sources_is_unknown(&self, operand: &Operand<'tcx>) -> bool {
+        match operand {
+            Operand::Copy(_) | Operand::Move(_) => true,
+            Operand::Constant(constant) => {
+                self.constant_without_modeled_sources_is_unknown(constant)
+            }
+        }
+    }
+
+    fn constant_without_modeled_sources_is_unknown(&self, constant: &ConstOperand<'tcx>) -> bool {
+        match &constant.const_ {
+            Const::Unevaluated(unevaluated, ty) => {
+                if unevaluated.promoted.is_some() {
+                    return false;
+                }
+                self.tcx
+                    .const_eval_poly(unevaluated.def)
+                    .map(|value| self.const_value_without_modeled_sources_is_unknown(&value, *ty))
+                    .unwrap_or(true)
+            }
+            Const::Val(value, ty) => {
+                self.const_value_without_modeled_sources_is_unknown(value, *ty)
+            }
+            Const::Ty(_, _) => true,
+        }
+    }
+
+    fn const_value_without_modeled_sources_is_unknown(
+        &self,
+        value: &ConstValue<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match value {
+            ConstValue::Scalar(scalar) => match scalar.try_to_scalar_int() {
+                Ok(int) => int.to_bits(int.size()) != 0,
+                Err(_) => true,
+            },
+            ConstValue::Indirect { .. } => pointer_slot_count(ty) > 0,
+            ConstValue::ZeroSized | ConstValue::Slice { .. } => false,
         }
     }
 
