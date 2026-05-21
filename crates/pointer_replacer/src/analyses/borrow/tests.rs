@@ -190,6 +190,21 @@ fn assert_lifetime_flow_edge(
     );
 }
 
+fn assert_lifetime_no_flow_edge(
+    facts: &FxHashMap<String, LifetimeFlowFacts>,
+    function: &str,
+    source: &str,
+    target: &str,
+) {
+    assert!(
+        !facts[function]
+            .value_flows
+            .contains(&(source.to_string(), target.to_string())),
+        "{function} should not contain value flow {source} -> {target}; got {:?}",
+        facts[function].value_flows
+    );
+}
+
 fn assert_lifetime_storage_alias(
     facts: &FxHashMap<String, LifetimeFlowFacts>,
     function: &str,
@@ -468,6 +483,66 @@ fn lifetime_flow_slice_split_suffix_return() {
     assert_lifetime_not_unknown_target(&facts, "split_suffix", "return@0");
     assert_lifetime_flow_edge(&facts, "split_suffix_mut", "arg1@0", "return@0");
     assert_lifetime_not_unknown_target(&facts, "split_suffix_mut", "return@0");
+}
+
+#[test]
+fn lifetime_flow_slice_split_conditional_field_sources_join() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn split_suffix_conditional(
+            xs: &[i32],
+            ys: &[i32],
+            index: usize,
+            pick_x: bool,
+        ) -> *const i32 {
+            let parts: (&[i32], &[i32]);
+            if pick_x {
+                parts = xs.split_at(index);
+            } else {
+                parts = ys.split_at(index);
+            }
+            parts.1.as_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "split_suffix_conditional", "arg1@0", "return@0");
+    assert_lifetime_flow_edge(&facts, "split_suffix_conditional", "arg2@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "split_suffix_conditional", "return@0");
+}
+
+#[test]
+fn lifetime_flow_slice_split_field_assignment_kills_stale_source() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn split_suffix_overwritten(
+            xs: &[i32],
+            ys: &[i32],
+            index: usize,
+        ) -> *const i32 {
+            let mut parts = xs.split_at(index);
+            parts.1 = ys;
+            parts.1.as_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "split_suffix_overwritten", "arg2@0", "return@0");
+    assert_lifetime_no_flow_edge(&facts, "split_suffix_overwritten", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "split_suffix_overwritten", "return@0");
+}
+
+#[test]
+fn lifetime_flow_slice_split_aggregate_copy_propagates_field_sources() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn split_suffix_copied(xs: &[i32], index: usize) -> *const i32 {
+            let parts = xs.split_at(index);
+            let p2 = parts;
+            p2.1.as_ptr()
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "split_suffix_copied", "arg1@0", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "split_suffix_copied", "return@0");
 }
 
 #[test]
