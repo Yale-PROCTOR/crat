@@ -821,6 +821,9 @@ pub fn demote_pointers_iterative(
 
         let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
 
+        // Demote every live provenance that depends on the invalid loan, not just
+        // the local where the borrow was originally assigned.
+        // (for inter-procedural borrow inference, e.g., p = id(q))
         for loan in invalid_loans.iter() {
             let borrow_data = &borrow_set.loans[loan];
             for row in errors.rows() {
