@@ -1,11 +1,12 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
-    IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
+    IndexVec,
 };
 use rustc_middle::{
     mir::{
-        Body, Local, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Terminator, visit::Visitor,
+        visit::Visitor, BinOp, Body, Local, Operand, Place, PlaceElem, Rvalue, Terminator,
+        RETURN_PLACE,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -49,6 +50,17 @@ pub struct LifetimeFlowSummary {
 pub struct LocalSlot {
     pub local: Local,
     pub depth: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DerivedPlaceKey {
+    local: Local,
+    projection: Vec<DerivedPlaceElem>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DerivedPlaceElem {
+    Field(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +147,7 @@ pub fn analyze_body_lifetime_flow_result<'tcx>(
         flow: &mut body_flow,
         callee_summaries,
         program_functions,
+        derived_place_sources: FxHashMap::default(),
     }
     .visit_body(body);
 
@@ -386,6 +399,7 @@ struct FlowVisitor<'flow, 'summary, 'tcx> {
     flow: &'flow mut BodyLifetimeFlow,
     callee_summaries: &'summary FxHashMap<LocalDefId, LifetimeFlowSummary>,
     program_functions: &'summary FxHashSet<LocalDefId>,
+    derived_place_sources: FxHashMap<DerivedPlaceKey, LifetimeSlot>,
 }
 
 impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
@@ -399,9 +413,46 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
 
     fn operand_slot(&self, operand: &Operand<'tcx>) -> Option<LifetimeSlot> {
         match operand {
-            Operand::Copy(place) | Operand::Move(place) => self.flow.slot_for_place(*place, 0),
+            Operand::Copy(place) | Operand::Move(place) => self.place_slot_or_derived(*place),
             Operand::Constant(_) => None,
         }
+    }
+
+    fn place_slot_or_derived(&self, place: Place<'tcx>) -> Option<LifetimeSlot> {
+        self.flow
+            .slot_for_place(place, 0)
+            .or_else(|| self.derived_place_source(place))
+    }
+
+    fn derived_place_source(&self, place: Place<'tcx>) -> Option<LifetimeSlot> {
+        let key = derived_place_key(place)?;
+        self.derived_place_sources.get(&key).copied()
+    }
+
+    fn record_derived_field_source(
+        &mut self,
+        place: Place<'tcx>,
+        field_index: usize,
+        source: LifetimeSlot,
+    ) -> bool {
+        let Some(key) = derived_field_key(place, field_index) else {
+            return false;
+        };
+        self.derived_place_sources.insert(key, source);
+        true
+    }
+
+    fn operand_is_slice_like_ref(&self, operand: &Operand<'tcx>) -> bool {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                is_slice_like_ref_ty(place.ty(self.body, self.tcx).ty)
+            }
+            Operand::Constant(_) => false,
+        }
+    }
+
+    fn place_is_slice_like_ref(&self, place: Place<'tcx>) -> bool {
+        is_slice_like_ref_ty(place.ty(self.body, self.tcx).ty)
     }
 
     fn assign_from_place_address(&mut self, target: LifetimeSlot, place: Place<'tcx>) {
@@ -423,8 +474,91 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 }
             }
             None => {
-                self.flow.mark_unknown(target);
+                if let Some(deref_depth) = place_deref_interior_depth(place) {
+                    if let Some(source) = self.flow.slot_for_local(place.local, deref_depth - 1) {
+                        self.flow.add_flow(source, target);
+                    } else {
+                        self.flow.mark_unknown(target);
+                    }
+                } else {
+                    self.flow.mark_unknown(target);
+                }
             }
+        }
+    }
+
+    fn apply_known_input_return_call(&mut self, call: &MirFunctionCall<'_, 'tcx>) -> bool {
+        let Some(arg0) = call.args.first() else {
+            return false;
+        };
+
+        if self.apply_known_aggregate_input_return_call(call, &arg0.node) {
+            return true;
+        }
+
+        let Some(destination) = self.flow.slot_for_place(call.destination, 0) else {
+            return false;
+        };
+
+        if is_provenance_preserving_pointer_method(&call.func, self.tcx) {
+            self.assign_known_return_from_operand(destination, &arg0.node);
+            return true;
+        }
+
+        if is_known_slice_view_return_call(&call.func, self.tcx)
+            && self.place_is_slice_like_ref(call.destination)
+        {
+            self.assign_known_return_from_operand(destination, &arg0.node);
+            return true;
+        }
+
+        if is_known_slice_index_return_call(&call.func, self.tcx)
+            && self.operand_is_slice_like_ref(&arg0.node)
+        {
+            self.assign_known_return_from_operand(destination, &arg0.node);
+            return true;
+        }
+
+        if is_known_c_string_search_return_call(&call.func, self.tcx) {
+            self.assign_known_return_from_operand(destination, &arg0.node);
+            return true;
+        }
+
+        if is_known_memchr_return_call(&call.func, self.tcx)
+            && self.operand_is_slice_like_ref(&arg0.node)
+        {
+            self.assign_known_return_from_operand(destination, &arg0.node);
+            return true;
+        }
+
+        false
+    }
+
+    fn apply_known_aggregate_input_return_call(
+        &mut self,
+        call: &MirFunctionCall<'_, 'tcx>,
+        arg0: &Operand<'tcx>,
+    ) -> bool {
+        if !is_known_slice_split_return_call(&call.func, self.tcx)
+            || !self.operand_is_slice_like_ref(arg0)
+            || !place_is_slice_pair_ref(self.body, self.tcx, call.destination)
+        {
+            return false;
+        }
+
+        let Some(source) = self.operand_slot(arg0) else {
+            return false;
+        };
+
+        self.record_derived_field_source(call.destination, 0, source)
+            | self.record_derived_field_source(call.destination, 1, source)
+    }
+
+    fn assign_known_return_from_operand(&mut self, target: LifetimeSlot, operand: &Operand<'tcx>) {
+        if let Some(source) = self.operand_slot(operand) {
+            self.flow.add_flow(source, target);
+        } else {
+            self.flow.mark_unknown(target);
         }
     }
 
@@ -527,7 +661,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             | Rvalue::ShallowInitBox(operand, _)
             | Rvalue::WrapUnsafeBinder(operand, _) => self.assign_from_operand(target, operand),
             Rvalue::CopyForDeref(place) => {
-                if let Some(source) = self.flow.slot_for_place(*place, 0) {
+                if let Some(source) = self.place_slot_or_derived(*place) {
                     self.flow.add_flow(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
@@ -536,6 +670,9 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
                 self.assign_from_place_address(target, *place);
             }
             Rvalue::ThreadLocalRef(_) => self.flow.mark_unknown(target),
+            Rvalue::BinaryOp(BinOp::Offset, operands) => {
+                self.assign_from_operand(target, &operands.0);
+            }
             Rvalue::Repeat(..)
             | Rvalue::Len(..)
             | Rvalue::BinaryOp(..)
@@ -554,6 +691,10 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
         let Some(call) = terminator.as_call(self.tcx) else {
             return;
         };
+
+        if self.apply_known_input_return_call(&call) {
+            return;
+        }
 
         if let CallKind::RustLib(def_id) = &call.func
             && is_borrowing_method(*def_id, self.tcx)
@@ -611,12 +752,128 @@ fn pointer_pointee_ty(ty: Ty<'_>) -> Option<Ty<'_>> {
     }
 }
 
+fn is_slice_like_ref_ty(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        TyKind::Ref(_, inner, _) => matches!(inner.kind(), TyKind::Slice(_) | TyKind::Array(..)),
+        _ => false,
+    }
+}
+
+fn place_is_slice_pair_ref<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>, place: Place<'tcx>) -> bool {
+    is_slice_pair_ref_ty(place.ty(body, tcx).ty)
+}
+
+fn is_slice_pair_ref_ty(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        TyKind::Tuple(fields) if fields.len() == 2 => {
+            fields.iter().all(|field| is_slice_like_ref_ty(field))
+        }
+        _ => false,
+    }
+}
+
 fn is_null_pointer_constructor(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
     !def_id.is_local() && {
         let name = tcx.item_name(def_id);
         let name = name.as_str();
         name == "null" || name == "null_mut"
     }
+}
+
+fn is_provenance_preserving_pointer_method(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    let CallKind::RustLib(def_id) = func else {
+        return false;
+    };
+    if def_id.is_local() || tcx.def_kind(*def_id) != rustc_hir::def::DefKind::AssocFn {
+        return false;
+    }
+
+    let name = tcx.item_name(*def_id);
+    let name = name.as_str();
+    matches!(
+        name,
+        "wrapping_offset"
+            | "byte_offset"
+            | "wrapping_byte_offset"
+            | "add"
+            | "wrapping_add"
+            | "sub"
+            | "wrapping_sub"
+    )
+}
+
+fn is_known_slice_view_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    let CallKind::RustLib(def_id) = func else {
+        return false;
+    };
+    if def_id.is_local() {
+        return false;
+    }
+
+    let name = tcx.item_name(*def_id);
+    let name = name.as_str();
+    name == "cast_slice"
+        || name == "cast_slice_mut"
+        || name == "from_raw_parts"
+        || name == "from_raw_parts_mut"
+}
+
+fn is_known_slice_index_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    let CallKind::RustLib(def_id) = func else {
+        return false;
+    };
+    if def_id.is_local() || tcx.def_kind(*def_id) != rustc_hir::def::DefKind::AssocFn {
+        return false;
+    }
+
+    let name = tcx.item_name(*def_id);
+    let name = name.as_str();
+    matches!(
+        name,
+        "index" | "index_mut" | "get_unchecked" | "get_unchecked_mut"
+    )
+}
+
+fn is_known_slice_split_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    let CallKind::RustLib(def_id) = func else {
+        return false;
+    };
+    if def_id.is_local() || tcx.def_kind(*def_id) != rustc_hir::def::DefKind::AssocFn {
+        return false;
+    }
+
+    let name = tcx.item_name(*def_id);
+    let name = name.as_str();
+    matches!(
+        name,
+        "split_at" | "split_at_mut" | "split_at_unchecked" | "split_at_mut_unchecked"
+    )
+}
+
+fn is_known_c_string_search_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    match func {
+        CallKind::FreeStanding(def_id) | CallKind::Impl(def_id) => {
+            is_known_c_string_search_name(tcx.item_name(def_id.to_def_id()).as_str())
+        }
+        CallKind::RustLib(def_id) => is_known_c_string_search_name(tcx.item_name(*def_id).as_str()),
+        CallKind::LibC(name) => is_known_c_string_search_name(name.as_str()),
+        CallKind::Closure | CallKind::Dynamic => false,
+    }
+}
+
+fn is_known_memchr_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
+    match func {
+        CallKind::FreeStanding(def_id) | CallKind::Impl(def_id) => {
+            tcx.item_name(def_id.to_def_id()).as_str() == "memchr"
+        }
+        CallKind::RustLib(def_id) => tcx.item_name(*def_id).as_str() == "memchr",
+        CallKind::LibC(name) => name.as_str() == "memchr",
+        CallKind::Closure | CallKind::Dynamic => false,
+    }
+}
+
+fn is_known_c_string_search_name(name: impl PartialEq<&'static str>) -> bool {
+    name == "strchr" || name == "strrchr" || name == "strstr"
 }
 
 fn place_deref_depth(place: Place<'_>) -> Option<u8> {
@@ -631,6 +888,61 @@ fn place_deref_depth(place: Place<'_>) -> Option<u8> {
         }
     }
     Some(depth)
+}
+
+fn derived_place_key(place: Place<'_>) -> Option<DerivedPlaceKey> {
+    let key = derived_place_key_prefix(place)?;
+    if key.projection.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+fn derived_field_key(place: Place<'_>, field_index: usize) -> Option<DerivedPlaceKey> {
+    let mut key = derived_place_key_prefix(place)?;
+    key.projection.push(DerivedPlaceElem::Field(field_index));
+    Some(key)
+}
+
+fn derived_place_key_prefix(place: Place<'_>) -> Option<DerivedPlaceKey> {
+    let mut projection = vec![];
+    for elem in place.projection {
+        match elem {
+            PlaceElem::Field(field, _) => {
+                projection.push(DerivedPlaceElem::Field(field.as_usize()));
+            }
+            PlaceElem::OpaqueCast(_) => {}
+            _ => return None,
+        }
+    }
+    Some(DerivedPlaceKey {
+        local: place.local,
+        projection,
+    })
+}
+
+fn place_deref_interior_depth(place: Place<'_>) -> Option<u8> {
+    let mut depth = 0u8;
+    let mut saw_interior = false;
+    for projection in place.projection {
+        match projection {
+            PlaceElem::Deref if !saw_interior => {
+                depth = depth.checked_add(1)?;
+            }
+            PlaceElem::Field(..)
+            | PlaceElem::Index(_)
+            | PlaceElem::ConstantIndex { .. }
+            | PlaceElem::Subslice { .. }
+            | PlaceElem::Downcast(..)
+                if depth > 0 =>
+            {
+                saw_interior = true;
+            }
+            PlaceElem::OpaqueCast(_) => {}
+            _ => return None,
+        }
+    }
+    saw_interior.then_some(depth)
 }
 
 fn transitive_closure(
