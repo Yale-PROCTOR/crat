@@ -648,6 +648,45 @@ fn lifetime_flow_raw_memchr_return_stays_unknown() {
 }
 
 #[test]
+fn lifetime_flow_int_to_pointer_cast_marks_return_unknown() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn constant_addr() -> *mut i32 {
+            0x1234usize as *mut i32
+        }
+
+        unsafe fn from_integer(n: usize) -> *mut i32 {
+            n as *mut i32
+        }
+        ",
+    );
+    assert_lifetime_unknown_target(&facts, "constant_addr", "return@0");
+    assert_lifetime_unknown_target(&facts, "from_integer", "return@0");
+}
+
+#[test]
+fn lifetime_flow_null_pointer_constructor_has_no_unknown_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        unsafe fn null_ptr() -> *const i32 {
+            core::ptr::null()
+        }
+
+        unsafe fn null_mut_ptr() -> *mut i32 {
+            core::ptr::null_mut()
+        }
+
+        unsafe fn zero_cast_null_ptr() -> *mut i32 {
+            0usize as *mut i32
+        }
+        ",
+    );
+    assert_lifetime_not_unknown_target(&facts, "null_ptr", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "null_mut_ptr", "return@0");
+    assert_lifetime_not_unknown_target(&facts, "zero_cast_null_ptr", "return@0");
+}
+
+#[test]
 fn lifetime_flow_forwarded_output_reference_aliases_storage() {
     let facts = get_lifetime_flow_facts(
         "
