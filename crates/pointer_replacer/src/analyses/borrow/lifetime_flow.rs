@@ -5,8 +5,8 @@ use rustc_index::{
 };
 use rustc_middle::{
     mir::{
-        BinOp, Body, Local, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Terminator,
-        visit::Visitor,
+        BinOp, Body, Local, Location, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Statement,
+        StatementKind, Terminator, visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -140,6 +140,7 @@ pub fn analyze_body_lifetime_flow_result<'tcx>(
     program_functions: &FxHashSet<LocalDefId>,
 ) -> LifetimeFlowResult {
     let mut body_flow = BodyLifetimeFlow::new(body);
+    let derived_place_sources = compute_derived_place_sources(tcx, body, &body_flow);
 
     FlowVisitor {
         tcx,
@@ -147,7 +148,7 @@ pub fn analyze_body_lifetime_flow_result<'tcx>(
         flow: &mut body_flow,
         callee_summaries,
         program_functions,
-        derived_place_sources: FxHashMap::default(),
+        derived_place_sources,
     }
     .visit_body(body);
 
@@ -199,6 +200,314 @@ impl PartialEq for LifetimeFlowResult {
 }
 
 impl Eq for LifetimeFlowResult {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DerivedPlaceSourceState {
+    sources: FxHashMap<DerivedPlaceKey, FxHashSet<LifetimeSlot>>,
+}
+
+impl DerivedPlaceSourceState {
+    fn union_from(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (key, sources) in &other.sources {
+            let target = self.sources.entry(key.clone()).or_default();
+            let old_len = target.len();
+            target.extend(sources.iter().copied());
+            changed |= target.len() != old_len;
+        }
+        changed
+    }
+
+    fn kill_place_prefix(&mut self, place: Place<'_>) {
+        let Some(prefix) = derived_place_key_prefix(place) else {
+            return;
+        };
+        self.sources.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    fn insert_sources<I>(&mut self, key: DerivedPlaceKey, sources: I)
+    where I: IntoIterator<Item = LifetimeSlot> {
+        let sources = sources.into_iter().collect::<FxHashSet<_>>();
+        if sources.is_empty() {
+            return;
+        }
+        self.sources.entry(key).or_default().extend(sources);
+    }
+
+    fn sources_for_key(&self, key: &DerivedPlaceKey) -> Vec<LifetimeSlot> {
+        self.sources
+            .get(key)
+            .map(|sources| sources.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl DerivedPlaceKey {
+    fn starts_with(&self, prefix: &Self) -> bool {
+        self.local == prefix.local && self.projection.starts_with(&prefix.projection)
+    }
+
+    fn rebase_from_prefix(
+        &self,
+        source_prefix: &Self,
+        target_prefix: &Self,
+    ) -> Option<DerivedPlaceKey> {
+        if !self.starts_with(source_prefix) {
+            return None;
+        }
+
+        let suffix = &self.projection[source_prefix.projection.len()..];
+        let mut projection = target_prefix.projection.clone();
+        projection.extend_from_slice(suffix);
+        Some(DerivedPlaceKey {
+            local: target_prefix.local,
+            projection,
+        })
+    }
+}
+
+struct DerivedPlaceDataflow<'flow, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    body: &'flow Body<'tcx>,
+    flow: &'flow BodyLifetimeFlow,
+}
+
+impl<'flow, 'tcx> DerivedPlaceDataflow<'flow, 'tcx> {
+    fn compute(&self) -> FxHashMap<Location, DerivedPlaceSourceState> {
+        let mut in_states =
+            IndexVec::from_elem(DerivedPlaceSourceState::default(), &self.body.basic_blocks);
+
+        loop {
+            let mut changed = false;
+
+            for (block, block_data) in self.body.basic_blocks.iter_enumerated() {
+                let mut state = in_states[block].clone();
+
+                for statement in &block_data.statements {
+                    self.apply_statement_effect(&mut state, statement);
+                }
+
+                if let Some(terminator) = &block_data.terminator {
+                    self.apply_terminator_effect(&mut state, terminator);
+                    for successor in terminator.successors() {
+                        changed |= in_states[successor].union_from(&state);
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        let mut by_location = FxHashMap::default();
+        for (block, block_data) in self.body.basic_blocks.iter_enumerated() {
+            let mut state = in_states[block].clone();
+
+            for (statement_index, statement) in block_data.statements.iter().enumerate() {
+                by_location.insert(
+                    Location {
+                        block,
+                        statement_index,
+                    },
+                    state.clone(),
+                );
+                self.apply_statement_effect(&mut state, statement);
+            }
+
+            if let Some(terminator) = &block_data.terminator {
+                by_location.insert(
+                    Location {
+                        block,
+                        statement_index: block_data.statements.len(),
+                    },
+                    state.clone(),
+                );
+                self.apply_terminator_effect(&mut state, terminator);
+            }
+        }
+
+        by_location
+    }
+
+    fn apply_statement_effect(
+        &self,
+        state: &mut DerivedPlaceSourceState,
+        statement: &Statement<'tcx>,
+    ) {
+        let StatementKind::Assign(box (place, rvalue)) = &statement.kind else {
+            return;
+        };
+        self.apply_assign_effect(state, *place, rvalue);
+    }
+
+    fn apply_assign_effect(
+        &self,
+        state: &mut DerivedPlaceSourceState,
+        target: Place<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+    ) {
+        match rvalue {
+            Rvalue::Use(operand)
+            | Rvalue::Cast(_, operand, _)
+            | Rvalue::ShallowInitBox(operand, _)
+            | Rvalue::WrapUnsafeBinder(operand, _) => {
+                self.apply_operand_assign_effect(state, target, operand);
+            }
+            Rvalue::CopyForDeref(place) => {
+                self.apply_place_assign_effect(state, target, *place);
+            }
+            Rvalue::BinaryOp(BinOp::Offset, operands) => {
+                self.apply_operand_assign_effect(state, target, &operands.0);
+            }
+            Rvalue::Ref(..)
+            | Rvalue::RawPtr(..)
+            | Rvalue::ThreadLocalRef(_)
+            | Rvalue::Repeat(..)
+            | Rvalue::Len(..)
+            | Rvalue::BinaryOp(..)
+            | Rvalue::NullaryOp(..)
+            | Rvalue::UnaryOp(..)
+            | Rvalue::Discriminant(..)
+            | Rvalue::Aggregate(..) => {
+                state.kill_place_prefix(target);
+            }
+        }
+    }
+
+    fn apply_operand_assign_effect(
+        &self,
+        state: &mut DerivedPlaceSourceState,
+        target: Place<'tcx>,
+        operand: &Operand<'tcx>,
+    ) {
+        let before = state.clone();
+        state.kill_place_prefix(target);
+
+        let Some(source_place) = operand.place() else {
+            return;
+        };
+
+        self.copy_derived_descendants(&before, state, target, source_place);
+        if let Some(target_key) = derived_place_key(target) {
+            state.insert_sources(
+                target_key,
+                self.place_sources_from_state(&before, source_place),
+            );
+        }
+    }
+
+    fn apply_place_assign_effect(
+        &self,
+        state: &mut DerivedPlaceSourceState,
+        target: Place<'tcx>,
+        source: Place<'tcx>,
+    ) {
+        let before = state.clone();
+        state.kill_place_prefix(target);
+
+        self.copy_derived_descendants(&before, state, target, source);
+        if let Some(target_key) = derived_place_key(target) {
+            state.insert_sources(target_key, self.place_sources_from_state(&before, source));
+        }
+    }
+
+    fn apply_terminator_effect(
+        &self,
+        state: &mut DerivedPlaceSourceState,
+        terminator: &Terminator<'tcx>,
+    ) {
+        let Some(call) = terminator.as_call(self.tcx) else {
+            return;
+        };
+
+        let before = state.clone();
+        state.kill_place_prefix(call.destination);
+
+        let Some(arg0) = call.args.first() else {
+            return;
+        };
+        if !is_known_slice_split_return_call(&call.func, self.tcx)
+            || !self.operand_is_slice_like_ref(&arg0.node)
+            || !place_is_slice_pair_ref(self.body, self.tcx, call.destination)
+        {
+            return;
+        }
+
+        let sources = self.operand_sources_from_state(&before, &arg0.node);
+        for field_index in [0, 1] {
+            if let Some(key) = derived_field_key(call.destination, field_index) {
+                state.insert_sources(key, sources.iter().copied());
+            }
+        }
+    }
+
+    fn copy_derived_descendants(
+        &self,
+        before: &DerivedPlaceSourceState,
+        state: &mut DerivedPlaceSourceState,
+        target: Place<'tcx>,
+        source: Place<'tcx>,
+    ) {
+        let Some(source_prefix) = derived_place_key_prefix(source) else {
+            return;
+        };
+        let Some(target_prefix) = derived_place_key_prefix(target) else {
+            return;
+        };
+
+        for (key, sources) in &before.sources {
+            let Some(target_key) = key.rebase_from_prefix(&source_prefix, &target_prefix) else {
+                continue;
+            };
+            state.insert_sources(target_key, sources.iter().copied());
+        }
+    }
+
+    fn operand_sources_from_state(
+        &self,
+        state: &DerivedPlaceSourceState,
+        operand: &Operand<'tcx>,
+    ) -> Vec<LifetimeSlot> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.place_sources_from_state(state, *place)
+            }
+            Operand::Constant(_) => vec![],
+        }
+    }
+
+    fn place_sources_from_state(
+        &self,
+        state: &DerivedPlaceSourceState,
+        place: Place<'tcx>,
+    ) -> Vec<LifetimeSlot> {
+        if let Some(slot) = self.flow.slot_for_place(place, 0) {
+            return vec![slot];
+        }
+        let Some(key) = derived_place_key(place) else {
+            return vec![];
+        };
+        state.sources_for_key(&key)
+    }
+
+    fn operand_is_slice_like_ref(&self, operand: &Operand<'tcx>) -> bool {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                is_slice_like_ref_ty(place.ty(self.body, self.tcx).ty)
+            }
+            Operand::Constant(_) => false,
+        }
+    }
+}
+
+fn compute_derived_place_sources<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    flow: &BodyLifetimeFlow,
+) -> FxHashMap<Location, DerivedPlaceSourceState> {
+    DerivedPlaceDataflow { tcx, body, flow }.compute()
+}
 
 impl BodyLifetimeFlow {
     fn new(body: &Body<'_>) -> Self {
@@ -399,47 +708,47 @@ struct FlowVisitor<'flow, 'summary, 'tcx> {
     flow: &'flow mut BodyLifetimeFlow,
     callee_summaries: &'summary FxHashMap<LocalDefId, LifetimeFlowSummary>,
     program_functions: &'summary FxHashSet<LocalDefId>,
-    derived_place_sources: FxHashMap<DerivedPlaceKey, LifetimeSlot>,
+    derived_place_sources: FxHashMap<Location, DerivedPlaceSourceState>,
 }
 
 impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
-    fn assign_from_operand(&mut self, target: LifetimeSlot, operand: &Operand<'tcx>) {
-        let Some(source) = self.operand_slot(operand) else {
-            return;
-        };
-        self.flow.add_flow(source, target);
-        self.flow.add_descendant_aliases(source, target);
-    }
-
-    fn operand_slot(&self, operand: &Operand<'tcx>) -> Option<LifetimeSlot> {
-        match operand {
-            Operand::Copy(place) | Operand::Move(place) => self.place_slot_or_derived(*place),
-            Operand::Constant(_) => None,
+    fn assign_from_operand(
+        &mut self,
+        target: LifetimeSlot,
+        operand: &Operand<'tcx>,
+        location: Location,
+    ) {
+        for source in self.operand_slots(operand, location) {
+            self.flow.add_flow(source, target);
+            self.flow.add_descendant_aliases(source, target);
         }
     }
 
-    fn place_slot_or_derived(&self, place: Place<'tcx>) -> Option<LifetimeSlot> {
-        self.flow
-            .slot_for_place(place, 0)
-            .or_else(|| self.derived_place_source(place))
+    fn operand_slots(&self, operand: &Operand<'tcx>, location: Location) -> Vec<LifetimeSlot> {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.place_slots_or_derived(*place, location)
+            }
+            Operand::Constant(_) => vec![],
+        }
     }
 
-    fn derived_place_source(&self, place: Place<'tcx>) -> Option<LifetimeSlot> {
-        let key = derived_place_key(place)?;
-        self.derived_place_sources.get(&key).copied()
+    fn place_slots_or_derived(&self, place: Place<'tcx>, location: Location) -> Vec<LifetimeSlot> {
+        if let Some(slot) = self.flow.slot_for_place(place, 0) {
+            return vec![slot];
+        }
+        self.derived_place_sources(place, location)
     }
 
-    fn record_derived_field_source(
-        &mut self,
-        place: Place<'tcx>,
-        field_index: usize,
-        source: LifetimeSlot,
-    ) -> bool {
-        let Some(key) = derived_field_key(place, field_index) else {
-            return false;
+    fn derived_place_sources(&self, place: Place<'tcx>, location: Location) -> Vec<LifetimeSlot> {
+        let Some(key) = derived_place_key(place) else {
+            return vec![];
         };
-        self.derived_place_sources.insert(key, source);
-        true
+        self.derived_place_sources
+            .get(&location)
+            .and_then(|state| state.sources.get(&key))
+            .map(|sources| sources.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     fn operand_is_slice_like_ref(&self, operand: &Operand<'tcx>) -> bool {
@@ -487,7 +796,11 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         }
     }
 
-    fn apply_known_input_return_call(&mut self, call: &MirFunctionCall<'_, 'tcx>) -> bool {
+    fn apply_known_input_return_call(
+        &mut self,
+        call: &MirFunctionCall<'_, 'tcx>,
+        location: Location,
+    ) -> bool {
         let Some(arg0) = call.args.first() else {
             return false;
         };
@@ -501,33 +814,33 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         };
 
         if is_provenance_preserving_pointer_method(&call.func, self.tcx) {
-            self.assign_known_return_from_operand(destination, &arg0.node);
+            self.assign_known_return_from_operand(destination, &arg0.node, location);
             return true;
         }
 
         if is_known_slice_view_return_call(&call.func, self.tcx)
             && self.place_is_slice_like_ref(call.destination)
         {
-            self.assign_known_return_from_operand(destination, &arg0.node);
+            self.assign_known_return_from_operand(destination, &arg0.node, location);
             return true;
         }
 
         if is_known_slice_index_return_call(&call.func, self.tcx)
             && self.operand_is_slice_like_ref(&arg0.node)
         {
-            self.assign_known_return_from_operand(destination, &arg0.node);
+            self.assign_known_return_from_operand(destination, &arg0.node, location);
             return true;
         }
 
         if is_known_c_string_search_return_call(&call.func, self.tcx) {
-            self.assign_known_return_from_operand(destination, &arg0.node);
+            self.assign_known_return_from_operand(destination, &arg0.node, location);
             return true;
         }
 
         if is_known_memchr_return_call(&call.func, self.tcx)
             && self.operand_is_slice_like_ref(&arg0.node)
         {
-            self.assign_known_return_from_operand(destination, &arg0.node);
+            self.assign_known_return_from_operand(destination, &arg0.node, location);
             return true;
         }
 
@@ -546,19 +859,22 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
             return false;
         }
 
-        let Some(source) = self.operand_slot(arg0) else {
-            return false;
-        };
-
-        self.record_derived_field_source(call.destination, 0, source)
-            | self.record_derived_field_source(call.destination, 1, source)
+        true
     }
 
-    fn assign_known_return_from_operand(&mut self, target: LifetimeSlot, operand: &Operand<'tcx>) {
-        if let Some(source) = self.operand_slot(operand) {
-            self.flow.add_flow(source, target);
-        } else {
+    fn assign_known_return_from_operand(
+        &mut self,
+        target: LifetimeSlot,
+        operand: &Operand<'tcx>,
+        location: Location,
+    ) {
+        let sources = self.operand_slots(operand, location);
+        if sources.is_empty() {
             self.flow.mark_unknown(target);
+        } else {
+            for source in sources {
+                self.flow.add_flow(source, target);
+            }
         }
     }
 
@@ -644,7 +960,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
         &mut self,
         place: &Place<'tcx>,
         rvalue: &Rvalue<'tcx>,
-        _location: rustc_middle::mir::Location,
+        location: rustc_middle::mir::Location,
     ) {
         let rvalue_ty = rvalue.ty(self.body, self.tcx);
         if pointer_slot_count(rvalue_ty) == 0 {
@@ -659,9 +975,11 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             Rvalue::Use(operand)
             | Rvalue::Cast(_, operand, _)
             | Rvalue::ShallowInitBox(operand, _)
-            | Rvalue::WrapUnsafeBinder(operand, _) => self.assign_from_operand(target, operand),
+            | Rvalue::WrapUnsafeBinder(operand, _) => {
+                self.assign_from_operand(target, operand, location)
+            }
             Rvalue::CopyForDeref(place) => {
-                if let Some(source) = self.place_slot_or_derived(*place) {
+                for source in self.place_slots_or_derived(*place, location) {
                     self.flow.add_flow(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
@@ -671,7 +989,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             }
             Rvalue::ThreadLocalRef(_) => self.flow.mark_unknown(target),
             Rvalue::BinaryOp(BinOp::Offset, operands) => {
-                self.assign_from_operand(target, &operands.0);
+                self.assign_from_operand(target, &operands.0, location);
             }
             Rvalue::Repeat(..)
             | Rvalue::Len(..)
@@ -686,13 +1004,13 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
     fn visit_terminator(
         &mut self,
         terminator: &Terminator<'tcx>,
-        _location: rustc_middle::mir::Location,
+        location: rustc_middle::mir::Location,
     ) {
         let Some(call) = terminator.as_call(self.tcx) else {
             return;
         };
 
-        if self.apply_known_input_return_call(&call) {
+        if self.apply_known_input_return_call(&call, location) {
             return;
         }
 
@@ -701,7 +1019,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             && let Some(arg0) = call.args.first()
         {
             if let Some(destination) = self.flow.slot_for_place(call.destination, 0) {
-                self.assign_from_operand(destination, &arg0.node);
+                self.assign_from_operand(destination, &arg0.node, location);
             }
             return;
         }
