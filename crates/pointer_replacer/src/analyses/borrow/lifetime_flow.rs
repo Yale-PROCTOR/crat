@@ -1,12 +1,12 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
-    bit_set::{DenseBitSet, SparseBitMatrix},
     IndexVec,
+    bit_set::{DenseBitSet, SparseBitMatrix},
 };
 use rustc_middle::{
     mir::{
-        visit::Visitor, BinOp, Body, Local, Operand, Place, PlaceElem, Rvalue, Terminator,
-        RETURN_PLACE,
+        BinOp, Body, Local, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Terminator,
+        visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
