@@ -1145,35 +1145,8 @@ pub fn demote_pointers_iterative_with_fields(
 pub fn mutable_references_no_guarantee(
     program: &RustProgram,
     mutables: &FxHashMap<LocalDefId, IndexVec<Local, bool>>,
-) -> (
-    FxHashMap<LocalDefId, DenseBitSet<Local>>,
-    FxHashMap<LocalDefId, DenseBitSet<Local>>,
-) {
-    let results = classified_references_with_fields_no_guarantee(program, mutables);
-    (results.mutable_locals, results.shared_locals)
-}
-
-#[allow(dead_code)]
-pub fn mutable_references_with_fields_no_guarantee(
-    program: &RustProgram,
 ) -> BorrowPromotionResults {
-    let mutables = program
-        .functions
-        .iter()
-        .map(|&f| {
-            let body = program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(f)
-                .borrow();
-            let facts = body
-                .local_decls
-                .iter()
-                .map(|_| true)
-                .collect::<IndexVec<Local, _>>();
-            (f, facts)
-        })
-        .collect::<FxHashMap<_, _>>();
-    classified_references_with_fields_no_guarantee(program, &mutables)
+    classified_references_with_fields_no_guarantee(program, mutables)
 }
 
 pub fn classified_references_with_fields_no_guarantee(

@@ -9091,12 +9091,12 @@ mod tests {
         );
         let source_var_groups = SourceVarGroups::new(&input);
         let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-        let (mutable_references, shared_references) =
+        let borrow_promotion_result =
             analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
         let promoted_mut_ref_result =
-            source_var_groups.postprocess_promoted_mut_refs(mutable_references);
+            source_var_groups.postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals);
         let promoted_shared_ref_result =
-            source_var_groups.postprocess_promoted_mut_refs(shared_references);
+            source_var_groups.postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals);
         let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
         let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
         offset_sign_result.access_signs =
