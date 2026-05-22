@@ -5,6 +5,7 @@ use super::*;
 
 fn build_rust_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     let mut functions = vec![];
+    let mut structs = vec![];
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
             continue;
@@ -12,14 +13,16 @@ fn build_rust_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         let OwnerNode::Item(item) = owner.node() else {
             continue;
         };
-        if matches!(item.kind, ItemKind::Fn { .. }) {
-            functions.push(item.owner_id.def_id);
+        match item.kind {
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+            _ => {}
         }
     }
     RustProgram {
         tcx,
         functions,
-        structs: vec![],
+        structs,
     }
 }
 
@@ -58,6 +61,61 @@ fn run_demote(code: &str) -> Vec<String> {
         }
         all_demoted.sort();
         all_demoted
+    })
+    .unwrap()
+}
+
+fn run_demote_fields(code: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let mut ctxt = all_mutable_ctxt(&program);
+        let demoted = demote_pointers_iterative_with_fields(&program, &mut ctxt);
+        let mut fields = demoted
+            .fields
+            .iter()
+            .map(|field| {
+                let struct_name = tcx.item_name(field.struct_did.to_def_id());
+                format!("{}::field{}", struct_name, field.field_index)
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        fields
+    })
+    .unwrap()
+}
+
+fn run_promoted_mut_fields(code: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let results = mutable_references_with_fields_no_guarantee(&program);
+        let mut fields = results
+            .mutable_fields
+            .iter()
+            .map(|field| {
+                let struct_name = tcx.item_name(field.struct_did.to_def_id());
+                format!("{}::field{}", struct_name, field.field_index)
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        fields
+    })
+    .unwrap()
+}
+
+fn run_promoted_shared_fields(code: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let results = mutable_references_with_fields_no_guarantee(&program);
+        let mut fields = results
+            .shared_fields
+            .iter()
+            .map(|field| {
+                let struct_name = tcx.item_name(field.struct_did.to_def_id());
+                format!("{}::field{}", struct_name, field.field_index)
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        fields
     })
     .unwrap()
 }
@@ -168,11 +226,17 @@ fn collect_lifetime_flow_edges(
 }
 
 fn format_signature_slot(slot: lifetime_flow::SignatureSlot) -> String {
-    let root = match slot.root {
+    let root = match slot.place.root {
         lifetime_flow::SignatureRoot::Return => "return".to_string(),
         lifetime_flow::SignatureRoot::Arg(local) => format!("arg{}", local.index()),
     };
-    format!("{root}@{}", slot.depth)
+    let derefs = "*".repeat(slot.place.deref_depth as usize);
+    let field = slot
+        .place
+        .field
+        .map(|field| format!(".field{}", field.field_index))
+        .unwrap_or_default();
+    format!("{root}{derefs}{field}@{}", slot.depth)
 }
 
 fn assert_lifetime_flow_edge(
@@ -361,6 +425,43 @@ fn lifetime_flow_read_output() {
         "read output should flow out arg1@1 to return@0; got {:?}",
         edges["read_out"]
     );
+}
+
+#[test]
+fn lifetime_flow_arg_deref_field_return() {
+    let facts = get_lifetime_flow_facts(
+        "
+        #[repr(C)]
+        struct Holder {
+            p: *mut i32,
+        }
+
+        unsafe fn get(h: *mut Holder) -> *mut i32 {
+            (*h).p
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "get", "arg1*.field0@0", "return@0");
+}
+
+#[test]
+fn lifetime_flow_store_then_load_arg_deref_field() {
+    let facts = get_lifetime_flow_facts(
+        "
+        #[repr(C)]
+        struct Holder {
+            p: *mut i32,
+        }
+
+        unsafe fn store_then_get(h: *mut Holder, p: *mut i32) -> *mut i32 {
+            (*h).p = p;
+            (*h).p
+        }
+        ",
+    );
+    assert_lifetime_flow_edge(&facts, "store_then_get", "arg2@0", "return@0");
+    assert_lifetime_flow_edge(&facts, "store_then_get", "arg2@0", "arg1*.field0@0");
+    assert_lifetime_flow_edge(&facts, "store_then_get", "arg1*.field0@0", "return@0");
 }
 
 #[test]
@@ -806,6 +907,75 @@ fn test_demote_strategy_no_ub() {
         ",
     );
     assert_eq!(demoted, vec!["x", "y"], "both x and y should be demoted");
+}
+
+#[test]
+fn demote_struct_field_assignment_on_conflict() {
+    let demoted_fields = run_demote_fields(
+        "
+        struct Holder {
+            p: *mut i32,
+        }
+
+        unsafe fn f() {
+            let mut x = 0i32;
+            let mut h = Holder { p: core::ptr::null_mut() };
+            h.p = &raw mut x;
+            x = 1;
+            *h.p = 2;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted_fields,
+        vec!["Holder::field0"],
+        "conflicting use of h.p should demote the global Holder::p field slot"
+    );
+}
+
+#[test]
+fn promote_direct_struct_field_without_conflict() {
+    let promoted_fields = run_promoted_mut_fields(
+        "
+        struct Holder {
+            p: *mut i32,
+        }
+
+        unsafe fn f() {
+            let mut x = 0i32;
+            let mut h = Holder { p: core::ptr::null_mut() };
+            h.p = &raw mut x;
+            *h.p = 1;
+        }
+        ",
+    );
+    assert_eq!(
+        promoted_fields,
+        vec!["Holder::field0"],
+        "Holder::p should be promoted when its field borrow has no conflict"
+    );
+}
+
+#[test]
+fn promote_direct_const_struct_field_without_conflict() {
+    let promoted_fields = run_promoted_shared_fields(
+        "
+        struct Holder {
+            p: *const i32,
+        }
+
+        unsafe fn f() -> i32 {
+            let x = 0i32;
+            let h = Holder { p: &raw const x };
+            *h.p
+        }
+        ",
+    );
+    assert_eq!(
+        promoted_fields,
+        vec!["Holder::field0"],
+        "Holder::p should be promoted as shared when it is a const raw pointer field"
+    );
 }
 
 #[test]

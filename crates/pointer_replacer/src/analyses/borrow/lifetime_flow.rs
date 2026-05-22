@@ -5,14 +5,18 @@ use rustc_index::{
 };
 use rustc_middle::{
     mir::{
-        BinOp, Body, Const, ConstOperand, ConstValue, Local, Location, Operand, Place, PlaceElem,
-        RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator, visit::Visitor,
+        BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location, Operand,
+        Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
+        visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::def_id::{DefId, LocalDefId};
 
-use super::is_borrowing_method;
+use super::{
+    ProvenanceOwner, StructFieldSlot, direct_raw_pointer_field_slot, is_borrowing_method,
+    is_direct_raw_ptr_ty,
+};
 use crate::{
     analyses::mir::{CallGraphPostOrder, CallKind, MirFunctionCall, TerminatorExt},
     utils::rustc::RustProgram,
@@ -33,8 +37,15 @@ pub enum SignatureRoot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SignatureSlot {
+pub struct SignaturePlace {
     pub root: SignatureRoot,
+    pub deref_depth: u8,
+    pub field: Option<StructFieldSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SignatureSlot {
+    pub place: SignaturePlace,
     pub depth: u8,
 }
 
@@ -47,8 +58,21 @@ pub struct LifetimeFlowSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FieldPlace {
+    base: Local,
+    deref_depth: u8,
+    field: StructFieldSlot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LifetimeOwner {
+    Local(Local),
+    Field(FieldPlace),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalSlot {
-    pub local: Local,
+    owner: LifetimeOwner,
     pub depth: u8,
 }
 
@@ -66,7 +90,7 @@ enum DerivedPlaceElem {
 #[derive(Clone, Debug)]
 pub struct BodyLifetimeFlow {
     pub slots: IndexVec<LifetimeSlot, LocalSlot>,
-    slot_map: FxHashMap<(usize, u8), LifetimeSlot>,
+    slot_map: FxHashMap<(LifetimeOwner, u8), LifetimeSlot>,
     pub value_flows: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub storage_aliases: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub unknown_targets: DenseBitSet<LifetimeSlot>,
@@ -91,7 +115,7 @@ pub fn analyze_program_lifetime_flow(program: &RustProgram<'_>) -> LifetimeFlowR
 
     for &did in &program.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-        let result = empty_lifetime_flow_result(&body);
+        let result = empty_lifetime_flow_result(tcx, &body);
         summaries.insert(did, result.summary.clone());
         results.insert(did, result);
     }
@@ -139,7 +163,7 @@ pub fn analyze_body_lifetime_flow_result<'tcx>(
     callee_summaries: &FxHashMap<LocalDefId, LifetimeFlowSummary>,
     program_functions: &FxHashSet<LocalDefId>,
 ) -> LifetimeFlowResult {
-    let mut body_flow = BodyLifetimeFlow::new(body);
+    let mut body_flow = BodyLifetimeFlow::new(tcx, body);
     let derived_place_sources = compute_derived_place_sources(tcx, body, &body_flow);
 
     FlowVisitor {
@@ -161,8 +185,8 @@ pub fn analyze_body_lifetime_flow_result<'tcx>(
     }
 }
 
-fn empty_lifetime_flow_result(body: &Body<'_>) -> LifetimeFlowResult {
-    let body_flow = BodyLifetimeFlow::new(body).closed();
+fn empty_lifetime_flow_result<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> LifetimeFlowResult {
+    let body_flow = BodyLifetimeFlow::new(tcx, body).closed();
     let summary = body_flow.to_summary(body);
     LifetimeFlowResult {
         summary,
@@ -482,7 +506,7 @@ impl<'flow, 'tcx> DerivedPlaceDataflow<'flow, 'tcx> {
         state: &DerivedPlaceSourceState,
         place: Place<'tcx>,
     ) -> Vec<LifetimeSlot> {
-        if let Some(slot) = self.flow.slot_for_place(place, 0) {
+        if let Some(slot) = self.flow.slot_for_place(self.body, place, 0) {
             return vec![slot];
         }
         let Some(key) = derived_place_key(place) else {
@@ -510,14 +534,20 @@ fn compute_derived_place_sources<'tcx>(
 }
 
 impl BodyLifetimeFlow {
-    fn new(body: &Body<'_>) -> Self {
+    fn new<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Self {
         let mut slots = IndexVec::new();
         let mut slot_map = FxHashMap::default();
 
         for (local, local_decl) in body.local_decls.iter_enumerated() {
             for depth in 0..pointer_slot_count(local_decl.ty) {
-                let slot = slots.push(LocalSlot { local, depth });
-                slot_map.insert((local.index(), depth), slot);
+                let owner = LifetimeOwner::Local(local);
+                let slot = slots.push(LocalSlot { owner, depth });
+                slot_map.insert((owner, depth), slot);
+            }
+            for field_place in field_places_for_local(tcx, local, local_decl.ty) {
+                let owner = LifetimeOwner::Field(field_place);
+                let slot = slots.push(LocalSlot { owner, depth: 0 });
+                slot_map.insert((owner, 0), slot);
             }
         }
 
@@ -532,10 +562,14 @@ impl BodyLifetimeFlow {
     }
 
     pub fn slot_for_local(&self, local: Local, depth: u8) -> Option<LifetimeSlot> {
-        self.slot_map.get(&(local.index(), depth)).copied()
+        self.slot_for_owner(LifetimeOwner::Local(local), depth)
     }
 
-    pub fn depth0_value_flows(&self) -> Vec<(Local, Local)> {
+    fn slot_for_owner(&self, owner: LifetimeOwner, depth: u8) -> Option<LifetimeSlot> {
+        self.slot_map.get(&(owner, depth)).copied()
+    }
+
+    pub fn depth0_value_flows(&self) -> Vec<(ProvenanceOwner, ProvenanceOwner)> {
         let mut flows = vec![];
 
         for source in self.value_flows.rows() {
@@ -543,6 +577,9 @@ impl BodyLifetimeFlow {
             if source_slot.depth != 0 {
                 continue;
             }
+            let Some(source_owner) = provenance_owner(source_slot.owner) else {
+                continue;
+            };
 
             let Some(targets) = self.value_flows.row(source) else {
                 continue;
@@ -551,7 +588,10 @@ impl BodyLifetimeFlow {
             for target in targets.iter() {
                 let target_slot = self.slots[target];
                 if target_slot.depth == 0 {
-                    flows.push((source_slot.local, target_slot.local));
+                    let Some(target_owner) = provenance_owner(target_slot.owner) else {
+                        continue;
+                    };
+                    flows.push((source_owner, target_owner));
                 }
             }
         }
@@ -559,7 +599,24 @@ impl BodyLifetimeFlow {
         flows
     }
 
-    fn slot_for_place(&self, place: Place<'_>, extra_depth: u8) -> Option<LifetimeSlot> {
+    fn slot_for_place<'tcx, D: HasLocalDecls<'tcx>>(
+        &self,
+        local_decls: &D,
+        place: Place<'tcx>,
+        extra_depth: u8,
+    ) -> Option<LifetimeSlot> {
+        if let Some((field, deref_depth, _)) = direct_raw_pointer_field_slot(local_decls, place) {
+            if extra_depth == 0 {
+                return self.slot_for_owner(
+                    LifetimeOwner::Field(FieldPlace {
+                        base: place.local,
+                        deref_depth,
+                        field,
+                    }),
+                    0,
+                );
+            }
+        }
         let base_depth = place_deref_depth(place)?;
         let depth = base_depth.checked_add(extra_depth)?;
         self.slot_for_local(place.local, depth)
@@ -567,7 +624,7 @@ impl BodyLifetimeFlow {
 
     fn slot_after(&self, slot: LifetimeSlot, offset: u8) -> Option<LifetimeSlot> {
         let local_slot = self.slots[slot];
-        self.slot_for_local(local_slot.local, local_slot.depth.checked_add(offset)?)
+        self.slot_for_owner(local_slot.owner, local_slot.depth.checked_add(offset)?)
     }
 
     fn add_flow(&mut self, source: LifetimeSlot, target: LifetimeSlot) {
@@ -600,9 +657,14 @@ impl BodyLifetimeFlow {
         self.unknown_targets.insert(target);
     }
 
-    fn mark_unknown_place_slots(&mut self, place: Place<'_>, start_depth: u8) {
+    fn mark_unknown_place_slots<'tcx, D: HasLocalDecls<'tcx>>(
+        &mut self,
+        local_decls: &D,
+        place: Place<'tcx>,
+        start_depth: u8,
+    ) {
         for depth in start_depth..MAX_SIGNATURE_SLOT_DEPTH {
-            let Some(slot) = self.slot_for_place(place, depth) else {
+            let Some(slot) = self.slot_for_place(local_decls, place, depth) else {
                 break;
             };
             self.mark_unknown(slot);
@@ -643,9 +705,38 @@ impl BodyLifetimeFlow {
                 let Some(internal) = self.slot_for_local(local, depth) else {
                     continue;
                 };
-                let summary = slots.push(SignatureSlot { root, depth });
+                let summary = slots.push(SignatureSlot {
+                    place: SignaturePlace {
+                        root,
+                        deref_depth: 0,
+                        field: None,
+                    },
+                    depth,
+                });
                 internal_to_summary.insert(internal, summary);
             }
+        }
+
+        for (slot, local_slot) in self.slots.iter_enumerated() {
+            let LifetimeOwner::Field(field_place) = local_slot.owner else {
+                continue;
+            };
+            let root = if field_place.base == RETURN_PLACE {
+                SignatureRoot::Return
+            } else if field_place.base.index() <= body.arg_count {
+                SignatureRoot::Arg(field_place.base)
+            } else {
+                continue;
+            };
+            let summary = slots.push(SignatureSlot {
+                place: SignaturePlace {
+                    root,
+                    deref_depth: field_place.deref_depth,
+                    field: Some(field_place.field),
+                },
+                depth: local_slot.depth,
+            });
+            internal_to_summary.insert(slot, summary);
         }
 
         let mut value_flows = SparseBitMatrix::new(slots.len());
@@ -702,6 +793,47 @@ impl BodyLifetimeFlow {
     }
 }
 
+fn provenance_owner(owner: LifetimeOwner) -> Option<ProvenanceOwner> {
+    match owner {
+        LifetimeOwner::Local(local) => Some(ProvenanceOwner::Local(local)),
+        LifetimeOwner::Field(field_place) => Some(ProvenanceOwner::Field(field_place.field)),
+    }
+}
+
+fn field_places_for_local<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    local: Local,
+    mut ty: Ty<'tcx>,
+) -> Vec<FieldPlace> {
+    let mut fields = vec![];
+    for deref_depth in 0..=MAX_SIGNATURE_SLOT_DEPTH {
+        if let TyKind::Adt(adt_def, args) = ty.kind()
+            && adt_def.did().is_local()
+            && adt_def.is_struct()
+            && !adt_def.is_union()
+        {
+            for (field_index, field_def) in adt_def.all_fields().enumerate() {
+                if is_direct_raw_ptr_ty(field_def.ty(tcx, args)) {
+                    fields.push(FieldPlace {
+                        base: local,
+                        deref_depth,
+                        field: StructFieldSlot {
+                            struct_did: adt_def.did().expect_local(),
+                            field_index,
+                        },
+                    });
+                }
+            }
+        }
+
+        let Some(pointee) = pointer_pointee_ty(ty) else {
+            break;
+        };
+        ty = pointee;
+    }
+    fields
+}
+
 struct FlowVisitor<'flow, 'summary, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'flow Body<'tcx>,
@@ -742,7 +874,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
     }
 
     fn place_slots_or_derived(&self, place: Place<'tcx>, location: Location) -> Vec<LifetimeSlot> {
-        if let Some(slot) = self.flow.slot_for_place(place, 0) {
+        if let Some(slot) = self.flow.slot_for_place(self.body, place, 0) {
             return vec![slot];
         }
         self.derived_place_sources(place, location)
@@ -817,7 +949,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
     fn assign_from_place_address(&mut self, target: LifetimeSlot, place: Place<'tcx>) {
         match place_deref_depth(place) {
             Some(0) => {
-                if let Some(place_slot) = self.flow.slot_for_place(place, 0)
+                if let Some(place_slot) = self.flow.slot_for_place(self.body, place, 0)
                     && let Some(target_pointee) = self.flow.slot_after(target, 1)
                 {
                     self.flow.add_alias(target_pointee, place_slot);
@@ -859,7 +991,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
             return true;
         }
 
-        let Some(destination) = self.flow.slot_for_place(call.destination, 0) else {
+        let Some(destination) = self.flow.slot_for_place(self.body, call.destination, 0) else {
             return false;
         };
 
@@ -982,25 +1114,56 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         call: &MirFunctionCall<'_, 'tcx>,
         slot: SignatureSlot,
     ) -> Option<LifetimeSlot> {
-        match slot.root {
-            SignatureRoot::Return => self.flow.slot_for_place(call.destination, slot.depth),
+        match slot.place.root {
+            SignatureRoot::Return => {
+                self.instantiate_signature_place(call.destination, slot.place, slot.depth)
+            }
             SignatureRoot::Arg(local) => {
                 let arg_index = local.index().checked_sub(1)?;
                 let arg = call.args.get(arg_index)?;
                 let place = arg.node.place()?;
-                self.flow.slot_for_place(place, slot.depth)
+                self.instantiate_signature_place(place, slot.place, slot.depth)
             }
         }
     }
 
+    fn instantiate_signature_place(
+        &self,
+        root_place: Place<'tcx>,
+        signature_place: SignaturePlace,
+        depth: u8,
+    ) -> Option<LifetimeSlot> {
+        if let Some(field) = signature_place.field {
+            if depth != 0 {
+                return None;
+            }
+            let root_depth = place_deref_depth(root_place)?;
+            return self.flow.slot_for_owner(
+                LifetimeOwner::Field(FieldPlace {
+                    base: root_place.local,
+                    deref_depth: root_depth.checked_add(signature_place.deref_depth)?,
+                    field,
+                }),
+                0,
+            );
+        }
+
+        self.flow.slot_for_place(
+            self.body,
+            root_place,
+            signature_place.deref_depth.checked_add(depth)?,
+        )
+    }
+
     fn mark_unknown_call_effects(&mut self, call: &MirFunctionCall<'_, 'tcx>) {
-        self.flow.mark_unknown_place_slots(call.destination, 0);
+        self.flow
+            .mark_unknown_place_slots(self.body, call.destination, 0);
 
         for arg in call.args {
             let Some(place) = arg.node.place() else {
                 continue;
             };
-            self.flow.mark_unknown_place_slots(place, 1);
+            self.flow.mark_unknown_place_slots(self.body, place, 1);
         }
     }
 }
@@ -1017,7 +1180,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             return;
         }
 
-        let Some(target) = self.flow.slot_for_place(*place, 0) else {
+        let Some(target) = self.flow.slot_for_place(self.body, *place, 0) else {
             return;
         };
 
@@ -1068,7 +1231,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             && is_borrowing_method(*def_id, self.tcx)
             && let Some(arg0) = call.args.first()
         {
-            if let Some(destination) = self.flow.slot_for_place(call.destination, 0) {
+            if let Some(destination) = self.flow.slot_for_place(self.body, call.destination, 0) {
                 self.assign_from_operand(destination, &arg0.node, location);
             }
             return;
@@ -1094,9 +1257,9 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
 }
 
 fn observable_value_target(slot: SignatureSlot) -> bool {
-    match slot.root {
+    match slot.place.root {
         SignatureRoot::Return => true,
-        SignatureRoot::Arg(_) => slot.depth > 0,
+        SignatureRoot::Arg(_) => slot.place.field.is_some() || slot.depth > 0,
     }
 }
 

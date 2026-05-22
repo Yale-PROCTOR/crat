@@ -19,9 +19,11 @@ use rustc_index::{
 use rustc_middle::{
     mir::{
         Body, HasLocalDecls, Local, Location, Operand, PassWhere, Place, PlaceElem, RETURN_PLACE,
-        Rvalue, Terminator, pretty::PrettyPrintMirOptions, visit::Visitor,
+        Rvalue, Terminator,
+        pretty::PrettyPrintMirOptions,
+        visit::{PlaceContext, Visitor},
     },
-    ty::TyCtxt,
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::{fmt::DebugWithContext, points::DenseLocationMap};
 use rustc_span::def_id::LocalDefId;
@@ -53,17 +55,41 @@ rustc_index::newtype_index! {
 }
 
 pub type PromotedMutRefs = FxHashMap<LocalDefId, DenseBitSet<Local>>;
+pub type PromotedFieldRefs = FxHashSet<StructFieldSlot>;
+
+#[allow(dead_code)]
+pub struct BorrowPromotionResults {
+    pub mutable_locals: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    pub shared_locals: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    pub mutable_fields: PromotedFieldRefs,
+    pub shared_fields: PromotedFieldRefs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StructFieldSlot {
+    pub struct_did: LocalDefId,
+    pub field_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProvenanceOwner {
+    Local(Local),
+    Field(StructFieldSlot),
+}
 
 pub enum ProvenanceData {
     PlaceHolder(Local, bool), // (Local, is_mutable)
     Local(Local, bool),       // (Local, is_mutable)
+    Field(StructFieldSlot, bool),
 }
 
 impl ProvenanceData {
-    pub fn local(&self) -> Local {
+    pub fn owner(&self) -> ProvenanceOwner {
         match self {
-            ProvenanceData::PlaceHolder(local, _) => *local,
-            ProvenanceData::Local(local, _) => *local,
+            ProvenanceData::PlaceHolder(local, _) | ProvenanceData::Local(local, _) => {
+                ProvenanceOwner::Local(*local)
+            }
+            ProvenanceData::Field(field, _) => ProvenanceOwner::Field(*field),
         }
     }
 
@@ -71,15 +97,60 @@ impl ProvenanceData {
         match self {
             ProvenanceData::PlaceHolder(_, is_mutable) => *is_mutable,
             ProvenanceData::Local(_, is_mutable) => *is_mutable,
+            ProvenanceData::Field(_, is_mutable) => *is_mutable,
         }
     }
 }
 
+fn is_direct_raw_ptr_ty(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::RawPtr(..))
+}
+
+fn direct_raw_pointer_field_slot<'tcx, D: HasLocalDecls<'tcx>>(
+    local_decls: &D,
+    place: Place<'tcx>,
+) -> Option<(StructFieldSlot, u8, bool)> {
+    let mut base_ty = local_decls.local_decls()[place.local].ty;
+    let mut deref_depth = 0u8;
+
+    for (index, projection_elem) in place.projection.iter().enumerate() {
+        match projection_elem {
+            PlaceElem::Deref => {
+                deref_depth = deref_depth.checked_add(1)?;
+                base_ty = base_ty.builtin_deref(true)?;
+            }
+            PlaceElem::Field(field, field_ty) if index + 1 == place.projection.len() => {
+                let TyKind::Adt(adt_def, _) = base_ty.kind() else {
+                    return None;
+                };
+                if !adt_def.did().is_local() || !adt_def.is_struct() || adt_def.is_union() {
+                    return None;
+                }
+                let TyKind::RawPtr(_, mutability) = field_ty.kind() else {
+                    return None;
+                };
+                return Some((
+                    StructFieldSlot {
+                        struct_did: adt_def.did().expect_local(),
+                        field_index: field.index(),
+                    },
+                    deref_depth,
+                    mutability.is_mut(),
+                ));
+            }
+            PlaceElem::OpaqueCast(_) => {}
+            _ => return None,
+        }
+    }
+
+    None
+}
+
 impl std::fmt::Debug for ProvenanceData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let local = self.local();
+        let owner = self.owner();
         let is_mutable = self.is_mutable();
-        f.write_fmt(format_args!("'{local:?} (mutable: {is_mutable})"))
+        f.write_fmt(format_args!("'{owner:?} (mutable: {is_mutable})"))
     }
 }
 
@@ -87,8 +158,57 @@ impl std::fmt::Debug for ProvenanceData {
 /// for nested pointers. But I guess it could be fine?
 pub struct ProvenanceSet {
     local_data: IndexVec<Local, Option<Provenance>>,
+    field_data: FxHashMap<StructFieldSlot, Option<Provenance>>,
     provenance_data: IndexVec<Provenance, ProvenanceData>,
     tree_borrow_local: RefCell<UnionFind<Local>>,
+}
+
+impl ProvenanceSet {
+    fn provenance_for_owner(&self, owner: ProvenanceOwner) -> Option<Provenance> {
+        match owner {
+            ProvenanceOwner::Local(local) => self.local_data[local],
+            ProvenanceOwner::Field(field) => self.field_data.get(&field).copied().flatten(),
+        }
+    }
+
+    fn owner_for_place<'tcx, D: HasLocalDecls<'tcx>>(
+        &self,
+        local_decls: &D,
+        place: Place<'tcx>,
+    ) -> Option<ProvenanceOwner> {
+        if let Some(local) = place.as_local()
+            && self.local_data[local].is_some()
+        {
+            return Some(ProvenanceOwner::Local(local));
+        }
+
+        let Some((field, _, _)) = direct_raw_pointer_field_slot(local_decls, place) else {
+            return None;
+        };
+        self.field_data
+            .get(&field)
+            .copied()
+            .flatten()
+            .map(|_| ProvenanceOwner::Field(field))
+    }
+
+    fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
+        match owner {
+            ProvenanceOwner::Local(local) => {
+                let changed = self.local_data[local].is_some();
+                self.local_data[local] = None;
+                changed
+            }
+            ProvenanceOwner::Field(field) => {
+                let Some(provenance) = self.field_data.get_mut(&field) else {
+                    return false;
+                };
+                let changed = provenance.is_some();
+                *provenance = None;
+                changed
+            }
+        }
+    }
 }
 
 pub trait HasProvenanceSet {
@@ -106,6 +226,7 @@ impl HasProvenanceSet for Body<'_> {
     {
         let body = self;
         let mut local_data = IndexVec::from_elem_n(None, body.local_decls.len());
+        let mut field_data = FxHashMap::default();
         let mut provenance_data = IndexVec::new();
 
         for (provenance, (local, local_decl)) in local_data
@@ -122,17 +243,81 @@ impl HasProvenanceSet for Body<'_> {
             }
         }
 
+        for (field, is_mutable) in collect_direct_raw_pointer_field_slots(body) {
+            field_data.entry(field).or_insert_with(|| {
+                Some(provenance_data.push(ProvenanceData::Field(field, is_mutable)))
+            });
+        }
+
         ProvenanceSet {
             local_data,
+            field_data,
             provenance_data,
             tree_borrow_local: RefCell::new(UnionFind::new(body.local_decls.len())),
         }
     }
 }
 
+fn collect_direct_raw_pointer_field_slots<'tcx>(
+    body: &Body<'tcx>,
+) -> FxHashMap<StructFieldSlot, bool> {
+    struct Vis<'body, 'tcx> {
+        body: &'body Body<'tcx>,
+        fields: FxHashMap<StructFieldSlot, bool>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Vis<'_, 'tcx> {
+        fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+            if let Some((field, _, is_mutable)) = direct_raw_pointer_field_slot(self.body, *place) {
+                self.fields
+                    .entry(field)
+                    .and_modify(|mutable| *mutable |= is_mutable)
+                    .or_insert(is_mutable);
+            }
+            self.super_place(place, context, location);
+        }
+    }
+
+    let mut vis = Vis {
+        body,
+        fields: FxHashMap::default(),
+    };
+    vis.visit_body(body);
+    vis.fields
+}
+
+fn direct_raw_pointer_field_slots_in_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut ty: Ty<'tcx>,
+) -> Vec<StructFieldSlot> {
+    let mut fields = vec![];
+    loop {
+        if let TyKind::Adt(adt_def, args) = ty.kind()
+            && adt_def.did().is_local()
+            && adt_def.is_struct()
+            && !adt_def.is_union()
+        {
+            for (field_index, field_def) in adt_def.all_fields().enumerate() {
+                if is_direct_raw_ptr_ty(field_def.ty(tcx, args)) {
+                    fields.push(StructFieldSlot {
+                        struct_did: adt_def.did().expect_local(),
+                        field_index,
+                    });
+                }
+            }
+        }
+        let Some(pointee) = ty.builtin_deref(true) else {
+            break;
+        };
+        ty = pointee;
+    }
+    fields
+}
+
 pub struct GBorrowInferCtxt {
     pub provenances: FxHashMap<LocalDefId, ProvenanceSet>,
     pub lifetime_flows: LifetimeFlowResults,
+    pub field_users: FxHashMap<StructFieldSlot, FxHashSet<LocalDefId>>,
 }
 
 impl GBorrowInferCtxt {
@@ -145,6 +330,8 @@ impl GBorrowInferCtxt {
     {
         let lifetime_flows = analyze_program_lifetime_flow(program);
         let mut provenances = FxHashMap::default();
+        let mut field_users: FxHashMap<StructFieldSlot, FxHashSet<LocalDefId>> =
+            FxHashMap::default();
         for f in program.functions.iter().copied() {
             let body = program
                 .tcx
@@ -153,11 +340,18 @@ impl GBorrowInferCtxt {
             let is_candidate = is_candidate(f);
             let is_mutable = is_mutable(f);
             provenances.insert(f, body.provenance_set(is_candidate, is_mutable));
+            for field in collect_direct_raw_pointer_field_slots(&body)
+                .keys()
+                .copied()
+            {
+                field_users.entry(field).or_default().insert(f);
+            }
         }
 
         GBorrowInferCtxt {
             provenances,
             lifetime_flows,
+            field_users,
         }
     }
 
@@ -199,12 +393,12 @@ impl<C> DebugWithContext<C> for Loan {}
 pub struct BorrowData<'tcx> {
     location: Location,
     borrowed: Place<'tcx>,
-    assigned: Borrower<'tcx>,
+    assigned: Borrower,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Borrower<'tcx> {
-    AssignStmt(Place<'tcx>),
+pub enum Borrower {
+    Assign(ProvenanceOwner),
     #[allow(unused)]
     CallArg(LocalDefId, usize),
 }
@@ -252,10 +446,11 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                 rvalue: &Rvalue<'tcx>,
                 location: Location,
             ) {
-                if !matches!(lhs.as_local(), Some(lhs_local) if self.provenance_set.local_data[lhs_local].is_some())
-                {
+                let Some(assigned_owner) =
+                    self.provenance_set.owner_for_place(self.local_decl, *lhs)
+                else {
                     return self.super_assign(lhs, rvalue, location);
-                }
+                };
 
                 let rvalue_ty = rvalue.ty(self.local_decl, self.tcx);
                 if !rvalue_ty.is_any_ptr() {
@@ -268,7 +463,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         let loan = self.loans.push(BorrowData {
                             location,
                             borrowed: *place,
-                            assigned: Borrower::AssignStmt(*lhs),
+                            assigned: Borrower::Assign(assigned_owner),
                         });
                         loans.push(loan);
 
@@ -284,7 +479,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                             let loan = self.loans.push(BorrowData {
                                 location,
                                 borrowed: Place::from(other_local),
-                                assigned: Borrower::AssignStmt(*lhs),
+                                assigned: Borrower::Assign(assigned_owner),
                             });
                             loans.push(loan);
                         }
@@ -298,7 +493,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                         let loan = self.loans.push(BorrowData {
                             location,
                             borrowed: place.project_deeper(&[PlaceElem::Deref], self.tcx),
-                            assigned: Borrower::AssignStmt(*lhs),
+                            assigned: Borrower::Assign(assigned_owner),
                         });
                         loans.push(loan);
 
@@ -314,7 +509,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                             let loan = self.loans.push(BorrowData {
                                 location,
                                 borrowed: Place::from(other_local),
-                                assigned: Borrower::AssignStmt(*lhs),
+                                assigned: Borrower::Assign(assigned_owner),
                             });
                             loans.push(loan);
                         }
@@ -336,13 +531,15 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                     if is_borrowing_method(*def_id, self.tcx) {
                         let arg0 = &mir_call.args[0].node;
                         if let Some(arg0_place) = arg0.place()
-                            && self.provenance_set.local_data[mir_call.destination.local].is_some()
+                            && let Some(assigned_owner) = self
+                                .provenance_set
+                                .owner_for_place(self.local_decl, mir_call.destination)
                         {
                             let mut loans = vec![];
                             let loan = self.loans.push(BorrowData {
                                 location,
                                 borrowed: arg0_place.project_deeper(&[PlaceElem::Deref], self.tcx),
-                                assigned: Borrower::AssignStmt(mir_call.destination),
+                                assigned: Borrower::Assign(assigned_owner),
                             });
                             loans.push(loan);
 
@@ -358,7 +555,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                                 let loan = self.loans.push(BorrowData {
                                     location,
                                     borrowed: Place::from(other_local),
-                                    assigned: Borrower::AssignStmt(mir_call.destination),
+                                    assigned: Borrower::Assign(assigned_owner),
                                 });
                                 loans.push(loan);
                             }
@@ -452,6 +649,7 @@ impl ProvenanceConstraintGraph {
     ) -> Self {
         struct Vis<'this, 'tcx> {
             tcx: TyCtxt<'tcx>,
+            body: &'this Body<'tcx>,
             graph: &'this mut ProvenanceConstraintGraph,
             borrow_set: &'this BorrowSet<'tcx>,
             provenance_set: &'this ProvenanceSet,
@@ -475,10 +673,12 @@ impl ProvenanceConstraintGraph {
                         ..
                     } = &self.borrow_set.loans[loan];
 
-                    let Some(lhs) = place.as_local() else {
+                    let Some(lhs_owner) = self.provenance_set.owner_for_place(self.body, *place)
+                    else {
                         return self.super_assign(place, rvalue, location);
                     };
-                    let lhs_provenance = self.provenance_set.local_data[lhs].unwrap();
+                    let lhs_provenance =
+                        self.provenance_set.provenance_for_owner(lhs_owner).unwrap();
 
                     self.graph.membership.push(MembershipConstraint {
                         loan,
@@ -546,6 +746,7 @@ impl ProvenanceConstraintGraph {
 
         Vis {
             tcx,
+            body,
             graph: &mut graph,
             borrow_set,
             provenance_set,
@@ -558,10 +759,10 @@ impl ProvenanceConstraintGraph {
             .get(&body.source.def_id().expect_local())
         {
             for (source, target) in lifetime_flow.body.depth0_value_flows() {
-                let Some(source_provenance) = provenance_set.local_data[source] else {
+                let Some(source_provenance) = provenance_set.provenance_for_owner(source) else {
                     continue;
                 };
-                let Some(target_provenance) = provenance_set.local_data[target] else {
+                let Some(target_provenance) = provenance_set.provenance_for_owner(target) else {
                     continue;
                 };
                 graph.subset.push(SubsetConstraint {
@@ -776,11 +977,25 @@ pub fn dump_coarse_inferred_bounds(program: &RustProgram, global_borrow_ctxt: &G
     }
 }
 
+#[allow(dead_code)]
 pub fn demote_pointers_iterative(
     program: &RustProgram,
     global_borrow_ctxt: &mut GBorrowInferCtxt,
 ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+    demote_pointers_iterative_with_fields(program, global_borrow_ctxt).locals
+}
+
+pub struct DemotionResults {
+    pub locals: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    pub fields: FxHashSet<StructFieldSlot>,
+}
+
+pub fn demote_pointers_iterative_with_fields(
+    program: &RustProgram,
+    global_borrow_ctxt: &mut GBorrowInferCtxt,
+) -> DemotionResults {
     let mut demoted = FxHashMap::default();
+    let mut demoted_fields = FxHashSet::default();
 
     let tcx = program.tcx;
 
@@ -818,66 +1033,109 @@ pub fn demote_pointers_iterative(
         }
 
         let mut demoted_locals = DenseBitSet::new_empty(body.local_decls.len());
+        let mut demoted_field_slots = FxHashSet::default();
 
-        let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
+        let changed = {
+            let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
 
-        // Demote every live provenance that depends on the invalid loan, not just
-        // the local where the borrow was originally assigned.
-        // (for inter-procedural borrow inference, e.g., p = id(q))
-        for loan in invalid_loans.iter() {
-            let borrow_data = &borrow_set.loans[loan];
-            for row in errors.rows() {
-                let Some(loans) = errors.row(row) else {
-                    continue;
-                };
-                if !loans.contains(loan) {
-                    continue;
-                }
-                let Some(live_provenances) = provenance_liveness.row(row) else {
-                    continue;
-                };
-                for provenance in live_provenances.iter() {
-                    if !requires.contains(provenance, loan) {
+            // Demote every live provenance that depends on the invalid loan, not just
+            // the local where the borrow was originally assigned.
+            // (for inter-procedural borrow inference, e.g., p = id(q))
+            for loan in invalid_loans.iter() {
+                let borrow_data = &borrow_set.loans[loan];
+                for row in errors.rows() {
+                    let Some(loans) = errors.row(row) else {
+                        continue;
+                    };
+                    if !loans.contains(loan) {
                         continue;
                     }
-                    let local = provenance_set.provenance_data[provenance].local();
-                    demoted_locals.insert(local);
-                    provenance_set
-                        .tree_borrow_local
-                        .get_mut()
-                        .union(local, borrow_data.borrowed.local);
+                    let Some(live_provenances) = provenance_liveness.row(row) else {
+                        continue;
+                    };
+                    for provenance in live_provenances.iter() {
+                        if !requires.contains(provenance, loan) {
+                            continue;
+                        }
+                        match provenance_set.provenance_data[provenance].owner() {
+                            ProvenanceOwner::Local(local) => {
+                                demoted_locals.insert(local);
+                                provenance_set
+                                    .tree_borrow_local
+                                    .get_mut()
+                                    .union(local, borrow_data.borrowed.local);
+                            }
+                            ProvenanceOwner::Field(field) => {
+                                demoted_field_slots.insert(field);
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        for loan in invalid_loans.iter() {
-            let borrow_data = &borrow_set.loans[loan];
-            if let Borrower::AssignStmt(assigned) = borrow_data.assigned {
-                demoted_locals.insert(assigned.local);
-                provenance_set
-                    .tree_borrow_local
-                    .get_mut()
-                    .union(assigned.local, borrow_data.borrowed.local);
+            for loan in invalid_loans.iter() {
+                let borrow_data = &borrow_set.loans[loan];
+                if let Borrower::Assign(assigned) = borrow_data.assigned {
+                    match assigned {
+                        ProvenanceOwner::Local(local) => {
+                            demoted_locals.insert(local);
+                            provenance_set
+                                .tree_borrow_local
+                                .get_mut()
+                                .union(local, borrow_data.borrowed.local);
+                        }
+                        ProvenanceOwner::Field(field) => {
+                            demoted_field_slots.insert(field);
+                        }
+                    }
+                }
             }
-        }
 
-        let mut changed = false;
-        for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {
-            if demoted_locals.contains(local) && provenance.is_some() {
-                changed = true;
-                *provenance = None;
+            let mut changed = false;
+            for (local, provenance) in provenance_set.local_data.iter_enumerated_mut() {
+                if demoted_locals.contains(local) && provenance.is_some() {
+                    changed = true;
+                    *provenance = None;
+                }
             }
-        }
+            for field in demoted_field_slots.iter().copied() {
+                changed |= provenance_set.disable_owner(ProvenanceOwner::Field(field));
+            }
+            changed
+        };
 
         if changed && !in_worklist.contains(&f) {
             worklist.push_back(f);
             in_worklist.insert(f);
         }
 
+        for field in demoted_field_slots.iter().copied() {
+            if !demoted_fields.insert(field) {
+                continue;
+            }
+            let users = global_borrow_ctxt
+                .field_users
+                .get(&field)
+                .cloned()
+                .unwrap_or_default();
+            for user in users {
+                if let Some(provenance_set) = global_borrow_ctxt.provenances.get_mut(&user) {
+                    provenance_set.disable_owner(ProvenanceOwner::Field(field));
+                }
+                if !in_worklist.contains(&user) {
+                    worklist.push_back(user);
+                    in_worklist.insert(user);
+                }
+            }
+        }
+
         demoted.get_mut(&f).unwrap().union(&demoted_locals);
     }
 
-    demoted
+    DemotionResults {
+        locals: demoted,
+        fields: demoted_fields,
+    }
 }
 
 /// Analyse which raw pointer locals within a function can potentially be a mutable references.
@@ -891,14 +1149,47 @@ pub fn mutable_references_no_guarantee(
     FxHashMap<LocalDefId, DenseBitSet<Local>>,
     FxHashMap<LocalDefId, DenseBitSet<Local>>,
 ) {
+    let results = classified_references_with_fields_no_guarantee(program, mutables);
+    (results.mutable_locals, results.shared_locals)
+}
+
+#[allow(dead_code)]
+pub fn mutable_references_with_fields_no_guarantee(
+    program: &RustProgram,
+) -> BorrowPromotionResults {
+    let mutables = program
+        .functions
+        .iter()
+        .map(|&f| {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(f)
+                .borrow();
+            let facts = body
+                .local_decls
+                .iter()
+                .map(|_| true)
+                .collect::<IndexVec<Local, _>>();
+            (f, facts)
+        })
+        .collect::<FxHashMap<_, _>>();
+    classified_references_with_fields_no_guarantee(program, &mutables)
+}
+
+pub fn classified_references_with_fields_no_guarantee(
+    program: &RustProgram,
+    mutables: &FxHashMap<LocalDefId, IndexVec<Local, bool>>,
+) -> BorrowPromotionResults {
     let mut mutable_references = FxHashMap::default();
     let mut shared_references = FxHashMap::default();
+    let mut mutable_fields = FxHashSet::default();
+    let mut shared_fields = FxHashSet::default();
 
     let mut global_borrow_ctxt = GBorrowInferCtxt::classified_pointers(program, mutables);
     // let demoted = demote_pointers(program, &global_borrow_ctxt);
-    let demoted = demote_pointers_iterative(program, &mut global_borrow_ctxt);
+    let demoted = demote_pointers_iterative_with_fields(program, &mut global_borrow_ctxt);
 
-    for (&f, demoted) in demoted.iter() {
+    for (&f, demoted) in demoted.locals.iter() {
         let provenance_set = &global_borrow_ctxt.provenances[&f];
         let mut promoted_mutable = DenseBitSet::new_empty(demoted.domain_size());
         let mut promoted_shared = DenseBitSet::new_empty(demoted.domain_size());
@@ -919,7 +1210,28 @@ pub fn mutable_references_no_guarantee(
         shared_references.insert(f, promoted_shared);
     }
 
-    (mutable_references, shared_references)
+    for provenance_set in global_borrow_ctxt.provenances.values() {
+        for (&field, &provenance) in &provenance_set.field_data {
+            if demoted.fields.contains(&field) {
+                continue;
+            }
+            let Some(provenance) = provenance else {
+                continue;
+            };
+            if provenance_set.provenance_data[provenance].is_mutable() {
+                mutable_fields.insert(field);
+            } else {
+                shared_fields.insert(field);
+            }
+        }
+    }
+
+    BorrowPromotionResults {
+        mutable_locals: mutable_references,
+        shared_locals: shared_references,
+        mutable_fields,
+        shared_fields,
+    }
 }
 
 #[cfg(test)]
