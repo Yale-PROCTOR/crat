@@ -147,7 +147,7 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
             if varying_params.contains(&param) {
-                let feature = make_feature_name(&param, &raw_value)?;
+                let feature = make_feature_name(&param, &raw_value);
                 if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
                     if existing_param != &param || existing_value != &raw_value {
                         return Err(format!(
@@ -225,37 +225,8 @@ fn config_value_to_string(param: &str, value: &Value) -> Result<String, String> 
     }
 }
 
-fn make_feature_name(param: &str, value: &str) -> Result<String, String> {
-    let param = normalize_feature_component(param)?;
-    let value = normalize_feature_component(value)?;
-    Ok(format!("{param}_{value}"))
-}
-
-fn normalize_feature_component(component: &str) -> Result<String, String> {
-    let mut normalized = String::new();
-    let mut previous_underscore = false;
-    for ch in component.chars() {
-        let ch = ch.to_ascii_lowercase();
-        if ch.is_ascii_alphanumeric() {
-            normalized.push(ch);
-            previous_underscore = false;
-        } else if ch == '_' && !previous_underscore {
-            normalized.push(ch);
-            previous_underscore = true;
-        } else if !previous_underscore && !normalized.is_empty() {
-            normalized.push('_');
-            previous_underscore = true;
-        }
-    }
-    while normalized.ends_with('_') {
-        normalized.pop();
-    }
-    if normalized.is_empty() {
-        return Err(format!(
-            "cannot derive a cargo feature component from {component:?}"
-        ));
-    }
-    Ok(normalized)
+fn make_feature_name(param: &str, value: &str) -> String {
+    format!("{param}_{value}")
 }
 
 fn common_dir_name(translations: &[Translation]) -> Result<OsString, String> {
@@ -596,9 +567,7 @@ fn simplified_cfg_condition(
         .map(|(param, values)| {
             values
                 .iter()
-                .map(|value| {
-                    make_feature_name(param, value).expect("existing config value is valid")
-                })
+                .map(|value| make_feature_name(param, value))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -860,7 +829,7 @@ mod tests {
         let features = config
             .iter()
             .filter(|(param, _)| varying_params.contains(*param))
-            .map(|(param, value)| make_feature_name(param, value).expect("test config is valid"))
+            .map(|(param, value)| make_feature_name(param, value))
             .collect::<Vec<_>>();
 
         Translation {
