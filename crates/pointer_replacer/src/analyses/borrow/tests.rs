@@ -30,6 +30,25 @@ fn all_mutable_ctxt(program: &RustProgram) -> GBorrowInferCtxt {
     GBorrowInferCtxt::new(program, |_| |_| true, |_| |_| true)
 }
 
+fn all_mutable_facts(program: &RustProgram) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
+    program
+        .functions
+        .iter()
+        .map(|&f| {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(f)
+                .borrow();
+            let facts = body
+                .local_decls
+                .iter()
+                .map(|_| true)
+                .collect::<IndexVec<Local, _>>();
+            (f, facts)
+        })
+        .collect()
+}
+
 fn user_var_names(tcx: TyCtxt, def_id: LocalDefId, locals: &DenseBitSet<Local>) -> Vec<String> {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
     let mut names = vec![];
@@ -87,7 +106,8 @@ fn run_demote_fields(code: &str) -> Vec<String> {
 fn run_promoted_mut_fields(code: &str) -> Vec<String> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = build_rust_program(tcx);
-        let results = mutable_references_with_fields_no_guarantee(&program);
+        let mutables = all_mutable_facts(&program);
+        let results = mutable_references_no_guarantee(&program, &mutables);
         let mut fields = results
             .mutable_fields
             .iter()
@@ -105,7 +125,8 @@ fn run_promoted_mut_fields(code: &str) -> Vec<String> {
 fn run_promoted_shared_fields(code: &str) -> Vec<String> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = build_rust_program(tcx);
-        let results = mutable_references_with_fields_no_guarantee(&program);
+        let mutables = all_mutable_facts(&program);
+        let results = mutable_references_no_guarantee(&program, &mutables);
         let mut fields = results
             .shared_fields
             .iter()
