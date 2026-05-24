@@ -63,6 +63,7 @@ pub struct BorrowPromotionResults {
     pub shared_locals: FxHashMap<LocalDefId, DenseBitSet<Local>>,
     pub mutable_fields: PromotedFieldRefs,
     pub shared_fields: PromotedFieldRefs,
+    pub lifetime_flows: LifetimeFlowResults,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1204,6 +1205,7 @@ pub fn classified_references_with_fields_no_guarantee(
         shared_locals: shared_references,
         mutable_fields,
         shared_fields,
+        lifetime_flows: global_borrow_ctxt.lifetime_flows,
     }
 }
 

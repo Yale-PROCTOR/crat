@@ -836,8 +836,8 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
         "#,
         &[
-            "let mut x: *mut crate::Node =",
-            "let mut y: *mut crate::Node = std::ptr::null_mut();",
+            "let mut x: *mut crate::Node<'a> =",
+            "let mut y: *mut crate::Node<'a> = std::ptr::null_mut();",
         ],
         &["Option<&crate::Node>"],
     );
@@ -1058,8 +1058,1050 @@ pub unsafe fn get_entries(map: *mut Map) -> *mut i32 {
     return (*map).entries;
 }
 "#,
-        &["pub unsafe fn get_entries(map: &crate::Map) -> *const i32"],
-        &["Option<Box<i32>>", "Option<Box<[i32]>>"],
+        &[
+            "pub unsafe fn create_map<'a>() -> Box<crate::Map<'a>>",
+            "Box::new(crate::Map { entries: None })",
+            "pub unsafe fn get_entries<'a>(map: &crate::Map<'a>) -> *const i32",
+        ],
+        &[
+            "Option<Box<i32>>",
+            "Option<Box<[i32]>>",
+            "Box<crate::Map>",
+            "&crate::Map)",
+            "entries: std::ptr::null_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_generic_struct_field_synthetic_default_path() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Holder<T> {
+    pub p: *mut T,
+}
+
+pub unsafe fn create<T>() -> *mut Holder<T> {
+    let holder: *mut Holder<T> = malloc(std::mem::size_of::<Holder<T>>()) as *mut Holder<T>;
+    (*holder).p = std::ptr::null_mut();
+    return holder;
+}
+"#,
+        &[
+            "pub struct Holder<'a, T>",
+            "pub p: Option<&'a mut T>",
+            "pub unsafe fn create<'a, T>() -> Box<crate::Holder<'a, T>>",
+            "Box::new(crate::Holder { p: None })",
+        ],
+        &[
+            "crate::Holder<T> {",
+            "Box<crate::Holder<T>>",
+            "p: std::ptr::null_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_mutable_struct_field_to_option_ref() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut h = Holder { p: &raw mut x };
+    *h.p = 7;
+    h.p = core::ptr::null_mut();
+    if h.p.is_null() {
+        return x;
+    }
+    *h.p
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a mut i32>",
+            "Holder { p: Some(&mut x) }",
+            "h.p = None;",
+            "h.p.is_none()",
+        ],
+        &["pub p: *mut i32", "*h.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_promoted_field_struct_return_type() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+pub unsafe fn make(x: *const i32) -> Holder {
+    Holder { p: x }
+}
+"#,
+        &["pub struct Holder {", "pub p: *const i32", "-> Holder"],
+        &["Holder<'_", "Option<&'a i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_tuple_struct_field_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder(pub *mut i32);
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder(&raw mut x);
+    *h.0 = 7;
+    x
+}
+"#,
+        &[
+            "pub struct Holder(pub *mut i32)",
+            "Holder(&raw mut (x))",
+            "*h.0 = 7",
+        ],
+        &["Holder<'_", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_direct_freed_returned_pointer_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn id(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn caller(mut x: i32) {
+    free(id(&raw mut x) as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub unsafe fn id(mut p: *mut i32) -> *mut i32",
+            "free(id(&raw mut (x)) as *mut core::ffi::c_void)",
+        ],
+        &["pub unsafe fn id<'a>", "-> &'a mut i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_updates_impl_headers_for_promoted_struct_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+impl Copy for Holder {}
+
+impl Clone for Holder {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder { p: &raw const x };
+    let _ = *h.p;
+    x
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "impl<'a> Copy for Holder<'a>",
+            "impl<'a> Clone for Holder<'a>",
+            "pub p: Option<&'a i32>",
+        ],
+        &["impl Copy for Holder {", "impl Clone for Holder {"],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_promoted_field_access_inside_impl_methods() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+impl Holder {
+    pub unsafe fn read(&self) -> i32 {
+        if self.p.is_null() {
+            return 0;
+        }
+        *self.p
+    }
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder { p: &raw const x };
+    let _ = *h.p;
+    h.read()
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "impl<'a> Holder<'a>",
+            "self.p.is_none()",
+            "*(self.p.unwrap())",
+        ],
+        &["impl Holder {", "self.p.is_null()", "*self.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_promoted_field_nested_in_generic_return_type() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut h = Holder { p: &raw mut x };
+    *h.p = 7;
+    x
+}
+
+pub unsafe fn maybe_holder() -> Option<Holder> {
+    None
+}
+"#,
+        &[
+            "pub struct Holder {",
+            "pub p: *mut i32",
+            "pub unsafe fn maybe_holder() -> Option<Holder>",
+        ],
+        &["Holder<'_", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_promoted_field_raw_pointer_return_type() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+extern "C" {
+    fn make_holder() -> *mut Holder;
+}
+
+pub unsafe fn touch() {
+    let h = make_holder();
+    if !(*h).p.is_null() {
+        *(*h).p = 7;
+    }
+}
+"#,
+        &["pub struct Holder {", "pub p: *mut i32", "-> *mut Holder"],
+        &["Holder<'_", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_c_string_field_from_offset_struct_array_call() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Record {
+    pub name: *const i8,
+}
+
+pub unsafe fn consume_c_string(s: *const i8) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    *s.offset(1) as i32
+}
+
+pub unsafe fn force_field_promotion(mut x: i8) -> i32 {
+    let r = Record { name: &raw const x };
+    *r.name as i32
+}
+
+pub unsafe fn show(fields: *mut Record, i: isize) -> i32 {
+    consume_c_string((*fields.offset(i)).name)
+}
+"#,
+        &["pub struct Record {", "pub name: *const i8"],
+        &["Record<'_", "Option<&'a i8>"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_c_string_field_from_impl_method_call() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Record {
+    pub name: *const i8,
+}
+
+pub unsafe fn consume_c_string(s: *const i8) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    *s.offset(1) as i32
+}
+
+impl Record {
+    pub unsafe fn show(fields: *mut Record, i: isize) -> i32 {
+        consume_c_string((*fields.offset(i)).name)
+    }
+}
+
+pub unsafe fn force_field_promotion(mut x: i8) -> i32 {
+    let r = Record { name: &raw const x };
+    *r.name as i32
+}
+"#,
+        &[
+            "pub struct Record {",
+            "pub name: *const i8",
+            "consume_c_string(if",
+        ],
+        &["Record<'_", "Option<&'a i8>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_direct_raw_field_call_result_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn id(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn make(mut x: i32) -> Holder {
+    Holder { p: id(&raw mut x) }
+}
+"#,
+        &[
+            "pub struct Holder {",
+            "pub p: *mut i32",
+            "pub unsafe fn id<'a>(p: &'a mut i32) -> *mut i32",
+            "Holder { p: id((Some(&mut x)).unwrap()) }",
+        ],
+        &["Holder<'_", "-> &'a mut i32", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_borrows_repeated_optional_mut_arg_without_move() {
+    run_test(
+        r#"
+pub unsafe fn write(p: *mut i32) {
+    *p = 1;
+}
+
+pub unsafe fn caller(p: *mut i32) {
+    if !p.is_null() {
+        write(p);
+        write(p);
+    }
+}
+"#,
+        &[
+            "pub unsafe fn caller(mut p: Option<&mut i32>)",
+            "let p_borrowed = p.as_deref_mut().unwrap();",
+            "write(p_borrowed)",
+        ],
+        &["write((p).unwrap())"],
+    );
+}
+
+#[test]
+fn test_rewriter_reborrows_repeated_optional_mut_arg_for_optional_callee() {
+    run_test(
+        r#"
+pub unsafe fn maybe_write(p: *mut i32) {
+    if !p.is_null() {
+        *p = 1;
+    }
+}
+
+pub unsafe fn caller(p: *mut i32) {
+    if !p.is_null() {
+        maybe_write(p);
+        maybe_write(p);
+    }
+}
+"#,
+        &[
+            "pub unsafe fn maybe_write(mut p: Option<&mut i32>)",
+            "pub unsafe fn caller(mut p: Option<&mut i32>)",
+            "maybe_write((p).as_deref_mut())",
+        ],
+        &["maybe_write(p);"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_raw_cast_local_binding_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub x: i32,
+}
+
+pub unsafe fn touch(info: *mut Info) {
+    let q: *mut Info = info as *mut Info;
+    (*q).x = 1;
+}
+"#,
+        &[
+            "pub unsafe fn touch(mut info: &mut crate::Info)",
+            "let mut q: *mut crate::Info = (info) as *mut crate::Info;",
+        ],
+        &["let mut q: &mut crate::Info"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_raw_cast_local_call_arg_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub x: i32,
+}
+
+pub unsafe fn init(info: *mut Info) {
+    (*info).x = 1;
+}
+
+pub unsafe fn touch(info: *mut Info) {
+    init(info as *mut Info);
+}
+"#,
+        &[
+            "pub unsafe fn init(mut info: *mut crate::Info)",
+            "init((info) as *mut crate::Info)",
+        ],
+        &["pub unsafe fn init(mut info: &mut crate::Info)"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_raw_casted_foreign_call_input_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn strtol(s: *const core::ffi::c_char, endp: *mut *mut core::ffi::c_char, base: core::ffi::c_int) -> core::ffi::c_long;
+}
+
+pub unsafe fn parse(str: *const core::ffi::c_char) -> core::ffi::c_long {
+    let mut endp: *mut i8 = str as *mut core::ffi::c_char as *mut i8;
+    strtol(str, &raw mut endp, 10)
+}
+"#,
+        &[
+            "pub unsafe fn parse(str: *const i8)",
+            "let mut endp: *mut i8",
+            "str as *mut core::ffi::c_char as *mut i8",
+            "strtol(str, &raw mut (endp), 10)",
+        ],
+        &["str: Option<&i8>", "strtol((str)"],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_casted_optional_ref_local_binding() {
+    run_test(
+        r#"
+pub unsafe fn read(bytes: *mut u8) -> i32 {
+    let int_ptr: *mut core::ffi::c_int = bytes as *mut core::ffi::c_int;
+    if int_ptr.is_null() {
+        return 0;
+    }
+    *int_ptr
+}
+"#,
+        &[
+            "let int_ptr: Option<&i32>",
+            "as *const i32",
+            "int_ptr.is_none()",
+        ],
+        &["bytes as *mut core::ffi::c_int"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_generic_struct_field_preserves_type_args() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder<T> {
+    pub p: *mut T,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut h: Holder<i32> = Holder { p: &raw mut x };
+    *h.p = 7;
+    x
+}
+"#,
+        &[
+            "pub struct Holder<'a, T>",
+            "pub p: Option<&'a mut T>",
+            "let mut h: Holder<'_, i32> = Holder { p: Some(&mut x) };",
+        ],
+        &["Holder<i32>", "pub p: *mut T", "*h.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_struct_field_after_existing_lifetime_args() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder<'ctx, T> {
+    pub ctx: &'ctx T,
+    pub p: *mut T,
+}
+
+pub unsafe fn touch<'ctx>(ctx: &'ctx i32, mut x: i32) -> i32 {
+    let mut h: Holder<'ctx, i32> = Holder { ctx, p: &raw mut x };
+    *h.p = 7;
+    *h.ctx
+}
+"#,
+        &[
+            "pub struct Holder<'ctx, 'a, T>",
+            "pub p: Option<&'a mut T>",
+            "let mut h: Holder<'ctx, '_, i32> = Holder { ctx, p: Some(&mut x) };",
+        ],
+        &[
+            "Holder<'a, 'ctx",
+            "Holder<'_, 'ctx",
+            "Holder<'ctx, i32>",
+            "*h.p",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_self_referential_struct_field_pointee_lifetime() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub next: *mut Node,
+    pub value: i32,
+}
+
+pub unsafe fn touch() -> i32 {
+    let mut other = Node { next: std::ptr::null_mut(), value: 1 };
+    let mut node = Node { next: &raw mut other, value: 0 };
+    (*node.next).value = 2;
+    node.value
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "pub next: Option<&'a mut Node<'a>>",
+            "Node { next: None, value: 1 }",
+            "Node { next: Some(&mut other), value: 0 }",
+        ],
+        &["Option<&'a mut Node>", "*node.next"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_mutable_field_write_from_immutable_holder() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder { p: &raw mut x };
+    *h.p = 7;
+    x
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a mut i32>",
+            "let mut h = Holder { p: Some(&mut x) };",
+        ],
+        &["let h = Holder", "pub p: *mut i32", "*h.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_mutable_field_write_from_by_value_param() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn write(h: Holder) {
+    *h.p = 7;
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder { p: &raw mut x };
+    write(h);
+    x
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a mut i32>",
+            "pub unsafe fn write(mut h: Holder<'_>)",
+        ],
+        &["pub unsafe fn write(h: Holder<'_>)", "*h.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_struct_field_on_active_raw_mut_reborrow() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let h = Holder { p: &raw mut x };
+    let q = &raw mut x;
+    *q = 1;
+    *h.p = 7;
+    x
+}
+"#,
+        &["pub p: *mut i32", "Holder { p: &raw mut x }", "*h.p = 7"],
+        &["Option<&'a mut i32>", "h.p.as_deref_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_mutable_struct_field_to_field_assignment_with_rhs_reuse() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32, mut y: i32) -> i32 {
+    let mut h1 = Holder { p: &raw mut x };
+    let h2 = Holder { p: &raw mut y };
+    h1.p = h2.p;
+    *h1.p = 7;
+    *h2.p = 9;
+    x
+}
+"#,
+        &["pub p: *mut i32", "h1.p = h2.p;", "*h2.p = 9"],
+        &[
+            "Option<&'a mut i32>",
+            "h1.p.as_deref_mut",
+            "h2.p.as_deref_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_mutable_struct_field_literal_copy_with_rhs_reuse() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut y: i32) -> i32 {
+    let h2 = Holder { p: &raw mut y };
+    let h1 = Holder { p: h2.p };
+    *h1.p = 7;
+    *h2.p = 9;
+    y
+}
+"#,
+        &["pub p: *mut i32", "Holder { p: h2.p }", "*h2.p = 9"],
+        &[
+            "Option<&'a mut i32>",
+            "h1.p.as_deref_mut",
+            "h2.p.as_deref_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_mutable_rhs_field_copied_to_shared_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Source {
+    pub p: *mut i32,
+}
+
+#[repr(C)]
+pub struct View {
+    pub q: *const i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let src = Source { p: &raw mut x };
+    let view = View { q: src.p };
+    *src.p = 7;
+    *view.q
+}
+"#,
+        &["pub p: *mut i32", "View { q: src.p }", "*src.p = 7"],
+        &["pub p: Option<&'a mut i32>", "src.p.as_deref_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_nested_struct_path_in_field_pointee_type() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub nodes: *const Vec<Node>,
+}
+
+pub unsafe fn set_node(mut x: i32) -> i32 {
+    let mut node = Node { value: &raw mut x };
+    *node.value = 7;
+    x
+}
+
+pub unsafe fn hold(nodes: &Vec<Node>) -> usize {
+    let holder = Holder { nodes: std::ptr::null() };
+    if holder.nodes.is_null() {
+        return nodes.len();
+    }
+    (*holder.nodes).len()
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "pub value: Option<&'a mut i32>",
+            "pub struct Holder<'a>",
+            "pub nodes: Option<&'a Vec<Node<'a>>>",
+        ],
+        &["Vec<Node>>", "Vec<Node>"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_multiple_mutable_struct_fields_from_same_local() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub a: *mut i32,
+    pub b: *mut i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let pair = Pair { a: &raw mut x, b: &raw mut x };
+    *pair.a = 3;
+    *pair.b = 4;
+    x
+}
+"#,
+        &[
+            "pub a: *mut i32",
+            "pub b: *mut i32",
+            "Pair { a: &raw mut x, b: &raw mut x }",
+        ],
+        &["Option<&'a mut i32>", "Some(&mut x)", "as_deref_mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_mixed_mutable_shared_struct_fields_from_same_local() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub a: *mut i32,
+    pub b: *const i32,
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let pair = Pair { a: &raw mut x, b: &raw const x };
+    *pair.a = 3;
+    *pair.b
+}
+"#,
+        &[
+            "pub a: *mut i32",
+            "pub b: *const i32",
+            "Pair { a: &raw mut x, b: &raw const x }",
+        ],
+        &[
+            "Option<&'a mut i32>",
+            "Option<&'b i32>",
+            "Some(&mut x)",
+            "Some(&x)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_shared_struct_field_to_option_ref() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+pub unsafe fn read(x: i32) -> i32 {
+    let h = Holder { p: &raw const x };
+    *h.p
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a i32>",
+            "Holder { p: Some(&x) }",
+            "h.p.unwrap()",
+        ],
+        &["pub p: *const i32", "*h.p"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_multiple_struct_fields_with_distinct_lifetimes() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub a: *mut i32,
+    pub b: *const i32,
+}
+
+pub unsafe fn sum(mut x: i32, y: i32) -> i32 {
+    let mut pair = Pair { a: &raw mut x, b: &raw const y };
+    *pair.a = 3;
+    *pair.a + *pair.b
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "pub a: Option<&'a mut i32>",
+            "pub b: Option<&'b i32>",
+            "Pair { a: Some(&mut x), b: Some(&y) }",
+        ],
+        &["pub a: *mut i32", "pub b: *const i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_demoted_struct_field_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn conflict() -> i32 {
+    let mut x = 0;
+    let mut h = Holder { p: &raw mut x };
+    x = 1;
+    *h.p = 2;
+    x
+}
+"#,
+        &["pub p: *mut i32", "*h.p = 2"],
+        &["pub struct Holder<'a>", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_identity_return_with_named_lifetime() {
+    run_test(
+        r#"
+pub unsafe fn id(x: *mut i32) -> *mut i32 {
+    return x;
+}
+"#,
+        &[
+            "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32",
+            "return x;",
+        ],
+        &["-> *mut i32", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_interprocedural_return_lifetime() {
+    run_test(
+        r#"
+pub unsafe fn id(x: *mut i32) -> *mut i32 {
+    x
+}
+
+pub unsafe fn wrap(y: *mut i32) -> *mut i32 {
+    id(y)
+}
+"#,
+        &[
+            "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32",
+            "pub unsafe fn wrap<'a>(y: &'a mut i32) -> &'a mut i32",
+            "id(y)",
+        ],
+        &["-> *mut i32", "id((y) as *mut"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_nullable_returned_borrow_lifetime() {
+    run_test(
+        r#"
+pub unsafe fn maybe(flag: bool, x: *mut i32) -> *mut i32 {
+    if flag { x } else { core::ptr::null_mut() }
+}
+"#,
+        &[
+            "pub unsafe fn maybe<'a>(flag: bool, mut x: Option<&'a mut i32>)",
+            "-> Option<&'a mut i32>",
+            "if flag { x } else { None }",
+            "None",
+        ],
+        &["-> &'a mut i32", "panic!()"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_nullable_returned_borrow_through_local() {
+    run_test(
+        r#"
+pub unsafe fn maybe_local(flag: bool, x: *mut i32) -> *mut i32 {
+    let r = if flag { x } else { core::ptr::null_mut() };
+    r
+}
+"#,
+        &[
+            "pub unsafe fn maybe_local<'a>(flag: bool, mut x: Option<&'a mut i32>)",
+            "-> Option<&'a mut i32>",
+            "let mut r: Option<&mut i32> = if flag { x } else { None }",
+            "r",
+        ],
+        &["-> &'a mut i32", "panic!()"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_nullable_returned_borrow_null_literal() {
+    run_test(
+        r#"
+pub unsafe fn maybe_zero(flag: bool, x: *mut i32) -> *mut i32 {
+    if flag { x } else { 0 as *mut i32 }
+}
+"#,
+        &[
+            "pub unsafe fn maybe_zero<'a>(flag: bool, mut x: Option<&'a mut i32>)",
+            "-> Option<&'a mut i32>",
+            "if flag { x } else { None }",
+        ],
+        &["-> &'a mut i32", "panic!()"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_nullable_returned_input_without_null_return() {
+    run_test(
+        r#"
+pub unsafe fn pick(x: *mut i32, y: *mut i32) -> *mut i32 {
+    *y = 1;
+    if x.is_null() { y } else { x }
+}
+"#,
+        &[
+            "mut x: Option<&'a mut i32>",
+            "y: &'a mut i32",
+            "-> &'a mut i32",
+            "if x.is_none()",
+        ],
+        &["x: &'a mut i32", "if false"],
+    );
+}
+
+#[test]
+fn test_rewriter_generated_lifetime_names_skip_existing_params() {
+    run_test(
+        r#"
+pub unsafe fn pick_existing<'a>(x: &'a i32, y: *const i32) -> *const i32 {
+    y
+}
+"#,
+        &["pub unsafe fn pick_existing<'a, 'b>(x: &'a i32, y: &'b i32) -> &'b i32"],
+        &["-> *const i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_fn_pointer_signature_raw_with_return_relation() {
+    run_test(
+        r#"
+pub unsafe fn id(x: *mut i32) -> *mut i32 {
+    x
+}
+
+pub unsafe fn caller(mut x: i32) -> i32 {
+    let f: unsafe fn(*mut i32) -> *mut i32 = id;
+    let p = f(&mut x);
+    *p
+}
+"#,
+        &[
+            "let f: unsafe fn(*mut i32) -> *mut i32 = id",
+            "pub unsafe fn id(x: *mut i32) -> *mut i32",
+        ],
+        &["pub unsafe fn id<'a>"],
     );
 }
 
@@ -3263,7 +4305,7 @@ pub unsafe fn complexmode(
         &[
             "let mut log_msg___v: *mut i8",
             "let mut log_message: *mut i8",
-            "log_message)).unwrap() = rv___t.1",
+            "Some(&mut log_message).unwrap() = rv___t.1",
         ],
         &["let mut log_msg___v: *const i8", "let mut log_message: &"],
     );
