@@ -25,6 +25,7 @@ use crate::{
             AnalysisKind as OwnershipAnalysisKind, CrateCtxt, solidify::SolidifiedOwnershipSchemes,
             whole_program::WholeProgramAnalysis,
         },
+        struct_copy::StructCopyAnalysisResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -50,6 +51,7 @@ pub struct Analysis {
     ownership_schemes: Option<SolidifiedOwnershipSchemes>,
     offset_sign_result: OffsetSignResult,
     nullity_result: analyses::nullity::NullityResult,
+    struct_copy_result: StructCopyAnalysisResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -94,6 +96,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
     let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+    let struct_copy_result =
+        analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
     let promoted_mut_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
     let promoted_shared_ref_result = source_var_groups
@@ -117,6 +121,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         ownership_schemes,
         offset_sign_result,
         nullity_result,
+        struct_copy_result,
     };
 
     let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);

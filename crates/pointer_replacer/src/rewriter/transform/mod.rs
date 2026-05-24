@@ -16,6 +16,7 @@ use rustc_hir::{
 };
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
+use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
@@ -88,6 +89,13 @@ impl LocalRawParamSummary {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
+    fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+        if self.should_remove_generated_copy_clone_impl(&item) {
+            return smallvec![];
+        }
+        mut_visit::walk_flat_map_item(self, item)
+    }
+
     fn visit_item(&mut self, item: &mut Item) {
         let node_id = item.id;
         let mut fn_output_transform: Option<(LocalDefId, PtrKind)> = None;
@@ -1090,6 +1098,32 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .structs
             .get(&field.struct_did)
             .and_then(|plan| plan.field_lifetimes.get(&field.field_index).copied())
+    }
+
+    fn should_remove_generated_copy_clone_impl(&self, item: &Item) -> bool {
+        if !utils::ast::is_automatically_derived(&item.attrs) {
+            return false;
+        }
+        let ItemKind::Impl(box impl_item) = &item.kind else {
+            return false;
+        };
+        let Some(of_trait) = &impl_item.of_trait else {
+            return false;
+        };
+        if !of_trait
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| matches!(seg.ident.name.as_str(), "Copy" | "Clone"))
+        {
+            return false;
+        }
+        let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
+            return false;
+        };
+        self.analysis
+            .struct_copy_result
+            .should_remove_generated_impl(struct_did)
     }
 
     fn struct_has_field_promotion_candidate(&self, struct_did: LocalDefId) -> bool {
@@ -2254,6 +2288,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
 
         let def_id = hir_ptr.hir_id.owner.def_id;
+        if let PtrCtx::Rhs(PtrKind::OptRef(m)) = ctx
+            && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
+            && let Some(PtrKind::OptRef(source_m)) = self.promoted_field_kind(field)
+        {
+            *ptr = self.opt_ref_from_opt_ref(e, m, source_m, lhs_inner_ty, rhs_inner_ty, def_id);
+            return PtrKind::OptRef(m);
+        }
 
         if pe.addr_of {
             let addr_source_mut = addr_of_mutability(e).unwrap_or(false);
@@ -2840,6 +2881,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     assert!(pe.projs.is_empty());
                     *ptr = self.ref_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
                     return PtrKind::Ref(m);
+                }
+                (PtrCtx::Deref(false), PtrKind::OptRef(false)) if !need_cast => {
+                    assert!(pe.projs.is_empty());
+                    return PtrKind::OptRef(false);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
                     assert!(pe.projs.is_empty());
@@ -10041,6 +10086,7 @@ fn collect_demoted_promoted_fields(
         tcx,
         &promoted_fields,
         &analysis.borrow_promotion_result.mutable_fields,
+        &analysis.struct_copy_result,
         sig_decs,
         ptr_kinds,
     );
@@ -10539,6 +10585,7 @@ fn collect_struct_shape_demoted_fields(
     tcx: TyCtxt<'_>,
     promoted_fields: &FxHashSet<StructFieldSlot>,
     mutable_fields: &FxHashSet<StructFieldSlot>,
+    struct_copy_result: &crate::analyses::struct_copy::StructCopyAnalysisResult,
     sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> FxHashSet<StructFieldSlot> {
@@ -10546,7 +10593,8 @@ fn collect_struct_shape_demoted_fields(
 
     for &field in promoted_fields {
         if !struct_has_named_fields(tcx, field.struct_did)
-            || (mutable_fields.contains(&field) && struct_has_copy_impl(tcx, field.struct_did))
+            || (mutable_fields.contains(&field)
+                && struct_copy_result.must_preserve_copy(field.struct_did))
         {
             demoted.insert(field);
         }
@@ -10603,6 +10651,7 @@ fn emit_promotion_diagnostics(
         tcx,
         &promoted_fields,
         &analysis.borrow_promotion_result.mutable_fields,
+        &analysis.struct_copy_result,
         sig_decs,
         ptr_kinds,
     );
@@ -10829,35 +10878,6 @@ fn struct_has_named_fields(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
         return false;
     };
     matches!(variant_data, hir::VariantData::Struct { .. })
-}
-
-fn struct_has_copy_impl(tcx: TyCtxt<'_>, struct_did: LocalDefId) -> bool {
-    tcx.hir_crate(()).owners.iter().any(|owner| {
-        let Some(owner) = owner.as_owner() else {
-            return false;
-        };
-        let hir::OwnerNode::Item(item) = owner.node() else {
-            return false;
-        };
-        let hir::ItemKind::Impl(impl_) = item.kind else {
-            return false;
-        };
-        let Some(of_trait) = impl_.of_trait else {
-            return false;
-        };
-        if !of_trait
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident.name.as_str() == "Copy")
-        {
-            return false;
-        }
-        let hir::TyKind::Path(qpath) = impl_.self_ty.kind else {
-            return false;
-        };
-        hir_local_struct_did_from_qpath(&qpath) == Some(struct_did)
-    })
 }
 
 fn collect_promoted_fields_in_by_value_ty(
@@ -11415,6 +11435,8 @@ mod tests {
         let borrow_promotion_result =
             analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
         let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+        let struct_copy_result =
+            analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
         let promoted_mut_ref_result = source_var_groups
             .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
         let promoted_shared_ref_result = source_var_groups
@@ -11438,6 +11460,7 @@ mod tests {
             ownership_schemes,
             offset_sign_result,
             nullity_result,
+            struct_copy_result,
         };
 
         (input, analysis)
