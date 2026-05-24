@@ -1470,7 +1470,7 @@ pub unsafe fn caller(p: *mut i32) {
 }
 
 #[test]
-fn test_rewriter_keeps_raw_cast_local_binding_raw() {
+fn test_rewriter_rewrites_noop_cast_local_binding_to_ref() {
     run_test(
         r#"
 #[repr(C)]
@@ -1485,14 +1485,14 @@ pub unsafe fn touch(info: *mut Info) {
 "#,
         &[
             "pub unsafe fn touch(mut info: &mut crate::Info)",
-            "let mut q: *mut crate::Info = (info) as *mut crate::Info;",
+            "let mut q: &mut crate::Info = (Some(&mut *(info))).unwrap();",
         ],
-        &["let mut q: &mut crate::Info"],
+        &["let mut q: *mut crate::Info"],
     );
 }
 
 #[test]
-fn test_rewriter_keeps_raw_cast_local_call_arg_raw() {
+fn test_rewriter_rewrites_noop_cast_local_call_arg_to_ref() {
     run_test(
         r#"
 #[repr(C)]
@@ -1509,10 +1509,37 @@ pub unsafe fn touch(info: *mut Info) {
 }
 "#,
         &[
-            "pub unsafe fn init(mut info: *mut crate::Info)",
-            "init((info) as *mut crate::Info)",
+            "pub unsafe fn init(mut info: &mut crate::Info)",
+            "init((Some(&mut *(info))).unwrap());",
         ],
-        &["pub unsafe fn init(mut info: &mut crate::Info)"],
+        &["pub unsafe fn init(mut info: *mut crate::Info)"],
+    );
+}
+
+#[test]
+fn test_rewriter_does_not_demote_ref_callee_for_noop_cast_call() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub h: [u32; 8],
+    pub flag: i32,
+}
+
+pub unsafe fn init(state: *mut State) {
+    (*state).h[0] = 1;
+    (*state).flag = 0;
+}
+
+pub unsafe fn caller(ctx: *mut State) {
+    init(ctx as *mut State);
+}
+"#,
+        &[
+            "pub unsafe fn init(mut state: &mut crate::State)",
+            "init((Some(&mut *(ctx))).unwrap());",
+        ],
+        &["pub unsafe fn init(mut state: *mut crate::State)"],
     );
 }
 
@@ -5053,6 +5080,74 @@ pub unsafe extern "C" fn foo() {
 "#,
         &["bytemuck::cast_slice_mut", "slice::from_mut", "as usize..]"],
         &["*mut", "as *mut"],
+    );
+}
+
+#[test]
+fn test_param_byte_cast_offset_rewrites_to_slice_bytemuck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub leaf_addr: [u32; 8],
+}
+
+pub unsafe extern "C" fn set_type(addr: *mut u32, offset: i32, value: u32) {
+    *(addr as *mut u8).offset(offset as isize) = value as u8;
+}
+
+pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
+    let leaf_addr: *mut u32 = (*info).leaf_addr.as_mut_ptr();
+    set_type(leaf_addr as *mut u32, offset, value);
+}
+"#,
+        &[
+            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
+            "bytemuck::cast_slice_mut::<_,",
+            "u8>(&mut (addr))",
+            "set_type((leaf_addr).as_slice_mut(), offset, value);",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
+            "*(addr as *mut u8).offset",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_local_noop_cast_call_does_not_demote_slice_callee() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub leaf_addr: [u32; 8],
+}
+
+extern "C" {
+    fn consume(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe extern "C" fn set_type(addr: *mut u32, offset: i32, value: u32) {
+    *(addr as *mut u8).offset(offset as isize) = value as u8;
+}
+
+pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, value: u32) {
+    let info: *mut Info = v_info as *mut Info;
+    consume(info as *mut core::ffi::c_void);
+    let leaf_addr: *mut u32 = (*info).leaf_addr.as_mut_ptr();
+    set_type(leaf_addr as *mut u32, offset, value);
+}
+"#,
+        &[
+            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
+            "bytemuck::cast_slice_mut::<_,",
+            "u8>(&mut (addr))",
+            "set_type(if (leaf_addr).is_null()",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
+            "*(addr as *mut u8).offset",
+        ],
     );
 }
 
