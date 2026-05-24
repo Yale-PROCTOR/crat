@@ -167,7 +167,7 @@ pub unsafe fn foo() -> *mut i32 {
 }
 
 #[test]
-fn test_rewriter_keeps_field_stored_malloc_raw() {
+fn test_rewriter_rewrites_owned_scalar_struct_field_to_opt_box() {
     run_test(
         r#"
 extern "C" {
@@ -186,10 +186,185 @@ pub unsafe fn stash(owner: *mut Holder) {
 }
 "#,
         &[
-            "malloc(std::mem::size_of::<i32>())",
-            "(*owner).data = data;",
+            "pub data: Option<Box<i32>>",
+            "Box::from_raw((data) as *mut i32)",
         ],
-        &["Option<Box<i32>>", "Some(Box::new("],
+        &["pub data: *mut i32", "(*owner).data = data;"],
+    );
+}
+
+#[test]
+fn test_rewriter_drops_selected_owned_scalar_struct_field_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    let data: *mut i32 = malloc(std::mem::size_of::<i32>());
+    (*owner).data = data;
+}
+
+pub unsafe fn release(owner: *mut Holder) {
+    free((*owner).data as *mut core::ffi::c_void);
+}
+"#,
+        &["pub data: Option<Box<i32>>", "drop(((*owner).data).take())"],
+        &["free((*owner).data as *mut core::ffi::c_void);"],
+    );
+}
+
+#[test]
+fn test_rewriter_drops_nested_owned_scalar_struct_field_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Holder,
+}
+
+pub unsafe fn stash(owner: *mut Outer) {
+    (*owner).inner.data = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn release(owner: *mut Outer) {
+    free((*owner).inner.data as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub data: Option<Box<i32>>",
+            "drop(((*owner).inner.data).take())",
+        ],
+        &["drop(((*owner).data).take())"],
+    );
+}
+
+#[test]
+fn test_rewriter_marks_local_owned_scalar_struct_field_free_mutable() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).data = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn release_local() {
+    let h = Holder { data: malloc(std::mem::size_of::<i32>()) };
+    free(h.data as *mut core::ffi::c_void);
+}
+"#,
+        &["let mut h = Holder", "drop((h.data).take())"],
+        &[
+            "let h = crate::Holder",
+            "free(h.data as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_unsupported_owned_scalar_struct_field_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).data = malloc(2 * std::mem::size_of::<i32>());
+}
+"#,
+        &[
+            "pub data: *mut i32",
+            "malloc(2 * std::mem::size_of::<i32>())",
+        ],
+        &["pub data: Option<&", "pub data: Option<Box<i32>>"],
+    );
+}
+
+#[test]
+fn test_rewriter_removes_generated_copy_clone_for_owned_scalar_struct_field() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).data = malloc(std::mem::size_of::<i32>());
+}
+"#,
+        &["pub data: Option<Box<i32>>"],
+        &["impl Copy for", "impl Clone for"],
+    );
+}
+
+#[test]
+fn test_rewriter_visits_impl_for_owned_scalar_struct_field() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    let data: *mut i32 = malloc(std::mem::size_of::<i32>());
+    (*owner).data = data;
+}
+
+impl Holder {
+    pub unsafe fn init(&mut self) {
+        self.data = malloc(std::mem::size_of::<i32>());
+    }
+}
+"#,
+        &[
+            "pub data: Option<Box<i32>>",
+            "Box::from_raw((data) as *mut i32)",
+            "self.data = Some(Box::new(<i32 as Default>::default()));",
+        ],
+        &["pub data: *mut i32", "self.data = malloc"],
     );
 }
 
