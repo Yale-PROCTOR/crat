@@ -1450,10 +1450,84 @@ pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
 "#,
         &[
             "pub struct Holder<'a>",
-            "pub p: Option<&'a mut i32>",
-            "std::slice::from_raw_parts_mut",
+            "pub p: &'a mut [i32]",
+            "as usize..",
         ],
-        &["pub p: *mut i32", "*h.p.offset(1) = 9;"],
+        &[
+            "pub p: Option<&'a mut i32>",
+            "pub p: *mut i32",
+            "*h.p.offset(1) = 9;",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_array_like_struct_field_to_slice() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
+    let h = Holder { p: buf.as_mut_ptr() };
+    *h.p.offset(1) = 9;
+    buf[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "as usize.."],
+        &[
+            "pub p: Option<&'a mut i32>",
+            "pub p: *mut i32",
+            "*h.p.offset",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_negative_offset_struct_field_to_slice_cursor() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+pub unsafe fn touch(buf: [i32; 4]) -> i32 {
+    let h = Holder { p: buf.as_ptr().offset(3) };
+    *h.p.offset(-1)
+}
+"#,
+        &[
+            "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
+            "crate::slice_cursor::SliceCursor::",
+            ".seek((-1) as isize)",
+        ],
+        &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
+    );
+}
+
+#[test]
+fn test_rewriter_reads_mutable_cursor_field_through_shared_struct_ref() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub words: *mut u32,
+    pub word_index: i32,
+}
+
+pub unsafe fn load_word(s: *const State) -> u32 {
+    *(*s).words.offset((*s).word_index as isize)
+}
+"#,
+        &[
+            "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
+            ".as_slice()",
+            ".seek(((*s).word_index as isize) as isize)",
+        ],
+        &["let mut _c = ((*s).words);", "*(*s).words.offset"],
     );
 }
 
@@ -1473,14 +1547,10 @@ pub unsafe fn load_word(s: *const State) -> u32 {
 "#,
         &[
             "pub struct State<'a>",
-            "pub words: Option<&'a u32>",
-            ".offset((*s).word_index as isize)).as_ref()",
-            ".unwrap()",
+            "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
+            ".seek(((*s).word_index as isize) as isize)",
         ],
-        &[
-            "return *(((*s).words).as_deref().map_or",
-            "*(*s).words.offset",
-        ],
+        &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
 }
 
@@ -1502,10 +1572,39 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
 "#,
         &[
             "pub struct State<'a>",
-            "pub words: Option<&'a u32>",
-            "std::ptr::null::<u32>()",
+            "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
+            "crate::slice_cursor::SliceCursor::from_raw_parts",
+            ".seek((-(((*s).count / 8) as isize)) as isize)",
         ],
-        &["std::ptr::null::<i8>(), |_x| _x"],
+        &[
+            "pub words: Option<&'a u32>",
+            "std::ptr::null::<i8>(), |_x| _x",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_casted_mutable_cursor_field_from_shared_struct_ref() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub words: *mut u32,
+    pub word_index: i32,
+    pub count: i32,
+}
+
+pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
+    return (((*s).words.offset((*s).word_index as isize)) as *mut i8)
+        .offset(-(((*s).count / 8) as isize)) as *const i8;
+}
+"#,
+        &[
+            "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
+            ".as_slice()",
+            ".seek((-(((*s).count / 8) as isize)) as isize)",
+        ],
+        &["}).as_mut_ptr()", "*(*s).words.offset"],
     );
 }
 
@@ -1592,10 +1691,11 @@ pub unsafe fn touch(buf: [i8; 2]) -> i32 {
 "#,
         &[
             "pub struct Holder<'a>",
-            "pub p: Option<&'a i8>",
-            "read_second(&(std::slice::from_raw_parts",
+            "pub unsafe fn read_second(p: &[i8])",
+            "pub p: &'a [i8]",
+            "read_second(h.p)",
         ],
-        &["pub p: *const i8"],
+        &["pub p: Option<&'a i8>", "pub p: *const i8"],
     );
 }
 
@@ -1621,10 +1721,14 @@ pub unsafe fn prog_fetch(p: *mut Program, out: *mut i32) {
 "#,
         &[
             "pub struct Program<'a>",
+            "pub code: &'a [i32]",
+            "code: &'a [i32]",
+            "(*p).code = (code);",
+        ],
+        &[
             "pub code: Option<&'a i32>",
             "(*p).code = (code).as_ptr().as_ref();",
         ],
-        &["(*p).code = (code).first();"],
     );
 }
 
@@ -2037,10 +2141,11 @@ pub unsafe fn show(fields: *mut Record, i: isize) -> i32 {
 "#,
         &[
             "pub struct Record<'a>",
-            "pub name: Option<&'a i8>",
-            "consume_c_string(&(std::slice::from_raw_parts",
+            "pub name: &'a [i8]",
+            "pub unsafe fn consume_c_string(s: &[i8])",
+            "consume_c_string(((fields)[(i) as isize]).name)",
         ],
-        &["pub name: *const i8"],
+        &["pub name: Option<&'a i8>", "pub name: *const i8"],
     );
 }
 
@@ -6340,8 +6445,11 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
     return foo(q, 1 as libc::c_int);
 }
 "#,
-        &[".as_deref()"],
-        &["SliceCursor::new((", ").as_slice())"],
+        &[
+            "SliceCursor::new((p).as_slice())",
+            ".seek((4 as isize) as isize)",
+        ],
+        &["}).as_deref()"],
     );
 }
 
