@@ -104,7 +104,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
                     return;
                 };
-                if !self.struct_has_field_promotion_candidate(struct_did) {
+                if !self.struct_has_field_rewrite_candidate(struct_did) {
                     return;
                 }
                 let lifetimes = self.ordered_struct_lifetimes(struct_did);
@@ -418,7 +418,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _ident, _) = let_stmt.pat.kind
-            && self.local_binding_needs_mut_for_promoted_field_write(hir_id)
+            && (self.local_binding_needs_mut_for_promoted_field_write(hir_id)
+                || self.local_binding_needs_mut_for_owned_field_free(hir_id))
             && let PatKind::Ident(binding_mode, ..) = &mut local.pat.kind
         {
             binding_mode.1 = Mutability::Mut;
@@ -516,7 +517,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     panic!("{hir_expr:?}")
                 };
                 if let Some(field) = self.promoted_field_slot_for_hir_field(hir_lhs)
-                    && let Some(kind) = self.promoted_field_kind(field)
+                    && let Some(kind) = self.field_ptr_kind(field)
                 {
                     let target_inner_ty =
                         unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_lhs)).map(|(inner, _)| inner);
@@ -672,6 +673,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
 
+                if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
+                    *expr = free_rewrite;
+                    return;
+                }
+
                 for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
                     let ty = typeck.expr_ty_adjusted(harg);
                     let param_kind = sig_dec
@@ -692,7 +698,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             == Some(PtrKind::OptRef(true))
                             || self
                                 .promoted_field_slot_for_hir_field(harg)
-                                .and_then(|field| self.promoted_field_kind(field))
+                                .and_then(|field| self.field_ptr_kind(field))
                                 == Some(PtrKind::OptRef(true)))
                     {
                         *arg = P(utils::expr!(
@@ -700,11 +706,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             pprust::expr_to_string(arg)
                         ));
                     }
-                }
-
-                if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
-                    *expr = free_rewrite;
-                    return;
                 }
 
                 hoist_opt_ref_borrow(expr);
@@ -831,7 +832,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 if let Some(m) = m {
                     if let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
-                        && let Some(kind) = self.promoted_field_kind(field)
+                        && let Some(kind) = self.field_ptr_kind(field)
                     {
                         let field_str = pprust::expr_to_string(e);
                         *expr = match kind {
@@ -842,6 +843,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 utils::expr!("*({field_str}).as_deref().unwrap()")
                             }
                             PtrKind::OptRef(false) => utils::expr!("*({field_str}.unwrap())"),
+                            PtrKind::OptBox if m => {
+                                utils::expr!("*({field_str}).as_deref_mut().unwrap()")
+                            }
+                            PtrKind::OptBox => {
+                                utils::expr!("*({field_str}).as_deref().unwrap()")
+                            }
                             _ => unreachable!(),
                         };
                         return;
@@ -969,6 +976,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
                 changed = true;
             }
+            let owned_field_free_bindings = collect_owned_field_free_owner_bindings(
+                rust_program.tcx,
+                analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &free_like_wrappers,
+            );
+            for hir_id in owned_field_free_bindings {
+                if force_signature_input_mut_for_binding(rust_program.tcx, &mut sig_decs, hir_id) {
+                    changed = true;
+                }
+            }
             let raw_call_result_bindings =
                 collect_raw_call_result_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
@@ -1026,7 +1045,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &demoted_fields,
         );
         let (demoted_field_source_bindings, raw_field_source_callees) =
-            collect_raw_field_source_bindings(rust_program.tcx, analysis, &demoted_fields);
+            collect_raw_field_source_bindings(
+                rust_program.tcx,
+                analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &demoted_fields,
+            );
         let mut sig_changed = false;
         for hir_id in &demoted_field_source_bindings {
             sig_changed |=
@@ -1040,6 +1065,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs);
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
+        emit_ownership_field_diagnostics(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
         let raw_bridge_bindings = collect_raw_bridge_bindings(
             rust_program.tcx,
             &ptr_kinds,
@@ -1064,6 +1090,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
+    }
+
+    fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
+            self.ownership_field_kind(field)
+        } else {
+            self.promoted_field_kind(field)
+        }
+    }
+
+    fn ownership_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        ownership_field_ptr_kind(
+            self.tcx,
+            self.analysis,
+            &self.sig_decs,
+            &self.ptr_kinds,
+            field,
+        )
     }
 
     fn promoted_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
@@ -1136,15 +1180,31 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         self.analysis
             .struct_copy_result
             .should_remove_generated_impl(struct_did)
+            || self.struct_has_owning_box_field_candidate(struct_did)
     }
 
-    fn struct_has_field_promotion_candidate(&self, struct_did: LocalDefId) -> bool {
+    fn struct_has_field_rewrite_candidate(&self, struct_did: LocalDefId) -> bool {
         self.analysis
             .borrow_promotion_result
             .mutable_fields
             .iter()
             .chain(self.analysis.borrow_promotion_result.shared_fields.iter())
             .any(|field| field.struct_did == struct_did)
+            || self.struct_has_owning_box_field_candidate(struct_did)
+    }
+
+    fn struct_has_owning_box_field_candidate(&self, struct_did: LocalDefId) -> bool {
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .any(|(field_index, _)| {
+                self.ownership_field_kind(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                }) == Some(PtrKind::OptBox)
+            })
     }
 
     fn ordered_struct_lifetimes(&self, struct_did: LocalDefId) -> Vec<Symbol> {
@@ -1173,33 +1233,36 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         fields: &mut ThinVec<FieldDef>,
     ) {
         let lifetimes = self.ordered_struct_lifetimes(struct_did);
-        if lifetimes.is_empty() {
-            return;
+        if !lifetimes.is_empty() {
+            super::lifetimes::ensure_lifetime_params(generics, &lifetimes);
         }
-        super::lifetimes::ensure_lifetime_params(generics, &lifetimes);
 
         for (field_index, field_def) in fields.iter_mut().enumerate() {
             let field = StructFieldSlot {
                 struct_did,
                 field_index,
             };
-            let Some(kind) = self.promoted_field_kind(field) else {
-                continue;
-            };
-            let Some(lifetime) = self.field_lifetime(field) else {
+            let Some(kind) = self.field_ptr_kind(field) else {
                 continue;
             };
             let TyKind::Ptr(mut_ty) = &field_def.ty.kind else {
                 continue;
             };
-            let PtrKind::OptRef(mutability) = kind else {
-                continue;
-            };
-            field_def.ty = P(mk_opt_ref_ast_ty_with_lifetime(
-                self.ast_ty_string_with_promoted_lifetimes(&mut_ty.ty),
-                mutability,
-                lifetime,
-            ));
+            let inner_ty = self.ast_ty_string_with_promoted_lifetimes(&mut_ty.ty);
+            match kind {
+                PtrKind::OptRef(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_opt_ref_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                }
+                PtrKind::OptBox => {
+                    field_def.ty = P(utils::ty!("Option<Box<{inner_ty}>>"));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1368,7 +1431,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             struct_did,
             field_index,
         };
-        self.promoted_field_kind(field).map(|_| field)
+        self.field_ptr_kind(field).map(|_| field)
     }
 
     fn promoted_field_slot_for_ast_field(&self, ast_id: NodeId) -> Option<StructFieldSlot> {
@@ -1385,7 +1448,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             struct_did,
             field_index,
         };
-        self.promoted_field_kind(field).map(|_| field)
+        self.field_ptr_kind(field).map(|_| field)
     }
 
     fn rewrite_struct_literal_fields(&self, expr_id: NodeId, se: &mut StructExpr) {
@@ -1399,7 +1462,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             let Some(field) = self.promoted_field_slot_for_ast_field(ast_field.id) else {
                 continue;
             };
-            let Some(kind) = self.promoted_field_kind(field) else {
+            let Some(kind) = self.field_ptr_kind(field) else {
                 continue;
             };
             let Some(hir_field) = hir_fields
@@ -1823,6 +1886,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         hir_expr: &'tcx hir::Expr<'tcx>,
         args: &[P<Expr>],
     ) -> Option<Expr> {
+        if let Some(field_free) = self.rewrite_owned_field_free_call(hir_expr, args) {
+            return Some(field_free);
+        }
         let (hir_id, _harg) =
             hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)?;
         if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
@@ -1861,6 +1927,32 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 len_expr,
             ),
         })
+    }
+
+    fn rewrite_owned_field_free_call(
+        &self,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        args: &[P<Expr>],
+    ) -> Option<Expr> {
+        if !hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
+            && !hir_called_local_fn(self.tcx, hir_expr)
+                .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id))
+        {
+            return None;
+        }
+        let hir::ExprKind::Call(_, hir_args) = hir_expr.kind else {
+            return None;
+        };
+        let [hir_arg] = hir_args else { return None };
+        let [arg] = args else { return None };
+        let hir_field = hir_unwrap_casts(hir_arg);
+        let field = hir_struct_field_slot(self.tcx, hir_field)?;
+        if !matches!(self.field_ptr_kind(field), Some(PtrKind::OptBox)) {
+            return None;
+        }
+        let _ = arg;
+        let field_expr = hir_field_access_expr_string(self.tcx, hir_field)?;
+        Some(utils::expr!("drop(({}).take())", field_expr))
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -2123,8 +2215,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     && let Some(field) =
                         self.transform.promoted_field_slot_for_hir_field(field_expr)
                     && matches!(
-                        self.transform.promoted_field_kind(field),
-                        Some(PtrKind::OptRef(true))
+                        self.transform.field_ptr_kind(field),
+                        Some(PtrKind::OptRef(true) | PtrKind::OptBox)
                     )
                 {
                     self.found = true;
@@ -2136,6 +2228,49 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         let body = self.tcx.hir_body_owned_by(target_hir_id.owner.def_id);
         let mut visitor = PromotedFieldWriteVisitor {
+            transform: self,
+            target_hir_id,
+            found: false,
+        };
+        visitor.visit_body(body);
+        visitor.found
+    }
+
+    fn local_binding_needs_mut_for_owned_field_free(&self, target_hir_id: HirId) -> bool {
+        struct OwnedFieldFreeVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            target_hir_id: HirId,
+            found: bool,
+        }
+
+        impl<'tcx> Visitor<'tcx> for OwnedFieldFreeVisitor<'_, '_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if self.found {
+                    return;
+                }
+                let is_direct_free =
+                    hir_call_matches_foreign_name(self.transform.tcx, expr, "free");
+                let is_wrapper_free = hir_called_local_fn(self.transform.tcx, expr)
+                    .is_some_and(|def_id| self.transform.free_like_wrappers.contains(&def_id));
+                if (is_direct_free || is_wrapper_free)
+                    && let hir::ExprKind::Call(_, args) = expr.kind
+                    && let [arg] = args
+                {
+                    let field_expr = hir_unwrap_casts(arg);
+                    if let Some(field) = hir_struct_field_slot(self.transform.tcx, field_expr)
+                        && self.transform.field_ptr_kind(field) == Some(PtrKind::OptBox)
+                        && hir_projection_root_local_id(field_expr) == Some(self.target_hir_id)
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+        let mut visitor = OwnedFieldFreeVisitor {
             transform: self,
             target_hir_id,
             found: false,
@@ -2281,13 +2416,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
         if let PtrCtx::Rhs(kind @ PtrKind::OptRef(_)) = ctx
             && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
-            && self.promoted_field_kind(field) == Some(kind)
+            && self.field_ptr_kind(field) == Some(kind)
         {
             return kind;
         }
         if let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
             && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
-            && matches!(self.promoted_field_kind(field), Some(PtrKind::OptRef(_)))
+            && matches!(self.field_ptr_kind(field), Some(PtrKind::OptRef(_)))
             && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
         {
             *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty);
@@ -2429,7 +2564,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let def_id = hir_ptr.hir_id.owner.def_id;
         if let PtrCtx::Rhs(PtrKind::OptRef(m)) = ctx
             && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
-            && let Some(PtrKind::OptRef(source_m)) = self.promoted_field_kind(field)
+            && let Some(PtrKind::OptRef(source_m)) = self.field_ptr_kind(field)
         {
             *ptr = self.opt_ref_from_opt_ref(e, m, source_m, lhs_inner_ty, rhs_inner_ty, def_id);
             return PtrKind::OptRef(m);
@@ -3579,7 +3714,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return self.effective_ptr_kind(hir_id);
         }
         if let Some(field) = self.promoted_field_slot_for_hir_field(pe.hir_base) {
-            return self.promoted_field_kind(field);
+            return self.field_ptr_kind(field);
         }
         if let hir::ExprKind::Call(func, _) = pe.hir_base.kind
             && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
@@ -3635,7 +3770,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             struct_did,
                             field_index,
                         };
-                        let field_expr = if self.promoted_field_kind(field_slot).is_some() {
+                        let field_expr = if self.field_ptr_kind(field_slot).is_some() {
                             utils::expr!("None")
                         } else {
                             self.default_value_expr(field.ty(self.tcx, args))
@@ -7462,6 +7597,30 @@ fn force_signature_input_raw_for_binding(
     true
 }
 
+fn force_signature_input_mut_for_binding(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    hir_id: HirId,
+) -> bool {
+    let Some((did, idx)) = param_index_for_binding(tcx, hir_id) else {
+        return false;
+    };
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    let decision = match sig_dec.input_decs.get(idx).copied().flatten() {
+        Some(PtrKind::Ref(false)) => Some(PtrKind::Ref(true)),
+        Some(PtrKind::OptRef(false)) => Some(PtrKind::OptRef(true)),
+        Some(PtrKind::Raw(false)) => Some(PtrKind::Raw(true)),
+        _ => return false,
+    };
+    sig_dec.set_input_dec(idx, decision);
+    true
+}
+
 fn force_signature_output_raw(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
@@ -10445,6 +10604,65 @@ fn collect_unsupported_box_usage_bindings(
     bindings
 }
 
+fn collect_owned_field_free_owner_bindings(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
+) -> FxHashSet<HirId> {
+    struct OwnedFieldFreeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        analysis: &'a Analysis,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        free_like_wrappers: &'a FxHashSet<LocalDefId>,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for OwnedFieldFreeVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
+            let is_wrapper_free = hir_called_local_fn(self.tcx, expr)
+                .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id));
+            if (is_direct_free || is_wrapper_free)
+                && let hir::ExprKind::Call(_, args) = expr.kind
+                && let [arg] = args
+            {
+                let field_expr = hir_unwrap_casts(arg);
+                if let Some(field) = hir_struct_field_slot(self.tcx, field_expr)
+                    && ownership_field_ptr_kind(
+                        self.tcx,
+                        self.analysis,
+                        self.sig_decs,
+                        self.ptr_kinds,
+                        field,
+                    ) == Some(PtrKind::OptBox)
+                    && let Some(root) = hir_projection_root_local_id(field_expr)
+                {
+                    self.bindings.insert(root);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        let mut visitor = OwnedFieldFreeVisitor {
+            tcx,
+            analysis,
+            sig_decs,
+            ptr_kinds,
+            free_like_wrappers,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        bindings.extend(visitor.bindings);
+    });
+    bindings
+}
+
 fn collect_demoted_promoted_fields(
     tcx: TyCtxt<'_>,
     analysis: &Analysis,
@@ -11030,6 +11248,8 @@ fn for_each_hir_fn_body<'tcx>(
 fn collect_raw_field_source_bindings(
     tcx: TyCtxt<'_>,
     analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
     demoted_fields: &FxHashSet<StructFieldSlot>,
 ) -> (FxHashSet<HirId>, FxHashSet<LocalDefId>) {
     let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
@@ -11044,6 +11264,9 @@ fn collect_raw_field_source_bindings(
     struct DemotedFieldSourceVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        analysis: &'a Analysis,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         promoted_fields: &'a FxHashSet<StructFieldSlot>,
         demoted_fields: &'a FxHashSet<StructFieldSlot>,
         bindings: FxHashSet<HirId>,
@@ -11052,6 +11275,27 @@ fn collect_raw_field_source_bindings(
 
     impl<'tcx> DemotedFieldSourceVisitor<'_, 'tcx> {
         fn field_stays_raw(&self, field: StructFieldSlot) -> bool {
+            if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
+                return ownership_field_ptr_kind(
+                    self.tcx,
+                    self.analysis,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    field,
+                )
+                .is_none();
+            }
+            if ownership_field_ptr_kind(
+                self.tcx,
+                self.analysis,
+                self.sig_decs,
+                self.ptr_kinds,
+                field,
+            )
+            .is_some()
+            {
+                return false;
+            }
             if self.demoted_fields.contains(&field) {
                 return true;
             }
@@ -11116,6 +11360,9 @@ fn collect_raw_field_source_bindings(
         let mut visitor = DemotedFieldSourceVisitor {
             tcx,
             typeck,
+            analysis,
+            sig_decs,
+            ptr_kinds,
             promoted_fields: &promoted_fields,
             demoted_fields,
             bindings: FxHashSet::default(),
@@ -11126,6 +11373,643 @@ fn collect_raw_field_source_bindings(
         callees.extend(visitor.callees);
     });
     (bindings, callees)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum OwnershipFieldBlockReason {
+    NonRawFieldType,
+    NonScalarPointee,
+    CVoidOrFilePointee,
+    UnsupportedStructLiteralRhs,
+    UnsupportedAssignmentRhs,
+    UnsupportedCallRhs,
+    UnsupportedRawLocalSource,
+    AllocatorSizeMismatch,
+    ReallocOrBufferPattern,
+    CStringOrStrFunctionPattern,
+}
+
+impl OwnershipFieldBlockReason {
+    const ALL: [Self; 10] = [
+        Self::NonRawFieldType,
+        Self::NonScalarPointee,
+        Self::CVoidOrFilePointee,
+        Self::UnsupportedStructLiteralRhs,
+        Self::UnsupportedAssignmentRhs,
+        Self::UnsupportedCallRhs,
+        Self::UnsupportedRawLocalSource,
+        Self::AllocatorSizeMismatch,
+        Self::ReallocOrBufferPattern,
+        Self::CStringOrStrFunctionPattern,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NonRawFieldType => "non_raw_field_type",
+            Self::NonScalarPointee => "non_scalar_pointee",
+            Self::CVoidOrFilePointee => "c_void_or_file_pointee",
+            Self::UnsupportedStructLiteralRhs => "unsupported_struct_literal_rhs",
+            Self::UnsupportedAssignmentRhs => "unsupported_assignment_rhs",
+            Self::UnsupportedCallRhs => "unsupported_call_rhs",
+            Self::UnsupportedRawLocalSource => "unsupported_raw_local_source",
+            Self::AllocatorSizeMismatch => "allocator_size_mismatch",
+            Self::ReallocOrBufferPattern => "realloc_or_buffer_pattern",
+            Self::CStringOrStrFunctionPattern => "cstring_or_str_function_pattern",
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct OwnershipFieldDiagnostics {
+    total: usize,
+    selected_opt_box: usize,
+    blocked_total: usize,
+    block_reason_counts: FxHashMap<OwnershipFieldBlockReason, usize>,
+}
+
+impl OwnershipFieldDiagnostics {
+    fn record_blocked(&mut self, reasons: impl IntoIterator<Item = OwnershipFieldBlockReason>) {
+        self.blocked_total += 1;
+        let mut saw_reason = false;
+        for reason in reasons {
+            saw_reason = true;
+            *self.block_reason_counts.entry(reason).or_default() += 1;
+        }
+        if !saw_reason {
+            *self
+                .block_reason_counts
+                .entry(OwnershipFieldBlockReason::UnsupportedAssignmentRhs)
+                .or_default() += 1;
+        }
+    }
+}
+
+fn ownership_field_ptr_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    field: StructFieldSlot,
+) -> Option<PtrKind> {
+    let inner_ty = scalar_owning_raw_field_inner_ty(tcx, analysis, field)?;
+    if field_has_unsupported_opt_box_rhs(tcx, sig_decs, ptr_kinds, field, inner_ty) {
+        return None;
+    }
+    Some(PtrKind::OptBox)
+}
+
+fn scalar_owning_raw_field_inner_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    field: StructFieldSlot,
+) -> Option<ty::Ty<'tcx>> {
+    owning_struct_field_scalar_inner_ty(tcx, analysis, field)?.ok()
+}
+
+fn owning_struct_field_scalar_inner_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    field: StructFieldSlot,
+) -> Option<Result<ty::Ty<'tcx>, OwnershipFieldBlockReason>> {
+    if !struct_field_is_exactly_owning(analysis, field) {
+        return None;
+    }
+
+    let struct_ty = tcx.type_of(field.struct_did).skip_binder();
+    let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    let Some(field_ty) = adt_def
+        .all_fields()
+        .nth(field.field_index)
+        .map(|field| field.ty(tcx, args))
+    else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    let ty::TyKind::RawPtr(inner_ty, _) = field_ty.kind() else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    if inner_ty.is_c_void(tcx) || utils::file::contains_file_ty(*inner_ty, tcx) {
+        return Some(Err(OwnershipFieldBlockReason::CVoidOrFilePointee));
+    }
+    if matches!(
+        inner_ty.kind(),
+        ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..) | ty::TyKind::Slice(_) | ty::TyKind::Array(..)
+    ) {
+        return Some(Err(OwnershipFieldBlockReason::NonScalarPointee));
+    }
+    Some(Ok(*inner_ty))
+}
+
+fn struct_field_is_exactly_owning(analysis: &Analysis, field: StructFieldSlot) -> bool {
+    let Some(ownership_schemes) = analysis.ownership_schemes.as_ref() else {
+        return false;
+    };
+    let field_ownership =
+        ownership_schemes.struct_field_result(&field.struct_did.to_def_id(), field.field_index);
+    field_ownership.len() == 1
+        && field_ownership
+            .first()
+            .is_some_and(crate::analyses::ownership::Ownership::is_owning)
+}
+
+fn field_has_unsupported_opt_box_rhs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_field: StructFieldSlot,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> bool {
+    struct FieldBoxTargetVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_field: StructFieldSlot,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        found_unsupported: bool,
+    }
+
+    impl<'tcx> FieldBoxTargetVisitor<'_, 'tcx> {
+        fn rhs_supported(&self, rhs: &'tcx hir::Expr<'tcx>) -> bool {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                return true;
+            }
+            hir_unwrapped_local_id(rhs).is_some_and(|hir_id| {
+                matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                    && raw_local_has_supported_scalar_box_source(
+                        self.tcx,
+                        self.sig_decs,
+                        self.ptr_kinds,
+                        hir_id,
+                        self.lhs_inner_ty,
+                    )
+            })
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBoxTargetVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found_unsupported {
+                return;
+            }
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                if slot == self.target_field && !self.rhs_supported(field.expr) {
+                                    self.found_unsupported = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if hir_struct_field_slot(self.tcx, lhs) == Some(self.target_field)
+                        && !self.rhs_supported(rhs)
+                    {
+                        self.found_unsupported = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut found_unsupported = false;
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        if found_unsupported {
+            return;
+        }
+        let mut visitor = FieldBoxTargetVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            target_field,
+            lhs_inner_ty,
+            found_unsupported: false,
+        };
+        visitor.visit_body(body);
+        found_unsupported |= visitor.found_unsupported;
+    });
+    found_unsupported
+}
+
+fn collect_ownership_field_rhs_block_reasons<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_fields: &FxHashMap<StructFieldSlot, ty::Ty<'tcx>>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>> {
+    struct FieldBoxTargetVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_fields: &'a FxHashMap<StructFieldSlot, ty::Ty<'tcx>>,
+        reasons: FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>>,
+    }
+
+    impl<'tcx> FieldBoxTargetVisitor<'_, 'tcx> {
+        fn record_rhs(
+            &mut self,
+            field: StructFieldSlot,
+            rhs: &'tcx hir::Expr<'tcx>,
+            fallback: OwnershipFieldBlockReason,
+        ) {
+            let Some(lhs_inner_ty) = self.target_fields.get(&field).copied() else {
+                return;
+            };
+            if let Some(reason) = opt_box_rhs_block_reason(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                lhs_inner_ty,
+                fallback,
+            ) {
+                self.reasons.entry(field).or_default().insert(reason);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBoxTargetVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                if self.target_fields.contains_key(&slot) {
+                                    self.record_rhs(
+                                        slot,
+                                        field.expr,
+                                        OwnershipFieldBlockReason::UnsupportedStructLiteralRhs,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs)
+                        && self.target_fields.contains_key(&field)
+                    {
+                        self.record_rhs(
+                            field,
+                            rhs,
+                            OwnershipFieldBlockReason::UnsupportedAssignmentRhs,
+                        );
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut reasons: FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>> =
+        FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        let mut visitor = FieldBoxTargetVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            target_fields,
+            reasons: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        for (field, field_reasons) in visitor.reasons {
+            reasons.entry(field).or_default().extend(field_reasons);
+        }
+    });
+    reasons
+}
+
+fn opt_box_rhs_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    rhs: &'tcx hir::Expr<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    fallback: OwnershipFieldBlockReason,
+) -> Option<OwnershipFieldBlockReason> {
+    if hir_rhs_supports_box_target(tcx, sig_decs, ptr_kinds, rhs, PtrKind::OptBox, lhs_inner_ty) {
+        return None;
+    }
+    if let Some(hir_id) = hir_unwrapped_local_id(rhs)
+        && matches!(ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+    {
+        if raw_local_has_supported_scalar_box_source(tcx, sig_decs, ptr_kinds, hir_id, lhs_inner_ty)
+        {
+            return None;
+        }
+        return Some(
+            raw_local_scalar_box_source_block_reason(
+                tcx,
+                sig_decs,
+                ptr_kinds,
+                hir_id,
+                lhs_inner_ty,
+            )
+            .unwrap_or(OwnershipFieldBlockReason::UnsupportedRawLocalSource),
+        );
+    }
+    Some(direct_opt_box_rhs_block_reason(
+        tcx,
+        lhs_inner_ty,
+        rhs,
+        fallback,
+    ))
+}
+
+fn direct_opt_box_rhs_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    rhs: &'tcx hir::Expr<'tcx>,
+    fallback: OwnershipFieldBlockReason,
+) -> OwnershipFieldBlockReason {
+    let Some(name) = hir_call_name(rhs) else {
+        return fallback;
+    };
+    if call_name_is_cstring_or_str_pattern(name) {
+        return OwnershipFieldBlockReason::CStringOrStrFunctionPattern;
+    }
+    if call_name_is_realloc_or_buffer_pattern(name) {
+        return OwnershipFieldBlockReason::ReallocOrBufferPattern;
+    }
+    if call_name_is_libc_allocator(name)
+        && !hir_supports_scalar_box_allocator_root(tcx, lhs_inner_ty, rhs)
+    {
+        return OwnershipFieldBlockReason::AllocatorSizeMismatch;
+    }
+    OwnershipFieldBlockReason::UnsupportedCallRhs
+}
+
+fn call_name_is_libc_allocator(name: Symbol) -> bool {
+    matches!(name.as_str(), "malloc" | "calloc" | "realloc")
+}
+
+fn call_name_is_realloc_or_buffer_pattern(name: Symbol) -> bool {
+    let name = name.as_str();
+    name.contains("realloc") || name.contains("allocarray")
+}
+
+fn call_name_is_cstring_or_str_pattern(name: Symbol) -> bool {
+    let name = name.as_str();
+    name.starts_with("str") || name.contains("_str") || name.contains("cstr")
+}
+
+fn raw_local_scalar_box_source_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_hir_id: HirId,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> Option<OwnershipFieldBlockReason> {
+    struct LocalSourceReasonVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_hir_id: HirId,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        reasons: FxHashSet<OwnershipFieldBlockReason>,
+    }
+
+    impl<'tcx> LocalSourceReasonVisitor<'_, 'tcx> {
+        fn record_source(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                return;
+            }
+            self.reasons.insert(direct_opt_box_rhs_block_reason(
+                self.tcx,
+                self.lhs_inner_ty,
+                rhs,
+                OwnershipFieldBlockReason::UnsupportedRawLocalSource,
+            ));
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalSourceReasonVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && hir_id == self.target_hir_id
+                && let Some(init) = let_stmt.init
+            {
+                self.record_source(init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.target_hir_id)
+            {
+                self.record_source(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let body = tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+    let mut visitor = LocalSourceReasonVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        target_hir_id,
+        lhs_inner_ty,
+        reasons: FxHashSet::default(),
+    };
+    visitor.visit_body(body);
+    OwnershipFieldBlockReason::ALL
+        .into_iter()
+        .find(|reason| visitor.reasons.contains(reason))
+}
+
+fn raw_local_has_supported_scalar_box_source<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_hir_id: HirId,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> bool {
+    struct LocalSourceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_hir_id: HirId,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        saw_supported_source: bool,
+        saw_unsupported_source: bool,
+    }
+
+    impl<'tcx> LocalSourceVisitor<'_, 'tcx> {
+        fn record_source(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                self.saw_supported_source = true;
+            } else {
+                self.saw_unsupported_source = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalSourceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && hir_id == self.target_hir_id
+                && let Some(init) = let_stmt.init
+            {
+                self.record_source(init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.target_hir_id)
+            {
+                self.record_source(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let body = tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+    let mut visitor = LocalSourceVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        target_hir_id,
+        lhs_inner_ty,
+        saw_supported_source: false,
+        saw_unsupported_source: false,
+    };
+    visitor.visit_body(body);
+    visitor.saw_supported_source && !visitor.saw_unsupported_source
+}
+
+fn collect_ownership_field_diagnostics<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> OwnershipFieldDiagnostics {
+    let mut diagnostics = OwnershipFieldDiagnostics::default();
+    let mut scalar_fields = FxHashMap::default();
+
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        if !matches!(item.kind, hir::ItemKind::Struct(..)) {
+            continue;
+        }
+        let struct_did = item.owner_id.def_id;
+        let field_count = tcx.adt_def(struct_did).non_enum_variant().fields.len();
+        for field_index in 0..field_count {
+            let field = StructFieldSlot {
+                struct_did,
+                field_index,
+            };
+            let Some(inner_ty) = owning_struct_field_scalar_inner_ty(tcx, analysis, field) else {
+                continue;
+            };
+            diagnostics.total += 1;
+            let inner_ty = match inner_ty {
+                Ok(inner_ty) => inner_ty,
+                Err(reason) => {
+                    diagnostics.record_blocked([reason]);
+                    continue;
+                }
+            };
+            scalar_fields.insert(field, inner_ty);
+        }
+    }
+
+    let block_reasons =
+        collect_ownership_field_rhs_block_reasons(tcx, sig_decs, ptr_kinds, &scalar_fields);
+    for field in scalar_fields.keys().copied() {
+        if let Some(reasons) = block_reasons.get(&field) {
+            if reasons.is_empty() {
+                diagnostics.selected_opt_box += 1;
+            } else {
+                diagnostics.record_blocked(reasons.iter().copied());
+            }
+        } else {
+            diagnostics.selected_opt_box += 1;
+        }
+    }
+
+    diagnostics
+}
+
+fn emit_ownership_field_diagnostics(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) {
+    let diagnostics = collect_ownership_field_diagnostics(tcx, analysis, sig_decs, ptr_kinds);
+    eprintln!(
+        "[pointer-ownership-fields] fields total={} selected_opt_box={} blocked={}",
+        diagnostics.total, diagnostics.selected_opt_box, diagnostics.blocked_total,
+    );
+    for reason in OwnershipFieldBlockReason::ALL {
+        let fields = diagnostics
+            .block_reason_counts
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
+        if fields > 0 {
+            eprintln!(
+                "[pointer-ownership-fields] block reason={} fields={}",
+                reason.as_str(),
+                fields,
+            );
+        }
+    }
 }
 
 fn collect_struct_shape_demoted_fields(
@@ -11537,6 +12421,36 @@ fn hir_field_base_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
         return None;
     };
     hir_unwrapped_local_id(base)
+}
+
+fn hir_projection_root_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
+    match hir_unwrap_casts(hir_expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => hir_projection_root_local_id(inner),
+        hir::ExprKind::Field(base, _) => hir_projection_root_local_id(base),
+        _ => None,
+    }
+}
+
+fn hir_field_access_expr_string(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<String> {
+    match hir_unwrap_casts(hir_expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(tcx.hir_name(hir_id).to_string()),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
+            Some(format!("(*{})", hir_field_access_expr_string(tcx, inner)?))
+        }
+        hir::ExprKind::Field(base, ident) => Some(format!(
+            "{}.{}",
+            hir_field_access_expr_string(tcx, base)?,
+            ident.name
+        )),
+        _ => None,
+    }
 }
 
 fn hir_local_struct_did_from_qpath(qpath: &hir::QPath<'_>) -> Option<LocalDefId> {
@@ -12208,6 +13122,53 @@ pub unsafe fn print_preallocated_like(buffer: *mut State) -> i32 {
                 "expected {expected} in Holder.p conflict reasons: {holder_p:?}; all reasons: {reasons:?}"
             );
         }
+    }
+
+    #[test]
+    fn ownership_field_diagnostics_count_selected_and_blocked_fields() {
+        let diagnostics = ::utils::compilation::run_compiler_on_str(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Good {
+    pub data: *mut i32,
+}
+
+#[repr(C)]
+pub struct Bad {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash_good(owner: *mut Good) {
+    (*owner).data = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn stash_bad(owner: *mut Bad) {
+    (*owner).data = malloc(2 * std::mem::size_of::<i32>());
+}
+"#,
+            |tcx| {
+                let (input, analysis) = build_analysis(tcx);
+                let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
+                    simulate_transform_reasons(tcx, &input, &analysis);
+                collect_ownership_field_diagnostics(tcx, &analysis, &sig_decs, &ptr_kinds)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.total, 2);
+        assert_eq!(diagnostics.selected_opt_box, 1);
+        assert_eq!(diagnostics.blocked_total, 1);
+        assert_eq!(
+            diagnostics
+                .block_reason_counts
+                .get(&OwnershipFieldBlockReason::AllocatorSizeMismatch)
+                .copied(),
+            Some(1),
+        );
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
