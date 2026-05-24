@@ -10606,10 +10606,31 @@ fn emit_promotion_diagnostics(
         sig_decs,
         ptr_kinds,
     );
+    let usage_counts = count_promoted_field_usages(tcx, &promoted_fields);
     let live_fields = promoted_fields
         .iter()
         .filter(|field| !demoted_fields.contains(field))
         .count();
+    let promoted_structs = promoted_fields
+        .iter()
+        .map(|field| field.struct_did)
+        .collect::<FxHashSet<_>>()
+        .len();
+    let blocked_structs = promoted_fields
+        .iter()
+        .filter(|field| demoted_fields.contains(field))
+        .map(|field| field.struct_did)
+        .collect::<FxHashSet<_>>()
+        .len();
+    let promoted_field_usages = promoted_fields
+        .iter()
+        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
+        .sum::<usize>();
+    let blocked_field_usages = promoted_fields
+        .iter()
+        .filter(|field| demoted_fields.contains(field))
+        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
+        .sum::<usize>();
     let planned_return_lifetimes = lifetime_plans.functions.len();
     let promoted_return_lifetimes = lifetime_plans
         .functions
@@ -10626,12 +10647,16 @@ fn emit_promotion_diagnostics(
         .count();
 
     eprintln!(
-        "[pointer-promotion] fields total={} mutable={} shared={} shape_demoted={} final_demoted={} live={} returns_planned={} returns_live={}",
+        "[pointer-promotion] fields total={} structs={} usages={} mutable={} shared={} shape_demoted={} final_demoted={} blocked_structs={} blocked_usages={} live={} returns_planned={} returns_live={}",
         promoted_fields.len(),
+        promoted_structs,
+        promoted_field_usages,
         analysis.borrow_promotion_result.mutable_fields.len(),
         analysis.borrow_promotion_result.shared_fields.len(),
         shape_demoted.len(),
         demoted_fields.len(),
+        blocked_structs,
+        blocked_field_usages,
         live_fields,
         planned_return_lifetimes,
         promoted_return_lifetimes,
@@ -10663,8 +10688,9 @@ fn emit_promotion_diagnostics(
             "live"
         };
         eprintln!(
-            "[pointer-promotion] field {reason} {mutability} {}",
-            field_slot_label(tcx, field)
+            "[pointer-promotion] field {reason} {mutability} uses={} {}",
+            usage_counts.get(&field).copied().unwrap_or_default(),
+            field_slot_label(tcx, field),
         );
     }
 
@@ -10702,6 +10728,67 @@ fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
         .map(|field| field.name.as_str().to_owned())
         .unwrap_or_else(|| format!("#{}", field.field_index));
     format!("{struct_name}.{field_name}")
+}
+
+fn count_promoted_field_usages(
+    tcx: TyCtxt<'_>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+) -> FxHashMap<StructFieldSlot, usize> {
+    struct FieldUsageVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        promoted_fields: &'a FxHashSet<StructFieldSlot>,
+        usages: FxHashMap<StructFieldSlot, usize>,
+    }
+
+    impl FieldUsageVisitor<'_, '_> {
+        fn record(&mut self, field: StructFieldSlot) {
+            if self.promoted_fields.contains(&field) {
+                *self.usages.entry(field).or_default() += 1;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldUsageVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let Some(field) = hir_struct_field_slot(self.tcx, expr) {
+                self.record(field);
+            }
+
+            if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                && let Some(struct_did) = hir_local_struct_did_from_qpath(qpath)
+                    .or_else(|| hir_local_struct_did_from_ty(self.typeck.expr_ty(expr)))
+            {
+                for field in fields {
+                    if let Some(field_index) =
+                        hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                    {
+                        self.record(StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        });
+                    }
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut usages = FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = FieldUsageVisitor {
+            tcx,
+            typeck,
+            promoted_fields,
+            usages: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        for (field, count) in visitor.usages {
+            *usages.entry(field).or_default() += count;
+        }
+    });
+    usages
 }
 
 fn signature_output_rewrites_to_owning<'tcx>(
