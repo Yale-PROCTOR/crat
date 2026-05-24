@@ -6,6 +6,7 @@ use errors::{Errors, compute_errors};
 use invalidates::{Invalidates, compute_invalidates};
 use itertools::Itertools as _;
 use killed::{Killed, compute_killed};
+use lifetime_flow::{LifetimeFlowResults, analyze_program_lifetime_flow};
 use loan_liveness::{LoanLiveness, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
@@ -38,6 +39,7 @@ macro_rules! disallow_interprocedural {
 mod errors;
 mod invalidates;
 mod killed;
+pub mod lifetime_flow;
 mod loan_liveness;
 mod places_conflict;
 mod provenance_liveness;
@@ -130,6 +132,7 @@ impl HasProvenanceSet for Body<'_> {
 
 pub struct GBorrowInferCtxt {
     pub provenances: FxHashMap<LocalDefId, ProvenanceSet>,
+    pub lifetime_flows: LifetimeFlowResults,
 }
 
 impl GBorrowInferCtxt {
@@ -140,6 +143,7 @@ impl GBorrowInferCtxt {
         K: Fn(LocalDefId) -> L,
         L: Fn(Local) -> bool,
     {
+        let lifetime_flows = analyze_program_lifetime_flow(program);
         let mut provenances = FxHashMap::default();
         for f in program.functions.iter().copied() {
             let body = program
@@ -151,7 +155,10 @@ impl GBorrowInferCtxt {
             provenances.insert(f, body.provenance_set(is_candidate, is_mutable));
         }
 
-        GBorrowInferCtxt { provenances }
+        GBorrowInferCtxt {
+            provenances,
+            lifetime_flows,
+        }
     }
 
     pub fn _all_pointers(program: &RustProgram) -> Self {
@@ -546,6 +553,25 @@ impl ProvenanceConstraintGraph {
         }
         .visit_body(body);
 
+        if let Some(lifetime_flow) = global_borrow_ctxt
+            .lifetime_flows
+            .get(&body.source.def_id().expect_local())
+        {
+            for (source, target) in lifetime_flow.body.depth0_value_flows() {
+                let Some(source_provenance) = provenance_set.local_data[source] else {
+                    continue;
+                };
+                let Some(target_provenance) = provenance_set.local_data[target] else {
+                    continue;
+                };
+                graph.subset.push(SubsetConstraint {
+                    sup: target_provenance,
+                    sub: source_provenance,
+                    _location: Location::START,
+                });
+            }
+        }
+
         graph
     }
 }
@@ -773,7 +799,11 @@ pub fn demote_pointers_iterative(
 
         let inference = borrow_inference(tcx, f, global_borrow_ctxt);
         let BorrowInferenceResults {
-            borrow_set, errors, ..
+            borrow_set,
+            errors,
+            provenance_liveness,
+            requires,
+            ..
         } = inference;
 
         let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
@@ -791,17 +821,43 @@ pub fn demote_pointers_iterative(
 
         let provenance_set = global_borrow_ctxt.provenances.get_mut(&f).unwrap();
 
+        // Demote every live provenance that depends on the invalid loan, not just
+        // the local where the borrow was originally assigned.
+        // (for inter-procedural borrow inference, e.g., p = id(q))
         for loan in invalid_loans.iter() {
             let borrow_data = &borrow_set.loans[loan];
-            match borrow_data.assigned {
-                Borrower::AssignStmt(assigned) => {
-                    demoted_locals.insert(assigned.local);
+            for row in errors.rows() {
+                let Some(loans) = errors.row(row) else {
+                    continue;
+                };
+                if !loans.contains(loan) {
+                    continue;
+                }
+                let Some(live_provenances) = provenance_liveness.row(row) else {
+                    continue;
+                };
+                for provenance in live_provenances.iter() {
+                    if !requires.contains(provenance, loan) {
+                        continue;
+                    }
+                    let local = provenance_set.provenance_data[provenance].local();
+                    demoted_locals.insert(local);
                     provenance_set
                         .tree_borrow_local
                         .get_mut()
-                        .union(assigned.local, borrow_data.borrowed.local);
+                        .union(local, borrow_data.borrowed.local);
                 }
-                Borrower::CallArg(..) => unimplemented!(),
+            }
+        }
+
+        for loan in invalid_loans.iter() {
+            let borrow_data = &borrow_set.loans[loan];
+            if let Borrower::AssignStmt(assigned) = borrow_data.assigned {
+                demoted_locals.insert(assigned.local);
+                provenance_set
+                    .tree_borrow_local
+                    .get_mut()
+                    .union(assigned.local, borrow_data.borrowed.local);
             }
         }
 
