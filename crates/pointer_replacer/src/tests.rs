@@ -1167,6 +1167,201 @@ pub unsafe fn touch(mut x: i32) -> i32 {
 }
 
 #[test]
+fn test_rewriter_removes_unneeded_generated_copy_for_mutable_struct_field() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub tag: i32,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for Holder {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for Holder {
+    #[inline]
+    fn clone(&self) -> Holder {
+        let _: ::core::clone::AssertParamIsClone<*mut i32>;
+        let _: ::core::clone::AssertParamIsClone<i32>;
+        *self
+    }
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut h = Holder { p: &raw mut x, tag: 3 };
+    *h.p = 7;
+    h.p = core::ptr::null_mut();
+    h.tag
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a mut i32>",
+            "Holder { p: Some(&mut x), tag: 3 }",
+            "h.p = None;",
+        ],
+        &[
+            "pub p: *mut i32",
+            "impl ::core::marker::Copy for Holder",
+            "impl ::core::clone::Clone for Holder",
+            "*h.p = 7",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_reborrows_mutable_promoted_field_for_shared_pointer_assignment() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct Node {
+    pub value: i32,
+    pub next: *mut Node,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for Node {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for Node {
+    #[inline]
+    fn clone(&self) -> Node {
+        let _: ::core::clone::AssertParamIsClone<i32>;
+        let _: ::core::clone::AssertParamIsClone<*mut Node>;
+        *self
+    }
+}
+
+pub unsafe fn last_value(mut head: *mut Node) -> i32 {
+    if head.is_null() {
+        return 0;
+    }
+    while !(*head).next.is_null() {
+        head = (*head).next;
+    }
+    (*head).value
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "pub next: Option<&'a mut Node<'a>>",
+            "head = ((*head.unwrap()).next).as_deref();",
+        ],
+        &[
+            "impl ::core::marker::Copy for Node",
+            "impl ::core::clone::Clone for Node",
+            "head = unsafe { ((*(head).as_deref().unwrap()).next).as_ref() };",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_generated_copy_when_struct_is_reused_after_raw_storage_move() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub tag: i32,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for Holder {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for Holder {
+    #[inline]
+    fn clone(&self) -> Holder {
+        let _: ::core::clone::AssertParamIsClone<*mut i32>;
+        let _: ::core::clone::AssertParamIsClone<i32>;
+        *self
+    }
+}
+
+pub unsafe fn touch(mut x: i32, slot: *mut Holder) -> i32 {
+    let h = Holder { p: &raw mut x, tag: 3 };
+    *slot = h;
+    *h.p = 7;
+    h.tag
+}
+"#,
+        &[
+            "pub struct Holder {",
+            "pub p: *mut i32",
+            "impl ::core::marker::Copy for Holder",
+            "impl ::core::clone::Clone for Holder",
+            "*slot = h;",
+            "*h.p = 7",
+        ],
+        &["pub p: Option<&'a mut i32>", "Holder<'a>"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_generated_copy_when_copy_container_depends_on_struct() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct Inner {
+    pub p: *mut i32,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for Inner {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for Inner {
+    #[inline]
+    fn clone(&self) -> Inner {
+        let _: ::core::clone::AssertParamIsClone<*mut i32>;
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for Outer {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for Outer {
+    #[inline]
+    fn clone(&self) -> Outer {
+        let _: ::core::clone::AssertParamIsClone<Inner>;
+        *self
+    }
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let inner = Inner { p: &raw mut x };
+    *inner.p = 7;
+    0
+}
+"#,
+        &[
+            "pub struct Inner {",
+            "pub p: *mut i32",
+            "impl ::core::marker::Copy for Inner",
+            "impl ::core::marker::Copy for Outer",
+        ],
+        &["pub p: Option<&'a mut i32>", "Inner<'a>"],
+    );
+}
+
+#[test]
 fn test_rewriter_demotes_promoted_field_struct_return_type() {
     run_test(
         r#"
