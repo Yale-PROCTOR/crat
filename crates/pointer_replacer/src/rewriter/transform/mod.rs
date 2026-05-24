@@ -44,6 +44,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
     free_like_wrappers: FxHashSet<LocalDefId>,
     demoted_fields: FxHashSet<StructFieldSlot>,
+    field_cursor_fields: FxHashSet<StructFieldSlot>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     pub bytemuck: Cell<bool>,
@@ -234,7 +235,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_slice_ty(inner_ty, *m);
+                            *param.ty =
+                                self.mk_slice_ty_with_lifetime(inner_ty, *m, input_lifetime);
                         }
                         Some(PtrKind::Raw(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -254,7 +256,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_cursor_ty(inner_ty, *m);
+                            *param.ty =
+                                self.mk_cursor_ty_with_lifetime(inner_ty, *m, input_lifetime);
                             self.slice_cursor.set(true);
                         }
                         Some(PtrKind::BoxedSlice) => {
@@ -715,11 +718,22 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             {
                 let receiver = unwrap_paren(receiver);
                 let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx);
-                if hir_receiver.is_some_and(|hir_receiver| {
-                    self.promoted_field_slot_for_hir_field(hir_receiver)
-                        .is_some()
-                }) {
-                    seg.ident.name = Symbol::intern("is_none");
+                if let Some(field_kind) = hir_receiver
+                    .and_then(|hir_receiver| self.promoted_field_slot_for_hir_field(hir_receiver))
+                    .and_then(|field| self.field_ptr_kind(field))
+                {
+                    match field_kind {
+                        PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice => {
+                            seg.ident.name = Symbol::intern("is_none");
+                        }
+                        PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                            seg.ident.name = Symbol::intern("is_empty");
+                        }
+                        PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice => {
+                            *expr = utils::expr!("false");
+                        }
+                        PtrKind::Raw(_) => {}
+                    }
                 } else if let Some(hir_receiver) = hir_receiver
                     && let Some(pe) = self.ptr_expr(receiver, hir_receiver)
                     && matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
@@ -848,6 +862,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             PtrKind::OptBox => {
                                 utils::expr!("*({field_str}).as_deref().unwrap()")
+                            }
+                            PtrKind::Slice(_) => {
+                                utils::expr!("({field_str})[0]")
+                            }
+                            PtrKind::SliceCursor(_) => {
+                                utils::expr!("({field_str})[0 as usize]")
                             }
                             _ => unreachable!(),
                         };
@@ -1066,6 +1086,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         emit_ownership_field_diagnostics(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
+        apply_field_storage_input_lifetimes(
+            rust_program.tcx,
+            analysis,
+            &lifetime_plans,
+            &demoted_fields,
+            &field_cursor_fields,
+            &mut sig_decs,
+        );
         let raw_bridge_bindings = collect_raw_bridge_bindings(
             rust_program.tcx,
             &ptr_kinds,
@@ -1085,6 +1114,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             alloc_wrappers,
             free_like_wrappers,
             demoted_fields,
+            field_cursor_fields,
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             bytemuck: Cell::new(false),
@@ -1093,7 +1123,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
+        if struct_field_is_exactly_owning(self.analysis, field) {
             self.ownership_field_kind(field)
         } else {
             self.promoted_field_kind(field)
@@ -1114,23 +1144,36 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if self.demoted_fields.contains(&field) {
             return None;
         }
-        if self
+        let mutability = if self
             .analysis
             .borrow_promotion_result
             .mutable_fields
             .contains(&field)
         {
-            Some(PtrKind::OptRef(true))
+            true
         } else if self
             .analysis
             .borrow_promotion_result
             .shared_fields
             .contains(&field)
         {
-            Some(PtrKind::OptRef(false))
+            false
         } else {
-            None
+            return None;
+        };
+        if self.field_is_array_like(field) {
+            if self.field_cursor_fields.contains(&field) {
+                Some(PtrKind::SliceCursor(mutability))
+            } else {
+                Some(PtrKind::Slice(mutability))
+            }
+        } else {
+            Some(PtrKind::OptRef(mutability))
         }
+    }
+
+    fn field_is_array_like(&self, field: StructFieldSlot) -> bool {
+        analysis_field_is_array_like(self.analysis, field)
     }
 
     fn mark_param_mut_if_needed(&self, param: &mut Param) {
@@ -1260,6 +1303,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 PtrKind::OptBox => {
                     field_def.ty = P(utils::ty!("Option<Box<{inner_ty}>>"));
+                }
+                PtrKind::Slice(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_slice_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                }
+                PtrKind::SliceCursor(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_cursor_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                    self.slice_cursor.set(true);
                 }
                 _ => {}
             }
@@ -1728,6 +1788,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn mk_cursor_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let cursor = if mutability {
+            "SliceCursorMut"
+        } else {
+            "SliceCursor"
+        };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{}", lifetime.as_str()))
+            .unwrap_or_else(|| "'_".to_owned());
+        utils::ty!("crate::slice_cursor::{cursor}<{lifetime}, {ty}>")
+    }
+
     fn mk_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.ty_name(ty);
         if mutability {
@@ -1735,6 +1813,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         } else {
             utils::ty!("&[{ty}]")
         }
+    }
+
+    fn mk_slice_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("&{lifetime}{m}[{ty}]")
     }
 
     fn mk_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
@@ -1748,17 +1840,30 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         field_expr: &Expr,
         mutability: bool,
         inner_ty: ty::Ty<'tcx>,
+        field_kind: PtrKind,
     ) -> Expr {
         let field_expr = pprust::expr_to_string(field_expr);
         let inner_ty = self.ty_name(inner_ty);
-        if mutability {
-            utils::expr!(
-                "({field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
-            )
-        } else {
-            utils::expr!(
-                "({field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
-            )
+        match field_kind {
+            PtrKind::OptRef(_) | PtrKind::OptBox => {
+                if mutability {
+                    utils::expr!(
+                        "({field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
+                    )
+                } else {
+                    utils::expr!(
+                        "({field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
+                    )
+                }
+            }
+            PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                if mutability {
+                    utils::expr!("({field_expr}).as_mut_ptr() as *mut {inner_ty}")
+                } else {
+                    utils::expr!("({field_expr}).as_ptr() as *const {inner_ty}")
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -2414,7 +2519,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
         let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
-        if let PtrCtx::Rhs(kind @ PtrKind::OptRef(_)) = ctx
+        if let PtrCtx::Rhs(
+            kind @ (PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
+        ) = ctx
             && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
             && self.field_ptr_kind(field) == Some(kind)
         {
@@ -2422,10 +2529,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         if let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
             && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
-            && matches!(self.field_ptr_kind(field), Some(PtrKind::OptRef(_)))
+            && let Some(field_kind) = self.field_ptr_kind(field)
+            && matches!(
+                field_kind,
+                PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+            )
             && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
         {
-            *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty);
+            *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty, field_kind);
             return PtrKind::Raw(m);
         }
         let mut pe = if let Some(pe) = self.ptr_expr(e, hir_e) {
@@ -3438,7 +3549,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     let base = self.projected_expr(&pe, m, false);
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
-                    if !m && m1 {
+                    if !m && m1 && pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty {
                         result = utils::expr!("({}).as_deref()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
@@ -3770,10 +3881,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             struct_did,
                             field_index,
                         };
-                        let field_expr = if self.field_ptr_kind(field_slot).is_some() {
-                            utils::expr!("None")
-                        } else {
-                            self.default_value_expr(field.ty(self.tcx, args))
+                        let field_expr = match self.field_ptr_kind(field_slot) {
+                            Some(PtrKind::OptRef(_) | PtrKind::OptBox) => utils::expr!("None"),
+                            Some(PtrKind::Slice(m)) => self.empty_slice_expr(m),
+                            Some(PtrKind::SliceCursor(m)) => {
+                                self.slice_cursor.set(true);
+                                if m {
+                                    utils::expr!("crate::slice_cursor::SliceCursorMut::empty()")
+                                } else {
+                                    utils::expr!("crate::slice_cursor::SliceCursor::empty()")
+                                }
+                            }
+                            _ => self.default_value_expr(field.ty(self.tcx, args)),
                         };
                         format!("{field_name}: {}", pprust::expr_to_string(&field_expr))
                     })
@@ -5327,6 +5446,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
+        if !m && let Some(receiver) = slice_cursor_mut_temp_as_slice_receiver(e) {
+            let shared_cursor = utils::expr!("({}).as_deref()", pprust::expr_to_string(receiver));
+            return self.cursor_from_cursor(&shared_cursor, m, lhs_inner_ty, rhs_inner_ty);
+        }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let is_rewritten_slice_like_local =
             matches!(pe.base_kind, PtrExprBaseKind::Path(Res::Local(_)))
@@ -5437,14 +5560,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if !need_cast {
             e.clone()
         } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
-            self.bytemuck.set(true);
             utils::expr!(
-                "{}::new(bytemuck::cast_slice{}::<_, {}>(({}).as_slice{}()))",
+                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 1_000_000)",
                 cursor_ty,
                 if m { "_mut" } else { "" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
             )
         } else {
             utils::expr!(
@@ -5747,11 +5869,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             },
             |kind| kind.is_mut(),
         );
-        let mut is_plain_slice = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
-            matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Slice(_)))
-        } else {
-            false
-        };
+        let mut is_plain_slice = matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         // A "data container" is a Vec/array accessed via as_ptr that is NOT a cursor.
         // For these, offsets should produce re-sliced expressions, not cursor operations.
         let is_data_container = pe.as_ptr
@@ -5759,14 +5877,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pe.base_kind,
                 PtrExprBaseKind::Array | PtrExprBaseKind::Alloca
             );
-        let is_mut_cursor_base = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
-            matches!(
-                self.ptr_kinds.get(&hir_id),
-                Some(PtrKind::SliceCursor(true))
-            )
-        } else {
-            false
-        };
+        let is_mut_cursor_base =
+            matches!(self.ptr_source_kind(pe), Some(PtrKind::SliceCursor(true)));
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -5800,12 +5912,28 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                                 pprust::expr_to_string(offset),
                             );
                         }
-                    } else if m && is_mut_cursor_base {
-                        e = utils::expr!(
-                            "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
-                            pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
-                        );
+                    } else if is_mut_cursor_base {
+                        if m {
+                            e = utils::expr!(
+                                "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
+                        } else {
+                            if is_slice_cursor_mut_constructor_call(&e) {
+                                e = utils::expr!(
+                                    "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                            } else {
+                                e = utils::expr!(
+                                    "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                            }
+                        }
                     } else {
                         e = utils::expr!(
                             "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
@@ -5939,6 +6067,24 @@ fn mk_opt_ref_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime:
     let m = if mutability { "mut " } else { "" };
     let lifetime = lifetime.as_str();
     utils::ty!("Option<&'{lifetime} {m}{inner_ty}>")
+}
+
+#[inline]
+fn mk_slice_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: Symbol) -> Ty {
+    let m = if mutability { "mut " } else { "" };
+    let lifetime = lifetime.as_str();
+    utils::ty!("&'{lifetime} {m}[{inner_ty}]")
+}
+
+#[inline]
+fn mk_cursor_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: Symbol) -> Ty {
+    let cursor = if mutability {
+        "SliceCursorMut"
+    } else {
+        "SliceCursor"
+    };
+    let lifetime = lifetime.as_str();
+    utils::ty!("crate::slice_cursor::{cursor}<'{lifetime}, {inner_ty}>")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12416,6 +12562,148 @@ fn hir_struct_field_slot(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<St
     })
 }
 
+fn apply_field_storage_input_lifetimes(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    lifetime_plans: &super::lifetimes::LifetimePlans,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+    field_cursor_fields: &FxHashSet<StructFieldSlot>,
+    sig_decs: &mut SigDecisions,
+) {
+    struct FieldStorageLifetimeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        analysis: &'a Analysis,
+        lifetime_plans: &'a super::lifetimes::LifetimePlans,
+        demoted_fields: &'a FxHashSet<StructFieldSlot>,
+        field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
+        sig_decs: &'a mut SigDecisions,
+    }
+
+    impl FieldStorageLifetimeVisitor<'_, '_> {
+        fn record_storage(&mut self, field: StructFieldSlot, rhs: &hir::Expr<'_>) {
+            if !matches!(
+                borrow_promoted_array_field_kind(
+                    self.analysis,
+                    self.demoted_fields,
+                    self.field_cursor_fields,
+                    field,
+                ),
+                Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+            ) {
+                return;
+            }
+            let Some(lifetime) = self
+                .lifetime_plans
+                .structs
+                .get(&field.struct_did)
+                .and_then(|plan| plan.field_lifetimes.get(&field.field_index))
+                .copied()
+            else {
+                return;
+            };
+            let Some(rhs_hir_id) = hir_unwrapped_local_id(hir_unwrap_addr_of_deref(rhs)) else {
+                return;
+            };
+            let Some((did, input_index)) = param_index_for_binding(self.tcx, rhs_hir_id) else {
+                return;
+            };
+            let Some(sig_dec) = self.sig_decs.data.get_mut(&did) else {
+                return;
+            };
+            if let Some(input_lifetime) = sig_dec.input_lifetimes.get_mut(input_index)
+                && (input_lifetime.is_none() || *input_lifetime == Some(lifetime))
+            {
+                *input_lifetime = Some(lifetime);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldStorageLifetimeVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs) {
+                        self.record_storage(field, rhs);
+                    }
+                }
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field_expr in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field_expr.ident.name)
+                            {
+                                self.record_storage(
+                                    StructFieldSlot {
+                                        struct_did,
+                                        field_index,
+                                    },
+                                    field_expr.expr,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldStorageLifetimeVisitor {
+        tcx,
+        analysis,
+        lifetime_plans,
+        demoted_fields,
+        field_cursor_fields,
+        sig_decs,
+    };
+    for def_id in tcx.hir_body_owners() {
+        visitor.visit_body(tcx.hir_body_owned_by(def_id));
+    }
+}
+
+fn borrow_promoted_array_field_kind(
+    analysis: &Analysis,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+    field_cursor_fields: &FxHashSet<StructFieldSlot>,
+    field: StructFieldSlot,
+) -> Option<PtrKind> {
+    if demoted_fields.contains(&field) || struct_field_is_exactly_owning(analysis, field) {
+        return None;
+    }
+    let mutability = if analysis
+        .borrow_promotion_result
+        .mutable_fields
+        .contains(&field)
+    {
+        true
+    } else if analysis
+        .borrow_promotion_result
+        .shared_fields
+        .contains(&field)
+    {
+        false
+    } else {
+        return None;
+    };
+    if !analysis_field_is_array_like(analysis, field) {
+        return None;
+    }
+    if field_cursor_fields.contains(&field) {
+        Some(PtrKind::SliceCursor(mutability))
+    } else {
+        Some(PtrKind::Slice(mutability))
+    }
+}
+
+fn analysis_field_is_array_like(analysis: &Analysis, field: StructFieldSlot) -> bool {
+    analysis
+        .fatness_result
+        .struct_facts(field.struct_did)
+        .nth(field.field_index)
+        .is_some_and(|fatnesses| fatnesses.iter().any(|fatness| fatness.is_arr()))
+}
+
 fn hir_field_base_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
     let hir::ExprKind::Field(base, _) = hir_expr.kind else {
         return None;
@@ -12604,6 +12892,36 @@ fn is_std_slice_constructor_call(expr: &Expr) -> bool {
                 && matches!(
                     ctor,
                     "from_mut" | "from_ref" | "from_raw_parts" | "from_raw_parts_mut"
+                );
+        }
+    }
+    false
+}
+
+fn slice_cursor_mut_temp_as_slice_receiver(expr: &Expr) -> Option<&Expr> {
+    let expr = unwrap_paren(expr);
+    let ExprKind::MethodCall(call) = &expr.kind else {
+        return None;
+    };
+    if !matches!(call.seg.ident.name.as_str(), "as_slice" | "as_slice_mut") {
+        return None;
+    }
+    let receiver = unwrap_paren(&call.receiver);
+    is_slice_cursor_mut_constructor_call(receiver).then_some(receiver)
+}
+
+fn is_slice_cursor_mut_constructor_call(expr: &Expr) -> bool {
+    if let ExprKind::Call(callee, _) = &unwrap_cast_and_paren(expr).kind
+        && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
+    {
+        let segs = &path.segments;
+        if segs.len() >= 2 {
+            let ctor = segs[segs.len() - 1].ident.name.as_str();
+            let owner = segs[segs.len() - 2].ident.name.as_str();
+            return owner == "SliceCursorMut"
+                && matches!(
+                    ctor,
+                    "new" | "with_pos" | "from_mut" | "from_raw_parts" | "from_raw_parts_mut"
                 );
         }
     }
@@ -12869,6 +13187,7 @@ mod tests {
             alloc_wrappers: FxHashMap::default(),
             free_like_wrappers: FxHashSet::default(),
             demoted_fields: FxHashSet::default(),
+            field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
             bytemuck: Cell::new(false),
