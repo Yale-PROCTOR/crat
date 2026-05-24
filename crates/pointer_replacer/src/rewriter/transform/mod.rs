@@ -946,7 +946,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             {
                 changed = true;
             }
-            if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs) {
+            if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
                 changed = true;
             }
             let raw_call_result_bindings =
@@ -6886,6 +6886,10 @@ fn is_mutable_borrow_like_decision(kind: PtrKind) -> bool {
     )
 }
 
+fn is_borrow_bridgeable_source_decision(kind: PtrKind) -> bool {
+    matches!(kind, PtrKind::Raw(_)) || is_borrow_like_decision(kind)
+}
+
 fn arg_may_mutably_borrow(arg_points_to_mutable: bool, decision: Option<PtrKind>) -> bool {
     decision.is_some_and(is_mutable_borrow_like_decision) || arg_points_to_mutable
 }
@@ -7439,10 +7443,15 @@ fn downgrade_freed_borrow_outputs(
     changed
 }
 
-fn downgrade_raw_cast_call_inputs(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions) -> bool {
+fn downgrade_raw_cast_call_inputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> bool {
     struct RawCastCallVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         changed: bool,
     }
 
@@ -7470,7 +7479,18 @@ fn downgrade_raw_cast_call_inputs(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions) 
                 else {
                     continue;
                 };
-                if hir_casted_pointer_local_source(self.tcx, typeck, arg).is_none() {
+                let Some(source_hir_id) = hir_casted_pointer_local_source(self.tcx, typeck, arg)
+                else {
+                    continue;
+                };
+                let input_dec = sig_dec.input_decs.get(idx).copied().flatten();
+                if input_dec.is_some_and(is_borrow_like_decision)
+                    && self
+                        .ptr_kinds
+                        .get(&source_hir_id)
+                        .copied()
+                        .is_some_and(is_borrow_bridgeable_source_decision)
+                {
                     continue;
                 }
                 let raw = PtrKind::Raw(mutability.is_mut());
@@ -7498,6 +7518,7 @@ fn downgrade_raw_cast_call_inputs(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions) 
         let mut visitor = RawCastCallVisitor {
             tcx,
             sig_decs,
+            ptr_kinds,
             changed: false,
         };
         visitor.visit_body(body);
@@ -9550,6 +9571,20 @@ fn collect_raw_local_assignment_bindings(
                 && let Some(rhs_hir_id) =
                     hir_casted_pointer_local_source(self.tcx, self.tcx.typeck(hir_id.owner), init)
             {
+                if self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .copied()
+                    .is_some_and(is_borrow_like_decision)
+                    && self
+                        .ptr_kinds
+                        .get(&rhs_hir_id)
+                        .copied()
+                        .is_some_and(is_borrow_bridgeable_source_decision)
+                {
+                    intravisit::walk_stmt(self, stmt);
+                    return;
+                }
                 self.bindings.insert(hir_id);
                 if raw_pointer_binding_is_const(self.tcx, rhs_hir_id) {
                     self.bindings.insert(rhs_hir_id);
