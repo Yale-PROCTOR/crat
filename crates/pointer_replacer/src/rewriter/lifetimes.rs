@@ -136,9 +136,6 @@ fn function_lifetime_plans(
     let mut plans = FxHashMap::default();
 
     for did in input.functions.iter().copied() {
-        if !is_rust_abi_fn(input.tcx, did) {
-            continue;
-        }
         let body = input
             .tcx
             .mir_drops_elaborated_and_const_checked(did)
@@ -174,16 +171,6 @@ fn function_lifetime_plans(
     }
 
     plans
-}
-
-fn is_rust_abi_fn(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
-    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
-        return false;
-    };
-    let hir::ItemKind::Fn { sig, .. } = item.kind else {
-        return false;
-    };
-    sig.header.abi.is_rustic_abi()
 }
 
 fn returned_input_indexes(summary: &LifetimeFlowSummary, input_len: usize) -> Option<Vec<usize>> {
