@@ -997,6 +997,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
         let demoted_fields =
             collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        emit_promotion_diagnostics(
+            rust_program.tcx,
+            analysis,
+            &lifetime_plans,
+            &sig_decs,
+            &ptr_kinds,
+            &demoted_fields,
+        );
         let (demoted_field_source_bindings, raw_field_source_callees) =
             collect_raw_field_source_bindings(rust_program.tcx, analysis, &demoted_fields);
         let mut sig_changed = false;
@@ -1432,26 +1440,36 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn ty_name(&self, ty: ty::Ty<'tcx>) -> String {
-        self.promoted_mir_ty_name(ty)
+        self.promoted_mir_ty_name(ty, true)
     }
 
-    fn promoted_mir_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
+    fn anonymous_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
+        self.promoted_mir_ty_name(ty, false)
+    }
+
+    fn promoted_mir_ty_name(&self, ty: ty::Ty<'tcx>, use_named_struct_lifetimes: bool) -> String {
         match ty.kind() {
             ty::TyKind::Adt(adt_def, args) => {
                 let mut args = args
                     .iter()
                     .map(|arg| match arg.kind() {
-                        ty::GenericArgKind::Type(ty) => self.promoted_mir_ty_name(ty),
+                        ty::GenericArgKind::Type(ty) => {
+                            self.promoted_mir_ty_name(ty, use_named_struct_lifetimes)
+                        }
                         ty::GenericArgKind::Const(cnst) => cnst.to_string(),
                         ty::GenericArgKind::Lifetime(_) => "'_".to_string(),
                     })
                     .collect::<Vec<_>>();
                 let lifetimes = self.lifetimes_for_ty(ty);
                 if !lifetimes.is_empty() {
-                    let promoted_lifetime_args = lifetimes
-                        .iter()
-                        .map(|lifetime| format!("'{}", lifetime.as_str()))
-                        .collect::<Vec<_>>();
+                    let promoted_lifetime_args = if use_named_struct_lifetimes {
+                        lifetimes
+                            .iter()
+                            .map(|lifetime| format!("'{}", lifetime.as_str()))
+                            .collect::<Vec<_>>()
+                    } else {
+                        std::iter::repeat_n("'_".to_string(), lifetimes.len()).collect::<Vec<_>>()
+                    };
                     let insert_at = self
                         .existing_lifetime_param_count_for_ty(ty)
                         .min(args.len());
@@ -1471,20 +1489,32 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             ty::TyKind::RawPtr(pointee, mutability) => {
                 let m = if mutability.is_mut() { "mut" } else { "const" };
-                format!("*{m} {}", self.promoted_mir_ty_name(*pointee))
+                format!(
+                    "*{m} {}",
+                    self.promoted_mir_ty_name(*pointee, use_named_struct_lifetimes)
+                )
             }
             ty::TyKind::Ref(_, inner, mutability) => {
                 let m = if mutability.is_mut() { "mut " } else { "" };
-                format!("&{m}{}", self.promoted_mir_ty_name(*inner))
+                format!(
+                    "&{m}{}",
+                    self.promoted_mir_ty_name(*inner, use_named_struct_lifetimes)
+                )
             }
             ty::TyKind::Array(elem, len) => {
-                format!("[{}; {len}]", self.promoted_mir_ty_name(*elem))
+                format!(
+                    "[{}; {len}]",
+                    self.promoted_mir_ty_name(*elem, use_named_struct_lifetimes)
+                )
             }
-            ty::TyKind::Slice(elem) => format!("[{}]", self.promoted_mir_ty_name(*elem)),
+            ty::TyKind::Slice(elem) => format!(
+                "[{}]",
+                self.promoted_mir_ty_name(*elem, use_named_struct_lifetimes)
+            ),
             ty::TyKind::Tuple(elems) => {
                 let elems = elems
                     .iter()
-                    .map(|elem| self.promoted_mir_ty_name(elem))
+                    .map(|elem| self.promoted_mir_ty_name(elem, use_named_struct_lifetimes))
                     .collect::<Vec<_>>();
                 format!("({})", elems.join(", "))
             }
@@ -1511,7 +1541,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_ref_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
-        self.mk_ref_ty_with_lifetime(ty, mutability, None)
+        let ty = self.anonymous_ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        utils::ty!("&{m}{ty}")
     }
 
     fn mk_ref_ty_with_lifetime(
@@ -1529,7 +1561,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_opt_ref_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
-        self.mk_opt_ref_ty_with_lifetime(ty, mutability, None)
+        let ty = self.anonymous_ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        utils::ty!("Option<&{m}{ty}>")
     }
 
     fn mk_opt_ref_ty_with_lifetime(
@@ -10531,13 +10565,143 @@ fn collect_struct_shape_demoted_fields(
         }
     }) {
         let sig = tcx.fn_sig(did).skip_binder().skip_binder();
-        if signature_output_rewrites_to_owning(tcx, sig_decs, ptr_kinds, did, sig.output()) {
+        if signature_output_rewrites_to_owning(tcx, sig_decs, ptr_kinds, did, sig.output())
+            || signature_output_rewrites_to_borrow(sig_decs, did)
+        {
             continue;
         }
         collect_promoted_fields_in_by_value_ty(tcx, sig.output(), promoted_fields, &mut demoted);
     }
 
     demoted
+}
+
+fn emit_promotion_diagnostics(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    lifetime_plans: &super::lifetimes::LifetimePlans,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+) {
+    let Ok(mode) = std::env::var("CRAT_POINTER_PROMOTION_DIAGNOSTICS") else {
+        return;
+    };
+    if mode.is_empty() || mode == "0" || mode.eq_ignore_ascii_case("false") {
+        return;
+    }
+
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+    let shape_demoted = collect_struct_shape_demoted_fields(
+        tcx,
+        &promoted_fields,
+        &analysis.borrow_promotion_result.mutable_fields,
+        sig_decs,
+        ptr_kinds,
+    );
+    let live_fields = promoted_fields
+        .iter()
+        .filter(|field| !demoted_fields.contains(field))
+        .count();
+    let planned_return_lifetimes = lifetime_plans.functions.len();
+    let promoted_return_lifetimes = lifetime_plans
+        .functions
+        .keys()
+        .filter(|did| {
+            sig_decs.data.get(did).is_some_and(|sig_dec| {
+                sig_dec.output_lifetime.is_some()
+                    && matches!(
+                        sig_dec.output_dec,
+                        Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
+                    )
+            })
+        })
+        .count();
+
+    eprintln!(
+        "[pointer-promotion] fields total={} mutable={} shared={} shape_demoted={} final_demoted={} live={} returns_planned={} returns_live={}",
+        promoted_fields.len(),
+        analysis.borrow_promotion_result.mutable_fields.len(),
+        analysis.borrow_promotion_result.shared_fields.len(),
+        shape_demoted.len(),
+        demoted_fields.len(),
+        live_fields,
+        planned_return_lifetimes,
+        promoted_return_lifetimes,
+    );
+
+    if mode != "full" {
+        return;
+    }
+
+    let mut fields = promoted_fields.iter().copied().collect::<Vec<_>>();
+    fields.sort_by_key(|field| field_slot_label(tcx, *field));
+    for field in fields {
+        let mutability = if analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            "mut"
+        } else {
+            "shared"
+        };
+        let reason = if demoted_fields.contains(&field) {
+            if shape_demoted.contains(&field) {
+                "demoted_shape"
+            } else {
+                "demoted_conflict"
+            }
+        } else {
+            "live"
+        };
+        eprintln!(
+            "[pointer-promotion] field {reason} {mutability} {}",
+            field_slot_label(tcx, field)
+        );
+    }
+
+    let mut planned_returns = lifetime_plans.functions.keys().copied().collect::<Vec<_>>();
+    planned_returns.sort_by_key(|did| tcx.def_path_str(*did));
+    for did in planned_returns {
+        let Some(sig_dec) = sig_decs.data.get(&did) else {
+            continue;
+        };
+        let state = if sig_dec.output_lifetime.is_some()
+            && matches!(
+                sig_dec.output_dec,
+                Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
+            ) {
+            "live"
+        } else {
+            "demoted"
+        };
+        eprintln!(
+            "[pointer-promotion] return {state} {} {:?}",
+            tcx.def_path_str(did),
+            sig_dec.output_dec
+        );
+    }
+}
+
+fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
+    let struct_name = tcx.def_path_str(field.struct_did);
+    let field_name = tcx
+        .adt_def(field.struct_did)
+        .non_enum_variant()
+        .fields
+        .iter()
+        .nth(field.field_index)
+        .map(|field| field.name.as_str().to_owned())
+        .unwrap_or_else(|| format!("#{}", field.field_index));
+    format!("{struct_name}.{field_name}")
 }
 
 fn signature_output_rewrites_to_owning<'tcx>(
@@ -10557,6 +10721,17 @@ fn signature_output_rewrites_to_owning<'tcx>(
         return false;
     };
     !fn_tail_returns_unsupported_box_binding(tcx, sig_decs, ptr_kinds, did, output_dec, inner_ty)
+}
+
+fn signature_output_rewrites_to_borrow(sig_decs: &SigDecisions, did: LocalDefId) -> bool {
+    sig_decs.data.get(&did).is_some_and(|sig| {
+        matches!(
+            sig.output_dec,
+            Some(
+                PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+            )
+        )
+    })
 }
 
 fn struct_has_named_fields(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {

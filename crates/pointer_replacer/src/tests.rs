@@ -1074,6 +1074,36 @@ pub unsafe fn get_entries(map: *mut Map) -> *mut i32 {
 }
 
 #[test]
+fn test_rewriter_promotes_struct_field_through_borrowed_struct_return() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *const i32,
+}
+
+pub unsafe fn id_holder(h: *mut Holder) -> *mut Holder {
+    h
+}
+
+pub unsafe fn touch(mut x: i32) -> i32 {
+    let mut h = Holder { p: &raw const x };
+    let r = id_holder(&raw mut h);
+    *(*r).p
+}
+"#,
+        &[
+            "pub struct Holder<'a>",
+            "pub p: Option<&'a i32>",
+            "pub unsafe fn id_holder<'a>(h: &'a mut crate::Holder<'a>)",
+            "-> &'a mut crate::Holder<'a>",
+            "Holder { p: Some(&x) }",
+        ],
+        &["pub p: *const i32", "*(*r).p"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_generic_struct_field_synthetic_default_path() {
     run_test(
         r#"
@@ -1997,6 +2027,22 @@ pub unsafe fn id(x: *mut i32) -> *mut i32 {
 "#,
         &[
             "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32",
+            "return x;",
+        ],
+        &["-> *mut i32", "Option<&'a mut i32>"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_extern_c_identity_return_with_named_lifetime() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn id(x: *mut i32) -> *mut i32 {
+    return x;
+}
+"#,
+        &[
+            "pub unsafe extern \"C\" fn id<'a>(x: &'a mut i32) -> &'a mut i32",
             "return x;",
         ],
         &["-> *mut i32", "Option<&'a mut i32>"],
@@ -5694,8 +5740,11 @@ pub unsafe extern "C" fn foo(mut x: *mut libc::c_int) -> *mut libc::c_int {
     return x;
 }
 "#,
-        &["*const"],
-        &[],
+        &[
+            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a mut i32)",
+            "-> &'a mut i32",
+        ],
+        &["-> *mut libc::c_int", "*const"],
     );
 }
 
@@ -5716,8 +5765,15 @@ pub unsafe extern "C" fn bar() {
     *q = foo(&mut x);
 }
 "#,
-        &["*const"],
-        &[],
+        &[
+            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a mut i32)",
+            "-> &'a mut i32",
+            "*q = (foo((Some(&mut x)).unwrap())) as *mut i32;",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn foo(mut x: *mut libc::c_int)",
+            "-> *mut libc::c_int",
+        ],
     );
 }
 
