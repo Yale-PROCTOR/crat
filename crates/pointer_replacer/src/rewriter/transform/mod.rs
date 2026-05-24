@@ -464,10 +464,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     local.ty = Some(P(self.mk_opt_ref_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::Box => {
-                    local.ty = Some(P(self.mk_box_ty(lhs_inner_ty)));
+                    local.ty = Some(P(self.mk_local_box_ty(lhs_inner_ty)));
                 }
                 PtrKind::OptBox => {
-                    local.ty = Some(P(self.mk_opt_box_ty(lhs_inner_ty)));
+                    local.ty = Some(P(self.mk_local_opt_box_ty(lhs_inner_ty)));
                 }
                 PtrKind::BoxedSlice => {
                     local.ty = Some(P(self.mk_boxed_slice_ty(lhs_inner_ty)));
@@ -518,7 +518,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if let Some(field) = self.promoted_field_slot_for_hir_field(hir_lhs)
                     && let Some(kind) = self.promoted_field_kind(field)
                 {
-                    self.transform_rhs(rhs, hir_rhs, kind);
+                    let target_inner_ty =
+                        unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_lhs)).map(|(inner, _)| inner);
+                    self.transform_promoted_field_rhs(rhs, hir_rhs, kind, target_inner_ty);
                     return;
                 }
                 let lhs_ty = typeck.expr_ty(hir_lhs);
@@ -686,8 +688,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
                     self.transform_rhs(arg, harg, param_kind);
                     if param_kind == PtrKind::OptRef(true)
-                        && hir_path_source_kind(self.tcx, &self.ptr_kinds, harg)
+                        && (hir_path_source_kind(self.tcx, &self.ptr_kinds, harg)
                             == Some(PtrKind::OptRef(true))
+                            || self
+                                .promoted_field_slot_for_hir_field(harg)
+                                .and_then(|field| self.promoted_field_kind(field))
+                                == Some(PtrKind::OptRef(true)))
                     {
                         *arg = P(utils::expr!(
                             "({}).as_deref_mut()",
@@ -713,6 +719,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .is_some()
                 }) {
                     seg.ident.name = Symbol::intern("is_none");
+                } else if let Some(hir_receiver) = hir_receiver
+                    && let Some(pe) = self.ptr_expr(receiver, hir_receiver)
+                    && matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
+                    && !pe.projs.is_empty()
+                {
+                    *expr = utils::expr!("({}).is_none()", pprust::expr_to_string(pe.base));
                 } else if matches!(receiver.kind, ExprKind::Path(_, _))
                     && let Some(hir_id) = self.hir_id_of_path(receiver.id)
                     && let Some(ptr_kind) = self.effective_ptr_kind(hir_id)
@@ -1396,7 +1408,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             else {
                 continue;
             };
-            self.transform_rhs(&mut ast_field.expr, hir_field.expr, kind);
+            self.transform_promoted_field_rhs(&mut ast_field.expr, hir_field.expr, kind, None);
         }
     }
 
@@ -1619,8 +1631,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("Box<{ty}>")
     }
 
+    fn mk_local_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
+        utils::ty!("Box<{ty}>")
+    }
+
     fn mk_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.ty_name(ty);
+        utils::ty!("Option<Box<{ty}>>")
+    }
+
+    fn mk_local_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
         utils::ty!("Option<Box<{ty}>>")
     }
 
@@ -1963,6 +1985,123 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_kind: PtrKind,
     ) -> PtrKind {
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
+    }
+
+    fn transform_promoted_field_rhs(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
+        if self.try_transform_raw_pointer_to_promoted_field(
+            rhs,
+            hir_rhs,
+            field_kind,
+            target_inner_ty,
+        ) || self.try_transform_slice_to_promoted_field(
+            rhs,
+            hir_rhs,
+            field_kind,
+            target_inner_ty,
+        ) {
+            field_kind
+        } else {
+            self.transform_rhs(rhs, hir_rhs, field_kind)
+        }
+    }
+
+    fn try_transform_raw_pointer_to_promoted_field(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> bool {
+        let PtrKind::OptRef(m) = field_kind else {
+            return false;
+        };
+        if is_null_like_ptr_arg(unwrap_addr_of_deref(unwrap_cast_and_paren(rhs)))
+            || hir_raw_addr_local(hir_rhs).is_some()
+            || matches!(
+                unwrap_cast_and_paren(rhs).kind,
+                ExprKind::AddrOf(BorrowKind::Ref, ..)
+            )
+        {
+            return false;
+        }
+        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_cast(hir_rhs).kind
+            && let Res::Local(hir_id) = path.res
+            && !matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Raw(_)))
+        {
+            return false;
+        }
+        let typeck = self.tcx.typeck(hir_rhs.hir_id.owner);
+        let Some((rhs_inner_ty, rhs_mut)) =
+            unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_rhs))
+        else {
+            return false;
+        };
+        let lhs_inner_ty = target_inner_ty.unwrap_or(rhs_inner_ty);
+        *rhs = self.opt_ref_from_raw_without_unsafe(
+            unwrap_addr_of_deref(unwrap_paren(rhs)),
+            m,
+            rhs_mut.is_mut(),
+            lhs_inner_ty,
+            rhs_inner_ty,
+        );
+        true
+    }
+
+    fn try_transform_slice_to_promoted_field(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> bool {
+        let PtrKind::OptRef(m) = field_kind else {
+            return false;
+        };
+        let e = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
+        let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_rhs));
+        let Some(pe) = self.ptr_expr(e, hir_e) else {
+            return false;
+        };
+        if !pe.projs.is_empty() {
+            return false;
+        }
+        let source_mutability = match self.ptr_source_kind(&pe) {
+            Some(PtrKind::Slice(source_m)) | Some(PtrKind::SliceCursor(source_m)) => source_m,
+            _ => return false,
+        };
+        if m && !source_mutability {
+            return false;
+        }
+        let Some(rhs_inner_ty) = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx) else {
+            return false;
+        };
+        let lhs_inner_ty = target_inner_ty.unwrap_or(rhs_inner_ty);
+        let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
+        let ref_method = if m { "as_mut" } else { "as_ref" };
+        *rhs = if lhs_inner_ty == rhs_inner_ty {
+            utils::expr!(
+                "({}).{}().{}()",
+                pprust::expr_to_string(pe.base),
+                ptr_method,
+                ref_method,
+            )
+        } else {
+            utils::expr!(
+                "(({}).{}() as *{} {}).{}()",
+                pprust::expr_to_string(pe.base),
+                ptr_method,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                ref_method,
+            )
+        };
+        true
     }
 
     fn local_binding_needs_mut_for_promoted_field_write(&self, target_hir_id: HirId) -> bool {
@@ -2840,8 +2979,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    if pe.projs.is_empty() {
+                        *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    } else if let Some((base, source_inner_ty)) =
+                        self.projected_opt_ref_slice_expr(&pe, m, m1)
+                    {
+                        *ptr = self.raw_from_slice_or_cursor(
+                            &base,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            source_inner_ty,
+                        );
+                    } else {
+                        *ptr =
+                            self.raw_from_projected_opt_ref(&pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    }
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Slice(m1)) => {
@@ -2882,22 +3035,63 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     *ptr = self.ref_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
                     return PtrKind::Ref(m);
                 }
-                (PtrCtx::Deref(false), PtrKind::OptRef(false)) if !need_cast => {
-                    assert!(pe.projs.is_empty());
+                (PtrCtx::Deref(false), PtrKind::OptRef(false))
+                    if !need_cast && pe.projs.is_empty() =>
+                {
                     return PtrKind::OptRef(false);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    // can be used for deref, so type must be specified
-                    *ptr = self.opt_ref_from_opt_ref(
-                        pe.base,
-                        m,
-                        m1,
-                        lhs_inner_ty,
-                        rhs_inner_ty,
-                        def_id,
-                    );
-                    return PtrKind::OptRef(m);
+                    if pe.projs.is_empty() {
+                        // can be used for deref, so type must be specified
+                        *ptr = self.opt_ref_from_opt_ref(
+                            pe.base,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                            def_id,
+                        );
+                        return PtrKind::OptRef(m);
+                    }
+                    if let Some((base, source_inner_ty)) =
+                        self.projected_opt_ref_slice_expr(&pe, m, m1)
+                    {
+                        match ctx {
+                            PtrCtx::Deref(_) => {
+                                *ptr = self.plain_slice_from_slice(
+                                    &base,
+                                    &pe,
+                                    m,
+                                    lhs_inner_ty,
+                                    source_inner_ty,
+                                );
+                                return PtrKind::Slice(m);
+                            }
+                            PtrCtx::Rhs(PtrKind::OptRef(_)) => {
+                                *ptr = self.opt_ref_from_slice_or_cursor(
+                                    &base,
+                                    m,
+                                    lhs_inner_ty,
+                                    source_inner_ty,
+                                    def_id,
+                                );
+                                return PtrKind::OptRef(m);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    if matches!(ctx, PtrCtx::Deref(_)) {
+                        *ptr = self.opt_ref_from_projected_opt_ref(
+                            &pe,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::OptRef(m);
+                    }
+                    *ptr = self.raw_from_projected_opt_ref(&pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::BoxedSlice) => {
                     let (base, source_inner_ty) = self
@@ -3120,8 +3314,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     *ptr = result;
                     return PtrKind::SliceCursor(m);
                 }
-                (PtrCtx::Rhs(PtrKind::SliceCursor(_) | PtrKind::Slice(_)), PtrKind::OptRef(_)) => {
-                    panic!()
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::OptRef(m1)) => {
+                    let (base, source_inner_ty) = self
+                        .projected_opt_ref_slice_expr(&pe, m, m1)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr =
+                        self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, source_inner_ty);
+                    return PtrKind::Slice(m);
+                }
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::OptRef(m1)) => {
+                    self.slice_cursor.set(true);
+                    let (base, source_inner_ty) = self
+                        .projected_opt_ref_slice_expr(&pe, m, m1)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr =
+                        self.cursor_from_plain_slice(&base, &pe, m, lhs_inner_ty, source_inner_ty);
+                    return PtrKind::SliceCursor(m);
                 }
                 (
                     PtrCtx::Rhs(PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
@@ -3369,6 +3577,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     fn ptr_source_kind(&self, pe: &PtrExpr<'_, 'tcx>) -> Option<PtrKind> {
         if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
             return self.effective_ptr_kind(hir_id);
+        }
+        if let Some(field) = self.promoted_field_slot_for_hir_field(pe.hir_base) {
+            return self.promoted_field_kind(field);
         }
         if let hir::ExprKind::Call(func, _) = pe.hir_base.kind
             && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
@@ -3882,6 +4093,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         self.apply_boxed_slice_projections(pe, m, &mut expr)
     }
 
+    fn projected_opt_ref_slice_expr(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        source_mut: bool,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
+        if m && !source_mut {
+            return None;
+        }
+        let source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        let raw = self.raw_from_opt_ref(pe.base, m, source_mut, source_inner_ty, source_inner_ty);
+        let mut expr = utils::expr!(
+            "std::slice::from_raw_parts{}({}, 1_000_000)",
+            if m { "_mut" } else { "" },
+            pprust::expr_to_string(&raw),
+        );
+        self.apply_borrowed_slice_projections(pe, m, &mut expr)
+    }
+
     fn apply_boxed_slice_projections(
         &self,
         pe: &PtrExpr<'_, 'tcx>,
@@ -3892,6 +4122,37 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
+                    *expr = utils::expr!(
+                        "({})[({}) as usize..]",
+                        pprust::expr_to_string(expr),
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty)?;
+                    *expr = self.plain_slice_from_expr(expr, m, to_ty, from_ty);
+                    from_ty = to_ty;
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+        Some((expr.clone(), from_ty))
+    }
+
+    fn apply_borrowed_slice_projections(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        expr: &mut Expr,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
+        let mut from_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        for proj in &pe.projs {
+            match proj {
+                PtrExprProj::Offset(offset) => {
+                    if !self.offset_expr_can_be_slice_index(offset) {
+                        return None;
+                    }
                     *expr = utils::expr!(
                         "({})[({}) as usize..]",
                         pprust::expr_to_string(expr),
@@ -4348,6 +4609,91 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn raw_from_projected_opt_ref(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let source_inner_ty =
+            unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx).unwrap_or(rhs_inner_ty);
+        let mut raw = self.raw_from_opt_ref(pe.base, m, m1, source_inner_ty, source_inner_ty);
+        let mut from_ty = source_inner_ty;
+        for proj in &pe.projs {
+            match proj {
+                PtrExprProj::Offset(offset) => {
+                    raw = utils::expr!(
+                        "({}).offset({})",
+                        pprust::expr_to_string(&raw),
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    raw = utils::expr!("({}) as usize", pprust::expr_to_string(&raw));
+                }
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
+                    raw = utils::expr!(
+                        "({}) as *{} {}",
+                        pprust::expr_to_string(&raw),
+                        if m { "mut" } else { "const" },
+                        mir_ty_to_string(to_ty, self.tcx),
+                    );
+                    from_ty = to_ty;
+                }
+                PtrExprProj::IntegerOp(expr, op) => {
+                    let method = match op {
+                        OpKind::WrappingAdd => "wrapping_add",
+                        OpKind::WrappingSub => "wrapping_sub",
+                    };
+                    raw = utils::expr!(
+                        "({}).{}({})",
+                        pprust::expr_to_string(&raw),
+                        method,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+                PtrExprProj::IntegerBinOp(expr, op) => {
+                    let op_str = match op {
+                        BinOpKind::BitAnd => "&",
+                        BinOpKind::BitOr => "|",
+                        _ => panic!(),
+                    };
+                    raw = utils::expr!(
+                        "({}) {} ({})",
+                        pprust::expr_to_string(&raw),
+                        op_str,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+            }
+        }
+        if from_ty != lhs_inner_ty {
+            utils::expr!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(&raw),
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
+        } else {
+            raw
+        }
+    }
+
+    fn opt_ref_from_projected_opt_ref(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let raw = self.raw_from_projected_opt_ref(pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+        self.opt_ref_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+    }
+
     fn raw_from_slice_or_cursor(
         &self,
         e: &Expr,
@@ -4396,6 +4742,35 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         } else {
             utils::expr!(
                 "unsafe {{ (({}){} as *{} {}).as_{}() }}",
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                if m { "mut" } else { "ref" },
+            )
+        }
+    }
+
+    fn opt_ref_from_raw_without_unsafe(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
+        if !need_cast {
+            utils::expr!(
+                "({}){}.as_{}()",
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "ref" },
+            )
+        } else {
+            utils::expr!(
+                "(({}){} as *{} {}).as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
@@ -5062,10 +5437,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             ExprKind::MethodCall(call) => {
                 let hir::ExprKind::MethodCall(seg, hreceiver, _, _) = hir_expr.kind else {
-                    panic!()
+                    return Some(PtrExpr::new(
+                        expr,
+                        hir_expr,
+                        base_ty,
+                        PtrExprBaseKind::Other,
+                    ));
                 };
                 let name = seg.ident.name.as_str();
-                if name == "offset" {
+                if name == "offset" || name == "add" {
                     let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;
                     ptr_expr.push_offset(&call.args[0]);
                     Some(ptr_expr)
@@ -10090,20 +10470,113 @@ fn collect_demoted_promoted_fields(
         sig_decs,
         ptr_kinds,
     );
+    demoted_fields.extend(
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds)
+            .keys()
+            .copied(),
+    );
+
+    demoted_fields
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ConflictDemotionReason {
+    ActiveBorrowOverlap,
+    LocalAssignmentWhileBorrowed,
+    ConflictingReborrow,
+    MutableFieldCopy,
+    RawPointeeFieldMove,
+    RawFieldPointerProjection,
+    RawStorageAllocator,
+    RawStoragePointer,
+    RawBindingFromField,
+    RawLocalCallArg,
+    RawUnknownCallArg,
+}
+
+impl ConflictDemotionReason {
+    const ALL: [Self; 11] = [
+        Self::ActiveBorrowOverlap,
+        Self::LocalAssignmentWhileBorrowed,
+        Self::ConflictingReborrow,
+        Self::MutableFieldCopy,
+        Self::RawPointeeFieldMove,
+        Self::RawFieldPointerProjection,
+        Self::RawStorageAllocator,
+        Self::RawStoragePointer,
+        Self::RawBindingFromField,
+        Self::RawLocalCallArg,
+        Self::RawUnknownCallArg,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ActiveBorrowOverlap => "active_borrow_overlap",
+            Self::LocalAssignmentWhileBorrowed => "local_assignment_while_borrowed",
+            Self::ConflictingReborrow => "conflicting_reborrow",
+            Self::MutableFieldCopy => "mutable_field_copy",
+            Self::RawPointeeFieldMove => "raw_pointee_field_move",
+            Self::RawFieldPointerProjection => "raw_field_pointer_projection",
+            Self::RawStorageAllocator => "raw_storage_allocator",
+            Self::RawStoragePointer => "raw_storage_pointer",
+            Self::RawBindingFromField => "raw_binding_from_field",
+            Self::RawLocalCallArg => "raw_local_call_arg",
+            Self::RawUnknownCallArg => "raw_unknown_call_arg",
+        }
+    }
+}
+
+fn collect_field_conflict_demotion_reasons(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>> {
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+    if promoted_fields.is_empty() {
+        return FxHashMap::default();
+    }
 
     struct FieldBorrowConflictVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
         sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         promoted_fields: &'a FxHashSet<StructFieldSlot>,
         mutable_fields: &'a FxHashSet<StructFieldSlot>,
         allocator_locals: FxHashSet<HirId>,
         active_borrows: FxHashMap<HirId, FxHashMap<StructFieldSlot, bool>>,
         ignored_borrow_exprs: FxHashSet<HirId>,
-        demoted_fields: FxHashSet<StructFieldSlot>,
+        conflict_reasons: FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>>,
     }
 
     impl<'tcx> FieldBorrowConflictVisitor<'_, 'tcx> {
+        fn record_conflict(&mut self, field: StructFieldSlot, reason: ConflictDemotionReason) {
+            if self.promoted_fields.contains(&field) {
+                self.conflict_reasons
+                    .entry(field)
+                    .or_default()
+                    .insert(reason);
+            }
+        }
+
+        fn record_conflicts(
+            &mut self,
+            fields: impl IntoIterator<Item = StructFieldSlot>,
+            reason: ConflictDemotionReason,
+        ) {
+            for field in fields {
+                self.record_conflict(field, reason);
+            }
+        }
+
         fn record_field_borrow(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
             if !self.promoted_fields.contains(&field) {
                 return;
@@ -10112,13 +10585,25 @@ fn collect_demoted_promoted_fields(
                 return;
             };
             self.ignored_borrow_exprs.insert(rhs.hir_id);
-            let fields = self.active_borrows.entry(local).or_default();
-            if !fields.is_empty() && (new_mut || fields.values().any(|existing_mut| *existing_mut))
-            {
-                self.demoted_fields.extend(fields.keys().copied());
-                self.demoted_fields.insert(field);
+            let conflicting_fields = {
+                let fields = self.active_borrows.entry(local).or_default();
+                let has_conflict = !fields.is_empty()
+                    && (new_mut || fields.values().any(|existing_mut| *existing_mut));
+                let conflicting_fields = if has_conflict {
+                    fields.keys().copied().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                fields.insert(field, new_mut);
+                conflicting_fields
+            };
+            if !conflicting_fields.is_empty() {
+                self.record_conflicts(
+                    conflicting_fields,
+                    ConflictDemotionReason::ActiveBorrowOverlap,
+                );
+                self.record_conflict(field, ConflictDemotionReason::ActiveBorrowOverlap);
             }
-            fields.insert(field, new_mut);
         }
 
         fn record_local_assignment(&mut self, lhs: &'tcx hir::Expr<'tcx>) {
@@ -10126,7 +10611,10 @@ fn collect_demoted_promoted_fields(
                 return;
             };
             if let Some(fields) = self.active_borrows.get(&local) {
-                self.demoted_fields.extend(fields.keys().copied());
+                self.record_conflicts(
+                    fields.keys().copied().collect::<Vec<_>>(),
+                    ConflictDemotionReason::LocalAssignmentWhileBorrowed,
+                );
             }
         }
 
@@ -10140,7 +10628,10 @@ fn collect_demoted_promoted_fields(
             if let Some(fields) = self.active_borrows.get(&local)
                 && (new_mut || fields.values().any(|existing_mut| *existing_mut))
             {
-                self.demoted_fields.extend(fields.keys().copied());
+                self.record_conflicts(
+                    fields.keys().copied().collect::<Vec<_>>(),
+                    ConflictDemotionReason::ConflictingReborrow,
+                );
             }
         }
 
@@ -10164,8 +10655,8 @@ fn collect_demoted_promoted_fields(
             if !self.mutable_fields.contains(&rhs_field) {
                 return;
             }
-            self.demoted_fields.insert(lhs_field);
-            self.demoted_fields.insert(rhs_field);
+            self.record_conflict(lhs_field, ConflictDemotionReason::MutableFieldCopy);
+            self.record_conflict(rhs_field, ConflictDemotionReason::MutableFieldCopy);
         }
 
         fn promoted_field_slots_in_expr(
@@ -10198,12 +10689,15 @@ fn collect_demoted_promoted_fields(
             visitor.fields
         }
 
-        fn demote_promoted_fields_in_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
-            self.demoted_fields
-                .extend(self.promoted_field_slots_in_expr(expr));
+        fn record_promoted_fields_in_expr(
+            &mut self,
+            expr: &'tcx hir::Expr<'tcx>,
+            reason: ConflictDemotionReason,
+        ) {
+            self.record_conflicts(self.promoted_field_slots_in_expr(expr), reason);
         }
 
-        fn demote_moved_mutable_fields_from_raw_pointee_arg(
+        fn record_moved_mutable_fields_from_raw_pointee_arg(
             &mut self,
             expr: &'tcx hir::Expr<'tcx>,
         ) {
@@ -10212,7 +10706,7 @@ fn collect_demoted_promoted_fields(
                 typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
                 promoted_fields: &'a FxHashSet<StructFieldSlot>,
                 mutable_fields: &'a FxHashSet<StructFieldSlot>,
-                demoted_fields: FxHashSet<StructFieldSlot>,
+                fields: FxHashSet<StructFieldSlot>,
             }
 
             impl<'tcx> RawPointeeFieldMoveVisitor<'_, 'tcx> {
@@ -10254,7 +10748,7 @@ fn collect_demoted_promoted_fields(
                         && let hir::ExprKind::Field(base, _) = expr.kind
                         && self.expr_contains_raw_deref(base)
                     {
-                        self.demoted_fields.insert(field);
+                        self.fields.insert(field);
                     }
                     intravisit::walk_expr(self, expr);
                 }
@@ -10265,10 +10759,10 @@ fn collect_demoted_promoted_fields(
                 typeck: self.typeck,
                 promoted_fields: self.promoted_fields,
                 mutable_fields: self.mutable_fields,
-                demoted_fields: FxHashSet::default(),
+                fields: FxHashSet::default(),
             };
             visitor.visit_expr(expr);
-            self.demoted_fields.extend(visitor.demoted_fields);
+            self.record_conflicts(visitor.fields, ConflictDemotionReason::RawPointeeFieldMove);
         }
 
         fn expr_contains_allocator_call(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
@@ -10314,14 +10808,58 @@ fn collect_demoted_promoted_fields(
                     .is_some_and(|hir_id| self.allocator_locals.contains(&hir_id))
         }
 
-        fn expr_requires_raw_field_storage(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+        fn raw_field_storage_reason(
+            &self,
+            field: StructFieldSlot,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) -> Option<ConflictDemotionReason> {
             if self.expr_is_null_constructor(expr) || hir_raw_addr_local(expr).is_some() {
-                return false;
+                return None;
             }
             if self.expr_is_allocator_root_source(expr) {
-                return true;
+                return Some(ConflictDemotionReason::RawStorageAllocator);
             }
-            unwrap_ptr_from_mir_ty(self.typeck.expr_ty_adjusted(expr)).is_some()
+            if self.raw_storage_source_loses_mutability(field, expr) {
+                return Some(ConflictDemotionReason::RawStoragePointer);
+            }
+            None
+        }
+
+        fn raw_storage_source_loses_mutability(
+            &self,
+            field: StructFieldSlot,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) -> bool {
+            if !self.mutable_fields.contains(&field) {
+                return false;
+            }
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_cast(expr).kind
+                && let Res::Local(hir_id) = path.res
+            {
+                return matches!(
+                    self.ptr_kinds.get(&hir_id),
+                    Some(
+                        PtrKind::Ref(false)
+                            | PtrKind::OptRef(false)
+                            | PtrKind::Slice(false)
+                            | PtrKind::SliceCursor(false)
+                    )
+                );
+            }
+            if let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
+                && let Some(sig_dec) = self.sig_decs.data.get(&callee_did)
+            {
+                return matches!(
+                    sig_dec.output_dec,
+                    Some(
+                        PtrKind::Ref(false)
+                            | PtrKind::OptRef(false)
+                            | PtrKind::Slice(false)
+                            | PtrKind::SliceCursor(false)
+                    )
+                );
+            }
+            false
         }
 
         fn record_allocator_binding(&mut self, hir_id: HirId, expr: &'tcx hir::Expr<'tcx>) {
@@ -10334,8 +10872,8 @@ fn collect_demoted_promoted_fields(
         }
 
         fn record_raw_field_storage(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
-            if self.promoted_fields.contains(&field) && self.expr_requires_raw_field_storage(rhs) {
-                self.demoted_fields.insert(field);
+            if let Some(reason) = self.raw_field_storage_reason(field, rhs) {
+                self.record_conflict(field, reason);
             }
         }
 
@@ -10344,7 +10882,7 @@ fn collect_demoted_promoted_fields(
             if unwrap_ptr_from_mir_ty(self.typeck.node_type(binding_hir_id)).is_none() {
                 return;
             }
-            self.demote_promoted_fields_in_expr(init);
+            self.record_promoted_fields_in_expr(init, ConflictDemotionReason::RawBindingFromField);
         }
 
         fn record_raw_field_call(&mut self, expr: &'tcx hir::Expr<'tcx>) {
@@ -10352,24 +10890,27 @@ fn collect_demoted_promoted_fields(
                 return;
             };
             for arg in args.iter() {
-                self.demote_moved_mutable_fields_from_raw_pointee_arg(arg);
+                self.record_moved_mutable_fields_from_raw_pointee_arg(arg);
             }
             if let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
                 && let Some(sig_dec) = self.sig_decs.data.get(&callee_did)
             {
-                for (arg_index, arg) in args.iter().enumerate() {
-                    if matches!(
-                        sig_dec.input_decs.get(arg_index).copied().flatten(),
-                        Some(PtrKind::Raw(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
-                    ) {
-                        self.demote_promoted_fields_in_expr(arg);
-                    }
-                }
+                let _ = sig_dec;
                 return;
             }
-            for arg in args.iter() {
-                self.demote_promoted_fields_in_expr(arg);
+        }
+
+        fn record_raw_field_pointer_projection(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let hir::ExprKind::MethodCall(seg, receiver, _, _) = expr.kind else {
+                return;
+            };
+            if !matches!(seg.ident.name.as_str(), "wrapping_offset" | "sub") {
+                return;
             }
+            self.record_promoted_fields_in_expr(
+                receiver,
+                ConflictDemotionReason::RawFieldPointerProjection,
+            );
         }
 
         fn record_mutable_field_copy(
@@ -10397,6 +10938,7 @@ fn collect_demoted_promoted_fields(
 
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             self.record_conflicting_reborrow(expr);
+            self.record_raw_field_pointer_projection(expr);
             match expr.kind {
                 hir::ExprKind::Struct(qpath, fields, _) => {
                     if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
@@ -10437,23 +10979,28 @@ fn collect_demoted_promoted_fields(
         }
     }
 
+    let mut conflict_reasons: FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>> =
+        FxHashMap::default();
     for_each_hir_fn_body(tcx, |body, typeck| {
         let mut visitor = FieldBorrowConflictVisitor {
             tcx,
             typeck,
             sig_decs,
+            ptr_kinds,
             promoted_fields: &promoted_fields,
             mutable_fields: &analysis.borrow_promotion_result.mutable_fields,
             allocator_locals: FxHashSet::default(),
             active_borrows: FxHashMap::default(),
             ignored_borrow_exprs: FxHashSet::default(),
-            demoted_fields: FxHashSet::default(),
+            conflict_reasons: FxHashMap::default(),
         };
         visitor.visit_body(body);
-        demoted_fields.extend(visitor.demoted_fields);
+        for (field, reasons) in visitor.conflict_reasons {
+            conflict_reasons.entry(field).or_default().extend(reasons);
+        }
     });
 
-    demoted_fields
+    conflict_reasons
 }
 
 fn for_each_hir_fn_body<'tcx>(
@@ -10655,6 +11202,8 @@ fn emit_promotion_diagnostics(
         sig_decs,
         ptr_kinds,
     );
+    let conflict_reasons =
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds);
     let usage_counts = count_promoted_field_usages(tcx, &promoted_fields);
     let live_fields = promoted_fields
         .iter()
@@ -10711,6 +11260,28 @@ fn emit_promotion_diagnostics(
         promoted_return_lifetimes,
     );
 
+    let mut conflict_reason_stats = FxHashMap::<ConflictDemotionReason, (usize, usize)>::default();
+    for (field, reasons) in &conflict_reasons {
+        for &reason in reasons {
+            let usage_count = usage_counts.get(field).copied().unwrap_or_default();
+            let entry = conflict_reason_stats.entry(reason).or_default();
+            entry.0 += 1;
+            entry.1 += usage_count;
+        }
+    }
+    for reason in ConflictDemotionReason::ALL {
+        let (fields, usages) = conflict_reason_stats
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
+        eprintln!(
+            "[pointer-promotion] conflict reason={} fields={} usages={}",
+            reason.as_str(),
+            fields,
+            usages,
+        );
+    }
+
     if mode != "full" {
         return;
     }
@@ -10736,11 +11307,25 @@ fn emit_promotion_diagnostics(
         } else {
             "live"
         };
+        let label = field_slot_label(tcx, field);
         eprintln!(
             "[pointer-promotion] field {reason} {mutability} uses={} {}",
             usage_counts.get(&field).copied().unwrap_or_default(),
-            field_slot_label(tcx, field),
+            label,
         );
+        if let Some(reasons) = conflict_reasons.get(&field) {
+            let mut reason_names = reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>();
+            reason_names.sort();
+            eprintln!(
+                "[pointer-promotion] field-conflict reasons={} uses={} {}",
+                reason_names.join(","),
+                usage_counts.get(&field).copied().unwrap_or_default(),
+                label,
+            );
+        }
     }
 
     let mut planned_returns = lifetime_plans.functions.keys().copied().collect::<Vec<_>>();
@@ -11464,6 +12049,165 @@ mod tests {
         };
 
         (input, analysis)
+    }
+
+    fn field_conflict_reason_names_for_code(code: &str) -> FxHashMap<String, Vec<&'static str>> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (input, analysis) = build_analysis(tcx);
+            let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
+                simulate_transform_reasons(tcx, &input, &analysis);
+            let mut sig_decs = sig_decs;
+            force_test_input_raw(tcx, &mut sig_decs, "raw_local");
+            let reasons =
+                collect_field_conflict_demotion_reasons(tcx, &analysis, &sig_decs, &ptr_kinds);
+            reasons
+                .into_iter()
+                .map(|(field, reasons)| {
+                    let mut reason_names = reasons
+                        .into_iter()
+                        .map(|reason| reason.as_str())
+                        .collect::<Vec<_>>();
+                    reason_names.sort();
+                    (field_slot_label(tcx, field), reason_names)
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn force_test_input_raw(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions, name: &str) {
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            if !matches!(item.kind, HirItemKind::Fn { .. }) {
+                continue;
+            }
+            if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() != name {
+                continue;
+            }
+            if let Some(sig_dec) = sig_decs.data.get_mut(&item.owner_id.def_id)
+                && !sig_dec.input_decs.is_empty()
+            {
+                sig_dec.input_decs[0] = Some(PtrKind::Raw(true));
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_diagnostics_collect_all_conflict_reasons_for_field() {
+        let reasons = field_conflict_reason_names_for_code(
+            r#"
+extern "C" {
+    fn foreign(p: *mut i32);
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub q: *mut i32,
+}
+
+#[repr(C)]
+pub struct Other {
+    pub r: *mut i32,
+}
+
+pub unsafe fn raw_local(p: *mut i32) {
+    foreign(p);
+}
+
+pub unsafe fn conflict(mut x: i32, mut y: i32, raw: *mut i32, owner: *mut Holder) {
+    let mut h = Holder { p: &raw mut x, q: &raw mut x };
+    let mut other = Other { r: &raw mut x };
+    *h.p = 1;
+    *h.q = 2;
+    *other.r = 3;
+    let _raw_binding: *mut i32 = h.p;
+    let _q_raw_binding: *mut i32 = h.q;
+    x = 2;
+    let _reborrow = &mut x;
+    foreign(h.p);
+    foreign(h.q);
+    raw_local(h.p);
+    let _offset = h.p.sub(1);
+    h.p = raw;
+    h.p = malloc(4) as *mut i32;
+    y = 2;
+    h.q = &raw mut y;
+    y = 3;
+    (*owner).p = h.p;
+    raw_local((*owner).p);
+}
+"#,
+        );
+        let incompatible_raw_storage_reasons = field_conflict_reason_names_for_code(
+            r#"
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct PrintBuf {
+    pub buffer: *mut State,
+}
+
+pub unsafe fn print_preallocated_like(buffer: *mut State) -> i32 {
+    let mut p = PrintBuf { buffer: std::ptr::null_mut::<State>() };
+    p.buffer = buffer;
+    if p.buffer.is_null() {
+        0
+    } else {
+        1
+    }
+}
+"#,
+        );
+
+        let all_reasons = reasons
+            .values()
+            .chain(incompatible_raw_storage_reasons.values())
+            .flat_map(|reasons| reasons.iter().copied())
+            .collect::<FxHashSet<_>>();
+        for expected in [
+            "active_borrow_overlap",
+            "conflicting_reborrow",
+            "local_assignment_while_borrowed",
+            "mutable_field_copy",
+            "raw_binding_from_field",
+            "raw_field_pointer_projection",
+            "raw_pointee_field_move",
+            "raw_storage_allocator",
+            "raw_storage_pointer",
+        ] {
+            assert!(
+                all_reasons.contains(expected),
+                "expected {expected} in conflict reasons: {all_reasons:?}; all reasons: {reasons:?}"
+            );
+        }
+
+        let holder_p = reasons
+            .iter()
+            .find(|(field, _)| field.ends_with("Holder.p"))
+            .map(|(_, reasons)| reasons)
+            .unwrap_or_else(|| panic!("Holder.p missing from conflict reasons: {reasons:?}"));
+        for expected in [
+            "mutable_field_copy",
+            "raw_binding_from_field",
+            "raw_field_pointer_projection",
+            "raw_pointee_field_move",
+            "raw_storage_allocator",
+        ] {
+            assert!(
+                holder_p.contains(&expected),
+                "expected {expected} in Holder.p conflict reasons: {holder_p:?}; all reasons: {reasons:?}"
+            );
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
