@@ -15,7 +15,10 @@ use transform::TransformVisitor;
 use crate::{
     analyses::{
         self,
-        borrow::PromotedMutRefs as PromotedMutRefResult,
+        borrow::{
+            BorrowPromotionResults, PromotedMutRefs as PromotedMutRefResult,
+            lifetime_flow::LifetimeFlowResults,
+        },
         offset_sign::sign::OffsetSignResult,
         output_params::OutputParams,
         ownership::{
@@ -29,10 +32,15 @@ use crate::{
 
 mod collector;
 mod decision;
+mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
 
 pub struct Analysis {
+    #[allow(dead_code)]
+    borrow_promotion_result: BorrowPromotionResults,
+    #[allow(dead_code)]
+    borrow_lifetime_flows: LifetimeFlowResults,
     promoted_mut_ref_result: PromotedMutRefResult,
     promoted_shared_ref_result: PromotedMutRefResult,
     mutability_result: MutabilityResult,
@@ -85,10 +93,11 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
     let borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-    let promoted_mut_ref_result =
-        source_var_groups.postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals);
-    let promoted_shared_ref_result =
-        source_var_groups.postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals);
+    let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+    let promoted_mut_ref_result = source_var_groups
+        .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+    let promoted_shared_ref_result = source_var_groups
+        .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
@@ -97,6 +106,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let analysis_results = Analysis {
+        borrow_promotion_result,
+        borrow_lifetime_flows,
         promoted_mut_ref_result,
         promoted_shared_ref_result,
         mutability_result,

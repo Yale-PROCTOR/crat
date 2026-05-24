@@ -1,10 +1,15 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    self as hir, HirId,
+    def::Res,
+    intravisit::{self, Visitor},
+};
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{Local, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{self, TyCtxt},
 };
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{Symbol, def_id::LocalDefId};
 
 use super::{Analysis, collector::collect_fn_ptrs};
 use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
@@ -246,8 +251,45 @@ impl<'tcx> DecisionMaker<'tcx> {
 pub struct SigDecision {
     /// None means no change
     pub input_decs: Vec<Option<PtrKind>>,
+    pub input_lifetimes: Vec<Option<Symbol>>,
     pub output_dec: Option<PtrKind>,
+    pub output_lifetime: Option<Symbol>,
     pub signature_locked: bool,
+}
+
+impl SigDecision {
+    pub(crate) fn set_input_dec(&mut self, idx: usize, decision: Option<PtrKind>) {
+        self.input_decs[idx] = decision;
+        if !decision_carries_lifetime(decision)
+            && let Some(lifetime) = self.input_lifetimes.get_mut(idx)
+        {
+            *lifetime = None;
+        }
+    }
+
+    pub(crate) fn set_output_dec(&mut self, decision: Option<PtrKind>) {
+        self.output_dec = decision;
+        if !decision_carries_lifetime(decision) {
+            self.output_lifetime = None;
+        }
+    }
+
+    fn normalize_lifetimes(&mut self) {
+        for idx in 0..self.input_decs.len() {
+            if !decision_carries_lifetime(self.input_decs[idx])
+                && let Some(lifetime) = self.input_lifetimes.get_mut(idx)
+            {
+                *lifetime = None;
+            }
+        }
+        if !decision_carries_lifetime(self.output_dec) {
+            self.output_lifetime = None;
+        }
+    }
+}
+
+fn decision_carries_lifetime(decision: Option<PtrKind>) -> bool {
+    matches!(decision, Some(PtrKind::Ref(_) | PtrKind::OptRef(_)))
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -256,7 +298,11 @@ pub struct SigDecisions {
 }
 
 impl SigDecisions {
-    pub fn new(rust_program: &RustProgram, analysis: &Analysis) -> Self {
+    pub fn new(
+        rust_program: &RustProgram,
+        analysis: &Analysis,
+        lifetime_plans: &super::lifetimes::LifetimePlans,
+    ) -> Self {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());
 
@@ -264,21 +310,21 @@ impl SigDecisions {
         let fn_ptrs = collect_fn_ptrs(rust_program);
 
         for did in rust_program.functions.iter() {
+            let input_len = rust_program
+                .tcx
+                .fn_sig(*did)
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .len();
             if fn_ptrs.contains(did) {
                 data.insert(
                     *did,
                     SigDecision {
-                        input_decs: vec![
-                            None;
-                            rust_program
-                                .tcx
-                                .fn_sig(*did)
-                                .skip_binder()
-                                .inputs()
-                                .skip_binder()
-                                .len()
-                        ],
+                        input_decs: vec![None; input_len],
+                        input_lifetimes: vec![None; input_len],
                         output_dec: None,
+                        output_lifetime: None,
                         signature_locked: true,
                     },
                 );
@@ -292,7 +338,18 @@ impl SigDecisions {
                 .borrow();
 
             let sig = rust_program.tcx.fn_sig(*did).skip_binder();
-            let input_len = sig.inputs().skip_binder().len();
+            debug_assert_eq!(input_len, sig.inputs().skip_binder().len());
+            let lifetime_plan = lifetime_plans
+                .functions
+                .get(did)
+                .cloned()
+                .unwrap_or_default();
+            let output_lifetime = lifetime_plan.output_lifetime;
+            let input_lifetimes = if lifetime_plan.input_lifetimes.len() == input_len {
+                lifetime_plan.input_lifetimes.clone()
+            } else {
+                vec![None; input_len]
+            };
 
             let aliases = analysis.aliases.get(did);
 
@@ -312,6 +369,11 @@ impl SigDecisions {
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
             let direct_output_dec =
                 match decision_maker.decide(return_local, return_decl, return_aliases) {
+                    Some(kind @ (PtrKind::Ref(_) | PtrKind::OptRef(_)))
+                        if output_lifetime.is_some() =>
+                    {
+                        Some(kind)
+                    }
                     Some(
                         kind @ (PtrKind::Raw(_)
                         | PtrKind::OptBox
@@ -343,17 +405,236 @@ impl SigDecisions {
                 (None, None) => None,
             };
 
-            data.insert(
-                *did,
-                SigDecision {
+            data.insert(*did, {
+                let mut sig_dec = SigDecision {
                     input_decs,
+                    input_lifetimes,
                     output_dec,
+                    output_lifetime,
                     signature_locked: false,
-                },
-            );
+                };
+                apply_return_borrow_lifetime_plan(
+                    *did,
+                    body,
+                    &lifetime_plan,
+                    &decision_maker,
+                    &mut sig_dec,
+                );
+                sig_dec.normalize_lifetimes();
+                sig_dec
+            });
         }
         SigDecisions { data }
     }
+}
+
+fn apply_return_borrow_lifetime_plan<'tcx>(
+    did: LocalDefId,
+    body: &rustc_middle::mir::Body<'tcx>,
+    lifetime_plan: &super::lifetimes::FnLifetimePlan,
+    decision_maker: &DecisionMaker<'tcx>,
+    sig_dec: &mut SigDecision,
+) {
+    let Some(output_lifetime) = lifetime_plan.output_lifetime else {
+        return;
+    };
+    let return_local = Local::from_u32(0);
+    let Some((_, output_mutability)) =
+        super::transform::unwrap_ptr_from_mir_ty(body.local_decls[return_local].ty)
+    else {
+        return;
+    };
+
+    let mut returned_inputs = Vec::new();
+    for (idx, lifetime) in lifetime_plan.input_lifetimes.iter().enumerate() {
+        if *lifetime != Some(output_lifetime) {
+            continue;
+        }
+        if !matches!(
+            sig_dec.input_decs.get(idx).copied().flatten(),
+            Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
+        ) {
+            return;
+        }
+        let local = Local::from_usize(idx + 1);
+        let Some((_, input_mutability)) =
+            super::transform::unwrap_ptr_from_mir_ty(body.local_decls[local].ty)
+        else {
+            return;
+        };
+        returned_inputs.push((idx, input_mutability.is_mut()));
+    }
+    if returned_inputs.is_empty() {
+        return;
+    }
+
+    let return_kind =
+        if return_place_may_receive_null_constructor(body, decision_maker.tcx, return_local) {
+            PtrKind::OptRef(output_mutability.is_mut())
+        } else {
+            PtrKind::Ref(output_mutability.is_mut())
+        };
+    for (idx, is_mut) in returned_inputs {
+        let input_kind = if return_kind.is_optional()
+            || returned_input_is_observed_nullable(decision_maker.tcx, did, idx)
+        {
+            PtrKind::OptRef
+        } else {
+            PtrKind::Ref
+        };
+        sig_dec.set_input_dec(idx, Some(input_kind(is_mut)));
+        sig_dec.input_lifetimes[idx] = Some(output_lifetime);
+    }
+    sig_dec.set_output_dec(Some(return_kind));
+    sig_dec.output_lifetime = Some(output_lifetime);
+}
+
+fn returned_input_is_observed_nullable(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> bool {
+    fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+        let expr = match expr.kind {
+            hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) => inner,
+            _ => expr,
+        };
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind else {
+            return None;
+        };
+        let Res::Local(hir_id) = path.res else {
+            return None;
+        };
+        Some(hir_id)
+    }
+
+    struct NullableUseVisitor {
+        param: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for NullableUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::MethodCall(seg, receiver, _, _) = expr.kind
+                && seg.ident.name.as_str() == "is_null"
+                && hir_unwrapped_local_id(receiver) == Some(self.param)
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return false;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return false;
+    };
+    let body = tcx.hir_body(body);
+    let Some(param) = body.params.get(idx) else {
+        return false;
+    };
+    let hir::PatKind::Binding(_, param_hir_id, _, _) = param.pat.kind else {
+        return false;
+    };
+    let mut visitor = NullableUseVisitor {
+        param: param_hir_id,
+        found: false,
+    };
+    visitor.visit_body(body);
+    visitor.found
+}
+
+fn return_place_may_receive_null_constructor<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    return_local: Local,
+) -> bool {
+    fn is_null_like_call<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
+        let Some(func_const) = func.constant() else {
+            return false;
+        };
+        let ty::TyKind::FnDef(def_id, _) = func_const.ty().kind() else {
+            return false;
+        };
+        matches!(tcx.item_name(*def_id).as_str(), "null" | "null_mut")
+    }
+
+    fn const_is_zero(value: &rustc_middle::mir::Const<'_>, tcx: TyCtxt<'_>) -> bool {
+        if let Some(scalar) = value.try_to_scalar()
+            && let Ok(int) = scalar.try_to_scalar_int()
+        {
+            return int.to_bits(int.size()) == 0;
+        }
+        if let rustc_middle::mir::Const::Unevaluated(unevaluated, _) = value
+            && unevaluated.promoted.is_none()
+            && let Ok(rustc_middle::mir::ConstValue::Scalar(scalar)) =
+                tcx.const_eval_poly(unevaluated.def)
+            && let Ok(int) = scalar.try_to_scalar_int()
+        {
+            return int.to_bits(int.size()) == 0;
+        }
+        false
+    }
+
+    fn operand_is_zero(operand: &Operand<'_>, tcx: TyCtxt<'_>) -> bool {
+        let Operand::Constant(constant) = operand else {
+            return false;
+        };
+        const_is_zero(&constant.const_, tcx)
+    }
+
+    let mut nullable = DenseBitSet::new_empty(body.local_decls.len());
+    loop {
+        let mut changed = false;
+        for bb in body.basic_blocks.iter() {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                let Some(destination) = place.as_local() else {
+                    continue;
+                };
+                let source_nullable = match rvalue {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) => src
+                        .as_local()
+                        .is_some_and(|source| nullable.contains(source)),
+                    Rvalue::Use(operand) if body.local_decls[destination].ty.is_raw_ptr() => {
+                        operand_is_zero(operand, tcx)
+                    }
+                    Rvalue::Cast(_, operand, ty) if ty.is_raw_ptr() => {
+                        operand_is_zero(operand, tcx)
+                    }
+                    _ => false,
+                };
+                if source_nullable {
+                    changed |= nullable.insert(destination);
+                }
+            }
+
+            let Some(terminator) = &bb.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                func, destination, ..
+            } = &terminator.kind
+            else {
+                continue;
+            };
+            if is_null_like_call(tcx, func)
+                && let Some(destination) = destination.as_local()
+            {
+                changed |= nullable.insert(destination);
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    nullable.contains(return_local)
 }
 
 fn infer_returned_local_box_kind<'tcx>(
@@ -758,5 +1039,39 @@ pub unsafe fn foo(p: *mut i32, q: *mut i32) {
             );
         });
         assert_eq!(decision, Some(PtrKind::Raw(true)));
+    }
+
+    #[test]
+    fn sig_decision_clears_input_lifetime_when_downgraded_to_raw() {
+        let lifetime = Symbol::new(1);
+        let mut sig_dec = SigDecision {
+            input_decs: vec![Some(PtrKind::OptRef(true))],
+            input_lifetimes: vec![Some(lifetime)],
+            output_dec: Some(PtrKind::OptRef(true)),
+            output_lifetime: Some(lifetime),
+            signature_locked: false,
+        };
+
+        sig_dec.set_input_dec(0, Some(PtrKind::Raw(true)));
+
+        assert_eq!(sig_dec.input_lifetimes, vec![None]);
+        assert_eq!(sig_dec.output_lifetime, Some(lifetime));
+    }
+
+    #[test]
+    fn sig_decision_clears_output_lifetime_when_downgraded_to_raw() {
+        let lifetime = Symbol::new(1);
+        let mut sig_dec = SigDecision {
+            input_decs: vec![Some(PtrKind::OptRef(true))],
+            input_lifetimes: vec![Some(lifetime)],
+            output_dec: Some(PtrKind::OptRef(true)),
+            output_lifetime: Some(lifetime),
+            signature_locked: false,
+        };
+
+        sig_dec.set_output_dec(Some(PtrKind::Raw(true)));
+
+        assert_eq!(sig_dec.input_lifetimes, vec![Some(lifetime)]);
+        assert_eq!(sig_dec.output_lifetime, None);
     }
 }
