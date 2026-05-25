@@ -532,10 +532,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
                 let lhs_hir_id = if let ExprKind::Path(_, _) = lhs.kind
                     && let Some(hir_id) = self.hir_id_of_path(lhs.id)
-                    && let ExprKind::Path(_, path) = &lhs.kind
-                    && let Some(seg) = path.segments.last()
                 {
-                    let _ = seg;
                     Some(hir_id)
                 } else {
                     None
@@ -4867,7 +4864,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "if ({0}).is_null() {{
                     None
                 }} else {{
-                    Some(unsafe {{ Box::from_raw(({0}) as *mut {1}) }})
+                    Some(Box::from_raw(({0}) as *mut {1}))
                 }}",
                 pprust::expr_to_string(e),
                 lhs_ty,
@@ -4879,7 +4876,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         None
                     }} else {{
-                        Some(unsafe {{ Box::from_raw(_x as *mut {}) }})
+                        Some(Box::from_raw(_x as *mut {}))
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -8990,7 +8987,7 @@ fn ty_supports_scalar_box_from_raw_bridge(ty: ty::Ty<'_>) -> bool {
 
 fn scalar_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str) -> Expr {
     utils::expr!(
-        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(unsafe {{ Box::from_raw((__crat_raw_free) as *mut {}) }}); }} }}",
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(Box::from_raw((__crat_raw_free) as *mut {})); }} }}",
         arg_str,
         inner_ty_str,
     )
@@ -8998,7 +8995,7 @@ fn scalar_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str) -> Expr {
 
 fn array_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str, len_expr: &str) -> Expr {
     utils::expr!(
-        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(unsafe {{ Box::from_raw(std::ptr::slice_from_raw_parts_mut((__crat_raw_free) as *mut {}, ({}) as usize)) }}); }} }}",
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut((__crat_raw_free) as *mut {}, ({}) as usize))); }} }}",
         arg_str,
         inner_ty_str,
         len_expr,
@@ -12248,6 +12245,11 @@ fn emit_ownership_field_diagnostics(
     sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) {
+    let mode = std::env::var("CRAT_POINTER_OWNERSHIP_FIELD_DIAGNOSTICS").ok();
+    if !diagnostics_env_value_enabled(mode.as_deref()) {
+        return;
+    }
+
     let diagnostics = collect_ownership_field_diagnostics(tcx, analysis, sig_decs, ptr_kinds);
     eprintln!(
         "[pointer-ownership-fields] fields total={} selected_opt_box={} blocked={}",
@@ -12267,6 +12269,10 @@ fn emit_ownership_field_diagnostics(
             );
         }
     }
+}
+
+fn diagnostics_env_value_enabled(mode: Option<&str>) -> bool {
+    mode.is_some_and(|mode| !mode.is_empty() && mode != "0" && !mode.eq_ignore_ascii_case("false"))
 }
 
 fn collect_struct_shape_demoted_fields(
@@ -13599,6 +13605,17 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
                 .copied(),
             Some(1),
         );
+    }
+
+    #[test]
+    fn diagnostics_env_value_enabled_requires_truthy_value() {
+        assert!(!diagnostics_env_value_enabled(None));
+        assert!(!diagnostics_env_value_enabled(Some("")));
+        assert!(!diagnostics_env_value_enabled(Some("0")));
+        assert!(!diagnostics_env_value_enabled(Some("false")));
+        assert!(!diagnostics_env_value_enabled(Some("FALSE")));
+        assert!(diagnostics_env_value_enabled(Some("1")));
+        assert!(diagnostics_env_value_enabled(Some("full")));
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

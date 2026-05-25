@@ -189,7 +189,7 @@ pub unsafe fn stash(owner: *mut Holder) {
             "pub data: Option<Box<i32>>",
             "Box::from_raw((data) as *mut i32)",
         ],
-        &["pub data: *mut i32", "(*owner).data = data;"],
+        &["pub data: *mut i32", "(*owner).data = data;", "unsafe {"],
     );
 }
 
@@ -3169,7 +3169,7 @@ pub unsafe fn cleanup() {
 }
 "#,
         &["let __crat_raw_free =", "Box::from_raw((__crat_raw_free)"],
-        &["Box::from_raw((alloc_node()"],
+        &["Box::from_raw((alloc_node()", "unsafe {"],
     );
 }
 
