@@ -266,9 +266,10 @@ impl FnPtrRewriteDecision {
             for (hir_id, local) in &hir_to_mir.binding_to_local {
                 let var = Var::Local(fn_did, *local);
                 if let Some(&loc) = pre.vars.get(&var)
-                    && let Some(decs) = loc_decisions.get(&loc) {
-                        annotation_decisions.insert(*hir_id, decs.clone());
-                    }
+                    && let Some(decs) = loc_decisions.get(&loc)
+                {
+                    annotation_decisions.insert(*hir_id, decs.clone());
+                }
             }
         }
 
