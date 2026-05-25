@@ -1609,6 +1609,30 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
 }
 
 #[test]
+fn test_rewriter_cursor_numeric_cast_uses_bytemuck_not_raw_parts() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+pub unsafe fn container_from_b(i: *const i32) -> *const Pair {
+    ((i as *const i8).offset(-(4 as isize))) as *const Pair
+}
+"#,
+        &[
+            "pub unsafe fn container_from_b(i: crate::slice_cursor::SliceCursor<'_, i32>)",
+            "bytemuck::cast_slice::<_,",
+            "i8>((i).as_slice())",
+            ".seek((-(4 as isize)) as isize)",
+        ],
+        &["crate::slice_cursor::SliceCursor::from_raw_parts((i).as_ptr()"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_field_passed_to_unknown_raw_call() {
     run_test(
         r#"
