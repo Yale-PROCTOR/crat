@@ -5559,14 +5559,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         };
         if !need_cast {
             e.clone()
-        } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
+        } else if !m
+            && lhs_inner_ty.is_numeric()
+            && rhs_inner_ty.is_numeric()
+            && !utils::ast::has_side_effects(e)
+        {
+            self.bytemuck.set(true);
             utils::expr!(
-                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 1_000_000)",
+                "{}::new(bytemuck::cast_slice::<_, {}>(({}).as_slice()))",
                 cursor_ty,
-                if m { "_mut" } else { "" },
-                pprust::expr_to_string(e),
-                if m { "mut" } else { "const" },
                 mir_ty_to_string(lhs_inner_ty, self.tcx),
+                pprust::expr_to_string(e),
             )
         } else {
             utils::expr!(
