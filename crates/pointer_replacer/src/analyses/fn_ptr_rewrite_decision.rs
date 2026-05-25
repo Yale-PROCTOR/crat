@@ -72,191 +72,53 @@ impl FnPtrRewriteDecision {
             individual_decisions.insert(did, decs);
         }
 
-        // --- Step 2: call-site alias check ---
+        // --- Step 2: call-site alias check (Andersen overlap) ---
 
-        // Build group_members: rep → members
-        let mut group_members: FxHashMap<LocalDefId, Vec<LocalDefId>> = FxHashMap::default();
-        for (&did, &rep) in &fn_ptr_groups.fn_to_group {
-            group_members.entry(rep).or_default().push(did);
-        }
+        // forced_raw[rep][i] means: position i in this group's decisions must be None (raw pointer).
+        let mut forced_raw: FxHashMap<LocalDefId, FxHashSet<usize>> = FxHashMap::default();
 
-        let mut disqualified: FxHashSet<LocalDefId> = FxHashSet::default();
+        for (caller, bb_to_slot) in &pre.indirect_calls {
+            let Some(bb_to_args) = pre.indirect_call_args.get(caller) else { continue };
+            for (bb, &slot_loc) in bb_to_slot {
+                let Some(arg_locs) = bb_to_args.get(bb) else { continue };
 
-        // Build inverse map: Andersen Loc → (fn_did, MIR local) so we can trace copies.
-        let mut inv_vars: FxHashMap<andersen::Loc, (LocalDefId, rustc_middle::mir::Local)> =
-            FxHashMap::default();
-        for (var, &loc) in &pre.vars {
-            if let Var::Local(fn_did, local) = *var {
-                inv_vars.insert(loc, (fn_did, local));
-            }
-        }
-
-        // Helper: build a copy-source map for a MIR body (local → source for simple copies).
-        let build_copy_src =
-            |body: &rustc_middle::mir::Body<'_>|
-             -> FxHashMap<rustc_middle::mir::Local, rustc_middle::mir::Local> {
-                let mut copy_src = FxHashMap::default();
-                for bb_data in body.basic_blocks.iter() {
-                    for stmt in &bb_data.statements {
-                        if let rustc_middle::mir::StatementKind::Assign(box (
-                            dst,
-                            rustc_middle::mir::Rvalue::Use(
-                                rustc_middle::mir::Operand::Copy(src)
-                                | rustc_middle::mir::Operand::Move(src),
-                            ),
-                        )) = &stmt.kind
-                            && dst.projection.is_empty() && src.projection.is_empty() {
-                                copy_src.insert(dst.local, src.local);
-                            }
-                    }
-                }
-                copy_src
-            };
-
-        // Follow the copy chain to its source (up to 64 steps).
-        let resolve_local =
-            |mut local: rustc_middle::mir::Local,
-             copy_src: &FxHashMap<rustc_middle::mir::Local, rustc_middle::mir::Local>|
-             -> rustc_middle::mir::Local {
-                for _ in 0..64 {
-                    match copy_src.get(&local) {
-                        Some(&src) => local = src,
-                        None => break,
-                    }
-                }
-                local
-            };
-
-        // Check 1 (inner-aliasing): for each indirect call site, inspect the MIR terminator
-        // args within the dispatch function's body. This catches `cb(p, p)` patterns where
-        // the dispatch function itself passes the same local to multiple parameter positions.
-        for (&caller_did, bb_to_callee_loc) in &pre.indirect_calls {
-            let body = &*tcx
-                .mir_drops_elaborated_and_const_checked(caller_did)
-                .borrow();
-            let copy_src = build_copy_src(body);
-
-            for (&bb, &callee_loc) in bb_to_callee_loc {
-                let pointed_reps: FxHashSet<LocalDefId> = solutions[callee_loc]
+                let reps: FxHashSet<LocalDefId> = solutions[slot_loc]
                     .iter()
                     .filter_map(|loc| pre.inv_fns.get(&loc))
                     .filter_map(|did| fn_ptr_groups.fn_to_group.get(did))
                     .copied()
                     .collect();
-                if pointed_reps.is_empty() {
+
+                if reps.is_empty() {
                     continue;
                 }
 
-                let rustc_middle::mir::TerminatorKind::Call { args, .. } =
-                    &body.basic_blocks[bb].terminator().kind
-                else {
-                    continue;
-                };
-
-                let source_locals: Vec<Option<rustc_middle::mir::Local>> = args
-                    .iter()
-                    .map(|a| {
-                        let local = a.node.place()?.as_local()?;
-                        Some(resolve_local(local, &copy_src))
-                    })
-                    .collect();
-
-                let n = source_locals.len();
-                let aliased = (0..n).any(|i| {
-                    (0..i).any(|j| {
-                        matches!(
-                            (source_locals[i], source_locals[j]),
-                            (Some(a), Some(b)) if a == b
-                        )
-                    })
-                });
-
-                if aliased {
-                    for rep in &pointed_reps {
-                        for &member in group_members.get(rep).into_iter().flatten() {
-                            disqualified.insert(member);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check 2 (outer-aliasing): for each dispatch function, look at its callers via
-        // pre.call_args. If a caller passes the same pointer to two parameter positions of
-        // the dispatch function (e.g., `call_it(f, x, x)`), the fn-ptr group is aliased.
-        for (dispatch_did, bb_to_callee_loc) in &pre.indirect_calls {
-            let targeted_reps: FxHashSet<LocalDefId> = bb_to_callee_loc
-                .values()
-                .flat_map(|callee_loc| solutions[*callee_loc].iter())
-                .filter_map(|loc| pre.inv_fns.get(&loc))
-                .filter_map(|did| fn_ptr_groups.fn_to_group.get(did))
-                .copied()
-                .collect();
-            if targeted_reps.is_empty() {
-                continue;
-            }
-
-            let Some(call_sites) = pre.call_args.get(dispatch_did) else {
-                continue;
-            };
-
-            let mut any_aliased = false;
-            'sites: for site_args in call_sites {
-                // site_args[0] is the fn-ptr argument; real params start at index 1.
-                let real_args: Vec<Option<andersen::Loc>> = if site_args.len() > 1 {
-                    site_args[1..].to_vec()
-                } else {
-                    continue;
-                };
-
-                let source_locals: Vec<Option<(LocalDefId, rustc_middle::mir::Local)>> = real_args
-                    .iter()
-                    .map(|opt_loc| {
-                        let loc = (*opt_loc)?;
-                        let &(caller_did, local) = inv_vars.get(&loc)?;
-                        let body = &*tcx
-                            .mir_drops_elaborated_and_const_checked(caller_did)
-                            .borrow();
-                        let copy_src = build_copy_src(body);
-                        let resolved = resolve_local(local, &copy_src);
-                        Some((caller_did, resolved))
-                    })
-                    .collect();
-
-                for i in 0..source_locals.len() {
-                    for j in (i + 1)..source_locals.len() {
-                        let (Some(src_i), Some(src_j)) = (source_locals[i], source_locals[j])
-                        else {
+                for i in 0..arg_locs.len() {
+                    for j in 0..i {
+                        let (Some(loc_i), Some(loc_j)) = (arg_locs[i], arg_locs[j]) else {
                             continue;
                         };
-                        if src_i == src_j {
-                            any_aliased = true;
-                            break 'sites;
+                        let mut sol = solutions[loc_i].clone();
+                        sol.intersect(&solutions[loc_j]);
+                        if !sol.is_empty() {
+                            for &rep in &reps {
+                                let positions = forced_raw.entry(rep).or_default();
+                                positions.insert(i);
+                                positions.insert(j);
+                            }
                         }
-                    }
-                }
-            }
-
-            if any_aliased {
-                for rep in &targeted_reps {
-                    for &member in group_members.get(rep).into_iter().flatten() {
-                        disqualified.insert(member);
                     }
                 }
             }
         }
 
-        let direct_rewrite: FxHashSet<LocalDefId> = fn_ptr_groups
-            .fn_to_group
-            .keys()
-            .copied()
-            .filter(|did| !disqualified.contains(did))
-            .collect();
-        let needs_wrapper = disqualified;
+        let direct_rewrite: FxHashSet<LocalDefId> =
+            fn_ptr_groups.fn_to_group.keys().copied().collect();
+        let needs_wrapper: FxHashSet<LocalDefId> = FxHashSet::default();
 
-        // --- Step 3: annotation propagation for direct_rewrite groups only ---
+        // --- Step 3: annotation propagation for all groups ---
 
-        // Build loc_decisions only for groups where ALL members are in direct_rewrite
+        // Build loc_decisions for all groups, applying forced_raw overrides.
         let mut loc_decisions: FxHashMap<andersen::Loc, Vec<Option<PtrKind>>> =
             FxHashMap::default();
 
@@ -268,15 +130,21 @@ impl FnPtrRewriteDecision {
                 .next()
                 .copied();
             if let Some(rep) = maybe_rep {
-                // Only include if all group members are in direct_rewrite
-                let all_direct = group_members
-                    .get(&rep)
-                    .map(|members| members.iter().all(|m| direct_rewrite.contains(m)))
-                    .unwrap_or(false);
-                if all_direct
-                    && let Some(decs) = fn_ptr_groups.group_decisions.get(&rep) {
-                        loc_decisions.insert(v, decs.clone());
-                    }
+                if let Some(decs) = fn_ptr_groups.group_decisions.get(&rep) {
+                    let forced = forced_raw.get(&rep);
+                    let modified_decs: Vec<Option<PtrKind>> = decs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &d)| {
+                            if forced.is_some_and(|f| f.contains(&i)) {
+                                None
+                            } else {
+                                d
+                            }
+                        })
+                        .collect();
+                    loc_decisions.insert(v, modified_decs);
+                }
             }
         }
 
@@ -560,7 +428,10 @@ pub unsafe fn test(x: *const i32, y: *const i32) -> i32 {
     }
 
     #[test]
-    fn aliasing_arguments_at_call_site_give_needs_wrapper() {
+    fn outer_aliasing_with_opaque_ptr_gives_direct_rewrite() {
+        // x has no tracked allocation in Andersen (opaque parameter),
+        // so the outer aliasing call_it(f, x, x) is not detected.
+        // Both f and g remain in direct_rewrite; needs_wrapper is always empty.
         let code = r#"
 pub unsafe fn f(p: *mut i32, q: *mut i32) { *p = *q; }
 pub unsafe fn g(p: *mut i32, q: *mut i32) { *p += *q; }
@@ -576,20 +447,16 @@ pub unsafe fn test(x: *mut i32) {
         let did_f = find_did(&named, "f");
         let did_g = find_did(&named, "g");
         assert!(
-            decision.needs_wrapper.contains(&did_f),
-            "f should be in needs_wrapper"
+            decision.direct_rewrite.contains(&did_f),
+            "f should be in direct_rewrite"
         );
         assert!(
-            decision.needs_wrapper.contains(&did_g),
-            "g should be in needs_wrapper"
+            decision.direct_rewrite.contains(&did_g),
+            "g should be in direct_rewrite"
         );
         assert!(
-            !decision.direct_rewrite.contains(&did_f),
-            "f should not be in direct_rewrite"
-        );
-        assert!(
-            !decision.direct_rewrite.contains(&did_g),
-            "g should not be in direct_rewrite"
+            decision.needs_wrapper.is_empty(),
+            "needs_wrapper should always be empty"
         );
     }
 
@@ -619,29 +486,49 @@ pub unsafe fn test(p: *const i32) -> i32 {
     }
 
     #[test]
-    fn dispatch_fn_aliasing_args_gives_needs_wrapper() {
-        // The dispatch function itself passes p twice to the fn-ptr call site.
+    fn aliasing_with_tracked_alloc_forces_positions_to_raw() {
+        // dispatch receives two separate args; the caller passes the same stack
+        // address for both. solutions[p] ∩ solutions[q] = {Loc(x)} → non-empty
+        // → forced raw at positions 0 and 1. f remains in direct_rewrite.
         let code = r#"
 pub unsafe fn f(p: *mut i32, q: *mut i32) { *p = *q; }
-pub unsafe fn dispatch(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32) {
-    cb(p, p);
+pub unsafe fn dispatch(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32, q: *mut i32) {
+    cb(p, q)
 }
-pub unsafe fn test(x: *mut i32) { dispatch(f, x); }
+pub unsafe fn test() {
+    let mut x: i32 = 0;
+    let px = &raw mut x;
+    dispatch(f, px, px);
+}
 "#;
         let (decision, named) = build_rewrite_decision_for(code);
         let did_f = find_did(&named, "f");
         assert!(
-            decision.needs_wrapper.contains(&did_f),
-            "f should be needs_wrapper: dispatch calls cb(p, p) which aliases"
+            decision.direct_rewrite.contains(&did_f),
+            "f should be in direct_rewrite"
         );
         assert!(
-            !decision.direct_rewrite.contains(&did_f),
-            "f should not be in direct_rewrite"
+            decision.needs_wrapper.is_empty(),
+            "needs_wrapper should always be empty"
+        );
+        // All annotation decisions have None at the aliased positions (forced raw).
+        assert!(
+            !decision.annotation_decisions.is_empty(),
+            "annotation_decisions should be non-empty (group is still rewritten)"
+        );
+        assert!(
+            decision
+                .annotation_decisions
+                .values()
+                .all(|decs| decs.iter().all(|d| d.is_none())),
+            "annotation_decisions should have all-None entries for aliased group"
         );
     }
 
     #[test]
-    fn aliasing_group_leaves_annotation_decisions_empty() {
+    fn outer_aliasing_with_opaque_ptr_populates_annotation_decisions() {
+        // Outer aliasing call_it(f, x, x) with opaque x is not detected by Andersen.
+        // No forced_raw is applied, so annotation_decisions are populated normally.
         let code = r#"
 pub unsafe fn f(p: *mut i32, q: *mut i32) { *p = *q; }
 pub unsafe fn call_it(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32, q: *mut i32) {
@@ -649,10 +536,11 @@ pub unsafe fn call_it(cb: unsafe fn(*mut i32, *mut i32), p: *mut i32, q: *mut i3
 }
 pub unsafe fn test(x: *mut i32) { call_it(f, x, x); }
 "#;
-        let (decision, _named) = build_rewrite_decision_for(code);
-        assert!(
-            decision.annotation_decisions.is_empty(),
-            "annotation_decisions should be empty when group is aliasing"
-        );
+        let (decision, named) = build_rewrite_decision_for(code);
+        // needs_wrapper is always empty
+        assert!(decision.needs_wrapper.is_empty());
+        // f is in direct_rewrite
+        let did_f = find_did(&named, "f");
+        assert!(decision.direct_rewrite.contains(&did_f));
     }
 }

@@ -94,7 +94,6 @@ impl FnPtrGroups {
             let input_len = tcx.fn_sig(*rep).skip_binder().inputs().skip_binder().len();
 
             let mut all_input_decs: Vec<Vec<Option<PtrKind>>> = Vec::new();
-            let mut all_output_decs: Vec<Option<PtrKind>> = Vec::new();
 
             for &did in members {
                 let decision_maker = DecisionMaker::new(analysis, did, tcx);
@@ -111,20 +110,7 @@ impl FnPtrGroups {
                         decision_maker.decide(param, param_decl, param_aliases)
                     })
                     .collect();
-
-                let return_local = Local::from_u32(0);
-                let return_decl = &body.local_decls[return_local];
-                let return_aliases = aliases.and_then(|a| a.get(&return_local));
-                let direct_output_dec = get_direct_output_dec(decision_maker.decide(
-                    return_local,
-                    return_decl,
-                    return_aliases,
-                ));
-                let returned_local_dec =
-                    infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
-                let output_dec = get_output_dec(direct_output_dec, returned_local_dec);
                 all_input_decs.push(member_input_decs);
-                all_output_decs.push(output_dec);
             }
 
             // Intersect: position i gets Some(k) only if ALL members agree on k

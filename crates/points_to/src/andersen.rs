@@ -172,6 +172,7 @@ pub struct PreAnalysisData<'tcx> {
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     pub call_args: FxHashMap<LocalDefId, Vec<Vec<Option<Loc>>>>,
     pub indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, Loc>>,
+    pub indirect_call_args: FxHashMap<LocalDefId, FxHashMap<BasicBlock, Vec<Option<Loc>>>>,
 
     pub index_info: IndexInfo<'tcx>,
     pub globals: FxHashMap<LocalDefId, Loc>,
@@ -272,6 +273,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut exposed_fn_args = vec![];
 
     let mut indirect_calls: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+    let mut indirect_call_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
@@ -396,6 +398,19 @@ pub fn pre_analyze<'a, 'tcx>(
                         .entry(item.local_def_id)
                         .or_default()
                         .insert(bb, index);
+                    let arg_locs: Vec<Option<Loc>> = args
+                        .iter()
+                        .map(|a| {
+                            a.node.place().map(|p| {
+                                let var = Var::Local(item.local_def_id, p.local);
+                                vars[&var]
+                            })
+                        })
+                        .collect();
+                    indirect_call_args
+                        .entry(item.local_def_id)
+                        .or_default()
+                        .insert(bb, arg_locs);
                 }
                 _ => {
                     let def_id = some_or!(operand_to_fn(func), continue);
@@ -454,6 +469,7 @@ pub fn pre_analyze<'a, 'tcx>(
         call_graph,
         call_args,
         indirect_calls,
+        indirect_call_args,
         index_info,
         globals,
         non_fn_globals,
