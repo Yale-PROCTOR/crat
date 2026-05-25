@@ -1,7 +1,7 @@
 use points_to::andersen;
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::{mir::Local, ty};
+use rustc_middle::mir::Local;
 
 use crate::{
     rewriter::{
