@@ -16,6 +16,8 @@ use crate::{
     analyses::{
         self,
         borrow::PromotedMutRefs as PromotedMutRefResult,
+        fn_ptr_groups::FnPtrGroups,
+        fn_ptr_rewrite_decision::FnPtrRewriteDecision,
         offset_sign::sign::OffsetSignResult,
         output_params::OutputParams,
         ownership::{
@@ -24,24 +26,25 @@ use crate::{
         },
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
+    rewriter::decision::PtrKind,
     utils::rustc::RustProgram,
 };
 
-mod collector;
-mod decision;
+pub(crate) mod collector;
+pub(crate) mod decision;
 mod struct_array_field_pre;
 mod transform;
 
 pub struct Analysis {
-    promoted_mut_ref_result: PromotedMutRefResult,
-    promoted_shared_ref_result: PromotedMutRefResult,
-    mutability_result: MutabilityResult,
-    fatness_result: FatnessResult,
-    aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
-    output_params: OutputParams,
-    ownership_schemes: Option<SolidifiedOwnershipSchemes>,
-    offset_sign_result: OffsetSignResult,
-    nullity_result: analyses::nullity::NullityResult,
+    pub(crate) promoted_mut_ref_result: PromotedMutRefResult,
+    pub(crate) promoted_shared_ref_result: PromotedMutRefResult,
+    pub(crate) mutability_result: MutabilityResult,
+    pub(crate) fatness_result: FatnessResult,
+    pub(crate) aliases: FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>>,
+    pub(crate) output_params: OutputParams,
+    pub(crate) ownership_schemes: Option<SolidifiedOwnershipSchemes>,
+    pub(crate) offset_sign_result: OffsetSignResult,
+    pub(crate) nullity_result: analyses::nullity::NullityResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -108,7 +111,23 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         nullity_result,
     };
 
-    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
+    let fn_ptr_groups = FnPtrGroups::build(&pre_points_to, &points_to, &input, &analysis_results);
+    let fn_ptr_rewrite = FnPtrRewriteDecision::build(
+        &pre_points_to,
+        &points_to,
+        &input,
+        &analysis_results,
+        &tss,
+        &fn_ptr_groups,
+    );
+
+    let mut visitor = TransformVisitor::new(
+        &input,
+        &analysis_results,
+        ast_to_hir,
+        fn_ptr_groups,
+        fn_ptr_rewrite,
+    );
     visitor.visit_crate(&mut krate);
 
     // add SliceCursor module to the crate if it was used
@@ -149,7 +168,7 @@ pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     (pprust::crate_to_string_for_macros(&krate), changed)
 }
 
-fn collect_input(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+pub(crate) fn collect_input(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     let mut functions = vec![];
     let mut structs = vec![];
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
@@ -190,7 +209,7 @@ fn maybe_solidified_ownership<'tcx>(
         .map(|results| results.solidify(input))
 }
 
-fn find_param_aliases<'tcx>(
+pub(crate) fn find_param_aliases<'tcx>(
     pre: &andersen::PreAnalysisData<'tcx>,
     points_to: &andersen::Solutions,
     tcx: TyCtxt<'tcx>,
@@ -260,6 +279,29 @@ fn print_nullity_counts(
             non_null
         );
     }
+}
+
+#[allow(unused)]
+fn print_fn_ptr_arg_counts(input: &RustProgram<'_>, fn_ptr_groups: &FnPtrGroups) {
+    let mut total_args = 0usize;
+    let mut promoted_args = 0usize;
+
+    for (rep, decs) in &fn_ptr_groups.group_decisions {
+        let total = decs.len();
+        let promoted = decs
+            .iter()
+            .filter(|d| matches!(d, Some(k) if !matches!(k, PtrKind::Raw(_))))
+            .count();
+        total_args += total;
+        promoted_args += promoted;
+        println!(
+            "crat_fn_ptr\t{}\t{}\t{}",
+            input.tcx.def_path_str(rep.to_def_id()),
+            total,
+            promoted
+        );
+    }
+    println!("crat_fn_ptr_total\t{}\t{}", total_args, promoted_args);
 }
 
 fn slice_cursor_mod_str() -> &'static str {

@@ -1,5 +1,7 @@
 pub mod borrow;
 mod encoding;
+pub mod fn_ptr_groups;
+pub mod fn_ptr_rewrite_decision;
 mod lattice;
 mod liveness;
 mod mir;
