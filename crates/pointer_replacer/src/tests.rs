@@ -2984,10 +2984,11 @@ pub unsafe fn free_nested() {
     free(p as *mut core::ffi::c_void);
 }
 "#,
-        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "let mut p: *mut *mut i32 = malloc(",
             "free(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
     );
 }
@@ -3031,10 +3032,93 @@ pub unsafe fn free_one() {
     free(p as *mut core::ffi::c_void);
 }
 "#,
-        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "calloc(1, std::mem::size_of::<*mut i32>())",
             "free(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_bridges_raw_scalar_typedef_sizeof_allocator_root_and_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub next: *mut NodeAlias,
+    pub value: i32,
+}
+
+pub type NodeAlias = Node;
+
+#[repr(C)]
+pub struct List {
+    pub head: *mut NodeAlias,
+}
+
+pub unsafe fn push_alias_sized(list: *mut List) {
+    let node: *mut NodeAlias =
+        malloc(std::mem::size_of::<NodeAlias>()) as *mut NodeAlias;
+    if node.is_null() {
+        return;
+    }
+    (*node).next = (*list).head;
+    (*list).head = node;
+}
+
+pub unsafe fn clear_alias_sized(list: *mut List) {
+    free((*list).head as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "malloc(std::mem::size_of::<NodeAlias>())",
+            "free(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_bridges_raw_scalar_field_allocator_root_and_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub node: *mut Node,
+}
+
+pub unsafe fn init_and_clear(holder: *mut Holder) {
+    (*holder).node = malloc(std::mem::size_of::<Node>()) as *mut Node;
+    if ((*holder).node).is_null() {
+        return;
+    }
+    (*(*holder).node).value = 7;
+    free((*holder).node as *mut core::ffi::c_void);
+}
+"#,
+        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "malloc(std::mem::size_of::<Node>())",
+            "free((*holder).node as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
     );
 }
@@ -3059,6 +3143,33 @@ pub unsafe fn alloc_chars(len: usize) {
             "realloc(std::ptr::null_mut::<core::ffi::c_void>(), len)",
             "free(buf as *mut core::ffi::c_void);",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_box_from_raw_free_evaluates_argument_once() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub value: i32,
+}
+
+pub unsafe fn alloc_node() -> *mut Node {
+    malloc(std::mem::size_of::<Node>()) as *mut Node
+}
+
+pub unsafe fn cleanup() {
+    free(alloc_node() as *mut core::ffi::c_void);
+}
+"#,
+        &["let __crat_raw_free =", "Box::from_raw((__crat_raw_free)"],
+        &["Box::from_raw((alloc_node()"],
     );
 }
 
@@ -3088,10 +3199,11 @@ pub unsafe fn foo() {
     dealloc_ptr(p as *mut core::ffi::c_void);
 }
 "#,
-        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "alloc_zeroed(1, std::mem::size_of::<i32>())",
             "dealloc_ptr(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
     );
 }
@@ -3481,11 +3593,12 @@ pub unsafe fn helper() -> i32 {
     result
 }
 "#,
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(s as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
-        &["Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -3517,11 +3630,12 @@ pub unsafe fn helper() -> i32 {
     0
 }
 "#,
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(result as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
-        &["Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -3552,8 +3666,12 @@ pub unsafe fn helper() -> i32 {
     0
 }
 "#,
-        &["calloc(1, std::mem::size_of::<State>())"],
-        &["Box::into_raw(", "Box::leak("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(state as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
     );
 }
 
@@ -3587,11 +3705,12 @@ pub unsafe fn helper() -> i32 {
     0
 }
 "#,
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(s as *mut core::ffi::c_void);",
+            "Box::into_raw(",
         ],
-        &["Box::into_raw(", "Box::leak("],
     );
 }
 
@@ -3639,8 +3758,12 @@ pub unsafe fn helper() -> i32 {
     result
 }
 "#,
-        &["calloc(1, std::mem::size_of::<State>())"],
-        &["Box::into_raw(", "Box::leak("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "calloc(1, std::mem::size_of::<State>())",
+            "free(s as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
     );
 }
 
@@ -3683,11 +3806,11 @@ pub unsafe fn checkshift_like() -> i32 {
     result
 }
 "#,
-        &["Box::into_raw(Box::new(", "Box::from_raw("],
+        &["Box::leak(Box::new(", "Box::from_raw("],
         &[
             "malloc(std::mem::size_of::<State>())",
             "free(state as *mut core::ffi::c_void);",
-            "Box::leak(",
+            "Box::into_raw(",
         ],
     );
 }

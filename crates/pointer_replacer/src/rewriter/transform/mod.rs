@@ -632,7 +632,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             )
                         {
                             self.transform_rhs(rhs, hir_rhs, lhs_kind);
-                        } else if lhs_hir_id.is_none() {
+                        } else if lhs_hir_id.is_none()
+                            && !self.try_bridge_raw_projection_root(
+                                rhs,
+                                hir_rhs,
+                                hir_lhs,
+                                lhs_kind,
+                                lhs_inner_ty,
+                            )
+                        {
                             self.transform_rhs(rhs, hir_rhs, lhs_kind);
                         }
                     }
@@ -1890,18 +1898,60 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ) else {
             return false;
         };
-        let info = self.raw_bridge_bindings.get(&lhs_hir_id).or_else(|| {
-            self.alloc_wrappers
-                .contains_key(&lhs_hir_id.owner.def_id)
-                .then_some(&current_info)
-        });
+        let info = self
+            .raw_bridge_bindings
+            .get(&lhs_hir_id)
+            .cloned()
+            .or_else(|| {
+                self.alloc_wrappers
+                    .contains_key(&lhs_hir_id.owner.def_id)
+                    .then_some(current_info.clone())
+            })
+            .or_else(|| {
+                (matches!(current_info, RawBridgeInfo::Scalar)
+                    && ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty))
+                .then_some(current_info.clone())
+            });
         let Some(info) = info else {
             return false;
         };
-        if &current_info != info {
+        if current_info != info {
             return false;
         }
-        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, info);
+        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, &info);
+        true
+    }
+
+    fn try_bridge_raw_projection_root(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &'tcx hir::Expr<'tcx>,
+        hir_lhs: &'tcx hir::Expr<'tcx>,
+        lhs_kind: PtrKind,
+        lhs_inner_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        let PtrKind::Raw(m) = lhs_kind else {
+            return false;
+        };
+        if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+            return false;
+        }
+        if hir_struct_field_slot(self.tcx, hir_lhs).is_none() {
+            return false;
+        }
+        let Some(info) = hir_raw_bridge_info(
+            self.tcx,
+            lhs_inner_ty,
+            hir_rhs,
+            Some(&self.alloc_wrappers),
+            None,
+        ) else {
+            return false;
+        };
+        if !matches!(info, RawBridgeInfo::Scalar) {
+            return false;
+        }
+        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, &info);
         true
     }
 
@@ -1911,7 +1961,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match info {
             RawBridgeInfo::Scalar => utils::expr!(
-                "Box::into_raw(Box::new({})) as *{} {}",
+                "Box::leak(Box::new({})) as *{} {}",
                 default_expr_str,
                 if m { "mut" } else { "const" },
                 ty,
@@ -1994,44 +2044,75 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if let Some(field_free) = self.rewrite_owned_field_free_call(hir_expr, args) {
             return Some(field_free);
         }
-        let (hir_id, _harg) =
-            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)?;
-        if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
-            && matches!(
-                self.effective_ptr_kind(hir_id),
-                Some(PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
-            )
+        if let Some((hir_id, _harg)) =
+            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)
         {
-            let local_name = self.tcx.hir_name(hir_id).to_string();
-            return match self.effective_ptr_kind(hir_id) {
-                Some(PtrKind::Box | PtrKind::BoxedSlice) => {
-                    Some(utils::expr!("drop({local_name})"))
-                }
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
-                    Some(utils::expr!("drop(({local_name}).take())"))
-                }
-                _ => None,
-            };
+            if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
+                && matches!(
+                    self.effective_ptr_kind(hir_id),
+                    Some(
+                        PtrKind::Box
+                            | PtrKind::OptBox
+                            | PtrKind::BoxedSlice
+                            | PtrKind::OptBoxedSlice
+                    )
+                )
+            {
+                let local_name = self.tcx.hir_name(hir_id).to_string();
+                return match self.effective_ptr_kind(hir_id) {
+                    Some(PtrKind::Box | PtrKind::BoxedSlice) => {
+                        Some(utils::expr!("drop({local_name})"))
+                    }
+                    Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                        Some(utils::expr!("drop(({local_name}).take())"))
+                    }
+                    _ => None,
+                };
+            }
+            if let Some(info) = self.raw_bridge_bindings.get(&hir_id) {
+                let [arg] = args else { return None };
+                let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
+                let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
+                let arg_str = pprust::expr_to_string(arg);
+                let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
+                return Some(match info {
+                    RawBridgeInfo::Scalar => scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str),
+                    RawBridgeInfo::Array { len_expr } => {
+                        array_box_from_raw_free_expr(&arg_str, &inner_ty_str, len_expr)
+                    }
+                });
+            }
         }
-        let info = self.raw_bridge_bindings.get(&hir_id)?;
+        self.rewrite_scalar_box_from_raw_free_call(hir_expr, args)
+    }
+
+    fn rewrite_scalar_box_from_raw_free_call(
+        &self,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        args: &[P<Expr>],
+    ) -> Option<Expr> {
+        if !hir_call_matches_foreign_name(self.tcx, hir_expr, "free") {
+            return None;
+        }
+        let hir::ExprKind::Call(_, hir_args) = hir_expr.kind else {
+            return None;
+        };
+        let [hir_arg] = hir_args else { return None };
         let [arg] = args else { return None };
-        let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
+        let hir_arg = hir_unwrap_casts(hir_arg);
+        let arg_ty = self
+            .tcx
+            .typeck(hir_expr.hir_id.owner)
+            .expr_ty_adjusted(hir_arg);
         let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
-        let arg_str = pprust::expr_to_string(arg);
+        if !ty_supports_scalar_box_from_raw_bridge(inner_ty) {
+            return None;
+        }
+        let mut raw_arg = (**arg).clone();
+        self.transform_rhs(&mut raw_arg, hir_arg, PtrKind::Raw(true));
+        let arg_str = pprust::expr_to_string(&raw_arg);
         let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
-        Some(match info {
-            RawBridgeInfo::Scalar => utils::expr!(
-                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(({0}) as *mut {1}) }}); }}",
-                arg_str,
-                inner_ty_str,
-            ),
-            RawBridgeInfo::Array { len_expr } => utils::expr!(
-                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(std::ptr::slice_from_raw_parts_mut(({0}) as *mut {1}, ({2}) as usize)) }}); }}",
-                arg_str,
-                inner_ty_str,
-                len_expr,
-            ),
-        })
+        Some(scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str))
     }
 
     fn rewrite_owned_field_free_call(
@@ -8900,6 +8981,30 @@ fn ty_supports_raw_bridge_default_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>
     }
 }
 
+fn ty_supports_scalar_box_from_raw_bridge(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+    )
+}
+
+fn scalar_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str) -> Expr {
+    utils::expr!(
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(unsafe {{ Box::from_raw((__crat_raw_free) as *mut {}) }}); }} }}",
+        arg_str,
+        inner_ty_str,
+    )
+}
+
+fn array_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str, len_expr: &str) -> Expr {
+    utils::expr!(
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(unsafe {{ Box::from_raw(std::ptr::slice_from_raw_parts_mut((__crat_raw_free) as *mut {}, ({}) as usize)) }}); }} }}",
+        arg_str,
+        inner_ty_str,
+        len_expr,
+    )
+}
+
 fn fieldless_enum_zero_variant<'tcx>(
     tcx: TyCtxt<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
@@ -8958,9 +9063,10 @@ fn raw_bridge_info_from_call<'tcx>(
     let ty_name = (!ty_contains_param(lhs_inner_ty)).then(|| mir_ty_to_string(lhs_inner_ty, tcx));
     match (name, args) {
         (name, [bytes]) if name == Symbol::intern("malloc") => {
-            if ty_name
-                .as_ref()
-                .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
+            if hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
+                || ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
             {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(bytes) {
@@ -8972,9 +9078,10 @@ fn raw_bridge_info_from_call<'tcx>(
         }
         (name, [count, elem_size]) if name == Symbol::intern("calloc") => {
             if hir_is_literal_one(tcx, count)
-                && ty_name
-                    .as_ref()
-                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, elem_size, ty_name))
+                && (hir_size_of_call_matches_expected(tcx, elem_size, lhs_inner_ty)
+                    || ty_name
+                        .as_ref()
+                        .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, elem_size, ty_name)))
             {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(count) || scalar_arg_rejected(elem_size) {
@@ -9000,9 +9107,10 @@ fn raw_bridge_info_from_call<'tcx>(
         (name, [ptr, bytes])
             if name == Symbol::intern("realloc") && hir_is_null_like_ptr_arg(tcx, ptr) =>
         {
-            if ty_name
-                .as_ref()
-                .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
+            if hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
+                || ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
             {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(bytes) {
@@ -14847,9 +14955,9 @@ pub unsafe fn free_nested() {
         let (analysis, after) = analyze_pointer_safety_for_code(code);
         assert_eq!(analysis.safe_box_sites.total(), 0);
         assert_eq!(after.frees, 0);
-        assert_eq!(after.bridge_calls.leak, 0);
+        assert_eq!(after.bridge_calls.leak, 1);
         assert_eq!(after.bridge_calls.from_raw, 1);
-        assert_eq!(after.bridge_calls.into_raw, 1);
+        assert_eq!(after.bridge_calls.into_raw, 0);
     }
 
     #[test]
