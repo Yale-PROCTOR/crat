@@ -52,7 +52,7 @@ impl FnPtrRewriteDecision {
         let mut individual_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>> =
             FxHashMap::default();
 
-        for (&did, _) in &fn_ptr_groups.fn_to_group {
+        for &did in fn_ptr_groups.fn_to_group.keys() {
             let input_len = tcx.fn_sig(did).skip_binder().inputs().skip_binder().len();
             let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
             let aliases = analysis.aliases.get(&did);
@@ -105,11 +105,9 @@ impl FnPtrRewriteDecision {
                                 | rustc_middle::mir::Operand::Move(src),
                             ),
                         )) = &stmt.kind
-                        {
-                            if dst.projection.is_empty() && src.projection.is_empty() {
+                            && dst.projection.is_empty() && src.projection.is_empty() {
                                 copy_src.insert(dst.local, src.local);
                             }
-                        }
                     }
                 }
                 copy_src
@@ -275,11 +273,10 @@ impl FnPtrRewriteDecision {
                     .get(&rep)
                     .map(|members| members.iter().all(|m| direct_rewrite.contains(m)))
                     .unwrap_or(false);
-                if all_direct {
-                    if let Some(decs) = fn_ptr_groups.group_decisions.get(&rep) {
+                if all_direct
+                    && let Some(decs) = fn_ptr_groups.group_decisions.get(&rep) {
                         loc_decisions.insert(v, decs.clone());
                     }
-                }
             }
         }
 
@@ -400,11 +397,10 @@ impl FnPtrRewriteDecision {
             let hir_to_mir = utils::ir::map_thir_to_mir(fn_did, false, rust_program.tcx);
             for (hir_id, local) in &hir_to_mir.binding_to_local {
                 let var = Var::Local(fn_did, *local);
-                if let Some(&loc) = pre.vars.get(&var) {
-                    if let Some(decs) = loc_decisions.get(&loc) {
+                if let Some(&loc) = pre.vars.get(&var)
+                    && let Some(decs) = loc_decisions.get(&loc) {
                         annotation_decisions.insert(*hir_id, decs.clone());
                     }
-                }
             }
         }
 

@@ -198,16 +198,15 @@ impl MutVisitor for TransformVisitor<'_> {
                             *param.ty = mk_opt_boxed_slice_ty(inner_ty, self.tcx);
                         }
                         None => {
-                            if let TyKind::BareFn(bare_fn) = &mut param.ty.kind {
-                                if let Some(hir_id) =
+                            if let TyKind::BareFn(bare_fn) = &mut param.ty.kind
+                                && let Some(hir_id) =
                                     self.ast_to_hir.local_map.get(&param.pat.id).copied()
-                                    && let Some(decs) =
-                                        self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
-                                {
-                                    let decs = decs.clone();
-                                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                                        self.slice_cursor.set(true);
-                                    }
+                                && let Some(decs) =
+                                    self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
+                            {
+                                let decs = decs.clone();
+                                if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                                    self.slice_cursor.set(true);
                                 }
                             }
                             continue;
@@ -282,16 +281,15 @@ impl MutVisitor for TransformVisitor<'_> {
                 };
                 for (field_idx, field) in fields.iter_mut().enumerate() {
                     let fi = FieldIdx::from_usize(field_idx);
-                    if let TyKind::BareFn(bare_fn) = &mut field.ty.kind {
-                        if let Some(decs) = self
+                    if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                        && let Some(decs) = self
                             .fn_ptr_rewrite
                             .field_decisions
                             .get(&(struct_def_id, fi))
-                        {
-                            let decs = decs.clone();
-                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                                self.slice_cursor.set(true);
-                            }
+                    {
+                        let decs = decs.clone();
+                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                            self.slice_cursor.set(true);
                         }
                     }
                 }
@@ -303,10 +301,9 @@ impl MutVisitor for TransformVisitor<'_> {
                     let decs = decs.clone();
                     if let Some(ty) = &mut ty_alias.ty
                         && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
+                        && rewrite_bare_fn_inputs(bare_fn, &decs)
                     {
-                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                            self.slice_cursor.set(true);
-                        }
+                        self.slice_cursor.set(true);
                     }
                 }
             }
@@ -701,21 +698,18 @@ impl MutVisitor for TransformVisitor<'_> {
                         .last()
                         .is_some_and(|s| s.ident.name == rustc_span::sym::transmute)
                     && hargs.iter().any(|h| self.hir_expr_has_fn_ptr_group_cast(h))
+                    && let ExprKind::Path(_, path) = &mut func_ast.kind
+                    && let Some(seg) = path.segments.last_mut()
+                    && let Some(gen_args) = &mut seg.args
+                    && let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args
                 {
-                    if let ExprKind::Path(_, path) = &mut func_ast.kind
-                        && let Some(seg) = path.segments.last_mut()
-                        && let Some(gen_args) = &mut seg.args
-                        && let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args
-                    {
-                        for arg in &mut angle_args.args {
-                            if let AngleBracketedArg::Arg(GenericArg::Type(ty)) = arg {
-                                ty.kind = TyKind::Infer;
-                                break;
-                            }
+                    for arg in &mut angle_args.args {
+                        if let AngleBracketedArg::Arg(GenericArg::Type(ty)) = arg {
+                            ty.kind = TyKind::Infer;
+                            break;
                         }
                     }
                 }
-
                 hoist_opt_ref_borrow(expr);
             }
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
@@ -881,22 +875,20 @@ impl MutVisitor for TransformVisitor<'_> {
                 }
             }
             ExprKind::Cast(_, cast_ty) => {
-                if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind {
-                    if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
-                        && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let inner = utils::hir::unwrap_drop_temps(hir_inner);
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
+                        && let hir::def::Res::Def(_, def_id) = path.res
+                        && let Some(local_did) = def_id.as_local()
+                        && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
+                        && let Some(decs) = self.fn_ptr_rewrite.individual_decisions.get(&local_did)
                     {
-                        let inner = utils::hir::unwrap_drop_temps(hir_inner);
-                        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
-                            && let hir::def::Res::Def(_, def_id) = path.res
-                            && let Some(local_did) = def_id.as_local()
-                            && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
-                            && let Some(decs) =
-                                self.fn_ptr_rewrite.individual_decisions.get(&local_did)
-                        {
-                            let decs = decs.clone();
-                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
-                                self.slice_cursor.set(true);
-                            }
+                        let decs = decs.clone();
+                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                            self.slice_cursor.set(true);
                         }
                     }
                 }
@@ -1205,7 +1197,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         if !adt_def.is_struct() {
             return None;
         }
-        let Some(struct_did) = adt_def.did().as_local() else { return None };
+        let struct_did = adt_def.did().as_local()?;
         let field_idx = adt_def
             .all_fields()
             .position(|f| f.name == field_ident.name)
@@ -4802,10 +4794,10 @@ fn find_bare_fn_in_ty_mut(ty: &mut Ty) -> Option<&mut rustc_ast::BareFnTy> {
             let gen_args = seg.args.as_mut()?;
             let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args else { return None };
             for arg in &mut angle_args.args {
-                if let AngleBracketedArg::Arg(GenericArg::Type(inner_ty)) = arg {
-                    if let Some(bare_fn) = find_bare_fn_in_ty_mut(inner_ty) {
-                        return Some(bare_fn);
-                    }
+                if let AngleBracketedArg::Arg(GenericArg::Type(inner_ty)) = arg
+                    && let Some(bare_fn) = find_bare_fn_in_ty_mut(inner_ty)
+                {
+                    return Some(bare_fn);
                 }
             }
             None

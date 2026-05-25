@@ -301,7 +301,7 @@ fn print_fn_ptr_arg_counts(input: &RustProgram<'_>, fn_ptr_groups: &FnPtrGroups)
             promoted
         );
     }
-    println!("crat_fn_ptr_total\t{}\t{}", total_args, promoted_args);
+    println!("crat_fn_ptr_total\t{total_args}\t{promoted_args}");
 }
 
 fn slice_cursor_mod_str() -> &'static str {
