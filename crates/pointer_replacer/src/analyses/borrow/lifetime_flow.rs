@@ -605,17 +605,17 @@ impl BodyLifetimeFlow {
         place: Place<'tcx>,
         extra_depth: u8,
     ) -> Option<LifetimeSlot> {
-        if let Some((field, deref_depth, _)) = direct_raw_pointer_field_slot(local_decls, place) {
-            if extra_depth == 0 {
-                return self.slot_for_owner(
-                    LifetimeOwner::Field(FieldPlace {
-                        base: place.local,
-                        deref_depth,
-                        field,
-                    }),
-                    0,
-                );
-            }
+        if let Some((field, deref_depth, _)) = direct_raw_pointer_field_slot(local_decls, place)
+            && extra_depth == 0
+        {
+            return self.slot_for_owner(
+                LifetimeOwner::Field(FieldPlace {
+                    base: place.local,
+                    deref_depth,
+                    field,
+                }),
+                0,
+            );
         }
         let base_depth = place_deref_depth(place)?;
         let depth = base_depth.checked_add(extra_depth)?;

@@ -183,9 +183,7 @@ impl ProvenanceSet {
             return Some(ProvenanceOwner::Local(local));
         }
 
-        let Some((field, _, _)) = direct_raw_pointer_field_slot(local_decls, place) else {
-            return None;
-        };
+        let (field, _, _) = direct_raw_pointer_field_slot(local_decls, place)?;
         self.field_data
             .get(&field)
             .copied()

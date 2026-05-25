@@ -1408,9 +1408,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn local_struct_did_for_ast_ty(&self, ty: &Ty) -> Option<LocalDefId> {
-        let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx) else {
-            return None;
-        };
+        let hir_ty = self.ast_to_hir.get_ty(ty.id, self.tcx)?;
         let hir::TyKind::Path(hir_qpath) = hir_ty.kind else {
             return None;
         };
@@ -1490,7 +1488,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         };
         let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
-        let struct_did = self.local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
+        let struct_did = hir_local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
         let field_index = self.field_index_by_name(struct_did, ident.name)?;
         let field = StructFieldSlot {
             struct_did,
@@ -1548,16 +1546,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         };
         def_id.as_local()
-    }
-
-    fn local_struct_did_from_ty(&self, ty: ty::Ty<'tcx>) -> Option<LocalDefId> {
-        match ty.kind() {
-            ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct() => {
-                Some(adt_def.did().expect_local())
-            }
-            ty::TyKind::Ref(_, inner, _) => self.local_struct_did_from_ty(*inner),
-            _ => None,
-        }
     }
 
     fn field_index_by_name(&self, struct_did: LocalDefId, field_name: Symbol) -> Option<usize> {
@@ -6000,20 +5988,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
+                        } else if is_slice_cursor_mut_constructor_call(&e) {
+                            e = utils::expr!(
+                                "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
                         } else {
-                            if is_slice_cursor_mut_constructor_call(&e) {
-                                e = utils::expr!(
-                                    "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
-                                    pprust::expr_to_string(&e),
-                                    pprust::expr_to_string(offset),
-                                );
-                            } else {
-                                e = utils::expr!(
-                                    "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
-                                    pprust::expr_to_string(&e),
-                                    pprust::expr_to_string(offset),
-                                );
-                            }
+                            e = utils::expr!(
+                                "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
                         }
                     } else {
                         e = utils::expr!(
@@ -11364,12 +11350,6 @@ fn collect_field_conflict_demotion_reasons(
             for arg in args.iter() {
                 self.record_moved_mutable_fields_from_raw_pointee_arg(arg);
             }
-            if let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
-                && let Some(sig_dec) = self.sig_decs.data.get(&callee_did)
-            {
-                let _ = sig_dec;
-                return;
-            }
         }
 
         fn record_raw_field_pointer_projection(&mut self, expr: &'tcx hir::Expr<'tcx>) {
@@ -12224,8 +12204,8 @@ fn collect_ownership_field_diagnostics<'tcx>(
 
     let block_reasons =
         collect_ownership_field_rhs_block_reasons(tcx, sig_decs, ptr_kinds, &scalar_fields);
-    for field in scalar_fields.keys().copied() {
-        if let Some(reasons) = block_reasons.get(&field) {
+    for field in scalar_fields.keys() {
+        if let Some(reasons) = block_reasons.get(field) {
             if reasons.is_empty() {
                 diagnostics.selected_opt_box += 1;
             } else {
@@ -12312,7 +12292,7 @@ fn collect_struct_shape_demoted_fields(
         {
             continue;
         }
-        collect_promoted_fields_in_by_value_ty(tcx, sig.output(), promoted_fields, &mut demoted);
+        collect_promoted_fields_in_by_value_ty(sig.output(), promoted_fields, &mut demoted);
     }
 
     demoted
@@ -12613,14 +12593,13 @@ fn struct_has_named_fields(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
 }
 
 fn collect_promoted_fields_in_by_value_ty(
-    tcx: TyCtxt<'_>,
     ty: ty::Ty<'_>,
     promoted_fields: &FxHashSet<StructFieldSlot>,
     demoted: &mut FxHashSet<StructFieldSlot>,
 ) {
     match ty.kind() {
         ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _) => {
-            collect_promoted_fields_in_by_value_ty(tcx, *inner, promoted_fields, demoted);
+            collect_promoted_fields_in_by_value_ty(*inner, promoted_fields, demoted);
         }
         ty::TyKind::Adt(adt_def, args) => {
             if adt_def.did().is_local() && adt_def.is_struct() && !adt_def.is_union() {
@@ -12634,17 +12613,17 @@ fn collect_promoted_fields_in_by_value_ty(
             }
             for arg in args.iter() {
                 if let ty::GenericArgKind::Type(ty) = arg.kind() {
-                    collect_promoted_fields_in_by_value_ty(tcx, ty, promoted_fields, demoted);
+                    collect_promoted_fields_in_by_value_ty(ty, promoted_fields, demoted);
                 }
             }
         }
         ty::TyKind::Tuple(tys) => {
             for ty in tys.iter() {
-                collect_promoted_fields_in_by_value_ty(tcx, ty, promoted_fields, demoted);
+                collect_promoted_fields_in_by_value_ty(ty, promoted_fields, demoted);
             }
         }
         ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) => {
-            collect_promoted_fields_in_by_value_ty(tcx, *ty, promoted_fields, demoted);
+            collect_promoted_fields_in_by_value_ty(*ty, promoted_fields, demoted);
         }
         _ => {}
     }
