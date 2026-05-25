@@ -83,12 +83,10 @@ fn collect_copy_impls(tcx: TyCtxt<'_>) -> CopyImpls {
         let Some(of_trait) = impl_.of_trait else {
             continue;
         };
-        if !of_trait
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident.name.as_str() == "Copy")
-        {
+        if !matches!(
+            of_trait.path.segments.last(),
+            Some(seg) if seg.ident.name.as_str() == "Copy"
+        ) {
             continue;
         }
         let Some(struct_did) = hir_local_struct_did_from_ty(impl_.self_ty) else {
