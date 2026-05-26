@@ -26,7 +26,6 @@ use crate::{
         },
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
-    rewriter::decision::PtrKind,
     utils::rustc::RustProgram,
 };
 
@@ -284,29 +283,6 @@ fn print_nullity_counts(
             non_null
         );
     }
-}
-
-#[allow(unused)]
-fn print_fn_ptr_arg_counts(input: &RustProgram<'_>, fn_ptr_groups: &FnPtrGroups) {
-    let mut total_args = 0usize;
-    let mut promoted_args = 0usize;
-
-    for (rep, decs) in &fn_ptr_groups.group_decisions {
-        let total = decs.len();
-        let promoted = decs
-            .iter()
-            .filter(|d| matches!(d, Some(k) if !matches!(k, PtrKind::Raw(_))))
-            .count();
-        total_args += total;
-        promoted_args += promoted;
-        println!(
-            "crat_fn_ptr\t{}\t{}\t{}",
-            input.tcx.def_path_str(rep.to_def_id()),
-            total,
-            promoted
-        );
-    }
-    println!("crat_fn_ptr_total\t{total_args}\t{promoted_args}");
 }
 
 fn slice_cursor_mod_str() -> &'static str {

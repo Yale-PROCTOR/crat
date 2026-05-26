@@ -41,7 +41,7 @@ pub(crate) struct TransformVisitor<'tcx> {
     alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
     free_like_wrappers: FxHashSet<LocalDefId>,
     ast_to_hir: AstToHir,
-    pub(crate) fn_ptr_rewrite: FnPtrRewriteDecision,
+    fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
 }
@@ -309,8 +309,7 @@ impl MutVisitor for TransformVisitor<'_> {
             }
             ItemKind::Static(box static_item) => {
                 // only bare fn-ptr statics (fn(...)) are covered; Option<fn(...)> statics
-                // are not in annotation_decisions and their BareFn match fails here — consistent
-                // with the TyKind::FnPtr guard in FnPtrRewriteDecision::build Step 3e.
+                // are not in annotation_decisions and their BareFn match fails here
                 let static_def_id = self.ast_to_hir.global_map[&node_id];
                 let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
                 if let TyKind::BareFn(bare_fn) = &mut static_item.ty.kind

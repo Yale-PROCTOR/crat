@@ -117,6 +117,7 @@ impl FnPtrGroups {
                         let dec = member_decs.get(i).copied().flatten();
                         match (agreed, dec) {
                             (_, None) => return None,
+                            (Some(k), _) | (_, Some(k)) if k.is_owning_box_like() => return None,
                             (None, Some(k)) => agreed = Some(k),
                             (Some(a), Some(b)) if a == b => {}
                             _ => return None,
