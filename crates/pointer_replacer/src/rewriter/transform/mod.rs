@@ -640,6 +640,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        if let ExprKind::MethodCall(call) = &expr.kind
+            && let ExprKind::Path(_, _) = &unwrap_cast_and_paren(&call.receiver).kind
+            && call.seg.ident.name.as_str() == "offset"
+            && call.args.len() == 1
+        {
+            let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+            if let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = hir_expr.kind {
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                if let Some((_, raw_mut)) =
+                    unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_receiver))
+                {
+                    self.transform_ptr(expr, hir_expr, PtrCtx::Rhs(PtrKind::Raw(raw_mut.is_mut())));
+                    return;
+                }
+            }
+        }
+
         mut_visit::walk_expr(self, expr);
 
         match &mut expr.kind {

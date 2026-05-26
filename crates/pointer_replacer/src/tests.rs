@@ -10,9 +10,27 @@ fn rewrite_struct_arrays_with_config(code: &str, config: &Config) -> (String, bo
         .unwrap()
 }
 
+fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        rewrite_array_local_provenance(config, tcx)
+    })
+    .unwrap()
+}
+
 fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
+    rewrite_with_config(input, config)
+}
+
+fn rewrite_struct_arrays_then_array_local_then_pointer(
+    code: &str,
+    config: &Config,
+) -> (String, BytemuckDependency) {
+    let (pre, struct_changed) = rewrite_struct_arrays_with_config(code, config);
+    let input = if struct_changed { pre.as_str() } else { code };
+    let (pre, array_changed) = rewrite_array_local_provenance_with_config(input, config);
+    let input = if array_changed { pre.as_str() } else { input };
     rewrite_with_config(input, config)
 }
 
@@ -7451,6 +7469,272 @@ pub unsafe fn foo() -> i32 {
     assert!(!s.contains("pub a: [Elem; 3]"), "{s}");
     assert!(s.contains("pub b: Elem"), "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_simple_non_null_derived_local() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: usize = (3) as usize"), "{s}");
+    assert!(
+        s.contains("*((p).offset(q_idx as isize) as *mut i32) = 3"),
+        "{s}"
+    );
+    assert!(
+        s.matches("*((p).offset(q_idx as isize) as *mut i32)")
+            .count()
+            >= 2,
+        "{s}"
+    );
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+    assert!(!s.contains("*q"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_uses_option_index_for_nullable_local() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut k: isize) -> i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    if q.is_null() {
+        q = p.offset(k);
+    }
+    *q = 7;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: Option<usize> = None"), "{s}");
+    assert!(s.contains("if q_idx.is_none()"), "{s}");
+    assert!(s.contains("q_idx = Some((k) as usize)"), "{s}");
+    assert!(
+        s.contains("*((p).offset(q_idx.unwrap() as isize) as *mut i32) = 7"),
+        "{s}"
+    );
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+    assert!(!s.contains("q.is_null()"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_preserves_nullable_pointer_value_use() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    if take {
+        q = p.add(2);
+    }
+    q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: Option<usize> = None"), "{s}");
+    assert!(s.contains("q_idx = Some((2) as usize)"), "{s}");
+    assert!(
+        s.contains("q_idx.map_or(std::ptr::null_mut() as *mut i32"),
+        "{s}"
+    );
+    assert!(
+        s.contains("|idx| ((p).offset(idx as isize)) as *mut i32"),
+        "{s}"
+    );
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_assignment_with_planned_local_in_rhs() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p.offset(if q.is_null() { 0 } else { 1 });
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q: *mut i32"), "{s}");
+    assert!(s.contains("q = p.offset(if q.is_null()"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_does_not_treat_local_null_mut_as_null_literal() {
+    let code = r#"
+pub unsafe fn null_mut() -> *mut i32 {
+    0 as *mut i32
+}
+
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = null_mut();
+    q = p.add(1);
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q: *mut i32 = null_mut()"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_self_relative_assignment() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(1);
+    *p = 1;
+    q = q.offset(2);
+    *q = 9;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: usize = (1) as usize"), "{s}");
+    assert!(s.contains("q_idx ="), "{s}");
+    assert!(s.contains("as isize +"), "{s}");
+    assert!(
+        s.contains("*((p).offset(q_idx as isize) as *mut i32) = 9"),
+        "{s}"
+    );
+    assert!(!s.contains("q = q.offset"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_address_taken_derived_local() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, out: *mut *mut i32) {
+    let mut q: *mut i32 = p.offset(3);
+    let _addr: *mut *mut i32 = &raw mut q;
+    *p = 0;
+    *q = 1;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("let mut q: *mut i32 = p.offset(3)"), "{s}");
+    assert!(s.contains("&raw mut q"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_unsupported_assignment_source() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, r: *mut i32) {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 0;
+    q = r;
+    *q = 1;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(!changed, "{s}");
+    assert!(s.contains("let mut q: *mut i32 = p.offset(3)"), "{s}");
+    assert!(s.contains("q = r"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_tracks_index_when_base_is_reassigned() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(1);
+    p = p.offset(1);
+    *q + *p
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut p_idx: usize = 0usize"), "{s}");
+    assert!(s.contains("let mut q_idx: usize"), "{s}");
+    assert!(
+        s.contains("((p_idx) as isize + ((1) as usize) as isize) as usize"),
+        "{s}"
+    );
+    assert!(
+        s.contains("p_idx = ((p_idx) as isize + ((1) as usize) as isize) as usize"),
+        "{s}"
+    );
+    assert!(
+        s.contains("*((p).offset(q_idx as isize) as *mut i32)")
+            && s.contains("*((p).offset(p_idx as isize) as *mut i32)"),
+        "{s}"
+    );
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+    assert!(!s.contains("p = p.offset(1)"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_preserves_member_before_base_cursor_move() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
+    let mut prev: *mut i32 = p;
+    p = p.offset(n);
+    *prev + *p
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut p_idx: usize = 0usize"), "{s}");
+    assert!(s.contains("let mut prev_idx: usize = p_idx"), "{s}");
+    assert!(
+        s.contains("p_idx = ((p_idx) as isize + ((n) as usize) as isize) as usize"),
+        "{s}"
+    );
+    assert!(
+        s.contains("*((p).offset(prev_idx as isize) as *mut i32)")
+            && s.contains("*((p).offset(p_idx as isize) as *mut i32)"),
+        "{s}"
+    );
+    assert!(!s.contains("let mut prev: *mut i32"), "{s}");
+    assert!(!s.contains("p = p.offset(n)"), "{s}");
+}
+
+#[test]
+fn test_pointer_pipeline_runs_array_local_rewriter_before_pointer_rewriter() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_uses_slice_base_pointer_after_struct_arrays() {
+    let code = r#"
+pub unsafe fn foo(p: &[i32], n: isize) -> i32 {
+    let mut q: *mut i32 = p.as_ptr().offset(n) as *mut i32;
+    if q > p.as_ptr() as *mut i32 {
+        *q
+    } else {
+        0
+    }
+}
+"#;
+    let (s, array_changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(array_changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx"), "{s}");
+    assert!(s.contains("(p).as_ptr().offset"), "{s}");
+    assert!(!s.contains("p.offset"), "{s}");
 }
 
 #[test]

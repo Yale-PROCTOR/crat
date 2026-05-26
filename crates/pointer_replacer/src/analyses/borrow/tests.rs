@@ -53,12 +53,11 @@ fn user_var_names(tcx: TyCtxt, def_id: LocalDefId, locals: &DenseBitSet<Local>) 
     let body = &*tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
     let mut names = vec![];
     for var_debug_info in body.var_debug_info.iter() {
-        if let VarDebugInfoContents::Place(place) = &var_debug_info.value {
-            if let Some(local) = place.as_local()
-                && locals.contains(local)
-            {
-                names.push(var_debug_info.name.as_str().to_string());
-            }
+        if let VarDebugInfoContents::Place(place) = &var_debug_info.value
+            && let Some(local) = place.as_local()
+            && locals.contains(local)
+        {
+            names.push(var_debug_info.name.as_str().to_string());
         }
     }
     names.sort();
