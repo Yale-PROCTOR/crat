@@ -15,7 +15,7 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
@@ -24,7 +24,7 @@ use utils::{
 };
 
 use super::{
-    Analysis,
+    Analysis, Config,
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
@@ -45,6 +45,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     free_like_wrappers: FxHashSet<LocalDefId>,
     demoted_fields: FxHashSet<StructFieldSlot>,
     field_cursor_fields: FxHashSet<StructFieldSlot>,
+    c_exposed_abi_fields: FxHashSet<StructFieldSlot>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     pub bytemuck: Cell<bool>,
@@ -947,6 +948,101 @@ enum PtrCtx {
     Deref(bool),
 }
 
+fn is_c_exposed_fn(tcx: TyCtxt<'_>, did: LocalDefId, c_exposed_fns: &FxHashSet<String>) -> bool {
+    let name = tcx.item_name(did.to_def_id());
+    c_exposed_fns.contains(name.as_str())
+        || tcx
+            .get_attrs(did.to_def_id(), sym::export_name)
+            .any(|attr| {
+                attr.value_str()
+                    .is_some_and(|s| c_exposed_fns.contains(s.as_str()))
+            })
+}
+
+fn is_local_c_abi_struct(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
+    let adt_def = tcx.adt_def(did);
+    let repr = adt_def.repr();
+    adt_def.is_struct() && !adt_def.is_union() && repr.c() && repr.pack.is_none()
+}
+
+fn collect_local_abi_struct_fields_from_ty(
+    tcx: TyCtxt<'_>,
+    ty: ty::Ty<'_>,
+    fields: &mut FxHashSet<StructFieldSlot>,
+) {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) | ty::TyKind::Ref(_, pointee, _) => {
+            collect_local_abi_struct_fields_from_ty(tcx, *pointee, fields);
+        }
+        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+            collect_local_abi_struct_fields_from_ty(tcx, *elem, fields);
+        }
+        ty::TyKind::Tuple(elems) => {
+            for elem in elems.iter() {
+                collect_local_abi_struct_fields_from_ty(tcx, elem, fields);
+            }
+        }
+        ty::TyKind::Adt(adt_def, args) => {
+            if let Some(struct_did) = adt_def.did().as_local()
+                && is_local_c_abi_struct(tcx, struct_did)
+            {
+                fields.extend(adt_def.non_enum_variant().fields.iter_enumerated().map(
+                    |(field_index, _)| StructFieldSlot {
+                        struct_did,
+                        field_index: field_index.index(),
+                    },
+                ));
+                return;
+            }
+            for arg in args.iter() {
+                if let ty::GenericArgKind::Type(arg_ty) = arg.kind() {
+                    collect_local_abi_struct_fields_from_ty(tcx, arg_ty, fields);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_c_exposed_abi_fields<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    c_exposed_fns: &FxHashSet<String>,
+    sig_decs: &SigDecisions,
+) -> FxHashSet<StructFieldSlot> {
+    let tcx = rust_program.tcx;
+    let mut fields = FxHashSet::default();
+
+    for did in &rust_program.functions {
+        if !is_c_exposed_fn(tcx, *did, c_exposed_fns) {
+            continue;
+        }
+        let Some(sig_dec) = sig_decs.data.get(did) else {
+            continue;
+        };
+        let sig = tcx.fn_sig(*did).skip_binder().skip_binder();
+        let direct_interface_fix = sig_dec
+            .input_decs
+            .iter()
+            .any(|dec| matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))));
+
+        for (ty, dec) in sig.inputs().iter().copied().zip(&sig_dec.input_decs) {
+            if matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))) {
+                if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(ty) {
+                    collect_local_abi_struct_fields_from_ty(tcx, inner_ty, &mut fields);
+                }
+            } else if !direct_interface_fix {
+                collect_local_abi_struct_fields_from_ty(tcx, ty, &mut fields);
+            }
+        }
+
+        if !direct_interface_fix {
+            collect_local_abi_struct_fields_from_ty(tcx, sig.output(), &mut fields);
+        }
+    }
+
+    fields
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AllocatorRoot<'a> {
     Malloc {
@@ -960,6 +1056,7 @@ enum AllocatorRoot<'a> {
 
 impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     pub fn new(
+        config: &Config,
         rust_program: &RustProgram<'tcx>,
         analysis: &'analysis Analysis,
         ast_to_hir: AstToHir,
@@ -1059,6 +1156,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
+        let c_exposed_abi_fields =
+            collect_c_exposed_abi_fields(rust_program, &config.c_exposed_fns, &sig_decs);
         let demoted_fields =
             collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
         emit_promotion_diagnostics(
@@ -1120,6 +1219,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             free_like_wrappers,
             demoted_fields,
             field_cursor_fields,
+            c_exposed_abi_fields,
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             bytemuck: Cell::new(false),
@@ -1128,6 +1228,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if self.c_exposed_abi_fields.contains(&field) {
+            return None;
+        }
         if struct_field_is_exactly_owning(self.analysis, field) {
             self.ownership_field_kind(field)
         } else {
@@ -1232,13 +1335,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn struct_has_field_rewrite_candidate(&self, struct_did: LocalDefId) -> bool {
-        self.analysis
-            .borrow_promotion_result
-            .mutable_fields
-            .iter()
-            .chain(self.analysis.borrow_promotion_result.shared_fields.iter())
-            .any(|field| field.struct_did == struct_did)
-            || self.struct_has_owning_box_field_candidate(struct_did)
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .any(|(field_index, _)| {
+                self.field_ptr_kind(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                })
+                .is_some()
+            })
     }
 
     fn struct_has_owning_box_field_candidate(&self, struct_did: LocalDefId) -> bool {
@@ -1248,7 +1356,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .fields
             .iter_enumerated()
             .any(|(field_index, _)| {
-                self.ownership_field_kind(StructFieldSlot {
+                self.field_ptr_kind(StructFieldSlot {
                     struct_did,
                     field_index: field_index.index(),
                 }) == Some(PtrKind::OptBox)
@@ -1264,11 +1372,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         field_lifetimes
             .into_iter()
             .filter(|(field_index, _)| {
-                self.promoted_field_kind(StructFieldSlot {
-                    struct_did,
-                    field_index: **field_index,
-                })
-                .is_some()
+                matches!(
+                    self.field_ptr_kind(StructFieldSlot {
+                        struct_did,
+                        field_index: **field_index,
+                    }),
+                    Some(
+                        PtrKind::Ref(_)
+                            | PtrKind::OptRef(_)
+                            | PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
+                    )
+                )
             })
             .map(|(_, lifetime)| *lifetime)
             .collect()
@@ -13284,6 +13399,7 @@ mod tests {
             free_like_wrappers: FxHashSet::default(),
             demoted_fields: FxHashSet::default(),
             field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
+            c_exposed_abi_fields: FxHashSet::default(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
             bytemuck: Cell::new(false),

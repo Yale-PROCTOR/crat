@@ -124,7 +124,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         struct_copy_result,
     };
 
-    let mut visitor = TransformVisitor::new(&input, &analysis_results, ast_to_hir);
+    let mut visitor = TransformVisitor::new(config, &input, &analysis_results, ast_to_hir);
     visitor.visit_crate(&mut krate);
 
     // add SliceCursor module to the crate if it was used
