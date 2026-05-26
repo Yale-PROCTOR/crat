@@ -31,6 +31,20 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     }
 }
 
+fn run_test_with_config(code: &str, config: &Config, includes: &[&str], excludes: &[&str]) {
+    let (s, _) = rewrite_with_config(code, config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
 #[test]
 fn test_local_ptr_to_ref() {
     run_test(
@@ -6108,6 +6122,102 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
         ],
+    );
+}
+
+#[test]
+fn test_c_exposed_abi_struct_without_interface_wrapper_stays_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("parse_number".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct parse_buffer {
+    pub content: *const u8,
+    pub length: usize,
+    pub offset: usize,
+    pub depth: usize,
+}
+
+#[repr(C)]
+pub struct cJSON {
+    pub valueint: i32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn parse_number(item: *mut cJSON, input_buffer: *mut parse_buffer) -> i32 {
+    if input_buffer.is_null() || (*input_buffer).content.is_null() {
+        return 0;
+    }
+    let b = *(*input_buffer).content.offset((*input_buffer).offset as isize);
+    (*item).valueint = b as i32;
+    (*input_buffer).offset += 1;
+    return 1;
+}
+"#,
+        &config,
+        &["pub content: *const u8"],
+        &["pub struct parse_buffer<", "pub content: &'"],
+    );
+}
+
+#[test]
+fn test_c_exposed_slice_element_abi_struct_fields_stay_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("driver".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct Record {
+    pub name: *const i8,
+    pub value: i32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn driver(records: *const Record) -> i32 {
+    if records.is_null() {
+        return 0;
+    }
+    let first = records.offset(0);
+    if (*first).name.is_null() {
+        return (*first).value;
+    }
+    return *(*first).name as i32 + (*first).value;
+}
+"#,
+        &config,
+        &["pub name: *const i8"],
+        &["pub struct Record<", "pub name: Option<&", "pub name: &'"],
+    );
+}
+
+#[test]
+fn test_c_exposed_wrapped_function_does_not_freeze_non_slice_struct_param() {
+    let mut config = Config::default();
+    config
+        .c_exposed_fns
+        .insert("SPX_wots_gen_leafx1".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub steps: *const u32,
+    pub leaf_addr: [u32; 8],
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn SPX_wots_gen_leafx1(dest: *mut u8, info: *mut Info, len: usize) {
+    let mut i = 0usize;
+    while i < len {
+        *dest.offset(i as isize) = *(*info).steps.offset(i as isize) as u8;
+        i += 1;
+    }
+    *dest.offset(0) = (*info).leaf_addr[0] as u8;
+}
+"#,
+        &config,
+        &["pub struct Info<", "pub steps: &'"],
+        &["pub steps: *const u32"],
     );
 }
 
