@@ -247,6 +247,7 @@ pub struct SigDecision {
     /// None means no change
     pub input_decs: Vec<Option<PtrKind>>,
     pub output_dec: Option<PtrKind>,
+    pub signature_locked: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -289,6 +290,7 @@ impl SigDecisions {
                     SigDecision {
                         input_decs,
                         output_dec: None,
+                        signature_locked: false,
                     },
                 );
                 continue;
@@ -333,6 +335,7 @@ impl SigDecisions {
                 SigDecision {
                     input_decs,
                     output_dec,
+                    signature_locked: false,
                 },
             );
         }
@@ -423,14 +426,14 @@ pub fn get_output_dec(
     returned_local_output_dec: Option<PtrKind>,
 ) -> Option<PtrKind> {
     match (direct_output_dec, returned_local_output_dec) {
-    (
-        Some(PtrKind::Raw(_)),
-        Some(
-            kind @ (PtrKind::OptBox
-            | PtrKind::OptBoxedSlice
-            | PtrKind::Box
-            | PtrKind::BoxedSlice),
-        ),
+        (
+            Some(PtrKind::Raw(_)),
+            Some(
+                kind @ (PtrKind::OptBox
+                | PtrKind::OptBoxedSlice
+                | PtrKind::Box
+                | PtrKind::BoxedSlice),
+            ),
         ) => Some(kind),
         (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
         (
