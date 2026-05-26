@@ -343,7 +343,7 @@ impl SigDecisions {
     }
 }
 
-pub(crate) fn infer_returned_local_box_kind<'tcx>(
+fn infer_returned_local_box_kind<'tcx>(
     body: &rustc_middle::mir::Body<'tcx>,
     decision_maker: &DecisionMaker<'tcx>,
     aliases: Option<&FxHashMap<Local, FxHashSet<Local>>>,
