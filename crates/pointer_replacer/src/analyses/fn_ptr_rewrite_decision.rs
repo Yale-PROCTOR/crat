@@ -129,22 +129,22 @@ impl FnPtrRewriteDecision {
                 .filter_map(|did| fn_ptr_groups.fn_to_group.get(did))
                 .next()
                 .copied();
-            if let Some(rep) = maybe_rep {
-                if let Some(decs) = fn_ptr_groups.group_decisions.get(&rep) {
-                    let forced = forced_raw.get(&rep);
-                    let modified_decs: Vec<Option<PtrKind>> = decs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &d)| {
-                            if forced.is_some_and(|f| f.contains(&i)) {
-                                None
-                            } else {
-                                d
-                            }
-                        })
-                        .collect();
-                    loc_decisions.insert(v, modified_decs);
-                }
+            if let Some(rep) = maybe_rep
+                && let Some(decs) = fn_ptr_groups.group_decisions.get(&rep)
+            {
+                let forced = forced_raw.get(&rep);
+                let modified_decs: Vec<Option<PtrKind>> = decs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| {
+                        if forced.is_some_and(|f| f.contains(&i)) {
+                            None
+                        } else {
+                            d
+                        }
+                    })
+                    .collect();
+                loc_decisions.insert(v, modified_decs);
             }
         }
 
