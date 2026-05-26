@@ -98,9 +98,40 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
         self.fn_locals.locals(did).map(|vars| &self.model[vars])
     }
 
+    pub fn function_body_fact(
+        &self,
+        did: LocalDefId,
+        local_idx: usize,
+        offset: usize,
+    ) -> Option<Qualifier>
+    where
+        Qualifier: Copy,
+    {
+        self.function_body_facts(did)
+            .nth(local_idx)
+            .and_then(|quals| quals.get(offset))
+            .copied()
+    }
+
     #[allow(unused)]
     pub fn struct_facts(&self, did: LocalDefId) -> impl Iterator<Item = &[Qualifier]> {
         self.struct_fields.fields(did).map(|vars| &self.model[vars])
+    }
+
+    #[allow(dead_code)]
+    pub fn struct_field_fact(
+        &self,
+        did: LocalDefId,
+        field_idx: usize,
+        offset: usize,
+    ) -> Option<Qualifier>
+    where
+        Qualifier: Copy,
+    {
+        self.struct_facts(did)
+            .nth(field_idx)
+            .and_then(|quals| quals.get(offset))
+            .copied()
     }
 }
 

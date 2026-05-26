@@ -2315,6 +2315,37 @@ fn wg(
 }
 
 #[test]
+fn test_all_writes_keeps_direct_pointer_local_write() {
+    analyze_fn_with(
+        "",
+        "mut p: *mut i32",
+        "
+            p = p.offset(1);
+        ",
+        |mut res, tcx| {
+            let def_id = res
+                .writes
+                .keys()
+                .copied()
+                .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "f")
+                .unwrap();
+
+            let filtered = res.writes.remove(&def_id).unwrap_or_default();
+            let all = res.all_writes.remove(&def_id).unwrap_or_default();
+
+            assert!(
+                filtered.values().all(|writes| writes.is_empty()),
+                "filtered writes may omit direct pointer-local writes that are not address-taken"
+            );
+            assert!(
+                all.values().any(|writes| !writes.is_empty()),
+                "all_writes must retain the direct assignment to p"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_writes_compound() {
     // _1 = const 0_i32
     // _2 = const 0_i32
