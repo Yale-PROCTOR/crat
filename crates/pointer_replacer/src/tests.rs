@@ -6625,6 +6625,40 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_c_exposed_signature_struct_fields_stay_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("driver".to_string());
+    let (s, _) = rewrite_with_config(
+        r#"
+#[repr(C)]
+pub struct Record {
+    pub precision: *const i8,
+}
+
+pub unsafe fn use_str(p: *const i8) -> i8 {
+    return *p.offset(0);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn driver(fields: *const Record) -> i8 {
+    return use_str((*fields).precision);
+}
+"#,
+        &config,
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+
+    assert!(
+        s.contains("pub struct Record {\n    pub precision: *const i8,"),
+        "expected C-exposed signature struct fields to keep raw C layout:\n{s}"
+    );
+    assert!(
+        !s.contains("pub struct Record<"),
+        "expected C-exposed signature struct not to gain pointer lifetimes:\n{s}"
+    );
+}
+
 /// Raw pointer mutability cast: `p` is *mut (writes through it), `q` is *const
 /// (only compared). The comparison `p == q` requires matching types, so a cast
 /// is inserted.
