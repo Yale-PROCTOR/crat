@@ -965,26 +965,30 @@ fn collect_c_exposed_signature_structs<'tcx>(
             .copied()
             .chain(std::iter::once(sig.output()))
         {
-            collect_local_structs_from_ty(ty, &mut structs);
+            collect_local_structs_from_ty(rust_program.tcx, ty, &mut structs);
         }
     }
     structs
 }
 
-fn collect_local_structs_from_ty<'tcx>(ty: ty::Ty<'tcx>, structs: &mut FxHashSet<LocalDefId>) {
+fn collect_local_structs_from_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    structs: &mut FxHashSet<LocalDefId>,
+) {
     match ty.kind() {
         ty::TyKind::RawPtr(pointee, _) => {
-            collect_local_structs_from_ty(*pointee, structs);
+            collect_local_structs_from_ty(tcx, *pointee, structs);
         }
         ty::TyKind::Ref(_, pointee, _) => {
-            collect_local_structs_from_ty(*pointee, structs);
+            collect_local_structs_from_ty(tcx, *pointee, structs);
         }
         ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
-            collect_local_structs_from_ty(*elem, structs);
+            collect_local_structs_from_ty(tcx, *elem, structs);
         }
         ty::TyKind::Tuple(elems) => {
             for elem in elems.iter() {
-                collect_local_structs_from_ty(elem, structs);
+                collect_local_structs_from_ty(tcx, elem, structs);
             }
         }
         ty::TyKind::Adt(adt_def, args) => {
@@ -996,7 +1000,7 @@ fn collect_local_structs_from_ty<'tcx>(ty: ty::Ty<'tcx>, structs: &mut FxHashSet
             }
             for arg in args.iter() {
                 if let ty::GenericArgKind::Type(arg_ty) = arg.kind() {
-                    collect_local_structs_from_ty(arg_ty, structs);
+                    collect_local_structs_from_ty(tcx, arg_ty, structs);
                 }
             }
         }
