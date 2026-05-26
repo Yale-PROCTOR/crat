@@ -24,7 +24,7 @@ use utils::{
 };
 
 use super::{
-    Analysis, Config,
+    Analysis,
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
@@ -45,7 +45,6 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     free_like_wrappers: FxHashSet<LocalDefId>,
     demoted_fields: FxHashSet<StructFieldSlot>,
     field_cursor_fields: FxHashSet<StructFieldSlot>,
-    c_exposed_signature_structs: FxHashSet<LocalDefId>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     pub bytemuck: Cell<bool>,
@@ -948,66 +947,6 @@ enum PtrCtx {
     Deref(bool),
 }
 
-fn collect_c_exposed_signature_structs<'tcx>(
-    rust_program: &RustProgram<'tcx>,
-    c_exposed_fns: &FxHashSet<String>,
-) -> FxHashSet<LocalDefId> {
-    let mut structs = FxHashSet::default();
-    for did in &rust_program.functions {
-        let name = rust_program.tcx.item_name(did.to_def_id());
-        if !c_exposed_fns.contains(name.as_str()) {
-            continue;
-        }
-        let sig = rust_program.tcx.fn_sig(*did).skip_binder().skip_binder();
-        for ty in sig
-            .inputs()
-            .iter()
-            .copied()
-            .chain(std::iter::once(sig.output()))
-        {
-            collect_local_structs_from_ty(rust_program.tcx, ty, &mut structs);
-        }
-    }
-    structs
-}
-
-fn collect_local_structs_from_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: ty::Ty<'tcx>,
-    structs: &mut FxHashSet<LocalDefId>,
-) {
-    match ty.kind() {
-        ty::TyKind::RawPtr(pointee, _) => {
-            collect_local_structs_from_ty(tcx, *pointee, structs);
-        }
-        ty::TyKind::Ref(_, pointee, _) => {
-            collect_local_structs_from_ty(tcx, *pointee, structs);
-        }
-        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
-            collect_local_structs_from_ty(tcx, *elem, structs);
-        }
-        ty::TyKind::Tuple(elems) => {
-            for elem in elems.iter() {
-                collect_local_structs_from_ty(tcx, elem, structs);
-            }
-        }
-        ty::TyKind::Adt(adt_def, args) => {
-            if adt_def.is_struct()
-                && !adt_def.is_union()
-                && let Some(local_did) = adt_def.did().as_local()
-            {
-                structs.insert(local_did);
-            }
-            for arg in args.iter() {
-                if let ty::GenericArgKind::Type(arg_ty) = arg.kind() {
-                    collect_local_structs_from_ty(tcx, arg_ty, structs);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum AllocatorRoot<'a> {
     Malloc {
@@ -1021,14 +960,11 @@ enum AllocatorRoot<'a> {
 
 impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     pub fn new(
-        config: &Config,
         rust_program: &RustProgram<'tcx>,
         analysis: &'analysis Analysis,
         ast_to_hir: AstToHir,
     ) -> TransformVisitor<'analysis, 'tcx> {
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
-        let c_exposed_signature_structs =
-            collect_c_exposed_signature_structs(rust_program, &config.c_exposed_fns);
         let mut sig_decs = SigDecisions::new(rust_program, analysis, &lifetime_plans); // TODO: Move outside
         let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs); // TODO: Move outside
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
@@ -1184,7 +1120,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             free_like_wrappers,
             demoted_fields,
             field_cursor_fields,
-            c_exposed_signature_structs,
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             bytemuck: Cell::new(false),
@@ -1193,9 +1128,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        if self.c_exposed_signature_structs.contains(&field.struct_did) {
-            return None;
-        }
         if struct_field_is_exactly_owning(self.analysis, field) {
             self.ownership_field_kind(field)
         } else {
@@ -1300,9 +1232,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn struct_has_field_rewrite_candidate(&self, struct_did: LocalDefId) -> bool {
-        if self.c_exposed_signature_structs.contains(&struct_did) {
-            return false;
-        }
         self.analysis
             .borrow_promotion_result
             .mutable_fields
@@ -1327,9 +1256,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn ordered_struct_lifetimes(&self, struct_did: LocalDefId) -> Vec<Symbol> {
-        if self.c_exposed_signature_structs.contains(&struct_did) {
-            return vec![];
-        }
         let Some(plan) = self.lifetime_plans.structs.get(&struct_did) else {
             return vec![];
         };
@@ -13358,7 +13284,6 @@ mod tests {
             free_like_wrappers: FxHashSet::default(),
             demoted_fields: FxHashSet::default(),
             field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
-            c_exposed_signature_structs: FxHashSet::default(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
             bytemuck: Cell::new(false),
