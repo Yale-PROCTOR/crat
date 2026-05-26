@@ -15,6 +15,8 @@ use rustc_middle::{
 use rustc_span::{Symbol, sym};
 use utils::{expr, item};
 
+use crate::return_escape;
+
 pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -26,6 +28,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             statics.insert(def_id);
         }
     }
+    let returned_statics = return_escape::statics_returned_by_non_raw_address(tcx);
 
     let mut visitor = HirVisitor {
         tcx,
@@ -38,6 +41,9 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     let mut refcells = FxHashSet::default();
     for (def_id, exprs) in visitor.statics {
         if !statics.contains(&def_id) {
+            continue;
+        }
+        if returned_statics.contains(&def_id) {
             continue;
         }
         if exprs.iter().all(|(_, mutated)| !*mutated) {
@@ -777,6 +783,27 @@ unsafe fn f() -> *mut i32 { X = 1; return &raw mut X; }
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
             &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_reference_return_keeps_static_mut() {
+        let code = r#"
+unsafe fn f<'a>(outer: &'a mut i32) -> &'a mut i32 {
+    static mut X: i32 = 1;
+    if *outer >= X {
+        X += *outer;
+        return (Some(&mut X)).unwrap();
+    } else {
+        *outer += X;
+        return outer;
+    }
+}
+"#;
+        run_test(
+            code,
+            &["static mut X"],
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
         );
     }
 
