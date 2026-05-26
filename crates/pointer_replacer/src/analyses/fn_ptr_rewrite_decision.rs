@@ -190,7 +190,9 @@ impl FnPtrRewriteDecision {
                     continue;
                 }
                 let Some(struct_did) = adt_def.did().as_local() else { continue };
-                let Some(&base_loc) = pre.vars.get(&Var::Local(fn_did, local)) else { continue };
+                let Some(&base_loc) = pre.vars.get(&Var::Local(fn_did, local)) else {
+                    continue;
+                };
                 build_field_candidates(&mut field_dec_candidates, struct_did, base_loc, ty);
             }
         }
@@ -348,6 +350,13 @@ mod tests {
             let pre = points_to::andersen::pre_analyze(&config, &tss, tcx);
             let solutions = points_to::andersen::analyze(&config, &pre, &tss, tcx);
             let aliases = crate::rewriter::find_param_aliases(&pre, &solutions, tcx);
+            let points_to_result = points_to::andersen::post_analyze(
+                &config,
+                pre.clone(),
+                solutions.clone(),
+                &tss,
+                tcx,
+            );
             let mutability_result =
                 crate::analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
             let output_params = crate::analyses::output_params::compute_output_params(
@@ -370,7 +379,7 @@ mod tests {
                 crate::analyses::offset_sign::sign::offset_sign_analysis(&input);
             offset_sign_result.access_signs =
                 source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-            let nullity_result = crate::analyses::nullity::analyze(&input);
+            let nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
             let analysis = crate::rewriter::Analysis {
                 promoted_mut_ref_result,
                 promoted_shared_ref_result,

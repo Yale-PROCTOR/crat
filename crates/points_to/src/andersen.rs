@@ -91,13 +91,13 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     solutions
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BodyItem {
     local_def_id: LocalDefId,
     is_fn: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexInfo<'tcx> {
     pub ends: IndexVec<Loc, Loc>,
     tys: IndexVec<Loc, Ty<'tcx>>,
@@ -164,7 +164,7 @@ impl<'tcx> IndexInfo<'tcx> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreAnalysisData<'tcx> {
     pub bodies: Vec<BodyItem>,
     pub alloc_fns: FxHashSet<LocalDefId>,
@@ -1355,6 +1355,7 @@ impl LocNode {
     }
 }
 
+#[derive(Clone)]
 pub enum LocEdges {
     Fields(IndexVec<FieldIdx, LocNode>),
     Index(LocNode),

@@ -73,8 +73,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
     let points_to = andersen::post_analyze(
         &andersen_config,
-        pre_points_to,
-        points_to_solutions,
+        pre_points_to.clone(),
+        points_to_solutions.clone(),
         &tss,
         tcx,
     );
@@ -111,10 +111,15 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         nullity_result,
     };
 
-    let fn_ptr_groups = FnPtrGroups::build(&pre_points_to, &points_to, &input, &analysis_results);
+    let fn_ptr_groups = FnPtrGroups::build(
+        &pre_points_to,
+        &points_to_solutions,
+        &input,
+        &analysis_results,
+    );
     let fn_ptr_rewrite = FnPtrRewriteDecision::build(
         &pre_points_to,
-        &points_to,
+        &points_to_solutions,
         &input,
         &analysis_results,
         &tss,
