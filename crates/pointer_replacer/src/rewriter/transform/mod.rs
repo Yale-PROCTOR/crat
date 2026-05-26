@@ -41,6 +41,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: FxHashSet<HirId>,
     raw_bridge_bindings: FxHashMap<HirId, RawBridgeInfo>,
+    raw_scalar_bridge_fields: FxHashSet<StructFieldSlot>,
     alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
     free_like_wrappers: FxHashSet<LocalDefId>,
     demoted_fields: FxHashSet<StructFieldSlot>,
@@ -1156,6 +1157,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
+        let raw_scalar_bridge_fields =
+            collect_raw_scalar_bridge_fields(rust_program.tcx, &alloc_wrappers);
         let c_exposed_abi_fields =
             collect_c_exposed_abi_fields(rust_program, &config.c_exposed_fns, &sig_decs);
         let demoted_fields =
@@ -1215,6 +1218,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ptr_kinds,
             forced_raw_bindings,
             raw_bridge_bindings,
+            raw_scalar_bridge_fields,
             alloc_wrappers,
             free_like_wrappers,
             demoted_fields,
@@ -2036,7 +2040,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
             return false;
         }
-        if hir_struct_field_slot(self.tcx, hir_lhs).is_none() {
+        let Some(field) = hir_struct_field_slot(self.tcx, hir_lhs) else {
+            return false;
+        };
+        if !self.raw_scalar_bridge_fields.contains(&field) {
             return false;
         }
         let Some(info) = hir_raw_bridge_info(
@@ -2200,6 +2207,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let [hir_arg] = hir_args else { return None };
         let [arg] = args else { return None };
         let hir_arg = hir_unwrap_casts(hir_arg);
+        if let Some(field) = hir_struct_field_slot(self.tcx, hir_arg)
+            && !self.raw_scalar_bridge_fields.contains(&field)
+        {
+            return None;
+        }
         let arg_ty = self
             .tcx
             .typeck(hir_expr.hir_id.owner)
@@ -10159,6 +10171,125 @@ fn collect_local_raw_param_summaries(
     summaries
 }
 
+fn collect_raw_scalar_bridge_fields(
+    tcx: TyCtxt<'_>,
+    alloc_wrappers: &FxHashMap<LocalDefId, AllocWrapperInfo>,
+) -> FxHashSet<StructFieldSlot> {
+    #[derive(Default)]
+    struct State {
+        saw_scalar: bool,
+        disqualified: bool,
+    }
+
+    struct RawScalarFieldBridgeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        alloc_wrappers: &'a FxHashMap<LocalDefId, AllocWrapperInfo>,
+        states: &'a mut FxHashMap<StructFieldSlot, State>,
+        local_bridges: FxHashMap<HirId, RawBridgeInfo>,
+    }
+
+    impl<'tcx> RawScalarFieldBridgeVisitor<'_, 'tcx> {
+        fn raw_bridge_info_for_rhs(
+            &self,
+            lhs_inner_ty: ty::Ty<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) -> Option<RawBridgeInfo> {
+            if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+                return None;
+            }
+            if hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                return None;
+            }
+
+            hir_raw_bridge_info(self.tcx, lhs_inner_ty, rhs, Some(self.alloc_wrappers), None)
+        }
+
+        fn record_local_assignment(&mut self, lhs_hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            let lhs_ty = self.typeck.node_type(lhs_hir_id);
+            let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                self.local_bridges.remove(&lhs_hir_id);
+                return;
+            };
+            if let Some(info) = self.raw_bridge_info_for_rhs(lhs_inner_ty, rhs) {
+                self.local_bridges.insert(lhs_hir_id, info);
+            } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                self.local_bridges.remove(&lhs_hir_id);
+            }
+        }
+
+        fn record_field_assignment(
+            &mut self,
+            lhs: &'tcx hir::Expr<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            let Some(field) = hir_struct_field_slot(self.tcx, lhs) else {
+                return;
+            };
+            let lhs_ty = self.typeck.expr_ty_adjusted(lhs);
+            let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                return;
+            };
+            if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+                return;
+            }
+            if hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                return;
+            }
+
+            let info = self.raw_bridge_info_for_rhs(lhs_inner_ty, rhs).or_else(|| {
+                hir_unwrapped_local_id(rhs)
+                    .and_then(|hir_id| self.local_bridges.get(&hir_id).cloned())
+            });
+            let state = self.states.entry(field).or_default();
+            match info {
+                Some(RawBridgeInfo::Scalar) => state.saw_scalar = true,
+                Some(RawBridgeInfo::Array { .. }) | None => state.disqualified = true,
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawScalarFieldBridgeVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_local_assignment(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                if let Some(lhs_hir_id) = hir_unwrapped_local_id(lhs) {
+                    self.record_local_assignment(lhs_hir_id, rhs);
+                } else {
+                    self.record_field_assignment(lhs, rhs);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut states = FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = RawScalarFieldBridgeVisitor {
+            tcx,
+            typeck,
+            alloc_wrappers,
+            states: &mut states,
+            local_bridges: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+    });
+
+    states
+        .into_iter()
+        .filter_map(|(field, state)| (state.saw_scalar && !state.disqualified).then_some(field))
+        .collect()
+}
+
 fn collect_raw_bridge_bindings(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
@@ -13395,6 +13526,7 @@ mod tests {
             ptr_kinds: FxHashMap::default(),
             forced_raw_bindings: FxHashSet::default(),
             raw_bridge_bindings: FxHashMap::default(),
+            raw_scalar_bridge_fields: FxHashSet::default(),
             alloc_wrappers: FxHashMap::default(),
             free_like_wrappers: FxHashSet::default(),
             demoted_fields: FxHashSet::default(),

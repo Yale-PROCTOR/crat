@@ -3138,6 +3138,48 @@ pub unsafe fn init_and_clear(holder: *mut Holder) {
 }
 
 #[test]
+fn test_rewriter_keeps_dynamic_local_struct_field_free_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Pixel {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Image {
+    pub pix: *mut Pixel,
+}
+
+pub unsafe fn load(len: usize) {
+    let mut img = Image { pix: core::ptr::null_mut() };
+    img.pix = malloc(len * std::mem::size_of::<Pixel>()) as *mut Pixel;
+    free(img.pix as *mut core::ffi::c_void);
+}
+
+pub unsafe fn load_via_local(len: usize) {
+    let mut img = Image { pix: core::ptr::null_mut() };
+    let pix = malloc(len * std::mem::size_of::<Pixel>()) as *mut Pixel;
+    img.pix = pix;
+    free(img.pix as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "img.pix = malloc(len * std::mem::size_of::<Pixel>()) as *mut Pixel;",
+            "let mut pix: *mut crate::Pixel",
+            "img.pix = pix;",
+            "free(img.pix as *mut core::ffi::c_void);",
+        ],
+        &["Box::from_raw("],
+    );
+}
+
+#[test]
 fn test_rewriter_bridges_raw_array_realloc_null_root_and_free() {
     run_test(
         r#"
