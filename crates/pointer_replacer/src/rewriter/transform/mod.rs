@@ -607,6 +607,21 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         mut_visit::walk_expr(self, expr);
 
         match &mut expr.kind {
+            ExprKind::Field(base, _) => {
+                let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
+                    return;
+                };
+                let hir::ExprKind::Field(hir_base, _) = hir_expr.kind else {
+                    return;
+                };
+                if matches!(
+                    self.expr_ctx(hir_expr),
+                    ExprCtx::ImmediatelyAddrTaken | ExprCtx::AddrTaken(_)
+                ) {
+                    return;
+                }
+                self.simplify_promoted_ref_field_base(base, hir_base);
+            }
             ExprKind::Struct(se) => {
                 self.rewrite_struct_literal_fields(expr.id, se);
             }
@@ -1481,6 +1496,30 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return;
         };
         binding_mode.1 = Mutability::Mut;
+    }
+
+    fn simplify_promoted_ref_field_base(
+        &self,
+        base: &mut P<Expr>,
+        hir_base: &'tcx hir::Expr<'tcx>,
+    ) {
+        let hir::ExprKind::Unary(hir::UnOp::Deref, hir_inner) =
+            utils::hir::unwrap_drop_temps(hir_base).kind
+        else {
+            return;
+        };
+        let Some(hir_id) =
+            hir_unwrapped_local_id(hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_inner)))
+        else {
+            return;
+        };
+        if !matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Ref(_))) {
+            return;
+        }
+        let ExprKind::Unary(UnOp::Deref, inner) = &mut unwrap_paren_mut(base).kind else {
+            return;
+        };
+        **base = unwrap_addr_of_deref(inner).clone();
     }
 
     fn field_lifetime(&self, field: StructFieldSlot) -> Option<Symbol> {
