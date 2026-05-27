@@ -7596,6 +7596,8 @@ struct LocalStructDowngradeFacts {
 
 struct LocalStructBodyFacts {
     body_local_counts: FxHashMap<HirId, usize>,
+    body_field_projection_counts: FxHashMap<(HirId, Symbol), usize>,
+    local_offset_bindings_with_unbounded_index: FxHashSet<HirId>,
     calls: Vec<LocalStructCallFact>,
     lets: Vec<LocalStructLetFact>,
     reborrow_assignments: Vec<LocalStructReborrowAssignmentFact>,
@@ -7607,6 +7609,8 @@ impl LocalStructBodyFacts {
     fn new() -> Self {
         Self {
             body_local_counts: FxHashMap::default(),
+            body_field_projection_counts: FxHashMap::default(),
+            local_offset_bindings_with_unbounded_index: FxHashSet::default(),
             calls: Vec::new(),
             lets: Vec::new(),
             reborrow_assignments: Vec::new(),
@@ -7630,6 +7634,8 @@ struct LocalStructLetFact {
     binding_hir_id: HirId,
     init_points_to_mutable: bool,
     init_local_counts: FxHashMap<HirId, usize>,
+    init_field_projection_counts: FxHashMap<(HirId, Symbol), usize>,
+    init_array_field_ptr_alias: Option<(HirId, Symbol)>,
     init_non_raw_field_projection_roots: FxHashSet<HirId>,
 }
 
@@ -7765,6 +7771,8 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                     self.typeck.expr_ty_adjusted(init),
                 ),
                 init_local_counts: hir_local_id_counts_in_expr(init),
+                init_field_projection_counts: hir_field_projection_counts_in_expr(init),
+                init_array_field_ptr_alias: hir_array_field_ptr_alias(self.typeck, init),
                 init_non_raw_field_projection_roots: hir_non_raw_field_projection_roots_in_expr(
                     self.typeck,
                     init,
@@ -7803,13 +7811,26 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
             let hir::ExprKind::MethodCall(seg, receiver, args, _) = expr.kind else {
                 return;
             };
-            if !args.is_empty() || seg.ident.name.as_str() != "as_mut_ptr" {
-                return;
+            match seg.ident.name.as_str() {
+                "add" | "offset" | "wrapping_offset" if args.len() == 1 => {
+                    if let Some(receiver_hir_id) = hir_unwrapped_local_id(receiver)
+                        && !hir_local_ids_outside_top_level_field_projections(&args[0]).is_empty()
+                    {
+                        self.body
+                            .local_offset_bindings_with_unbounded_index
+                            .insert(receiver_hir_id);
+                    }
+                }
+                "as_mut_ptr" if args.is_empty() => {
+                    self.body.field_mut_ptrs.push(LocalStructFieldMutPtrFact {
+                        receiver_local_ids: hir_local_ids_in_expr(receiver),
+                        receiver_field_projection_roots: hir_field_projection_roots_in_expr(
+                            receiver,
+                        ),
+                    });
+                }
+                _ => {}
             }
-            self.body.field_mut_ptrs.push(LocalStructFieldMutPtrFact {
-                receiver_local_ids: hir_local_ids_in_expr(receiver),
-                receiver_field_projection_roots: hir_field_projection_roots_in_expr(receiver),
-            });
         }
     }
 
@@ -7824,6 +7845,13 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             if let Some(hir_id) = hir_unwrapped_local_id(expr) {
                 *self.body.body_local_counts.entry(hir_id).or_default() += 1;
+            }
+            if let Some(field_use) = hir_top_level_field_projection_use(expr) {
+                *self
+                    .body
+                    .body_field_projection_counts
+                    .entry(field_use)
+                    .or_default() += 1;
             }
             self.visit_call_expr(expr);
             if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
@@ -8045,6 +8073,14 @@ fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
                 if body.body_local_counts.get(root).copied().unwrap_or(0) <= *init_count {
                     continue;
                 }
+                if long_lived_borrow_uses_only_disjoint_array_fields(
+                    body,
+                    let_fact,
+                    *root,
+                    *init_count,
+                ) {
+                    continue;
+                }
                 if !force_signature_input_raw_for_binding(tcx, sig_decs, let_fact.binding_hir_id) {
                     continue;
                 }
@@ -8054,6 +8090,56 @@ fn downgrade_long_lived_local_struct_field_borrow_bindings<'tcx>(
         }
     }
     (changed, bindings)
+}
+
+fn long_lived_borrow_uses_only_disjoint_array_fields(
+    body: &LocalStructBodyFacts,
+    let_fact: &LocalStructLetFact,
+    root: HirId,
+    init_count: usize,
+) -> bool {
+    let Some((alias_root, alias_field)) = let_fact.init_array_field_ptr_alias else {
+        return false;
+    };
+    if alias_root != root {
+        return false;
+    }
+    if body
+        .local_offset_bindings_with_unbounded_index
+        .contains(&let_fact.binding_hir_id)
+    {
+        return false;
+    }
+
+    let root_uses = body.body_local_counts.get(&root).copied().unwrap_or(0);
+    let Some(extra_root_uses) = root_uses.checked_sub(init_count) else {
+        return false;
+    };
+    if extra_root_uses == 0 {
+        return true;
+    }
+
+    let init_alias_field_uses = let_fact
+        .init_field_projection_counts
+        .get(&(root, alias_field))
+        .copied()
+        .unwrap_or(0);
+    let body_alias_field_uses = body
+        .body_field_projection_counts
+        .get(&(root, alias_field))
+        .copied()
+        .unwrap_or(0);
+    if body_alias_field_uses > init_alias_field_uses {
+        return false;
+    }
+
+    let disjoint_field_uses = body
+        .body_field_projection_counts
+        .iter()
+        .filter(|((field_root, field), _)| *field_root == root && *field != alias_field)
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    disjoint_field_uses == extra_root_uses
 }
 
 fn downgrade_local_struct_reborrow_assignment_bindings<'tcx>(
@@ -8514,6 +8600,42 @@ fn hir_local_id_counts_in_expr(expr: &hir::Expr<'_>) -> FxHashMap<HirId, usize> 
         *counts.entry(hir_id).or_default() += 1;
     }
     counts
+}
+
+fn hir_top_level_field_projection_use(expr: &hir::Expr<'_>) -> Option<(HirId, Symbol)> {
+    if let hir::ExprKind::Field(base, ident) = expr.kind
+        && let Some(root) = hir_whole_ptr_root(base)
+    {
+        return Some((root, ident.name));
+    }
+    None
+}
+
+fn hir_field_projection_counts_in_expr(expr: &hir::Expr<'_>) -> FxHashMap<(HirId, Symbol), usize> {
+    let mut counts = FxHashMap::default();
+    for field_use in hir_top_level_field_projection_uses_in_expr(expr) {
+        *counts.entry(field_use).or_default() += 1;
+    }
+    counts
+}
+
+fn hir_array_field_ptr_alias<'tcx>(
+    typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<(HirId, Symbol)> {
+    let hir::ExprKind::MethodCall(seg, receiver, args, _) = hir_unwrap_casts(expr).kind else {
+        return None;
+    };
+    if !args.is_empty() || !matches!(seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") {
+        return None;
+    }
+    if !matches!(typeck.expr_ty(receiver).kind(), ty::TyKind::Array(..)) {
+        return None;
+    }
+    let hir::ExprKind::Field(base, ident) = hir_unwrap_casts(receiver).kind else {
+        return None;
+    };
+    Some((hir_whole_ptr_root(base)?, ident.name))
 }
 
 fn hir_field_projection_roots_in_expr(expr: &hir::Expr<'_>) -> FxHashSet<HirId> {

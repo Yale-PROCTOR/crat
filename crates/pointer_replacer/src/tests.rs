@@ -949,7 +949,7 @@ pub unsafe fn caller(s: *mut State) -> i32 {
 }
 
 #[test]
-fn test_rewriter_downgrades_long_lived_local_struct_field_borrow_conflict() {
+fn test_rewriter_downgrades_long_lived_array_field_alias_with_local_offset_index() {
     run_test(
         r#"
 #[repr(C)]
@@ -964,7 +964,7 @@ pub unsafe fn decorrelate(t: *mut State) {
     let residuals_0: *mut i32 = ((*t).residuals).as_mut_ptr();
     let mut i: u32 = 0;
     (*t).subframe_bitdepth = (*t).bitdepth;
-    while i < (*t).cur_blocksize && i < 5 {
+    while i < (*t).cur_blocksize && i <= 5 {
         *residuals_0.offset(i as isize) = i as i32;
         i += 1;
     }
@@ -974,7 +974,10 @@ pub unsafe fn decorrelate(t: *mut State) {
             "pub unsafe fn decorrelate(mut t: &mut crate::State)",
             "let mut residuals_0: *mut i32",
         ],
-        &["pub unsafe fn decorrelate(mut t: *mut crate::State)"],
+        &[
+            "pub unsafe fn decorrelate(mut t: *mut crate::State)",
+            "let mut residuals_0: &mut [i32]",
+        ],
     );
 }
 
@@ -1089,6 +1092,65 @@ pub unsafe fn add_sample(m: *mut State, value: u8) {
         "#,
         &["pub unsafe fn add_sample(mut m: &mut crate::State"],
         &["pub unsafe fn add_sample(mut m: *mut crate::State"],
+    );
+}
+
+#[test]
+fn test_rewriter_rewrites_array_field_mut_ptr_alias_offset_to_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pos: usize,
+    buffer: [u8; 8],
+}
+
+pub unsafe fn write_byte(d: *mut u8, value: u8) {
+    *d = value;
+    *d.offset(1) = value;
+}
+
+pub unsafe fn add_sample(m: *mut State, value: u8) {
+    let p: *mut u8 = (*m).buffer.as_mut_ptr();
+    write_byte(p.offset((*m).pos as isize), value);
+    (*m).pos += 1;
+}
+        "#,
+        &[
+            "let mut p: &mut [u8]",
+            "write_byte(&mut ((p)[(m.pos as isize) as usize..]), value)",
+        ],
+        &[
+            "let p: *mut u8",
+            ".buffer.as_mut_ptr()",
+            "p.offset((*m).pos as isize)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_array_field_mut_ptr_alias_raw_when_root_reuses_same_field() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pos: usize,
+    buffer: [u8; 8],
+}
+
+pub unsafe fn write_byte(d: *mut u8, value: u8) {
+    *d = value;
+    *d.offset(1) = value;
+}
+
+pub unsafe fn add_sample(m: *mut State, value: u8) {
+    let p: *mut u8 = (*m).buffer.as_mut_ptr();
+    (*m).buffer[0] = value;
+    write_byte(p.offset((*m).pos as isize), value);
+}
+        "#,
+        &["let mut p: *mut u8"],
+        &["let mut p: &mut [u8]"],
     );
 }
 

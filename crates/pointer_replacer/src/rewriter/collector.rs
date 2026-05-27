@@ -1,10 +1,13 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    ExprKind, HirId, QPath, TyKind,
+    self as hir, ExprKind, HirId, QPath, TyKind,
     def::{DefKind, Res},
-    intravisit::{Visitor, walk_expr},
+    intravisit::{Visitor, walk_expr, walk_stmt},
 };
-use rustc_middle::mir::{Local, Operand, Rvalue, StatementKind};
+use rustc_middle::{
+    mir::{Local, Operand, Rvalue, StatementKind},
+    ty::{self, TyCtxt},
+};
 use rustc_span::def_id::LocalDefId;
 
 use super::{
@@ -26,6 +29,8 @@ pub fn collect_diffs<'tcx>(
 
     for did in rust_program.functions.iter() {
         let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
+        let hir_body = rust_program.tcx.hir_body_owned_by(*did);
+        let binding_inits = collect_binding_inits(hir_body);
 
         let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
         let local_to_binding: FxHashMap<Local, HirId> = hir_to_mir
@@ -93,9 +98,22 @@ pub fn collect_diffs<'tcx>(
                     .or_else(|| decision_maker.decide(local, decl, aliases))
             };
 
-            if let Some(mut ptr_kind) = decision
-                && let Some(hir_id) = local_to_binding.get(&local)
-            {
+            if let Some(mut ptr_kind) = decision {
+                let Some(hir_id) = local_to_binding.get(&local) else {
+                    continue;
+                };
+                if !is_input
+                    && matches!(ptr_kind, PtrKind::Raw(_))
+                    && let Some(init) = binding_inits.get(hir_id).copied()
+                    && let Some(alias_kind) = array_field_pointer_alias_kind(
+                        rust_program.tcx,
+                        init,
+                        &ptr_kinds,
+                        local_needs_cursor(analysis, *did, local),
+                    )
+                {
+                    ptr_kind = alias_kind;
+                }
                 if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
                 }
@@ -143,6 +161,99 @@ fn collect_returned_output_locals(
 
     locals.remove(&Local::from_u32(0));
     locals
+}
+
+fn collect_binding_inits<'tcx>(
+    body: &'tcx hir::Body<'tcx>,
+) -> FxHashMap<HirId, &'tcx hir::Expr<'tcx>> {
+    struct BindingInitCollector<'tcx> {
+        inits: FxHashMap<HirId, &'tcx hir::Expr<'tcx>>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for BindingInitCollector<'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.inits.insert(hir_id, init);
+            }
+            walk_stmt(self, stmt);
+        }
+    }
+
+    let mut collector = BindingInitCollector {
+        inits: FxHashMap::default(),
+    };
+    collector.visit_body(body);
+    collector.inits
+}
+
+fn local_needs_cursor(analysis: &Analysis, did: LocalDefId, local: Local) -> bool {
+    analysis
+        .offset_sign_result
+        .access_signs
+        .get(&did)
+        .is_some_and(|signs| signs.contains(local))
+}
+
+fn array_field_pointer_alias_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    init: &'tcx hir::Expr<'tcx>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    needs_cursor: bool,
+) -> Option<PtrKind> {
+    if needs_cursor {
+        return None;
+    }
+
+    let hir::ExprKind::MethodCall(seg, receiver, args, _) = hir_unwrap_casts(init).kind else {
+        return None;
+    };
+    let mutability = match seg.ident.name.as_str() {
+        "as_ptr" => false,
+        "as_mut_ptr" => true,
+        _ => return None,
+    };
+    if !args.is_empty() {
+        return None;
+    }
+
+    let typeck = tcx.typeck(init.hir_id.owner);
+    if !matches!(typeck.expr_ty(receiver).kind(), ty::TyKind::Array(..)) {
+        return None;
+    }
+
+    let root = hir_projection_root_local_id(receiver)?;
+    let root_kind = ptr_kinds.get(&root).copied()?;
+    if !is_borrow_like_decision(root_kind) || (mutability && !root_kind.is_mut()) {
+        return None;
+    }
+
+    Some(PtrKind::Slice(mutability))
+}
+
+fn hir_unwrap_casts<'a, 'hir>(mut expr: &'a hir::Expr<'hir>) -> &'a hir::Expr<'hir> {
+    while let hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) = expr.kind {
+        expr = inner;
+    }
+    expr
+}
+
+fn hir_projection_root_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    match hir_unwrap_casts(expr).kind {
+        hir::ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => hir_projection_root_local_id(inner),
+        hir::ExprKind::Field(base, _) => hir_projection_root_local_id(base),
+        _ => None,
+    }
+}
+
+fn is_borrow_like_decision(kind: PtrKind) -> bool {
+    matches!(kind, PtrKind::Ref(_) | PtrKind::OptRef(_))
 }
 
 fn collect_non_outermost_owning_hir_locals(rust_program: &RustProgram) -> FxHashSet<HirId> {
