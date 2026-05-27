@@ -2962,7 +2962,7 @@ pub unsafe fn pick_existing<'a>(x: &'a i32, y: *const i32) -> *const i32 {
 }
 
 #[test]
-fn test_rewriter_keeps_fn_pointer_signature_raw_with_return_relation() {
+fn test_rewriter_rewrites_fn_pointer_input_with_raw_return_relation() {
     run_test(
         r#"
 pub unsafe fn id(x: *mut i32) -> *mut i32 {
@@ -2976,8 +2976,8 @@ pub unsafe fn caller(mut x: i32) -> i32 {
 }
 "#,
         &[
-            "let f: unsafe fn(*mut i32) -> *mut i32 = id",
-            "pub unsafe fn id(x: *mut i32) -> *mut i32",
+            "let f: unsafe fn(Option<&i32>) -> *mut i32 = id",
+            "pub unsafe fn id(x: Option<&i32>) -> *mut i32",
         ],
         &["pub unsafe fn id<'a>"],
     );

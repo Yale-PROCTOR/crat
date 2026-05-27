@@ -17,17 +17,16 @@ pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
     sig_decs: &SigDecisions,
+    fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
     let non_outermost_owning_locals = collect_non_outermost_owning_hir_locals(rust_program);
 
     let fn_ptrs = collect_fn_ptrs(rust_program);
 
-    // collect each HIR variable's before/after pointer kinds
     for did in rust_program.functions.iter() {
         let decision_maker = DecisionMaker::new(analysis, *did, rust_program.tcx);
 
-        // Assume every mir local has one or less corresponding hir id
         let hir_to_mir = utils::ir::map_thir_to_mir(*did, false, rust_program.tcx);
         let local_to_binding: FxHashMap<Local, HirId> = hir_to_mir
             .binding_to_local
@@ -41,7 +40,7 @@ pub fn collect_diffs<'tcx>(
             .borrow();
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
-        let input_skip_len = rust_program
+        let input_len = rust_program
             .tcx
             .fn_sig(*did)
             .skip_binder()
@@ -58,16 +57,12 @@ pub fn collect_diffs<'tcx>(
             .map(|kind| collect_returned_output_locals(body, kind))
             .unwrap_or_default();
 
-        for (local, decl) in body
-            .local_decls
-            .iter_enumerated()
-            .skip(1 + input_skip_len * (used_as_fn_ptr as usize))
-        // skip inputs if used as fn ptr
-        {
+        for (local, decl) in body.local_decls.iter_enumerated().skip(1) {
+            let is_input = local.index() <= input_len;
             let sig_input_dec = local
                 .index()
                 .checked_sub(1)
-                .filter(|idx| *idx < input_skip_len)
+                .filter(|idx| *idx < input_len)
                 .and_then(|idx| {
                     sig_decs
                         .data
@@ -78,9 +73,27 @@ pub fn collect_diffs<'tcx>(
                         .flatten()
                 });
             let aliases = aliases.and_then(|aliases| aliases.get(&local));
-            if let Some(mut ptr_kind) = sig_input_dec
-                .or_else(|| returned_output_locals.get(&local).copied())
-                .or_else(|| decision_maker.decide(local, decl, aliases))
+
+            let group_input_dec = if is_input && used_as_fn_ptr {
+                fn_ptr_groups
+                    .fn_to_group
+                    .get(did)
+                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep))
+                    .and_then(|decs| decs.get(local.index() - 1).copied())
+                    .flatten()
+            } else {
+                None
+            };
+
+            let decision = if is_input && used_as_fn_ptr {
+                sig_input_dec.or(group_input_dec)
+            } else {
+                sig_input_dec
+                    .or_else(|| returned_output_locals.get(&local).copied())
+                    .or_else(|| decision_maker.decide(local, decl, aliases))
+            };
+
+            if let Some(mut ptr_kind) = decision
                 && let Some(hir_id) = local_to_binding.get(&local)
             {
                 if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
