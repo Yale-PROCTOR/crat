@@ -2775,6 +2775,77 @@ pub unsafe fn read(x: i32) -> i32 {
 }
 
 #[test]
+fn test_rewriter_promotes_raw_struct_param_for_direct_pointer_field_access() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub next: *mut Node,
+    pub value: i32,
+}
+
+pub unsafe fn mark_if_linked(node: *mut Node) -> i32 {
+    if ((*node).next).is_null() {
+        (*node).value = 0;
+    } else {
+        (*node).value = 1;
+    }
+    (*node).value
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "pub next: Option<&'a mut Node<'a>>",
+            "pub unsafe fn mark_if_linked<'a>(mut node: &mut crate::Node<'a>)",
+            "(node.next).is_none()",
+        ],
+        &["pub next: *mut Node", "(*node).next", "(*&*(node)).next"],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_address_taken_field_base_for_promoted_struct_param() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct IntVec {
+    pub data: *mut i32,
+    pub len: usize,
+    pub cap: usize,
+}
+
+#[repr(C)]
+pub struct VM {
+    pub stack: IntVec,
+    pub steps: i32,
+}
+
+unsafe extern "C" {
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn init_vec(v: *mut IntVec) {
+    free((*v).data as *mut core::ffi::c_void);
+    (*v).data = std::ptr::null_mut();
+    (*v).len = 0;
+    (*v).cap = 0;
+}
+
+pub unsafe fn vm_init(vm: *mut VM) {
+    init_vec(&mut (*vm).stack);
+    (*vm).steps = 0;
+}
+"#,
+        &[
+            "pub unsafe fn vm_init(mut vm: &mut crate::VM)",
+            "init_vec((Some(&mut (*vm).stack)).unwrap())",
+            "vm.steps = 0",
+        ],
+        &["&raw mut (vm.stack)", "&mut *(&raw mut"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_multiple_struct_fields_with_distinct_lifetimes() {
     run_test(
         r#"
