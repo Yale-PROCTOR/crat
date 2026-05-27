@@ -2873,9 +2873,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                     self.slice_cursor.set(true);
                     *ptr = if m {
-                        utils::expr!("crate::slice_cursor::SliceCursor::empty()")
+                        utils::expr!("crate::slice_cursor::SliceCursorMut::empty()")
                     } else {
-                        utils::expr!("crate::slice_cursor::SliceCursorRef::empty()")
+                        utils::expr!("crate::slice_cursor::SliceCursor::empty()")
                     };
                     return PtrKind::SliceCursor(m);
                 }
