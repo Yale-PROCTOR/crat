@@ -302,11 +302,11 @@ impl SigDecisions {
         rust_program: &RustProgram,
         analysis: &Analysis,
         lifetime_plans: &super::lifetimes::LifetimePlans,
+        fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
     ) -> Self {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());
 
-        // do not change function signatures that are used as function pointers
         let fn_ptrs = collect_fn_ptrs(rust_program);
 
         for did in rust_program.functions.iter() {
@@ -318,14 +318,23 @@ impl SigDecisions {
                 .skip_binder()
                 .len();
             if fn_ptrs.contains(did) {
+                let input_decs = fn_ptr_groups
+                    .fn_to_group
+                    .get(did)
+                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep).cloned())
+                    .unwrap_or_else(|| vec![None; input_len]);
+                // don't rewrite output for fn-ptr group members: the fn-ptr type
+                // annotations (casts, parameter types) don't yet track output types,
+                // and the existing internal local-variable transformation handles
+                // the return conversion back to raw.
                 data.insert(
                     *did,
                     SigDecision {
-                        input_decs: vec![None; input_len],
+                        input_decs,
                         input_lifetimes: vec![None; input_len],
                         output_dec: None,
                         output_lifetime: None,
-                        signature_locked: true,
+                        signature_locked: false,
                     },
                 );
                 continue;
@@ -374,36 +383,11 @@ impl SigDecisions {
                     {
                         Some(kind)
                     }
-                    Some(
-                        kind @ (PtrKind::Raw(_)
-                        | PtrKind::OptBox
-                        | PtrKind::OptBoxedSlice
-                        | PtrKind::Box
-                        | PtrKind::BoxedSlice),
-                    ) => Some(kind),
-                    _ => None,
+                    other => get_direct_output_dec(other),
                 };
             let returned_local_output_dec =
                 infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
-            let output_dec = match (direct_output_dec, returned_local_output_dec) {
-                (
-                    Some(PtrKind::Raw(_)),
-                    Some(
-                        kind @ (PtrKind::OptBox
-                        | PtrKind::OptBoxedSlice
-                        | PtrKind::Box
-                        | PtrKind::BoxedSlice),
-                    ),
-                ) => Some(kind),
-                (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
-                (
-                    Some(PtrKind::OptBox | PtrKind::Box),
-                    Some(kind @ (PtrKind::OptBoxedSlice | PtrKind::BoxedSlice)),
-                ) => Some(kind),
-                (Some(kind), None) | (None, Some(kind)) => Some(kind),
-                (Some(kind), Some(_)) => Some(kind),
-                (None, None) => None,
-            };
+            let output_dec = get_output_dec(direct_output_dec, returned_local_output_dec);
 
             data.insert(*did, {
                 let mut sig_dec = SigDecision {
@@ -699,6 +683,44 @@ fn infer_returned_local_box_kind<'tcx>(
         Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) if return_non_null => Some(kind),
         Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => Some(kind.optional_variant()),
         _ => None,
+    }
+}
+
+pub fn get_direct_output_dec(decision: Option<PtrKind>) -> Option<PtrKind> {
+    match decision {
+        Some(
+            kind @ (PtrKind::Raw(_)
+            | PtrKind::OptBox
+            | PtrKind::OptBoxedSlice
+            | PtrKind::Box
+            | PtrKind::BoxedSlice),
+        ) => Some(kind),
+        _ => None,
+    }
+}
+
+pub fn get_output_dec(
+    direct_output_dec: Option<PtrKind>,
+    returned_local_output_dec: Option<PtrKind>,
+) -> Option<PtrKind> {
+    match (direct_output_dec, returned_local_output_dec) {
+        (
+            Some(PtrKind::Raw(_)),
+            Some(
+                kind @ (PtrKind::OptBox
+                | PtrKind::OptBoxedSlice
+                | PtrKind::Box
+                | PtrKind::BoxedSlice),
+            ),
+        ) => Some(kind),
+        (Some(PtrKind::Raw(m)), _) => Some(PtrKind::Raw(m)),
+        (
+            Some(PtrKind::OptBox | PtrKind::Box),
+            Some(kind @ (PtrKind::OptBoxedSlice | PtrKind::BoxedSlice)),
+        ) => Some(kind),
+        (Some(kind), None) | (None, Some(kind)) => Some(kind),
+        (Some(kind), Some(_)) => Some(kind),
+        (None, None) => None,
     }
 }
 

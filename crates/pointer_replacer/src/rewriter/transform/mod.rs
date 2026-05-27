@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use etrace::some_or;
+use rustc_abi::FieldIdx;
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
@@ -28,7 +29,13 @@ use super::{
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
-use crate::{analyses::borrow::StructFieldSlot, utils::rustc::RustProgram};
+use crate::{
+    analyses::{
+        borrow::StructFieldSlot, fn_ptr_groups::FnPtrGroups,
+        fn_ptr_rewrite_decision::FnPtrRewriteDecision,
+    },
+    utils::rustc::RustProgram,
+};
 
 pub(crate) struct TransformVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -49,6 +56,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     c_exposed_abi_fields: FxHashSet<StructFieldSlot>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
+    fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
     pub slice_cursor: Cell<bool>,
 }
@@ -126,6 +134,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ItemKind::Struct(_, generics, VariantData::Struct { fields, .. }) => {
                 if let Some(struct_did) = self.ast_to_hir.global_map.get(&node_id).copied() {
                     self.rewrite_struct_definition(struct_did, generics, fields);
+                    for (field_idx, field) in fields.iter_mut().enumerate() {
+                        let fi = FieldIdx::from_usize(field_idx);
+                        if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                            && let Some(decs) =
+                                self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
+                        {
+                            let decs = decs.clone();
+                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                                self.slice_cursor.set(true);
+                            }
+                        }
+                    }
                 }
             }
             ItemKind::Fn(box fn_item) => {
@@ -282,7 +302,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 });
                             *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
                         }
-                        None => continue,
+                        None => {
+                            if let TyKind::BareFn(bare_fn) = &mut param.ty.kind
+                                && let Some(hir_id) =
+                                    self.ast_to_hir.local_map.get(&param.pat.id).copied()
+                                && let Some(decs) =
+                                    self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
+                            {
+                                let decs = decs.clone();
+                                if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                                    self.slice_cursor.set(true);
+                                }
+                            }
+                            continue;
+                        }
                     }
 
                     let needs_mut_binding = input_dec.is_some_and(|kind| {
@@ -358,6 +391,55 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     _ => adjusted_output_dec,
                 };
                 fn_output_transform = output_kind.map(|kind| (def_id, kind));
+            }
+            ItemKind::Struct(_, _, variant_data) => {
+                let struct_def_id = self.ast_to_hir.global_map[&node_id];
+                let fields = match variant_data {
+                    VariantData::Struct { fields, .. } => fields.as_mut_slice(),
+                    VariantData::Tuple(fields, _) => fields.as_mut_slice(),
+                    VariantData::Unit(_) => &mut [],
+                };
+                for (field_idx, field) in fields.iter_mut().enumerate() {
+                    let fi = FieldIdx::from_usize(field_idx);
+                    if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                        && let Some(decs) = self
+                            .fn_ptr_rewrite
+                            .field_decisions
+                            .get(&(struct_def_id, fi))
+                    {
+                        let decs = decs.clone();
+                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                            self.slice_cursor.set(true);
+                        }
+                    }
+                }
+            }
+            ItemKind::TyAlias(box ty_alias) => {
+                let alias_def_id = self.ast_to_hir.global_map[&node_id];
+                let alias_hir_id = self.tcx.local_def_id_to_hir_id(alias_def_id);
+                if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&alias_hir_id) {
+                    let decs = decs.clone();
+                    if let Some(ty) = &mut ty_alias.ty
+                        && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
+                        && rewrite_bare_fn_inputs(bare_fn, &decs)
+                    {
+                        self.slice_cursor.set(true);
+                    }
+                }
+            }
+            ItemKind::Static(box static_item) => {
+                // only bare fn-ptr statics (fn(...)) are covered; Option<fn(...)> statics
+                // are not in annotation_decisions and their BareFn match fails here
+                let static_def_id = self.ast_to_hir.global_map[&node_id];
+                let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
+                if let TyKind::BareFn(bare_fn) = &mut static_item.ty.kind
+                    && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id)
+                {
+                    let decs = decs.clone();
+                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                        self.slice_cursor.set(true);
+                    }
+                }
             }
             _ => {}
         }
@@ -504,6 +586,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if !self.try_bridge_raw_root(rhs, hir_rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
                     self.transform_rhs(rhs, hir_rhs, lhs_kind);
                 }
+            }
+        }
+
+        // Handle fn-ptr typed locals: rewrite BareFn type annotations
+        if let Some(ty) = &mut local.ty
+            && let TyKind::BareFn(bare_fn) = &mut ty.kind
+            && let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+            && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
+        {
+            let decs = decs.clone();
+            if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                self.slice_cursor.set(true);
             }
         }
     }
@@ -668,7 +763,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.transform_rhs(r, hir_r, kind);
                 }
             }
-            ExprKind::Call(_, args) => {
+            ExprKind::Call(func_ast, args) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
@@ -681,6 +776,30 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 } else {
                     None
                 };
+
+                // for indirect calls via a fn-ptr binding, look up joint decisions
+                let fn_ptr_decisions: Option<&Vec<Option<PtrKind>>> = if sig_dec.is_none() {
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+                        && let Res::Local(binding_hir_id) = path.res
+                    {
+                        self.fn_ptr_rewrite
+                            .annotation_decisions
+                            .get(&binding_hir_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // for calls via struct-field fn-ptrs (e.g., `(s.field).expect(...)(args)`)
+                let field_fn_ptr_decisions: Option<&Vec<Option<PtrKind>>> =
+                    if sig_dec.is_none() && fn_ptr_decisions.is_none() {
+                        self.field_fn_ptr_decisions_for_call(func)
+                    } else {
+                        None
+                    };
+
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
@@ -693,6 +812,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let param_kind = sig_dec
                         .and_then(|sig| sig.input_decs.get(i).copied())
                         .flatten()
+                        .or_else(|| {
+                            fn_ptr_decisions
+                                .and_then(|decs| decs.get(i).copied())
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            field_fn_ptr_decisions
+                                .and_then(|decs| decs.get(i).copied())
+                                .flatten()
+                        })
                         .or_else(|| {
                             unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
                                 PtrKind::Raw(
@@ -718,6 +847,26 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
 
+                // when this is a transmute call and an argument casts a fn-ptr group function,
+                // replace the first explicit type arg with `_` to match the rewritten cast type
+                if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident.name == rustc_span::sym::transmute)
+                    && hargs.iter().any(|h| self.hir_expr_has_fn_ptr_group_cast(h))
+                    && let ExprKind::Path(_, path) = &mut func_ast.kind
+                    && let Some(seg) = path.segments.last_mut()
+                    && let Some(gen_args) = &mut seg.args
+                    && let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args
+                {
+                    for arg in &mut angle_args.args {
+                        if let AngleBracketedArg::Arg(GenericArg::Type(ty)) = arg {
+                            ty.kind = TyKind::Infer;
+                            break;
+                        }
+                    }
+                }
                 hoist_opt_ref_borrow(expr);
             }
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
@@ -933,6 +1082,25 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
+            ExprKind::Cast(_, cast_ty) => {
+                if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
+                    && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let inner = utils::hir::unwrap_drop_temps(hir_inner);
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
+                        && let hir::def::Res::Def(_, def_id) = path.res
+                        && let Some(local_did) = def_id.as_local()
+                        && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
+                        && let Some(decs) = self.fn_ptr_rewrite.individual_decisions.get(&local_did)
+                    {
+                        let decs = decs.clone();
+                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                            self.slice_cursor.set(true);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1061,10 +1229,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         rust_program: &RustProgram<'tcx>,
         analysis: &'analysis Analysis,
         ast_to_hir: AstToHir,
+        fn_ptr_groups: FnPtrGroups,
+        fn_ptr_rewrite: FnPtrRewriteDecision,
     ) -> TransformVisitor<'analysis, 'tcx> {
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
-        let mut sig_decs = SigDecisions::new(rust_program, analysis, &lifetime_plans); // TODO: Move outside
-        let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs); // TODO: Move outside
+        let mut sig_decs =
+            SigDecisions::new(rust_program, analysis, &lifetime_plans, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
@@ -1097,6 +1268,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 changed = true;
             }
             if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
+                changed = true;
+            }
+            if downgrade_cursor_inputs_from_unanchored_raw_callers(
+                rust_program.tcx,
+                &mut sig_decs,
+                &ptr_kinds,
+            ) {
                 changed = true;
             }
             let owned_field_free_bindings = collect_owned_field_free_owner_bindings(
@@ -1152,7 +1330,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !changed {
                 break;
             }
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs);
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
             normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         }
 
@@ -1189,7 +1367,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
         if sig_changed {
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs);
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         emit_ownership_field_diagnostics(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
@@ -1226,6 +1404,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             c_exposed_abi_fields,
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
+            fn_ptr_rewrite,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
@@ -2258,6 +2437,69 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_rhs.kind else { return None };
         let Res::Local(hir_id) = path.res else { return None };
         Some(hir_id)
+    }
+
+    /// Returns fn-ptr group decisions for calls via struct-field fn-ptrs like
+    /// `(struct.field).expect("...")(args)`. Checks for the `expect`/`unwrap` unwrap pattern.
+    fn field_fn_ptr_decisions_for_call<'a>(
+        &'a self,
+        func: &hir::Expr<'tcx>,
+    ) -> Option<&'a Vec<Option<PtrKind>>> {
+        let func = utils::hir::unwrap_drop_temps(func);
+        let hir::ExprKind::MethodCall(method_seg, receiver, _, _) = func.kind else {
+            return None;
+        };
+        if !matches!(method_seg.ident.name.as_str(), "expect" | "unwrap") {
+            return None;
+        }
+        let receiver = utils::hir::unwrap_drop_temps(receiver);
+        let hir::ExprKind::Field(struct_expr, field_ident) = receiver.kind else { return None };
+        let typeck = self.tcx.typeck(func.hir_id.owner);
+        let struct_ty = typeck.expr_ty_adjusted(struct_expr);
+        let ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else { return None };
+        if !adt_def.is_struct() {
+            return None;
+        }
+        let struct_did = adt_def.did().as_local()?;
+        let field_idx = adt_def
+            .all_fields()
+            .position(|f| f.name == field_ident.name)
+            .map(FieldIdx::from_usize)?;
+        self.fn_ptr_rewrite
+            .field_decisions
+            .get(&(struct_did, field_idx))
+    }
+
+    fn hir_expr_has_fn_ptr_group_cast(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+        struct CastFinder<'a> {
+            direct_rewrite: &'a FxHashSet<LocalDefId>,
+            found: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for CastFinder<'_> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if self.found {
+                    return;
+                }
+                if let hir::ExprKind::Cast(inner, _) = expr.kind {
+                    let inner = utils::hir::unwrap_drop_temps(inner);
+                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = inner.kind
+                        && let hir::def::Res::Def(_, def_id) = path.res
+                        && let Some(local_did) = def_id.as_local()
+                        && self.direct_rewrite.contains(&local_did)
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut finder = CastFinder {
+            direct_rewrite: &self.fn_ptr_rewrite.direct_rewrite,
+            found: false,
+        };
+        finder.visit_expr(expr);
+        finder.found
     }
 
     fn effective_ptr_kind(&self, hir_id: HirId) -> Option<PtrKind> {
@@ -6281,6 +6523,72 @@ fn mk_cursor_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: 
     utils::ty!("crate::slice_cursor::{cursor}<'{lifetime}, {inner_ty}>")
 }
 
+/// Finds a `BareFn` type nested inside wrappers like `Option<fn(...)>`.
+fn find_bare_fn_in_ty_mut(ty: &mut Ty) -> Option<&mut rustc_ast::BareFnTy> {
+    match &mut ty.kind {
+        TyKind::BareFn(bare_fn) => Some(bare_fn),
+        TyKind::Path(_, path) => {
+            let seg = path.segments.last_mut()?;
+            let gen_args = seg.args.as_mut()?;
+            let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args else { return None };
+            for arg in &mut angle_args.args {
+                if let AngleBracketedArg::Arg(GenericArg::Type(inner_ty)) = arg
+                    && let Some(bare_fn) = find_bare_fn_in_ty_mut(inner_ty)
+                {
+                    return Some(bare_fn);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` if any parameter was rewritten to a SliceCursor type.
+fn rewrite_bare_fn_inputs(
+    bare_fn: &mut rustc_ast::BareFnTy,
+    decisions: &[Option<PtrKind>],
+) -> bool {
+    let mut used_slice_cursor = false;
+    for (param, decision) in bare_fn.decl.inputs.iter_mut().zip(decisions) {
+        let Some(kind) = decision else { continue };
+        let TyKind::Ptr(MutTy { ty: inner_ty, .. }) = &param.ty.kind else { continue };
+        let inner_str = pprust::ty_to_string(inner_ty);
+        let new_ty = match kind {
+            PtrKind::Ref(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("&{m}{inner_str}")
+            }
+            PtrKind::OptRef(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("Option<&{m}{inner_str}>")
+            }
+            PtrKind::Slice(m) => {
+                let m = if *m { "mut " } else { "" };
+                utils::ty!("&{m}[{inner_str}]")
+            }
+            PtrKind::Raw(m) => {
+                let m = if *m { "mut" } else { "const" };
+                utils::ty!("*{m} {inner_str}")
+            }
+            PtrKind::Box => utils::ty!("Box<{inner_str}>"),
+            PtrKind::OptBox => utils::ty!("Option<Box<{inner_str}>>"),
+            PtrKind::BoxedSlice => utils::ty!("Box<[{inner_str}]>"),
+            PtrKind::OptBoxedSlice => utils::ty!("Option<Box<[{inner_str}]>>"),
+            PtrKind::SliceCursor(m) => {
+                used_slice_cursor = true;
+                if *m {
+                    utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {inner_str}>")
+                } else {
+                    utils::ty!("crate::slice_cursor::SliceCursor<'_, {inner_str}>")
+                }
+            }
+        };
+        param.ty = P(new_ty);
+    }
+    used_slice_cursor
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PtrExprBaseKind {
     Path(Res),
@@ -8483,6 +8791,342 @@ fn downgrade_raw_cast_call_inputs(
         changed |= visitor.changed;
     }
     changed
+}
+
+fn downgrade_cursor_inputs_from_unanchored_raw_callers(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> bool {
+    let raw_origin_locals = collect_unanchored_raw_pointer_locals(tcx, sig_decs, ptr_kinds);
+
+    struct CursorInputVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        raw_origin_locals: &'a FxHashSet<HirId>,
+        changed: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for CursorInputVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let hir::ExprKind::Call(_, args) = hir_unwrap_casts(expr).kind else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+
+            let updates = {
+                let Some(sig_dec) = self.sig_decs.data.get(&callee_did) else {
+                    intravisit::walk_expr(self, expr);
+                    return;
+                };
+                if sig_dec.signature_locked {
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                args.iter()
+                    .enumerate()
+                    .filter_map(|(idx, arg)| {
+                        let Some(PtrKind::SliceCursor(m)) =
+                            sig_dec.input_decs.get(idx).copied().flatten()
+                        else {
+                            return None;
+                        };
+                        if !callee_input_has_syntactic_negative_offset(self.tcx, callee_did, idx) {
+                            return None;
+                        }
+                        hir_expr_is_unanchored_raw_pointer_arg(
+                            self.tcx,
+                            self.sig_decs,
+                            self.ptr_kinds,
+                            self.raw_origin_locals,
+                            arg,
+                        )
+                        .then_some((idx, m))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            if !updates.is_empty()
+                && let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did)
+            {
+                for (idx, m) in updates {
+                    if matches!(
+                        sig_dec.input_decs.get(idx).copied().flatten(),
+                        Some(PtrKind::SliceCursor(_))
+                    ) {
+                        sig_dec.set_input_dec(idx, Some(PtrKind::Raw(m)));
+                        self.changed = true;
+                    }
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut changed = false;
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = CursorInputVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            raw_origin_locals: &raw_origin_locals,
+            changed: false,
+        };
+        visitor.visit_body(body);
+        changed |= visitor.changed;
+    }
+    changed
+}
+
+fn callee_input_has_syntactic_negative_offset(
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    idx: usize,
+) -> bool {
+    let Some(param_hir_id) = callee_input_param_binding(tcx, did, idx) else {
+        return false;
+    };
+
+    struct NegativeOffsetVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        param_hir_id: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for NegativeOffsetVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::MethodCall(seg, receiver, args, _) = expr.kind
+                && hir_unwrapped_local_id(receiver) == Some(self.param_hir_id)
+                && match seg.ident.name.as_str() {
+                    "sub" | "wrapping_sub" => true,
+                    "offset" | "wrapping_offset" => args
+                        .first()
+                        .is_some_and(|arg| hir_expr_is_syntactically_negative(self.tcx, arg)),
+                    _ => false,
+                }
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return false;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return false;
+    };
+    let mut visitor = NegativeOffsetVisitor {
+        tcx,
+        param_hir_id,
+        found: false,
+    };
+    visitor.visit_body(tcx.hir_body(body));
+    visitor.found
+}
+
+fn hir_expr_is_syntactically_negative(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    if matches!(
+        hir_unwrap_casts(expr).kind,
+        hir::ExprKind::Unary(hir::UnOp::Neg, _)
+    ) {
+        return true;
+    }
+    tcx.sess
+        .source_map()
+        .span_to_snippet(expr.span)
+        .ok()
+        .is_some_and(|snippet| snippet.trim_start().starts_with('-'))
+}
+
+fn collect_unanchored_raw_pointer_locals(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<HirId> {
+    struct RawOriginVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        locals: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> RawOriginVisitor<'_, 'tcx> {
+        fn record_assignment(&mut self, lhs: &'tcx hir::Expr<'tcx>, rhs: &'tcx hir::Expr<'tcx>) {
+            let Some(hir_id) = hir_unwrapped_local_id(lhs) else {
+                return;
+            };
+            if !tcx_node_ty_is_raw_ptr(self.tcx, hir_id) {
+                return;
+            }
+            if hir_expr_is_unanchored_raw_pointer_source(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+            ) {
+                self.locals.insert(hir_id);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawOriginVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+                && tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
+                && hir_expr_is_unanchored_raw_pointer_source(
+                    self.tcx,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    init,
+                )
+            {
+                self.locals.insert(hir_id);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                self.record_assignment(lhs, rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = RawOriginVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        locals: FxHashSet::default(),
+    };
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        visitor.visit_body(tcx.hir_body(body));
+    }
+    visitor.locals
+}
+
+fn hir_expr_is_unanchored_raw_pointer_arg(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    raw_origin_locals: &FxHashSet<HirId>,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    if hir_expr_uses_non_pointer_local(tcx, expr) {
+        return false;
+    }
+    if let Some(hir_id) = hir_unwrapped_local_id(expr)
+        && raw_origin_locals.contains(&hir_id)
+    {
+        return true;
+    }
+    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, expr)
+}
+
+fn hir_expr_is_unanchored_raw_pointer_source(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    if !hir_expr_ty_is_raw_ptr(tcx, expr) {
+        return false;
+    }
+
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            let Res::Local(hir_id) = path.res else {
+                return true;
+            };
+            let kind = ptr_kinds.get(&hir_id).copied().or_else(|| {
+                unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+                    .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
+            });
+            !kind.is_some_and(is_cursor_anchor_decision)
+        }
+        hir::ExprKind::Call(..) => hir_callee_output_kind(tcx, sig_decs, ptr_kinds, expr)
+            .is_none_or(|kind| !is_cursor_anchor_decision(kind)),
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
+            "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" => {
+                hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
+            }
+            "as_ptr" | "as_mut_ptr" => {
+                if hir_expr_ty_is_raw_ptr(tcx, receiver) {
+                    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        },
+        hir::ExprKind::AddrOf(_, _, pointee) => !hir_expr_ty_is_slice_or_array(tcx, pointee),
+        _ => true,
+    }
+}
+
+fn is_cursor_anchor_decision(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Slice(_) | PtrKind::SliceCursor(_) | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice
+    )
+}
+
+fn hir_expr_ty_is_raw_ptr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr)).is_some()
+}
+
+fn tcx_node_ty_is_raw_ptr(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id)).is_some()
+}
+
+fn hir_expr_uses_non_pointer_local(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    hir_local_ids_in_expr(expr)
+        .into_iter()
+        .any(|hir_id| !tcx_node_ty_is_raw_ptr(tcx, hir_id))
+}
+
+fn hir_expr_ty_is_slice_or_array(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    match tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr).kind() {
+        ty::TyKind::Array(..) | ty::TyKind::Slice(..) => true,
+        ty::TyKind::Ref(_, inner, _) => {
+            matches!(inner.kind(), ty::TyKind::Array(..) | ty::TyKind::Slice(..))
+        }
+        _ => false,
+    }
 }
 
 fn downgrade_unsupported_box_outputs<'tcx>(
@@ -13534,6 +14178,7 @@ mod tests {
             c_exposed_abi_fields: FxHashSet::default(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
+            fn_ptr_rewrite: FnPtrRewriteDecision::default(),
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
         }
@@ -14461,8 +15106,9 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
         let (input, analysis) = build_analysis(tcx);
         let tracked_sites = collect_semantic_allocator_sites(tcx, &input);
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
-        let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans);
-        let initial_ptr_kinds = collect_diffs(&input, &analysis, &sig_decs);
+        let fn_ptr_groups = FnPtrGroups::default();
+        let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+        let initial_ptr_kinds = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
         let (_sig_decs, final_ptr_kinds, _reason_map, _usage_subreason_map) =
             simulate_transform_reasons(tcx, &input, &analysis);
 
@@ -14631,8 +15277,9 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
         FxHashMap<HirId, Vec<&'static str>>,
     ) {
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(input, analysis);
-        let mut sig_decs = SigDecisions::new(input, analysis, &lifetime_plans);
-        let mut ptr_kinds = collect_diffs(input, analysis, &sig_decs);
+        let fn_ptr_groups = FnPtrGroups::default();
+        let mut sig_decs = SigDecisions::new(input, analysis, &lifetime_plans, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups);
         let free_like_wrappers = collect_local_free_wrappers(tcx);
         let local_raw_free_summaries = collect_local_raw_free_summaries(tcx, &free_like_wrappers);
         let local_raw_param_summaries =
@@ -14664,6 +15311,9 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
                 changed = true;
             }
             if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers) {
+                changed = true;
+            }
+            if downgrade_cursor_inputs_from_unanchored_raw_callers(tcx, &mut sig_decs, &ptr_kinds) {
                 changed = true;
             }
 
@@ -15448,6 +16098,68 @@ pub unsafe fn id(x: *mut i32) -> *mut i32 {
             assert_eq!(sig_dec.output_lifetime, Some(lifetime));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn raw_local_caller_keeps_negative_cursor_input_raw() {
+        let code = r#"
+extern "C" {
+    fn foreign() -> *const u8;
+}
+
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let p = foreign();
+    read_before(p)
+}
+"#;
+
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        let normalized = normalize_expr_snippet(&rewritten);
+        assert!(
+            normalized.contains("fnread_before(p:*constu8)")
+                || normalized.contains("fnread_before(mutp:*constu8)"),
+            "{rewritten}"
+        );
+        assert!(
+            !normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
+            "{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn array_pointer_caller_keeps_negative_cursor_input_cursor() {
+        let code = r#"
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    read_before(buf.as_ptr().offset(1))
+}
+"#;
+
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        let normalized = normalize_expr_snippet(&rewritten);
+        assert!(
+            normalized.contains("fnread_before(p:crate::slice_cursor::SliceCursor")
+                || normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
+            "{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
     }
 
     #[test]
