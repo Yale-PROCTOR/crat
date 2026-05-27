@@ -367,20 +367,29 @@ mod tests {
             let source_var_groups =
                 crate::analyses::mir_variable_grouping::SourceVarGroups::new(&input);
             let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-            let (mutable_references, shared_references) =
+            let borrow_promotion_result =
                 crate::analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-            let promoted_mut_ref_result =
-                source_var_groups.postprocess_promoted_mut_refs(mutable_references);
-            let promoted_shared_ref_result =
-                source_var_groups.postprocess_promoted_mut_refs(shared_references);
+            let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+            let struct_copy_result = crate::analyses::struct_copy::analyze(
+                &input,
+                &borrow_promotion_result.mutable_fields,
+            );
+            let promoted_mut_ref_result = source_var_groups
+                .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+            let promoted_shared_ref_result = source_var_groups
+                .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
             let fatness_result =
                 crate::analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
             let mut offset_sign_result =
                 crate::analyses::offset_sign::sign::offset_sign_analysis(&input);
             offset_sign_result.access_signs =
                 source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-            let nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
+            let mut nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
+            nullity_result.non_null_locals =
+                source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
             let analysis = crate::rewriter::Analysis {
+                borrow_promotion_result,
+                borrow_lifetime_flows,
                 promoted_mut_ref_result,
                 promoted_shared_ref_result,
                 mutability_result,
@@ -390,6 +399,7 @@ mod tests {
                 ownership_schemes: None,
                 offset_sign_result,
                 nullity_result,
+                struct_copy_result,
             };
             let fn_ptr_groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis);
             let decision = FnPtrRewriteDecision::build(

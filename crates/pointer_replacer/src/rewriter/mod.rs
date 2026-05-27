@@ -15,7 +15,10 @@ use transform::TransformVisitor;
 use crate::{
     analyses::{
         self,
-        borrow::PromotedMutRefs as PromotedMutRefResult,
+        borrow::{
+            BorrowPromotionResults, PromotedMutRefs as PromotedMutRefResult,
+            lifetime_flow::LifetimeFlowResults,
+        },
         fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
         offset_sign::sign::OffsetSignResult,
@@ -24,6 +27,7 @@ use crate::{
             AnalysisKind as OwnershipAnalysisKind, CrateCtxt, solidify::SolidifiedOwnershipSchemes,
             whole_program::WholeProgramAnalysis,
         },
+        struct_copy::StructCopyAnalysisResult,
         type_qualifier::foster::{fatness::FatnessResult, mutability::MutabilityResult},
     },
     utils::rustc::RustProgram,
@@ -31,10 +35,15 @@ use crate::{
 
 pub(crate) mod collector;
 pub(crate) mod decision;
+mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
 
 pub struct Analysis {
+    #[allow(dead_code)]
+    pub(crate) borrow_promotion_result: BorrowPromotionResults,
+    #[allow(dead_code)]
+    pub(crate) borrow_lifetime_flows: LifetimeFlowResults,
     pub(crate) promoted_mut_ref_result: PromotedMutRefResult,
     pub(crate) promoted_shared_ref_result: PromotedMutRefResult,
     pub(crate) mutability_result: MutabilityResult,
@@ -44,6 +53,7 @@ pub struct Analysis {
     pub(crate) ownership_schemes: Option<SolidifiedOwnershipSchemes>,
     pub(crate) offset_sign_result: OffsetSignResult,
     pub(crate) nullity_result: analyses::nullity::NullityResult,
+    pub(crate) struct_copy_result: StructCopyAnalysisResult,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -85,12 +95,15 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-    let (mutable_references, shared_references) =
+    let borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-    let promoted_mut_ref_result =
-        source_var_groups.postprocess_promoted_mut_refs(mutable_references);
-    let promoted_shared_ref_result =
-        source_var_groups.postprocess_promoted_mut_refs(shared_references);
+    let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+    let struct_copy_result =
+        analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
+    let promoted_mut_ref_result = source_var_groups
+        .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+    let promoted_shared_ref_result = source_var_groups
+        .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
@@ -99,6 +112,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let analysis_results = Analysis {
+        borrow_promotion_result,
+        borrow_lifetime_flows,
         promoted_mut_ref_result,
         promoted_shared_ref_result,
         mutability_result,
@@ -108,6 +123,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         ownership_schemes,
         offset_sign_result,
         nullity_result,
+        struct_copy_result,
     };
 
     let fn_ptr_groups = FnPtrGroups::build(
@@ -126,6 +142,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     );
 
     let mut visitor = TransformVisitor::new(
+        config,
         &input,
         &analysis_results,
         ast_to_hir,

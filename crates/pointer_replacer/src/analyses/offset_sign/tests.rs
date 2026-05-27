@@ -70,6 +70,35 @@ fn needs_cursor(map: &FxHashMap<(String, String), bool>, fn_name: &str, var: &st
     map.get(&(fn_name.to_string(), var.to_string())).copied()
 }
 
+fn run_field_analysis(code: &str) -> FxHashMap<(String, String), bool> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let rust_program = build_rust_program(tcx);
+        let result = offset_sign_analysis(&rust_program);
+        let mut map = FxHashMap::default();
+        for field in &result.field_access_signs {
+            let struct_name = tcx.item_name(field.struct_did.to_def_id()).to_string();
+            let field_name = tcx
+                .adt_def(field.struct_did)
+                .all_fields()
+                .nth(field.field_index)
+                .map(|field| field.name.to_string())
+                .unwrap_or_else(|| field.field_index.to_string());
+            map.insert((struct_name, field_name), true);
+        }
+        map
+    })
+    .unwrap()
+}
+
+fn field_needs_cursor(
+    map: &FxHashMap<(String, String), bool>,
+    struct_name: &str,
+    field_name: &str,
+) -> Option<bool> {
+    map.get(&(struct_name.to_string(), field_name.to_string()))
+        .copied()
+}
+
 #[test]
 fn lit_neg_needs_cursor() {
     let map = run_analysis(
@@ -866,6 +895,51 @@ fn struct_field_deref_not_flagged() {
         needs_cursor(&map, "use_field", "s"),
         Some(true),
         "s: struct pointer — (*s).buf.offset should not be attributed to s"
+    );
+}
+
+#[test]
+fn struct_field_copy_to_local_negative_offset_marks_field() {
+    let map = run_field_analysis(
+        "
+        pub struct Buf {
+            pub buf: *const i32,
+        }
+
+        pub unsafe fn use_field(s: *const Buf) -> i32 {
+            let p = (*s).buf;
+            *p.offset(-1)
+        }
+        ",
+    );
+    assert_eq!(
+        field_needs_cursor(&map, "Buf", "buf"),
+        Some(true),
+        "Buf::buf copied to p and offset(-1) should need a cursor"
+    );
+}
+
+#[test]
+fn struct_field_passed_to_callee_negative_offset_marks_field() {
+    let map = run_field_analysis(
+        "
+        pub struct Buf {
+            pub buf: *const i32,
+        }
+
+        pub unsafe fn read_prev(p: *const i32) -> i32 {
+            *p.offset(-1)
+        }
+
+        pub unsafe fn use_field(s: *const Buf) -> i32 {
+            read_prev((*s).buf)
+        }
+        ",
+    );
+    assert_eq!(
+        field_needs_cursor(&map, "Buf", "buf"),
+        Some(true),
+        "Buf::buf passed to a callee whose param needs a cursor should need a cursor"
     );
 }
 
