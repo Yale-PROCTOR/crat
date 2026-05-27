@@ -1539,7 +1539,7 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek(((*s).word_index as isize) as isize)",
+            ".seek((s.word_index as isize) as isize)",
         ],
         &["let mut _c = ((*s).words);", "*(*s).words.offset"],
     );
@@ -1562,9 +1562,75 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
-            ".seek(((*s).word_index as isize) as isize)",
+            ".seek((s.word_index as isize) as isize)",
         ],
         &["pub words: Option<&'a u32>", "*(*s).words.offset"],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_field_copied_to_safe_local_alias() {
+    run_test(
+        r#"
+use ::libc;
+
+#[repr(C)]
+pub struct Buffer {
+    pub content: *const libc::c_uchar,
+    pub offset: usize,
+}
+
+pub unsafe extern "C" fn first(buffer: *const Buffer) -> libc::c_int {
+    let input = (*buffer).content.offset((*buffer).offset as isize);
+    *input as libc::c_int
+}
+"#,
+        &[
+            "pub struct Buffer<'a>",
+            "pub content: &'a [libc::c_uchar]",
+            "[(buffer.offset as isize) as usize..]).first()",
+        ],
+        &[
+            "pub content: *const u8",
+            "let input = (*buffer).content.offset",
+            "*input as",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_demotes_cursor_field_copied_to_local_offset_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Bs {
+    pub buf: *const u8,
+    pub pos: i32,
+    pub limit: i32,
+}
+
+pub unsafe fn get_bits(bs: *mut Bs, n: i32) -> u32 {
+    let mut p: *const u8 = ((*bs).buf).offset(((*bs).pos >> 3) as isize);
+    (*bs).pos += n;
+    if (*bs).pos > (*bs).limit {
+        return 0;
+    }
+    let fresh = *p;
+    p = p.offset(1);
+    fresh as u32
+}
+"#,
+        &[
+            "pub struct Bs {",
+            "pub buf: *const u8",
+            "std::slice::from_raw_parts(((bs.buf).offset",
+        ],
+        &[
+            "pub struct Bs<'a>",
+            "pub buf: crate::slice_cursor::SliceCursor",
+            "let mut p: crate::slice_cursor::SliceCursor",
+            "}).as_slice()",
+        ],
     );
 }
 
@@ -1588,7 +1654,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
             "crate::slice_cursor::SliceCursor::from_raw_parts",
-            ".seek((-(((*s).count / 8) as isize)) as isize)",
+            ".seek((-((s.count / 8) as isize)) as isize)",
         ],
         &[
             "pub words: Option<&'a u32>",
@@ -1616,7 +1682,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek((-(((*s).count / 8) as isize)) as isize)",
+            ".seek((-((s.count / 8) as isize)) as isize)",
         ],
         &["}).as_mut_ptr()", "*(*s).words.offset"],
     );
@@ -1761,7 +1827,7 @@ pub unsafe fn prog_fetch(p: *mut Program, out: *mut i32) {
             "pub struct Program<'a>",
             "pub code: &'a [i32]",
             "code: &'a [i32]",
-            "(*p).code = (code);",
+            "p.code = (code);",
         ],
         &[
             "pub code: Option<&'a i32>",
@@ -6313,6 +6379,80 @@ pub unsafe extern "C" fn parse_number(item: *mut cJSON, input_buffer: *mut parse
         &config,
         &["pub content: *const u8"],
         &["pub struct parse_buffer<", "pub content: &'"],
+    );
+}
+
+#[test]
+fn test_c_exposed_thin_struct_opt_ref_field_can_promote() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("smallestValue".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct ListNode {
+    pub value: i32,
+    pub next: *mut ListNode,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smallestValue(mut head: *mut ListNode) -> i32 {
+    if head.is_null() {
+        return -1;
+    }
+    let mut smallest = (*head).value;
+    while !(*head).next.is_null() {
+        head = (*head).next;
+        if (*head).value < smallest {
+            smallest = (*head).value;
+        }
+    }
+    smallest
+}
+"#,
+        &config,
+        &[
+            "pub struct ListNode<'a>",
+            "pub next: Option<&'a mut ListNode<'a>>",
+            "head = ((*head.unwrap()).next).as_deref();",
+        ],
+        &[
+            "pub next: *mut ListNode",
+            "head = unsafe { ((*head.unwrap()).next).as_ref() };",
+        ],
+    );
+}
+
+#[test]
+fn test_c_exposed_strduped_struct_field_stays_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("parse".to_string());
+    run_test_with_config(
+        r#"
+extern "C" {
+    fn strdup(s: *const i8) -> *mut i8;
+}
+
+#[repr(C)]
+pub struct OsData {
+    pub arch: *mut i8,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn parse(osd: *mut OsData, s: *const i8) -> i32 {
+    (*osd).arch = strdup(s);
+    if ((*osd).arch).is_null() {
+        return 0;
+    }
+    *(*osd).arch as i32
+}
+"#,
+        &config,
+        &["pub arch: *mut i8", "osd.arch = strdup((s).as_ptr());"],
+        &[
+            "pub struct OsData<'",
+            "pub arch: Option<&",
+            "strdup(s)).as_mut()",
+        ],
     );
 }
 
