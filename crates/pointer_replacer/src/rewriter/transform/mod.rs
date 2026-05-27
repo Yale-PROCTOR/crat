@@ -16,30 +16,45 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
+use smallvec::smallvec;
+use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
 use super::{
-    Analysis,
+    Analysis, Config,
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
 use crate::{
-    analyses::{fn_ptr_groups::FnPtrGroups, fn_ptr_rewrite_decision::FnPtrRewriteDecision},
+    analyses::{
+        borrow::StructFieldSlot, fn_ptr_groups::FnPtrGroups,
+        fn_ptr_rewrite_decision::FnPtrRewriteDecision,
+    },
     utils::rustc::RustProgram,
 };
 
-pub(crate) struct TransformVisitor<'tcx> {
+pub(crate) struct TransformVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    analysis: &'a Analysis,
     sig_decs: SigDecisions,
+    // Function signatures should use the normalized decisions above; plans are retained for
+    // later struct field lifetime emission.
+    #[allow(dead_code)]
+    lifetime_plans: super::lifetimes::LifetimePlans,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: FxHashSet<HirId>,
     raw_bridge_bindings: FxHashMap<HirId, RawBridgeInfo>,
+    raw_scalar_bridge_fields: FxHashSet<StructFieldSlot>,
     alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
     free_like_wrappers: FxHashSet<LocalDefId>,
+    demoted_fields: FxHashSet<StructFieldSlot>,
+    field_cursor_fields: FxHashSet<StructFieldSlot>,
+    c_exposed_abi_fields: FxHashSet<StructFieldSlot>,
+    impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
@@ -84,12 +99,55 @@ impl LocalRawParamSummary {
     }
 }
 
-impl MutVisitor for TransformVisitor<'_> {
+impl MutVisitor for TransformVisitor<'_, '_> {
+    fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+        if self.should_remove_generated_copy_clone_impl(&item) {
+            return smallvec![];
+        }
+        mut_visit::walk_flat_map_item(self, item)
+    }
+
     fn visit_item(&mut self, item: &mut Item) {
         let node_id = item.id;
         let mut fn_output_transform: Option<(LocalDefId, PtrKind)> = None;
         match &mut item.kind {
-            ItemKind::Impl(_) => return,
+            ItemKind::Impl(box impl_item) => {
+                let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
+                    return;
+                };
+                if !self.struct_has_field_rewrite_candidate(struct_did) {
+                    return;
+                }
+                let lifetimes = self.ordered_struct_lifetimes(struct_did);
+                if !lifetimes.is_empty() {
+                    super::lifetimes::ensure_lifetime_params(&mut impl_item.generics, &lifetimes);
+                    self.add_struct_lifetime_args_to_ty_with_lifetimes(
+                        &mut impl_item.self_ty,
+                        &lifetimes,
+                    );
+                }
+                self.impl_self_lifetimes.push((struct_did, lifetimes));
+                mut_visit::walk_item(self, item);
+                self.impl_self_lifetimes.pop();
+                return;
+            }
+            ItemKind::Struct(_, generics, VariantData::Struct { fields, .. }) => {
+                if let Some(struct_did) = self.ast_to_hir.global_map.get(&node_id).copied() {
+                    self.rewrite_struct_definition(struct_did, generics, fields);
+                    for (field_idx, field) in fields.iter_mut().enumerate() {
+                        let fi = FieldIdx::from_usize(field_idx);
+                        if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                            && let Some(decs) =
+                                self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
+                        {
+                            let decs = decs.clone();
+                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                                self.slice_cursor.set(true);
+                            }
+                        }
+                    }
+                }
+            }
             ItemKind::Fn(box fn_item) => {
                 let def_id = self.ast_to_hir.global_map[&node_id];
                 let mir_body = self
@@ -98,13 +156,57 @@ impl MutVisitor for TransformVisitor<'_> {
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
 
-                for ((local_decl, input_dec), param) in mir_body
+                if !sig_dec.signature_locked {
+                    let mut planned_lifetimes = Vec::new();
+                    for lifetime in sig_dec
+                        .input_lifetimes
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .chain(sig_dec.output_lifetime)
+                    {
+                        if !planned_lifetimes.contains(&lifetime) {
+                            planned_lifetimes.push(lifetime);
+                        }
+                    }
+                    for (local_decl, input_dec) in
+                        mir_body.local_decls.iter().skip(1).zip(&sig_dec.input_decs)
+                    {
+                        if input_dec.is_some()
+                            && let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                        {
+                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
+                        }
+                    }
+                    if sig_dec.output_dec.is_some() {
+                        let return_decl =
+                            &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
+                        if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
+                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
+                        }
+                    }
+                    super::lifetimes::ensure_lifetime_params(
+                        &mut fn_item.generics,
+                        &planned_lifetimes,
+                    );
+                }
+
+                for (param_index, ((local_decl, input_dec), param)) in mir_body
                     .local_decls
                     .iter()
                     .skip(1)
                     .zip(&sig_dec.input_decs)
                     .zip(&mut fn_item.sig.decl.inputs)
+                    .enumerate()
                 {
+                    self.mark_param_mut_if_needed(param);
+                    let input_lifetime =
+                        sig_dec.input_lifetimes.get(param_index).copied().flatten();
+                    if matches!(local_decl.ty.kind(), ty::TyKind::Ref(..))
+                        && input_lifetime.is_none()
+                    {
+                        continue;
+                    }
                     match input_dec {
                         Some(PtrKind::Ref(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -114,7 +216,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_ref_ty(inner_ty, *m, self.tcx);
+                            *param.ty = self.mk_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
                         }
                         Some(PtrKind::OptRef(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -124,7 +226,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_opt_ref_ty(inner_ty, *m, self.tcx);
+                            *param.ty =
+                                self.mk_opt_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
                         }
                         Some(PtrKind::Box) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -134,7 +237,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_box_ty(inner_ty, self.tcx);
+                            *param.ty = self.mk_box_ty(inner_ty);
                         }
                         Some(PtrKind::OptBox) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -144,7 +247,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_opt_box_ty(inner_ty, self.tcx);
+                            *param.ty = self.mk_opt_box_ty(inner_ty);
                         }
                         Some(PtrKind::Slice(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -154,7 +257,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_slice_ty(inner_ty, *m, self.tcx);
+                            *param.ty =
+                                self.mk_slice_ty_with_lifetime(inner_ty, *m, input_lifetime);
                         }
                         Some(PtrKind::Raw(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -164,7 +268,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_raw_ptr_ty(inner_ty, *m, self.tcx);
+                            *param.ty = self.mk_raw_ptr_ty(inner_ty, *m);
                         }
                         Some(PtrKind::SliceCursor(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -174,7 +278,8 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_cursor_ty(inner_ty, *m, self.tcx);
+                            *param.ty =
+                                self.mk_cursor_ty_with_lifetime(inner_ty, *m, input_lifetime);
                             self.slice_cursor.set(true);
                         }
                         Some(PtrKind::BoxedSlice) => {
@@ -185,7 +290,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_boxed_slice_ty(inner_ty, self.tcx);
+                            *param.ty = self.mk_boxed_slice_ty(inner_ty);
                         }
                         Some(PtrKind::OptBoxedSlice) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -195,7 +300,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = mk_opt_boxed_slice_ty(inner_ty, self.tcx);
+                            *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
                         }
                         None => {
                             if let TyKind::BareFn(bare_fn) = &mut param.ty.kind
@@ -213,7 +318,16 @@ impl MutVisitor for TransformVisitor<'_> {
                         }
                     }
 
-                    if input_dec.is_some_and(|kind| kind.is_mut())
+                    let needs_mut_binding = input_dec.is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            PtrKind::OptRef(true)
+                                | PtrKind::OptBox
+                                | PtrKind::OptBoxedSlice
+                                | PtrKind::SliceCursor(true)
+                        ) || (input_lifetime.is_none() && kind.is_mut())
+                    });
+                    if needs_mut_binding
                         && let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind
                     {
                         binding_mode.1 = Mutability::Mut;
@@ -247,17 +361,23 @@ impl MutVisitor for TransformVisitor<'_> {
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
                         *ret_ty = P(match output_dec {
-                            PtrKind::Ref(m) => mk_ref_ty(inner_ty, m, self.tcx),
-                            PtrKind::OptRef(m) => mk_opt_ref_ty(inner_ty, m, self.tcx),
-                            PtrKind::Box => mk_box_ty(inner_ty, self.tcx),
-                            PtrKind::OptBox => mk_opt_box_ty(inner_ty, self.tcx),
-                            PtrKind::Raw(m) => mk_raw_ptr_ty(inner_ty, m, self.tcx),
-                            PtrKind::BoxedSlice => mk_boxed_slice_ty(inner_ty, self.tcx),
-                            PtrKind::OptBoxedSlice => mk_opt_boxed_slice_ty(inner_ty, self.tcx),
-                            PtrKind::Slice(m) => mk_slice_ty(inner_ty, m, self.tcx),
+                            PtrKind::Ref(m) => {
+                                self.mk_ref_ty_with_lifetime(inner_ty, m, sig_dec.output_lifetime)
+                            }
+                            PtrKind::OptRef(m) => self.mk_opt_ref_ty_with_lifetime(
+                                inner_ty,
+                                m,
+                                sig_dec.output_lifetime,
+                            ),
+                            PtrKind::Box => self.mk_box_ty(inner_ty),
+                            PtrKind::OptBox => self.mk_opt_box_ty(inner_ty),
+                            PtrKind::Raw(m) => self.mk_raw_ptr_ty(inner_ty, m),
+                            PtrKind::BoxedSlice => self.mk_boxed_slice_ty(inner_ty),
+                            PtrKind::OptBoxedSlice => self.mk_opt_boxed_slice_ty(inner_ty),
+                            PtrKind::Slice(m) => self.mk_slice_ty(inner_ty, m),
                             PtrKind::SliceCursor(m) => {
                                 self.slice_cursor.set(true);
-                                mk_cursor_ty(inner_ty, m, self.tcx)
+                                self.mk_cursor_ty(inner_ty, m)
                             }
                         });
                     }
@@ -385,6 +505,15 @@ impl MutVisitor for TransformVisitor<'_> {
 
         if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _ident, _) = let_stmt.pat.kind
+            && (self.local_binding_needs_mut_for_promoted_field_write(hir_id)
+                || self.local_binding_needs_mut_for_owned_field_free(hir_id))
+            && let PatKind::Ident(binding_mode, ..) = &mut local.pat.kind
+        {
+            binding_mode.1 = Mutability::Mut;
+        }
+
+        if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _ident, _) = let_stmt.pat.kind
             && let Some(mut lhs_kind) = self.effective_ptr_kind(hir_id)
         {
             let typeck = self.tcx.typeck(hir_id.owner);
@@ -417,31 +546,31 @@ impl MutVisitor for TransformVisitor<'_> {
 
             match lhs_kind {
                 PtrKind::Ref(m) => {
-                    local.ty = Some(P(mk_ref_ty(lhs_inner_ty, m, self.tcx)));
+                    local.ty = Some(P(self.mk_ref_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::OptRef(m) => {
-                    local.ty = Some(P(mk_opt_ref_ty(lhs_inner_ty, m, self.tcx)));
+                    local.ty = Some(P(self.mk_opt_ref_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::Box => {
-                    local.ty = Some(P(mk_box_ty(lhs_inner_ty, self.tcx)));
+                    local.ty = Some(P(self.mk_local_box_ty(lhs_inner_ty)));
                 }
                 PtrKind::OptBox => {
-                    local.ty = Some(P(mk_opt_box_ty(lhs_inner_ty, self.tcx)));
+                    local.ty = Some(P(self.mk_local_opt_box_ty(lhs_inner_ty)));
                 }
                 PtrKind::BoxedSlice => {
-                    local.ty = Some(P(mk_boxed_slice_ty(lhs_inner_ty, self.tcx)));
+                    local.ty = Some(P(self.mk_boxed_slice_ty(lhs_inner_ty)));
                 }
                 PtrKind::OptBoxedSlice => {
-                    local.ty = Some(P(mk_opt_boxed_slice_ty(lhs_inner_ty, self.tcx)));
+                    local.ty = Some(P(self.mk_opt_boxed_slice_ty(lhs_inner_ty)));
                 }
                 PtrKind::Slice(m) => {
-                    local.ty = Some(P(mk_slice_ty(lhs_inner_ty, m, self.tcx)));
+                    local.ty = Some(P(self.mk_slice_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::Raw(m) => {
-                    local.ty = Some(P(mk_raw_ptr_ty(lhs_inner_ty, m, self.tcx)));
+                    local.ty = Some(P(self.mk_raw_ptr_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::SliceCursor(m) => {
-                    local.ty = Some(P(mk_cursor_ty(lhs_inner_ty, m, self.tcx)));
+                    local.ty = Some(P(self.mk_cursor_ty(lhs_inner_ty, m)));
                     self.slice_cursor.set(true);
                 }
             }
@@ -478,21 +607,29 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::walk_expr(self, expr);
 
         match &mut expr.kind {
+            ExprKind::Struct(se) => {
+                self.rewrite_struct_literal_fields(expr.id, se);
+            }
             ExprKind::Assign(lhs, rhs, _) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                 let hir::ExprKind::Assign(hir_lhs, hir_rhs, _) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
+                if let Some(field) = self.promoted_field_slot_for_hir_field(hir_lhs)
+                    && let Some(kind) = self.field_ptr_kind(field)
+                {
+                    let target_inner_ty =
+                        unwrap_ptr_from_mir_ty(typeck.expr_ty(hir_lhs)).map(|(inner, _)| inner);
+                    self.transform_promoted_field_rhs(rhs, hir_rhs, kind, target_inner_ty);
+                    return;
+                }
                 let lhs_ty = typeck.expr_ty(hir_lhs);
                 let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
                 let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
                 let lhs_hir_id = if let ExprKind::Path(_, _) = lhs.kind
                     && let Some(hir_id) = self.hir_id_of_path(lhs.id)
-                    && let ExprKind::Path(_, path) = &lhs.kind
-                    && let Some(seg) = path.segments.last()
                 {
-                    let _ = seg;
                     Some(hir_id)
                 } else {
                     None
@@ -589,7 +726,15 @@ impl MutVisitor for TransformVisitor<'_> {
                             )
                         {
                             self.transform_rhs(rhs, hir_rhs, lhs_kind);
-                        } else if lhs_hir_id.is_none() {
+                        } else if lhs_hir_id.is_none()
+                            && !self.try_bridge_raw_projection_root(
+                                rhs,
+                                hir_rhs,
+                                hir_lhs,
+                                lhs_kind,
+                                lhs_inner_ty,
+                            )
+                        {
                             self.transform_rhs(rhs, hir_rhs, lhs_kind);
                         }
                     }
@@ -657,6 +802,11 @@ impl MutVisitor for TransformVisitor<'_> {
 
                 let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
 
+                if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
+                    *expr = free_rewrite;
+                    return;
+                }
+
                 for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
                     let ty = typeck.expr_ty_adjusted(harg);
                     let param_kind = sig_dec
@@ -682,11 +832,19 @@ impl MutVisitor for TransformVisitor<'_> {
                     let Some(param_kind) = param_kind else { continue };
 
                     self.transform_rhs(arg, harg, param_kind);
-                }
-
-                if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
-                    *expr = free_rewrite;
-                    return;
+                    if param_kind == PtrKind::OptRef(true)
+                        && (hir_path_source_kind(self.tcx, &self.ptr_kinds, harg)
+                            == Some(PtrKind::OptRef(true))
+                            || self
+                                .promoted_field_slot_for_hir_field(harg)
+                                .and_then(|field| self.field_ptr_kind(field))
+                                == Some(PtrKind::OptRef(true)))
+                    {
+                        *arg = P(utils::expr!(
+                            "({}).as_deref_mut()",
+                            pprust::expr_to_string(arg)
+                        ));
+                    }
                 }
 
                 // when this is a transmute call and an argument casts a fn-ptr group function,
@@ -715,7 +873,30 @@ impl MutVisitor for TransformVisitor<'_> {
                 if seg.ident.name.as_str() == "is_null" =>
             {
                 let receiver = unwrap_paren(receiver);
-                if matches!(receiver.kind, ExprKind::Path(_, _))
+                let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx);
+                if let Some(field_kind) = hir_receiver
+                    .and_then(|hir_receiver| self.promoted_field_slot_for_hir_field(hir_receiver))
+                    .and_then(|field| self.field_ptr_kind(field))
+                {
+                    match field_kind {
+                        PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice => {
+                            seg.ident.name = Symbol::intern("is_none");
+                        }
+                        PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                            seg.ident.name = Symbol::intern("is_empty");
+                        }
+                        PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice => {
+                            *expr = utils::expr!("false");
+                        }
+                        PtrKind::Raw(_) => {}
+                    }
+                } else if let Some(hir_receiver) = hir_receiver
+                    && let Some(pe) = self.ptr_expr(receiver, hir_receiver)
+                    && matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
+                    && !pe.projs.is_empty()
+                {
+                    *expr = utils::expr!("({}).is_none()", pprust::expr_to_string(pe.base));
+                } else if matches!(receiver.kind, ExprKind::Path(_, _))
                     && let Some(hir_id) = self.hir_id_of_path(receiver.id)
                     && let Some(ptr_kind) = self.effective_ptr_kind(hir_id)
                 {
@@ -820,6 +1001,34 @@ impl MutVisitor for TransformVisitor<'_> {
                     ExprCtx::Lvalue => Some(true),
                 };
                 if let Some(m) = m {
+                    if let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
+                        && let Some(kind) = self.field_ptr_kind(field)
+                    {
+                        let field_str = pprust::expr_to_string(e);
+                        *expr = match kind {
+                            PtrKind::OptRef(true) if m => {
+                                utils::expr!("*({field_str}).as_deref_mut().unwrap()")
+                            }
+                            PtrKind::OptRef(true) => {
+                                utils::expr!("*({field_str}).as_deref().unwrap()")
+                            }
+                            PtrKind::OptRef(false) => utils::expr!("*({field_str}.unwrap())"),
+                            PtrKind::OptBox if m => {
+                                utils::expr!("*({field_str}).as_deref_mut().unwrap()")
+                            }
+                            PtrKind::OptBox => {
+                                utils::expr!("*({field_str}).as_deref().unwrap()")
+                            }
+                            PtrKind::Slice(_) => {
+                                utils::expr!("({field_str})[0]")
+                            }
+                            PtrKind::SliceCursor(_) => {
+                                utils::expr!("({field_str})[0 as usize]")
+                            }
+                            _ => unreachable!(),
+                        };
+                        return;
+                    }
                     // For SliceCursor with offset projections, try to emit base[offset] directly
                     let inner = unwrap_addr_of_deref(unwrap_cast_and_paren(e));
                     let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_e));
@@ -895,12 +1104,112 @@ impl MutVisitor for TransformVisitor<'_> {
             _ => {}
         }
     }
+
+    fn visit_ty(&mut self, ty: &mut Ty) {
+        mut_visit::walk_ty(self, ty);
+        self.add_struct_lifetime_args_to_ty(ty);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PtrCtx {
     Rhs(PtrKind),
     Deref(bool),
+}
+
+fn is_c_exposed_fn(tcx: TyCtxt<'_>, did: LocalDefId, c_exposed_fns: &FxHashSet<String>) -> bool {
+    let name = tcx.item_name(did.to_def_id());
+    c_exposed_fns.contains(name.as_str())
+        || tcx
+            .get_attrs(did.to_def_id(), sym::export_name)
+            .any(|attr| {
+                attr.value_str()
+                    .is_some_and(|s| c_exposed_fns.contains(s.as_str()))
+            })
+}
+
+fn is_local_c_abi_struct(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
+    let adt_def = tcx.adt_def(did);
+    let repr = adt_def.repr();
+    adt_def.is_struct() && !adt_def.is_union() && repr.c() && repr.pack.is_none()
+}
+
+fn collect_local_abi_struct_fields_from_ty(
+    tcx: TyCtxt<'_>,
+    ty: ty::Ty<'_>,
+    fields: &mut FxHashSet<StructFieldSlot>,
+) {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) | ty::TyKind::Ref(_, pointee, _) => {
+            collect_local_abi_struct_fields_from_ty(tcx, *pointee, fields);
+        }
+        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+            collect_local_abi_struct_fields_from_ty(tcx, *elem, fields);
+        }
+        ty::TyKind::Tuple(elems) => {
+            for elem in elems.iter() {
+                collect_local_abi_struct_fields_from_ty(tcx, elem, fields);
+            }
+        }
+        ty::TyKind::Adt(adt_def, args) => {
+            if let Some(struct_did) = adt_def.did().as_local()
+                && is_local_c_abi_struct(tcx, struct_did)
+            {
+                fields.extend(adt_def.non_enum_variant().fields.iter_enumerated().map(
+                    |(field_index, _)| StructFieldSlot {
+                        struct_did,
+                        field_index: field_index.index(),
+                    },
+                ));
+                return;
+            }
+            for arg in args.iter() {
+                if let ty::GenericArgKind::Type(arg_ty) = arg.kind() {
+                    collect_local_abi_struct_fields_from_ty(tcx, arg_ty, fields);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_c_exposed_abi_fields<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    c_exposed_fns: &FxHashSet<String>,
+    sig_decs: &SigDecisions,
+) -> FxHashSet<StructFieldSlot> {
+    let tcx = rust_program.tcx;
+    let mut fields = FxHashSet::default();
+
+    for did in &rust_program.functions {
+        if !is_c_exposed_fn(tcx, *did, c_exposed_fns) {
+            continue;
+        }
+        let Some(sig_dec) = sig_decs.data.get(did) else {
+            continue;
+        };
+        let sig = tcx.fn_sig(*did).skip_binder().skip_binder();
+        let direct_interface_fix = sig_dec
+            .input_decs
+            .iter()
+            .any(|dec| matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))));
+
+        for (ty, dec) in sig.inputs().iter().copied().zip(&sig_dec.input_decs) {
+            if matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))) {
+                if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(ty) {
+                    collect_local_abi_struct_fields_from_ty(tcx, inner_ty, &mut fields);
+                }
+            } else if !direct_interface_fix {
+                collect_local_abi_struct_fields_from_ty(tcx, ty, &mut fields);
+            }
+        }
+
+        if !direct_interface_fix {
+            collect_local_abi_struct_fields_from_ty(tcx, sig.output(), &mut fields);
+        }
+    }
+
+    fields
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -914,16 +1223,19 @@ enum AllocatorRoot<'a> {
     },
 }
 
-impl<'tcx> TransformVisitor<'tcx> {
+impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     pub fn new(
+        config: &Config,
         rust_program: &RustProgram<'tcx>,
-        analysis: &Analysis,
+        analysis: &'analysis Analysis,
         ast_to_hir: AstToHir,
         fn_ptr_groups: FnPtrGroups,
         fn_ptr_rewrite: FnPtrRewriteDecision,
-    ) -> TransformVisitor<'tcx> {
-        let mut sig_decs = SigDecisions::new(rust_program, analysis, &fn_ptr_groups);
-        let mut ptr_kinds = collect_diffs(rust_program, analysis, &fn_ptr_groups);
+    ) -> TransformVisitor<'analysis, 'tcx> {
+        let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
+        let mut sig_decs =
+            SigDecisions::new(rust_program, analysis, &lifetime_plans, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
@@ -951,10 +1263,47 @@ impl<'tcx> TransformVisitor<'tcx> {
             if downgrade_unsupported_box_outputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
                 changed = true;
             }
+            if downgrade_freed_borrow_outputs(rust_program.tcx, &mut sig_decs, &free_like_wrappers)
+            {
+                changed = true;
+            }
+            if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
+                changed = true;
+            }
+            if downgrade_cursor_inputs_from_unanchored_raw_callers(
+                rust_program.tcx,
+                &mut sig_decs,
+                &ptr_kinds,
+            ) {
+                changed = true;
+            }
+            let owned_field_free_bindings = collect_owned_field_free_owner_bindings(
+                rust_program.tcx,
+                analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &free_like_wrappers,
+            );
+            for hir_id in owned_field_free_bindings {
+                if force_signature_input_mut_for_binding(rust_program.tcx, &mut sig_decs, hir_id) {
+                    changed = true;
+                }
+            }
             let raw_call_result_bindings =
                 collect_raw_call_result_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
                 collect_raw_local_assignment_bindings(rust_program.tcx, &ptr_kinds);
+            for hir_id in &raw_local_assignment_bindings {
+                if param_index_for_binding(rust_program.tcx, *hir_id).is_some()
+                    && force_signature_input_raw_for_binding(
+                        rust_program.tcx,
+                        &mut sig_decs,
+                        *hir_id,
+                    )
+                {
+                    changed = true;
+                }
+            }
             let unsupported_box_target_bindings =
                 collect_unsupported_box_target_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
             let unsupported_box_usage_bindings = collect_unsupported_box_usage_bindings(
@@ -981,9 +1330,56 @@ impl<'tcx> TransformVisitor<'tcx> {
             if !changed {
                 break;
             }
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         }
 
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
+        let raw_scalar_bridge_fields =
+            collect_raw_scalar_bridge_fields(rust_program.tcx, &alloc_wrappers);
+        let c_exposed_abi_fields =
+            collect_c_exposed_abi_fields(rust_program, &config.c_exposed_fns, &sig_decs);
+        let demoted_fields =
+            collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        emit_promotion_diagnostics(
+            rust_program.tcx,
+            analysis,
+            &lifetime_plans,
+            &sig_decs,
+            &ptr_kinds,
+            &demoted_fields,
+        );
+        let (demoted_field_source_bindings, raw_field_source_callees) =
+            collect_raw_field_source_bindings(
+                rust_program.tcx,
+                analysis,
+                &sig_decs,
+                &ptr_kinds,
+                &demoted_fields,
+            );
+        let mut sig_changed = false;
+        for hir_id in &demoted_field_source_bindings {
+            sig_changed |=
+                force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id);
+        }
+        for callee_did in raw_field_source_callees {
+            sig_changed |= force_signature_output_raw(rust_program.tcx, &mut sig_decs, callee_did);
+        }
+        forced_raw_bindings.extend(demoted_field_source_bindings);
+        if sig_changed {
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+        }
+        normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
+        emit_ownership_field_diagnostics(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
+        apply_field_storage_input_lifetimes(
+            rust_program.tcx,
+            analysis,
+            &lifetime_plans,
+            &demoted_fields,
+            &field_cursor_fields,
+            &mut sig_decs,
+        );
         let raw_bridge_bindings = collect_raw_bridge_bindings(
             rust_program.tcx,
             &ptr_kinds,
@@ -994,16 +1390,771 @@ impl<'tcx> TransformVisitor<'tcx> {
 
         TransformVisitor {
             tcx: rust_program.tcx,
+            analysis,
             sig_decs,
+            lifetime_plans,
             ptr_kinds,
             forced_raw_bindings,
             raw_bridge_bindings,
+            raw_scalar_bridge_fields,
             alloc_wrappers,
             free_like_wrappers,
+            demoted_fields,
+            field_cursor_fields,
+            c_exposed_abi_fields,
+            impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             fn_ptr_rewrite,
             bytemuck: Cell::new(false),
             slice_cursor: Cell::new(false),
+        }
+    }
+
+    fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if self.c_exposed_abi_fields.contains(&field) {
+            return None;
+        }
+        if struct_field_is_exactly_owning(self.analysis, field) {
+            self.ownership_field_kind(field)
+        } else {
+            self.promoted_field_kind(field)
+        }
+    }
+
+    fn ownership_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        ownership_field_ptr_kind(
+            self.tcx,
+            self.analysis,
+            &self.sig_decs,
+            &self.ptr_kinds,
+            field,
+        )
+    }
+
+    fn promoted_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if self.demoted_fields.contains(&field) {
+            return None;
+        }
+        let mutability = if self
+            .analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            true
+        } else if self
+            .analysis
+            .borrow_promotion_result
+            .shared_fields
+            .contains(&field)
+        {
+            false
+        } else {
+            return None;
+        };
+        if self.field_is_array_like(field) {
+            if self.field_cursor_fields.contains(&field) {
+                Some(PtrKind::SliceCursor(mutability))
+            } else {
+                Some(PtrKind::Slice(mutability))
+            }
+        } else {
+            Some(PtrKind::OptRef(mutability))
+        }
+    }
+
+    fn field_is_array_like(&self, field: StructFieldSlot) -> bool {
+        analysis_field_is_array_like(self.analysis, field)
+    }
+
+    fn mark_param_mut_if_needed(&self, param: &mut Param) {
+        let Some(hir_pat) = self.ast_to_hir.get_pat(param.pat.id, self.tcx) else {
+            return;
+        };
+        let hir::PatKind::Binding(_, hir_id, _ident, _) = hir_pat.kind else {
+            return;
+        };
+        if !self.local_binding_needs_mut_for_promoted_field_write(hir_id) {
+            return;
+        }
+        let PatKind::Ident(binding_mode, ..) = &mut param.pat.kind else {
+            return;
+        };
+        binding_mode.1 = Mutability::Mut;
+    }
+
+    fn field_lifetime(&self, field: StructFieldSlot) -> Option<Symbol> {
+        self.lifetime_plans
+            .structs
+            .get(&field.struct_did)
+            .and_then(|plan| plan.field_lifetimes.get(&field.field_index).copied())
+    }
+
+    fn should_remove_generated_copy_clone_impl(&self, item: &Item) -> bool {
+        if !utils::ast::is_automatically_derived(&item.attrs) {
+            return false;
+        }
+        let ItemKind::Impl(box impl_item) = &item.kind else {
+            return false;
+        };
+        let Some(of_trait) = &impl_item.of_trait else {
+            return false;
+        };
+        if !of_trait
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| matches!(seg.ident.name.as_str(), "Copy" | "Clone"))
+        {
+            return false;
+        }
+        let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
+            return false;
+        };
+        self.analysis
+            .struct_copy_result
+            .should_remove_generated_impl(struct_did)
+            || self.struct_has_owning_box_field_candidate(struct_did)
+    }
+
+    fn struct_has_field_rewrite_candidate(&self, struct_did: LocalDefId) -> bool {
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .any(|(field_index, _)| {
+                self.field_ptr_kind(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                })
+                .is_some()
+            })
+    }
+
+    fn struct_has_owning_box_field_candidate(&self, struct_did: LocalDefId) -> bool {
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .any(|(field_index, _)| {
+                self.field_ptr_kind(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                }) == Some(PtrKind::OptBox)
+            })
+    }
+
+    fn ordered_struct_lifetimes(&self, struct_did: LocalDefId) -> Vec<Symbol> {
+        let Some(plan) = self.lifetime_plans.structs.get(&struct_did) else {
+            return vec![];
+        };
+        let mut field_lifetimes: Vec<_> = plan.field_lifetimes.iter().collect();
+        field_lifetimes.sort_by_key(|(field_index, _)| **field_index);
+        field_lifetimes
+            .into_iter()
+            .filter(|(field_index, _)| {
+                matches!(
+                    self.field_ptr_kind(StructFieldSlot {
+                        struct_did,
+                        field_index: **field_index,
+                    }),
+                    Some(
+                        PtrKind::Ref(_)
+                            | PtrKind::OptRef(_)
+                            | PtrKind::Slice(_)
+                            | PtrKind::SliceCursor(_)
+                    )
+                )
+            })
+            .map(|(_, lifetime)| *lifetime)
+            .collect()
+    }
+
+    fn rewrite_struct_definition(
+        &self,
+        struct_did: LocalDefId,
+        generics: &mut Generics,
+        fields: &mut ThinVec<FieldDef>,
+    ) {
+        let lifetimes = self.ordered_struct_lifetimes(struct_did);
+        if !lifetimes.is_empty() {
+            super::lifetimes::ensure_lifetime_params(generics, &lifetimes);
+        }
+
+        for (field_index, field_def) in fields.iter_mut().enumerate() {
+            let field = StructFieldSlot {
+                struct_did,
+                field_index,
+            };
+            let Some(kind) = self.field_ptr_kind(field) else {
+                continue;
+            };
+            let TyKind::Ptr(mut_ty) = &field_def.ty.kind else {
+                continue;
+            };
+            let inner_ty = self.ast_ty_string_with_promoted_lifetimes(&mut_ty.ty);
+            match kind {
+                PtrKind::OptRef(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_opt_ref_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                }
+                PtrKind::OptBox => {
+                    field_def.ty = P(utils::ty!("Option<Box<{inner_ty}>>"));
+                }
+                PtrKind::Slice(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_slice_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                }
+                PtrKind::SliceCursor(mutability) => {
+                    let Some(lifetime) = self.field_lifetime(field) else {
+                        continue;
+                    };
+                    field_def.ty = P(mk_cursor_ast_ty_with_lifetime(
+                        inner_ty, mutability, lifetime,
+                    ));
+                    self.slice_cursor.set(true);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn ast_ty_string_with_promoted_lifetimes(&self, ty: &Ty) -> String {
+        let mut ty = ty.clone();
+        self.add_promoted_lifetime_args_to_ast_ty(&mut ty);
+        pprust::ty_to_string(&ty)
+    }
+
+    fn add_promoted_lifetime_args_to_ast_ty(&self, ty: &mut Ty) {
+        struct FieldPointeeTyVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl MutVisitor for FieldPointeeTyVisitor<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                mut_visit::walk_ty(self, ty);
+                self.transform
+                    .add_promoted_lifetime_args_to_ast_ty_shallow(ty);
+            }
+        }
+
+        let mut visitor = FieldPointeeTyVisitor { transform: self };
+        visitor.visit_ty(ty);
+    }
+
+    fn add_promoted_lifetime_args_to_ast_ty_shallow(&self, ty: &mut Ty) {
+        let ty_str = pprust::ty_to_string(ty);
+        let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx) else {
+            return;
+        };
+        let hir::TyKind::Path(qpath) = &hir_ty.kind else {
+            return;
+        };
+        let Some(struct_did) = self.local_struct_did_from_qpath(qpath) else {
+            return;
+        };
+        let lifetimes = self.ordered_struct_lifetimes(struct_did);
+        if lifetimes.is_empty() {
+            return;
+        }
+        let promoted_lifetime_args = lifetimes
+            .iter()
+            .map(|lifetime| format!("'{}", lifetime.as_str()))
+            .collect::<Vec<_>>();
+        *ty = utils::ty!(
+            "{}",
+            add_lifetime_args_to_type_path_string(
+                ty_str,
+                self.existing_lifetime_param_count(struct_did),
+                &promoted_lifetime_args,
+            )
+        );
+    }
+
+    fn add_struct_lifetime_args_to_ty(&self, ty: &mut Ty) {
+        let Some((struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
+            return;
+        };
+        if self
+            .impl_self_lifetimes
+            .last()
+            .is_some_and(|(impl_struct_did, _)| *impl_struct_did == struct_did)
+        {
+            self.add_struct_lifetime_args_to_ty_with_lifetimes(ty, &lifetimes);
+        } else {
+            self.add_struct_lifetime_args_to_ty_with_lifetime_count(ty, lifetimes.len());
+        }
+    }
+
+    fn struct_lifetimes_for_ty(&self, ty: &Ty) -> Option<(LocalDefId, Vec<Symbol>)> {
+        let struct_did = self.local_struct_did_for_ast_ty(ty)?;
+        let lifetimes = self.ordered_struct_lifetimes(struct_did);
+        if lifetimes.is_empty() {
+            return None;
+        }
+        Some((struct_did, lifetimes))
+    }
+
+    fn local_struct_did_for_ast_ty(&self, ty: &Ty) -> Option<LocalDefId> {
+        let hir_ty = self.ast_to_hir.get_ty(ty.id, self.tcx)?;
+        let hir::TyKind::Path(hir_qpath) = hir_ty.kind else {
+            return None;
+        };
+        self.local_struct_did_from_qpath(&hir_qpath)
+    }
+
+    fn add_struct_lifetime_args_to_ty_with_lifetimes(&self, ty: &mut Ty, lifetimes: &[Symbol]) {
+        let Some((struct_did, _)) = self.struct_lifetimes_for_ty(ty) else {
+            return;
+        };
+        let promoted_lifetime_args = lifetimes
+            .iter()
+            .map(|lifetime| format!("'{}", lifetime.as_str()))
+            .collect::<Vec<_>>();
+        self.add_struct_lifetime_args_to_ty_with_args(
+            ty,
+            struct_did,
+            lifetimes,
+            &promoted_lifetime_args,
+        );
+    }
+
+    fn add_struct_lifetime_args_to_ty_with_lifetime_count(
+        &self,
+        ty: &mut Ty,
+        lifetime_count: usize,
+    ) {
+        let Some((struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
+            return;
+        };
+        let promoted_lifetime_args = std::iter::repeat_n("'_", lifetime_count)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.add_struct_lifetime_args_to_ty_with_args(
+            ty,
+            struct_did,
+            &lifetimes,
+            &promoted_lifetime_args,
+        );
+    }
+
+    fn add_struct_lifetime_args_to_ty_with_args(
+        &self,
+        ty: &mut Ty,
+        struct_did: LocalDefId,
+        expected_lifetimes: &[Symbol],
+        promoted_lifetime_args: &[String],
+    ) {
+        let TyKind::Path(None, path) = &ty.kind else {
+            return;
+        };
+        if path.segments.last().is_some_and(|seg| {
+            path_segment_has_expected_lifetimes(
+                seg,
+                self.existing_lifetime_param_count(struct_did),
+                expected_lifetimes,
+            )
+        }) {
+            return;
+        }
+        let ty_str = pprust::ty_to_string(ty);
+        *ty = utils::ty!(
+            "{}",
+            add_lifetime_args_to_type_path_string(
+                ty_str,
+                self.existing_lifetime_param_count(struct_did),
+                promoted_lifetime_args,
+            )
+        );
+    }
+
+    fn promoted_field_slot_for_hir_field(
+        &self,
+        hir_expr: &hir::Expr<'tcx>,
+    ) -> Option<StructFieldSlot> {
+        let hir::ExprKind::Field(base, ident) = hir_expr.kind else {
+            return None;
+        };
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let struct_did = hir_local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
+        let field_index = self.field_index_by_name(struct_did, ident.name)?;
+        let field = StructFieldSlot {
+            struct_did,
+            field_index,
+        };
+        self.field_ptr_kind(field).map(|_| field)
+    }
+
+    fn promoted_field_slot_for_ast_field(&self, ast_id: NodeId) -> Option<StructFieldSlot> {
+        let hir_field = self.ast_to_hir.get_expr_field(ast_id, self.tcx)?;
+        let hir::Node::Expr(parent) = self.tcx.parent_hir_node(hir_field.hir_id) else {
+            return None;
+        };
+        let hir::ExprKind::Struct(qpath, _, _) = parent.kind else {
+            return None;
+        };
+        let struct_did = self.local_struct_did_from_qpath(qpath)?;
+        let field_index = self.field_index_by_name(struct_did, hir_field.ident.name)?;
+        let field = StructFieldSlot {
+            struct_did,
+            field_index,
+        };
+        self.field_ptr_kind(field).map(|_| field)
+    }
+
+    fn rewrite_struct_literal_fields(&self, expr_id: NodeId, se: &mut StructExpr) {
+        let Some(hir_expr) = self.ast_to_hir.get_expr(expr_id, self.tcx) else {
+            return;
+        };
+        let hir::ExprKind::Struct(_, hir_fields, _) = hir_expr.kind else {
+            return;
+        };
+        for ast_field in &mut se.fields {
+            let Some(field) = self.promoted_field_slot_for_ast_field(ast_field.id) else {
+                continue;
+            };
+            let Some(kind) = self.field_ptr_kind(field) else {
+                continue;
+            };
+            let Some(hir_field) = hir_fields
+                .iter()
+                .find(|hir_field| hir_field.ident.name == ast_field.ident.name)
+            else {
+                continue;
+            };
+            self.transform_promoted_field_rhs(&mut ast_field.expr, hir_field.expr, kind, None);
+        }
+    }
+
+    fn local_struct_did_from_qpath(&self, qpath: &hir::QPath<'tcx>) -> Option<LocalDefId> {
+        let hir::QPath::Resolved(_, path) = qpath else {
+            return None;
+        };
+        let Res::Def(DefKind::Struct, def_id) = path.res else {
+            return None;
+        };
+        def_id.as_local()
+    }
+
+    fn field_index_by_name(&self, struct_did: LocalDefId, field_name: Symbol) -> Option<usize> {
+        self.tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+            .find_map(|(field_index, field)| {
+                (field.name == field_name).then_some(field_index.index())
+            })
+    }
+
+    fn extend_lifetimes_for_ty(&self, lifetimes: &mut Vec<Symbol>, ty: ty::Ty<'tcx>) {
+        for lifetime in self.lifetimes_for_ty(ty) {
+            if !lifetimes.contains(&lifetime) {
+                lifetimes.push(lifetime);
+            }
+        }
+    }
+
+    fn lifetimes_for_ty(&self, ty: ty::Ty<'tcx>) -> Vec<Symbol> {
+        let ty::TyKind::Adt(adt_def, _) = ty.kind() else {
+            return vec![];
+        };
+        if !adt_def.did().is_local() || !adt_def.is_struct() {
+            return vec![];
+        }
+        self.ordered_struct_lifetimes(adt_def.did().expect_local())
+    }
+
+    fn existing_lifetime_param_count_for_ty(&self, ty: ty::Ty<'tcx>) -> usize {
+        let ty::TyKind::Adt(adt_def, _) = ty.kind() else {
+            return 0;
+        };
+        if !adt_def.did().is_local() || !adt_def.is_struct() {
+            return 0;
+        }
+        self.existing_lifetime_param_count(adt_def.did().expect_local())
+    }
+
+    fn existing_lifetime_param_count(&self, did: LocalDefId) -> usize {
+        let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(did) else {
+            return 0;
+        };
+        let Some(generics) = item.kind.generics() else {
+            return 0;
+        };
+        generics
+            .params
+            .iter()
+            .filter(|param| matches!(param.kind, hir::GenericParamKind::Lifetime { .. }))
+            .count()
+    }
+
+    fn ty_name(&self, ty: ty::Ty<'tcx>) -> String {
+        self.promoted_mir_ty_name(ty, true)
+    }
+
+    fn anonymous_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
+        self.promoted_mir_ty_name(ty, false)
+    }
+
+    fn promoted_mir_ty_name(&self, ty: ty::Ty<'tcx>, use_named_struct_lifetimes: bool) -> String {
+        match ty.kind() {
+            ty::TyKind::Adt(adt_def, args) => {
+                let mut args = args
+                    .iter()
+                    .map(|arg| match arg.kind() {
+                        ty::GenericArgKind::Type(ty) => {
+                            self.promoted_mir_ty_name(ty, use_named_struct_lifetimes)
+                        }
+                        ty::GenericArgKind::Const(cnst) => cnst.to_string(),
+                        ty::GenericArgKind::Lifetime(_) => "'_".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                let lifetimes = self.lifetimes_for_ty(ty);
+                if !lifetimes.is_empty() {
+                    let promoted_lifetime_args = if use_named_struct_lifetimes {
+                        lifetimes
+                            .iter()
+                            .map(|lifetime| format!("'{}", lifetime.as_str()))
+                            .collect::<Vec<_>>()
+                    } else {
+                        std::iter::repeat_n("'_".to_string(), lifetimes.len()).collect::<Vec<_>>()
+                    };
+                    let insert_at = self
+                        .existing_lifetime_param_count_for_ty(ty)
+                        .min(args.len());
+                    if !generic_args_have_lifetimes(&args, insert_at, promoted_lifetime_args.len())
+                    {
+                        for (offset, lifetime) in promoted_lifetime_args.into_iter().enumerate() {
+                            args.insert(insert_at + offset, lifetime);
+                        }
+                    }
+                }
+                let base = self.adt_type_name(*adt_def);
+                if args.is_empty() {
+                    base
+                } else {
+                    format!("{base}<{}>", args.join(", "))
+                }
+            }
+            ty::TyKind::RawPtr(pointee, mutability) => {
+                let m = if mutability.is_mut() { "mut" } else { "const" };
+                format!(
+                    "*{m} {}",
+                    self.promoted_mir_ty_name(*pointee, use_named_struct_lifetimes)
+                )
+            }
+            ty::TyKind::Ref(_, inner, mutability) => {
+                let m = if mutability.is_mut() { "mut " } else { "" };
+                format!(
+                    "&{m}{}",
+                    self.promoted_mir_ty_name(*inner, use_named_struct_lifetimes)
+                )
+            }
+            ty::TyKind::Array(elem, len) => {
+                format!(
+                    "[{}; {len}]",
+                    self.promoted_mir_ty_name(*elem, use_named_struct_lifetimes)
+                )
+            }
+            ty::TyKind::Slice(elem) => format!(
+                "[{}]",
+                self.promoted_mir_ty_name(*elem, use_named_struct_lifetimes)
+            ),
+            ty::TyKind::Tuple(elems) => {
+                let elems = elems
+                    .iter()
+                    .map(|elem| self.promoted_mir_ty_name(elem, use_named_struct_lifetimes))
+                    .collect::<Vec<_>>();
+                format!("({})", elems.join(", "))
+            }
+            ty::TyKind::Param(param) => param.name.as_str().to_owned(),
+            _ => mir_ty_to_string(ty, self.tcx),
+        }
+    }
+
+    fn adt_type_name(&self, adt_def: ty::AdtDef<'tcx>) -> String {
+        let path_str = self.tcx.def_path_str(adt_def.did());
+        if path_str.starts_with("std") {
+            let name = self.tcx.item_name(adt_def.did());
+            if matches!(
+                name.as_str(),
+                "Option" | "Result" | "Vec" | "String" | "Box"
+            ) {
+                name.as_str().to_owned()
+            } else {
+                path_str
+            }
+        } else {
+            format!("crate::{path_str}")
+        }
+    }
+
+    fn mk_ref_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        utils::ty!("&{m}{ty}")
+    }
+
+    fn mk_ref_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("&{lifetime}{m}{ty}")
+    }
+
+    fn mk_opt_ref_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        utils::ty!("Option<&{m}{ty}>")
+    }
+
+    fn mk_opt_ref_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("Option<&{lifetime}{m}{ty}>")
+    }
+
+    fn mk_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.ty_name(ty);
+        utils::ty!("Box<{ty}>")
+    }
+
+    fn mk_local_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
+        utils::ty!("Box<{ty}>")
+    }
+
+    fn mk_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.ty_name(ty);
+        utils::ty!("Option<Box<{ty}>>")
+    }
+
+    fn mk_local_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.anonymous_ty_name(ty);
+        utils::ty!("Option<Box<{ty}>>")
+    }
+
+    fn mk_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.ty_name(ty);
+        utils::ty!("Box<[{ty}]>")
+    }
+
+    fn mk_opt_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.ty_name(ty);
+        utils::ty!("Option<Box<[{ty}]>>")
+    }
+
+    fn mk_cursor_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.ty_name(ty);
+        if mutability {
+            utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {ty}>")
+        } else {
+            utils::ty!("crate::slice_cursor::SliceCursor<'_, {ty}>")
+        }
+    }
+
+    fn mk_cursor_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let cursor = if mutability {
+            "SliceCursorMut"
+        } else {
+            "SliceCursor"
+        };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{}", lifetime.as_str()))
+            .unwrap_or_else(|| "'_".to_owned());
+        utils::ty!("crate::slice_cursor::{cursor}<{lifetime}, {ty}>")
+    }
+
+    fn mk_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.ty_name(ty);
+        if mutability {
+            utils::ty!("&mut [{ty}]")
+        } else {
+            utils::ty!("&[{ty}]")
+        }
+    }
+
+    fn mk_slice_ty_with_lifetime(
+        &self,
+        ty: ty::Ty<'tcx>,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let ty = self.ty_name(ty);
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("&{lifetime}{m}[{ty}]")
+    }
+
+    fn mk_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.ty_name(ty);
+        let m = if mutability { "mut" } else { "const" };
+        utils::ty!("*{m} {ty}")
+    }
+
+    fn raw_from_promoted_field_expr(
+        &self,
+        field_expr: &Expr,
+        mutability: bool,
+        inner_ty: ty::Ty<'tcx>,
+        field_kind: PtrKind,
+    ) -> Expr {
+        let field_expr = pprust::expr_to_string(field_expr);
+        let inner_ty = self.ty_name(inner_ty);
+        match field_kind {
+            PtrKind::OptRef(_) | PtrKind::OptBox => {
+                if mutability {
+                    utils::expr!(
+                        "({field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
+                    )
+                } else {
+                    utils::expr!(
+                        "({field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
+                    )
+                }
+            }
+            PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
+                if mutability {
+                    utils::expr!("({field_expr}).as_mut_ptr() as *mut {inner_ty}")
+                } else {
+                    utils::expr!("({field_expr}).as_ptr() as *const {inner_ty}")
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -1030,28 +2181,73 @@ impl<'tcx> TransformVisitor<'tcx> {
         ) else {
             return false;
         };
-        let info = self.raw_bridge_bindings.get(&lhs_hir_id).or_else(|| {
-            self.alloc_wrappers
-                .contains_key(&lhs_hir_id.owner.def_id)
-                .then_some(&current_info)
-        });
+        let info = self
+            .raw_bridge_bindings
+            .get(&lhs_hir_id)
+            .cloned()
+            .or_else(|| {
+                self.alloc_wrappers
+                    .contains_key(&lhs_hir_id.owner.def_id)
+                    .then_some(current_info.clone())
+            })
+            .or_else(|| {
+                (matches!(current_info, RawBridgeInfo::Scalar)
+                    && ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty))
+                .then_some(current_info.clone())
+            });
         let Some(info) = info else {
             return false;
         };
-        if &current_info != info {
+        if current_info != info {
             return false;
         }
-        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, info);
+        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, &info);
+        true
+    }
+
+    fn try_bridge_raw_projection_root(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &'tcx hir::Expr<'tcx>,
+        hir_lhs: &'tcx hir::Expr<'tcx>,
+        lhs_kind: PtrKind,
+        lhs_inner_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        let PtrKind::Raw(m) = lhs_kind else {
+            return false;
+        };
+        if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+            return false;
+        }
+        let Some(field) = hir_struct_field_slot(self.tcx, hir_lhs) else {
+            return false;
+        };
+        if !self.raw_scalar_bridge_fields.contains(&field) {
+            return false;
+        }
+        let Some(info) = hir_raw_bridge_info(
+            self.tcx,
+            lhs_inner_ty,
+            hir_rhs,
+            Some(&self.alloc_wrappers),
+            None,
+        ) else {
+            return false;
+        };
+        if !matches!(info, RawBridgeInfo::Scalar) {
+            return false;
+        }
+        *rhs = self.raw_bridge_expr(lhs_inner_ty, m, &info);
         true
     }
 
     fn raw_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool, info: &RawBridgeInfo) -> Expr {
-        let ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let ty = self.ty_name(lhs_inner_ty);
         let default_expr = self.default_value_expr(lhs_inner_ty);
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match info {
             RawBridgeInfo::Scalar => utils::expr!(
-                "Box::into_raw(Box::new({})) as *{} {}",
+                "Box::leak(Box::new({})) as *{} {}",
                 default_expr_str,
                 if m { "mut" } else { "const" },
                 ty,
@@ -1080,6 +2276,9 @@ impl<'tcx> TransformVisitor<'tcx> {
     ) {
         let PtrKind::Raw(m) = output_kind else {
             self.transform_rhs(rhs, hir_rhs, output_kind);
+            if matches!(output_kind, PtrKind::Ref(_)) {
+                use_moving_opt_ref_unwraps_for_return(rhs);
+            }
             return;
         };
         let Some((rhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(
@@ -1128,44 +2327,109 @@ impl<'tcx> TransformVisitor<'tcx> {
         hir_expr: &'tcx hir::Expr<'tcx>,
         args: &[P<Expr>],
     ) -> Option<Expr> {
-        let (hir_id, _harg) =
-            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)?;
-        if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
-            && matches!(
-                self.effective_ptr_kind(hir_id),
-                Some(PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
-            )
-        {
-            let local_name = self.tcx.hir_name(hir_id).to_string();
-            return match self.effective_ptr_kind(hir_id) {
-                Some(PtrKind::Box | PtrKind::BoxedSlice) => {
-                    Some(utils::expr!("drop({local_name})"))
-                }
-                Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
-                    Some(utils::expr!("drop(({local_name}).take())"))
-                }
-                _ => None,
-            };
+        if let Some(field_free) = self.rewrite_owned_field_free_call(hir_expr, args) {
+            return Some(field_free);
         }
-        let info = self.raw_bridge_bindings.get(&hir_id)?;
+        if let Some((hir_id, _harg)) =
+            hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)
+        {
+            if hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
+                && matches!(
+                    self.effective_ptr_kind(hir_id),
+                    Some(
+                        PtrKind::Box
+                            | PtrKind::OptBox
+                            | PtrKind::BoxedSlice
+                            | PtrKind::OptBoxedSlice
+                    )
+                )
+            {
+                let local_name = self.tcx.hir_name(hir_id).to_string();
+                return match self.effective_ptr_kind(hir_id) {
+                    Some(PtrKind::Box | PtrKind::BoxedSlice) => {
+                        Some(utils::expr!("drop({local_name})"))
+                    }
+                    Some(PtrKind::OptBox | PtrKind::OptBoxedSlice) => {
+                        Some(utils::expr!("drop(({local_name}).take())"))
+                    }
+                    _ => None,
+                };
+            }
+            if let Some(info) = self.raw_bridge_bindings.get(&hir_id) {
+                let [arg] = args else { return None };
+                let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
+                let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
+                let arg_str = pprust::expr_to_string(arg);
+                let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
+                return Some(match info {
+                    RawBridgeInfo::Scalar => scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str),
+                    RawBridgeInfo::Array { len_expr } => {
+                        array_box_from_raw_free_expr(&arg_str, &inner_ty_str, len_expr)
+                    }
+                });
+            }
+        }
+        self.rewrite_scalar_box_from_raw_free_call(hir_expr, args)
+    }
+
+    fn rewrite_scalar_box_from_raw_free_call(
+        &self,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        args: &[P<Expr>],
+    ) -> Option<Expr> {
+        if !hir_call_matches_foreign_name(self.tcx, hir_expr, "free") {
+            return None;
+        }
+        let hir::ExprKind::Call(_, hir_args) = hir_expr.kind else {
+            return None;
+        };
+        let [hir_arg] = hir_args else { return None };
         let [arg] = args else { return None };
-        let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
+        let hir_arg = hir_unwrap_casts(hir_arg);
+        if let Some(field) = hir_struct_field_slot(self.tcx, hir_arg)
+            && !self.raw_scalar_bridge_fields.contains(&field)
+        {
+            return None;
+        }
+        let arg_ty = self
+            .tcx
+            .typeck(hir_expr.hir_id.owner)
+            .expr_ty_adjusted(hir_arg);
         let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
-        let arg_str = pprust::expr_to_string(arg);
+        if !ty_supports_scalar_box_from_raw_bridge(inner_ty) {
+            return None;
+        }
+        let mut raw_arg = (**arg).clone();
+        self.transform_rhs(&mut raw_arg, hir_arg, PtrKind::Raw(true));
+        let arg_str = pprust::expr_to_string(&raw_arg);
         let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
-        Some(match info {
-            RawBridgeInfo::Scalar => utils::expr!(
-                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(({0}) as *mut {1}) }}); }}",
-                arg_str,
-                inner_ty_str,
-            ),
-            RawBridgeInfo::Array { len_expr } => utils::expr!(
-                "if !({0}).is_null() {{ drop(unsafe {{ Box::from_raw(std::ptr::slice_from_raw_parts_mut(({0}) as *mut {1}, ({2}) as usize)) }}); }}",
-                arg_str,
-                inner_ty_str,
-                len_expr,
-            ),
-        })
+        Some(scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str))
+    }
+
+    fn rewrite_owned_field_free_call(
+        &self,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        args: &[P<Expr>],
+    ) -> Option<Expr> {
+        if !hir_call_matches_foreign_name(self.tcx, hir_expr, "free")
+            && !hir_called_local_fn(self.tcx, hir_expr)
+                .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id))
+        {
+            return None;
+        }
+        let hir::ExprKind::Call(_, hir_args) = hir_expr.kind else {
+            return None;
+        };
+        let [hir_arg] = hir_args else { return None };
+        let [arg] = args else { return None };
+        let hir_field = hir_unwrap_casts(hir_arg);
+        let field = hir_struct_field_slot(self.tcx, hir_field)?;
+        if !matches!(self.field_ptr_kind(field), Some(PtrKind::OptBox)) {
+            return None;
+        }
+        let _ = arg;
+        let field_expr = hir_field_access_expr_string(self.tcx, hir_field)?;
+        Some(utils::expr!("drop(({}).take())", field_expr))
     }
 
     fn hir_id_of_path(&self, id: NodeId) -> Option<HirId> {
@@ -1304,15 +2568,15 @@ impl<'tcx> TransformVisitor<'tcx> {
         target_kind: PtrKind,
         lhs_inner_ty: ty::Ty<'tcx>,
     ) -> bool {
-        struct UnsupportedBoxAssignmentVisitor<'a, 'tcx> {
-            transform: &'a TransformVisitor<'tcx>,
+        struct UnsupportedBoxAssignmentVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
             target_hir_id: HirId,
             target_kind: PtrKind,
             lhs_inner_ty: ty::Ty<'tcx>,
             found: bool,
         }
 
-        impl<'tcx> Visitor<'tcx> for UnsupportedBoxAssignmentVisitor<'_, 'tcx> {
+        impl<'tcx> Visitor<'tcx> for UnsupportedBoxAssignmentVisitor<'_, '_, 'tcx> {
             fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
                 if self.found {
                     return;
@@ -1353,6 +2617,206 @@ impl<'tcx> TransformVisitor<'tcx> {
         lhs_kind: PtrKind,
     ) -> PtrKind {
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
+    }
+
+    fn transform_promoted_field_rhs(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
+        if self.try_transform_raw_pointer_to_promoted_field(
+            rhs,
+            hir_rhs,
+            field_kind,
+            target_inner_ty,
+        ) || self.try_transform_slice_to_promoted_field(
+            rhs,
+            hir_rhs,
+            field_kind,
+            target_inner_ty,
+        ) {
+            field_kind
+        } else {
+            self.transform_rhs(rhs, hir_rhs, field_kind)
+        }
+    }
+
+    fn try_transform_raw_pointer_to_promoted_field(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> bool {
+        let PtrKind::OptRef(m) = field_kind else {
+            return false;
+        };
+        if is_null_like_ptr_arg(unwrap_addr_of_deref(unwrap_cast_and_paren(rhs)))
+            || hir_raw_addr_local(hir_rhs).is_some()
+            || matches!(
+                unwrap_cast_and_paren(rhs).kind,
+                ExprKind::AddrOf(BorrowKind::Ref, ..)
+            )
+        {
+            return false;
+        }
+        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_cast(hir_rhs).kind
+            && let Res::Local(hir_id) = path.res
+            && !matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Raw(_)))
+        {
+            return false;
+        }
+        let typeck = self.tcx.typeck(hir_rhs.hir_id.owner);
+        let Some((rhs_inner_ty, rhs_mut)) =
+            unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_rhs))
+        else {
+            return false;
+        };
+        let lhs_inner_ty = target_inner_ty.unwrap_or(rhs_inner_ty);
+        *rhs = self.opt_ref_from_raw_without_unsafe(
+            unwrap_addr_of_deref(unwrap_paren(rhs)),
+            m,
+            rhs_mut.is_mut(),
+            lhs_inner_ty,
+            rhs_inner_ty,
+        );
+        true
+    }
+
+    fn try_transform_slice_to_promoted_field(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> bool {
+        let PtrKind::OptRef(m) = field_kind else {
+            return false;
+        };
+        let e = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
+        let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_rhs));
+        let Some(pe) = self.ptr_expr(e, hir_e) else {
+            return false;
+        };
+        if !pe.projs.is_empty() {
+            return false;
+        }
+        let source_mutability = match self.ptr_source_kind(&pe) {
+            Some(PtrKind::Slice(source_m)) | Some(PtrKind::SliceCursor(source_m)) => source_m,
+            _ => return false,
+        };
+        if m && !source_mutability {
+            return false;
+        }
+        let Some(rhs_inner_ty) = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx) else {
+            return false;
+        };
+        let lhs_inner_ty = target_inner_ty.unwrap_or(rhs_inner_ty);
+        let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
+        let ref_method = if m { "as_mut" } else { "as_ref" };
+        *rhs = if lhs_inner_ty == rhs_inner_ty {
+            utils::expr!(
+                "({}).{}().{}()",
+                pprust::expr_to_string(pe.base),
+                ptr_method,
+                ref_method,
+            )
+        } else {
+            utils::expr!(
+                "(({}).{}() as *{} {}).{}()",
+                pprust::expr_to_string(pe.base),
+                ptr_method,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                ref_method,
+            )
+        };
+        true
+    }
+
+    fn local_binding_needs_mut_for_promoted_field_write(&self, target_hir_id: HirId) -> bool {
+        struct PromotedFieldWriteVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            target_hir_id: HirId,
+            found: bool,
+        }
+
+        impl<'tcx> Visitor<'tcx> for PromotedFieldWriteVisitor<'_, '_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if self.found {
+                    return;
+                }
+                if let hir::ExprKind::Unary(UnOp::Deref, field_expr) = expr.kind
+                    && matches!(self.transform.expr_ctx(expr), ExprCtx::Lvalue)
+                    && hir_field_base_local_id(field_expr)
+                        .is_some_and(|id| id == self.target_hir_id)
+                    && let Some(field) =
+                        self.transform.promoted_field_slot_for_hir_field(field_expr)
+                    && matches!(
+                        self.transform.field_ptr_kind(field),
+                        Some(PtrKind::OptRef(true) | PtrKind::OptBox)
+                    )
+                {
+                    self.found = true;
+                    return;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+        let mut visitor = PromotedFieldWriteVisitor {
+            transform: self,
+            target_hir_id,
+            found: false,
+        };
+        visitor.visit_body(body);
+        visitor.found
+    }
+
+    fn local_binding_needs_mut_for_owned_field_free(&self, target_hir_id: HirId) -> bool {
+        struct OwnedFieldFreeVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            target_hir_id: HirId,
+            found: bool,
+        }
+
+        impl<'tcx> Visitor<'tcx> for OwnedFieldFreeVisitor<'_, '_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if self.found {
+                    return;
+                }
+                let is_direct_free =
+                    hir_call_matches_foreign_name(self.transform.tcx, expr, "free");
+                let is_wrapper_free = hir_called_local_fn(self.transform.tcx, expr)
+                    .is_some_and(|def_id| self.transform.free_like_wrappers.contains(&def_id));
+                if (is_direct_free || is_wrapper_free)
+                    && let hir::ExprKind::Call(_, args) = expr.kind
+                    && let [arg] = args
+                {
+                    let field_expr = hir_unwrap_casts(arg);
+                    if let Some(field) = hir_struct_field_slot(self.transform.tcx, field_expr)
+                        && self.transform.field_ptr_kind(field) == Some(PtrKind::OptBox)
+                        && hir_projection_root_local_id(field_expr) == Some(self.target_hir_id)
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let body = self.tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+        let mut visitor = OwnedFieldFreeVisitor {
+            transform: self,
+            target_hir_id,
+            found: false,
+        };
+        visitor.visit_body(body);
+        visitor.found
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
@@ -1443,10 +2907,28 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
         }
 
+        if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::OptRef(_))) = ctx
+            && let Some(pe) = self.ptr_expr(e, hir_e)
+            && pe.projs.is_empty()
+            && !hir_expr_starts_with_cast(hir_ptr)
+            && self.ptr_source_kind(&pe) == Some(kind)
+        {
+            return kind;
+        }
+
         if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice)) = ctx {
             debug_assert!(!kind.is_optional());
             self.transform_ptr(ptr, hir_ptr, PtrCtx::Rhs(kind.optional_variant()));
-            *ptr = utils::expr!("({}).unwrap()", pprust::expr_to_string(ptr));
+            *ptr = match kind {
+                PtrKind::Ref(m) if opt_ref_receiver_should_borrow(ptr) => {
+                    utils::expr!(
+                        "({}).as_deref{}().unwrap()",
+                        pprust::expr_to_string(ptr),
+                        if m { "_mut" } else { "" },
+                    )
+                }
+                _ => utils::expr!("({}).unwrap()", pprust::expr_to_string(ptr)),
+            };
             return kind;
         }
 
@@ -1472,6 +2954,26 @@ impl<'tcx> TransformVisitor<'tcx> {
         let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
         let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
+        if let PtrCtx::Rhs(
+            kind @ (PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
+        ) = ctx
+            && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
+            && self.field_ptr_kind(field) == Some(kind)
+        {
+            return kind;
+        }
+        if let PtrCtx::Rhs(PtrKind::Raw(m)) = ctx
+            && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
+            && let Some(field_kind) = self.field_ptr_kind(field)
+            && matches!(
+                field_kind,
+                PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+            )
+            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+        {
+            *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty, field_kind);
+            return PtrKind::Raw(m);
+        }
         let mut pe = if let Some(pe) = self.ptr_expr(e, hir_e) {
             pe
         } else if let Some((rhs_inner_ty, rhs_mut)) = unwrap_ptr_from_mir_ty(rhs_ty) {
@@ -1606,6 +3108,13 @@ impl<'tcx> TransformVisitor<'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
 
         let def_id = hir_ptr.hir_id.owner.def_id;
+        if let PtrCtx::Rhs(PtrKind::OptRef(m)) = ctx
+            && let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
+            && let Some(PtrKind::OptRef(source_m)) = self.field_ptr_kind(field)
+        {
+            *ptr = self.opt_ref_from_opt_ref(e, m, source_m, lhs_inner_ty, rhs_inner_ty, def_id);
+            return PtrKind::OptRef(m);
+        }
 
         if pe.addr_of {
             let addr_source_mut = addr_of_mutability(e).unwrap_or(false);
@@ -1810,11 +3319,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                 }
                 PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m) => {
                     if !need_cast && !ty_updated {
-                        *ptr = utils::expr!(
-                            "Some(&{}({}))",
-                            if m { "mut " } else { "" },
-                            pprust::expr_to_string(e),
-                        );
+                        let target = borrow_target_expr_string(e);
+                        *ptr = utils::expr!("Some(&{}{})", if m { "mut " } else { "" }, target,);
                     } else if !ty_updated
                         && lhs_inner_ty.is_numeric()
                         && rhs_inner_ty.is_numeric()
@@ -2154,8 +3660,22 @@ impl<'tcx> TransformVisitor<'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    if pe.projs.is_empty() {
+                        *ptr = self.raw_from_opt_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    } else if let Some((base, source_inner_ty)) =
+                        self.projected_opt_ref_slice_expr(&pe, m, m1)
+                    {
+                        *ptr = self.raw_from_slice_or_cursor(
+                            &base,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            source_inner_ty,
+                        );
+                    } else {
+                        *ptr =
+                            self.raw_from_projected_opt_ref(&pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    }
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Slice(m1)) => {
@@ -2196,18 +3716,63 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = self.ref_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty, def_id);
                     return PtrKind::Ref(m);
                 }
+                (PtrCtx::Deref(false), PtrKind::OptRef(false))
+                    if !need_cast && pe.projs.is_empty() =>
+                {
+                    return PtrKind::OptRef(false);
+                }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)) | PtrCtx::Deref(m), PtrKind::OptRef(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    // can be used for deref, so type must be specified
-                    *ptr = self.opt_ref_from_opt_ref(
-                        pe.base,
-                        m,
-                        m1,
-                        lhs_inner_ty,
-                        rhs_inner_ty,
-                        def_id,
-                    );
-                    return PtrKind::OptRef(m);
+                    if pe.projs.is_empty() {
+                        // can be used for deref, so type must be specified
+                        *ptr = self.opt_ref_from_opt_ref(
+                            pe.base,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                            def_id,
+                        );
+                        return PtrKind::OptRef(m);
+                    }
+                    if let Some((base, source_inner_ty)) =
+                        self.projected_opt_ref_slice_expr(&pe, m, m1)
+                    {
+                        match ctx {
+                            PtrCtx::Deref(_) => {
+                                *ptr = self.plain_slice_from_slice(
+                                    &base,
+                                    &pe,
+                                    m,
+                                    lhs_inner_ty,
+                                    source_inner_ty,
+                                );
+                                return PtrKind::Slice(m);
+                            }
+                            PtrCtx::Rhs(PtrKind::OptRef(_)) => {
+                                *ptr = self.opt_ref_from_slice_or_cursor(
+                                    &base,
+                                    m,
+                                    lhs_inner_ty,
+                                    source_inner_ty,
+                                    def_id,
+                                );
+                                return PtrKind::OptRef(m);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    if matches!(ctx, PtrCtx::Deref(_)) {
+                        *ptr = self.opt_ref_from_projected_opt_ref(
+                            &pe,
+                            m,
+                            m1,
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::OptRef(m);
+                    }
+                    *ptr = self.raw_from_projected_opt_ref(&pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::OptRef(m)), PtrKind::BoxedSlice) => {
                     let (base, source_inner_ty) = self
@@ -2419,7 +3984,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let base = self.projected_expr(&pe, m, false);
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
-                    if !m && m1 {
+                    if !m && m1 && pe.projs.is_empty() && lhs_inner_ty == rhs_inner_ty {
                         result = utils::expr!("({}).as_deref()", pprust::expr_to_string(&result),);
                     }
                     // need fork only for identity copy (no projections, no cast)
@@ -2430,8 +3995,22 @@ impl<'tcx> TransformVisitor<'tcx> {
                     *ptr = result;
                     return PtrKind::SliceCursor(m);
                 }
-                (PtrCtx::Rhs(PtrKind::SliceCursor(_) | PtrKind::Slice(_)), PtrKind::OptRef(_)) => {
-                    panic!()
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::OptRef(m1)) => {
+                    let (base, source_inner_ty) = self
+                        .projected_opt_ref_slice_expr(&pe, m, m1)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr =
+                        self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, source_inner_ty);
+                    return PtrKind::Slice(m);
+                }
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::OptRef(m1)) => {
+                    self.slice_cursor.set(true);
+                    let (base, source_inner_ty) = self
+                        .projected_opt_ref_slice_expr(&pe, m, m1)
+                        .unwrap_or_else(|| panic!("{}", pprust::expr_to_string(ptr)));
+                    *ptr =
+                        self.cursor_from_plain_slice(&base, &pe, m, lhs_inner_ty, source_inner_ty);
+                    return PtrKind::SliceCursor(m);
                 }
                 (
                     PtrCtx::Rhs(PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
@@ -2680,6 +4259,9 @@ impl<'tcx> TransformVisitor<'tcx> {
         if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
             return self.effective_ptr_kind(hir_id);
         }
+        if let Some(field) = self.promoted_field_slot_for_hir_field(pe.hir_base) {
+            return self.field_ptr_kind(field);
+        }
         if let hir::ExprKind::Call(func, _) = pe.hir_base.kind
             && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
             && let Res::Def(_, def_id) = path.res
@@ -2713,7 +4295,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             ty::TyKind::RawPtr(pointee, mutability) => utils::expr!(
                 "std::ptr::null{}::<{}>()",
                 if mutability.is_mut() { "_mut" } else { "" },
-                mir_ty_to_string(*pointee, self.tcx),
+                self.ty_name(*pointee),
             ),
             ty::TyKind::Array(elem, _) => {
                 let elem_expr = self.default_value_expr(*elem);
@@ -2723,12 +4305,30 @@ impl<'tcx> TransformVisitor<'tcx> {
                 )
             }
             ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() && adt_def.is_struct() => {
-                let ty_name = mir_ty_to_string(ty, self.tcx);
+                let ty_name = strip_top_level_generic_args_from_type_path(self.ty_name(ty));
+                let struct_did = adt_def.did().expect_local();
                 let fields = adt_def
                     .all_fields()
-                    .map(|field| {
+                    .enumerate()
+                    .map(|(field_index, field)| {
                         let field_name = self.tcx.item_name(field.did).as_str().to_owned();
-                        let field_expr = self.default_value_expr(field.ty(self.tcx, args));
+                        let field_slot = StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        };
+                        let field_expr = match self.field_ptr_kind(field_slot) {
+                            Some(PtrKind::OptRef(_) | PtrKind::OptBox) => utils::expr!("None"),
+                            Some(PtrKind::Slice(m)) => self.empty_slice_expr(m),
+                            Some(PtrKind::SliceCursor(m)) => {
+                                self.slice_cursor.set(true);
+                                if m {
+                                    utils::expr!("crate::slice_cursor::SliceCursorMut::empty()")
+                                } else {
+                                    utils::expr!("crate::slice_cursor::SliceCursor::empty()")
+                                }
+                            }
+                            _ => self.default_value_expr(field.ty(self.tcx, args)),
+                        };
                         format!("{field_name}: {}", pprust::expr_to_string(&field_expr))
                     })
                     .collect::<Vec<_>>()
@@ -2736,18 +4336,18 @@ impl<'tcx> TransformVisitor<'tcx> {
                 utils::expr!("{} {{ {} }}", ty_name, fields)
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_enum() => {
-                let ty_name = mir_ty_to_string(ty, self.tcx);
+                let ty_name = self.ty_name(ty);
                 let variant_name = fieldless_enum_zero_variant(self.tcx, *adt_def).unwrap();
                 utils::expr!("{}::{}", ty_name, variant_name)
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
-                let ty_name = mir_ty_to_string(ty, self.tcx);
+                let ty_name = self.ty_name(ty);
                 utils::expr!(
                     "unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}"
                 )
             }
             _ => {
-                let ty = mir_ty_to_string(ty, self.tcx);
+                let ty = self.ty_name(ty);
                 utils::expr!("<{ty} as Default>::default()")
             }
         }
@@ -2795,7 +4395,7 @@ impl<'tcx> TransformVisitor<'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
     ) -> Option<PtrKind> {
         let alloc_root = self.allocator_root(expr)?;
-        let ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let ty = self.ty_name(lhs_inner_ty);
         let default_expr = self.default_value_expr(lhs_inner_ty);
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match (target_kind, alloc_root) {
@@ -3182,6 +4782,25 @@ impl<'tcx> TransformVisitor<'tcx> {
         self.apply_boxed_slice_projections(pe, m, &mut expr)
     }
 
+    fn projected_opt_ref_slice_expr(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        source_mut: bool,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
+        if m && !source_mut {
+            return None;
+        }
+        let source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        let raw = self.raw_from_opt_ref(pe.base, m, source_mut, source_inner_ty, source_inner_ty);
+        let mut expr = utils::expr!(
+            "std::slice::from_raw_parts{}({}, 1_000_000)",
+            if m { "_mut" } else { "" },
+            pprust::expr_to_string(&raw),
+        );
+        self.apply_borrowed_slice_projections(pe, m, &mut expr)
+    }
+
     fn apply_boxed_slice_projections(
         &self,
         pe: &PtrExpr<'_, 'tcx>,
@@ -3192,6 +4811,37 @@ impl<'tcx> TransformVisitor<'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
+                    *expr = utils::expr!(
+                        "({})[({}) as usize..]",
+                        pprust::expr_to_string(expr),
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty)?;
+                    *expr = self.plain_slice_from_expr(expr, m, to_ty, from_ty);
+                    from_ty = to_ty;
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+        Some((expr.clone(), from_ty))
+    }
+
+    fn apply_borrowed_slice_projections(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        expr: &mut Expr,
+    ) -> Option<(Expr, ty::Ty<'tcx>)> {
+        let mut from_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        for proj in &pe.projs {
+            match proj {
+                PtrExprProj::Offset(offset) => {
+                    if !self.offset_expr_can_be_slice_index(offset) {
+                        return None;
+                    }
                     *expr = utils::expr!(
                         "({})[({}) as usize..]",
                         pprust::expr_to_string(expr),
@@ -3571,7 +5221,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                 "if ({0}).is_null() {{
                     None
                 }} else {{
-                    Some(unsafe {{ Box::from_raw(({0}) as *mut {1}) }})
+                    Some(Box::from_raw(({0}) as *mut {1}))
                 }}",
                 pprust::expr_to_string(e),
                 lhs_ty,
@@ -3583,7 +5233,7 @@ impl<'tcx> TransformVisitor<'tcx> {
                     if _x.is_null() {{
                         None
                     }} else {{
-                        Some(unsafe {{ Box::from_raw(_x as *mut {}) }})
+                        Some(Box::from_raw(_x as *mut {}))
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -3648,6 +5298,91 @@ impl<'tcx> TransformVisitor<'tcx> {
         }
     }
 
+    fn raw_from_projected_opt_ref(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let source_inner_ty =
+            unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx).unwrap_or(rhs_inner_ty);
+        let mut raw = self.raw_from_opt_ref(pe.base, m, m1, source_inner_ty, source_inner_ty);
+        let mut from_ty = source_inner_ty;
+        for proj in &pe.projs {
+            match proj {
+                PtrExprProj::Offset(offset) => {
+                    raw = utils::expr!(
+                        "({}).offset({})",
+                        pprust::expr_to_string(&raw),
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    raw = utils::expr!("({}) as usize", pprust::expr_to_string(&raw));
+                }
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
+                    raw = utils::expr!(
+                        "({}) as *{} {}",
+                        pprust::expr_to_string(&raw),
+                        if m { "mut" } else { "const" },
+                        mir_ty_to_string(to_ty, self.tcx),
+                    );
+                    from_ty = to_ty;
+                }
+                PtrExprProj::IntegerOp(expr, op) => {
+                    let method = match op {
+                        OpKind::WrappingAdd => "wrapping_add",
+                        OpKind::WrappingSub => "wrapping_sub",
+                    };
+                    raw = utils::expr!(
+                        "({}).{}({})",
+                        pprust::expr_to_string(&raw),
+                        method,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+                PtrExprProj::IntegerBinOp(expr, op) => {
+                    let op_str = match op {
+                        BinOpKind::BitAnd => "&",
+                        BinOpKind::BitOr => "|",
+                        _ => panic!(),
+                    };
+                    raw = utils::expr!(
+                        "({}) {} ({})",
+                        pprust::expr_to_string(&raw),
+                        op_str,
+                        pprust::expr_to_string(expr),
+                    );
+                }
+            }
+        }
+        if from_ty != lhs_inner_ty {
+            utils::expr!(
+                "({}) as *{} {}",
+                pprust::expr_to_string(&raw),
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+            )
+        } else {
+            raw
+        }
+    }
+
+    fn opt_ref_from_projected_opt_ref(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let raw = self.raw_from_projected_opt_ref(pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+        self.opt_ref_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+    }
+
     fn raw_from_slice_or_cursor(
         &self,
         e: &Expr,
@@ -3696,6 +5431,35 @@ impl<'tcx> TransformVisitor<'tcx> {
         } else {
             utils::expr!(
                 "unsafe {{ (({}){} as *{} {}).as_{}() }}",
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "const" },
+                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                if m { "mut" } else { "ref" },
+            )
+        }
+    }
+
+    fn opt_ref_from_raw_without_unsafe(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
+        if !need_cast {
+            utils::expr!(
+                "({}){}.as_{}()",
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "ref" },
+            )
+        } else {
+            utils::expr!(
+                "(({}){} as *{} {}).as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
@@ -4117,6 +5881,10 @@ impl<'tcx> TransformVisitor<'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
+        if !m && let Some(receiver) = slice_cursor_mut_temp_as_slice_receiver(e) {
+            let shared_cursor = utils::expr!("({}).as_deref()", pprust::expr_to_string(receiver));
+            return self.cursor_from_cursor(&shared_cursor, m, lhs_inner_ty, rhs_inner_ty);
+        }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let is_rewritten_slice_like_local =
             matches!(pe.base_kind, PtrExprBaseKind::Path(Res::Local(_)))
@@ -4226,15 +5994,17 @@ impl<'tcx> TransformVisitor<'tcx> {
         };
         if !need_cast {
             e.clone()
-        } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
+        } else if !m
+            && lhs_inner_ty.is_numeric()
+            && rhs_inner_ty.is_numeric()
+            && !utils::ast::has_side_effects(e)
+        {
             self.bytemuck.set(true);
             utils::expr!(
-                "{}::new(bytemuck::cast_slice{}::<_, {}>(({}).as_slice{}()))",
+                "{}::new(bytemuck::cast_slice::<_, {}>(({}).as_slice()))",
                 cursor_ty,
-                if m { "_mut" } else { "" },
                 mir_ty_to_string(lhs_inner_ty, self.tcx),
                 pprust::expr_to_string(e),
-                if m { "_mut" } else { "" },
             )
         } else {
             utils::expr!(
@@ -4362,10 +6132,15 @@ impl<'tcx> TransformVisitor<'tcx> {
             }
             ExprKind::MethodCall(call) => {
                 let hir::ExprKind::MethodCall(seg, hreceiver, _, _) = hir_expr.kind else {
-                    panic!()
+                    return Some(PtrExpr::new(
+                        expr,
+                        hir_expr,
+                        base_ty,
+                        PtrExprBaseKind::Other,
+                    ));
                 };
                 let name = seg.ident.name.as_str();
-                if name == "offset" {
+                if name == "offset" || name == "add" {
                     let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;
                     ptr_expr.push_offset(&call.args[0]);
                     Some(ptr_expr)
@@ -4532,11 +6307,7 @@ impl<'tcx> TransformVisitor<'tcx> {
             },
             |kind| kind.is_mut(),
         );
-        let mut is_plain_slice = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
-            matches!(self.effective_ptr_kind(hir_id), Some(PtrKind::Slice(_)))
-        } else {
-            false
-        };
+        let mut is_plain_slice = matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         // A "data container" is a Vec/array accessed via as_ptr that is NOT a cursor.
         // For these, offsets should produce re-sliced expressions, not cursor operations.
         let is_data_container = pe.as_ptr
@@ -4544,14 +6315,8 @@ impl<'tcx> TransformVisitor<'tcx> {
                 pe.base_kind,
                 PtrExprBaseKind::Array | PtrExprBaseKind::Alloca
             );
-        let is_mut_cursor_base = if let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind {
-            matches!(
-                self.ptr_kinds.get(&hir_id),
-                Some(PtrKind::SliceCursor(true))
-            )
-        } else {
-            false
-        };
+        let is_mut_cursor_base =
+            matches!(self.ptr_source_kind(pe), Some(PtrKind::SliceCursor(true)));
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -4585,12 +6350,26 @@ impl<'tcx> TransformVisitor<'tcx> {
                                 pprust::expr_to_string(offset),
                             );
                         }
-                    } else if m && is_mut_cursor_base {
-                        e = utils::expr!(
-                            "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
-                            pprust::expr_to_string(&e),
-                            pprust::expr_to_string(offset),
-                        );
+                    } else if is_mut_cursor_base {
+                        if m {
+                            e = utils::expr!(
+                                "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
+                        } else if is_slice_cursor_mut_constructor_call(&e) {
+                            e = utils::expr!(
+                                "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
+                        } else {
+                            e = utils::expr!(
+                                "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
+                                pprust::expr_to_string(&e),
+                                pprust::expr_to_string(offset),
+                            );
+                        }
                     } else {
                         e = utils::expr!(
                             "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
@@ -4720,68 +6499,28 @@ fn ty_is_slice_ref(ty: ty::Ty<'_>) -> bool {
 }
 
 #[inline]
-fn mk_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
+fn mk_opt_ref_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: Symbol) -> Ty {
     let m = if mutability { "mut " } else { "" };
-    utils::ty!("&{m}{ty}")
+    let lifetime = lifetime.as_str();
+    utils::ty!("Option<&'{lifetime} {m}{inner_ty}>")
 }
 
 #[inline]
-fn mk_opt_ref_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
+fn mk_slice_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: Symbol) -> Ty {
     let m = if mutability { "mut " } else { "" };
-    utils::ty!("Option<&{m}{ty}>")
+    let lifetime = lifetime.as_str();
+    utils::ty!("&'{lifetime} {m}[{inner_ty}]")
 }
 
 #[inline]
-fn mk_box_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    utils::ty!("Box<{ty}>")
-}
-
-#[inline]
-fn mk_opt_box_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    utils::ty!("Option<Box<{ty}>>")
-}
-
-#[inline]
-fn mk_boxed_slice_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    utils::ty!("Box<[{ty}]>")
-}
-
-#[inline]
-fn mk_opt_boxed_slice_ty<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    utils::ty!("Option<Box<[{ty}]>>")
-}
-
-#[inline]
-fn mk_cursor_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    if mutability {
-        utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {ty}>")
+fn mk_cursor_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: Symbol) -> Ty {
+    let cursor = if mutability {
+        "SliceCursorMut"
     } else {
-        utils::ty!("crate::slice_cursor::SliceCursor<'_, {ty}>")
-    }
-}
-
-#[inline]
-fn mk_slice_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    if mutability {
-        utils::ty!("&mut [{ty}]")
-    } else {
-        utils::ty!("&[{ty}]")
-    }
-}
-
-#[inline]
-fn mk_raw_ptr_ty<'tcx>(ty: ty::Ty<'tcx>, mutability: bool, tcx: TyCtxt<'tcx>) -> Ty {
-    let ty = mir_ty_to_string(ty, tcx);
-    let m = if mutability { "mut" } else { "const" };
-    utils::ty!("*{m} {ty}")
+        "SliceCursor"
+    };
+    let lifetime = lifetime.as_str();
+    utils::ty!("crate::slice_cursor::{cursor}<'{lifetime}, {inner_ty}>")
 }
 
 /// Finds a `BareFn` type nested inside wrappers like `Option<fn(...)>`.
@@ -5018,6 +6757,13 @@ fn hir_unwrap_cast<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
     }
 }
 
+fn hir_expr_starts_with_cast(expr: &hir::Expr<'_>) -> bool {
+    matches!(
+        utils::hir::unwrap_drop_temps(expr).kind,
+        hir::ExprKind::Cast(..)
+    )
+}
+
 fn hir_unwrap_addr_of_deref<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
     if let hir::ExprKind::AddrOf(_, _, e) = utils::hir::unwrap_drop_temps(expr).kind
         && let hir::ExprKind::Unary(UnOp::Deref, e) = utils::hir::unwrap_drop_temps(e).kind
@@ -5083,6 +6829,133 @@ fn expr_snippet(tcx: TyCtxt<'_>, expr: &Expr) -> Option<String> {
         .span_to_snippet(expr.span)
         .ok()
         .map(|snippet| normalize_expr_snippet(&snippet))
+}
+
+fn borrow_target_expr_string(expr: &Expr) -> String {
+    let expr = unwrap_paren(expr);
+    let expr_str = pprust::expr_to_string(expr);
+    match expr.kind {
+        ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => expr_str,
+        _ => format!("({expr_str})"),
+    }
+}
+
+fn add_lifetime_args_to_type_path_string(
+    ty_name: String,
+    existing_lifetime_count: usize,
+    promoted_lifetime_args: &[String],
+) -> String {
+    if promoted_lifetime_args.is_empty() {
+        return ty_name;
+    }
+    let Some(generic_start) = ty_name.find('<') else {
+        return format!("{}<{}>", ty_name, promoted_lifetime_args.join(", "));
+    };
+    let Some(generic_end) = matching_angle_bracket(&ty_name, generic_start) else {
+        return ty_name;
+    };
+
+    let prefix = &ty_name[..generic_start];
+    let suffix = &ty_name[generic_end + 1..];
+    let mut args = split_top_level_generic_args(&ty_name[generic_start + 1..generic_end]);
+    let insert_at = existing_lifetime_count.min(args.len());
+    if generic_args_have_lifetimes(&args, insert_at, promoted_lifetime_args.len()) {
+        return ty_name;
+    }
+    for (offset, lifetime) in promoted_lifetime_args.iter().enumerate() {
+        args.insert(insert_at + offset, lifetime.clone());
+    }
+
+    if args.is_empty() {
+        format!("{prefix}<{}>{suffix}", promoted_lifetime_args.join(", "))
+    } else {
+        format!("{prefix}<{}>{suffix}", args.join(", "))
+    }
+}
+
+fn strip_top_level_generic_args_from_type_path(ty_name: String) -> String {
+    let Some(generic_start) = ty_name.find('<') else {
+        return ty_name;
+    };
+    let Some(generic_end) = matching_angle_bracket(&ty_name, generic_start) else {
+        return ty_name;
+    };
+    format!(
+        "{}{}",
+        &ty_name[..generic_start],
+        &ty_name[generic_end + 1..]
+    )
+}
+
+fn matching_angle_bracket(s: &str, generic_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, ch) in s[generic_start..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(generic_start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_generic_args(args: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut depth = 0isize;
+    let mut start = 0usize;
+    for (index, ch) in args.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let arg = args[start..index].trim();
+                if !arg.is_empty() {
+                    result.push(arg.to_string());
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let arg = args[start..].trim();
+    if !arg.is_empty() {
+        result.push(arg.to_string());
+    }
+    result
+}
+
+fn generic_args_have_lifetimes(args: &[String], start: usize, count: usize) -> bool {
+    args.get(start..start + count)
+        .is_some_and(|args| args.iter().all(|arg| arg.trim_start().starts_with('\'')))
+}
+
+fn path_segment_has_expected_lifetimes(
+    seg: &PathSegment,
+    existing_lifetime_count: usize,
+    promoted_lifetimes: &[Symbol],
+) -> bool {
+    if promoted_lifetimes.is_empty() {
+        return true;
+    }
+    let Some(args) = &seg.args else {
+        return false;
+    };
+    let GenericArgs::AngleBracketed(args) = &**args else {
+        return false;
+    };
+    if args.args.len() < existing_lifetime_count + promoted_lifetimes.len() {
+        return false;
+    }
+    args.args
+        .iter()
+        .skip(existing_lifetime_count)
+        .take(promoted_lifetimes.len())
+        .all(|arg| matches!(arg, AngleBracketedArg::Arg(GenericArg::Lifetime(_))))
 }
 
 fn size_of_type_name_candidates(ty_name: &str) -> Vec<String> {
@@ -5345,6 +7218,22 @@ fn hir_is_literal_one(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
     hir_expr_snippet(tcx, hir_unwrap_casts(expr)).is_some_and(|snippet| snippet == "1")
 }
 
+fn ty_contains_param(ty: ty::Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::TyKind::Param(_) => true,
+        ty::TyKind::Adt(_, args) => args.iter().any(|arg| match arg.kind() {
+            ty::GenericArgKind::Type(ty) => ty_contains_param(ty),
+            _ => false,
+        }),
+        ty::TyKind::RawPtr(inner, _)
+        | ty::TyKind::Ref(_, inner, _)
+        | ty::TyKind::Array(inner, _)
+        | ty::TyKind::Slice(inner) => ty_contains_param(*inner),
+        ty::TyKind::Tuple(elems) => elems.iter().any(ty_contains_param),
+        _ => false,
+    }
+}
+
 fn hir_is_null_ptr_constructor(expr: &hir::Expr<'_>) -> bool {
     let hir::ExprKind::Call(callee, args) = hir_unwrap_casts(expr).kind else {
         return false;
@@ -5380,7 +7269,8 @@ fn hir_supports_scalar_box_allocator_root<'tcx>(
     lhs_inner_ty: ty::Ty<'tcx>,
     rhs: &hir::Expr<'tcx>,
 ) -> bool {
-    let expected_ty_name = mir_ty_to_string(lhs_inner_ty, tcx);
+    let expected_ty_name =
+        (!ty_contains_param(lhs_inner_ty)).then(|| mir_ty_to_string(lhs_inner_ty, tcx));
     let hir::ExprKind::Call(_, args) = hir_unwrap_casts(rhs).kind else {
         return false;
     };
@@ -5390,18 +7280,24 @@ fn hir_supports_scalar_box_allocator_root<'tcx>(
     match (name, args) {
         (name, [bytes]) if name == Symbol::intern("malloc") => {
             hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
-                || hir_is_exact_size_of_expr(tcx, bytes, &expected_ty_name)
+                || expected_ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
         }
         (name, [count, elem_size]) if name == Symbol::intern("calloc") => {
             hir_is_literal_one(tcx, count)
                 && (hir_size_of_call_matches_expected(tcx, elem_size, lhs_inner_ty)
-                    || hir_is_exact_size_of_expr(tcx, elem_size, &expected_ty_name))
+                    || expected_ty_name
+                        .as_ref()
+                        .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, elem_size, ty_name)))
         }
         (name, [ptr, bytes])
             if name == Symbol::intern("realloc") && hir_is_null_like_ptr_arg(tcx, ptr) =>
         {
             hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
-                || hir_is_exact_size_of_expr(tcx, bytes, &expected_ty_name)
+                || expected_ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
         }
         _ => false,
     }
@@ -5972,7 +7868,7 @@ fn downgrade_conflicting_local_struct_call_inputs<'tcx>(
                 {
                     continue;
                 }
-                sig_dec.input_decs[idx] = Some(PtrKind::Raw(true));
+                sig_dec.set_input_dec(idx, Some(PtrKind::Raw(true)));
                 bindings.insert(param_hir_id);
                 changed = true;
             }
@@ -6232,6 +8128,10 @@ fn is_mutable_borrow_like_decision(kind: PtrKind) -> bool {
     )
 }
 
+fn is_borrow_bridgeable_source_decision(kind: PtrKind) -> bool {
+    matches!(kind, PtrKind::Raw(_)) || is_borrow_like_decision(kind)
+}
+
 fn arg_may_mutably_borrow(arg_points_to_mutable: bool, decision: Option<PtrKind>) -> bool {
     decision.is_some_and(is_mutable_borrow_like_decision) || arg_points_to_mutable
 }
@@ -6331,9 +8231,67 @@ fn force_signature_input_raw_for_binding(
     if sig_dec.signature_locked {
         return false;
     }
-    if !matches!(sig_dec.input_decs.get(idx), Some(Some(PtrKind::Raw(_)))) {
-        sig_dec.input_decs[idx] = Some(PtrKind::Raw(true));
+    let raw_mut = unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+        .map(|(_, mutability)| mutability.is_mut())
+        .unwrap_or(true);
+    let decision = match sig_dec.input_decs.get(idx).copied().flatten() {
+        Some(raw @ PtrKind::Raw(_)) => Some(raw),
+        _ => Some(PtrKind::Raw(raw_mut)),
+    };
+    if sig_dec.input_decs.get(idx).copied().flatten() == decision {
+        return false;
     }
+    sig_dec.set_input_dec(idx, decision);
+    true
+}
+
+fn force_signature_input_mut_for_binding(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    hir_id: HirId,
+) -> bool {
+    let Some((did, idx)) = param_index_for_binding(tcx, hir_id) else {
+        return false;
+    };
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    let decision = match sig_dec.input_decs.get(idx).copied().flatten() {
+        Some(PtrKind::Ref(false)) => Some(PtrKind::Ref(true)),
+        Some(PtrKind::OptRef(false)) => Some(PtrKind::OptRef(true)),
+        Some(PtrKind::Raw(false)) => Some(PtrKind::Raw(true)),
+        _ => return false,
+    };
+    sig_dec.set_input_dec(idx, decision);
+    true
+}
+
+fn force_signature_output_raw(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    did: LocalDefId,
+) -> bool {
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    let output_mut = sig_dec
+        .output_dec
+        .map(|kind| kind.is_mut())
+        .or_else(|| {
+            let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+            let ty::TyKind::RawPtr(_, mutability) = sig.output().kind() else {
+                return None;
+            };
+            Some(mutability.is_mut())
+        })
+        .unwrap_or(true);
+    sig_dec.set_output_dec(Some(PtrKind::Raw(output_mut)));
     true
 }
 
@@ -6607,13 +8565,568 @@ fn downgrade_unsupported_box_inputs(
             if local_raw_param_summaries.get(&(*did, idx))
                 != Some(&LocalRawParamSummary::BorrowOnly)
             {
-                sig_dec.input_decs[idx] = Some(PtrKind::Raw(kind.is_mut()));
+                sig_dec.set_input_dec(idx, Some(PtrKind::Raw(kind.is_mut())));
                 bindings.insert(hir_id);
                 changed = true;
             }
         }
     }
     (changed, bindings)
+}
+
+fn downgrade_freed_borrow_outputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
+) -> bool {
+    struct FreedBorrowOutputVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        free_like_wrappers: &'a FxHashSet<LocalDefId>,
+        call_results: FxHashMap<HirId, LocalDefId>,
+        freed_locals: FxHashSet<HirId>,
+        freed_call_results: FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> FreedBorrowOutputVisitor<'_, 'tcx> {
+        fn record_call_result(&mut self, hir_id: HirId, expr: &'tcx hir::Expr<'tcx>) {
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                return;
+            };
+            self.call_results.insert(hir_id, callee_did);
+        }
+
+        fn record_freed_call_result(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
+            let is_wrapper_free = hir_called_local_fn(self.tcx, expr)
+                .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id));
+            if !is_direct_free && !is_wrapper_free {
+                return;
+            }
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                return;
+            };
+            let [arg] = args else { return };
+            if let Some(callee_did) = hir_called_local_fn(self.tcx, hir_unwrap_casts(arg)) {
+                self.freed_call_results.insert(callee_did);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FreedBorrowOutputVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_call_result(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(hir_id) = hir_unwrapped_local_id(lhs)
+            {
+                self.record_call_result(hir_id, rhs);
+            }
+            if let Some((hir_id, _)) =
+                hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
+            {
+                self.freed_locals.insert(hir_id);
+            } else {
+                self.record_freed_call_result(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut callees_to_raw = FxHashSet::default();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = FreedBorrowOutputVisitor {
+            tcx,
+            free_like_wrappers,
+            call_results: FxHashMap::default(),
+            freed_locals: FxHashSet::default(),
+            freed_call_results: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        for freed_local in visitor.freed_locals {
+            if let Some(callee_did) = visitor.call_results.get(&freed_local) {
+                callees_to_raw.insert(*callee_did);
+            }
+        }
+        callees_to_raw.extend(visitor.freed_call_results);
+    }
+
+    let mut changed = false;
+    for callee_did in callees_to_raw {
+        let Some(sig_dec) = sig_decs.data.get_mut(&callee_did) else {
+            continue;
+        };
+        if sig_dec.signature_locked {
+            continue;
+        }
+        let Some(output_kind) = sig_dec.output_dec else {
+            continue;
+        };
+        if !is_borrow_like_decision(output_kind) && !output_kind.is_owning_box_like() {
+            continue;
+        }
+        let output_lifetime = sig_dec.output_lifetime;
+        sig_dec.set_output_dec(Some(PtrKind::Raw(output_kind.is_mut())));
+        if let Some(output_lifetime) = output_lifetime {
+            for idx in 0..sig_dec.input_decs.len() {
+                if sig_dec.input_lifetimes.get(idx).copied().flatten() != Some(output_lifetime) {
+                    continue;
+                }
+                let Some(input_kind) = sig_dec.input_decs[idx] else {
+                    continue;
+                };
+                if is_borrow_like_decision(input_kind) {
+                    sig_dec.set_input_dec(idx, Some(PtrKind::Raw(input_kind.is_mut())));
+                }
+            }
+        } else if output_kind.is_owning_box_like() {
+            for idx in 0..sig_dec.input_decs.len() {
+                let Some(input_kind) = sig_dec.input_decs[idx] else {
+                    continue;
+                };
+                sig_dec.set_input_dec(idx, Some(PtrKind::Raw(input_kind.is_mut())));
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn downgrade_raw_cast_call_inputs(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> bool {
+    struct RawCastCallVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        changed: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawCastCallVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let hir::ExprKind::Call(_, args) = expr.kind else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let typeck = self.tcx.typeck(expr.hir_id.owner);
+            let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            if sig_dec.signature_locked {
+                intravisit::walk_expr(self, expr);
+                return;
+            }
+            for (idx, arg) in args.iter().enumerate() {
+                let Some((_, mutability)) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(arg))
+                else {
+                    continue;
+                };
+                let Some(source_hir_id) = hir_casted_pointer_local_source(self.tcx, typeck, arg)
+                else {
+                    continue;
+                };
+                let input_dec = sig_dec.input_decs.get(idx).copied().flatten();
+                if input_dec.is_some_and(is_borrow_like_decision)
+                    && self
+                        .ptr_kinds
+                        .get(&source_hir_id)
+                        .copied()
+                        .is_some_and(is_borrow_bridgeable_source_decision)
+                {
+                    continue;
+                }
+                let raw = PtrKind::Raw(mutability.is_mut());
+                if sig_dec.input_decs.get(idx).copied().flatten() != Some(raw) {
+                    sig_dec.set_input_dec(idx, Some(raw));
+                    self.changed = true;
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut changed = false;
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = RawCastCallVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            changed: false,
+        };
+        visitor.visit_body(body);
+        changed |= visitor.changed;
+    }
+    changed
+}
+
+fn downgrade_cursor_inputs_from_unanchored_raw_callers(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> bool {
+    let raw_origin_locals = collect_unanchored_raw_pointer_locals(tcx, sig_decs, ptr_kinds);
+
+    struct CursorInputVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a mut SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        raw_origin_locals: &'a FxHashSet<HirId>,
+        changed: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for CursorInputVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let hir::ExprKind::Call(_, args) = hir_unwrap_casts(expr).kind else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                intravisit::walk_expr(self, expr);
+                return;
+            };
+
+            let updates = {
+                let Some(sig_dec) = self.sig_decs.data.get(&callee_did) else {
+                    intravisit::walk_expr(self, expr);
+                    return;
+                };
+                if sig_dec.signature_locked {
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                args.iter()
+                    .enumerate()
+                    .filter_map(|(idx, arg)| {
+                        let Some(PtrKind::SliceCursor(m)) =
+                            sig_dec.input_decs.get(idx).copied().flatten()
+                        else {
+                            return None;
+                        };
+                        if !callee_input_has_syntactic_negative_offset(self.tcx, callee_did, idx) {
+                            return None;
+                        }
+                        hir_expr_is_unanchored_raw_pointer_arg(
+                            self.tcx,
+                            self.sig_decs,
+                            self.ptr_kinds,
+                            self.raw_origin_locals,
+                            arg,
+                        )
+                        .then_some((idx, m))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            if !updates.is_empty()
+                && let Some(sig_dec) = self.sig_decs.data.get_mut(&callee_did)
+            {
+                for (idx, m) in updates {
+                    if matches!(
+                        sig_dec.input_decs.get(idx).copied().flatten(),
+                        Some(PtrKind::SliceCursor(_))
+                    ) {
+                        sig_dec.set_input_dec(idx, Some(PtrKind::Raw(m)));
+                        self.changed = true;
+                    }
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut changed = false;
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = CursorInputVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            raw_origin_locals: &raw_origin_locals,
+            changed: false,
+        };
+        visitor.visit_body(body);
+        changed |= visitor.changed;
+    }
+    changed
+}
+
+fn callee_input_has_syntactic_negative_offset(
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    idx: usize,
+) -> bool {
+    let Some(param_hir_id) = callee_input_param_binding(tcx, did, idx) else {
+        return false;
+    };
+
+    struct NegativeOffsetVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        param_hir_id: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for NegativeOffsetVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if let hir::ExprKind::MethodCall(seg, receiver, args, _) = expr.kind
+                && hir_unwrapped_local_id(receiver) == Some(self.param_hir_id)
+                && match seg.ident.name.as_str() {
+                    "sub" | "wrapping_sub" => true,
+                    "offset" | "wrapping_offset" => args
+                        .first()
+                        .is_some_and(|arg| hir_expr_is_syntactically_negative(self.tcx, arg)),
+                    _ => false,
+                }
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return false;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return false;
+    };
+    let mut visitor = NegativeOffsetVisitor {
+        tcx,
+        param_hir_id,
+        found: false,
+    };
+    visitor.visit_body(tcx.hir_body(body));
+    visitor.found
+}
+
+fn hir_expr_is_syntactically_negative(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    if matches!(
+        hir_unwrap_casts(expr).kind,
+        hir::ExprKind::Unary(hir::UnOp::Neg, _)
+    ) {
+        return true;
+    }
+    tcx.sess
+        .source_map()
+        .span_to_snippet(expr.span)
+        .ok()
+        .is_some_and(|snippet| snippet.trim_start().starts_with('-'))
+}
+
+fn collect_unanchored_raw_pointer_locals(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<HirId> {
+    struct RawOriginVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        locals: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> RawOriginVisitor<'_, 'tcx> {
+        fn record_assignment(&mut self, lhs: &'tcx hir::Expr<'tcx>, rhs: &'tcx hir::Expr<'tcx>) {
+            let Some(hir_id) = hir_unwrapped_local_id(lhs) else {
+                return;
+            };
+            if !tcx_node_ty_is_raw_ptr(self.tcx, hir_id) {
+                return;
+            }
+            if hir_expr_is_unanchored_raw_pointer_source(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+            ) {
+                self.locals.insert(hir_id);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawOriginVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+                && tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
+                && hir_expr_is_unanchored_raw_pointer_source(
+                    self.tcx,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    init,
+                )
+            {
+                self.locals.insert(hir_id);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                self.record_assignment(lhs, rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = RawOriginVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        locals: FxHashSet::default(),
+    };
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        visitor.visit_body(tcx.hir_body(body));
+    }
+    visitor.locals
+}
+
+fn hir_expr_is_unanchored_raw_pointer_arg(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    raw_origin_locals: &FxHashSet<HirId>,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    if hir_expr_uses_non_pointer_local(tcx, expr) {
+        return false;
+    }
+    if let Some(hir_id) = hir_unwrapped_local_id(expr)
+        && raw_origin_locals.contains(&hir_id)
+    {
+        return true;
+    }
+    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, expr)
+}
+
+fn hir_expr_is_unanchored_raw_pointer_source(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    if !hir_expr_ty_is_raw_ptr(tcx, expr) {
+        return false;
+    }
+
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            let Res::Local(hir_id) = path.res else {
+                return true;
+            };
+            let kind = ptr_kinds.get(&hir_id).copied().or_else(|| {
+                unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+                    .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
+            });
+            !kind.is_some_and(is_cursor_anchor_decision)
+        }
+        hir::ExprKind::Call(..) => hir_callee_output_kind(tcx, sig_decs, ptr_kinds, expr)
+            .is_none_or(|kind| !is_cursor_anchor_decision(kind)),
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
+            "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" => {
+                hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
+            }
+            "as_ptr" | "as_mut_ptr" => {
+                if hir_expr_ty_is_raw_ptr(tcx, receiver) {
+                    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        },
+        hir::ExprKind::AddrOf(_, _, pointee) => !hir_expr_ty_is_slice_or_array(tcx, pointee),
+        _ => true,
+    }
+}
+
+fn is_cursor_anchor_decision(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Slice(_) | PtrKind::SliceCursor(_) | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice
+    )
+}
+
+fn hir_expr_ty_is_raw_ptr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr)).is_some()
+}
+
+fn tcx_node_ty_is_raw_ptr(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id)).is_some()
+}
+
+fn hir_expr_uses_non_pointer_local(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    hir_local_ids_in_expr(expr)
+        .into_iter()
+        .any(|hir_id| !tcx_node_ty_is_raw_ptr(tcx, hir_id))
+}
+
+fn hir_expr_ty_is_slice_or_array(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    match tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr).kind() {
+        ty::TyKind::Array(..) | ty::TyKind::Slice(..) => true,
+        ty::TyKind::Ref(_, inner, _) => {
+            matches!(inner.kind(), ty::TyKind::Array(..) | ty::TyKind::Slice(..))
+        }
+        _ => false,
+    }
 }
 
 fn downgrade_unsupported_box_outputs<'tcx>(
@@ -6650,7 +9163,7 @@ fn downgrade_unsupported_box_outputs<'tcx>(
     let changed = !to_raw.is_empty();
     for did in to_raw {
         if let Some(sig_dec) = sig_decs.data.get_mut(&did) {
-            sig_dec.output_dec = Some(PtrKind::Raw(true));
+            sig_dec.set_output_dec(Some(PtrKind::Raw(true)));
         }
     }
     changed
@@ -6914,6 +9427,18 @@ fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
     Some(hir_id)
 }
 
+fn hir_path_source_kind(
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    expr: &hir::Expr<'_>,
+) -> Option<PtrKind> {
+    let hir_id = hir_unwrapped_local_id(expr)?;
+    ptr_kinds.get(&hir_id).copied().or_else(|| {
+        unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+            .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
+    })
+}
+
 fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
     struct LocalUseVisitor {
         locals: Vec<HirId>,
@@ -7166,7 +9691,7 @@ fn hir_wrapper_scalar_dag_status<'tcx>(
                 return WrapperScalarDagStatus::Rejected;
             }
             let mut status = hir_wrapper_scalar_dag_status(ctx, receiver, visiting, depth + 1);
-            for arg in args {
+            for arg in args.iter() {
                 status = combine_wrapper_scalar_dag_status(
                     status,
                     hir_wrapper_scalar_dag_status(ctx, arg, visiting, depth + 1),
@@ -7210,6 +9735,30 @@ fn ty_supports_raw_bridge_default_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>
     }
 }
 
+fn ty_supports_scalar_box_from_raw_bridge(ty: ty::Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+    )
+}
+
+fn scalar_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str) -> Expr {
+    utils::expr!(
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(Box::from_raw((__crat_raw_free) as *mut {})); }} }}",
+        arg_str,
+        inner_ty_str,
+    )
+}
+
+fn array_box_from_raw_free_expr(arg_str: &str, inner_ty_str: &str, len_expr: &str) -> Expr {
+    utils::expr!(
+        "{{ let __crat_raw_free = {}; if !(__crat_raw_free).is_null() {{ drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut((__crat_raw_free) as *mut {}, ({}) as usize))); }} }}",
+        arg_str,
+        inner_ty_str,
+        len_expr,
+    )
+}
+
 fn fieldless_enum_zero_variant<'tcx>(
     tcx: TyCtxt<'tcx>,
     adt_def: ty::AdtDef<'tcx>,
@@ -7235,6 +9784,9 @@ fn raw_array_len_expr_from_bytes<'tcx>(
     bytes: &hir::Expr<'_>,
 ) -> Option<String> {
     let bytes = hir_expr_verbatim_snippet(tcx, hir_unwrap_casts(bytes))?;
+    if ty_contains_param(lhs_inner_ty) {
+        return None;
+    }
     let ty = mir_ty_to_string(lhs_inner_ty, tcx);
     Some(format!(
         "((({bytes}) as usize) / std::mem::size_of::<{ty}>())"
@@ -7262,10 +9814,14 @@ fn raw_bridge_info_from_call<'tcx>(
     if !ty_supports_raw_bridge_default_expr(tcx, lhs_inner_ty) {
         return None;
     }
-    let ty_name = mir_ty_to_string(lhs_inner_ty, tcx);
+    let ty_name = (!ty_contains_param(lhs_inner_ty)).then(|| mir_ty_to_string(lhs_inner_ty, tcx));
     match (name, args) {
         (name, [bytes]) if name == Symbol::intern("malloc") => {
-            if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
+            if hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
+                || ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
+            {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(bytes) {
                 None
@@ -7275,12 +9831,18 @@ fn raw_bridge_info_from_call<'tcx>(
             }
         }
         (name, [count, elem_size]) if name == Symbol::intern("calloc") => {
-            if hir_is_literal_one(tcx, count) && hir_is_exact_size_of_expr(tcx, elem_size, &ty_name)
+            if hir_is_literal_one(tcx, count)
+                && (hir_size_of_call_matches_expected(tcx, elem_size, lhs_inner_ty)
+                    || ty_name
+                        .as_ref()
+                        .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, elem_size, ty_name)))
             {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(count) || scalar_arg_rejected(elem_size) {
                 None
-            } else if hir_is_exact_size_of_expr(tcx, count, &ty_name)
+            } else if ty_name
+                .as_ref()
+                .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, count, ty_name))
                 || (byte_sized_elem && hir_is_exact_c_char_size_of_expr(tcx, count))
             {
                 if byte_sized_elem {
@@ -7299,7 +9861,11 @@ fn raw_bridge_info_from_call<'tcx>(
         (name, [ptr, bytes])
             if name == Symbol::intern("realloc") && hir_is_null_like_ptr_arg(tcx, ptr) =>
         {
-            if hir_is_exact_size_of_expr(tcx, bytes, &ty_name) {
+            if hir_size_of_call_matches_expected(tcx, bytes, lhs_inner_ty)
+                || ty_name
+                    .as_ref()
+                    .is_some_and(|ty_name| hir_is_exact_size_of_expr(tcx, bytes, ty_name))
+            {
                 Some(RawBridgeInfo::Scalar)
             } else if scalar_arg_rejected(bytes) {
                 None
@@ -8249,6 +10815,125 @@ fn collect_local_raw_param_summaries(
     summaries
 }
 
+fn collect_raw_scalar_bridge_fields(
+    tcx: TyCtxt<'_>,
+    alloc_wrappers: &FxHashMap<LocalDefId, AllocWrapperInfo>,
+) -> FxHashSet<StructFieldSlot> {
+    #[derive(Default)]
+    struct State {
+        saw_scalar: bool,
+        disqualified: bool,
+    }
+
+    struct RawScalarFieldBridgeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+        alloc_wrappers: &'a FxHashMap<LocalDefId, AllocWrapperInfo>,
+        states: &'a mut FxHashMap<StructFieldSlot, State>,
+        local_bridges: FxHashMap<HirId, RawBridgeInfo>,
+    }
+
+    impl<'tcx> RawScalarFieldBridgeVisitor<'_, 'tcx> {
+        fn raw_bridge_info_for_rhs(
+            &self,
+            lhs_inner_ty: ty::Ty<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) -> Option<RawBridgeInfo> {
+            if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+                return None;
+            }
+            if hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                return None;
+            }
+
+            hir_raw_bridge_info(self.tcx, lhs_inner_ty, rhs, Some(self.alloc_wrappers), None)
+        }
+
+        fn record_local_assignment(&mut self, lhs_hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            let lhs_ty = self.typeck.node_type(lhs_hir_id);
+            let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                self.local_bridges.remove(&lhs_hir_id);
+                return;
+            };
+            if let Some(info) = self.raw_bridge_info_for_rhs(lhs_inner_ty, rhs) {
+                self.local_bridges.insert(lhs_hir_id, info);
+            } else if !hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                self.local_bridges.remove(&lhs_hir_id);
+            }
+        }
+
+        fn record_field_assignment(
+            &mut self,
+            lhs: &'tcx hir::Expr<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            let Some(field) = hir_struct_field_slot(self.tcx, lhs) else {
+                return;
+            };
+            let lhs_ty = self.typeck.expr_ty_adjusted(lhs);
+            let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                return;
+            };
+            if !ty_supports_scalar_box_from_raw_bridge(lhs_inner_ty) {
+                return;
+            }
+            if hir_is_null_like_ptr_arg(self.tcx, rhs) {
+                return;
+            }
+
+            let info = self.raw_bridge_info_for_rhs(lhs_inner_ty, rhs).or_else(|| {
+                hir_unwrapped_local_id(rhs)
+                    .and_then(|hir_id| self.local_bridges.get(&hir_id).cloned())
+            });
+            let state = self.states.entry(field).or_default();
+            match info {
+                Some(RawBridgeInfo::Scalar) => state.saw_scalar = true,
+                Some(RawBridgeInfo::Array { .. }) | None => state.disqualified = true,
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawScalarFieldBridgeVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_local_assignment(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                if let Some(lhs_hir_id) = hir_unwrapped_local_id(lhs) {
+                    self.record_local_assignment(lhs_hir_id, rhs);
+                } else {
+                    self.record_field_assignment(lhs, rhs);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut states = FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = RawScalarFieldBridgeVisitor {
+            tcx,
+            typeck,
+            alloc_wrappers,
+            states: &mut states,
+            local_bridges: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+    });
+
+    states
+        .into_iter()
+        .filter_map(|(field, state)| (state.saw_scalar && !state.disqualified).then_some(field))
+        .collect()
+}
+
 fn collect_raw_bridge_bindings(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
@@ -8626,6 +11311,36 @@ fn collect_raw_local_assignment_bindings(
     }
 
     impl<'tcx> Visitor<'tcx> for RawLocalBindingVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+                && self.tcx.typeck(hir_id.owner).node_type(hir_id).is_raw_ptr()
+                && let Some(rhs_hir_id) =
+                    hir_casted_pointer_local_source(self.tcx, self.tcx.typeck(hir_id.owner), init)
+            {
+                if self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .copied()
+                    .is_some_and(is_borrow_like_decision)
+                    && self
+                        .ptr_kinds
+                        .get(&rhs_hir_id)
+                        .copied()
+                        .is_some_and(is_borrow_bridgeable_source_decision)
+                {
+                    intravisit::walk_stmt(self, stmt);
+                    return;
+                }
+                self.bindings.insert(hir_id);
+                if raw_pointer_binding_is_const(self.tcx, rhs_hir_id) {
+                    self.bindings.insert(rhs_hir_id);
+                }
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
                 && let hir::ExprKind::Path(hir::QPath::Resolved(_, lhs_path)) = lhs.kind
@@ -8668,6 +11383,33 @@ fn collect_raw_local_assignment_bindings(
         bindings.extend(visitor.bindings);
     }
     bindings
+}
+
+fn hir_casted_pointer_local_source<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &hir::Expr<'tcx>,
+) -> Option<HirId> {
+    match expr.kind {
+        hir::ExprKind::Cast(inner, _) | hir::ExprKind::DropTemps(inner) => {
+            if let Some(hir_id) = hir_unwrapped_local_id(inner)
+                && let Some((source_inner_ty, _)) =
+                    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+                && let Some((target_inner_ty, _)) =
+                    unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(expr))
+                && source_inner_ty == target_inner_ty
+            {
+                return Some(hir_id);
+            }
+            hir_casted_pointer_local_source(tcx, typeck, inner)
+        }
+        _ => None,
+    }
+}
+
+fn raw_pointer_binding_is_const(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+        .is_some_and(|(_, mutability)| !mutability.is_mut())
 }
 
 fn hir_deref_addr_of_local(expr: &hir::Expr<'_>) -> Option<HirId> {
@@ -8992,6 +11734,2044 @@ fn collect_unsupported_box_usage_bindings(
     bindings
 }
 
+fn collect_owned_field_free_owner_bindings(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
+) -> FxHashSet<HirId> {
+    struct OwnedFieldFreeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        analysis: &'a Analysis,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        free_like_wrappers: &'a FxHashSet<LocalDefId>,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for OwnedFieldFreeVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
+            let is_wrapper_free = hir_called_local_fn(self.tcx, expr)
+                .is_some_and(|def_id| self.free_like_wrappers.contains(&def_id));
+            if (is_direct_free || is_wrapper_free)
+                && let hir::ExprKind::Call(_, args) = expr.kind
+                && let [arg] = args
+            {
+                let field_expr = hir_unwrap_casts(arg);
+                if let Some(field) = hir_struct_field_slot(self.tcx, field_expr)
+                    && ownership_field_ptr_kind(
+                        self.tcx,
+                        self.analysis,
+                        self.sig_decs,
+                        self.ptr_kinds,
+                        field,
+                    ) == Some(PtrKind::OptBox)
+                    && let Some(root) = hir_projection_root_local_id(field_expr)
+                {
+                    self.bindings.insert(root);
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        let mut visitor = OwnedFieldFreeVisitor {
+            tcx,
+            analysis,
+            sig_decs,
+            ptr_kinds,
+            free_like_wrappers,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        bindings.extend(visitor.bindings);
+    });
+    bindings
+}
+
+fn collect_demoted_promoted_fields(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<StructFieldSlot> {
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+    if promoted_fields.is_empty() {
+        return FxHashSet::default();
+    }
+    let mut demoted_fields = collect_struct_shape_demoted_fields(
+        tcx,
+        &promoted_fields,
+        &analysis.borrow_promotion_result.mutable_fields,
+        &analysis.struct_copy_result,
+        sig_decs,
+        ptr_kinds,
+    );
+    demoted_fields.extend(
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds)
+            .keys()
+            .copied(),
+    );
+
+    demoted_fields
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ConflictDemotionReason {
+    ActiveBorrowOverlap,
+    LocalAssignmentWhileBorrowed,
+    ConflictingReborrow,
+    MutableFieldCopy,
+    RawPointeeFieldMove,
+    RawFieldPointerProjection,
+    RawStorageAllocator,
+    RawStoragePointer,
+    RawBindingFromField,
+    RawLocalCallArg,
+    RawUnknownCallArg,
+}
+
+impl ConflictDemotionReason {
+    const ALL: [Self; 11] = [
+        Self::ActiveBorrowOverlap,
+        Self::LocalAssignmentWhileBorrowed,
+        Self::ConflictingReborrow,
+        Self::MutableFieldCopy,
+        Self::RawPointeeFieldMove,
+        Self::RawFieldPointerProjection,
+        Self::RawStorageAllocator,
+        Self::RawStoragePointer,
+        Self::RawBindingFromField,
+        Self::RawLocalCallArg,
+        Self::RawUnknownCallArg,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ActiveBorrowOverlap => "active_borrow_overlap",
+            Self::LocalAssignmentWhileBorrowed => "local_assignment_while_borrowed",
+            Self::ConflictingReborrow => "conflicting_reborrow",
+            Self::MutableFieldCopy => "mutable_field_copy",
+            Self::RawPointeeFieldMove => "raw_pointee_field_move",
+            Self::RawFieldPointerProjection => "raw_field_pointer_projection",
+            Self::RawStorageAllocator => "raw_storage_allocator",
+            Self::RawStoragePointer => "raw_storage_pointer",
+            Self::RawBindingFromField => "raw_binding_from_field",
+            Self::RawLocalCallArg => "raw_local_call_arg",
+            Self::RawUnknownCallArg => "raw_unknown_call_arg",
+        }
+    }
+}
+
+fn collect_field_conflict_demotion_reasons(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>> {
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+    if promoted_fields.is_empty() {
+        return FxHashMap::default();
+    }
+
+    struct FieldBorrowConflictVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        promoted_fields: &'a FxHashSet<StructFieldSlot>,
+        mutable_fields: &'a FxHashSet<StructFieldSlot>,
+        allocator_locals: FxHashSet<HirId>,
+        active_borrows: FxHashMap<HirId, FxHashMap<StructFieldSlot, bool>>,
+        ignored_borrow_exprs: FxHashSet<HirId>,
+        conflict_reasons: FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>>,
+    }
+
+    impl<'tcx> FieldBorrowConflictVisitor<'_, 'tcx> {
+        fn record_conflict(&mut self, field: StructFieldSlot, reason: ConflictDemotionReason) {
+            if self.promoted_fields.contains(&field) {
+                self.conflict_reasons
+                    .entry(field)
+                    .or_default()
+                    .insert(reason);
+            }
+        }
+
+        fn record_conflicts(
+            &mut self,
+            fields: impl IntoIterator<Item = StructFieldSlot>,
+            reason: ConflictDemotionReason,
+        ) {
+            for field in fields {
+                self.record_conflict(field, reason);
+            }
+        }
+
+        fn record_field_borrow(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
+            if !self.promoted_fields.contains(&field) {
+                return;
+            }
+            let Some((local, new_mut)) = hir_raw_addr_local(rhs) else {
+                return;
+            };
+            self.ignored_borrow_exprs.insert(rhs.hir_id);
+            let conflicting_fields = {
+                let fields = self.active_borrows.entry(local).or_default();
+                let has_conflict = !fields.is_empty()
+                    && (new_mut || fields.values().any(|existing_mut| *existing_mut));
+                let conflicting_fields = if has_conflict {
+                    fields.keys().copied().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                fields.insert(field, new_mut);
+                conflicting_fields
+            };
+            if !conflicting_fields.is_empty() {
+                self.record_conflicts(
+                    conflicting_fields,
+                    ConflictDemotionReason::ActiveBorrowOverlap,
+                );
+                self.record_conflict(field, ConflictDemotionReason::ActiveBorrowOverlap);
+            }
+        }
+
+        fn record_local_assignment(&mut self, lhs: &'tcx hir::Expr<'tcx>) {
+            let Some(local) = hir_unwrapped_local_id(lhs) else {
+                return;
+            };
+            if let Some(fields) = self.active_borrows.get(&local) {
+                self.record_conflicts(
+                    fields.keys().copied().collect::<Vec<_>>(),
+                    ConflictDemotionReason::LocalAssignmentWhileBorrowed,
+                );
+            }
+        }
+
+        fn record_conflicting_reborrow(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            if self.ignored_borrow_exprs.contains(&expr.hir_id) {
+                return;
+            }
+            let Some((local, new_mut)) = hir_addr_local(expr) else {
+                return;
+            };
+            if let Some(fields) = self.active_borrows.get(&local)
+                && (new_mut || fields.values().any(|existing_mut| *existing_mut))
+            {
+                self.record_conflicts(
+                    fields.keys().copied().collect::<Vec<_>>(),
+                    ConflictDemotionReason::ConflictingReborrow,
+                );
+            }
+        }
+
+        fn clear_field_borrow(&mut self, field: StructFieldSlot) {
+            for fields in self.active_borrows.values_mut() {
+                fields.remove(&field);
+            }
+        }
+
+        fn record_mutable_field_copy_to_slot(
+            &mut self,
+            lhs_field: StructFieldSlot,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            if !self.promoted_fields.contains(&lhs_field) {
+                return;
+            }
+            let Some(rhs_field) = hir_struct_field_slot(self.tcx, rhs) else {
+                return;
+            };
+            if !self.mutable_fields.contains(&rhs_field) {
+                return;
+            }
+            self.record_conflict(lhs_field, ConflictDemotionReason::MutableFieldCopy);
+            self.record_conflict(rhs_field, ConflictDemotionReason::MutableFieldCopy);
+        }
+
+        fn promoted_field_slots_in_expr(
+            &self,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) -> FxHashSet<StructFieldSlot> {
+            struct FieldUseVisitor<'a, 'tcx> {
+                tcx: TyCtxt<'tcx>,
+                promoted_fields: &'a FxHashSet<StructFieldSlot>,
+                fields: FxHashSet<StructFieldSlot>,
+            }
+
+            impl<'tcx> Visitor<'tcx> for FieldUseVisitor<'_, 'tcx> {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, expr)
+                        && self.promoted_fields.contains(&field)
+                    {
+                        self.fields.insert(field);
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut visitor = FieldUseVisitor {
+                tcx: self.tcx,
+                promoted_fields: self.promoted_fields,
+                fields: FxHashSet::default(),
+            };
+            visitor.visit_expr(expr);
+            visitor.fields
+        }
+
+        fn record_promoted_fields_in_expr(
+            &mut self,
+            expr: &'tcx hir::Expr<'tcx>,
+            reason: ConflictDemotionReason,
+        ) {
+            self.record_conflicts(self.promoted_field_slots_in_expr(expr), reason);
+        }
+
+        fn record_moved_mutable_fields_from_raw_pointee_arg(
+            &mut self,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) {
+            struct RawPointeeFieldMoveVisitor<'a, 'tcx> {
+                tcx: TyCtxt<'tcx>,
+                typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+                promoted_fields: &'a FxHashSet<StructFieldSlot>,
+                mutable_fields: &'a FxHashSet<StructFieldSlot>,
+                fields: FxHashSet<StructFieldSlot>,
+            }
+
+            impl<'tcx> RawPointeeFieldMoveVisitor<'_, 'tcx> {
+                fn expr_contains_raw_deref(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+                    struct RawDerefVisitor<'a, 'tcx> {
+                        typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+                        found: bool,
+                    }
+
+                    impl<'tcx> Visitor<'tcx> for RawDerefVisitor<'_, 'tcx> {
+                        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                            if self.found {
+                                return;
+                            }
+                            if let hir::ExprKind::Unary(hir::UnOp::Deref, inner) = expr.kind
+                                && self.typeck.expr_ty(inner).is_raw_ptr()
+                            {
+                                self.found = true;
+                                return;
+                            }
+                            intravisit::walk_expr(self, expr);
+                        }
+                    }
+
+                    let mut visitor = RawDerefVisitor {
+                        typeck: self.typeck,
+                        found: false,
+                    };
+                    visitor.visit_expr(expr);
+                    visitor.found
+                }
+            }
+
+            impl<'tcx> Visitor<'tcx> for RawPointeeFieldMoveVisitor<'_, 'tcx> {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, expr)
+                        && self.promoted_fields.contains(&field)
+                        && self.mutable_fields.contains(&field)
+                        && let hir::ExprKind::Field(base, _) = expr.kind
+                        && self.expr_contains_raw_deref(base)
+                    {
+                        self.fields.insert(field);
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut visitor = RawPointeeFieldMoveVisitor {
+                tcx: self.tcx,
+                typeck: self.typeck,
+                promoted_fields: self.promoted_fields,
+                mutable_fields: self.mutable_fields,
+                fields: FxHashSet::default(),
+            };
+            visitor.visit_expr(expr);
+            self.record_conflicts(visitor.fields, ConflictDemotionReason::RawPointeeFieldMove);
+        }
+
+        fn expr_contains_allocator_call(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            struct AllocCallVisitor {
+                found: bool,
+            }
+
+            impl<'tcx> Visitor<'tcx> for AllocCallVisitor {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    if self.found {
+                        return;
+                    }
+                    if matches!(
+                        hir_call_name(expr),
+                        Some(name)
+                            if name == Symbol::intern("malloc")
+                                || name == Symbol::intern("calloc")
+                                || name == Symbol::intern("realloc")
+                    ) {
+                        self.found = true;
+                        return;
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut visitor = AllocCallVisitor { found: false };
+            visitor.visit_expr(expr);
+            visitor.found
+        }
+
+        fn expr_is_null_constructor(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            matches!(
+                hir_call_name(expr),
+                Some(name)
+                    if name == Symbol::intern("null") || name == Symbol::intern("null_mut")
+            )
+        }
+
+        fn expr_is_allocator_root_source(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            self.expr_contains_allocator_call(expr)
+                || hir_unwrapped_local_id(expr)
+                    .is_some_and(|hir_id| self.allocator_locals.contains(&hir_id))
+        }
+
+        fn raw_field_storage_reason(
+            &self,
+            field: StructFieldSlot,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) -> Option<ConflictDemotionReason> {
+            if self.expr_is_null_constructor(expr) || hir_raw_addr_local(expr).is_some() {
+                return None;
+            }
+            if self.expr_is_allocator_root_source(expr) {
+                return Some(ConflictDemotionReason::RawStorageAllocator);
+            }
+            if self.raw_storage_source_loses_mutability(field, expr) {
+                return Some(ConflictDemotionReason::RawStoragePointer);
+            }
+            None
+        }
+
+        fn raw_storage_source_loses_mutability(
+            &self,
+            field: StructFieldSlot,
+            expr: &'tcx hir::Expr<'tcx>,
+        ) -> bool {
+            if !self.mutable_fields.contains(&field) {
+                return false;
+            }
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_cast(expr).kind
+                && let Res::Local(hir_id) = path.res
+            {
+                return matches!(
+                    self.ptr_kinds.get(&hir_id),
+                    Some(
+                        PtrKind::Ref(false)
+                            | PtrKind::OptRef(false)
+                            | PtrKind::Slice(false)
+                            | PtrKind::SliceCursor(false)
+                    )
+                );
+            }
+            if let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
+                && let Some(sig_dec) = self.sig_decs.data.get(&callee_did)
+            {
+                return matches!(
+                    sig_dec.output_dec,
+                    Some(
+                        PtrKind::Ref(false)
+                            | PtrKind::OptRef(false)
+                            | PtrKind::Slice(false)
+                            | PtrKind::SliceCursor(false)
+                    )
+                );
+            }
+            false
+        }
+
+        fn record_allocator_binding(&mut self, hir_id: HirId, expr: &'tcx hir::Expr<'tcx>) {
+            if self.expr_contains_allocator_call(expr)
+                || hir_unwrapped_local_id(expr)
+                    .is_some_and(|rhs_id| self.allocator_locals.contains(&rhs_id))
+            {
+                self.allocator_locals.insert(hir_id);
+            }
+        }
+
+        fn record_raw_field_storage(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
+            if let Some(reason) = self.raw_field_storage_reason(field, rhs) {
+                self.record_conflict(field, reason);
+            }
+        }
+
+        fn record_raw_field_binding(&mut self, binding_hir_id: HirId, init: &'tcx hir::Expr<'tcx>) {
+            self.record_allocator_binding(binding_hir_id, init);
+            if unwrap_ptr_from_mir_ty(self.typeck.node_type(binding_hir_id)).is_none() {
+                return;
+            }
+            self.record_promoted_fields_in_expr(init, ConflictDemotionReason::RawBindingFromField);
+        }
+
+        fn record_raw_field_call(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let hir::ExprKind::Call(_, args) = hir_unwrap_casts(expr).kind else {
+                return;
+            };
+            for arg in args.iter() {
+                self.record_moved_mutable_fields_from_raw_pointee_arg(arg);
+            }
+        }
+
+        fn record_raw_field_pointer_projection(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let hir::ExprKind::MethodCall(seg, receiver, _, _) = expr.kind else {
+                return;
+            };
+            if !matches!(seg.ident.name.as_str(), "wrapping_offset" | "sub") {
+                return;
+            }
+            self.record_promoted_fields_in_expr(
+                receiver,
+                ConflictDemotionReason::RawFieldPointerProjection,
+            );
+        }
+
+        fn record_mutable_field_copy(
+            &mut self,
+            lhs: &'tcx hir::Expr<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            let Some(lhs_field) = hir_struct_field_slot(self.tcx, lhs) else {
+                return;
+            };
+            self.record_mutable_field_copy_to_slot(lhs_field, rhs);
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBorrowConflictVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_raw_field_binding(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.record_conflicting_reborrow(expr);
+            self.record_raw_field_pointer_projection(expr);
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let field_slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                self.record_mutable_field_copy_to_slot(field_slot, field.expr);
+                                self.record_field_borrow(field_slot, field.expr);
+                                self.record_raw_field_storage(field_slot, field.expr);
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(lhs_hir_id) = hir_unwrapped_local_id(lhs) {
+                        self.record_allocator_binding(lhs_hir_id, rhs);
+                    }
+                    self.record_mutable_field_copy(lhs, rhs);
+                    self.record_local_assignment(lhs);
+                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs) {
+                        self.clear_field_borrow(field);
+                        self.record_field_borrow(field, rhs);
+                        self.record_raw_field_storage(field, rhs);
+                    }
+                }
+                hir::ExprKind::AssignOp(_, lhs, _) => {
+                    self.record_local_assignment(lhs);
+                }
+                hir::ExprKind::Call(_, _) => self.record_raw_field_call(expr),
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut conflict_reasons: FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>> =
+        FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = FieldBorrowConflictVisitor {
+            tcx,
+            typeck,
+            sig_decs,
+            ptr_kinds,
+            promoted_fields: &promoted_fields,
+            mutable_fields: &analysis.borrow_promotion_result.mutable_fields,
+            allocator_locals: FxHashSet::default(),
+            active_borrows: FxHashMap::default(),
+            ignored_borrow_exprs: FxHashSet::default(),
+            conflict_reasons: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        for (field, reasons) in visitor.conflict_reasons {
+            conflict_reasons.entry(field).or_default().extend(reasons);
+        }
+    });
+
+    conflict_reasons
+}
+
+fn for_each_hir_fn_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut f: impl FnMut(&'tcx hir::Body<'tcx>, &'tcx rustc_middle::ty::TypeckResults<'tcx>),
+) {
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let body_id = match owner.node() {
+            hir::OwnerNode::Item(item) => match item.kind {
+                hir::ItemKind::Fn { body, .. } => body,
+                _ => continue,
+            },
+            hir::OwnerNode::ImplItem(item) => match item.kind {
+                hir::ImplItemKind::Fn(_, body) => body,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let body = tcx.hir_body(body_id);
+        f(body, tcx.typeck_body(body.id()));
+    }
+}
+
+fn collect_raw_field_source_bindings(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+) -> (FxHashSet<HirId>, FxHashSet<LocalDefId>) {
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+
+    struct DemotedFieldSourceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        analysis: &'a Analysis,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        promoted_fields: &'a FxHashSet<StructFieldSlot>,
+        demoted_fields: &'a FxHashSet<StructFieldSlot>,
+        bindings: FxHashSet<HirId>,
+        callees: FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> DemotedFieldSourceVisitor<'_, 'tcx> {
+        fn field_stays_raw(&self, field: StructFieldSlot) -> bool {
+            if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
+                return ownership_field_ptr_kind(
+                    self.tcx,
+                    self.analysis,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    field,
+                )
+                .is_none();
+            }
+            if ownership_field_ptr_kind(
+                self.tcx,
+                self.analysis,
+                self.sig_decs,
+                self.ptr_kinds,
+                field,
+            )
+            .is_some()
+            {
+                return false;
+            }
+            if self.demoted_fields.contains(&field) {
+                return true;
+            }
+            if self.promoted_fields.contains(&field) {
+                return false;
+            }
+            hir_field_is_raw_ptr(self.tcx, field)
+        }
+
+        fn record_rhs(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+            if let Some(callee_did) = hir_called_local_fn(self.tcx, rhs)
+                && self.typeck.expr_ty_adjusted(rhs).is_raw_ptr()
+            {
+                self.callees.insert(callee_did);
+            }
+            if let Some(hir_id) = hir_unwrapped_local_id(rhs)
+                && unwrap_ptr_from_mir_ty(self.tcx.typeck(hir_id.owner).node_type(hir_id)).is_some()
+            {
+                self.bindings.insert(hir_id);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for DemotedFieldSourceVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath)
+                        .or_else(|| hir_local_struct_did_from_ty(self.typeck.expr_ty(expr)))
+                    {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                if self.field_stays_raw(slot) {
+                                    self.record_rhs(field.expr);
+                                }
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(slot) = hir_struct_field_slot(self.tcx, lhs)
+                        && self.field_stays_raw(slot)
+                    {
+                        self.record_rhs(rhs);
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    let mut callees = FxHashSet::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = DemotedFieldSourceVisitor {
+            tcx,
+            typeck,
+            analysis,
+            sig_decs,
+            ptr_kinds,
+            promoted_fields: &promoted_fields,
+            demoted_fields,
+            bindings: FxHashSet::default(),
+            callees: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        bindings.extend(visitor.bindings);
+        callees.extend(visitor.callees);
+    });
+    (bindings, callees)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum OwnershipFieldBlockReason {
+    NonRawFieldType,
+    NonScalarPointee,
+    CVoidOrFilePointee,
+    UnsupportedStructLiteralRhs,
+    UnsupportedAssignmentRhs,
+    UnsupportedCallRhs,
+    UnsupportedRawLocalSource,
+    AllocatorSizeMismatch,
+    ReallocOrBufferPattern,
+    CStringOrStrFunctionPattern,
+}
+
+impl OwnershipFieldBlockReason {
+    const ALL: [Self; 10] = [
+        Self::NonRawFieldType,
+        Self::NonScalarPointee,
+        Self::CVoidOrFilePointee,
+        Self::UnsupportedStructLiteralRhs,
+        Self::UnsupportedAssignmentRhs,
+        Self::UnsupportedCallRhs,
+        Self::UnsupportedRawLocalSource,
+        Self::AllocatorSizeMismatch,
+        Self::ReallocOrBufferPattern,
+        Self::CStringOrStrFunctionPattern,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NonRawFieldType => "non_raw_field_type",
+            Self::NonScalarPointee => "non_scalar_pointee",
+            Self::CVoidOrFilePointee => "c_void_or_file_pointee",
+            Self::UnsupportedStructLiteralRhs => "unsupported_struct_literal_rhs",
+            Self::UnsupportedAssignmentRhs => "unsupported_assignment_rhs",
+            Self::UnsupportedCallRhs => "unsupported_call_rhs",
+            Self::UnsupportedRawLocalSource => "unsupported_raw_local_source",
+            Self::AllocatorSizeMismatch => "allocator_size_mismatch",
+            Self::ReallocOrBufferPattern => "realloc_or_buffer_pattern",
+            Self::CStringOrStrFunctionPattern => "cstring_or_str_function_pattern",
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct OwnershipFieldDiagnostics {
+    total: usize,
+    selected_opt_box: usize,
+    blocked_total: usize,
+    block_reason_counts: FxHashMap<OwnershipFieldBlockReason, usize>,
+}
+
+impl OwnershipFieldDiagnostics {
+    fn record_blocked(&mut self, reasons: impl IntoIterator<Item = OwnershipFieldBlockReason>) {
+        self.blocked_total += 1;
+        let mut saw_reason = false;
+        for reason in reasons {
+            saw_reason = true;
+            *self.block_reason_counts.entry(reason).or_default() += 1;
+        }
+        if !saw_reason {
+            *self
+                .block_reason_counts
+                .entry(OwnershipFieldBlockReason::UnsupportedAssignmentRhs)
+                .or_default() += 1;
+        }
+    }
+}
+
+fn ownership_field_ptr_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    field: StructFieldSlot,
+) -> Option<PtrKind> {
+    let inner_ty = scalar_owning_raw_field_inner_ty(tcx, analysis, field)?;
+    if field_has_unsupported_opt_box_rhs(tcx, sig_decs, ptr_kinds, field, inner_ty) {
+        return None;
+    }
+    Some(PtrKind::OptBox)
+}
+
+fn scalar_owning_raw_field_inner_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    field: StructFieldSlot,
+) -> Option<ty::Ty<'tcx>> {
+    owning_struct_field_scalar_inner_ty(tcx, analysis, field)?.ok()
+}
+
+fn owning_struct_field_scalar_inner_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    field: StructFieldSlot,
+) -> Option<Result<ty::Ty<'tcx>, OwnershipFieldBlockReason>> {
+    if !struct_field_is_exactly_owning(analysis, field) {
+        return None;
+    }
+
+    let struct_ty = tcx.type_of(field.struct_did).skip_binder();
+    let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    let Some(field_ty) = adt_def
+        .all_fields()
+        .nth(field.field_index)
+        .map(|field| field.ty(tcx, args))
+    else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    let ty::TyKind::RawPtr(inner_ty, _) = field_ty.kind() else {
+        return Some(Err(OwnershipFieldBlockReason::NonRawFieldType));
+    };
+    if inner_ty.is_c_void(tcx) || utils::file::contains_file_ty(*inner_ty, tcx) {
+        return Some(Err(OwnershipFieldBlockReason::CVoidOrFilePointee));
+    }
+    if matches!(
+        inner_ty.kind(),
+        ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..) | ty::TyKind::Slice(_) | ty::TyKind::Array(..)
+    ) {
+        return Some(Err(OwnershipFieldBlockReason::NonScalarPointee));
+    }
+    Some(Ok(*inner_ty))
+}
+
+fn struct_field_is_exactly_owning(analysis: &Analysis, field: StructFieldSlot) -> bool {
+    let Some(ownership_schemes) = analysis.ownership_schemes.as_ref() else {
+        return false;
+    };
+    let field_ownership =
+        ownership_schemes.struct_field_result(&field.struct_did.to_def_id(), field.field_index);
+    field_ownership.len() == 1
+        && field_ownership
+            .first()
+            .is_some_and(crate::analyses::ownership::Ownership::is_owning)
+}
+
+fn field_has_unsupported_opt_box_rhs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_field: StructFieldSlot,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> bool {
+    struct FieldBoxTargetVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_field: StructFieldSlot,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        found_unsupported: bool,
+    }
+
+    impl<'tcx> FieldBoxTargetVisitor<'_, 'tcx> {
+        fn rhs_supported(&self, rhs: &'tcx hir::Expr<'tcx>) -> bool {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                return true;
+            }
+            hir_unwrapped_local_id(rhs).is_some_and(|hir_id| {
+                matches!(self.ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+                    && raw_local_has_supported_scalar_box_source(
+                        self.tcx,
+                        self.sig_decs,
+                        self.ptr_kinds,
+                        hir_id,
+                        self.lhs_inner_ty,
+                    )
+            })
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBoxTargetVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found_unsupported {
+                return;
+            }
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                if slot == self.target_field && !self.rhs_supported(field.expr) {
+                                    self.found_unsupported = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if hir_struct_field_slot(self.tcx, lhs) == Some(self.target_field)
+                        && !self.rhs_supported(rhs)
+                    {
+                        self.found_unsupported = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut found_unsupported = false;
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        if found_unsupported {
+            return;
+        }
+        let mut visitor = FieldBoxTargetVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            target_field,
+            lhs_inner_ty,
+            found_unsupported: false,
+        };
+        visitor.visit_body(body);
+        found_unsupported |= visitor.found_unsupported;
+    });
+    found_unsupported
+}
+
+fn collect_ownership_field_rhs_block_reasons<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_fields: &FxHashMap<StructFieldSlot, ty::Ty<'tcx>>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>> {
+    struct FieldBoxTargetVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_fields: &'a FxHashMap<StructFieldSlot, ty::Ty<'tcx>>,
+        reasons: FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>>,
+    }
+
+    impl<'tcx> FieldBoxTargetVisitor<'_, 'tcx> {
+        fn record_rhs(
+            &mut self,
+            field: StructFieldSlot,
+            rhs: &'tcx hir::Expr<'tcx>,
+            fallback: OwnershipFieldBlockReason,
+        ) {
+            let Some(lhs_inner_ty) = self.target_fields.get(&field).copied() else {
+                return;
+            };
+            if let Some(reason) = opt_box_rhs_block_reason(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                lhs_inner_ty,
+                fallback,
+            ) {
+                self.reasons.entry(field).or_default().insert(reason);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldBoxTargetVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                            {
+                                let slot = StructFieldSlot {
+                                    struct_did,
+                                    field_index,
+                                };
+                                if self.target_fields.contains_key(&slot) {
+                                    self.record_rhs(
+                                        slot,
+                                        field.expr,
+                                        OwnershipFieldBlockReason::UnsupportedStructLiteralRhs,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs)
+                        && self.target_fields.contains_key(&field)
+                    {
+                        self.record_rhs(
+                            field,
+                            rhs,
+                            OwnershipFieldBlockReason::UnsupportedAssignmentRhs,
+                        );
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut reasons: FxHashMap<StructFieldSlot, FxHashSet<OwnershipFieldBlockReason>> =
+        FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, _typeck| {
+        let mut visitor = FieldBoxTargetVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            target_fields,
+            reasons: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        for (field, field_reasons) in visitor.reasons {
+            reasons.entry(field).or_default().extend(field_reasons);
+        }
+    });
+    reasons
+}
+
+fn opt_box_rhs_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    rhs: &'tcx hir::Expr<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    fallback: OwnershipFieldBlockReason,
+) -> Option<OwnershipFieldBlockReason> {
+    if hir_rhs_supports_box_target(tcx, sig_decs, ptr_kinds, rhs, PtrKind::OptBox, lhs_inner_ty) {
+        return None;
+    }
+    if let Some(hir_id) = hir_unwrapped_local_id(rhs)
+        && matches!(ptr_kinds.get(&hir_id), Some(PtrKind::Raw(_)))
+    {
+        if raw_local_has_supported_scalar_box_source(tcx, sig_decs, ptr_kinds, hir_id, lhs_inner_ty)
+        {
+            return None;
+        }
+        return Some(
+            raw_local_scalar_box_source_block_reason(
+                tcx,
+                sig_decs,
+                ptr_kinds,
+                hir_id,
+                lhs_inner_ty,
+            )
+            .unwrap_or(OwnershipFieldBlockReason::UnsupportedRawLocalSource),
+        );
+    }
+    Some(direct_opt_box_rhs_block_reason(
+        tcx,
+        lhs_inner_ty,
+        rhs,
+        fallback,
+    ))
+}
+
+fn direct_opt_box_rhs_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lhs_inner_ty: ty::Ty<'tcx>,
+    rhs: &'tcx hir::Expr<'tcx>,
+    fallback: OwnershipFieldBlockReason,
+) -> OwnershipFieldBlockReason {
+    let Some(name) = hir_call_name(rhs) else {
+        return fallback;
+    };
+    if call_name_is_cstring_or_str_pattern(name) {
+        return OwnershipFieldBlockReason::CStringOrStrFunctionPattern;
+    }
+    if call_name_is_realloc_or_buffer_pattern(name) {
+        return OwnershipFieldBlockReason::ReallocOrBufferPattern;
+    }
+    if call_name_is_libc_allocator(name)
+        && !hir_supports_scalar_box_allocator_root(tcx, lhs_inner_ty, rhs)
+    {
+        return OwnershipFieldBlockReason::AllocatorSizeMismatch;
+    }
+    OwnershipFieldBlockReason::UnsupportedCallRhs
+}
+
+fn call_name_is_libc_allocator(name: Symbol) -> bool {
+    matches!(name.as_str(), "malloc" | "calloc" | "realloc")
+}
+
+fn call_name_is_realloc_or_buffer_pattern(name: Symbol) -> bool {
+    let name = name.as_str();
+    name.contains("realloc") || name.contains("allocarray")
+}
+
+fn call_name_is_cstring_or_str_pattern(name: Symbol) -> bool {
+    let name = name.as_str();
+    name.starts_with("str") || name.contains("_str") || name.contains("cstr")
+}
+
+fn raw_local_scalar_box_source_block_reason<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_hir_id: HirId,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> Option<OwnershipFieldBlockReason> {
+    struct LocalSourceReasonVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_hir_id: HirId,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        reasons: FxHashSet<OwnershipFieldBlockReason>,
+    }
+
+    impl<'tcx> LocalSourceReasonVisitor<'_, 'tcx> {
+        fn record_source(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                return;
+            }
+            self.reasons.insert(direct_opt_box_rhs_block_reason(
+                self.tcx,
+                self.lhs_inner_ty,
+                rhs,
+                OwnershipFieldBlockReason::UnsupportedRawLocalSource,
+            ));
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalSourceReasonVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && hir_id == self.target_hir_id
+                && let Some(init) = let_stmt.init
+            {
+                self.record_source(init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.target_hir_id)
+            {
+                self.record_source(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let body = tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+    let mut visitor = LocalSourceReasonVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        target_hir_id,
+        lhs_inner_ty,
+        reasons: FxHashSet::default(),
+    };
+    visitor.visit_body(body);
+    OwnershipFieldBlockReason::ALL
+        .into_iter()
+        .find(|reason| visitor.reasons.contains(reason))
+}
+
+fn raw_local_has_supported_scalar_box_source<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_hir_id: HirId,
+    lhs_inner_ty: ty::Ty<'tcx>,
+) -> bool {
+    struct LocalSourceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        target_hir_id: HirId,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        saw_supported_source: bool,
+        saw_unsupported_source: bool,
+    }
+
+    impl<'tcx> LocalSourceVisitor<'_, 'tcx> {
+        fn record_source(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+            if hir_rhs_supports_box_target(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                rhs,
+                PtrKind::OptBox,
+                self.lhs_inner_ty,
+            ) {
+                self.saw_supported_source = true;
+            } else {
+                self.saw_unsupported_source = true;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalSourceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && hir_id == self.target_hir_id
+                && let Some(init) = let_stmt.init
+            {
+                self.record_source(init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && path.res == Res::Local(self.target_hir_id)
+            {
+                self.record_source(rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let body = tcx.hir_body_owned_by(target_hir_id.owner.def_id);
+    let mut visitor = LocalSourceVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        target_hir_id,
+        lhs_inner_ty,
+        saw_supported_source: false,
+        saw_unsupported_source: false,
+    };
+    visitor.visit_body(body);
+    visitor.saw_supported_source && !visitor.saw_unsupported_source
+}
+
+fn collect_ownership_field_diagnostics<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> OwnershipFieldDiagnostics {
+    let mut diagnostics = OwnershipFieldDiagnostics::default();
+    let mut scalar_fields = FxHashMap::default();
+
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        if !matches!(item.kind, hir::ItemKind::Struct(..)) {
+            continue;
+        }
+        let struct_did = item.owner_id.def_id;
+        let field_count = tcx.adt_def(struct_did).non_enum_variant().fields.len();
+        for field_index in 0..field_count {
+            let field = StructFieldSlot {
+                struct_did,
+                field_index,
+            };
+            let Some(inner_ty) = owning_struct_field_scalar_inner_ty(tcx, analysis, field) else {
+                continue;
+            };
+            diagnostics.total += 1;
+            let inner_ty = match inner_ty {
+                Ok(inner_ty) => inner_ty,
+                Err(reason) => {
+                    diagnostics.record_blocked([reason]);
+                    continue;
+                }
+            };
+            scalar_fields.insert(field, inner_ty);
+        }
+    }
+
+    let block_reasons =
+        collect_ownership_field_rhs_block_reasons(tcx, sig_decs, ptr_kinds, &scalar_fields);
+    for field in scalar_fields.keys() {
+        if let Some(reasons) = block_reasons.get(field) {
+            if reasons.is_empty() {
+                diagnostics.selected_opt_box += 1;
+            } else {
+                diagnostics.record_blocked(reasons.iter().copied());
+            }
+        } else {
+            diagnostics.selected_opt_box += 1;
+        }
+    }
+
+    diagnostics
+}
+
+fn emit_ownership_field_diagnostics(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) {
+    let mode = std::env::var("CRAT_POINTER_OWNERSHIP_FIELD_DIAGNOSTICS").ok();
+    if !diagnostics_env_value_enabled(mode.as_deref()) {
+        return;
+    }
+
+    let diagnostics = collect_ownership_field_diagnostics(tcx, analysis, sig_decs, ptr_kinds);
+    eprintln!(
+        "[pointer-ownership-fields] fields total={} selected_opt_box={} blocked={}",
+        diagnostics.total, diagnostics.selected_opt_box, diagnostics.blocked_total,
+    );
+    for reason in OwnershipFieldBlockReason::ALL {
+        let fields = diagnostics
+            .block_reason_counts
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
+        if fields > 0 {
+            eprintln!(
+                "[pointer-ownership-fields] block reason={} fields={}",
+                reason.as_str(),
+                fields,
+            );
+        }
+    }
+}
+
+fn diagnostics_env_value_enabled(mode: Option<&str>) -> bool {
+    mode.is_some_and(|mode| !mode.is_empty() && mode != "0" && !mode.eq_ignore_ascii_case("false"))
+}
+
+fn collect_struct_shape_demoted_fields(
+    tcx: TyCtxt<'_>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+    mutable_fields: &FxHashSet<StructFieldSlot>,
+    struct_copy_result: &crate::analyses::struct_copy::StructCopyAnalysisResult,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashSet<StructFieldSlot> {
+    let mut demoted = FxHashSet::default();
+
+    for &field in promoted_fields {
+        if !struct_has_named_fields(tcx, field.struct_did)
+            || (mutable_fields.contains(&field)
+                && struct_copy_result.must_preserve_copy(field.struct_did))
+        {
+            demoted.insert(field);
+        }
+    }
+
+    for did in tcx.hir_crate(()).owners.iter().filter_map(|owner| {
+        let owner = owner.as_owner()?;
+        match owner.node() {
+            hir::OwnerNode::Item(item) => {
+                matches!(item.kind, hir::ItemKind::Fn { .. }).then_some(item.owner_id.def_id)
+            }
+            hir::OwnerNode::ForeignItem(item) => {
+                matches!(item.kind, hir::ForeignItemKind::Fn(..)).then_some(item.owner_id.def_id)
+            }
+            _ => None,
+        }
+    }) {
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        if signature_output_rewrites_to_owning(tcx, sig_decs, ptr_kinds, did, sig.output())
+            || signature_output_rewrites_to_borrow(sig_decs, did)
+        {
+            continue;
+        }
+        collect_promoted_fields_in_by_value_ty(sig.output(), promoted_fields, &mut demoted);
+    }
+
+    demoted
+}
+
+fn emit_promotion_diagnostics(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    lifetime_plans: &super::lifetimes::LifetimePlans,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+) {
+    let Ok(mode) = std::env::var("CRAT_POINTER_PROMOTION_DIAGNOSTICS") else {
+        return;
+    };
+    if mode.is_empty() || mode == "0" || mode.eq_ignore_ascii_case("false") {
+        return;
+    }
+
+    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
+    promoted_fields.extend(
+        analysis
+            .borrow_promotion_result
+            .shared_fields
+            .iter()
+            .copied(),
+    );
+    let shape_demoted = collect_struct_shape_demoted_fields(
+        tcx,
+        &promoted_fields,
+        &analysis.borrow_promotion_result.mutable_fields,
+        &analysis.struct_copy_result,
+        sig_decs,
+        ptr_kinds,
+    );
+    let conflict_reasons =
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds);
+    let usage_counts = count_promoted_field_usages(tcx, &promoted_fields);
+    let live_fields = promoted_fields
+        .iter()
+        .filter(|field| !demoted_fields.contains(field))
+        .count();
+    let promoted_structs = promoted_fields
+        .iter()
+        .map(|field| field.struct_did)
+        .collect::<FxHashSet<_>>()
+        .len();
+    let blocked_structs = promoted_fields
+        .iter()
+        .filter(|field| demoted_fields.contains(field))
+        .map(|field| field.struct_did)
+        .collect::<FxHashSet<_>>()
+        .len();
+    let promoted_field_usages = promoted_fields
+        .iter()
+        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
+        .sum::<usize>();
+    let blocked_field_usages = promoted_fields
+        .iter()
+        .filter(|field| demoted_fields.contains(field))
+        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
+        .sum::<usize>();
+    let planned_return_lifetimes = lifetime_plans.functions.len();
+    let promoted_return_lifetimes = lifetime_plans
+        .functions
+        .keys()
+        .filter(|did| {
+            sig_decs.data.get(did).is_some_and(|sig_dec| {
+                sig_dec.output_lifetime.is_some()
+                    && matches!(
+                        sig_dec.output_dec,
+                        Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
+                    )
+            })
+        })
+        .count();
+
+    eprintln!(
+        "[pointer-promotion] fields total={} structs={} usages={} mutable={} shared={} shape_demoted={} final_demoted={} blocked_structs={} blocked_usages={} live={} returns_planned={} returns_live={}",
+        promoted_fields.len(),
+        promoted_structs,
+        promoted_field_usages,
+        analysis.borrow_promotion_result.mutable_fields.len(),
+        analysis.borrow_promotion_result.shared_fields.len(),
+        shape_demoted.len(),
+        demoted_fields.len(),
+        blocked_structs,
+        blocked_field_usages,
+        live_fields,
+        planned_return_lifetimes,
+        promoted_return_lifetimes,
+    );
+
+    let mut conflict_reason_stats = FxHashMap::<ConflictDemotionReason, (usize, usize)>::default();
+    for (field, reasons) in &conflict_reasons {
+        for &reason in reasons {
+            let usage_count = usage_counts.get(field).copied().unwrap_or_default();
+            let entry = conflict_reason_stats.entry(reason).or_default();
+            entry.0 += 1;
+            entry.1 += usage_count;
+        }
+    }
+    for reason in ConflictDemotionReason::ALL {
+        let (fields, usages) = conflict_reason_stats
+            .get(&reason)
+            .copied()
+            .unwrap_or_default();
+        eprintln!(
+            "[pointer-promotion] conflict reason={} fields={} usages={}",
+            reason.as_str(),
+            fields,
+            usages,
+        );
+    }
+
+    if mode != "full" {
+        return;
+    }
+
+    let mut fields = promoted_fields.iter().copied().collect::<Vec<_>>();
+    fields.sort_by_key(|field| field_slot_label(tcx, *field));
+    for field in fields {
+        let mutability = if analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            "mut"
+        } else {
+            "shared"
+        };
+        let reason = if demoted_fields.contains(&field) {
+            if shape_demoted.contains(&field) {
+                "demoted_shape"
+            } else {
+                "demoted_conflict"
+            }
+        } else {
+            "live"
+        };
+        let label = field_slot_label(tcx, field);
+        eprintln!(
+            "[pointer-promotion] field {reason} {mutability} uses={} {}",
+            usage_counts.get(&field).copied().unwrap_or_default(),
+            label,
+        );
+        if let Some(reasons) = conflict_reasons.get(&field) {
+            let mut reason_names = reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>();
+            reason_names.sort();
+            eprintln!(
+                "[pointer-promotion] field-conflict reasons={} uses={} {}",
+                reason_names.join(","),
+                usage_counts.get(&field).copied().unwrap_or_default(),
+                label,
+            );
+        }
+    }
+
+    let mut planned_returns = lifetime_plans.functions.keys().copied().collect::<Vec<_>>();
+    planned_returns.sort_by_key(|did| tcx.def_path_str(*did));
+    for did in planned_returns {
+        let Some(sig_dec) = sig_decs.data.get(&did) else {
+            continue;
+        };
+        let state = if sig_dec.output_lifetime.is_some()
+            && matches!(
+                sig_dec.output_dec,
+                Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
+            ) {
+            "live"
+        } else {
+            "demoted"
+        };
+        eprintln!(
+            "[pointer-promotion] return {state} {} {:?}",
+            tcx.def_path_str(did),
+            sig_dec.output_dec
+        );
+    }
+}
+
+fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
+    let struct_name = tcx.def_path_str(field.struct_did);
+    let field_name = tcx
+        .adt_def(field.struct_did)
+        .non_enum_variant()
+        .fields
+        .iter()
+        .nth(field.field_index)
+        .map(|field| field.name.as_str().to_owned())
+        .unwrap_or_else(|| format!("#{}", field.field_index));
+    format!("{struct_name}.{field_name}")
+}
+
+fn count_promoted_field_usages(
+    tcx: TyCtxt<'_>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+) -> FxHashMap<StructFieldSlot, usize> {
+    struct FieldUsageVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        promoted_fields: &'a FxHashSet<StructFieldSlot>,
+        usages: FxHashMap<StructFieldSlot, usize>,
+    }
+
+    impl FieldUsageVisitor<'_, '_> {
+        fn record(&mut self, field: StructFieldSlot) {
+            if self.promoted_fields.contains(&field) {
+                *self.usages.entry(field).or_default() += 1;
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldUsageVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let Some(field) = hir_struct_field_slot(self.tcx, expr) {
+                self.record(field);
+            }
+
+            if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                && let Some(struct_did) = hir_local_struct_did_from_qpath(qpath)
+                    .or_else(|| hir_local_struct_did_from_ty(self.typeck.expr_ty(expr)))
+            {
+                for field in fields {
+                    if let Some(field_index) =
+                        hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                    {
+                        self.record(StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        });
+                    }
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut usages = FxHashMap::default();
+    for_each_hir_fn_body(tcx, |body, typeck| {
+        let mut visitor = FieldUsageVisitor {
+            tcx,
+            typeck,
+            promoted_fields,
+            usages: FxHashMap::default(),
+        };
+        visitor.visit_body(body);
+        for (field, count) in visitor.usages {
+            *usages.entry(field).or_default() += count;
+        }
+    });
+    usages
+}
+
+fn signature_output_rewrites_to_owning<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    did: LocalDefId,
+    output_ty: ty::Ty<'tcx>,
+) -> bool {
+    let Some(output_dec) = sig_decs.data.get(&did).and_then(|sig| sig.output_dec) else {
+        return false;
+    };
+    if !output_dec.is_owning_box_like() {
+        return false;
+    }
+    let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(output_ty) else {
+        return false;
+    };
+    !fn_tail_returns_unsupported_box_binding(tcx, sig_decs, ptr_kinds, did, output_dec, inner_ty)
+}
+
+fn signature_output_rewrites_to_borrow(sig_decs: &SigDecisions, did: LocalDefId) -> bool {
+    sig_decs.data.get(&did).is_some_and(|sig| {
+        matches!(
+            sig.output_dec,
+            Some(
+                PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+            )
+        )
+    })
+}
+
+fn struct_has_named_fields(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return false;
+    };
+    let hir::ItemKind::Struct(_, _, variant_data) = item.kind else {
+        return false;
+    };
+    matches!(variant_data, hir::VariantData::Struct { .. })
+}
+
+fn collect_promoted_fields_in_by_value_ty(
+    ty: ty::Ty<'_>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+    demoted: &mut FxHashSet<StructFieldSlot>,
+) {
+    match ty.kind() {
+        ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _) => {
+            collect_promoted_fields_in_by_value_ty(*inner, promoted_fields, demoted);
+        }
+        ty::TyKind::Adt(adt_def, args) => {
+            if adt_def.did().is_local() && adt_def.is_struct() && !adt_def.is_union() {
+                let struct_did = adt_def.did().expect_local();
+                demoted.extend(
+                    promoted_fields
+                        .iter()
+                        .copied()
+                        .filter(|field| field.struct_did == struct_did),
+                );
+            }
+            for arg in args.iter() {
+                if let ty::GenericArgKind::Type(ty) = arg.kind() {
+                    collect_promoted_fields_in_by_value_ty(ty, promoted_fields, demoted);
+                }
+            }
+        }
+        ty::TyKind::Tuple(tys) => {
+            for ty in tys.iter() {
+                collect_promoted_fields_in_by_value_ty(ty, promoted_fields, demoted);
+            }
+        }
+        ty::TyKind::Array(ty, _) | ty::TyKind::Slice(ty) => {
+            collect_promoted_fields_in_by_value_ty(*ty, promoted_fields, demoted);
+        }
+        _ => {}
+    }
+}
+
+fn hir_raw_addr_local(expr: &hir::Expr<'_>) -> Option<(HirId, bool)> {
+    let expr = hir_unwrap_casts(expr);
+    let hir::ExprKind::AddrOf(hir::BorrowKind::Raw, mutability, pointee) = expr.kind else {
+        return None;
+    };
+    Some((hir_unwrapped_local_id(pointee)?, mutability.is_mut()))
+}
+
+fn hir_addr_local(expr: &hir::Expr<'_>) -> Option<(HirId, bool)> {
+    let expr = hir_unwrap_casts(expr);
+    let hir::ExprKind::AddrOf(_, mutability, pointee) = expr.kind else {
+        return None;
+    };
+    Some((hir_unwrapped_local_id(pointee)?, mutability.is_mut()))
+}
+
+fn hir_struct_field_slot(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<StructFieldSlot> {
+    let hir::ExprKind::Field(base, ident) = hir_expr.kind else {
+        return None;
+    };
+    let typeck = tcx.typeck(hir_expr.hir_id.owner);
+    let struct_did = hir_local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
+    let field_index = hir_field_index_by_name(tcx, struct_did, ident.name)?;
+    Some(StructFieldSlot {
+        struct_did,
+        field_index,
+    })
+}
+
+fn apply_field_storage_input_lifetimes(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    lifetime_plans: &super::lifetimes::LifetimePlans,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+    field_cursor_fields: &FxHashSet<StructFieldSlot>,
+    sig_decs: &mut SigDecisions,
+) {
+    struct FieldStorageLifetimeVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        analysis: &'a Analysis,
+        lifetime_plans: &'a super::lifetimes::LifetimePlans,
+        demoted_fields: &'a FxHashSet<StructFieldSlot>,
+        field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
+        sig_decs: &'a mut SigDecisions,
+    }
+
+    impl FieldStorageLifetimeVisitor<'_, '_> {
+        fn record_storage(&mut self, field: StructFieldSlot, rhs: &hir::Expr<'_>) {
+            if !matches!(
+                borrow_promoted_array_field_kind(
+                    self.analysis,
+                    self.demoted_fields,
+                    self.field_cursor_fields,
+                    field,
+                ),
+                Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+            ) {
+                return;
+            }
+            let Some(lifetime) = self
+                .lifetime_plans
+                .structs
+                .get(&field.struct_did)
+                .and_then(|plan| plan.field_lifetimes.get(&field.field_index))
+                .copied()
+            else {
+                return;
+            };
+            let Some(rhs_hir_id) = hir_unwrapped_local_id(hir_unwrap_addr_of_deref(rhs)) else {
+                return;
+            };
+            let Some((did, input_index)) = param_index_for_binding(self.tcx, rhs_hir_id) else {
+                return;
+            };
+            let Some(sig_dec) = self.sig_decs.data.get_mut(&did) else {
+                return;
+            };
+            if let Some(input_lifetime) = sig_dec.input_lifetimes.get_mut(input_index)
+                && (input_lifetime.is_none() || *input_lifetime == Some(lifetime))
+            {
+                *input_lifetime = Some(lifetime);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldStorageLifetimeVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs) {
+                        self.record_storage(field, rhs);
+                    }
+                }
+                hir::ExprKind::Struct(qpath, fields, _) => {
+                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                        for field_expr in fields {
+                            if let Some(field_index) =
+                                hir_field_index_by_name(self.tcx, struct_did, field_expr.ident.name)
+                            {
+                                self.record_storage(
+                                    StructFieldSlot {
+                                        struct_did,
+                                        field_index,
+                                    },
+                                    field_expr.expr,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldStorageLifetimeVisitor {
+        tcx,
+        analysis,
+        lifetime_plans,
+        demoted_fields,
+        field_cursor_fields,
+        sig_decs,
+    };
+    for def_id in tcx.hir_body_owners() {
+        visitor.visit_body(tcx.hir_body_owned_by(def_id));
+    }
+}
+
+fn borrow_promoted_array_field_kind(
+    analysis: &Analysis,
+    demoted_fields: &FxHashSet<StructFieldSlot>,
+    field_cursor_fields: &FxHashSet<StructFieldSlot>,
+    field: StructFieldSlot,
+) -> Option<PtrKind> {
+    if demoted_fields.contains(&field) || struct_field_is_exactly_owning(analysis, field) {
+        return None;
+    }
+    let mutability = if analysis
+        .borrow_promotion_result
+        .mutable_fields
+        .contains(&field)
+    {
+        true
+    } else if analysis
+        .borrow_promotion_result
+        .shared_fields
+        .contains(&field)
+    {
+        false
+    } else {
+        return None;
+    };
+    if !analysis_field_is_array_like(analysis, field) {
+        return None;
+    }
+    if field_cursor_fields.contains(&field) {
+        Some(PtrKind::SliceCursor(mutability))
+    } else {
+        Some(PtrKind::Slice(mutability))
+    }
+}
+
+fn analysis_field_is_array_like(analysis: &Analysis, field: StructFieldSlot) -> bool {
+    analysis
+        .fatness_result
+        .struct_facts(field.struct_did)
+        .nth(field.field_index)
+        .is_some_and(|fatnesses| fatnesses.iter().any(|fatness| fatness.is_arr()))
+}
+
+fn hir_field_base_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
+    let hir::ExprKind::Field(base, _) = hir_expr.kind else {
+        return None;
+    };
+    hir_unwrapped_local_id(base)
+}
+
+fn hir_projection_root_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
+    match hir_unwrap_casts(hir_expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => hir_projection_root_local_id(inner),
+        hir::ExprKind::Field(base, _) => hir_projection_root_local_id(base),
+        _ => None,
+    }
+}
+
+fn hir_field_access_expr_string(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<String> {
+    match hir_unwrap_casts(hir_expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(tcx.hir_name(hir_id).to_string()),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
+            Some(format!("(*{})", hir_field_access_expr_string(tcx, inner)?))
+        }
+        hir::ExprKind::Field(base, ident) => Some(format!(
+            "{}.{}",
+            hir_field_access_expr_string(tcx, base)?,
+            ident.name
+        )),
+        _ => None,
+    }
+}
+
+fn hir_local_struct_did_from_qpath(qpath: &hir::QPath<'_>) -> Option<LocalDefId> {
+    let hir::QPath::Resolved(_, path) = qpath else {
+        return None;
+    };
+    let Res::Def(DefKind::Struct, def_id) = path.res else {
+        return None;
+    };
+    def_id.as_local()
+}
+
+fn hir_local_struct_did_from_ty(ty: ty::Ty<'_>) -> Option<LocalDefId> {
+    match ty.kind() {
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct() => {
+            Some(adt_def.did().expect_local())
+        }
+        ty::TyKind::Ref(_, inner, _) => hir_local_struct_did_from_ty(*inner),
+        _ => None,
+    }
+}
+
+fn hir_field_index_by_name(
+    tcx: TyCtxt<'_>,
+    struct_did: LocalDefId,
+    field_name: Symbol,
+) -> Option<usize> {
+    tcx.adt_def(struct_did)
+        .non_enum_variant()
+        .fields
+        .iter_enumerated()
+        .find_map(|(field_index, field)| (field.name == field_name).then_some(field_index.index()))
+}
+
+fn hir_field_is_raw_ptr(tcx: TyCtxt<'_>, field: StructFieldSlot) -> bool {
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(field.struct_did) else {
+        return false;
+    };
+    let hir::ItemKind::Struct(_, _, variant_data) = item.kind else {
+        return false;
+    };
+    variant_data
+        .fields()
+        .get(field.field_index)
+        .is_some_and(|field_def| matches!(field_def.ty.kind, hir::TyKind::Ptr(_)))
+}
+
 fn downgrade_unsupported_allocator_box_kinds(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
@@ -9104,6 +13884,36 @@ fn is_std_slice_constructor_call(expr: &Expr) -> bool {
     false
 }
 
+fn slice_cursor_mut_temp_as_slice_receiver(expr: &Expr) -> Option<&Expr> {
+    let expr = unwrap_paren(expr);
+    let ExprKind::MethodCall(call) = &expr.kind else {
+        return None;
+    };
+    if !matches!(call.seg.ident.name.as_str(), "as_slice" | "as_slice_mut") {
+        return None;
+    }
+    let receiver = unwrap_paren(&call.receiver);
+    is_slice_cursor_mut_constructor_call(receiver).then_some(receiver)
+}
+
+fn is_slice_cursor_mut_constructor_call(expr: &Expr) -> bool {
+    if let ExprKind::Call(callee, _) = &unwrap_cast_and_paren(expr).kind
+        && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
+    {
+        let segs = &path.segments;
+        if segs.len() >= 2 {
+            let ctor = segs[segs.len() - 1].ident.name.as_str();
+            let owner = segs[segs.len() - 2].ident.name.as_str();
+            return owner == "SliceCursorMut"
+                && matches!(
+                    ctor,
+                    "new" | "with_pos" | "from_mut" | "from_raw_parts" | "from_raw_parts_mut"
+                );
+        }
+    }
+    false
+}
+
 fn is_plain_slice_expr(expr: &Expr) -> bool {
     let expr = unwrap_paren(expr);
     if matches!(expr.kind, ExprKind::Index(..) | ExprKind::Array(..)) {
@@ -9138,6 +13948,18 @@ fn is_slice_ref_expr(expr: &Expr) -> bool {
     )
 }
 
+fn opt_ref_receiver_should_borrow(expr: &Expr) -> bool {
+    match &unwrap_paren(expr).kind {
+        ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => true,
+        ExprKind::MethodCall(call)
+            if matches!(call.seg.ident.name.as_str(), "as_deref" | "as_deref_mut") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 fn hoist_opt_ref_borrow(expr: &mut Expr) {
     let mut visitor = OptRefBorrowVisitor::default();
     visitor.visit_expr(expr);
@@ -9161,6 +13983,37 @@ fn hoist_opt_ref_borrow(expr: &mut Expr) {
         visitor.visit_expr(expr);
         *expr = utils::expr!("{{ {lets} {} }}", pprust::expr_to_string(expr))
     }
+}
+
+fn use_moving_opt_ref_unwraps_for_return(expr: &mut Expr) {
+    struct ReturnOptRefUnwrapVisitor;
+
+    impl mut_visit::MutVisitor for ReturnOptRefUnwrapVisitor {
+        fn visit_expr(&mut self, expr: &mut Expr) {
+            mut_visit::walk_expr(self, expr);
+            let ExprKind::MethodCall(call) = &mut unwrap_paren_mut(expr).kind else {
+                return;
+            };
+            if call.seg.ident.name != rustc_span::sym::unwrap {
+                return;
+            }
+            let ExprKind::MethodCall(receiver_call) =
+                &mut unwrap_paren_mut(&mut call.receiver).kind
+            else {
+                return;
+            };
+            if !matches!(
+                receiver_call.seg.ident.name.as_str(),
+                "as_deref" | "as_deref_mut"
+            ) {
+                return;
+            }
+            let receiver = pprust::expr_to_string(&receiver_call.receiver);
+            *expr = utils::expr!("({receiver}).unwrap()");
+        }
+    }
+
+    ReturnOptRefUnwrapVisitor.visit_expr(expr);
 }
 
 #[derive(Default)]
@@ -9304,17 +14157,26 @@ mod tests {
         utils::rustc::RustProgram,
     };
 
-    fn synthetic_transform_visitor<'tcx>(tcx: TyCtxt<'tcx>) -> TransformVisitor<'tcx> {
+    fn synthetic_transform_visitor<'tcx>(tcx: TyCtxt<'tcx>) -> TransformVisitor<'static, 'tcx> {
+        let (_, analysis) = build_analysis(tcx);
+        let analysis = Box::leak(Box::new(analysis));
         TransformVisitor {
             tcx,
+            analysis,
             sig_decs: SigDecisions {
                 data: FxHashMap::default(),
             },
+            lifetime_plans: super::super::lifetimes::LifetimePlans::default(),
             ptr_kinds: FxHashMap::default(),
             forced_raw_bindings: FxHashSet::default(),
             raw_bridge_bindings: FxHashMap::default(),
+            raw_scalar_bridge_fields: FxHashSet::default(),
             alloc_wrappers: FxHashMap::default(),
             free_like_wrappers: FxHashSet::default(),
+            demoted_fields: FxHashSet::default(),
+            field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
+            c_exposed_abi_fields: FxHashSet::default(),
+            impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
             fn_ptr_rewrite: FnPtrRewriteDecision::default(),
             bytemuck: Cell::new(false),
@@ -9377,12 +14239,15 @@ mod tests {
         );
         let source_var_groups = SourceVarGroups::new(&input);
         let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-        let (mutable_references, shared_references) =
+        let borrow_promotion_result =
             analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-        let promoted_mut_ref_result =
-            source_var_groups.postprocess_promoted_mut_refs(mutable_references);
-        let promoted_shared_ref_result =
-            source_var_groups.postprocess_promoted_mut_refs(shared_references);
+        let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+        let struct_copy_result =
+            analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
+        let promoted_mut_ref_result = source_var_groups
+            .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+        let promoted_shared_ref_result = source_var_groups
+            .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
         let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
         let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
         offset_sign_result.access_signs =
@@ -9391,6 +14256,8 @@ mod tests {
         nullity_result.non_null_locals =
             source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
         let analysis = super::super::Analysis {
+            borrow_promotion_result,
+            borrow_lifetime_flows,
             promoted_mut_ref_result,
             promoted_shared_ref_result,
             mutability_result,
@@ -9400,9 +14267,227 @@ mod tests {
             ownership_schemes,
             offset_sign_result,
             nullity_result,
+            struct_copy_result,
         };
 
         (input, analysis)
+    }
+
+    fn field_conflict_reason_names_for_code(code: &str) -> FxHashMap<String, Vec<&'static str>> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (input, analysis) = build_analysis(tcx);
+            let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
+                simulate_transform_reasons(tcx, &input, &analysis);
+            let mut sig_decs = sig_decs;
+            force_test_input_raw(tcx, &mut sig_decs, "raw_local");
+            let reasons =
+                collect_field_conflict_demotion_reasons(tcx, &analysis, &sig_decs, &ptr_kinds);
+            reasons
+                .into_iter()
+                .map(|(field, reasons)| {
+                    let mut reason_names = reasons
+                        .into_iter()
+                        .map(|reason| reason.as_str())
+                        .collect::<Vec<_>>();
+                    reason_names.sort();
+                    (field_slot_label(tcx, field), reason_names)
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn force_test_input_raw(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions, name: &str) {
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            if !matches!(item.kind, HirItemKind::Fn { .. }) {
+                continue;
+            }
+            if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() != name {
+                continue;
+            }
+            if let Some(sig_dec) = sig_decs.data.get_mut(&item.owner_id.def_id)
+                && !sig_dec.input_decs.is_empty()
+            {
+                sig_dec.input_decs[0] = Some(PtrKind::Raw(true));
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_diagnostics_collect_all_conflict_reasons_for_field() {
+        let reasons = field_conflict_reason_names_for_code(
+            r#"
+extern "C" {
+    fn foreign(p: *mut i32);
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub q: *mut i32,
+}
+
+#[repr(C)]
+pub struct Other {
+    pub r: *mut i32,
+}
+
+pub unsafe fn raw_local(p: *mut i32) {
+    foreign(p);
+}
+
+pub unsafe fn conflict(mut x: i32, mut y: i32, raw: *mut i32, owner: *mut Holder) {
+    let mut h = Holder { p: &raw mut x, q: &raw mut x };
+    let mut other = Other { r: &raw mut x };
+    *h.p = 1;
+    *h.q = 2;
+    *other.r = 3;
+    let _raw_binding: *mut i32 = h.p;
+    let _q_raw_binding: *mut i32 = h.q;
+    x = 2;
+    let _reborrow = &mut x;
+    foreign(h.p);
+    foreign(h.q);
+    raw_local(h.p);
+    let _offset = h.p.sub(1);
+    h.p = raw;
+    h.p = malloc(4) as *mut i32;
+    y = 2;
+    h.q = &raw mut y;
+    y = 3;
+    (*owner).p = h.p;
+    raw_local((*owner).p);
+}
+"#,
+        );
+        let incompatible_raw_storage_reasons = field_conflict_reason_names_for_code(
+            r#"
+#[repr(C)]
+pub struct State {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct PrintBuf {
+    pub buffer: *mut State,
+}
+
+pub unsafe fn print_preallocated_like(buffer: *mut State) -> i32 {
+    let mut p = PrintBuf { buffer: std::ptr::null_mut::<State>() };
+    p.buffer = buffer;
+    if p.buffer.is_null() {
+        0
+    } else {
+        1
+    }
+}
+"#,
+        );
+
+        let all_reasons = reasons
+            .values()
+            .chain(incompatible_raw_storage_reasons.values())
+            .flat_map(|reasons| reasons.iter().copied())
+            .collect::<FxHashSet<_>>();
+        for expected in [
+            "active_borrow_overlap",
+            "conflicting_reborrow",
+            "local_assignment_while_borrowed",
+            "mutable_field_copy",
+            "raw_binding_from_field",
+            "raw_field_pointer_projection",
+            "raw_pointee_field_move",
+            "raw_storage_allocator",
+            "raw_storage_pointer",
+        ] {
+            assert!(
+                all_reasons.contains(expected),
+                "expected {expected} in conflict reasons: {all_reasons:?}; all reasons: {reasons:?}"
+            );
+        }
+
+        let holder_p = reasons
+            .iter()
+            .find(|(field, _)| field.ends_with("Holder.p"))
+            .map(|(_, reasons)| reasons)
+            .unwrap_or_else(|| panic!("Holder.p missing from conflict reasons: {reasons:?}"));
+        for expected in [
+            "mutable_field_copy",
+            "raw_binding_from_field",
+            "raw_field_pointer_projection",
+            "raw_pointee_field_move",
+            "raw_storage_allocator",
+        ] {
+            assert!(
+                holder_p.contains(&expected),
+                "expected {expected} in Holder.p conflict reasons: {holder_p:?}; all reasons: {reasons:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_field_diagnostics_count_selected_and_blocked_fields() {
+        let diagnostics = ::utils::compilation::run_compiler_on_str(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Good {
+    pub data: *mut i32,
+}
+
+#[repr(C)]
+pub struct Bad {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash_good(owner: *mut Good) {
+    (*owner).data = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn stash_bad(owner: *mut Bad) {
+    (*owner).data = malloc(2 * std::mem::size_of::<i32>());
+}
+"#,
+            |tcx| {
+                let (input, analysis) = build_analysis(tcx);
+                let (sig_decs, ptr_kinds, _reason_map, _usage_subreason_map) =
+                    simulate_transform_reasons(tcx, &input, &analysis);
+                collect_ownership_field_diagnostics(tcx, &analysis, &sig_decs, &ptr_kinds)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.total, 2);
+        assert_eq!(diagnostics.selected_opt_box, 1);
+        assert_eq!(diagnostics.blocked_total, 1);
+        assert_eq!(
+            diagnostics
+                .block_reason_counts
+                .get(&OwnershipFieldBlockReason::AllocatorSizeMismatch)
+                .copied(),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn diagnostics_env_value_enabled_requires_truthy_value() {
+        assert!(!diagnostics_env_value_enabled(None));
+        assert!(!diagnostics_env_value_enabled(Some("")));
+        assert!(!diagnostics_env_value_enabled(Some("0")));
+        assert!(!diagnostics_env_value_enabled(Some("false")));
+        assert!(!diagnostics_env_value_enabled(Some("FALSE")));
+        assert!(diagnostics_env_value_enabled(Some("1")));
+        assert!(diagnostics_env_value_enabled(Some("full")));
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10020,7 +15105,10 @@ mod tests {
     fn analyze_pointer_safety_for_program(tcx: TyCtxt<'_>) -> PointerSafetyAnalysisResult {
         let (input, analysis) = build_analysis(tcx);
         let tracked_sites = collect_semantic_allocator_sites(tcx, &input);
-        let initial_ptr_kinds = collect_diffs(&input, &analysis, &FnPtrGroups::default());
+        let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
+        let fn_ptr_groups = FnPtrGroups::default();
+        let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+        let initial_ptr_kinds = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
         let (_sig_decs, final_ptr_kinds, _reason_map, _usage_subreason_map) =
             simulate_transform_reasons(tcx, &input, &analysis);
 
@@ -10188,8 +15276,10 @@ mod tests {
         FxHashMap<HirId, Vec<&'static str>>,
         FxHashMap<HirId, Vec<&'static str>>,
     ) {
-        let mut sig_decs = SigDecisions::new(input, analysis, &FnPtrGroups::default());
-        let mut ptr_kinds = collect_diffs(input, analysis, &FnPtrGroups::default());
+        let lifetime_plans = super::super::lifetimes::LifetimePlans::new(input, analysis);
+        let fn_ptr_groups = FnPtrGroups::default();
+        let mut sig_decs = SigDecisions::new(input, analysis, &lifetime_plans, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups);
         let free_like_wrappers = collect_local_free_wrappers(tcx);
         let local_raw_free_summaries = collect_local_raw_free_summaries(tcx, &free_like_wrappers);
         let local_raw_param_summaries =
@@ -10218,6 +15308,12 @@ mod tests {
                 changed = true;
             }
             if downgrade_unsupported_box_outputs(tcx, &mut sig_decs, &ptr_kinds) {
+                changed = true;
+            }
+            if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers) {
+                changed = true;
+            }
+            if downgrade_cursor_inputs_from_unanchored_raw_callers(tcx, &mut sig_decs, &ptr_kinds) {
                 changed = true;
             }
 
@@ -10753,9 +15849,9 @@ pub unsafe fn free_nested() {
         let (analysis, after) = analyze_pointer_safety_for_code(code);
         assert_eq!(analysis.safe_box_sites.total(), 0);
         assert_eq!(after.frees, 0);
-        assert_eq!(after.bridge_calls.leak, 0);
+        assert_eq!(after.bridge_calls.leak, 1);
         assert_eq!(after.bridge_calls.from_raw, 1);
-        assert_eq!(after.bridge_calls.into_raw, 1);
+        assert_eq!(after.bridge_calls.into_raw, 0);
     }
 
     #[test]
@@ -10894,7 +15990,9 @@ pub unsafe fn drive(mut ctx: *mut Ctx) {
                 consume_did,
                 SigDecision {
                     input_decs: vec![Some(PtrKind::Raw(true)), Some(PtrKind::OptRef(false))],
+                    input_lifetimes: vec![None, None],
                     output_dec: None,
+                    output_lifetime: None,
                     signature_locked: false,
                 },
             );
@@ -10902,7 +16000,9 @@ pub unsafe fn drive(mut ctx: *mut Ctx) {
                 drive_did,
                 SigDecision {
                     input_decs: vec![Some(PtrKind::OptRef(true))],
+                    input_lifetimes: vec![None],
                     output_dec: None,
+                    output_lifetime: None,
                     signature_locked: false,
                 },
             );
@@ -10928,7 +16028,9 @@ pub unsafe fn drive(mut ctx: *mut Ctx) {
                 consume_did,
                 SigDecision {
                     input_decs: vec![Some(PtrKind::Slice(true)), Some(PtrKind::OptRef(false))],
+                    input_lifetimes: vec![None, None],
                     output_dec: None,
+                    output_lifetime: None,
                     signature_locked: false,
                 },
             );
@@ -10936,7 +16038,9 @@ pub unsafe fn drive(mut ctx: *mut Ctx) {
                 drive_did,
                 SigDecision {
                     input_decs: vec![Some(PtrKind::OptRef(true))],
+                    input_lifetimes: vec![None],
                     output_dec: None,
+                    output_lifetime: None,
                     signature_locked: false,
                 },
             );
@@ -10954,6 +16058,108 @@ pub unsafe fn drive(mut ctx: *mut Ctx) {
             );
         })
         .unwrap();
+    }
+
+    #[test]
+    fn force_signature_input_raw_for_binding_clears_input_lifetime() {
+        let code = r#"
+pub unsafe fn id(x: *mut i32) -> *mut i32 {
+    x
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = find_fn_did(tcx, "id");
+            let x_hir_id = find_param_hir_id(tcx, "id", "x");
+            let lifetime = Symbol::intern("a");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::OptRef(true))],
+                    input_lifetimes: vec![Some(lifetime)],
+                    output_dec: Some(PtrKind::OptRef(true)),
+                    output_lifetime: Some(lifetime),
+                    signature_locked: false,
+                },
+            );
+
+            assert!(force_signature_input_raw_for_binding(
+                tcx,
+                &mut sig_decs,
+                x_hir_id,
+            ));
+
+            let sig_dec = &sig_decs.data[&did];
+            assert_eq!(sig_dec.input_decs[0], Some(PtrKind::Raw(true)));
+            assert_eq!(sig_dec.input_lifetimes[0], None);
+            assert_eq!(sig_dec.output_lifetime, Some(lifetime));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn raw_local_caller_keeps_negative_cursor_input_raw() {
+        let code = r#"
+extern "C" {
+    fn foreign() -> *const u8;
+}
+
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let p = foreign();
+    read_before(p)
+}
+"#;
+
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        let normalized = normalize_expr_snippet(&rewritten);
+        assert!(
+            normalized.contains("fnread_before(p:*constu8)")
+                || normalized.contains("fnread_before(mutp:*constu8)"),
+            "{rewritten}"
+        );
+        assert!(
+            !normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
+            "{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+    }
+
+    #[test]
+    fn array_pointer_caller_keeps_negative_cursor_input_cursor() {
+        let code = r#"
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    read_before(buf.as_ptr().offset(1))
+}
+"#;
+
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        let normalized = normalize_expr_snippet(&rewritten);
+        assert!(
+            normalized.contains("fnread_before(p:crate::slice_cursor::SliceCursor")
+                || normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
+            "{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
     }
 
     #[test]

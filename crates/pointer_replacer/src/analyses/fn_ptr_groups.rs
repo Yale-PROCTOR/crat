@@ -211,20 +211,29 @@ mod tests {
             let source_var_groups =
                 crate::analyses::mir_variable_grouping::SourceVarGroups::new(&input);
             let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-            let (mutable_references, shared_references) =
+            let borrow_promotion_result =
                 crate::analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-            let promoted_mut_ref_result =
-                source_var_groups.postprocess_promoted_mut_refs(mutable_references);
-            let promoted_shared_ref_result =
-                source_var_groups.postprocess_promoted_mut_refs(shared_references);
+            let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+            let struct_copy_result = crate::analyses::struct_copy::analyze(
+                &input,
+                &borrow_promotion_result.mutable_fields,
+            );
+            let promoted_mut_ref_result = source_var_groups
+                .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+            let promoted_shared_ref_result = source_var_groups
+                .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
             let fatness_result =
                 crate::analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
             let mut offset_sign_result =
                 crate::analyses::offset_sign::sign::offset_sign_analysis(&input);
             offset_sign_result.access_signs =
                 source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-            let nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
+            let mut nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
+            nullity_result.non_null_locals =
+                source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
             let analysis = crate::rewriter::Analysis {
+                borrow_promotion_result,
+                borrow_lifetime_flows,
                 promoted_mut_ref_result,
                 promoted_shared_ref_result,
                 mutability_result,
@@ -234,6 +243,7 @@ mod tests {
                 ownership_schemes: None,
                 offset_sign_result,
                 nullity_result,
+                struct_copy_result,
             };
             let groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis);
             let named = named_fns(tcx);
@@ -411,6 +421,26 @@ pub unsafe fn use_all(p: *const i32) -> i32 { call_it(f, p) }
             rewritten.contains("CB: unsafe fn(&i32)"),
             "expected static CB type annotation rewritten to unsafe fn(&i32), got:\n{rewritten}"
         );
+    }
+
+    #[test]
+    fn braced_struct_fn_ptr_field_annotation_is_rewritten() {
+        let code = r#"
+pub unsafe fn f(p: *const i32) -> i32 { *p }
+pub struct Holder {
+    cb: unsafe fn(*const i32) -> i32,
+}
+pub unsafe fn make_holder() -> Holder {
+    Holder { cb: f }
+}
+"#;
+        let rewritten = rewrite(code);
+        assert!(
+            rewritten.contains("cb: unsafe fn(&i32)"),
+            "expected Holder.cb annotation rewritten to unsafe fn(&i32), got:\n{rewritten}"
+        );
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
     }
 
     #[test]

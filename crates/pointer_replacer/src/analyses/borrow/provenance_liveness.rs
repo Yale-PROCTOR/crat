@@ -8,7 +8,7 @@ use rustc_mir_dataflow::{
     points::{DenseLocationMap, PointIndex},
 };
 
-use super::{Provenance, ProvenanceSet};
+use super::{Provenance, ProvenanceSet, direct_raw_pointer_field_slots_in_ty};
 use crate::analyses::{liveness::MaybeLiveLocals, mir::TerminatorExt};
 
 /// The set of program points that a [`Provenance`] is live on exit
@@ -40,11 +40,17 @@ pub fn compute_provenance_liveness<'tcx>(
 
             local_liveness.seek_before_primary_effect(location);
             let liveness = local_liveness.get();
-            for provenance in liveness
-                .iter()
-                .flat_map(|local| provenance_set.local_data[local])
-            {
-                provenance_liveness.insert(point_index, provenance);
+            for local in liveness.iter() {
+                if let Some(provenance) = provenance_set.local_data[local] {
+                    provenance_liveness.insert(point_index, provenance);
+                }
+                for field in direct_raw_pointer_field_slots_in_ty(tcx, body.local_decls[local].ty) {
+                    if let Some(provenance) =
+                        provenance_set.field_data.get(&field).copied().flatten()
+                    {
+                        provenance_liveness.insert(point_index, provenance);
+                    }
+                }
             }
 
             if position == bb_len - 1 {

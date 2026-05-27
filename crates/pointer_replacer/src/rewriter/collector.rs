@@ -4,15 +4,19 @@ use rustc_hir::{
     def::{DefKind, Res},
     intravisit::{Visitor, walk_expr},
 };
-use rustc_middle::mir::Local;
+use rustc_middle::mir::{Local, Operand, Rvalue, StatementKind};
 use rustc_span::def_id::LocalDefId;
 
-use super::{Analysis, decision::PtrKind};
+use super::{
+    Analysis,
+    decision::{PtrKind, SigDecisions},
+};
 use crate::{rewriter::decision::DecisionMaker, utils::rustc::RustProgram};
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
+    sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
@@ -45,23 +49,48 @@ pub fn collect_diffs<'tcx>(
             .len();
 
         let aliases = analysis.aliases.get(did);
+        let returned_output_locals = sig_decs
+            .data
+            .get(did)
+            .and_then(|sig_dec| sig_dec.output_dec)
+            .filter(|kind| matches!(kind, PtrKind::Ref(_) | PtrKind::OptRef(_)))
+            .map(|kind| collect_returned_output_locals(body, kind))
+            .unwrap_or_default();
 
         for (local, decl) in body.local_decls.iter_enumerated().skip(1) {
             let is_input = local.index() <= input_len;
+            let sig_input_dec = local
+                .index()
+                .checked_sub(1)
+                .filter(|idx| *idx < input_len)
+                .and_then(|idx| {
+                    sig_decs
+                        .data
+                        .get(did)?
+                        .input_decs
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                });
             let aliases = aliases.and_then(|aliases| aliases.get(&local));
 
-            let decision = if is_input && used_as_fn_ptr {
-                if let Some(&rep) = fn_ptr_groups.fn_to_group.get(did) {
-                    fn_ptr_groups
-                        .group_decisions
-                        .get(&rep)
-                        .and_then(|decs| decs.get(local.index() - 1).copied())
-                        .flatten()
-                } else {
-                    continue;
-                }
+            let group_input_dec = if is_input && used_as_fn_ptr {
+                fn_ptr_groups
+                    .fn_to_group
+                    .get(did)
+                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep))
+                    .and_then(|decs| decs.get(local.index() - 1).copied())
+                    .flatten()
             } else {
-                decision_maker.decide(local, decl, aliases)
+                None
+            };
+
+            let decision = if is_input && used_as_fn_ptr {
+                sig_input_dec.or(group_input_dec)
+            } else {
+                sig_input_dec
+                    .or_else(|| returned_output_locals.get(&local).copied())
+                    .or_else(|| decision_maker.decide(local, decl, aliases))
             };
 
             if let Some(mut ptr_kind) = decision
@@ -76,6 +105,44 @@ pub fn collect_diffs<'tcx>(
     }
 
     ptr_kinds
+}
+
+fn collect_returned_output_locals(
+    body: &rustc_middle::mir::Body<'_>,
+    output_kind: PtrKind,
+) -> FxHashMap<Local, PtrKind> {
+    let mut locals = FxHashMap::default();
+    locals.insert(Local::from_u32(0), output_kind);
+
+    loop {
+        let mut changed = false;
+        for bb in body.basic_blocks.iter() {
+            for stmt in &bb.statements {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                let Some(destination) = place.as_local() else {
+                    continue;
+                };
+                if !locals.contains_key(&destination) {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(source) | Operand::Move(source)) = rvalue else {
+                    continue;
+                };
+                let Some(source) = source.as_local() else {
+                    continue;
+                };
+                changed |= locals.insert(source, output_kind).is_none();
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    locals.remove(&Local::from_u32(0));
+    locals
 }
 
 fn collect_non_outermost_owning_hir_locals(rust_program: &RustProgram) -> FxHashSet<HirId> {
