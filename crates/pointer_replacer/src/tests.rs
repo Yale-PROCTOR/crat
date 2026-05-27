@@ -5417,6 +5417,48 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+/// Null constructors assigned to SliceCursor pointers should use the matching
+/// empty cursor type, not raw/null or a nonexistent cursor reference type.
+#[test]
+fn test_null_ptr_constructor_slice_cursor() {
+    let config = Config::default();
+    let (s, _) = rewrite_with_config(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn mut_cursor() -> libc::c_int {
+    let mut arr: [libc::c_int; 4] = [0; 4];
+    let mut p: *mut libc::c_int = arr.as_mut_ptr().offset(2);
+    *p.offset(-1) = 10 as libc::c_int;
+    p = std::ptr::null_mut();
+    return 0 as libc::c_int;
+}
+
+pub unsafe extern "C" fn shared_cursor() -> libc::c_int {
+    let arr: [libc::c_int; 4] = [1; 4];
+    let mut p: *const libc::c_int = arr.as_ptr().offset(2);
+    let v = *p.offset(-1);
+    p = std::ptr::null();
+    return v;
+}
+"#,
+        &config,
+    );
+
+    assert!(
+        s.contains("crate::slice_cursor::SliceCursorMut::empty()"),
+        "Expected mutable null constructor to use SliceCursorMut::empty():\n{s}"
+    );
+    assert!(
+        s.contains("crate::slice_cursor::SliceCursor::empty()"),
+        "Expected shared null constructor to use SliceCursor::empty():\n{s}"
+    );
+    assert!(
+        !s.contains("SliceCursorRef::empty()"),
+        "Expected no nonexistent SliceCursorRef constructor:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
 /// Null literal (`0 as *mut T`) assigned to Raw pointer → `std::ptr::null_mut()`.
 /// Exercises the `is_zero() + PtrCtx::Rhs(Raw)` branch.
 #[test]
