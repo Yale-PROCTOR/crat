@@ -1661,7 +1661,7 @@ pub unsafe extern "C" fn first(buffer: *const Buffer) -> libc::c_int {
 }
 
 #[test]
-fn test_rewriter_demotes_cursor_field_copied_to_local_offset_alias() {
+fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_with_disjoint_root_update() {
     run_test(
         r#"
 #[repr(C)]
@@ -1683,15 +1683,50 @@ pub unsafe fn get_bits(bs: *mut Bs, n: i32) -> u32 {
 }
 "#,
         &[
-            "pub struct Bs {",
-            "pub buf: *const u8",
-            "std::slice::from_raw_parts(((bs.buf).offset",
+            "pub struct Bs<'a>",
+            "pub buf: crate::slice_cursor::SliceCursor<'a, u8>",
+            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
+            "p.seek((1) as isize)",
         ],
         &[
+            "pub buf: *const u8",
+            "std::slice::from_raw_parts(((bs.buf).offset",
+            "*p.offset",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_without_root_mutation() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Bs {
+    pub buf: *const u8,
+    pub pos: i32,
+    pub limit: i32,
+}
+
+pub unsafe fn read_two(bs: *const Bs) -> u32 {
+    let mut p: *const u8 = ((*bs).buf).offset(((*bs).pos >> 3) as isize);
+    if (*bs).pos > (*bs).limit {
+        return 0;
+    }
+    let first = *p as u32;
+    p = p.offset(1);
+    first + (*p as u32)
+}
+"#,
+        &[
             "pub struct Bs<'a>",
-            "pub buf: crate::slice_cursor::SliceCursor",
-            "let mut p: crate::slice_cursor::SliceCursor",
-            "}).as_slice()",
+            "pub buf: crate::slice_cursor::SliceCursor<'a, u8>",
+            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
+            "p.seek((1) as isize)",
+        ],
+        &[
+            "pub buf: *const u8",
+            "std::slice::from_raw_parts(((bs.buf).offset",
+            "*p as u32",
         ],
     );
 }
@@ -1990,6 +2025,37 @@ pub unsafe fn last_value(mut head: *mut Node) -> i32 {
             "impl ::core::clone::Clone for Node",
             "head = unsafe { ((*(head).as_deref().unwrap()).next).as_ref() };",
         ],
+    );
+}
+
+#[test]
+fn test_rewriter_promotes_noop_cast_of_recursive_field_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub value: i32,
+    pub next: *mut Node,
+}
+
+
+pub unsafe fn second_value(current: *const Node) -> i32 {
+    if current.is_null() {
+        return 0;
+    }
+    let next: *const Node = (*current).next as *const Node;
+    if next.is_null() {
+        return (*current).value;
+    }
+    (*next).value
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "pub next: Option<&'a mut Node<'a>>",
+            "((*current.unwrap()).next).as_deref()",
+        ],
+        &["pub next: *mut Node", "as_ref()"],
     );
 }
 
@@ -6575,6 +6641,49 @@ pub unsafe extern "C" fn SPX_wots_gen_leafx1(dest: *mut u8, info: *mut Info, len
         &config,
         &["pub struct Info<", "pub steps: &'"],
         &["pub steps: *const u32"],
+    );
+}
+
+#[test]
+fn test_c_exposed_wrapped_function_keeps_cursor_struct_field_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("read_bits".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct Bs {
+    pub buf: *const u8,
+    pub pos: i32,
+    pub limit: i32,
+}
+
+#[repr(C)]
+pub struct Out {
+    pub value: i32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn read_bits(bs: *mut Bs, out: *mut Out, hdr: *const u8) -> i32 {
+    if bs.is_null() || out.is_null() || hdr.is_null() {
+        return 0;
+    }
+    let mut p: *const u8 = ((*bs).buf).offset(((*bs).pos >> 3) as isize);
+    (*bs).pos += 8;
+    if (*bs).pos > (*bs).limit {
+        return 0;
+    }
+    (*out).value = *hdr.offset(1) as i32;
+    let first = *p as i32;
+    p = p.offset(1);
+    first + (*p as i32)
+}
+"#,
+        &config,
+        &["pub struct Bs {", "pub buf: *const u8"],
+        &[
+            "pub struct Bs<'",
+            "pub buf: crate::slice_cursor::SliceCursor",
+        ],
     );
 }
 
