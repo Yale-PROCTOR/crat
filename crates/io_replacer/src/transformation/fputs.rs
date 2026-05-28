@@ -20,29 +20,9 @@ impl TransformVisitor<'_, '_, '_> {
         let s_str = pprust::expr_to_string(s);
         self.lib_items.borrow_mut().insert(LibItem::Fputs);
 
-        if let Some((array, ty)) = self.array_of_as_ptr(s) {
-            if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.dependencies.bytemuck.set(true);
-                let e = format!(
-                    "crate::c_lib::rs_fputs(
-                        std::ffi::CStr::from_bytes_until_nul(
-                            bytemuck::cast_slice(&({array}))
-                        ).unwrap(),
-                        {stream_str},
-                    )"
-                );
-                return self.update_error_no_eof(ic, e, stream);
-            } else if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                let e = format!(
-                    "crate::c_lib::rs_fputs(
-                        std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
-                        {stream_str},
-                    )"
-                );
-                return self.update_error_no_eof(ic, e, stream);
-            }
+        if let Some(cstr) = self.cstr_from_as_ptr(s) {
+            let e = format!("crate::c_lib::rs_fputs({cstr}, {stream_str})");
+            return self.update_error_no_eof(ic, e, stream);
         }
 
         self.update_error_no_eof(
@@ -77,27 +57,9 @@ impl TransformVisitor<'_, '_, '_> {
             return self.update_error_no_eof(ic, e, &StdExpr::stdout());
         }
 
-        if let Some((array, ty)) = self.array_of_as_ptr(s) {
-            if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.dependencies.bytemuck.set(true);
-                let e = format!(
-                    "crate::c_lib::rs_puts(
-                        std::ffi::CStr::from_bytes_until_nul(
-                            bytemuck::cast_slice(&({array}))
-                        ).unwrap(),
-                    )"
-                );
-                return self.update_error_no_eof(ic, e, &StdExpr::stdout());
-            } else if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                let e = format!(
-                    "crate::c_lib::rs_puts(
-                        std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap(),
-                    )"
-                );
-                return self.update_error_no_eof(ic, e, &StdExpr::stdout());
-            }
+        if let Some(cstr) = self.cstr_from_as_ptr(s) {
+            let e = format!("crate::c_lib::rs_puts({cstr})");
+            return self.update_error_no_eof(ic, e, &StdExpr::stdout());
         }
 
         self.update_error_no_eof(

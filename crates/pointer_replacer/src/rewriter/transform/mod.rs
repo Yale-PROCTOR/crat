@@ -6628,26 +6628,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     } else if is_mut_cursor_base {
                         if m {
                             e = utils::expr!(
-                                "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                                "({}).as_deref_mut().offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         } else if is_slice_cursor_mut_constructor_call(&e) {
                             e = utils::expr!(
-                                "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
+                                "({}).as_deref().offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         } else {
                             e = utils::expr!(
-                                "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
+                                "crate::slice_cursor::SliceCursor::new(({}).as_slice()).offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         }
                     } else {
                         e = utils::expr!(
-                            "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
+                            "({}).offset_by(({}) as isize)",
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );

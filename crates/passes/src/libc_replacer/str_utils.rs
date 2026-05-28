@@ -12,7 +12,7 @@ use rustc_middle::ty;
 
 use crate::libc_replacer::LibItem;
 
-impl super::TransformVisitor<'_> {
+impl<'tcx> super::TransformVisitor<'tcx> {
     pub(super) fn c_byte_slice(&mut self, s: &Expr) -> Option<String> {
         if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
             if expr_has_with_borrow_call(array) {
@@ -24,6 +24,15 @@ impl super::TransformVisitor<'_> {
             } else if ty == self.tcx.types.i8 {
                 self.bytemuck = true;
                 return Some(format!("bytemuck::cast_slice::<_, u8>(&({array}))"));
+            }
+        }
+
+        if let Some((cursor, ty)) = self.slice_cursor_of_as_ptr(s, false, &[]) {
+            if ty == self.tcx.types.u8 {
+                return Some(cursor);
+            } else if ty == self.tcx.types.i8 {
+                self.bytemuck = true;
+                return Some(format!("bytemuck::cast_slice::<_, u8>({cursor})"));
             }
         }
 
@@ -45,25 +54,34 @@ impl super::TransformVisitor<'_> {
         s: &Expr,
         method_names: &[&str],
     ) -> Option<String> {
-        let (array, ty) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx)?;
-        if expr_is_static_path(array, &self.ast_to_hir, self.tcx) {
-            return None;
+        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
+            if expr_is_static_path(array, &self.ast_to_hir, self.tcx) {
+                return None;
+            }
+            if expr_has_with_borrow_call(array) || expr_has_method_call(array, method_names) {
+                return None;
+            }
+            let already_mut_ref = self.expr_is_mut_ref(array);
+            let array = pprust::expr_to_string(array);
+            let array_ref = if already_mut_ref {
+                format!("&mut *({array})")
+            } else {
+                format!("&mut ({array})")
+            };
+            if ty == self.tcx.types.u8 {
+                return Some(array_ref);
+            } else if ty == self.tcx.types.i8 {
+                self.bytemuck = true;
+                return Some(format!("bytemuck::cast_slice_mut::<_, u8>({array_ref})"));
+            }
         }
-        if expr_has_with_borrow_call(array) || expr_has_method_call(array, method_names) {
-            return None;
-        }
-        let already_mut_ref = self.expr_is_mut_ref(array);
-        let array = pprust::expr_to_string(array);
-        let array_ref = if already_mut_ref {
-            format!("&mut *({array})")
-        } else {
-            format!("&mut ({array})")
-        };
+
+        let (cursor, ty) = self.slice_cursor_of_as_ptr(s, true, method_names)?;
         if ty == self.tcx.types.u8 {
-            Some(array_ref)
+            Some(cursor)
         } else if ty == self.tcx.types.i8 {
             self.bytemuck = true;
-            Some(format!("bytemuck::cast_slice_mut::<_, u8>({array_ref})"))
+            Some(format!("bytemuck::cast_slice_mut::<_, u8>({cursor})"))
         } else {
             None
         }
@@ -81,20 +99,66 @@ impl super::TransformVisitor<'_> {
             })
     }
 
-    pub fn transform_strlen(&mut self, s: &Expr) -> Expr {
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!(
-                    "std::ffi::CStr::from_bytes_until_nul(&({array})).unwrap().count_bytes()"
-                );
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!(
-                    "std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({array}))).unwrap().count_bytes()"
-                );
+    fn slice_cursor_of_as_ptr(
+        &self,
+        s: &Expr,
+        mutable: bool,
+        method_names: &[&str],
+    ) -> Option<(String, ty::Ty<'tcx>)> {
+        let ExprKind::MethodCall(call) = &utils::ast::unwrap_cast_and_paren(s).kind else {
+            return None;
+        };
+        let method_name = call.seg.ident.name.as_str();
+        if mutable {
+            if method_name != "as_mut_ptr" {
+                return None;
             }
+        } else if method_name != "as_ptr" && method_name != "as_mut_ptr" {
+            return None;
+        }
+        let receiver = &call.receiver;
+        if expr_has_with_borrow_call(receiver) || expr_has_method_call(receiver, method_names) {
+            return None;
+        }
+        let (elem_ty, is_mut_cursor) = self.slice_cursor_elem_ty(receiver)?;
+        let is_offset_by = is_offset_by_call(receiver);
+        let receiver = pprust::expr_to_string(receiver);
+        let slice = if mutable {
+            format!("({receiver}).as_slice_mut()")
+        } else if is_mut_cursor && is_offset_by {
+            format!("({receiver}).as_deref().as_slice()")
+        } else {
+            format!("({receiver}).as_slice()")
+        };
+        Some((slice, elem_ty))
+    }
+
+    fn slice_cursor_elem_ty(&self, e: &Expr) -> Option<(ty::Ty<'tcx>, bool)> {
+        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_e.hir_id.owner);
+        let ty = typeck.expr_ty(hir_e).peel_refs();
+        let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() else {
+            return None;
+        };
+        let item_name = self.tcx.item_name(adt_def.did());
+        let is_mut_cursor = item_name.as_str() == "SliceCursorMut";
+        if item_name.as_str() != "SliceCursor" && !is_mut_cursor {
+            return None;
+        }
+        generic_args.iter().find_map(|arg| {
+            if let ty::GenericArgKind::Type(ty) = arg.kind() {
+                Some((ty, is_mut_cursor))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn transform_strlen(&mut self, s: &Expr) -> Expr {
+        if let Some(s) = self.c_byte_slice(s) {
+            return utils::expr!(
+                "std::ffi::CStr::from_bytes_until_nul({s}).unwrap().count_bytes()"
+            );
         }
 
         let s_str = pprust::expr_to_string(s);
@@ -244,6 +308,13 @@ fn expr_is_static_path(expr: &Expr, ast_to_hir: &utils::ir::AstToHir, tcx: ty::T
             ))
         )
     })
+}
+
+fn is_offset_by_call(e: &Expr) -> bool {
+    matches!(
+        &utils::ast::unwrap_cast_and_paren(e).kind,
+        ExprKind::MethodCall(call) if call.seg.ident.name.as_str() == "offset_by"
+    )
 }
 
 fn expr_has_with_borrow_call(expr: &Expr) -> bool {
