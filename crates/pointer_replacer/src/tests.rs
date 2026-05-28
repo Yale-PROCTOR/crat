@@ -6122,6 +6122,31 @@ pub unsafe fn foo() {
 }
 
 #[test]
+fn test_array_field_unsigned_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub addr: [u8; 16],
+    pub pos: u32,
+}
+
+pub unsafe fn consume(addr: *mut u8) {
+    *addr.offset(0) = 1;
+    *addr.offset(1) = 2;
+}
+
+pub unsafe fn foo(info: *mut Info) {
+    let pos = (*info).pos % 8;
+    consume((*info).addr.as_mut_ptr().offset(pos as isize));
+}
+"#,
+        &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
+        &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
 fn test_array_field_const_offset_raw_arg_uses_slice_suffix_ptr() {
     run_test(
         r#"
