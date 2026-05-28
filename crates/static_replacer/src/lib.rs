@@ -9,6 +9,7 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 
+mod return_escape;
 mod transformation;
 
 pub use transformation::replace_static;
