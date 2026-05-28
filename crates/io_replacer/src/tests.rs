@@ -605,6 +605,87 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_printf_and_fputs_slice_cursor_offset_by_string() {
+    run_test(
+        r#"
+pub mod slice_cursor {
+    pub struct SliceCursorMut<'a, T> {
+        base: &'a mut [T],
+        pos: usize,
+    }
+
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+        pos: usize,
+    }
+
+    impl<'a, T> Copy for SliceCursor<'a, T> {}
+
+    impl<'a, T> Clone for SliceCursor<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_deref(self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
+        }
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_slice(&self) -> &'a [T] {
+            &self.base[self.pos..]
+        }
+    }
+}
+
+unsafe fn f(
+    cursor: crate::slice_cursor::SliceCursor<'_, libc::c_char>,
+    mut_cursor: crate::slice_cursor::SliceCursorMut<'_, libc::c_char>,
+    start: isize,
+) {
+    printf(
+        b"%s %s %.2s\0" as *const u8 as *const libc::c_char,
+        cursor.offset_by(start).as_ptr(),
+        mut_cursor.offset_by(start).as_ptr(),
+        cursor.offset_by(start).as_ptr(),
+    );
+    fputs(cursor.offset_by(start).as_ptr(), stdout);
+}"#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice((cursor.offset_by(start)).as_slice())",
+            "(mut_cursor.offset_by(start)).as_deref().as_slice()",
+            "crate::c_lib::rs_fputs",
+        ],
+        &["std::ffi::CStr::from_ptr"],
+    );
+}
+
+#[test]
 fn test_printf_result() {
     run_test(
         r#"

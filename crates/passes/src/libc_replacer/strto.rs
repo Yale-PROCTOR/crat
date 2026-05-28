@@ -17,27 +17,14 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseFloat);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(nptr, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!(
-                    "crate::c_lib::strtod(
-                        &({array}),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {error},
-                    )"
-                );
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!(
-                    "crate::c_lib::strtod(
-                        bytemuck::cast_slice(&({array})),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {error},
-                    )"
-                );
-            }
+        if let Some(nptr) = self.c_byte_slice(nptr) {
+            return utils::expr!(
+                "crate::c_lib::strtod(
+                    {nptr},
+                    ({endptr_str} as *mut *const u8).as_mut(),
+                    {error},
+                )"
+            );
         }
 
         utils::expr!(
@@ -68,29 +55,15 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseInteger);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(nptr, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!(
-                    "crate::c_lib::strtol(
-                        &({array}),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {base_str},
-                        {error},
-                    )"
-                );
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!(
-                    "crate::c_lib::strtol(
-                        bytemuck::cast_slice(&({array})),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {base_str},
-                        {error},
-                    )"
-                );
-            }
+        if let Some(nptr) = self.c_byte_slice(nptr) {
+            return utils::expr!(
+                "crate::c_lib::strtol(
+                    {nptr},
+                    ({endptr_str} as *mut *const u8).as_mut(),
+                    {base_str},
+                    {error},
+                )"
+            );
         }
 
         utils::expr!(
@@ -122,29 +95,15 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseInteger);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(nptr, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!(
-                    "crate::c_lib::strtoul(
-                        &({array}),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {base_str},
-                        {error},
-                    )"
-                );
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!(
-                    "crate::c_lib::strtoul(
-                        bytemuck::cast_slice(&({array})),
-                        ({endptr_str} as *mut *const u8).as_mut(),
-                        {base_str},
-                        {error},
-                    )"
-                );
-            }
+        if let Some(nptr) = self.c_byte_slice(nptr) {
+            return utils::expr!(
+                "crate::c_lib::strtoul(
+                    {nptr},
+                    ({endptr_str} as *mut *const u8).as_mut(),
+                    {base_str},
+                    {error},
+                )"
+            );
         }
 
         utils::expr!(
@@ -164,15 +123,8 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseFloat);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!("crate::c_lib::atof(&({array}))");
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!("crate::c_lib::atof(bytemuck::cast_slice(&({array})))");
-            }
+        if let Some(s) = self.c_byte_slice(s) {
+            return utils::expr!("crate::c_lib::atof({s})");
         }
 
         utils::expr!("crate::c_lib::atof(std::slice::from_raw_parts(({s_str}) as _, 1_000_000))")
@@ -184,15 +136,8 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseInteger);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some((array, ty)) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx) {
-            if ty == self.tcx.types.u8 {
-                let array = pprust::expr_to_string(array);
-                return utils::expr!("crate::c_lib::atoi(&({array}))");
-            } else if ty == self.tcx.types.i8 {
-                let array = pprust::expr_to_string(array);
-                self.bytemuck = true;
-                return utils::expr!("crate::c_lib::atoi(bytemuck::cast_slice(&({array})))");
-            }
+        if let Some(s) = self.c_byte_slice(s) {
+            return utils::expr!("crate::c_lib::atoi({s})");
         }
 
         utils::expr!("crate::c_lib::atoi(std::slice::from_raw_parts(({s_str}) as _, 1_000_000))")

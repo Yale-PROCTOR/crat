@@ -353,6 +353,11 @@ fn slice_cursor_mod_str() -> &'static str {
             self.pos = self.pos.wrapping_add_signed(offset);
         }
 
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.seek(offset);
+            self
+        }
+
         pub fn is_empty(&self) -> bool {
             self.pos >= self.base.len()
         }
@@ -420,6 +425,11 @@ fn slice_cursor_mod_str() -> &'static str {
             self.pos = self.pos.wrapping_add_signed(offset);
         }
 
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.seek(offset);
+            self
+        }
+
         pub fn is_empty(&self) -> bool {
             self.pos >= self.base.len()
         }
@@ -432,7 +442,7 @@ fn slice_cursor_mod_str() -> &'static str {
             self.base.get(self.pos)
         }
 
-        pub fn as_slice(&self) -> &[T] {
+        pub fn as_slice(&self) -> &'a [T] {
             &self.base[self.pos..]
         }
     }

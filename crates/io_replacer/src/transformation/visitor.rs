@@ -419,6 +419,70 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
     pub(super) fn array_of_as_ptr<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, ty::Ty<'tcx>)> {
         utils::ir::array_of_as_ptr(e, &self.ast_to_hir, self.tcx)
     }
+
+    pub(super) fn cstr_from_as_ptr(&self, e: &Expr) -> Option<String> {
+        let (slice, elem_ty) = self.byte_slice_from_as_ptr(e)?;
+        let bytes = if elem_ty == self.tcx.types.u8 {
+            slice
+        } else if elem_ty.is_numeric() {
+            self.dependencies.bytemuck.set(true);
+            format!("bytemuck::cast_slice({slice})")
+        } else {
+            return None;
+        };
+        Some(format!(
+            "std::ffi::CStr::from_bytes_until_nul({bytes}).unwrap()"
+        ))
+    }
+
+    fn byte_slice_from_as_ptr(&self, e: &Expr) -> Option<(String, ty::Ty<'tcx>)> {
+        if let Some((array, elem_ty)) = self.array_of_as_ptr(e) {
+            return Some((format!("&({})", pprust::expr_to_string(array)), elem_ty));
+        }
+
+        let ExprKind::MethodCall(call) = &utils::ast::unwrap_cast_and_paren(e).kind else {
+            return None;
+        };
+        if call.seg.ident.name != sym::as_ptr {
+            return None;
+        }
+        let (elem_ty, is_mut_cursor) = self.slice_cursor_elem_ty(&call.receiver)?;
+        let receiver = pprust::expr_to_string(&call.receiver);
+        let slice = if is_mut_cursor && is_offset_by_call(&call.receiver) {
+            format!("({receiver}).as_deref().as_slice()")
+        } else {
+            format!("({receiver}).as_slice()")
+        };
+        Some((slice, elem_ty))
+    }
+
+    fn slice_cursor_elem_ty(&self, e: &Expr) -> Option<(ty::Ty<'tcx>, bool)> {
+        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_e.hir_id.owner);
+        let ty = typeck.expr_ty(hir_e).peel_refs();
+        let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() else {
+            return None;
+        };
+        let item_name = self.tcx.item_name(adt_def.did());
+        let is_mut_cursor = item_name == Symbol::intern("SliceCursorMut");
+        if item_name != Symbol::intern("SliceCursor") && !is_mut_cursor {
+            return None;
+        }
+        generic_args.iter().find_map(|arg| {
+            if let ty::GenericArgKind::Type(ty) = arg.kind() {
+                Some((ty, is_mut_cursor))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn is_offset_by_call(e: &Expr) -> bool {
+    matches!(
+        &utils::ast::unwrap_cast_and_paren(e).kind,
+        ExprKind::MethodCall(call) if call.seg.ident.name.as_str() == "offset_by"
+    )
 }
 
 impl MutVisitor for TransformVisitor<'_, '_, '_> {

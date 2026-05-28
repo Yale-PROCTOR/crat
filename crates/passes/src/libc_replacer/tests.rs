@@ -123,6 +123,93 @@ pub unsafe fn copy_static(mut src: &[i8], idx: usize) {
 }
 
 #[test]
+fn test_slice_cursor_offset_by_as_ptr_uses_safe_byte_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn strlen(__s: *const i8) -> usize;
+    fn atoi(__nptr: *const i8) -> i32;
+}
+
+pub mod slice_cursor {
+    pub struct SliceCursorMut<'a, T> {
+        base: &'a mut [T],
+        pos: usize,
+    }
+
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+        pos: usize,
+    }
+
+    impl<'a, T> Copy for SliceCursor<'a, T> {}
+
+    impl<'a, T> Clone for SliceCursor<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_deref(self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
+        }
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_slice(&self) -> &'a [T] {
+            &self.base[self.pos..]
+        }
+    }
+}
+
+pub unsafe fn parse_len(
+    cursor: crate::slice_cursor::SliceCursor<'_, i8>,
+    mut_cursor: crate::slice_cursor::SliceCursorMut<'_, i8>,
+    start: isize,
+) -> usize {
+    strlen(cursor.offset_by(start).as_ptr())
+        + atoi(cursor.offset_by(start).as_ptr()) as usize
+        + strlen(mut_cursor.offset_by(start).as_ptr())
+}
+        "#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "crate::c_lib::atoi",
+            "bytemuck::cast_slice::<_",
+            "(cursor.offset_by(start)).as_slice()",
+            "(mut_cursor.offset_by(start)).as_deref().as_slice()",
+        ],
+        &[
+            "std::ffi::CStr::from_ptr",
+            "std::slice::from_raw_parts((cursor.offset_by(start).as_ptr())",
+        ],
+    );
+}
+
+#[test]
 fn test_string_compare_copy_and_concat_use_c_lib_helpers() {
     run_test(
         r#"

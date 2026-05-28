@@ -1620,7 +1620,7 @@ pub unsafe fn touch(buf: [i32; 4]) -> i32 {
         &[
             "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
             "crate::slice_cursor::SliceCursor::",
-            ".seek((-1) as isize)",
+            ".offset_by((-1) as isize)",
         ],
         &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
     );
@@ -1643,7 +1643,7 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek((s.word_index as isize) as isize)",
+            ".offset_by((s.word_index",
         ],
         &["let mut _c = ((*s).words);", "*(*s).words.offset"],
     );
@@ -1666,7 +1666,7 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
-            ".seek((s.word_index as isize) as isize)",
+            ".offset_by((s.word_index",
         ],
         &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
@@ -1793,7 +1793,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
             "crate::slice_cursor::SliceCursor::from_raw_parts",
-            ".seek((-((s.count / 8) as isize)) as isize)",
+            ".offset_by((-((s.count / 8) as isize))",
         ],
         &[
             "pub words: Option<&'a u32>",
@@ -1821,7 +1821,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek((-((s.count / 8) as isize)) as isize)",
+            ".offset_by((-((s.count / 8) as isize))",
         ],
         &["}).as_mut_ptr()", "*(*s).words.offset"],
     );
@@ -1845,7 +1845,7 @@ pub unsafe fn container_from_b(i: *const i32) -> *const Pair {
             "pub unsafe fn container_from_b(i: crate::slice_cursor::SliceCursor<'_, i32>)",
             "bytemuck::cast_slice::<_,",
             "i8>((i).as_slice())",
-            ".seek((-(4 as isize)) as isize)",
+            ".offset_by((-(4 as isize))",
         ],
         &["crate::slice_cursor::SliceCursor::from_raw_parts((i).as_ptr()"],
     );
@@ -7235,10 +7235,7 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
     return foo(q, 1 as libc::c_int);
 }
 "#,
-        &[
-            "SliceCursor::new((p).as_slice())",
-            ".seek((4 as isize) as isize)",
-        ],
+        &["SliceCursor::new((p).as_slice())", ".offset_by((4 as"],
         &["}).as_deref()"],
     );
 }
