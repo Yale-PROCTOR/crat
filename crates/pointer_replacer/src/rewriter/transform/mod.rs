@@ -55,6 +55,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     field_cursor_fields: FxHashSet<StructFieldSlot>,
     c_exposed_abi_fields: FxHashSet<StructFieldSlot>,
     c_exposed_thin_abi_fields: FxHashSet<StructFieldSlot>,
+    c_exposed_cursor_abi_fields: FxHashSet<StructFieldSlot>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
@@ -1203,14 +1204,29 @@ fn collect_c_exposed_thin_input_fields_from_ty(
     }
 }
 
+fn collect_c_exposed_pointer_input_fields_from_ty(
+    tcx: TyCtxt<'_>,
+    ty: ty::Ty<'_>,
+    fields: &mut FxHashSet<StructFieldSlot>,
+) {
+    if let ty::TyKind::RawPtr(pointee, _) | ty::TyKind::Ref(_, pointee, _) = ty.kind() {
+        collect_local_abi_struct_fields_from_ty(tcx, *pointee, fields);
+    }
+}
+
 fn collect_c_exposed_abi_fields<'tcx>(
     rust_program: &RustProgram<'tcx>,
     c_exposed_fns: &FxHashSet<String>,
     sig_decs: &SigDecisions,
-) -> (FxHashSet<StructFieldSlot>, FxHashSet<StructFieldSlot>) {
+) -> (
+    FxHashSet<StructFieldSlot>,
+    FxHashSet<StructFieldSlot>,
+    FxHashSet<StructFieldSlot>,
+) {
     let tcx = rust_program.tcx;
     let mut frozen_fields = FxHashSet::default();
     let mut thin_fields = FxHashSet::default();
+    let mut cursor_fields = FxHashSet::default();
 
     for did in &rust_program.functions {
         if !is_c_exposed_fn(tcx, *did, c_exposed_fns) {
@@ -1226,6 +1242,7 @@ fn collect_c_exposed_abi_fields<'tcx>(
             .any(|dec| matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))));
 
         for (ty, dec) in sig.inputs().iter().copied().zip(&sig_dec.input_decs) {
+            collect_c_exposed_pointer_input_fields_from_ty(tcx, ty, &mut cursor_fields);
             if matches!(dec, Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))) {
                 if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(ty) {
                     collect_local_abi_struct_fields_from_ty(tcx, inner_ty, &mut frozen_fields);
@@ -1245,7 +1262,7 @@ fn collect_c_exposed_abi_fields<'tcx>(
         }
     }
 
-    (frozen_fields, thin_fields)
+    (frozen_fields, thin_fields, cursor_fields)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1373,16 +1390,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
         let raw_scalar_bridge_fields =
             collect_raw_scalar_bridge_fields(rust_program.tcx, &alloc_wrappers);
-        let (c_exposed_abi_fields, c_exposed_thin_abi_fields) =
+        let (c_exposed_abi_fields, c_exposed_thin_abi_fields, c_exposed_cursor_abi_fields) =
             collect_c_exposed_abi_fields(rust_program, &config.c_exposed_fns, &sig_decs);
         let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
-        let demoted_fields = collect_demoted_promoted_fields(
-            rust_program.tcx,
-            analysis,
-            &sig_decs,
-            &ptr_kinds,
-            &field_cursor_fields,
-        );
+        let demoted_fields =
+            collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
         emit_promotion_diagnostics(
             rust_program.tcx,
             analysis,
@@ -1444,6 +1456,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             field_cursor_fields,
             c_exposed_abi_fields,
             c_exposed_thin_abi_fields,
+            c_exposed_cursor_abi_fields,
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             fn_ptr_rewrite,
@@ -1463,6 +1476,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         if self.c_exposed_thin_abi_fields.contains(&field)
             && !matches!(kind, Some(PtrKind::OptRef(_)))
+        {
+            return None;
+        }
+        if self.c_exposed_cursor_abi_fields.contains(&field)
+            && matches!(kind, Some(PtrKind::SliceCursor(_)))
         {
             return None;
         }
@@ -11992,7 +12010,6 @@ fn collect_demoted_promoted_fields(
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    field_cursor_fields: &FxHashSet<StructFieldSlot>,
 ) -> FxHashSet<StructFieldSlot> {
     let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
     promoted_fields.extend(
@@ -12014,15 +12031,9 @@ fn collect_demoted_promoted_fields(
         ptr_kinds,
     );
     demoted_fields.extend(
-        collect_field_conflict_demotion_reasons(
-            tcx,
-            analysis,
-            sig_decs,
-            ptr_kinds,
-            field_cursor_fields,
-        )
-        .keys()
-        .copied(),
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds)
+            .keys()
+            .copied(),
     );
 
     demoted_fields
@@ -12080,7 +12091,6 @@ fn collect_field_conflict_demotion_reasons(
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    field_cursor_fields: &FxHashSet<StructFieldSlot>,
 ) -> FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>> {
     let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
     promoted_fields.extend(
@@ -12101,7 +12111,6 @@ fn collect_field_conflict_demotion_reasons(
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         promoted_fields: &'a FxHashSet<StructFieldSlot>,
         mutable_fields: &'a FxHashSet<StructFieldSlot>,
-        field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
         allocator_locals: FxHashSet<HirId>,
         active_borrows: FxHashMap<HirId, FxHashMap<StructFieldSlot, bool>>,
         ignored_borrow_exprs: FxHashSet<HirId>,
@@ -12246,74 +12255,6 @@ fn collect_field_conflict_demotion_reasons(
             reason: ConflictDemotionReason,
         ) {
             self.record_conflicts(self.promoted_field_slots_in_expr(expr), reason);
-        }
-
-        fn record_cursor_field_offset_binding(&mut self, init: &'tcx hir::Expr<'tcx>) {
-            struct OffsetVisitor<'a, 'tcx> {
-                tcx: TyCtxt<'tcx>,
-                promoted_fields: &'a FxHashSet<StructFieldSlot>,
-                field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
-                fields: FxHashSet<StructFieldSlot>,
-            }
-
-            impl<'tcx> OffsetVisitor<'_, 'tcx> {
-                fn cursor_field_slots_in_expr(
-                    &self,
-                    expr: &'tcx hir::Expr<'tcx>,
-                ) -> FxHashSet<StructFieldSlot> {
-                    struct FieldUseVisitor<'a, 'tcx> {
-                        tcx: TyCtxt<'tcx>,
-                        promoted_fields: &'a FxHashSet<StructFieldSlot>,
-                        field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
-                        fields: FxHashSet<StructFieldSlot>,
-                    }
-
-                    impl<'tcx> Visitor<'tcx> for FieldUseVisitor<'_, 'tcx> {
-                        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-                            if let Some(field) = hir_struct_field_slot(self.tcx, expr)
-                                && self.promoted_fields.contains(&field)
-                                && self.field_cursor_fields.contains(&field)
-                            {
-                                self.fields.insert(field);
-                            }
-                            intravisit::walk_expr(self, expr);
-                        }
-                    }
-
-                    let mut visitor = FieldUseVisitor {
-                        tcx: self.tcx,
-                        promoted_fields: self.promoted_fields,
-                        field_cursor_fields: self.field_cursor_fields,
-                        fields: FxHashSet::default(),
-                    };
-                    visitor.visit_expr(expr);
-                    visitor.fields
-                }
-            }
-
-            impl<'tcx> Visitor<'tcx> for OffsetVisitor<'_, 'tcx> {
-                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-                    if let hir::ExprKind::MethodCall(seg, receiver, _, _) = expr.kind
-                        && matches!(
-                            seg.ident.name.as_str(),
-                            "add" | "offset" | "wrapping_offset"
-                        )
-                    {
-                        self.fields
-                            .extend(self.cursor_field_slots_in_expr(receiver));
-                    }
-                    intravisit::walk_expr(self, expr);
-                }
-            }
-
-            let mut visitor = OffsetVisitor {
-                tcx: self.tcx,
-                promoted_fields: self.promoted_fields,
-                field_cursor_fields: self.field_cursor_fields,
-                fields: FxHashSet::default(),
-            };
-            visitor.visit_expr(init);
-            self.record_conflicts(visitor.fields, ConflictDemotionReason::RawBindingFromField);
         }
 
         fn record_moved_mutable_fields_from_raw_pointee_arg(
@@ -12510,8 +12451,6 @@ fn collect_field_conflict_demotion_reasons(
                         init,
                         ConflictDemotionReason::RawBindingFromField,
                     );
-                } else if matches!(kind, PtrKind::Slice(_) | PtrKind::SliceCursor(_)) {
-                    self.record_cursor_field_offset_binding(init);
                 }
                 return;
             }
@@ -12616,7 +12555,6 @@ fn collect_field_conflict_demotion_reasons(
             ptr_kinds,
             promoted_fields: &promoted_fields,
             mutable_fields: &analysis.borrow_promotion_result.mutable_fields,
-            field_cursor_fields,
             allocator_locals: FxHashSet::default(),
             active_borrows: FxHashMap::default(),
             ignored_borrow_exprs: FxHashSet::default(),
@@ -13505,14 +13443,8 @@ fn emit_promotion_diagnostics(
         sig_decs,
         ptr_kinds,
     );
-    let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
-    let conflict_reasons = collect_field_conflict_demotion_reasons(
-        tcx,
-        analysis,
-        sig_decs,
-        ptr_kinds,
-        &field_cursor_fields,
-    );
+    let conflict_reasons =
+        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds);
     let usage_counts = count_promoted_field_usages(tcx, &promoted_fields);
     let live_fields = promoted_fields
         .iter()
@@ -14469,6 +14401,7 @@ mod tests {
             field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
             c_exposed_abi_fields: FxHashSet::default(),
             c_exposed_thin_abi_fields: FxHashSet::default(),
+            c_exposed_cursor_abi_fields: FxHashSet::default(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir: AstToHir::default(),
             fn_ptr_rewrite: FnPtrRewriteDecision::default(),
@@ -14573,14 +14506,8 @@ mod tests {
                 simulate_transform_reasons(tcx, &input, &analysis);
             let mut sig_decs = sig_decs;
             force_test_input_raw(tcx, &mut sig_decs, "raw_local");
-            let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
-            let reasons = collect_field_conflict_demotion_reasons(
-                tcx,
-                &analysis,
-                &sig_decs,
-                &ptr_kinds,
-                &field_cursor_fields,
-            );
+            let reasons =
+                collect_field_conflict_demotion_reasons(tcx, &analysis, &sig_decs, &ptr_kinds);
             reasons
                 .into_iter()
                 .map(|(field, reasons)| {
