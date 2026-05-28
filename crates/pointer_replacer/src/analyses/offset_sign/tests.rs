@@ -1026,3 +1026,44 @@ fn branch_copy_cycle_aliases_safe() {
         "copy-related aliases in guarded branch should stay non-negative for offset use"
     );
 }
+
+/// return taint: x = f(a); g(x); where g offsets its param negatively.
+/// Chain: g::p (direct) → caller::x (param prop) → f::_0 (internal MIR return slot, not assertable)
+/// → f::a (intra-body edge). The third assertion verifies the final observable hop.
+#[test]
+fn return_taint_two_hops() {
+    let map = run_analysis(
+        "
+        unsafe fn g(p: *const i32) {
+            let _ = *p.offset(-1);
+        }
+        unsafe fn f(a: *const i32) -> *const i32 {
+            a
+        }
+        pub unsafe fn caller(a: *const i32) {
+            let x = f(a);
+            g(x);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "g", "p"),
+        Some(true),
+        "g::p directly offset by -1 needs cursor"
+    );
+    assert_eq!(
+        needs_cursor(&map, "caller", "x"),
+        Some(true),
+        "caller::x flows into g::p which needs cursor — existing param propagation"
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "a"),
+        Some(true),
+        "f::a tainted via return propagation: caller::x → f::_0 → f::a"
+    );
+    assert_eq!(
+        needs_cursor(&map, "caller", "a"),
+        Some(true),
+        "caller::a flows into f::a which needs cursor — propagated back via arg edge"
+    );
+}

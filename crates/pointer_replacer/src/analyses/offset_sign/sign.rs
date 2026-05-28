@@ -1217,7 +1217,12 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
     }
 
     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
-        if let TerminatorKind::Call { func, args, .. } = &terminator.kind
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &terminator.kind
             && let Operand::Constant(box constant) = func
         {
             let ty = constant.const_.ty();
@@ -1263,6 +1268,24 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                             .unwrap_or(FieldNode::Local(self.def_id, place.local));
                         add_field_edge(self.field_graph, lhs, rhs);
                     }
+                }
+                // if caller destination is tainted, callee's return slot also needs cursor
+                if let Some(local_def_id) = def_id.as_local()
+                    && !contains_deref(destination)
+                    && self
+                        .graph
+                        .contains_key(&(local_def_id, Local::from_usize(0)))
+                {
+                    let ret = Local::from_usize(0);
+                    self.graph
+                        .entry((self.def_id, destination.local))
+                        .or_default()
+                        .insert((local_def_id, ret));
+
+                    let lhs = raw_pointer_field_slot(self.body, *destination)
+                        .map(FieldNode::Field)
+                        .unwrap_or(FieldNode::Local(self.def_id, destination.local));
+                    add_field_edge(self.field_graph, lhs, FieldNode::Local(local_def_id, ret));
                 }
             };
         }
