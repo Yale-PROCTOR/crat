@@ -4896,9 +4896,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn array_field_offset_slice_ref(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
         let offset = array_field_direct_offset(pe, false)?;
-        if m && !is_int_lit_expr(offset) {
-            return None;
-        }
         if !self.offset_expr_can_be_slice_index(offset) {
             return None;
         }
