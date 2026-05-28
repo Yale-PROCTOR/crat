@@ -14,7 +14,9 @@ use super::{
     Analysis,
     decision::{PtrKind, SigDecisions},
 };
-use crate::{rewriter::decision::DecisionMaker, utils::rustc::RustProgram};
+use crate::{
+    analyses::borrow::StructFieldSlot, rewriter::decision::DecisionMaker, utils::rustc::RustProgram,
+};
 
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
@@ -102,17 +104,34 @@ pub fn collect_diffs<'tcx>(
                 let Some(hir_id) = local_to_binding.get(&local) else {
                     continue;
                 };
-                if !is_input
-                    && matches!(ptr_kind, PtrKind::Raw(_))
-                    && let Some(init) = binding_inits.get(hir_id).copied()
-                    && let Some(alias_kind) = array_field_pointer_alias_kind(
+                if !is_input && let Some(init) = binding_inits.get(hir_id).copied() {
+                    if let Some(alias_kind) = cursor_field_offset_alias_kind(
                         rust_program.tcx,
+                        analysis,
                         init,
                         &ptr_kinds,
-                        local_needs_cursor(analysis, *did, local),
-                    )
-                {
-                    ptr_kind = alias_kind;
+                        ptr_kind,
+                    ) {
+                        ptr_kind = alias_kind;
+                    } else if let PtrKind::Raw(raw_mutability) = ptr_kind {
+                        let needs_cursor = local_needs_cursor(analysis, *did, local);
+                        if let Some(alias_kind) = array_field_pointer_alias_kind(
+                            rust_program.tcx,
+                            init,
+                            &ptr_kinds,
+                            needs_cursor,
+                        ) {
+                            ptr_kind = alias_kind;
+                        } else if let Some(alias_kind) = pointer_field_alias_kind(
+                            rust_program.tcx,
+                            analysis,
+                            init,
+                            &ptr_kinds,
+                            raw_mutability,
+                        ) {
+                            ptr_kind = alias_kind;
+                        }
+                    }
                 }
                 if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
@@ -231,6 +250,185 @@ fn array_field_pointer_alias_kind<'tcx>(
     }
 
     Some(PtrKind::Slice(mutability))
+}
+
+fn cursor_field_offset_alias_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    init: &'tcx hir::Expr<'tcx>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    ptr_kind: PtrKind,
+) -> Option<PtrKind> {
+    if ptr_kind.is_mut()
+        || !matches!(
+            ptr_kind,
+            PtrKind::Raw(false) | PtrKind::Slice(false) | PtrKind::SliceCursor(false)
+        )
+    {
+        return None;
+    }
+
+    let hir::ExprKind::MethodCall(seg, receiver, args, _) = hir_unwrap_casts(init).kind else {
+        return None;
+    };
+    if !matches!(
+        seg.ident.name.as_str(),
+        "add" | "offset" | "wrapping_offset"
+    ) || args.len() != 1
+    {
+        return None;
+    }
+
+    let field_expr = hir_unwrap_casts(receiver);
+    let hir::ExprKind::Field(base, ident) = field_expr.kind else {
+        return None;
+    };
+
+    let typeck = tcx.typeck(init.hir_id.owner);
+    let field_pointee = raw_ptr_pointee(typeck.expr_ty(field_expr))?;
+    let init_pointee = raw_ptr_pointee(typeck.expr_ty_adjusted(init))?;
+    if field_pointee != init_pointee {
+        return None;
+    }
+
+    let struct_did = hir_local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
+    if local_struct_has_type_alias(tcx, struct_did) {
+        return None;
+    }
+    let field_index = hir_field_index_by_name(tcx, struct_did, ident.name)?;
+    let field = StructFieldSlot {
+        struct_did,
+        field_index,
+    };
+    if !analysis
+        .offset_sign_result
+        .field_access_signs
+        .contains(&field)
+    {
+        return None;
+    }
+    if !analysis
+        .borrow_promotion_result
+        .shared_fields
+        .contains(&field)
+        && !analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+    {
+        return None;
+    }
+
+    let root = hir_projection_root_local_id(base)?;
+    let root_kind = ptr_kinds.get(&root).copied()?;
+    if !is_borrow_like_decision(root_kind) {
+        return None;
+    }
+
+    Some(PtrKind::SliceCursor(false))
+}
+
+fn pointer_field_alias_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    analysis: &Analysis,
+    init: &'tcx hir::Expr<'tcx>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    raw_mutability: bool,
+) -> Option<PtrKind> {
+    if raw_mutability {
+        return None;
+    }
+
+    let field_expr = hir_unwrap_casts(init);
+    let hir::ExprKind::Field(base, ident) = field_expr.kind else {
+        return None;
+    };
+
+    let typeck = tcx.typeck(init.hir_id.owner);
+    let field_pointee = raw_ptr_pointee(typeck.expr_ty(field_expr))?;
+    let init_pointee = raw_ptr_pointee(typeck.expr_ty_adjusted(init))?;
+    if field_pointee != init_pointee {
+        return None;
+    }
+
+    let struct_did = hir_local_struct_did_from_ty(typeck.expr_ty_adjusted(base))?;
+    if local_struct_has_type_alias(tcx, struct_did) {
+        return None;
+    }
+    let field_index = hir_field_index_by_name(tcx, struct_did, ident.name)?;
+    let field = StructFieldSlot {
+        struct_did,
+        field_index,
+    };
+    let field_is_mut = analysis
+        .borrow_promotion_result
+        .mutable_fields
+        .contains(&field);
+    let field_is_shared = analysis
+        .borrow_promotion_result
+        .shared_fields
+        .contains(&field);
+    if !field_is_mut && !field_is_shared {
+        return None;
+    }
+
+    let root = hir_projection_root_local_id(base)?;
+    let root_kind = ptr_kinds.get(&root).copied()?;
+    if !is_borrow_like_decision(root_kind) {
+        return None;
+    }
+
+    Some(PtrKind::OptRef(false))
+}
+
+fn raw_ptr_pointee<'tcx>(ty: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) => Some(*pointee),
+        _ => None,
+    }
+}
+
+fn hir_local_struct_did_from_ty(ty: ty::Ty<'_>) -> Option<LocalDefId> {
+    match ty.kind() {
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct() => {
+            Some(adt_def.did().expect_local())
+        }
+        ty::TyKind::Ref(_, inner, _) => hir_local_struct_did_from_ty(*inner),
+        _ => None,
+    }
+}
+
+fn hir_field_index_by_name(
+    tcx: TyCtxt<'_>,
+    struct_did: LocalDefId,
+    field_name: rustc_span::Symbol,
+) -> Option<usize> {
+    tcx.adt_def(struct_did)
+        .non_enum_variant()
+        .fields
+        .iter_enumerated()
+        .find_map(|(field_index, field)| (field.name == field_name).then_some(field_index.index()))
+}
+
+fn local_struct_has_type_alias(tcx: TyCtxt<'_>, struct_did: LocalDefId) -> bool {
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::TyAlias(_, _, ty) = item.kind else {
+            continue;
+        };
+        if let hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind
+            && let Res::Def(DefKind::Struct, def_id) = path.res
+            && def_id.as_local() == Some(struct_did)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn hir_unwrap_casts<'a, 'hir>(mut expr: &'a hir::Expr<'hir>) -> &'a hir::Expr<'hir> {

@@ -13,7 +13,9 @@ From the main Crat checkout these are also available as
 
 Current next track: continue reducing pointer-field-specific unsafe usage,
 especially the broader `raw_pointer_struct_field_deref` bucket beyond the small
-field-base cleanup already committed.
+field-base cleanup already committed. Prefer a task with an unsafe-count win;
+avoid more correctness-only groundwork unless it directly unlocks a measured
+reduction.
 
 ## Handled So Far
 
@@ -41,6 +43,18 @@ field-base cleanup already committed.
   types match, and the alias is shared-only. This passed smoke/full/vector
   evaluation but did not reduce benchmark unsafe totals, so treat it as a
   correctness guard rather than a measured unsafe-reduction win.
+- The next uncommitted session explored the high-frequency
+  `field_offset;local_alias_to_field_root;raw_deref_field` subshape by promoting
+  shared local aliases initialized from pointer-field `.offset` / `.add` /
+  `.wrapping_offset` calls to `SliceCursor`. The initial version reduced unsafe
+  totals by 6 in smoke/full, but full vectors caught an ABI regression in
+  `Public-Tests/B01_organic/read_side_info_lib`: the exported `bs_t` struct's
+  `buf` field became a `SliceCursor`, changing the `repr(C)` layout observed by
+  the C-compatible harness. The final guarded version keeps cursor-tainted
+  fields raw for structs reached through C-exposed pointer inputs while still
+  allowing internal non-C-exposed cursor aliases. Final validation passed, but
+  unsafe totals returned to baseline (`20263` smoke, `70395` full), so this is
+  also correctness groundwork, not the desired unsafe-count-winning track.
 
 ## Still Open
 
@@ -52,3 +66,39 @@ field-base cleanup already committed.
   ownership, unsafe call-boundary adapters, function-pointer fields, mutable
   statics, and broad mutable local aliases remain out of scope until a targeted
   pattern is selected from the merged span evidence.
+- For the next session, skip C-exposed cursor-field layout rewrites unless the
+  interface layer can preserve ABI. Mine the merged span evidence for a
+  non-C-exposed or ABI-neutral subshape whose benchmark rows can plausibly move
+  the unsafe total, and write the red test from that concrete corpus evidence.
+
+## 2026-05-28 Evidence Pass
+
+- Aggregating `raw_pointer_struct_field_deref` by pointer-field-only rows shows
+  the biggest pointer-field local-alias shapes are still:
+  `field_offset;local_alias_to_field_root;raw_deref_field` (348 rows),
+  `local_alias_to_field_root;raw_deref_field` (226 rows), and
+  `field_mut_borrow;field_offset;local_alias_to_field_root;raw_deref_field`
+  (80 rows). Most high-count cases are C-exposed or ownership-heavy.
+- `Public-Tests/B02_synthetic/generic_foreach` has many `data;size` rows, but
+  its config exposes the array/list APIs. Promotion diagnostics show 8 candidate
+  mutable fields, all shape-demoted, with `raw_storage_allocator` on all 8 and
+  `raw_binding_from_field` / `raw_pointee_field_move` on the array `data`
+  fields. This is not a quick ABI-neutral pointer-field alias win.
+- `Public-Tests/B02_synthetic/memcpy_fun_buffers` is ABI-neutral
+  (`c_exposed_fns = []`) and has 34 pointer-field rows around
+  `buffer_array_t.buffers`. Diagnostics show one candidate field
+  (`src::main::buffer_array_t.buffers`, 23 promoted-field uses), but it is
+  shape-demoted and blocked by `raw_storage_allocator` plus
+  `raw_pointee_field_move`. Treat this as a possible boxed-slice/length-recovery
+  track, not a local-alias-only change.
+- `Public-Tests/B02_organic/underhanded_c_luggage` is also ABI-neutral and has
+  21 pointer-field rows around `RoutingDirective.next_directive`. Diagnostics
+  show one candidate field with 10 uses, no shape demotion, blocked by
+  `raw_binding_from_field` and `raw_pointee_field_move`. A targeted red-test
+  attempt confirmed the hard part: the insertion routine copies
+  `previous.next_directive` into a local, conditionally moves it into
+  `new_directive.next_directive`, and otherwise recurses. A simple mutable alias
+  promotion either borrows `previous.next_directive` too long or would need
+  `take()` plus path-sensitive restoration on the recursive branch. Do not
+  promote this shape until the transform can model take/restore semantics for
+  linked-list field moves.
