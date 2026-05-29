@@ -7890,7 +7890,6 @@ struct LocalStructDowngradeFacts {
 struct LocalStructBodyFacts {
     body_local_counts: FxHashMap<HirId, usize>,
     body_field_projection_counts: FxHashMap<(HirId, Symbol), usize>,
-    local_offset_bindings_with_unbounded_index: FxHashSet<HirId>,
     calls: Vec<LocalStructCallFact>,
     lets: Vec<LocalStructLetFact>,
     reborrow_assignments: Vec<LocalStructReborrowAssignmentFact>,
@@ -7903,7 +7902,6 @@ impl LocalStructBodyFacts {
         Self {
             body_local_counts: FxHashMap::default(),
             body_field_projection_counts: FxHashMap::default(),
-            local_offset_bindings_with_unbounded_index: FxHashSet::default(),
             calls: Vec::new(),
             lets: Vec::new(),
             reborrow_assignments: Vec::new(),
@@ -8105,15 +8103,6 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                 return;
             };
             match seg.ident.name.as_str() {
-                "add" | "offset" | "wrapping_offset" if args.len() == 1 => {
-                    if let Some(receiver_hir_id) = hir_unwrapped_local_id(receiver)
-                        && !hir_local_ids_outside_top_level_field_projections(&args[0]).is_empty()
-                    {
-                        self.body
-                            .local_offset_bindings_with_unbounded_index
-                            .insert(receiver_hir_id);
-                    }
-                }
                 "as_mut_ptr" if args.is_empty() => {
                     self.body.field_mut_ptrs.push(LocalStructFieldMutPtrFact {
                         receiver_local_ids: hir_local_ids_in_expr(receiver),
@@ -8395,12 +8384,6 @@ fn long_lived_borrow_uses_only_disjoint_array_fields(
         return false;
     };
     if alias_root != root {
-        return false;
-    }
-    if body
-        .local_offset_bindings_with_unbounded_index
-        .contains(&let_fact.binding_hir_id)
-    {
         return false;
     }
 

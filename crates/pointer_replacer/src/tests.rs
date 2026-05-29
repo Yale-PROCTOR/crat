@@ -1014,11 +1014,11 @@ pub unsafe fn decorrelate(t: *mut State) {
         "#,
         &[
             "pub unsafe fn decorrelate(mut t: &mut crate::State)",
-            "let mut residuals_0: *mut i32",
+            "let mut residuals_0: &mut [i32]",
         ],
         &[
             "pub unsafe fn decorrelate(mut t: *mut crate::State)",
-            "let mut residuals_0: &mut [i32]",
+            "let mut residuals_0: *mut i32",
         ],
     );
 }
