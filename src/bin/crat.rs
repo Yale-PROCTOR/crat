@@ -561,7 +561,9 @@ fn main() {
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
-                if bytemuck && !utils::has_dependency(&dir, "bytemuck") {
+                if bytemuck.needs_derive() {
+                    utils::bytemuck::ensure_bytemuck_with_derive(&dir);
+                } else if bytemuck.needs_runtime() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
             }

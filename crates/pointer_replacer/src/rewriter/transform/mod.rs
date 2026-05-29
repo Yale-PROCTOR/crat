@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
@@ -21,11 +21,14 @@ use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
+    bytemuck::{
+        BytemuckDerivePlan, BytemuckDeriveVisitor, BytemuckRequirement, BytemuckTypeClassifier,
+    },
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
 use super::{
-    Analysis, Config,
+    Analysis, BytemuckDependency, Config,
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
@@ -61,6 +64,8 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
+    bytemuck_derives: RefCell<BytemuckDerivePlan>,
+    bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
 }
 
@@ -108,6 +113,20 @@ impl LocalRawParamSummary {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
+    fn visit_crate(&mut self, krate: &mut Crate) {
+        mut_visit::walk_crate(self, krate);
+
+        if self.bytemuck_derives.borrow().is_empty() {
+            return;
+        }
+        let mut derive_visitor = BytemuckDeriveVisitor::new(
+            self.tcx,
+            &self.ast_to_hir,
+            self.bytemuck_derives.borrow().clone(),
+        );
+        derive_visitor.visit_crate(krate);
+    }
+
     fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         if self.should_remove_generated_copy_clone_impl(&item) {
             return smallvec![];
@@ -1615,8 +1634,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ast_to_hir,
             fn_ptr_rewrite,
             bytemuck: Cell::new(false),
+            bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
+            bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
         }
+    }
+
+    pub(crate) fn bytemuck_dependency(&self) -> BytemuckDependency {
+        BytemuckDependency::from_flags(
+            self.bytemuck.get(),
+            !self.bytemuck_derives.borrow().is_empty(),
+        )
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
@@ -5019,6 +5047,35 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
             }
             ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Float(_) => {
+                self.bytemuck.set(true);
+                let bytes = utils::expr!(
+                    "bytemuck::bytes_of{}(&{}({}))",
+                    if mutable { "_mut" } else { "" },
+                    if mutable { "mut " } else { "" },
+                    pointee_str,
+                );
+                if target_inner_ty == self.tcx.types.u8 {
+                    Some(bytes)
+                } else {
+                    Some(utils::expr!(
+                        "bytemuck::cast_slice{}::<_, {}>({})",
+                        if mutable { "_mut" } else { "" },
+                        target_ty,
+                        pprust::expr_to_string(&bytes),
+                    ))
+                }
+            }
+            ty::TyKind::Adt(adt, _) if adt.is_struct() => {
+                let requirement = if mutable {
+                    BytemuckRequirement::Pod
+                } else {
+                    BytemuckRequirement::NoUninit
+                };
+                let mut derives = self.bytemuck_derives.borrow_mut();
+                let mut classifier = self.bytemuck_classifier.borrow_mut();
+                if !derives.require_type(self.tcx, &mut classifier, pointee_ty, requirement) {
+                    return None;
+                }
                 self.bytemuck.set(true);
                 let bytes = utils::expr!(
                     "bytemuck::bytes_of{}(&{}({}))",
@@ -14627,6 +14684,8 @@ mod tests {
             ast_to_hir: AstToHir::default(),
             fn_ptr_rewrite: FnPtrRewriteDecision::default(),
             bytemuck: Cell::new(false),
+            bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
+            bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(tcx)),
             slice_cursor: Cell::new(false),
         }
     }

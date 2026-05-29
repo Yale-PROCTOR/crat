@@ -65,7 +65,32 @@ pub struct Config {
     pub force_ownership_analysis_failure: bool,
 }
 
-pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytemuckDependency {
+    None,
+    Runtime,
+    Derive,
+}
+
+impl BytemuckDependency {
+    pub fn from_flags(runtime: bool, derive: bool) -> Self {
+        match (runtime, derive) {
+            (_, true) => Self::Derive,
+            (true, false) => Self::Runtime,
+            (false, false) => Self::None,
+        }
+    }
+
+    pub fn needs_runtime(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn needs_derive(self) -> bool {
+        matches!(self, Self::Derive)
+    }
+}
+
+pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, BytemuckDependency) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -159,7 +184,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         code.push_str(slice_cursor_mod_str());
     }
 
-    (code, visitor.bytemuck.get())
+    (code, visitor.bytemuck_dependency())
 }
 
 pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
