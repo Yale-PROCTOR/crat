@@ -1,6 +1,6 @@
 use super::*;
 
-fn rewrite_with_config(code: &str, config: &Config) -> (String, bool) {
+fn rewrite_with_config(code: &str, config: &Config) -> (String, BytemuckDependency) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(config, tcx))
         .unwrap()
 }
@@ -10,7 +10,7 @@ fn rewrite_struct_arrays_with_config(code: &str, config: &Config) -> (String, bo
         .unwrap()
 }
 
-fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, bool) {
+fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
     rewrite_with_config(input, config)
@@ -490,6 +490,114 @@ pub unsafe fn make_state() -> *mut State {
 }
 
 #[test]
+fn test_rewriter_materializes_struct_box_with_raw_pointer_default() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct StructDefaultProbe {
+    pub next: *mut i32,
+    pub value: i32,
+}
+
+pub unsafe fn alloc_struct() -> *mut StructDefaultProbe {
+    let mut state: *mut StructDefaultProbe =
+        malloc(std::mem::size_of::<crate::StructDefaultProbe>()) as *mut crate::StructDefaultProbe;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::StructDefaultProbe>",
+            "let mut state: Box<crate::StructDefaultProbe>",
+            "Some(Box::new(crate::StructDefaultProbe {",
+            "next: std::ptr::null_mut::<i32>()",
+            "value: <i32 as Default>::default()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::StructDefaultProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_struct_box_with_large_array_defaults() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct StructArrayDefaultProbe {
+    pub name: [i8; 64],
+    pub nodes: [*mut i32; 100],
+}
+
+pub unsafe fn alloc_struct() -> *mut StructArrayDefaultProbe {
+    let mut state: *mut StructArrayDefaultProbe =
+        malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>()) as *mut crate::StructArrayDefaultProbe;
+    (*state).name[0] = 1;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::StructArrayDefaultProbe>",
+            "name: std::array::from_fn",
+            "nodes: std::array::from_fn",
+            "std::ptr::null_mut::<i32>()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_struct_box_with_union_default() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub union TypeConfusion {
+    pub int_val: i32,
+    pub float_val: f32,
+}
+
+#[repr(C)]
+pub struct UnionHolderProbe {
+    pub data: TypeConfusion,
+    pub value: i32,
+}
+
+pub unsafe fn alloc_struct() -> *mut UnionHolderProbe {
+    let mut state: *mut UnionHolderProbe =
+        malloc(std::mem::size_of::<crate::UnionHolderProbe>()) as *mut crate::UnionHolderProbe;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::UnionHolderProbe>",
+            "MaybeUninit::<crate::TypeConfusion>::zeroed().assume_init()",
+            "value: <i32 as Default>::default()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::UnionHolderProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_calloc_array_to_opt_boxed_slice() {
     run_test(
         r#"
@@ -513,6 +621,65 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::leak(",
             "Box::into_raw(",
             "calloc(4, std::mem::size_of::<i32>())",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_calloc_array_as_direct_boxed_slice_value() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_arr() {
+    let mut data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *data.offset(1) = 7;
+    free(data as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub unsafe fn alloc_arr()",
+            "let mut data: Box<[i32]>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "drop(data);",
+        ],
+        &[
+            "calloc(4, std::mem::size_of::<i32>())",
+            "free(data as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_calloc_array_binding_as_boxed_slice_without_raw_downgrade() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_arr() -> *mut i32 {
+    let mut data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *data.offset(1) = 7;
+    data
+}
+"#,
+        &[
+            "pub unsafe fn alloc_arr() -> Box<[i32]>",
+            "let mut data: Box<[i32]>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "(&mut ((&mut (data)[..])[(1) as usize..]))[0] = 7;",
+        ],
+        &[
+            "let mut data: *mut i32",
+            "calloc(4, std::mem::size_of::<i32>())",
+            "Box::leak(",
+            "Box::into_raw(",
         ],
     );
 }
@@ -991,6 +1158,67 @@ pub unsafe fn caller(s: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_shared_local_struct_array_field_as_mut_ptr_views_safe() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct s {
+    pub buffer: [core::ffi::c_int; 3],
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn foo(mut p: *mut core::ffi::c_int) -> core::ffi::c_int {
+    return *p.offset(0 as core::ffi::c_int as isize)
+        + *p.offset(1 as core::ffi::c_int as isize);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qux(mut p: *mut core::ffi::c_int) -> core::ffi::c_int {
+    *p.offset(0 as core::ffi::c_int as isize) = 1 as core::ffi::c_int;
+    *p.offset(1 as core::ffi::c_int as isize) = 1 as core::ffi::c_int;
+    return 1 as core::ffi::c_int;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bar(mut sp: *mut s) -> core::ffi::c_int {
+    let mut x: core::ffi::c_int = 0 as core::ffi::c_int;
+    x += foo(((*sp).buffer).as_mut_ptr());
+    x += qux(((*sp).buffer).as_mut_ptr());
+    return x;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn baz(mut sp: *mut s) -> core::ffi::c_int {
+    let mut x: core::ffi::c_int = 0 as core::ffi::c_int;
+    let mut q: *mut core::ffi::c_int = ((*sp).buffer).as_mut_ptr();
+    x += *q.offset(0 as core::ffi::c_int as isize)
+        + *q.offset(1 as core::ffi::c_int as isize);
+    let mut r: *mut core::ffi::c_int = &mut *((*sp).buffer)
+        .as_mut_ptr()
+        .offset(1 as core::ffi::c_int as isize) as *mut core::ffi::c_int;
+    x += *r.offset(0 as core::ffi::c_int as isize)
+        + *r.offset(1 as core::ffi::c_int as isize);
+    x += foo(((*sp).buffer).as_mut_ptr());
+    x += foo(&mut *((*sp).buffer).as_mut_ptr().offset(1 as core::ffi::c_int as isize));
+    x += foo(((*sp).buffer).as_mut_ptr().offset(1 as core::ffi::c_int as isize));
+    return x;
+}
+        "#,
+        &[
+            "pub unsafe extern \"C\" fn bar(mut sp: &mut crate::s)",
+            "pub unsafe extern \"C\" fn baz(mut sp: &crate::s)",
+            "let mut q: &[i32]",
+            "let mut r: &[i32]",
+            "foo(&",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn baz(mut sp: *mut crate::s)",
+            "std::slice::from_raw_parts",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_downgrades_long_lived_array_field_alias_with_local_offset_index() {
     run_test(
         r#"
@@ -1014,11 +1242,11 @@ pub unsafe fn decorrelate(t: *mut State) {
         "#,
         &[
             "pub unsafe fn decorrelate(mut t: &mut crate::State)",
-            "let mut residuals_0: *mut i32",
+            "let mut residuals_0: &mut [i32]",
         ],
         &[
             "pub unsafe fn decorrelate(mut t: *mut crate::State)",
-            "let mut residuals_0: &mut [i32]",
+            "let mut residuals_0: *mut i32",
         ],
     );
 }
@@ -1078,7 +1306,7 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
 
 #[test]
-fn test_rewriter_downgrades_local_struct_field_mut_ptr_root() {
+fn test_rewriter_keeps_local_struct_field_mut_ptr_offset_root_shared() {
     run_test(
         r#"
 #[repr(C)]
@@ -1105,10 +1333,14 @@ pub unsafe fn compare(arr: *mut ResultArray, idx: i32) -> i32 {
     return (*ptr).value;
 }
         "#,
-        &["pub unsafe fn compare(mut arr: *mut crate::ResultArray"],
         &[
             "pub unsafe fn compare(arr: &crate::ResultArray",
-            "pub unsafe fn compare(mut arr: &crate::ResultArray",
+            "let ptr: Option<&crate::ResultItem>",
+        ],
+        &[
+            "pub unsafe fn compare(mut arr: *mut crate::ResultArray",
+            "let ptr: *mut crate::ResultItem",
+            "std::slice::from_raw_parts",
         ],
     );
 }
@@ -1620,7 +1852,7 @@ pub unsafe fn touch(buf: [i32; 4]) -> i32 {
         &[
             "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
             "crate::slice_cursor::SliceCursor::",
-            ".seek((-1) as isize)",
+            ".offset_by((-1) as isize)",
         ],
         &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
     );
@@ -1643,7 +1875,7 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek((s.word_index as isize) as isize)",
+            ".offset_by((s.word_index",
         ],
         &["let mut _c = ((*s).words);", "*(*s).words.offset"],
     );
@@ -1666,7 +1898,7 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
-            ".seek((s.word_index as isize) as isize)",
+            ".offset_by((s.word_index",
         ],
         &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
@@ -1793,7 +2025,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
             "crate::slice_cursor::SliceCursor::from_raw_parts",
-            ".seek((-((s.count / 8) as isize)) as isize)",
+            ".offset_by((-((s.count / 8) as isize))",
         ],
         &[
             "pub words: Option<&'a u32>",
@@ -1821,7 +2053,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".seek((-((s.count / 8) as isize)) as isize)",
+            ".offset_by((-((s.count / 8) as isize))",
         ],
         &["}).as_mut_ptr()", "*(*s).words.offset"],
     );
@@ -1845,7 +2077,7 @@ pub unsafe fn container_from_b(i: *const i32) -> *const Pair {
             "pub unsafe fn container_from_b(i: crate::slice_cursor::SliceCursor<'_, i32>)",
             "bytemuck::cast_slice::<_,",
             "i8>((i).as_slice())",
-            ".seek((-(4 as isize)) as isize)",
+            ".offset_by((-(4 as isize))",
         ],
         &["crate::slice_cursor::SliceCursor::from_raw_parts((i).as_ptr()"],
     );
@@ -3445,6 +3677,46 @@ pub unsafe fn init_and_clear(holder: *mut Holder) {
 }
 
 #[test]
+fn test_rewriter_raw_bridge_default_uses_fieldless_enum_zero_variant() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(i32)]
+pub enum StatusCode {
+    STATUS_ERROR = -1,
+    STATUS_SUCCESS = 0,
+    STATUS_WARNING = 1,
+}
+
+#[repr(C)]
+pub struct ComputationResult {
+    pub value: i32,
+    pub status: StatusCode,
+}
+
+pub unsafe fn alloc_results(count: usize) {
+    let results: *mut ComputationResult =
+        malloc(count * std::mem::size_of::<crate::ComputationResult>()) as *mut crate::ComputationResult;
+    free(results as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "Box::leak(std::iter::repeat_with(||",
+            "status: crate::StatusCode::STATUS_SUCCESS",
+            "Box::from_raw(std::ptr::slice_from_raw_parts_mut",
+        ],
+        &[
+            "malloc(count * std::mem::size_of::<crate::ComputationResult>())",
+            "free(results as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_keeps_dynamic_local_struct_field_free_raw() {
     run_test(
         r#"
@@ -4765,7 +5037,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &["unsafe {", ".as_ref()", "let mut q: &i32"],
+        &[".as_ref()", "let mut q: &i32"],
         &[],
     );
 }
@@ -5009,7 +5281,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["unsafe {", "as *const i16", ".as_ref()", "let mut q: &i16"],
+        &["as *const i16", ".as_ref()", "let mut q: &i16"],
         &["bytemuck"],
     );
 }
@@ -5018,19 +5290,17 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 fn test_rewriter_wraps_raw_to_opt_ref_call_boundary_in_safe_context() {
     run_test(
         r#"
-pub fn foo() -> i32 {
+pub unsafe fn foo() -> i32 {
     let mut x: i32 = 42;
     let mut p: *mut i32 = &mut x;
     let mut r: *mut i32 = &mut x;
-    unsafe {
-        *p = 10;
-        *r = 20;
-    }
+    *p = 10;
+    *r = 20;
     let mut q: *mut i32 = p;
-    unsafe { *q }
+    *q
 }
 "#,
-        &["let mut q: &i32", "unsafe {", ".as_ref()"],
+        &["let mut q: &i32", ".as_ref()"],
         &[],
     );
 }
@@ -6029,6 +6299,32 @@ pub unsafe fn foo() -> i32 {
 }
 
 #[test]
+fn test_as_ptr_from_vec_ref_uses_safe_slice_view() {
+    run_test(
+        r#"
+pub unsafe fn foo() -> i32 {
+    let mut alloca_allocations: Vec<Vec<u8>> = Vec::new();
+    let mut data: *mut i32 = 0 as *mut i32;
+    alloca_allocations.push(::std::vec::from_elem(
+        0u8,
+        10usize * ::core::mem::size_of::<i32>(),
+    ));
+    data = alloca_allocations.last_mut().unwrap().as_mut_ptr() as *mut i32;
+    *data.offset(0) = 7;
+    *data.offset(1) = 9;
+    *data.offset(0)
+}
+"#,
+        &[
+            "let mut data: &mut [i32]",
+            "bytemuck::cast_slice_mut",
+            "alloca_allocations.last_mut().unwrap()",
+        ],
+        &["from_raw_parts_mut"],
+    );
+}
+
+#[test]
 fn test_as_ptr_deref_offset_uses_safe_slice_index() {
     run_test(
         r#"
@@ -6068,7 +6364,88 @@ pub unsafe fn hash(mut key: uint64_t) -> u64 {
 }
 
 #[test]
-fn test_array_field_ptr_arithmetic_stays_raw_slice() {
+fn test_addr_of_no_padding_struct_byte_slice_uses_bytemuck_bytes_of() {
+    let code = r#"
+#[repr(C)]
+pub struct House {
+    pub floors: i32,
+    pub bedrooms: i32,
+    pub bathrooms: f64,
+}
+impl Copy for House {}
+impl Clone for House {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn hash(mut house: House) -> u64 {
+    let mut bytes: *const u8 = &mut house as *mut House as *mut u8;
+    let mut hash = 0u64;
+    let mut i = 0usize;
+    while i < ::core::mem::size_of::<House>() {
+        hash += *bytes.offset(i as isize) as u64;
+        i += 1;
+    }
+    hash
+}
+"#;
+    let (s, bytemuck) = rewrite_with_config(code, &Config::default());
+    assert_eq!(bytemuck, BytemuckDependency::Derive);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in [
+        "#[derive(bytemuck::NoUninit)]",
+        "let mut bytes: &[u8] = bytemuck::bytes_of(&(house));",
+    ] {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in ["from_raw_parts", "&raw const"] {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_addr_of_padded_struct_byte_slice_stays_raw_parts() {
+    let code = r#"
+#[repr(C)]
+pub struct Padded {
+    pub tag: u8,
+    pub value: u32,
+}
+impl Copy for Padded {}
+impl Clone for Padded {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn hash(mut value: Padded) -> u64 {
+    let mut bytes: *const u8 = &mut value as *mut Padded as *mut u8;
+    let mut hash = 0u64;
+    let mut i = 0usize;
+    while i < ::core::mem::size_of::<Padded>() {
+        hash += *bytes.offset(i as isize) as u64;
+        i += 1;
+    }
+    hash
+}
+"#;
+    let (s, bytemuck) = rewrite_with_config(code, &Config::default());
+    assert_eq!(bytemuck, BytemuckDependency::None);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("from_raw_parts"),
+        "Expected raw fallback in:\n{s}"
+    );
+    for exclude in ["bytemuck::bytes_of", "derive(bytemuck"] {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_array_field_ptr_arithmetic_uses_slice_suffix() {
     run_test(
         r#"
 #[repr(C)]
@@ -6092,8 +6469,8 @@ pub unsafe fn alloc_from_block(a: *mut Arena, len: usize) -> i8 {
     *p.offset(1)
 }
 "#,
+        &["let mut p: &mut [i8]", "&mut (&mut ((*a.storage).storage))"],
         &["from_raw_parts_mut", ".as_mut_ptr().offset"],
-        &["&mut (&mut"],
     );
 }
 
@@ -6118,6 +6495,66 @@ pub unsafe fn foo() {
 "#,
         &["consume(&mut (info.addr)["],
         &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_unsigned_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub addr: [u8; 16],
+    pub pos: u32,
+}
+
+pub unsafe fn consume(addr: *mut u8) {
+    *addr.offset(0) = 1;
+    *addr.offset(1) = 2;
+}
+
+pub unsafe fn foo(info: *mut Info) {
+    let pos = (*info).pos % 8;
+    consume((*info).addr.as_mut_ptr().offset(pos as isize));
+}
+"#,
+        &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
+        &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_c_int_arithmetic_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Md5 {
+    pub buffer: [u8; 72],
+}
+
+pub unsafe fn unpack(d: *const u8) -> u32 {
+    return *d.offset(0) as u32
+        | ((*d.offset(1) as u32) << 8);
+}
+
+pub unsafe fn transform(m: *mut Md5) -> u32 {
+    return unpack(
+        &mut *(*m)
+            .buffer
+            .as_mut_ptr()
+            .offset((10 as core::ffi::c_int * 4 as core::ffi::c_int) as isize),
+    );
+}
+"#,
+        &[
+            "pub unsafe fn unpack(d: &[u8])",
+            "unpack(&",
+            "buffer)[",
+            "10 as core::ffi::c_int",
+            "* 4 as core::ffi::c_int",
+            "as usize..])",
+        ],
+        &["from_raw_parts", ".buffer.as_mut_ptr().offset"],
     );
 }
 
@@ -6764,6 +7201,55 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
 }
 
 #[test]
+fn test_raw_local_caller_keeps_negative_cursor_input_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn foreign() -> *const u8;
+}
+
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let p = foreign();
+    read_before(p)
+}
+"#,
+        &["pub unsafe fn read_before", "p: *const u8"],
+        &[
+            "fn read_before(p: crate::slice_cursor::SliceCursor",
+            "fn read_before(mut p: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_array_pointer_caller_keeps_negative_cursor_input_cursor() {
+    run_test(
+        r#"
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    read_before(buf.as_ptr().offset(1))
+}
+"#,
+        &[
+            "pub unsafe fn read_before",
+            "p: crate::slice_cursor::SliceCursor",
+        ],
+        &[
+            "fn read_before(p: *const u8)",
+            "fn read_before(mut p: *const u8)",
+        ],
+    );
+}
+
+#[test]
 fn test_opt_boxed_slice_offset_cursor_uses_slice_view_base() {
     run_test(
         r#"
@@ -7003,7 +7489,7 @@ pub unsafe fn foo() -> i32 {
 }
 "#;
     let (s, bytemuck) = rewrite_struct_arrays_then_pointer(code, &Config::default());
-    assert!(!bytemuck);
+    assert_eq!(bytemuck, BytemuckDependency::None);
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     for include in [
         "pub a: [Elem; 3]",
@@ -7210,10 +7696,7 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
     return foo(q, 1 as libc::c_int);
 }
 "#,
-        &[
-            "SliceCursor::new((p).as_slice())",
-            ".seek((4 as isize) as isize)",
-        ],
+        &["SliceCursor::new((p).as_slice())", ".offset_by((4 as"],
         &["}).as_deref()"],
     );
 }

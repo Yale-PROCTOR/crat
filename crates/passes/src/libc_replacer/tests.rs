@@ -1,4 +1,4 @@
-fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
+fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::TransformationResult {
     let res = utils::compilation::run_compiler_on_str(code, super::replace_libc).unwrap();
     utils::compilation::run_compiler_on_str(&res.code, utils::type_check).expect(&res.code);
     for include in includes {
@@ -15,6 +15,7 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
             res.code
         );
     }
+    res
 }
 
 #[test]
@@ -39,6 +40,138 @@ pub unsafe extern "C" fn foo(mut p: *mut s, mut q: *mut s) {
         &["&mut", "&(", "copy_from_slice"],
         &[],
     );
+}
+
+#[test]
+fn test_memcpy_from_int_object_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(x: i32) {
+    let mut raw = [0i8; 4];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<i32>(),
+    );
+}
+        "#,
+        &[
+            "bytemuck::bytes_of(&(x))",
+            "bytemuck::cast_slice_mut::<_",
+            "copy_from_slice(___src)",
+        ],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(!res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_float_object_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(x: f32) {
+    let mut raw = [0i8; 4];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<f32>(),
+    );
+}
+        "#,
+        &["bytemuck::bytes_of(&(x))", "copy_from_slice(___src)"],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(!res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_no_uninit_struct_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct House {
+    pub floors: i32,
+    pub bedrooms: i32,
+    pub bathrooms: f64,
+}
+
+impl Copy for House {}
+impl Clone for House {
+    fn clone(&self) -> House {
+        *self
+    }
+}
+
+pub unsafe fn foo(floors: i32) {
+    let mut house = House { floors, bedrooms: 3, bathrooms: 2.0 };
+    let mut raw = [0i8; 16];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const house as *const std::ffi::c_void,
+        ::core::mem::size_of::<House>(),
+    );
+}
+        "#,
+        &[
+            "#[derive(bytemuck::NoUninit)]",
+            "bytemuck::bytes_of(&(house))",
+            "copy_from_slice(___src)",
+        ],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_padded_struct_to_byte_array_is_left_alone() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Padded {
+    pub a: i8,
+    pub b: i32,
+}
+
+impl Copy for Padded {}
+impl Clone for Padded {
+    fn clone(&self) -> Padded {
+        *self
+    }
+}
+
+pub unsafe fn foo(x: Padded) {
+    let mut raw = [0i8; 8];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<Padded>(),
+    );
+}
+        "#,
+        &["memcpy(raw.as_mut_ptr"],
+        &["bytemuck::NoUninit", "bytemuck::bytes_of"],
+    );
+    assert!(!res.bytemuck);
+    assert!(!res.bytemuck_derive);
 }
 
 #[test]
@@ -119,6 +252,93 @@ pub unsafe fn copy_static(mut src: &[i8], idx: usize) {
         "#,
         &["strncpy(COMMON[idx].as_mut_ptr()"],
         &["___dst.fill(0)", "copy_from_slice(&___src[..___len])"],
+    );
+}
+
+#[test]
+fn test_slice_cursor_offset_by_as_ptr_uses_safe_byte_slice() {
+    run_test(
+        r#"
+extern "C" {
+    fn strlen(__s: *const i8) -> usize;
+    fn atoi(__nptr: *const i8) -> i32;
+}
+
+pub mod slice_cursor {
+    pub struct SliceCursorMut<'a, T> {
+        base: &'a mut [T],
+        pos: usize,
+    }
+
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+        pos: usize,
+    }
+
+    impl<'a, T> Copy for SliceCursor<'a, T> {}
+
+    impl<'a, T> Clone for SliceCursor<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_deref(self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
+        }
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_slice(&self) -> &'a [T] {
+            &self.base[self.pos..]
+        }
+    }
+}
+
+pub unsafe fn parse_len(
+    cursor: crate::slice_cursor::SliceCursor<'_, i8>,
+    mut_cursor: crate::slice_cursor::SliceCursorMut<'_, i8>,
+    start: isize,
+) -> usize {
+    strlen(cursor.offset_by(start).as_ptr())
+        + atoi(cursor.offset_by(start).as_ptr()) as usize
+        + strlen(mut_cursor.offset_by(start).as_ptr())
+}
+        "#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "crate::c_lib::atoi",
+            "bytemuck::cast_slice::<_",
+            "(cursor.offset_by(start)).as_slice()",
+            "(mut_cursor.offset_by(start)).as_deref().as_slice()",
+        ],
+        &[
+            "std::ffi::CStr::from_ptr",
+            "std::slice::from_raw_parts((cursor.offset_by(start).as_ptr())",
+        ],
     );
 }
 
@@ -239,11 +459,66 @@ extern "C" {
 
 pub unsafe fn foo(mut out: *mut i8, mut input: &[i8], mut n: i32, mut consumed: usize) {
     sprintf(out, b"%d\0" as *const u8 as *const i8, n);
-    sscanf(input.as_ptr(), b"%d%zn\0" as *const u8 as *const i8, &raw mut n, &raw mut consumed);
+    sscanf(input.as_ptr(), b"%s\0" as *const u8 as *const i8, out);
 }
         "#,
         &["sprintf(out", "sscanf(input.as_ptr"],
         &["std::io::Cursor::new"],
+    );
+}
+
+#[test]
+fn test_string_stdio_rewrites_sscanf_num_conversion() {
+    run_test(
+        r#"
+extern "C" {
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut input: &[i8], mut i: usize) -> i32 {
+    let mut data = [0i32; 4];
+    let mut consumed: usize = 0;
+    sscanf(
+        input.as_ptr(),
+        b"%d%zn\0" as *const u8 as *const i8,
+        (&mut data)[i..].as_mut_ptr(),
+        &raw mut consumed,
+    )
+}
+        "#,
+        &[
+            "crate::c_lib::sscanf_scan_d_zn",
+            "CountingBufRead",
+            "stream.consumed()",
+            "&mut ((&mut data)[i..])[0]",
+        ],
+        &["sscanf(input.as_ptr"],
+    );
+}
+
+#[test]
+fn test_string_stdio_rewrites_leading_sscanf_num_conversion() {
+    run_test(
+        r#"
+extern "C" {
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut input: &[i8], mut consumed: i32, mut n: i32) -> i32 {
+    sscanf(
+        input.as_ptr(),
+        b"%n%d\0" as *const u8 as *const i8,
+        &raw mut consumed,
+        &raw mut n,
+    )
+}
+        "#,
+        &[
+            "crate::c_lib::sscanf_scan_n_d",
+            "*v1 = stream.consumed() as i32",
+            "return -1",
+        ],
+        &["sscanf(input.as_ptr"],
     );
 }
 

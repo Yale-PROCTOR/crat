@@ -376,6 +376,22 @@ impl ConversionSpec {
     pub fn ty(&self) -> ConvTy {
         self.conversion.ty(self.length)
     }
+
+    pub fn num_ty(&self) -> Option<&'static str> {
+        if self.conversion != Conversion::Num || !self.assign || self.width.is_some() {
+            return None;
+        }
+
+        use LengthMod::*;
+        match self.length {
+            None => Some("i32"),
+            Some(Char) => Some("i8"),
+            Some(Short) => Some("i16"),
+            Some(Long | LongLong | IntMax | PtrDiff) => Some("i64"),
+            Some(Size) => Some("usize"),
+            Some(LongDouble) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +457,17 @@ fn test_scanf_parse() {
             width: None,
             length: None,
             conversion: Conversion::Str,
+            leading_space: false,
+            trailing_space: false,
+        }
+    );
+    assert_eq!(
+        test_helper("%zn"),
+        ConversionSpec {
+            assign: true,
+            width: None,
+            length: Some(LengthMod::Size),
+            conversion: Conversion::Num,
             leading_space: false,
             trailing_space: false,
         }

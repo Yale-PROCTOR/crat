@@ -204,6 +204,30 @@ unsafe fn f() -> libc::c_int {
 }
 
 #[test]
+fn test_scanf_num_conversion() {
+    run_test(
+        r#"
+unsafe fn f() -> libc::c_int {
+    let mut x: libc::c_int = 0;
+    let mut n: size_t = 0;
+    let r = scanf(
+        b"%d%zn\0" as *const u8 as *const libc::c_char,
+        &mut x as *mut libc::c_int,
+        &mut n as *mut size_t,
+    );
+    return r + x + n as libc::c_int;
+}"#,
+        &[
+            "stdin",
+            "scan_d_z_n",
+            "CountingBufRead",
+            "stream.consumed()",
+        ],
+        &["scanf"],
+    );
+}
+
+#[test]
 fn test_fscanf_numbers() {
     run_test(
         r#"
@@ -230,6 +254,30 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     );
 }"#,
         &["BufRead", "scan_d_h_d_l_d_u_h_u_l_u_g_l_g", "TT"],
+        &["FILE", "fscanf"],
+    );
+}
+
+#[test]
+fn test_fscanf_leading_num_conversion() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    let mut consumed: libc::c_int = 0;
+    let mut x: libc::c_int = 0;
+    return fscanf(
+        stream,
+        b"%n%d\0" as *const u8 as *const libc::c_char,
+        &mut consumed as *mut libc::c_int,
+        &mut x as *mut libc::c_int,
+    );
+}"#,
+        &[
+            "BufRead",
+            "scan_n_d",
+            "CountingBufRead",
+            "stream.consumed()",
+        ],
         &["FILE", "fscanf"],
     );
 }
@@ -601,6 +649,87 @@ unsafe fn f() {
 }"#,
         &["write!"],
         &["printf"],
+    );
+}
+
+#[test]
+fn test_printf_and_fputs_slice_cursor_offset_by_string() {
+    run_test(
+        r#"
+pub mod slice_cursor {
+    pub struct SliceCursorMut<'a, T> {
+        base: &'a mut [T],
+        pos: usize,
+    }
+
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+        pos: usize,
+    }
+
+    impl<'a, T> Copy for SliceCursor<'a, T> {}
+
+    impl<'a, T> Clone for SliceCursor<'a, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_deref(self) -> SliceCursor<'a, T> {
+            SliceCursor { base: self.base, pos: self.pos }
+        }
+
+        pub fn as_slice(&self) -> &[T] {
+            &self.base[self.pos..]
+        }
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub fn offset_by(mut self, offset: isize) -> Self {
+            self.pos = self.pos.wrapping_add_signed(offset);
+            self
+        }
+
+        pub fn as_ptr(&self) -> *const T {
+            self.base[self.pos..].as_ptr()
+        }
+
+        pub fn as_slice(&self) -> &'a [T] {
+            &self.base[self.pos..]
+        }
+    }
+}
+
+unsafe fn f(
+    cursor: crate::slice_cursor::SliceCursor<'_, libc::c_char>,
+    mut_cursor: crate::slice_cursor::SliceCursorMut<'_, libc::c_char>,
+    start: isize,
+) {
+    printf(
+        b"%s %s %.2s\0" as *const u8 as *const libc::c_char,
+        cursor.offset_by(start).as_ptr(),
+        mut_cursor.offset_by(start).as_ptr(),
+        cursor.offset_by(start).as_ptr(),
+    );
+    fputs(cursor.offset_by(start).as_ptr(), stdout);
+}"#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice((cursor.offset_by(start)).as_slice())",
+            "(mut_cursor.offset_by(start)).as_deref().as_slice()",
+            "crate::c_lib::rs_fputs",
+        ],
+        &["std::ffi::CStr::from_ptr"],
     );
 }
 

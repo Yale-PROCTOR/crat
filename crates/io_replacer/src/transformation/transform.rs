@@ -679,6 +679,7 @@ fn mir_local_span(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum LibItem {
     Peek,
+    CountingBufRead,
     IsEof,
     ParseChar,
     ParseScanSet,
@@ -732,6 +733,7 @@ pub(super) enum LibItem {
 
 static LIB_ITEMS_ARRAY: &[(LibItem, &str)] = &[
     (LibItem::Peek, utils::c_lib::PEEK),
+    (LibItem::CountingBufRead, utils::c_lib::COUNTING_BUF_READ),
     (LibItem::IsEof, utils::c_lib::IS_EOF),
     (LibItem::ParseChar, super::fscanf::PARSE_CHAR),
     (LibItem::ParseScanSet, super::fscanf::PARSE_SCAN_SET),

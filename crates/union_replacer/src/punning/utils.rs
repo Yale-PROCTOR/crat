@@ -1,4 +1,4 @@
-use std::{fs, path::Path, str::FromStr};
+use std::path::Path;
 
 use points_to::andersen;
 use rustc_hash::FxHashMap;
@@ -8,7 +8,6 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_span::def_id::{DefId, LocalDefId};
-use toml_edit::{DocumentMut, Item, Table};
 
 use super::raw_struct::UnionFieldClassification;
 
@@ -207,19 +206,5 @@ pub fn print_all_local_bodies_with_points_to(tcx: TyCtxt<'_>, result: &andersen:
 }
 
 pub fn ensure_bytemuck_with_derive(dir: &Path) {
-    let path = dir.join("Cargo.toml");
-    let content = fs::read_to_string(&path).unwrap();
-    let mut doc = content.parse::<DocumentMut>().unwrap();
-
-    if !doc.as_table().contains_key("dependencies") {
-        doc["dependencies"] = Item::Table(Table::new());
-    }
-
-    let deps = doc["dependencies"].as_table_mut().unwrap();
-    deps["bytemuck"] = Item::from_str(
-        r#"{ version = "1.24.0", features = ["derive", "min_const_generics", "must_cast"] }"#,
-    )
-    .unwrap();
-
-    fs::write(path, doc.to_string()).unwrap();
+    utils::bytemuck::ensure_bytemuck_with_derive(dir);
 }

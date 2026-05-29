@@ -119,6 +119,7 @@ pub fn collect_diffs<'tcx>(
                             rust_program.tcx,
                             init,
                             &ptr_kinds,
+                            raw_mutability,
                             needs_cursor,
                         ) {
                             ptr_kind = alias_kind;
@@ -220,6 +221,7 @@ fn array_field_pointer_alias_kind<'tcx>(
     tcx: TyCtxt<'tcx>,
     init: &'tcx hir::Expr<'tcx>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    target_mutability: bool,
     needs_cursor: bool,
 ) -> Option<PtrKind> {
     if needs_cursor {
@@ -229,11 +231,14 @@ fn array_field_pointer_alias_kind<'tcx>(
     let hir::ExprKind::MethodCall(seg, receiver, args, _) = hir_unwrap_casts(init).kind else {
         return None;
     };
-    let mutability = match seg.ident.name.as_str() {
+    let source_mutability = match seg.ident.name.as_str() {
         "as_ptr" => false,
         "as_mut_ptr" => true,
         _ => return None,
     };
+    if target_mutability && !source_mutability {
+        return None;
+    }
     if !args.is_empty() {
         return None;
     }
@@ -245,11 +250,11 @@ fn array_field_pointer_alias_kind<'tcx>(
 
     let root = hir_projection_root_local_id(receiver)?;
     let root_kind = ptr_kinds.get(&root).copied()?;
-    if !is_borrow_like_decision(root_kind) || (mutability && !root_kind.is_mut()) {
+    if !is_borrow_like_decision(root_kind) || (target_mutability && !root_kind.is_mut()) {
         return None;
     }
 
-    Some(PtrKind::Slice(mutability))
+    Some(PtrKind::Slice(target_mutability))
 }
 
 fn cursor_field_offset_alias_kind<'tcx>(
