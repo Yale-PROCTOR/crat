@@ -991,6 +991,67 @@ pub unsafe fn caller(s: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_shared_local_struct_array_field_as_mut_ptr_views_safe() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct s {
+    pub buffer: [core::ffi::c_int; 3],
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn foo(mut p: *mut core::ffi::c_int) -> core::ffi::c_int {
+    return *p.offset(0 as core::ffi::c_int as isize)
+        + *p.offset(1 as core::ffi::c_int as isize);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qux(mut p: *mut core::ffi::c_int) -> core::ffi::c_int {
+    *p.offset(0 as core::ffi::c_int as isize) = 1 as core::ffi::c_int;
+    *p.offset(1 as core::ffi::c_int as isize) = 1 as core::ffi::c_int;
+    return 1 as core::ffi::c_int;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bar(mut sp: *mut s) -> core::ffi::c_int {
+    let mut x: core::ffi::c_int = 0 as core::ffi::c_int;
+    x += foo(((*sp).buffer).as_mut_ptr());
+    x += qux(((*sp).buffer).as_mut_ptr());
+    return x;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn baz(mut sp: *mut s) -> core::ffi::c_int {
+    let mut x: core::ffi::c_int = 0 as core::ffi::c_int;
+    let mut q: *mut core::ffi::c_int = ((*sp).buffer).as_mut_ptr();
+    x += *q.offset(0 as core::ffi::c_int as isize)
+        + *q.offset(1 as core::ffi::c_int as isize);
+    let mut r: *mut core::ffi::c_int = &mut *((*sp).buffer)
+        .as_mut_ptr()
+        .offset(1 as core::ffi::c_int as isize) as *mut core::ffi::c_int;
+    x += *r.offset(0 as core::ffi::c_int as isize)
+        + *r.offset(1 as core::ffi::c_int as isize);
+    x += foo(((*sp).buffer).as_mut_ptr());
+    x += foo(&mut *((*sp).buffer).as_mut_ptr().offset(1 as core::ffi::c_int as isize));
+    x += foo(((*sp).buffer).as_mut_ptr().offset(1 as core::ffi::c_int as isize));
+    return x;
+}
+        "#,
+        &[
+            "pub unsafe extern \"C\" fn bar(mut sp: &mut crate::s)",
+            "pub unsafe extern \"C\" fn baz(mut sp: &crate::s)",
+            "let mut q: &[i32]",
+            "let mut r: &[i32]",
+            "foo(&",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn baz(mut sp: *mut crate::s)",
+            "std::slice::from_raw_parts",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_downgrades_long_lived_array_field_alias_with_local_offset_index() {
     run_test(
         r#"
@@ -1078,7 +1139,7 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
 
 #[test]
-fn test_rewriter_downgrades_local_struct_field_mut_ptr_root() {
+fn test_rewriter_keeps_local_struct_field_mut_ptr_offset_root_shared() {
     run_test(
         r#"
 #[repr(C)]
@@ -1105,10 +1166,14 @@ pub unsafe fn compare(arr: *mut ResultArray, idx: i32) -> i32 {
     return (*ptr).value;
 }
         "#,
-        &["pub unsafe fn compare(mut arr: *mut crate::ResultArray"],
         &[
             "pub unsafe fn compare(arr: &crate::ResultArray",
-            "pub unsafe fn compare(mut arr: &crate::ResultArray",
+            "let ptr: Option<&crate::ResultItem>",
+        ],
+        &[
+            "pub unsafe fn compare(mut arr: *mut crate::ResultArray",
+            "let ptr: *mut crate::ResultItem",
+            "std::slice::from_raw_parts",
         ],
     );
 }
@@ -6173,7 +6238,7 @@ pub unsafe fn hash(mut value: Padded) -> u64 {
 }
 
 #[test]
-fn test_array_field_ptr_arithmetic_stays_raw_slice() {
+fn test_array_field_ptr_arithmetic_uses_slice_suffix() {
     run_test(
         r#"
 #[repr(C)]
@@ -6197,8 +6262,8 @@ pub unsafe fn alloc_from_block(a: *mut Arena, len: usize) -> i8 {
     *p.offset(1)
 }
 "#,
+        &["let mut p: &mut [i8]", "&mut (&mut ((*a.storage).storage))"],
         &["from_raw_parts_mut", ".as_mut_ptr().offset"],
-        &["&mut (&mut"],
     );
 }
 
@@ -6248,6 +6313,41 @@ pub unsafe fn foo(info: *mut Info) {
 "#,
         &["consume(&mut ((*info).addr)[(pos as isize) as usize..]);"],
         &["from_raw_parts_mut", ".addr.as_mut_ptr().offset"],
+    );
+}
+
+#[test]
+fn test_array_field_c_int_arithmetic_offset_slice_arg_uses_slice_suffix() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Md5 {
+    pub buffer: [u8; 72],
+}
+
+pub unsafe fn unpack(d: *const u8) -> u32 {
+    return *d.offset(0) as u32
+        | ((*d.offset(1) as u32) << 8);
+}
+
+pub unsafe fn transform(m: *mut Md5) -> u32 {
+    return unpack(
+        &mut *(*m)
+            .buffer
+            .as_mut_ptr()
+            .offset((10 as core::ffi::c_int * 4 as core::ffi::c_int) as isize),
+    );
+}
+"#,
+        &[
+            "pub unsafe fn unpack(d: &[u8])",
+            "unpack(&",
+            "buffer)[",
+            "10 as core::ffi::c_int",
+            "* 4 as core::ffi::c_int",
+            "as usize..])",
+        ],
+        &["from_raw_parts", ".buffer.as_mut_ptr().offset"],
     );
 }
 

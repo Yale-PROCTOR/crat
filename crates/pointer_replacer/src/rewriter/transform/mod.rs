@@ -4897,12 +4897,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
         let offset = array_field_direct_offset(pe, true)?;
-        if m && !is_int_lit_expr(offset) {
-            return None;
-        }
-        if !self.offset_expr_can_be_slice_index(offset) {
-            return None;
-        }
         let slice = self.array_field_offset_slice_ref_from_offset(pe, offset, m);
         let mut raw = utils::expr!(
             "({}).as_{}ptr()",
@@ -4924,9 +4918,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn array_field_offset_slice_ref(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
         let offset = array_field_direct_offset(pe, false)?;
-        if !self.offset_expr_can_be_slice_index(offset) {
-            return None;
-        }
         Some(self.array_field_offset_slice_ref_from_offset(pe, offset, m))
     }
 
@@ -4936,29 +4927,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         offset: &Expr,
         m: bool,
     ) -> Expr {
+        let base = if matches!(self.behind_subscripts(pe.hir_base), PathOrDeref::Other)
+            && place_expr_contains_deref(pe.base)
+        {
+            utils::expr!(
+                "&{}({})",
+                if m { "mut " } else { "" },
+                pprust::expr_to_string(pe.base),
+            )
+        } else {
+            pe.base.clone()
+        };
         utils::expr!(
             "&{}({})[({}) as usize..]",
             if m { "mut " } else { "" },
-            pprust::expr_to_string(pe.base),
+            pprust::expr_to_string(&base),
             pprust::expr_to_string(offset),
         )
-    }
-
-    fn offset_expr_can_be_slice_index(&self, offset: &Expr) -> bool {
-        let offset = unwrap_paren(offset);
-        match &offset.kind {
-            ExprKind::Cast(inner, _) => self.offset_expr_can_be_slice_index(inner),
-            ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
-            ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => {
-                let Some(hir_offset) = self.ast_to_hir.get_expr(offset.id, self.tcx) else {
-                    return false;
-                };
-                let typeck = self.tcx.typeck(hir_offset.hir_id.owner);
-                let ty = typeck.expr_ty(hir_offset);
-                ty.is_integral() && !ty.is_signed()
-            }
-            _ => false,
-        }
     }
 
     fn safe_slice_view_cast_allowed(
@@ -5171,9 +5156,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
-                    if !self.offset_expr_can_be_slice_index(offset) {
-                        return None;
-                    }
                     *expr = utils::expr!(
                         "({})[({}) as usize..]",
                         pprust::expr_to_string(expr),
@@ -7535,14 +7517,6 @@ fn array_field_direct_offset<'a, 'tcx>(
     Some(*offset)
 }
 
-fn is_int_lit_expr(expr: &Expr) -> bool {
-    match &unwrap_paren(expr).kind {
-        ExprKind::Cast(inner, _) => is_int_lit_expr(inner),
-        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
-        _ => false,
-    }
-}
-
 fn is_array_field_ptr_arithmetic(pe: &PtrExpr<'_, '_>) -> bool {
     pe.as_ptr
         && pe.as_mut_ptr
@@ -7936,6 +7910,7 @@ struct LocalStructReborrowAssignmentFact {
 }
 
 struct LocalStructFieldMutPtrFact {
+    expr_hir_id: HirId,
     receiver_local_ids: Vec<HirId>,
     receiver_field_projection_roots: FxHashSet<HirId>,
 }
@@ -8105,6 +8080,7 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
             match seg.ident.name.as_str() {
                 "as_mut_ptr" if args.is_empty() => {
                     self.body.field_mut_ptrs.push(LocalStructFieldMutPtrFact {
+                        expr_hir_id: expr.hir_id,
                         receiver_local_ids: hir_local_ids_in_expr(receiver),
                         receiver_field_projection_roots: hir_field_projection_roots_in_expr(
                             receiver,
@@ -8477,6 +8453,12 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
                 if !field_mut_ptr.receiver_field_projection_roots.contains(root)
                     || !local_struct_borrow_binding(tcx, ptr_kinds, *root)
                     || is_mutable_borrow_like_decision(root_kind)
+                    || !local_struct_field_mut_ptr_consumer_requires_raw(
+                        tcx,
+                        sig_decs,
+                        ptr_kinds,
+                        field_mut_ptr.expr_hir_id,
+                    )
                     || !force_signature_input_raw_for_binding(tcx, sig_decs, *root)
                 {
                     continue;
@@ -8487,6 +8469,110 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
         }
     }
     (changed, bindings)
+}
+
+fn local_struct_field_mut_ptr_consumer_requires_raw(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    expr_hir_id: HirId,
+) -> bool {
+    let local_consumer_requires_raw = |hir_id: HirId| {
+        ptr_kinds
+            .get(&hir_id)
+            .copied()
+            .map(consumer_kind_requires_raw)
+            .unwrap_or_else(|| {
+                consumer_ty_requires_raw(tcx, tcx.typeck(hir_id.owner).node_type(hir_id))
+            })
+    };
+
+    let mut curr_id = expr_hir_id;
+    for (parent_id, parent_node) in tcx.hir_parent_iter(expr_hir_id) {
+        match parent_node {
+            hir::Node::Expr(parent) => match parent.kind {
+                hir::ExprKind::DropTemps(_)
+                | hir::ExprKind::Cast(_, _)
+                | hir::ExprKind::Unary(hir::UnOp::Deref, _)
+                | hir::ExprKind::AddrOf(_, _, _) => {}
+                hir::ExprKind::MethodCall(seg, receiver, args, _) if curr_id == receiver.hir_id => {
+                    match seg.ident.name.as_str() {
+                        "offset" | "add" => {
+                            if args.is_empty() {
+                                return true;
+                            }
+                        }
+                        "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub" => {
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
+                hir::ExprKind::Block(block, _)
+                    if block.expr.is_some_and(|expr| expr.hir_id == curr_id) => {}
+                hir::ExprKind::Call(_, args) => {
+                    let Some(arg_idx) = args.iter().position(|arg| arg.hir_id == curr_id) else {
+                        return true;
+                    };
+                    if let Some(callee_did) = hir_called_local_fn(tcx, parent)
+                        && let Some(kind) = sig_decs
+                            .data
+                            .get(&callee_did)
+                            .and_then(|sig_dec| sig_dec.input_decs.get(arg_idx).copied().flatten())
+                    {
+                        return consumer_kind_requires_raw(kind);
+                    }
+                    let typeck = tcx.typeck(parent.hir_id.owner);
+                    return consumer_ty_requires_raw(tcx, typeck.expr_ty_adjusted(&args[arg_idx]));
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == curr_id => {
+                    return hir_unwrapped_local_id(lhs)
+                        .map(local_consumer_requires_raw)
+                        .unwrap_or(true);
+                }
+                hir::ExprKind::Ret(Some(ret)) if ret.hir_id == curr_id => {
+                    let did = parent.hir_id.owner.def_id;
+                    if let Some(kind) = sig_decs.data.get(&did).and_then(|sig| sig.output_dec) {
+                        return consumer_kind_requires_raw(kind);
+                    }
+                    let output = tcx.fn_sig(did).skip_binder().skip_binder().output();
+                    return consumer_ty_requires_raw(tcx, output);
+                }
+                _ => return true,
+            },
+            hir::Node::LetStmt(let_stmt)
+                if let_stmt.init.is_some_and(|init| init.hir_id == curr_id) =>
+            {
+                let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind else {
+                    return true;
+                };
+                return local_consumer_requires_raw(binding_hir_id);
+            }
+            hir::Node::Stmt(_) => {}
+            _ => return true,
+        }
+        curr_id = parent_id;
+    }
+    true
+}
+
+fn consumer_kind_requires_raw(kind: PtrKind) -> bool {
+    match kind {
+        PtrKind::Ref(m)
+        | PtrKind::OptRef(m)
+        | PtrKind::Raw(m)
+        | PtrKind::Slice(m)
+        | PtrKind::SliceCursor(m) => m,
+        PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice => true,
+    }
+}
+
+fn consumer_ty_requires_raw<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    if ty_points_to_any(tcx, ty) {
+        ty_points_to_mutable(tcx, ty)
+    } else {
+        true
+    }
 }
 
 fn downgrade_static_local_struct_projection_bindings<'tcx>(
