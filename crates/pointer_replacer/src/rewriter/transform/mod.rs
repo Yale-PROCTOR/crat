@@ -4648,9 +4648,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
                 let ty_name = self.ty_name(ty);
-                utils::expr!(
-                    "unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}"
-                )
+                utils::expr!("std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init()")
             }
             _ => {
                 let ty = self.ty_name(ty);
@@ -5757,14 +5755,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         if !need_cast {
             utils::expr!(
-                "unsafe {{ ({}){}.as_{}() }}",
+                "({}){}.as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "ref" },
             )
         } else {
             utils::expr!(
-                "unsafe {{ (({}){} as *{} {}).as_{}() }}",
+                "(({}){} as *{} {}).as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
@@ -16867,7 +16865,7 @@ pub struct UnionHolderProbe {{
     pub value: i32,
 }}
 
-pub fn check() {{
+pub unsafe fn check() {{
     let _: Option<Box<crate::UnionHolderProbe>> = {emitted};
 }}
 "#

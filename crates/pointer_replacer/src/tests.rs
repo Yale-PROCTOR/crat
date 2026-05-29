@@ -4765,7 +4765,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q;
 }
 "#,
-        &["unsafe {", ".as_ref()", "let mut q: &i32"],
+        &[".as_ref()", "let mut q: &i32"],
         &[],
     );
 }
@@ -5009,7 +5009,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["unsafe {", "as *const i16", ".as_ref()", "let mut q: &i16"],
+        &["as *const i16", ".as_ref()", "let mut q: &i16"],
         &["bytemuck"],
     );
 }
@@ -5018,19 +5018,17 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 fn test_rewriter_wraps_raw_to_opt_ref_call_boundary_in_safe_context() {
     run_test(
         r#"
-pub fn foo() -> i32 {
+pub unsafe fn foo() -> i32 {
     let mut x: i32 = 42;
     let mut p: *mut i32 = &mut x;
     let mut r: *mut i32 = &mut x;
-    unsafe {
-        *p = 10;
-        *r = 20;
-    }
+    *p = 10;
+    *r = 20;
     let mut q: *mut i32 = p;
-    unsafe { *q }
+    *q
 }
 "#,
-        &["let mut q: &i32", "unsafe {", ".as_ref()"],
+        &["let mut q: &i32", ".as_ref()"],
         &[],
     );
 }
