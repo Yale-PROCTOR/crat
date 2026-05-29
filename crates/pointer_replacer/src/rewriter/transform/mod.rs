@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
@@ -21,11 +21,14 @@ use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
+    bytemuck::{
+        BytemuckDerivePlan, BytemuckDeriveVisitor, BytemuckRequirement, BytemuckTypeClassifier,
+    },
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
 use super::{
-    Analysis, Config,
+    Analysis, BytemuckDependency, Config,
     collector::collect_diffs,
     decision::{PtrKind, SigDecision, SigDecisions},
 };
@@ -61,6 +64,8 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
+    bytemuck_derives: RefCell<BytemuckDerivePlan>,
+    bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
 }
 
@@ -108,6 +113,20 @@ impl LocalRawParamSummary {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
+    fn visit_crate(&mut self, krate: &mut Crate) {
+        mut_visit::walk_crate(self, krate);
+
+        if self.bytemuck_derives.borrow().is_empty() {
+            return;
+        }
+        let mut derive_visitor = BytemuckDeriveVisitor::new(
+            self.tcx,
+            &self.ast_to_hir,
+            self.bytemuck_derives.borrow().clone(),
+        );
+        derive_visitor.visit_crate(krate);
+    }
+
     fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         if self.should_remove_generated_copy_clone_impl(&item) {
             return smallvec![];
@@ -1615,8 +1634,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ast_to_hir,
             fn_ptr_rewrite,
             bytemuck: Cell::new(false),
+            bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
+            bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
         }
+    }
+
+    pub(crate) fn bytemuck_dependency(&self) -> BytemuckDependency {
+        BytemuckDependency::from_flags(
+            self.bytemuck.get(),
+            !self.bytemuck_derives.borrow().is_empty(),
+        )
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
@@ -4620,9 +4648,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
                 let ty_name = self.ty_name(ty);
-                utils::expr!(
-                    "unsafe {{ std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init() }}"
-                )
+                utils::expr!("std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init()")
             }
             _ => {
                 let ty = self.ty_name(ty);
@@ -4823,8 +4849,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
 
-        let mut source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        let mut source_inner_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))?;
         let mut is_slice_ref = ty_is_slice_ref(pe.base_ty)
+            || ty_is_borrowed_slice_like_container(pe.base_ty, self.tcx)
             || matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         for proj in &pe.projs {
             match proj {
@@ -4869,12 +4897,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
         let offset = array_field_direct_offset(pe, true)?;
-        if m && !is_int_lit_expr(offset) {
-            return None;
-        }
-        if !self.offset_expr_can_be_slice_index(offset) {
-            return None;
-        }
         let slice = self.array_field_offset_slice_ref_from_offset(pe, offset, m);
         let mut raw = utils::expr!(
             "({}).as_{}ptr()",
@@ -4896,12 +4918,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn array_field_offset_slice_ref(&self, pe: &PtrExpr<'_, 'tcx>, m: bool) -> Option<Expr> {
         let offset = array_field_direct_offset(pe, false)?;
-        if m && !is_int_lit_expr(offset) {
-            return None;
-        }
-        if !self.offset_expr_can_be_slice_index(offset) {
-            return None;
-        }
         Some(self.array_field_offset_slice_ref_from_offset(pe, offset, m))
     }
 
@@ -4911,29 +4927,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         offset: &Expr,
         m: bool,
     ) -> Expr {
+        let base = if matches!(self.behind_subscripts(pe.hir_base), PathOrDeref::Other)
+            && place_expr_contains_deref(pe.base)
+        {
+            utils::expr!(
+                "&{}({})",
+                if m { "mut " } else { "" },
+                pprust::expr_to_string(pe.base),
+            )
+        } else {
+            pe.base.clone()
+        };
         utils::expr!(
             "&{}({})[({}) as usize..]",
             if m { "mut " } else { "" },
-            pprust::expr_to_string(pe.base),
+            pprust::expr_to_string(&base),
             pprust::expr_to_string(offset),
         )
-    }
-
-    fn offset_expr_can_be_slice_index(&self, offset: &Expr) -> bool {
-        let offset = unwrap_paren(offset);
-        match &offset.kind {
-            ExprKind::Cast(inner, _) => self.offset_expr_can_be_slice_index(inner),
-            ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
-            ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) => {
-                let Some(hir_offset) = self.ast_to_hir.get_expr(offset.id, self.tcx) else {
-                    return false;
-                };
-                let typeck = self.tcx.typeck(hir_offset.hir_id.owner);
-                let ty = typeck.expr_ty(hir_offset);
-                ty.is_integral() && !ty.is_signed()
-            }
-            _ => false,
-        }
     }
 
     fn safe_slice_view_cast_allowed(
@@ -5038,6 +5048,35 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     ))
                 }
             }
+            ty::TyKind::Adt(adt, _) if adt.is_struct() => {
+                let requirement = if mutable {
+                    BytemuckRequirement::Pod
+                } else {
+                    BytemuckRequirement::NoUninit
+                };
+                let mut derives = self.bytemuck_derives.borrow_mut();
+                let mut classifier = self.bytemuck_classifier.borrow_mut();
+                if !derives.require_type(self.tcx, &mut classifier, pointee_ty, requirement) {
+                    return None;
+                }
+                self.bytemuck.set(true);
+                let bytes = utils::expr!(
+                    "bytemuck::bytes_of{}(&{}({}))",
+                    if mutable { "_mut" } else { "" },
+                    if mutable { "mut " } else { "" },
+                    pointee_str,
+                );
+                if target_inner_ty == self.tcx.types.u8 {
+                    Some(bytes)
+                } else {
+                    Some(utils::expr!(
+                        "bytemuck::cast_slice{}::<_, {}>({})",
+                        if mutable { "_mut" } else { "" },
+                        target_ty,
+                        pprust::expr_to_string(&bytes),
+                    ))
+                }
+            }
             _ => None,
         }
     }
@@ -5117,9 +5156,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         for proj in &pe.projs {
             match proj {
                 PtrExprProj::Offset(offset) => {
-                    if !self.offset_expr_can_be_slice_index(offset) {
-                        return None;
-                    }
                     *expr = utils::expr!(
                         "({})[({}) as usize..]",
                         pprust::expr_to_string(expr),
@@ -5701,14 +5737,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let cast_mut = if m && !m1 { ".cast_mut()" } else { "" };
         if !need_cast {
             utils::expr!(
-                "unsafe {{ ({}){}.as_{}() }}",
+                "({}){}.as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "ref" },
             )
         } else {
             utils::expr!(
-                "unsafe {{ (({}){} as *{} {}).as_{}() }}",
+                "(({}){} as *{} {}).as_{}()",
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
@@ -6599,7 +6635,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if pe.projs.is_empty() {
             return e;
         }
-        let mut from_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx).unwrap();
+        let mut from_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))
+            .unwrap();
         let mut is_array = pe.base_ty.is_array();
         for proj in &pe.projs {
             match proj {
@@ -6631,26 +6669,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     } else if is_mut_cursor_base {
                         if m {
                             e = utils::expr!(
-                                "{{ let mut _c = ({}).as_deref_mut(); _c.seek(({}) as isize); _c }}",
+                                "({}).as_deref_mut().offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         } else if is_slice_cursor_mut_constructor_call(&e) {
                             e = utils::expr!(
-                                "{{ let mut _c = ({}).as_deref(); _c.seek(({}) as isize); _c }}",
+                                "({}).as_deref().offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         } else {
                             e = utils::expr!(
-                                "{{ let mut _c = crate::slice_cursor::SliceCursor::new(({}).as_slice()); _c.seek(({}) as isize); _c }}",
+                                "crate::slice_cursor::SliceCursor::new(({}).as_slice()).offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );
                         }
                     } else {
                         e = utils::expr!(
-                            "{{ let mut _c = ({}); _c.seek(({}) as isize); _c }}",
+                            "({}).offset_by(({}) as isize)",
                             pprust::expr_to_string(&e),
                             pprust::expr_to_string(offset),
                         );
@@ -6679,7 +6717,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         );
                         from_ty = to_ty;
                     } else {
-                        if matches!(e.kind, ExprKind::Index(..)) || is_array || is_plain_slice {
+                        if matches!(e.kind, ExprKind::Index(..))
+                            || is_data_container
+                            || is_array
+                            || is_plain_slice
+                        {
                             e = self.plain_slice_from_slice(&e, pe, current_mut, to_ty, from_ty);
                             is_plain_slice = true;
                         } else {
@@ -6769,6 +6811,33 @@ fn unwrap_ptr_or_arr_from_mir_ty<'tcx>(
         }
         _ => None,
     }
+}
+
+fn slice_like_container_inner_ty<'tcx>(
+    ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::Ref(_, inner, _) => slice_like_container_inner_ty(*inner, tcx),
+        ty::TyKind::Slice(ty) | ty::TyKind::Array(ty, _) => Some(*ty),
+        ty::TyKind::Adt(adt_def, gargs) => {
+            let name = tcx.item_name(adt_def.did());
+            if name == rustc_span::sym::Vec {
+                let ty::GenericArgKind::Type(ty) = gargs[0].kind() else { panic!() };
+                Some(ty)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ty_is_borrowed_slice_like_container<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Ref(_, inner, _) if slice_like_container_inner_ty(*inner, tcx).is_some()
+    )
 }
 
 fn ty_is_slice_ref(ty: ty::Ty<'_>) -> bool {
@@ -7448,14 +7517,6 @@ fn array_field_direct_offset<'a, 'tcx>(
     Some(*offset)
 }
 
-fn is_int_lit_expr(expr: &Expr) -> bool {
-    match &unwrap_paren(expr).kind {
-        ExprKind::Cast(inner, _) => is_int_lit_expr(inner),
-        ExprKind::Lit(lit) => matches!(lit.kind, token::LitKind::Integer),
-        _ => false,
-    }
-}
-
 fn is_array_field_ptr_arithmetic(pe: &PtrExpr<'_, '_>) -> bool {
     pe.as_ptr
         && pe.as_mut_ptr
@@ -7803,7 +7864,6 @@ struct LocalStructDowngradeFacts {
 struct LocalStructBodyFacts {
     body_local_counts: FxHashMap<HirId, usize>,
     body_field_projection_counts: FxHashMap<(HirId, Symbol), usize>,
-    local_offset_bindings_with_unbounded_index: FxHashSet<HirId>,
     calls: Vec<LocalStructCallFact>,
     lets: Vec<LocalStructLetFact>,
     reborrow_assignments: Vec<LocalStructReborrowAssignmentFact>,
@@ -7816,7 +7876,6 @@ impl LocalStructBodyFacts {
         Self {
             body_local_counts: FxHashMap::default(),
             body_field_projection_counts: FxHashMap::default(),
-            local_offset_bindings_with_unbounded_index: FxHashSet::default(),
             calls: Vec::new(),
             lets: Vec::new(),
             reborrow_assignments: Vec::new(),
@@ -7851,6 +7910,7 @@ struct LocalStructReborrowAssignmentFact {
 }
 
 struct LocalStructFieldMutPtrFact {
+    expr_hir_id: HirId,
     receiver_local_ids: Vec<HirId>,
     receiver_field_projection_roots: FxHashSet<HirId>,
 }
@@ -8018,17 +8078,9 @@ fn collect_local_struct_downgrade_facts<'tcx>(tcx: TyCtxt<'tcx>) -> LocalStructD
                 return;
             };
             match seg.ident.name.as_str() {
-                "add" | "offset" | "wrapping_offset" if args.len() == 1 => {
-                    if let Some(receiver_hir_id) = hir_unwrapped_local_id(receiver)
-                        && !hir_local_ids_outside_top_level_field_projections(&args[0]).is_empty()
-                    {
-                        self.body
-                            .local_offset_bindings_with_unbounded_index
-                            .insert(receiver_hir_id);
-                    }
-                }
                 "as_mut_ptr" if args.is_empty() => {
                     self.body.field_mut_ptrs.push(LocalStructFieldMutPtrFact {
+                        expr_hir_id: expr.hir_id,
                         receiver_local_ids: hir_local_ids_in_expr(receiver),
                         receiver_field_projection_roots: hir_field_projection_roots_in_expr(
                             receiver,
@@ -8310,12 +8362,6 @@ fn long_lived_borrow_uses_only_disjoint_array_fields(
     if alias_root != root {
         return false;
     }
-    if body
-        .local_offset_bindings_with_unbounded_index
-        .contains(&let_fact.binding_hir_id)
-    {
-        return false;
-    }
 
     let root_uses = body.body_local_counts.get(&root).copied().unwrap_or(0);
     let Some(extra_root_uses) = root_uses.checked_sub(init_count) else {
@@ -8407,6 +8453,12 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
                 if !field_mut_ptr.receiver_field_projection_roots.contains(root)
                     || !local_struct_borrow_binding(tcx, ptr_kinds, *root)
                     || is_mutable_borrow_like_decision(root_kind)
+                    || !local_struct_field_mut_ptr_consumer_requires_raw(
+                        tcx,
+                        sig_decs,
+                        ptr_kinds,
+                        field_mut_ptr.expr_hir_id,
+                    )
                     || !force_signature_input_raw_for_binding(tcx, sig_decs, *root)
                 {
                     continue;
@@ -8417,6 +8469,110 @@ fn downgrade_local_struct_field_mut_ptr_bindings<'tcx>(
         }
     }
     (changed, bindings)
+}
+
+fn local_struct_field_mut_ptr_consumer_requires_raw(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    expr_hir_id: HirId,
+) -> bool {
+    let local_consumer_requires_raw = |hir_id: HirId| {
+        ptr_kinds
+            .get(&hir_id)
+            .copied()
+            .map(consumer_kind_requires_raw)
+            .unwrap_or_else(|| {
+                consumer_ty_requires_raw(tcx, tcx.typeck(hir_id.owner).node_type(hir_id))
+            })
+    };
+
+    let mut curr_id = expr_hir_id;
+    for (parent_id, parent_node) in tcx.hir_parent_iter(expr_hir_id) {
+        match parent_node {
+            hir::Node::Expr(parent) => match parent.kind {
+                hir::ExprKind::DropTemps(_)
+                | hir::ExprKind::Cast(_, _)
+                | hir::ExprKind::Unary(hir::UnOp::Deref, _)
+                | hir::ExprKind::AddrOf(_, _, _) => {}
+                hir::ExprKind::MethodCall(seg, receiver, args, _) if curr_id == receiver.hir_id => {
+                    match seg.ident.name.as_str() {
+                        "offset" | "add" => {
+                            if args.is_empty() {
+                                return true;
+                            }
+                        }
+                        "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub" => {
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
+                hir::ExprKind::Block(block, _)
+                    if block.expr.is_some_and(|expr| expr.hir_id == curr_id) => {}
+                hir::ExprKind::Call(_, args) => {
+                    let Some(arg_idx) = args.iter().position(|arg| arg.hir_id == curr_id) else {
+                        return true;
+                    };
+                    if let Some(callee_did) = hir_called_local_fn(tcx, parent)
+                        && let Some(kind) = sig_decs
+                            .data
+                            .get(&callee_did)
+                            .and_then(|sig_dec| sig_dec.input_decs.get(arg_idx).copied().flatten())
+                    {
+                        return consumer_kind_requires_raw(kind);
+                    }
+                    let typeck = tcx.typeck(parent.hir_id.owner);
+                    return consumer_ty_requires_raw(tcx, typeck.expr_ty_adjusted(&args[arg_idx]));
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == curr_id => {
+                    return hir_unwrapped_local_id(lhs)
+                        .map(local_consumer_requires_raw)
+                        .unwrap_or(true);
+                }
+                hir::ExprKind::Ret(Some(ret)) if ret.hir_id == curr_id => {
+                    let did = parent.hir_id.owner.def_id;
+                    if let Some(kind) = sig_decs.data.get(&did).and_then(|sig| sig.output_dec) {
+                        return consumer_kind_requires_raw(kind);
+                    }
+                    let output = tcx.fn_sig(did).skip_binder().skip_binder().output();
+                    return consumer_ty_requires_raw(tcx, output);
+                }
+                _ => return true,
+            },
+            hir::Node::LetStmt(let_stmt)
+                if let_stmt.init.is_some_and(|init| init.hir_id == curr_id) =>
+            {
+                let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind else {
+                    return true;
+                };
+                return local_consumer_requires_raw(binding_hir_id);
+            }
+            hir::Node::Stmt(_) => {}
+            _ => return true,
+        }
+        curr_id = parent_id;
+    }
+    true
+}
+
+fn consumer_kind_requires_raw(kind: PtrKind) -> bool {
+    match kind {
+        PtrKind::Ref(m)
+        | PtrKind::OptRef(m)
+        | PtrKind::Raw(m)
+        | PtrKind::Slice(m)
+        | PtrKind::SliceCursor(m) => m,
+        PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice => true,
+    }
+}
+
+fn consumer_ty_requires_raw<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    if ty_points_to_any(tcx, ty) {
+        ty_points_to_mutable(tcx, ty)
+    } else {
+        true
+    }
 }
 
 fn downgrade_static_local_struct_projection_bindings<'tcx>(
@@ -14550,10 +14706,6 @@ impl mut_visit::MutVisitor for OptRefBorrowVisitor {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
-    use rustc_ast::{Crate, Expr, ItemKind, LocalKind, PatKind, StmtKind};
-    use rustc_ast_pretty::pprust;
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{self as hir, HirId, ItemKind as HirItemKind, OwnerNode};
     use rustc_middle::{
@@ -14568,36 +14720,6 @@ mod tests {
         rewriter::{Config, replace_local_borrows},
         utils::rustc::RustProgram,
     };
-
-    fn synthetic_transform_visitor<'tcx>(tcx: TyCtxt<'tcx>) -> TransformVisitor<'static, 'tcx> {
-        let (_, analysis) = build_analysis(tcx);
-        let analysis = Box::leak(Box::new(analysis));
-        TransformVisitor {
-            tcx,
-            analysis,
-            sig_decs: SigDecisions {
-                data: FxHashMap::default(),
-            },
-            lifetime_plans: super::super::lifetimes::LifetimePlans::default(),
-            ptr_kinds: FxHashMap::default(),
-            forced_raw_bindings: FxHashSet::default(),
-            borrowed_raw_params: FxHashMap::default(),
-            raw_bridge_bindings: FxHashMap::default(),
-            raw_scalar_bridge_fields: FxHashSet::default(),
-            alloc_wrappers: FxHashMap::default(),
-            free_like_wrappers: FxHashSet::default(),
-            demoted_fields: FxHashSet::default(),
-            field_cursor_fields: analysis.offset_sign_result.field_access_signs.clone(),
-            c_exposed_abi_fields: FxHashSet::default(),
-            c_exposed_thin_abi_fields: FxHashSet::default(),
-            c_exposed_cursor_abi_fields: FxHashSet::default(),
-            impl_self_lifetimes: Vec::new(),
-            ast_to_hir: AstToHir::default(),
-            fn_ptr_rewrite: FnPtrRewriteDecision::default(),
-            bytemuck: Cell::new(false),
-            slice_cursor: Cell::new(false),
-        }
-    }
 
     fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         let mut functions = Vec::new();
@@ -15976,91 +16098,6 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
         out
     }
 
-    fn find_struct_ty<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> ty::Ty<'tcx> {
-        tcx.hir_crate(())
-            .owners
-            .iter()
-            .filter_map(|maybe_owner| {
-                let owner = maybe_owner.as_owner()?;
-                let OwnerNode::Item(item) = owner.node() else {
-                    return None;
-                };
-                match item.kind {
-                    HirItemKind::Struct(..)
-                        if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() == name =>
-                    {
-                        Some(tcx.type_of(item.owner_id.def_id).instantiate_identity())
-                    }
-                    _ => None,
-                }
-            })
-            .next()
-            .expect("expected local struct type")
-    }
-
-    fn find_local_init_expr<'a>(krate: &'a Crate, fn_name: &str, local_name: &str) -> &'a Expr {
-        krate
-            .items
-            .iter()
-            .find_map(|item| {
-                let ItemKind::Fn(box fn_item) = &item.kind else {
-                    return None;
-                };
-                if fn_item.ident.name.as_str() != fn_name {
-                    return None;
-                }
-                let body = fn_item.body.as_ref()?;
-                body.stmts.iter().find_map(|stmt| {
-                    let StmtKind::Let(local) = &stmt.kind else {
-                        return None;
-                    };
-                    let PatKind::Ident(_, ident, _) = &local.pat.kind else {
-                        return None;
-                    };
-                    if ident.name.as_str() != local_name {
-                        return None;
-                    }
-                    match &local.kind {
-                        LocalKind::Init(expr) | LocalKind::InitElse(expr, _) => Some(expr.as_ref()),
-                        LocalKind::Decl => None,
-                    }
-                })
-            })
-            .expect("expected matching local initializer")
-    }
-
-    fn find_local_hir_id(tcx: TyCtxt<'_>, fn_name: &str, local_name: &str) -> HirId {
-        tcx.hir_crate(())
-            .owners
-            .iter()
-            .filter_map(|maybe_owner| maybe_owner.as_owner())
-            .find_map(|owner| {
-                let OwnerNode::Item(item) = owner.node() else {
-                    return None;
-                };
-                let HirItemKind::Fn { body, .. } = item.kind else {
-                    return None;
-                };
-                if tcx.item_name(item.owner_id.def_id.to_def_id()).as_str() != fn_name {
-                    return None;
-                }
-                let body = tcx.hir_body(body);
-                let hir::ExprKind::Block(block, _) = body.value.kind else {
-                    return None;
-                };
-                block.stmts.iter().find_map(|stmt| {
-                    let hir::StmtKind::Let(let_stmt) = stmt.kind else {
-                        return None;
-                    };
-                    let hir::PatKind::Binding(_, hir_id, ident, _) = let_stmt.pat.kind else {
-                        return None;
-                    };
-                    (ident.name.as_str() == local_name).then_some(hir_id)
-                })
-            })
-            .expect("expected matching local hir id")
-    }
-
     fn find_fn_did(tcx: TyCtxt<'_>, fn_name: &str) -> LocalDefId {
         tcx.hir_crate(())
             .owners
@@ -16511,419 +16548,6 @@ pub unsafe fn id(x: *mut i32) -> *mut i32 {
             assert_eq!(sig_dec.input_decs[0], Some(PtrKind::Raw(true)));
             assert_eq!(sig_dec.input_lifetimes[0], None);
             assert_eq!(sig_dec.output_lifetime, Some(lifetime));
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn raw_local_caller_keeps_negative_cursor_input_raw() {
-        let code = r#"
-extern "C" {
-    fn foreign() -> *const u8;
-}
-
-pub unsafe fn read_before(p: *const u8) -> u8 {
-    *p.offset(-1)
-}
-
-pub unsafe fn drive() -> u8 {
-    let p = foreign();
-    read_before(p)
-}
-"#;
-
-        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            replace_local_borrows(&Config::default(), tcx)
-        })
-        .unwrap();
-        let normalized = normalize_expr_snippet(&rewritten);
-        assert!(
-            normalized.contains("fnread_before(p:*constu8)")
-                || normalized.contains("fnread_before(mutp:*constu8)"),
-            "{rewritten}"
-        );
-        assert!(
-            !normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
-            "{rewritten}"
-        );
-        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
-            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
-    }
-
-    #[test]
-    fn array_pointer_caller_keeps_negative_cursor_input_cursor() {
-        let code = r#"
-pub unsafe fn read_before(p: *const u8) -> u8 {
-    *p.offset(-1)
-}
-
-pub unsafe fn drive() -> u8 {
-    let buf = [1u8, 2, 3, 4];
-    read_before(buf.as_ptr().offset(1))
-}
-"#;
-
-        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            replace_local_borrows(&Config::default(), tcx)
-        })
-        .unwrap();
-        let normalized = normalize_expr_snippet(&rewritten);
-        assert!(
-            normalized.contains("fnread_before(p:crate::slice_cursor::SliceCursor")
-                || normalized.contains("fnread_before(mutp:crate::slice_cursor::SliceCursor"),
-            "{rewritten}"
-        );
-        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
-            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
-    }
-
-    #[test]
-    fn struct_default_materialization_uses_recursive_defaults() {
-        let code = r#"
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-
-#[repr(C)]
-pub struct StructDefaultProbe {
-    pub next: *mut i32,
-    pub value: i32,
-}
-
-pub unsafe fn alloc_struct() {
-    let state: *mut StructDefaultProbe =
-        malloc(std::mem::size_of::<crate::StructDefaultProbe>()) as *mut crate::StructDefaultProbe;
-    let _ = state;
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let mut krate = ::utils::ast::expanded_ast(tcx);
-            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-
-            let struct_ty = find_struct_ty(tcx, "StructDefaultProbe");
-            let init_expr = find_local_init_expr(&krate, "alloc_struct", "state");
-            let mut materialized = init_expr.clone();
-            let visitor = synthetic_transform_visitor(tcx);
-
-            let kind = visitor.try_materialize_box_allocator_root(
-                &mut materialized,
-                init_expr,
-                None,
-                PtrKind::OptBox,
-                struct_ty,
-            );
-            assert_eq!(kind, Some(PtrKind::OptBox));
-
-            let emitted = pprust::expr_to_string(&materialized);
-            assert!(emitted.contains("Some(Box::new("), "{emitted}");
-            assert!(!emitted.contains("Box::into_raw("), "{emitted}");
-            assert!(emitted.contains("crate::StructDefaultProbe {"), "{emitted}");
-            assert!(
-                emitted.contains("next: std::ptr::null_mut::<i32>()"),
-                "{emitted}"
-            );
-            assert!(
-                emitted.contains("value: <i32 as Default>::default()"),
-                "{emitted}"
-            );
-
-            let check_code = format!(
-                r#"
-#[repr(C)]
-pub struct StructDefaultProbe {{
-    pub next: *mut i32,
-    pub value: i32,
-}}
-
-pub fn check() {{
-    let _: Option<Box<crate::StructDefaultProbe>> = {emitted};
-}}
-"#
-            );
-            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
-                .expect(&check_code);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn struct_default_materialization_handles_large_array_fields() {
-        let code = r#"
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-
-#[repr(C)]
-pub struct StructArrayDefaultProbe {
-    pub name: [i8; 64],
-    pub nodes: [*mut i32; 100],
-}
-
-pub unsafe fn alloc_struct() {
-    let state: *mut StructArrayDefaultProbe =
-        malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>()) as *mut crate::StructArrayDefaultProbe;
-    let _ = state;
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let mut krate = ::utils::ast::expanded_ast(tcx);
-            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-
-            let struct_ty = find_struct_ty(tcx, "StructArrayDefaultProbe");
-            let init_expr = find_local_init_expr(&krate, "alloc_struct", "state");
-            let mut materialized = init_expr.clone();
-            let visitor = synthetic_transform_visitor(tcx);
-
-            let kind = visitor.try_materialize_box_allocator_root(
-                &mut materialized,
-                init_expr,
-                None,
-                PtrKind::OptBox,
-                struct_ty,
-            );
-            assert_eq!(kind, Some(PtrKind::OptBox));
-
-            let emitted = pprust::expr_to_string(&materialized);
-            assert!(emitted.contains("Some(Box::new("), "{emitted}");
-            assert!(!emitted.contains("Box::into_raw("), "{emitted}");
-            assert!(emitted.contains("name: std::array::from_fn"), "{emitted}");
-            assert!(emitted.contains("nodes: std::array::from_fn"), "{emitted}");
-            assert!(emitted.contains("std::ptr::null_mut::<i32>()"), "{emitted}");
-
-            let check_code = format!(
-                r#"
-#[repr(C)]
-pub struct StructArrayDefaultProbe {{
-    pub name: [i8; 64],
-    pub nodes: [*mut i32; 100],
-}}
-
-pub fn check() {{
-    let _: Option<Box<crate::StructArrayDefaultProbe>> = {emitted};
-}}
-"#
-            );
-            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
-                .expect(&check_code);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn struct_default_materialization_handles_union_fields() {
-        let code = r#"
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-
-#[repr(C)]
-pub union TypeConfusion {
-    pub int_val: i32,
-    pub float_val: f32,
-}
-
-#[repr(C)]
-pub struct UnionHolderProbe {
-    pub data: TypeConfusion,
-    pub value: i32,
-}
-
-pub unsafe fn alloc_struct() {
-    let state: *mut UnionHolderProbe =
-        malloc(std::mem::size_of::<crate::UnionHolderProbe>()) as *mut crate::UnionHolderProbe;
-    let _ = state;
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let mut krate = ::utils::ast::expanded_ast(tcx);
-            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-
-            let struct_ty = find_struct_ty(tcx, "UnionHolderProbe");
-            let init_expr = find_local_init_expr(&krate, "alloc_struct", "state");
-            let mut materialized = init_expr.clone();
-            let visitor = synthetic_transform_visitor(tcx);
-
-            let kind = visitor.try_materialize_box_allocator_root(
-                &mut materialized,
-                init_expr,
-                None,
-                PtrKind::OptBox,
-                struct_ty,
-            );
-            assert_eq!(kind, Some(PtrKind::OptBox));
-
-            let emitted = pprust::expr_to_string(&materialized);
-            assert!(emitted.contains("Some(Box::new("), "{emitted}");
-            assert!(
-                emitted.contains("MaybeUninit::<crate::TypeConfusion>::zeroed().assume_init()"),
-                "{emitted}"
-            );
-
-            let check_code = format!(
-                r#"
-#[repr(C)]
-pub union TypeConfusion {{
-    pub int_val: i32,
-    pub float_val: f32,
-}}
-
-#[repr(C)]
-pub struct UnionHolderProbe {{
-    pub data: TypeConfusion,
-    pub value: i32,
-}}
-
-pub fn check() {{
-    let _: Option<Box<crate::UnionHolderProbe>> = {emitted};
-}}
-"#
-            );
-            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
-                .expect(&check_code);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn raw_bridge_default_materialization_handles_fieldless_enum_fields() {
-        let code = r#"
-#[repr(i32)]
-pub enum StatusCode {
-    STATUS_ERROR = -1,
-    STATUS_SUCCESS = 0,
-    STATUS_WARNING = 1,
-}
-
-#[repr(C)]
-pub struct ComputationResult {
-    pub value: i32,
-    pub status: StatusCode,
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let struct_ty = find_struct_ty(tcx, "ComputationResult");
-            assert!(ty_supports_raw_bridge_default_expr(tcx, struct_ty));
-
-            let visitor = synthetic_transform_visitor(tcx);
-            let raw_expr = visitor.raw_bridge_expr(
-                struct_ty,
-                true,
-                &RawBridgeInfo::Array {
-                    len_expr: "count".to_string(),
-                },
-            );
-            let emitted = pprust::expr_to_string(&raw_expr);
-            assert!(emitted.contains("Box::leak("), "{emitted}");
-            assert!(
-                emitted.contains("status: crate::StatusCode::STATUS_SUCCESS"),
-                "{emitted}"
-            );
-
-            let check_code = format!(
-                r#"
-#[repr(i32)]
-pub enum StatusCode {{
-    STATUS_ERROR = -1,
-    STATUS_SUCCESS = 0,
-    STATUS_WARNING = 1,
-}}
-
-#[repr(C)]
-pub struct ComputationResult {{
-    pub value: i32,
-    pub status: StatusCode,
-}}
-
-pub fn check(count: usize) {{
-    let _: *mut crate::ComputationResult = {emitted};
-}}
-"#
-            );
-            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
-                .expect(&check_code);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn boxed_slice_materialization_uses_direct_owning_value() {
-        let code = r#"
-extern "C" {
-    fn calloc(count: usize, size: usize) -> *mut i32;
-}
-
-pub unsafe fn alloc_arr() {
-    let data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
-    let _ = data;
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let mut krate = ::utils::ast::expanded_ast(tcx);
-            ::utils::ast::remove_unnecessary_items_from_ast(&mut krate);
-
-            let init_expr = find_local_init_expr(&krate, "alloc_arr", "data");
-            let mut materialized = init_expr.clone();
-            let visitor = synthetic_transform_visitor(tcx);
-
-            let kind = visitor.try_materialize_box_allocator_root(
-                &mut materialized,
-                init_expr,
-                None,
-                PtrKind::OptBoxedSlice,
-                tcx.types.i32,
-            );
-            assert_eq!(kind, Some(PtrKind::OptBoxedSlice));
-
-            let emitted = pprust::expr_to_string(&materialized);
-            assert!(
-                emitted.contains("Some(std::iter::repeat_with(||"),
-                "{emitted}"
-            );
-            assert!(
-                emitted.contains("collect::<Vec<i32>>().into_boxed_slice()"),
-                "{emitted}"
-            );
-            assert!(!emitted.contains("Box::leak("), "{emitted}");
-            assert!(!emitted.contains("Box::into_raw("), "{emitted}");
-
-            let check_code = format!(
-                r#"
-pub fn check() {{
-    let _: Option<Box<[i32]>> = {emitted};
-}}
-"#
-            );
-            ::utils::compilation::run_compiler_on_str(&check_code, ::utils::type_check)
-                .expect(&check_code);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn boxed_slice_bindings_are_not_preemptively_downgraded_to_raw() {
-        let code = r#"
-extern "C" {
-    fn calloc(count: usize, size: usize) -> *mut i32;
-}
-
-pub unsafe fn alloc_arr() {
-    let data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
-    let _ = data;
-}
-"#;
-
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let hir_id = find_local_hir_id(tcx, "alloc_arr", "data");
-            let mut ptr_kinds = FxHashMap::default();
-            ptr_kinds.insert(hir_id, PtrKind::OptBoxedSlice);
-
-            let downgraded = downgrade_unsupported_allocator_box_kinds(tcx, &ptr_kinds);
-            assert!(!downgraded.contains(&hir_id), "{downgraded:?}");
         })
         .unwrap();
     }

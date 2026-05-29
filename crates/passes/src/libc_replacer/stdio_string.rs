@@ -141,9 +141,7 @@ impl super::TransformVisitor<'_> {
     }
 
     fn scan_arg(&self, arg: &Expr, spec: &ConversionSpec) -> Option<String> {
-        let ConvTy::Scalar(spec_ty) = spec.ty() else {
-            return None;
-        };
+        let spec_ty = scan_arg_ty(spec)?;
         if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
             && let Some(hir_e) = self.ast_to_hir.get_expr(e.id, self.tcx)
         {
@@ -152,6 +150,11 @@ impl super::TransformVisitor<'_> {
             if ty == spec_ty {
                 return Some(format!("&mut ({})", pprust::expr_to_string(e)));
             }
+        }
+        if let Some((array, ty)) = utils::ir::array_of_as_ptr(arg, &self.ast_to_hir, self.tcx)
+            && ty.to_string() == spec_ty
+        {
+            return Some(format!("&mut ({})[0]", pprust::expr_to_string(array)));
         }
         None
     }
@@ -338,7 +341,17 @@ fn supported_scan_spec(spec: &ConversionSpec) -> bool {
     matches!(
         (&spec.conversion, spec.length),
         (ScanConversion::Int10, None) | (ScanConversion::Double, Some(fscanf::LengthMod::Long))
-    )
+    ) || spec.num_ty().is_some()
+}
+
+fn scan_arg_ty(spec: &ConversionSpec) -> Option<&'static str> {
+    if matches!(&spec.conversion, ScanConversion::Num) {
+        return spec.num_ty();
+    }
+    let ConvTy::Scalar(spec_ty) = spec.ty() else {
+        return None;
+    };
+    Some(spec_ty)
 }
 
 struct ScanFunction {
@@ -352,20 +365,47 @@ fn make_scan_function(specs: &[ConversionSpec]) -> Option<ScanFunction> {
     let mut name = "sscanf_scan".to_string();
     let mut args = "mut stream: R".to_string();
     let mut body = String::new();
-    writeln!(
-        body,
-        "    if is_eof(&mut stream, None, None, {}) {{
-        return -1;
-    }}",
-        specs[0].leading_space || skips_leading_whitespace(&specs[0])
-    )
-    .unwrap();
+    let has_num = specs
+        .iter()
+        .any(|spec| matches!(&spec.conversion, ScanConversion::Num));
+    if has_num {
+        writeln!(body, "    let mut stream = CountingBufRead::new(stream);").unwrap();
+    }
     writeln!(body, "    let mut count = 0;").unwrap();
 
     let mut lib_items = vec![];
+    if has_num {
+        lib_items.push(LibItem::CountingBufRead);
+    }
+    let mut checked_initial_eof = false;
     let mut num_traits = false;
     for (i, spec) in specs.iter().enumerate() {
-        if spec.leading_space && !skips_leading_whitespace(spec) {
+        if matches!(&spec.conversion, ScanConversion::Num) {
+            let ty = spec.num_ty()?;
+            let suffix = scan_num_suffix(spec)?;
+            write!(name, "_{suffix}").unwrap();
+            write!(args, ", v{}: &mut {ty}", i + 1).unwrap();
+            if spec.leading_space {
+                writeln!(body, "    let _ = is_eof(&mut stream, None, None, true);").unwrap();
+            }
+            writeln!(body, "    *v{} = stream.consumed() as {ty};", i + 1).unwrap();
+            if spec.trailing_space {
+                writeln!(body, "    let _ = is_eof(&mut stream, None, None, true);").unwrap();
+            }
+            continue;
+        }
+
+        if !checked_initial_eof {
+            checked_initial_eof = true;
+            writeln!(
+                body,
+                "    if is_eof(&mut stream, None, None, {}) {{
+        return -1;
+    }}",
+                spec.leading_space || skips_leading_whitespace(spec)
+            )
+            .unwrap();
+        } else if spec.leading_space && !skips_leading_whitespace(spec) {
             writeln!(body, "    let _ = is_eof(&mut stream, None, None, true);").unwrap();
         }
         let (suffix, ty, parser, item) = match (&spec.conversion, spec.length) {
@@ -421,7 +461,17 @@ fn make_scan_function(specs: &[ConversionSpec]) -> Option<ScanFunction> {
 
 fn skips_leading_whitespace(spec: &ConversionSpec) -> bool {
     !matches!(
-        spec.conversion,
-        ScanConversion::Seq | ScanConversion::ScanSet(_)
+        &spec.conversion,
+        ScanConversion::Seq | ScanConversion::ScanSet(_) | ScanConversion::Num
     )
+}
+
+fn scan_num_suffix(spec: &ConversionSpec) -> Option<String> {
+    spec.num_ty()?;
+    let mut suffix = String::new();
+    if let Some(length) = spec.length {
+        write!(suffix, "{length}").unwrap();
+    }
+    suffix.push('n');
+    Some(suffix)
 }
