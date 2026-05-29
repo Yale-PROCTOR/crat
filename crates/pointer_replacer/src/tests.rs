@@ -6029,6 +6029,32 @@ pub unsafe fn foo() -> i32 {
 }
 
 #[test]
+fn test_as_ptr_from_vec_ref_uses_safe_slice_view() {
+    run_test(
+        r#"
+pub unsafe fn foo() -> i32 {
+    let mut alloca_allocations: Vec<Vec<u8>> = Vec::new();
+    let mut data: *mut i32 = 0 as *mut i32;
+    alloca_allocations.push(::std::vec::from_elem(
+        0u8,
+        10usize * ::core::mem::size_of::<i32>(),
+    ));
+    data = alloca_allocations.last_mut().unwrap().as_mut_ptr() as *mut i32;
+    *data.offset(0) = 7;
+    *data.offset(1) = 9;
+    *data.offset(0)
+}
+"#,
+        &[
+            "let mut data: &mut [i32]",
+            "bytemuck::cast_slice_mut",
+            "alloca_allocations.last_mut().unwrap()",
+        ],
+        &["from_raw_parts_mut"],
+    );
+}
+
+#[test]
 fn test_as_ptr_deref_offset_uses_safe_slice_index() {
     run_test(
         r#"
