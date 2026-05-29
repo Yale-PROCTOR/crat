@@ -490,6 +490,114 @@ pub unsafe fn make_state() -> *mut State {
 }
 
 #[test]
+fn test_rewriter_materializes_struct_box_with_raw_pointer_default() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct StructDefaultProbe {
+    pub next: *mut i32,
+    pub value: i32,
+}
+
+pub unsafe fn alloc_struct() -> *mut StructDefaultProbe {
+    let mut state: *mut StructDefaultProbe =
+        malloc(std::mem::size_of::<crate::StructDefaultProbe>()) as *mut crate::StructDefaultProbe;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::StructDefaultProbe>",
+            "let mut state: Box<crate::StructDefaultProbe>",
+            "Some(Box::new(crate::StructDefaultProbe {",
+            "next: std::ptr::null_mut::<i32>()",
+            "value: <i32 as Default>::default()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::StructDefaultProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_struct_box_with_large_array_defaults() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct StructArrayDefaultProbe {
+    pub name: [i8; 64],
+    pub nodes: [*mut i32; 100],
+}
+
+pub unsafe fn alloc_struct() -> *mut StructArrayDefaultProbe {
+    let mut state: *mut StructArrayDefaultProbe =
+        malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>()) as *mut crate::StructArrayDefaultProbe;
+    (*state).name[0] = 1;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::StructArrayDefaultProbe>",
+            "name: std::array::from_fn",
+            "nodes: std::array::from_fn",
+            "std::ptr::null_mut::<i32>()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::StructArrayDefaultProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_struct_box_with_union_default() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub union TypeConfusion {
+    pub int_val: i32,
+    pub float_val: f32,
+}
+
+#[repr(C)]
+pub struct UnionHolderProbe {
+    pub data: TypeConfusion,
+    pub value: i32,
+}
+
+pub unsafe fn alloc_struct() -> *mut UnionHolderProbe {
+    let mut state: *mut UnionHolderProbe =
+        malloc(std::mem::size_of::<crate::UnionHolderProbe>()) as *mut crate::UnionHolderProbe;
+    (*state).value = 7;
+    state
+}
+"#,
+        &[
+            "pub unsafe fn alloc_struct() -> Box<crate::UnionHolderProbe>",
+            "MaybeUninit::<crate::TypeConfusion>::zeroed().assume_init()",
+            "value: <i32 as Default>::default()",
+        ],
+        &[
+            "malloc(std::mem::size_of::<crate::UnionHolderProbe>())",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_rewrites_calloc_array_to_opt_boxed_slice() {
     run_test(
         r#"
@@ -513,6 +621,65 @@ pub unsafe fn foo() -> *mut i32 {
             "Box::leak(",
             "Box::into_raw(",
             "calloc(4, std::mem::size_of::<i32>())",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_materializes_calloc_array_as_direct_boxed_slice_value() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_arr() {
+    let mut data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *data.offset(1) = 7;
+    free(data as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub unsafe fn alloc_arr()",
+            "let mut data: Box<[i32]>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "drop(data);",
+        ],
+        &[
+            "calloc(4, std::mem::size_of::<i32>())",
+            "free(data as *mut core::ffi::c_void);",
+            "Box::leak(",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_calloc_array_binding_as_boxed_slice_without_raw_downgrade() {
+    run_test(
+        r#"
+extern "C" {
+    fn calloc(count: usize, size: usize) -> *mut i32;
+}
+
+pub unsafe fn alloc_arr() -> *mut i32 {
+    let mut data: *mut i32 = calloc(4, std::mem::size_of::<i32>());
+    *data.offset(1) = 7;
+    data
+}
+"#,
+        &[
+            "pub unsafe fn alloc_arr() -> Box<[i32]>",
+            "let mut data: Box<[i32]>",
+            "collect::<Vec<i32>>().into_boxed_slice()",
+            "(&mut ((&mut (data)[..])[(1) as usize..]))[0] = 7;",
+        ],
+        &[
+            "let mut data: *mut i32",
+            "calloc(4, std::mem::size_of::<i32>())",
+            "Box::leak(",
+            "Box::into_raw(",
         ],
     );
 }
@@ -3505,6 +3672,46 @@ pub unsafe fn init_and_clear(holder: *mut Holder) {
             "malloc(std::mem::size_of::<Node>())",
             "free((*holder).node as *mut core::ffi::c_void);",
             "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_raw_bridge_default_uses_fieldless_enum_zero_variant() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(i32)]
+pub enum StatusCode {
+    STATUS_ERROR = -1,
+    STATUS_SUCCESS = 0,
+    STATUS_WARNING = 1,
+}
+
+#[repr(C)]
+pub struct ComputationResult {
+    pub value: i32,
+    pub status: StatusCode,
+}
+
+pub unsafe fn alloc_results(count: usize) {
+    let results: *mut ComputationResult =
+        malloc(count * std::mem::size_of::<crate::ComputationResult>()) as *mut crate::ComputationResult;
+    free(results as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "Box::leak(std::iter::repeat_with(||",
+            "status: crate::StatusCode::STATUS_SUCCESS",
+            "Box::from_raw(std::ptr::slice_from_raw_parts_mut",
+        ],
+        &[
+            "malloc(count * std::mem::size_of::<crate::ComputationResult>())",
+            "free(results as *mut core::ffi::c_void);",
         ],
     );
 }
@@ -6990,6 +7197,55 @@ pub unsafe extern "C" fn bar() -> libc::c_int {
             "foo(last_element, 5 as libc::c_int)",
         ],
         &["let mut last_element: &[i32]"],
+    );
+}
+
+#[test]
+fn test_raw_local_caller_keeps_negative_cursor_input_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn foreign() -> *const u8;
+}
+
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let p = foreign();
+    read_before(p)
+}
+"#,
+        &["pub unsafe fn read_before", "p: *const u8"],
+        &[
+            "fn read_before(p: crate::slice_cursor::SliceCursor",
+            "fn read_before(mut p: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_array_pointer_caller_keeps_negative_cursor_input_cursor() {
+    run_test(
+        r#"
+pub unsafe fn read_before(p: *const u8) -> u8 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    read_before(buf.as_ptr().offset(1))
+}
+"#,
+        &[
+            "pub unsafe fn read_before",
+            "p: crate::slice_cursor::SliceCursor",
+        ],
+        &[
+            "fn read_before(p: *const u8)",
+            "fn read_before(mut p: *const u8)",
+        ],
     );
 }
 
