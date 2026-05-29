@@ -1,4 +1,4 @@
-fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
+fn run_test(code: &str, includes: &[&str], excludes: &[&str]) -> super::TransformationResult {
     let res = utils::compilation::run_compiler_on_str(code, super::replace_libc).unwrap();
     utils::compilation::run_compiler_on_str(&res.code, utils::type_check).expect(&res.code);
     for include in includes {
@@ -15,6 +15,7 @@ fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
             res.code
         );
     }
+    res
 }
 
 #[test]
@@ -39,6 +40,138 @@ pub unsafe extern "C" fn foo(mut p: *mut s, mut q: *mut s) {
         &["&mut", "&(", "copy_from_slice"],
         &[],
     );
+}
+
+#[test]
+fn test_memcpy_from_int_object_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(x: i32) {
+    let mut raw = [0i8; 4];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<i32>(),
+    );
+}
+        "#,
+        &[
+            "bytemuck::bytes_of(&(x))",
+            "bytemuck::cast_slice_mut::<_",
+            "copy_from_slice(___src)",
+        ],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(!res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_float_object_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(x: f32) {
+    let mut raw = [0i8; 4];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<f32>(),
+    );
+}
+        "#,
+        &["bytemuck::bytes_of(&(x))", "copy_from_slice(___src)"],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(!res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_no_uninit_struct_to_byte_array() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct House {
+    pub floors: i32,
+    pub bedrooms: i32,
+    pub bathrooms: f64,
+}
+
+impl Copy for House {}
+impl Clone for House {
+    fn clone(&self) -> House {
+        *self
+    }
+}
+
+pub unsafe fn foo(floors: i32) {
+    let mut house = House { floors, bedrooms: 3, bathrooms: 2.0 };
+    let mut raw = [0i8; 16];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const house as *const std::ffi::c_void,
+        ::core::mem::size_of::<House>(),
+    );
+}
+        "#,
+        &[
+            "#[derive(bytemuck::NoUninit)]",
+            "bytemuck::bytes_of(&(house))",
+            "copy_from_slice(___src)",
+        ],
+        &["memcpy(raw.as_mut_ptr"],
+    );
+    assert!(res.bytemuck);
+    assert!(res.bytemuck_derive);
+}
+
+#[test]
+fn test_memcpy_from_padded_struct_to_byte_array_is_left_alone() {
+    let res = run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct Padded {
+    pub a: i8,
+    pub b: i32,
+}
+
+impl Copy for Padded {}
+impl Clone for Padded {
+    fn clone(&self) -> Padded {
+        *self
+    }
+}
+
+pub unsafe fn foo(x: Padded) {
+    let mut raw = [0i8; 8];
+    memcpy(
+        raw.as_mut_ptr() as *mut _,
+        &raw const x as *const std::ffi::c_void,
+        ::core::mem::size_of::<Padded>(),
+    );
+}
+        "#,
+        &["memcpy(raw.as_mut_ptr"],
+        &["bytemuck::NoUninit", "bytemuck::bytes_of"],
+    );
+    assert!(!res.bytemuck);
+    assert!(!res.bytemuck_derive);
 }
 
 #[test]

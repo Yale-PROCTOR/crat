@@ -3,66 +3,68 @@ use rustc_ast_pretty::pprust;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty;
 use rustc_span::{Symbol, sym};
-use utils::ast::unwrap_cast_and_paren;
+use utils::{ast::unwrap_cast_and_paren, bytemuck::BytemuckRequirement};
 
 use crate::libc_replacer::LibItem;
 
 impl<'tcx> super::TransformVisitor<'tcx> {
     pub fn transform_memcpy(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
         let ptr1 = self.array_of_ptr_or_offset(s1)?;
-        let ptr2 = self.array_of_ptr_or_offset(s2)?;
-        let hir_n = self.ast_to_hir.get_expr(n.id, self.tcx)?;
-        if ptr1.ty == ptr2.ty
-            && let Some(len_expr) = self.get_len_from_size(n, ptr1.ty, hir_n.hir_id.owner.def_id)
-        {
-            if self.current_fn_has_raw_deref && (!ptr1.is_plain() || !ptr2.is_plain()) {
-                return None;
-            }
-            let array1 = ptr1.slice(true);
-            let array2 = ptr2.slice(false);
-            let len = pprust::expr_to_string(&len_expr);
-            if ptr1.same_array(&ptr2) {
-                Some(utils::expr!(
-                    "{{ let ___tmp = ({array2})[..({len}) as usize].to_vec(); ({array1})[..({len}) as usize].copy_from_slice(&___tmp); }}"
-                ))
-            } else {
-                Some(utils::expr!(
-                    "({array1})[..({len}) as usize].copy_from_slice(&({array2})[..({len}) as usize])"
-                ))
-            }
-        } else if is_numeric_or_numeric_array(ptr1.ty) && is_numeric_or_numeric_array(ptr2.ty) {
-            if self.current_fn_has_raw_deref
-                && (!ptr1.is_plain()
-                    || !ptr2.is_plain()
-                    || !ptr1.ty.is_numeric()
-                    || !ptr2.ty.is_numeric())
+        if let Some(ptr2) = self.array_of_ptr_or_offset(s2) {
+            let hir_n = self.ast_to_hir.get_expr(n.id, self.tcx)?;
+            if ptr1.ty == ptr2.ty
+                && let Some(len_expr) =
+                    self.get_len_from_size(n, ptr1.ty, hir_n.hir_id.owner.def_id)
             {
-                return None;
+                if self.current_fn_has_raw_deref && (!ptr1.is_plain() || !ptr2.is_plain()) {
+                    return None;
+                }
+                let array1 = ptr1.slice(true);
+                let array2 = ptr2.slice(false);
+                let len = pprust::expr_to_string(&len_expr);
+                if ptr1.same_array(&ptr2) {
+                    return Some(utils::expr!(
+                        "{{ let ___tmp = ({array2})[..({len}) as usize].to_vec(); ({array1})[..({len}) as usize].copy_from_slice(&___tmp); }}"
+                    ));
+                } else {
+                    return Some(utils::expr!(
+                        "({array1})[..({len}) as usize].copy_from_slice(&({array2})[..({len}) as usize])"
+                    ));
+                }
+            } else if is_numeric_or_numeric_array(ptr1.ty) && is_numeric_or_numeric_array(ptr2.ty) {
+                if self.current_fn_has_raw_deref
+                    && (!ptr1.is_plain()
+                        || !ptr2.is_plain()
+                        || !ptr1.ty.is_numeric()
+                        || !ptr2.ty.is_numeric())
+                {
+                    return None;
+                }
+                self.bytemuck = true;
+                let array1 = if ptr1.ty == self.tcx.types.u8 {
+                    ptr1.slice(true)
+                } else {
+                    ptr1.byte_slice(true)
+                };
+                let array2 = if ptr2.ty == self.tcx.types.u8 {
+                    ptr2.slice(false)
+                } else {
+                    ptr2.byte_slice(false)
+                };
+                let n = pprust::expr_to_string(n);
+                if ptr1.same_array(&ptr2) {
+                    return Some(utils::expr!(
+                        "{{ let ___tmp = ({array2})[..({n}) as usize].to_vec(); ({array1})[..({n}) as usize].copy_from_slice(&___tmp); }}"
+                    ));
+                } else {
+                    return Some(utils::expr!(
+                        "({array1})[..({n}) as usize].copy_from_slice(&({array2})[..({n}) as usize])",
+                    ));
+                }
             }
-            self.bytemuck = true;
-            let array1 = if ptr1.ty == self.tcx.types.u8 {
-                ptr1.slice(true)
-            } else {
-                ptr1.byte_slice(true)
-            };
-            let array2 = if ptr2.ty == self.tcx.types.u8 {
-                ptr2.slice(false)
-            } else {
-                ptr2.byte_slice(false)
-            };
-            let n = pprust::expr_to_string(n);
-            if ptr1.same_array(&ptr2) {
-                Some(utils::expr!(
-                    "{{ let ___tmp = ({array2})[..({n}) as usize].to_vec(); ({array1})[..({n}) as usize].copy_from_slice(&___tmp); }}"
-                ))
-            } else {
-                Some(utils::expr!(
-                    "({array1})[..({n}) as usize].copy_from_slice(&({array2})[..({n}) as usize])",
-                ))
-            }
-        } else {
-            None
         }
+
+        self.transform_memcpy_object_to_bytes(&ptr1, s2, n)
     }
 
     pub fn transform_memmove(&mut self, s1: &Expr, s2: &Expr, n: &Expr) -> Option<Expr> {
@@ -188,6 +190,76 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         None
     }
 
+    fn transform_memcpy_object_to_bytes(
+        &mut self,
+        dst: &ArrayPtr<'_, 'tcx>,
+        src: &Expr,
+        n: &Expr,
+    ) -> Option<Expr> {
+        if self.current_fn_has_raw_deref || !is_i8_or_u8(dst.ty, self.tcx) {
+            return None;
+        }
+        let pointee = addr_of_pointee(src)?;
+        let hir_pointee = self.ast_to_hir.get_expr(pointee.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_pointee.hir_id.owner);
+        let pointee_ty = typeck.expr_ty(hir_pointee);
+        if !self.size_matches_type(n, pointee_ty, hir_pointee.hir_id.owner.def_id) {
+            return None;
+        }
+
+        match pointee_ty.kind() {
+            ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Float(_) => {}
+            ty::TyKind::Adt(adt, _) if adt.is_struct() => {
+                if !self.bytemuck_derives.require_type(
+                    self.tcx,
+                    &mut self.bytemuck_classifier,
+                    pointee_ty,
+                    BytemuckRequirement::NoUninit,
+                ) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        self.bytemuck = true;
+        let dst = if dst.ty == self.tcx.types.u8 {
+            dst.slice(true)
+        } else {
+            dst.byte_slice(true)
+        };
+        let src = pprust::expr_to_string(pointee);
+        Some(utils::expr!(
+            "{{ let ___src = bytemuck::bytes_of(&({src})); ({dst})[..___src.len()].copy_from_slice(___src); }}"
+        ))
+    }
+
+    fn size_matches_type(
+        &self,
+        size_expr: &Expr,
+        ty: rustc_middle::ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> bool {
+        if let ExprKind::Call(func, args) = &unwrap_cast_and_paren(size_expr).kind
+            && let ExprKind::Path(_, call_path) = &func.kind
+            && let Some(func_name) = get_fn_name_from_expr(func)
+            && func_name == sym::size_of
+            && args.is_empty()
+            && let Some(last_seg) = call_path.segments.last()
+            && let Some(box GenericArgs::AngleBracketed(AngleBracketedArgs { args, .. })) =
+                &last_seg.args
+            && let Some(AngleBracketedArg::Arg(GenericArg::Type(box ty_generic))) = args.first()
+            && let Some(ty_generic) = self.ast_to_hir.get_ty(ty_generic.id, self.tcx)
+        {
+            let typeck = self.tcx.typeck(ty_generic.hir_id.owner);
+            let ty_generic = typeck.node_type(ty_generic.hir_id);
+            utils::ir::ty_size(ty_generic, def_id, self.tcx)
+                == utils::ir::ty_size(ty, def_id, self.tcx)
+        } else {
+            false
+        }
+    }
+
     fn array_of_ptr_or_offset<'e>(&self, expr: &'e Expr) -> Option<ArrayPtr<'e, 'tcx>> {
         if let Some((array, ty)) = utils::ir::array_of_as_ptr(expr, &self.ast_to_hir, self.tcx) {
             return Some(ArrayPtr {
@@ -211,6 +283,16 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         } else {
             None
         }
+    }
+}
+
+fn addr_of_pointee(expr: &Expr) -> Option<&Expr> {
+    if let ExprKind::AddrOf(BorrowKind::Raw | BorrowKind::Ref, _, pointee) =
+        &unwrap_cast_and_paren(expr).kind
+    {
+        Some(pointee)
+    } else {
+        None
     }
 }
 

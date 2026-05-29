@@ -9,7 +9,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
 use rustc_middle::ty::{TyCtxt, TyKind};
 use thin_vec::ThinVec;
-use utils::{ast::unwrap_paren, expr};
+use utils::{
+    ast::unwrap_paren,
+    bytemuck::{BytemuckDerivePlan, BytemuckDeriveVisitor, BytemuckTypeClassifier},
+    expr,
+};
 
 use crate::libc_replacer::errno::ErrorCode;
 
@@ -25,6 +29,7 @@ mod tests;
 pub struct TransformationResult {
     pub code: String,
     pub bytemuck: bool,
+    pub bytemuck_derive: bool,
     pub num_traits: bool,
 }
 
@@ -53,10 +58,18 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
         lib_items: FxHashSet::default(),
         parsing_fns: FxHashMap::default(),
         bytemuck: false,
+        bytemuck_derives: BytemuckDerivePlan::default(),
+        bytemuck_classifier: BytemuckTypeClassifier::new(tcx),
         num_traits: false,
         current_fn_has_raw_deref: false,
     };
     visitor.visit_crate(&mut krate);
+    let bytemuck_derive = !visitor.bytemuck_derives.is_empty();
+    if bytemuck_derive {
+        let mut derive_visitor =
+            BytemuckDeriveVisitor::new(tcx, &visitor.ast_to_hir, visitor.bytemuck_derives.clone());
+        derive_visitor.visit_crate(&mut krate);
+    }
 
     let lib_items = krate.items.iter_mut().find_map(|item| {
         if let ItemKind::Mod(_, ident, ModKind::Loaded(items, _, _, _)) = &mut item.kind
@@ -106,6 +119,7 @@ pub fn replace_libc(tcx: TyCtxt<'_>) -> TransformationResult {
     TransformationResult {
         code,
         bytemuck: visitor.bytemuck,
+        bytemuck_derive,
         num_traits: visitor.num_traits,
     }
 }
@@ -126,6 +140,8 @@ struct TransformVisitor<'tcx> {
     lib_items: FxHashSet<LibItem>,
     parsing_fns: FxHashMap<String, String>,
     bytemuck: bool,
+    bytemuck_derives: BytemuckDerivePlan,
+    bytemuck_classifier: BytemuckTypeClassifier<'tcx>,
     num_traits: bool,
     current_fn_has_raw_deref: bool,
 }
