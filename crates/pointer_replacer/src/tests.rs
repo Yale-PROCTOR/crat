@@ -113,6 +113,48 @@ pub unsafe extern "C" fn foo(p: *const libc::c_int) -> libc::c_int {
 }
 
 #[test]
+fn test_blocked_raw_state_param_gets_local_borrow_alias() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct State {
+    pub buflen: i32,
+    pub t: [u32; 2],
+}
+
+extern "C" {
+    fn touch_state(state: *mut State);
+    fn touch_words(words: *mut u32);
+}
+
+pub unsafe extern "C" fn update(mut S: *mut State) -> i32 {
+    let mut left: i32 = (*S).buflen;
+    (*S).t[0usize] = ((*S).t[0usize]).wrapping_add(1);
+    let words: *mut u32 = ((*S).t).as_mut_ptr();
+    touch_words(words);
+    touch_state(S);
+    return left + (*S).t[0usize] as i32;
+}
+"#,
+        &[
+            "pub unsafe extern \"C\" fn update(mut S: *mut crate::State)",
+            "let __crat_borrowed_S = S.as_mut().unwrap();",
+            "let mut left: i32 = __crat_borrowed_S.buflen;",
+            "__crat_borrowed_S.t[0usize] =",
+            "let mut words: *mut u32 = (__crat_borrowed_S.t).as_mut_ptr();",
+            "return left + __crat_borrowed_S.t[0usize] as i32;",
+        ],
+        &[
+            "pub unsafe extern \"C\" fn update(mut S: &mut State)",
+            "let __crat_borrowed_S = unsafe",
+            "let mut left: i32 = (*S).buflen;",
+            "(*S).t[0usize]",
+            "((*S).t).as_mut_ptr()",
+        ],
+    );
+}
+
+#[test]
 fn test_reassigned_non_null_param_stays_optional() {
     run_test(
         r#"

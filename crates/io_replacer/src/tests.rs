@@ -1124,6 +1124,66 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_field_autoderef_borrowed() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    f: *mut FILE,
+}
+unsafe fn f(mut p: *mut s) {
+    let borrowed = p.as_mut().unwrap();
+    borrowed.f = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    if !(borrowed.f).is_null() {
+        fgetc(borrowed.f);
+        fclose(borrowed.f);
+        borrowed.f = std::ptr::null_mut();
+    }
+}"#,
+        &[
+            "std::fs::File::open",
+            "crate::c_lib::rs_fgetc",
+            "drop",
+            "is_none",
+        ],
+        &["FILE", "fopen", "fclose", "is_null"],
+    );
+}
+
+#[test]
+fn test_field_autoderef_borrowed_user_fn() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    f: *mut FILE,
+}
+unsafe fn g(mut stream: *mut FILE) {
+    fgetc(stream);
+}
+unsafe fn f(mut p: *mut s) {
+    let borrowed = p.as_mut().unwrap();
+    borrowed.f = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    if !(borrowed.f).is_null() {
+        g(borrowed.f);
+        g(borrowed.f);
+        fclose(borrowed.f);
+    }
+}"#,
+        &["std::fs::File::open", "crate::c_lib::rs_fgetc", "drop"],
+        &["FILE", "fopen", "fclose"],
+    );
+}
+
+#[test]
 fn test_field_borrowed() {
     run_test(
         r#"

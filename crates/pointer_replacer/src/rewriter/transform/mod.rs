@@ -47,6 +47,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     lifetime_plans: super::lifetimes::LifetimePlans,
     ptr_kinds: FxHashMap<HirId, PtrKind>,
     forced_raw_bindings: FxHashSet<HirId>,
+    borrowed_raw_params: FxHashMap<HirId, BorrowedRawParamInfo>,
     raw_bridge_bindings: FxHashMap<HirId, RawBridgeInfo>,
     raw_scalar_bridge_fields: FxHashSet<StructFieldSlot>,
     alloc_wrappers: FxHashMap<LocalDefId, AllocWrapperInfo>,
@@ -85,6 +86,11 @@ enum AllocWrapperInfo {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BorrowedRawParamInfo {
+    alias: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalRawParamSummary {
     BorrowOnly,
@@ -111,6 +117,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn visit_item(&mut self, item: &mut Item) {
         let node_id = item.id;
+        let mut fn_def_id: Option<LocalDefId> = None;
         let mut fn_output_transform: Option<(LocalDefId, PtrKind)> = None;
         match &mut item.kind {
             ItemKind::Impl(box impl_item) => {
@@ -152,6 +159,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ItemKind::Fn(box fn_item) => {
                 let def_id = self.ast_to_hir.global_map[&node_id];
+                fn_def_id = Some(def_id);
                 let mir_body = self
                     .tcx
                     .mir_drops_elaborated_and_const_checked(def_id)
@@ -448,6 +456,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         mut_visit::walk_item(self, item);
 
+        if let Some(def_id) = fn_def_id
+            && let ItemKind::Fn(box fn_item) = &mut item.kind
+            && let Some(body) = &mut fn_item.body
+        {
+            self.insert_borrowed_raw_param_aliases(def_id, body);
+        }
+
         if let Some((def_id, output_kind)) = fn_output_transform
             && let ItemKind::Fn(box fn_item) = &mut item.kind
             && let Some(body) = &mut fn_item.body
@@ -616,6 +631,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let hir::ExprKind::Field(hir_base, _) = hir_expr.kind else {
                     return;
                 };
+                if self.rewrite_borrowed_raw_param_field_base(base, hir_base) {
+                    return;
+                }
                 if matches!(
                     self.expr_ctx(hir_expr),
                     ExprCtx::ImmediatelyAddrTaken | ExprCtx::AddrTaken(_)
@@ -1265,6 +1283,138 @@ fn collect_c_exposed_abi_fields<'tcx>(
     (frozen_fields, thin_fields, cursor_fields)
 }
 
+fn collect_borrowed_raw_params(
+    tcx: TyCtxt<'_>,
+    initial_sig_decs: &SigDecisions,
+    final_sig_decs: &SigDecisions,
+) -> FxHashMap<HirId, BorrowedRawParamInfo> {
+    let mut params = FxHashMap::default();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let did = item.owner_id.def_id;
+        let Some(initial_sig_dec) = initial_sig_decs.data.get(&did) else {
+            continue;
+        };
+        let Some(final_sig_dec) = final_sig_decs.data.get(&did) else {
+            continue;
+        };
+        let hir_body = tcx.hir_body(body);
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        for (idx, param) in hir_body.params.iter().enumerate() {
+            if !matches!(
+                initial_sig_dec.input_decs.get(idx).copied().flatten(),
+                Some(PtrKind::Ref(true))
+            ) || !matches!(
+                final_sig_dec.input_decs.get(idx).copied().flatten(),
+                Some(PtrKind::Raw(true))
+            ) {
+                continue;
+            }
+            let Some(input_ty) = sig.inputs().iter().copied().nth(idx) else {
+                continue;
+            };
+            if !raw_pointer_pointee_is_local_struct(tcx, input_ty) {
+                continue;
+            }
+            let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+                continue;
+            };
+            let facts = borrowed_raw_param_facts(hir_body.value, hir_id);
+            if facts.assigned || facts.direct_field_derefs == 0 {
+                continue;
+            }
+            let param_name = tcx.hir_name(hir_id).to_string();
+            params.insert(
+                hir_id,
+                BorrowedRawParamInfo {
+                    alias: borrowed_raw_param_alias(&param_name),
+                },
+            );
+        }
+    }
+    params
+}
+
+#[derive(Default)]
+struct BorrowedRawParamFacts {
+    assigned: bool,
+    direct_field_derefs: usize,
+}
+
+fn borrowed_raw_param_facts(expr: &hir::Expr<'_>, target: HirId) -> BorrowedRawParamFacts {
+    struct ParamUseVisitor {
+        target: HirId,
+        facts: BorrowedRawParamFacts,
+    }
+
+    impl<'tcx> Visitor<'tcx> for ParamUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Assign(lhs, _, _) | hir::ExprKind::AssignOp(_, lhs, _) => {
+                    if hir_unwrapped_local_id(lhs) == Some(self.target) {
+                        self.facts.assigned = true;
+                    }
+                }
+                hir::ExprKind::Field(base, _) => {
+                    if hir_direct_raw_deref_local_id(base) == Some(self.target) {
+                        self.facts.direct_field_derefs += 1;
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = ParamUseVisitor {
+        target,
+        facts: BorrowedRawParamFacts::default(),
+    };
+    visitor.visit_expr(expr);
+    visitor.facts
+}
+
+fn hir_direct_raw_deref_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let hir::ExprKind::Unary(hir::UnOp::Deref, inner) = utils::hir::unwrap_drop_temps(expr).kind
+    else {
+        return None;
+    };
+    hir_unwrapped_local_id(hir_unwrap_casts(inner))
+}
+
+fn raw_pointer_pointee_is_local_struct<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let Some((pointee, _)) = unwrap_ptr_from_mir_ty(ty) else {
+        return false;
+    };
+    matches!(
+        pointee.kind(),
+        ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
+    ) && !utils::file::contains_file_ty(pointee, tcx)
+}
+
+fn borrowed_raw_param_alias(param_name: &str) -> String {
+    let mut component = String::new();
+    for c in param_name.chars() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            component.push(c);
+        } else {
+            component.push('_');
+        }
+    }
+    if component.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        component.insert(0, '_');
+    }
+    format!("__crat_borrowed_{component}")
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AllocatorRoot<'a> {
     Malloc {
@@ -1288,6 +1438,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
         let mut sig_decs =
             SigDecisions::new(rust_program, analysis, &lifetime_plans, &fn_ptr_groups);
+        let initial_sig_decs = sig_decs.clone();
         let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
@@ -1440,6 +1591,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &free_like_wrappers,
             &local_raw_param_summaries,
         );
+        let borrowed_raw_params =
+            collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &sig_decs);
 
         TransformVisitor {
             tcx: rust_program.tcx,
@@ -1448,6 +1601,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             lifetime_plans,
             ptr_kinds,
             forced_raw_bindings,
+            borrowed_raw_params,
             raw_bridge_bindings,
             raw_scalar_bridge_fields,
             alloc_wrappers,
@@ -1571,6 +1725,40 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return;
         };
         **base = unwrap_addr_of_deref(inner).clone();
+    }
+
+    fn rewrite_borrowed_raw_param_field_base(
+        &self,
+        base: &mut P<Expr>,
+        hir_base: &'tcx hir::Expr<'tcx>,
+    ) -> bool {
+        let Some(hir_id) = hir_direct_raw_deref_local_id(hir_base) else {
+            return false;
+        };
+        let Some(info) = self.borrowed_raw_params.get(&hir_id) else {
+            return false;
+        };
+        **base = utils::expr!("{}", info.alias);
+        true
+    }
+
+    fn insert_borrowed_raw_param_aliases(&self, def_id: LocalDefId, body: &mut Block) {
+        let hir_body = self.tcx.hir_body_owned_by(def_id);
+        let mut insert_at = 0usize;
+        for param in hir_body.params {
+            let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+                continue;
+            };
+            let Some(info) = self.borrowed_raw_params.get(&hir_id) else {
+                continue;
+            };
+            let param_name = self.tcx.hir_name(hir_id).to_string();
+            body.stmts.insert(
+                insert_at,
+                utils::stmt!("let {} = {}.as_mut().unwrap();", info.alias, param_name),
+            );
+            insert_at += 1;
+        }
     }
 
     fn field_lifetime(&self, field: StructFieldSlot) -> Option<Symbol> {
@@ -14393,6 +14581,7 @@ mod tests {
             lifetime_plans: super::super::lifetimes::LifetimePlans::default(),
             ptr_kinds: FxHashMap::default(),
             forced_raw_bindings: FxHashSet::default(),
+            borrowed_raw_params: FxHashMap::default(),
             raw_bridge_bindings: FxHashMap::default(),
             raw_scalar_bridge_fields: FxHashSet::default(),
             alloc_wrappers: FxHashMap::default(),
