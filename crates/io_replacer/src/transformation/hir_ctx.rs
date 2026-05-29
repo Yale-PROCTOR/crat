@@ -384,7 +384,7 @@ fn adt_of_expr<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Option<(AdtDef<'tcx>, LocalDefId)> {
     let typeck = tcx.typeck(expr.hir_id.owner.def_id);
-    let ty = typeck.expr_ty(expr);
+    let ty = typeck.expr_ty_adjusted(expr).peel_refs();
     let TyKind::Adt(adt_def, _) = ty.kind() else { return None };
     Some((*adt_def, adt_def.did().as_local()?))
 }
