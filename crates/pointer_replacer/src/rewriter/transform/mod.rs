@@ -4823,8 +4823,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
 
-        let mut source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
+        let mut source_inner_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))?;
         let mut is_slice_ref = ty_is_slice_ref(pe.base_ty)
+            || ty_is_borrowed_slice_like_container(pe.base_ty, self.tcx)
             || matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
         for proj in &pe.projs {
             match proj {
@@ -6596,7 +6598,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if pe.projs.is_empty() {
             return e;
         }
-        let mut from_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx).unwrap();
+        let mut from_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))
+            .unwrap();
         let mut is_array = pe.base_ty.is_array();
         for proj in &pe.projs {
             match proj {
@@ -6676,7 +6680,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         );
                         from_ty = to_ty;
                     } else {
-                        if matches!(e.kind, ExprKind::Index(..)) || is_array || is_plain_slice {
+                        if matches!(e.kind, ExprKind::Index(..))
+                            || is_data_container
+                            || is_array
+                            || is_plain_slice
+                        {
                             e = self.plain_slice_from_slice(&e, pe, current_mut, to_ty, from_ty);
                             is_plain_slice = true;
                         } else {
@@ -6766,6 +6774,33 @@ fn unwrap_ptr_or_arr_from_mir_ty<'tcx>(
         }
         _ => None,
     }
+}
+
+fn slice_like_container_inner_ty<'tcx>(
+    ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::Ref(_, inner, _) => slice_like_container_inner_ty(*inner, tcx),
+        ty::TyKind::Slice(ty) | ty::TyKind::Array(ty, _) => Some(*ty),
+        ty::TyKind::Adt(adt_def, gargs) => {
+            let name = tcx.item_name(adt_def.did());
+            if name == rustc_span::sym::Vec {
+                let ty::GenericArgKind::Type(ty) = gargs[0].kind() else { panic!() };
+                Some(ty)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ty_is_borrowed_slice_like_container<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::TyKind::Ref(_, inner, _) if slice_like_container_inner_ty(*inner, tcx).is_some()
+    )
 }
 
 fn ty_is_slice_ref(ty: ty::Ty<'_>) -> bool {
