@@ -1,6 +1,6 @@
 use super::*;
 
-fn rewrite_with_config(code: &str, config: &Config) -> (String, bool) {
+fn rewrite_with_config(code: &str, config: &Config) -> (String, BytemuckDependency) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| replace_local_borrows(config, tcx))
         .unwrap()
 }
@@ -10,7 +10,7 @@ fn rewrite_struct_arrays_with_config(code: &str, config: &Config) -> (String, bo
         .unwrap()
 }
 
-fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, bool) {
+fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
     rewrite_with_config(input, config)
@@ -6094,6 +6094,87 @@ pub unsafe fn hash(mut key: uint64_t) -> u64 {
 }
 
 #[test]
+fn test_addr_of_no_padding_struct_byte_slice_uses_bytemuck_bytes_of() {
+    let code = r#"
+#[repr(C)]
+pub struct House {
+    pub floors: i32,
+    pub bedrooms: i32,
+    pub bathrooms: f64,
+}
+impl Copy for House {}
+impl Clone for House {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn hash(mut house: House) -> u64 {
+    let mut bytes: *const u8 = &mut house as *mut House as *mut u8;
+    let mut hash = 0u64;
+    let mut i = 0usize;
+    while i < ::core::mem::size_of::<House>() {
+        hash += *bytes.offset(i as isize) as u64;
+        i += 1;
+    }
+    hash
+}
+"#;
+    let (s, bytemuck) = rewrite_with_config(code, &Config::default());
+    assert_eq!(bytemuck, BytemuckDependency::Derive);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in [
+        "#[derive(bytemuck::NoUninit)]",
+        "let mut bytes: &[u8] = bytemuck::bytes_of(&(house));",
+    ] {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in ["from_raw_parts", "&raw const"] {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_addr_of_padded_struct_byte_slice_stays_raw_parts() {
+    let code = r#"
+#[repr(C)]
+pub struct Padded {
+    pub tag: u8,
+    pub value: u32,
+}
+impl Copy for Padded {}
+impl Clone for Padded {
+    fn clone(&self) -> Self { *self }
+}
+
+pub unsafe fn hash(mut value: Padded) -> u64 {
+    let mut bytes: *const u8 = &mut value as *mut Padded as *mut u8;
+    let mut hash = 0u64;
+    let mut i = 0usize;
+    while i < ::core::mem::size_of::<Padded>() {
+        hash += *bytes.offset(i as isize) as u64;
+        i += 1;
+    }
+    hash
+}
+"#;
+    let (s, bytemuck) = rewrite_with_config(code, &Config::default());
+    assert_eq!(bytemuck, BytemuckDependency::None);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("from_raw_parts"),
+        "Expected raw fallback in:\n{s}"
+    );
+    for exclude in ["bytemuck::bytes_of", "derive(bytemuck"] {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
 fn test_array_field_ptr_arithmetic_stays_raw_slice() {
     run_test(
         r#"
@@ -7054,7 +7135,7 @@ pub unsafe fn foo() -> i32 {
 }
 "#;
     let (s, bytemuck) = rewrite_struct_arrays_then_pointer(code, &Config::default());
-    assert!(!bytemuck);
+    assert_eq!(bytemuck, BytemuckDependency::None);
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     for include in [
         "pub a: [Elem; 3]",
