@@ -33,10 +33,10 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+mod array_local_index_rewriter;
 pub(crate) mod collector;
 pub(crate) mod decision;
 mod lifetimes;
-mod array_local_index_rewriter;
 mod struct_array_field_pre;
 mod transform;
 

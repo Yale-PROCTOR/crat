@@ -7553,6 +7553,73 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
 }
 
 #[test]
+fn test_array_local_map_or_closure_body_rewrites_slice_base_offset() {
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut i32, mut take: bool, mut k: isize) -> *mut i32 {
+    let mut prev: *mut i32 = std::ptr::null_mut();
+    if take {
+        prev = raw.offset(k);
+    }
+    *raw.offset(0) = 3;
+    prev
+}
+"#;
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("mut raw: &mut [i32]"), "{s}");
+    let compact = s.split_whitespace().collect::<String>();
+    assert!(
+        compact.contains(
+            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|idx|((raw)[(idxasisize)asusize..]).as_mut_ptr())"
+        ),
+        "{s}"
+    );
+    assert!(!s.contains("(raw).offset(idx as isize)"), "{s}");
+}
+
+#[test]
+fn test_raw_map_or_with_reference_closure_body_is_not_rewritten() {
+    let code = r#"
+pub unsafe fn foo(mut opt: Option<&mut i32>) -> *mut i32 {
+    opt.as_deref_mut().map_or(std::ptr::null_mut::<i32>(), |_x| _x)
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("map_or"), "{s}");
+}
+
+#[test]
+fn test_non_option_map_or_with_raw_closure_body_is_not_rewritten() {
+    let code = r#"
+struct Wrapper;
+
+impl Wrapper {
+    unsafe fn map_or<F>(self, fallback: *mut i32, f: F) -> *mut i32
+    where
+        F: FnOnce(usize) -> *mut i32,
+    {
+        let result = f(0);
+        if result.is_null() {
+            fallback
+        } else {
+            result
+        }
+    }
+}
+
+pub unsafe fn foo(wrapper: Wrapper) -> *mut i32 {
+    let addr = 0usize;
+    wrapper.map_or(std::ptr::null_mut::<i32>(), |idx| (addr as *mut i32).offset(idx as isize))
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("wrapper.map_or"), "{s}");
+    assert!(s.contains("(addr as *mut i32).offset(idx as isize)"), "{s}");
+}
+
+#[test]
 fn test_array_local_rewriter_skips_assignment_with_planned_local_in_rhs() {
     let code = r#"
 pub unsafe fn foo(mut p: *mut i32) -> i32 {
