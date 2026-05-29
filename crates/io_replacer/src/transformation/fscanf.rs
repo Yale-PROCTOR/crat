@@ -53,81 +53,15 @@ impl TransformVisitor<'_, '_, '_> {
         let mut decls = String::new();
         let mut assigns = String::new();
         for (spec, arg) in specs.iter().filter(|spec| spec.assign).zip(args) {
+            if let Some(spec_ty) = spec.num_ty() {
+                let arg = self.scalar_scan_arg(arg.deref(), spec_ty);
+                write!(code, ", {arg}").unwrap();
+                continue;
+            }
             match spec.ty() {
                 ConvTy::Scalar(spec_ty) => {
-                    if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
-                        && let ExprKind::Unary(UnOp::Deref, e) = &unwrap_cast_and_paren(e).kind
-                        && let ExprKind::MethodCall(call1) = &unwrap_cast_and_paren(e).kind
-                        && call1.seg.ident.name == sym::offset
-                        && let ExprKind::MethodCall(call2) =
-                            &unwrap_cast_and_paren(&call1.receiver).kind
-                        && call2.seg.ident.name.as_str() == "as_mut_ptr"
-                        && let hir_receiver = self
-                            .ast_to_hir
-                            .get_expr(call2.receiver.id, self.tcx)
-                            .unwrap()
-                        && let typeck = self.tcx.typeck(hir_receiver.hir_id.owner)
-                        && let ty = typeck.expr_ty(hir_receiver)
-                        && let ty::TyKind::Array(ty, _) = ty.kind()
-                        && ty.to_string() == spec_ty
-                    {
-                        write!(
-                            code,
-                            ", &mut ({})[({}) as usize]",
-                            pprust::expr_to_string(&call2.receiver),
-                            pprust::expr_to_string(&call1.args[0]),
-                        )
-                        .unwrap();
-                        continue;
-                    }
-                    if let Some((array, ty)) = self.array_of_as_ptr(arg)
-                        && ty.to_string() == spec_ty
-                    {
-                        write!(code, ", &mut ({})[0]", pprust::expr_to_string(array)).unwrap();
-                        continue;
-                    }
-                    if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(arg).kind
-                        && call.seg.ident.name.as_str() == "map_or"
-                        && let ExprKind::MethodCall(call) =
-                            &unwrap_cast_and_paren(&call.receiver).kind
-                        && call.seg.ident.name.as_str() == "as_deref_mut"
-                        && let hir_e = self
-                            .ast_to_hir
-                            .get_expr(call.receiver.id, self.tcx)
-                            .unwrap()
-                        && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
-                        && let ty = typeck.expr_ty(hir_e)
-                        && let ty::TyKind::Adt(adt_def, gargs) = ty.kind()
-                        && self.tcx.item_name(adt_def.did()) == sym::Option
-                        && let [garg] = gargs[..]
-                        && let ty::GenericArgKind::Type(ty) = garg.kind()
-                        && let ty::TyKind::Ref(_, ty, _) = ty.kind()
-                        && ty.to_string() == spec_ty
-                    {
-                        write!(
-                            code,
-                            ", ({}).unwrap()",
-                            pprust::expr_to_string(&call.receiver)
-                        )
-                        .unwrap();
-                        continue;
-                    }
-                    if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
-                        && let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap()
-                        && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
-                        && let ty = typeck.expr_ty(hir_e).to_string()
-                        && ty == spec_ty
-                    {
-                        write!(code, ", &mut ({})", pprust::expr_to_string(e)).unwrap();
-                        continue;
-                    }
-                    write!(
-                        code,
-                        ", &mut *(({}) as *mut {})",
-                        pprust::expr_to_string(arg),
-                        spec_ty,
-                    )
-                    .unwrap();
+                    let arg = self.scalar_scan_arg(arg.deref(), spec_ty);
+                    write!(code, ", {arg}").unwrap();
                 }
                 ConvTy::String => {
                     i += 1;
@@ -181,6 +115,67 @@ impl TransformVisitor<'_, '_, '_> {
             expr!("{{ {decls} let ___res = {code}; {assigns} ___res }}")
         }
     }
+
+    fn scalar_scan_arg(&self, arg: &Expr, spec_ty: &str) -> String {
+        if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
+            && let ExprKind::Unary(UnOp::Deref, e) = &unwrap_cast_and_paren(e).kind
+            && let ExprKind::MethodCall(call1) = &unwrap_cast_and_paren(e).kind
+            && call1.seg.ident.name == sym::offset
+            && let ExprKind::MethodCall(call2) = &unwrap_cast_and_paren(&call1.receiver).kind
+            && call2.seg.ident.name.as_str() == "as_mut_ptr"
+            && let hir_receiver = self
+                .ast_to_hir
+                .get_expr(call2.receiver.id, self.tcx)
+                .unwrap()
+            && let typeck = self.tcx.typeck(hir_receiver.hir_id.owner)
+            && let ty = typeck.expr_ty(hir_receiver)
+            && let ty::TyKind::Array(ty, _) = ty.kind()
+            && ty.to_string() == spec_ty
+        {
+            return format!(
+                "&mut ({})[({}) as usize]",
+                pprust::expr_to_string(&call2.receiver),
+                pprust::expr_to_string(&call1.args[0]),
+            );
+        }
+        if let Some((array, ty)) = self.array_of_as_ptr(arg)
+            && ty.to_string() == spec_ty
+        {
+            return format!("&mut ({})[0]", pprust::expr_to_string(array));
+        }
+        if let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(arg).kind
+            && call.seg.ident.name.as_str() == "map_or"
+            && let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(&call.receiver).kind
+            && call.seg.ident.name.as_str() == "as_deref_mut"
+            && let hir_e = self
+                .ast_to_hir
+                .get_expr(call.receiver.id, self.tcx)
+                .unwrap()
+            && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+            && let ty = typeck.expr_ty(hir_e)
+            && let ty::TyKind::Adt(adt_def, gargs) = ty.kind()
+            && self.tcx.item_name(adt_def.did()) == sym::Option
+            && let [garg] = gargs[..]
+            && let ty::GenericArgKind::Type(ty) = garg.kind()
+            && let ty::TyKind::Ref(_, ty, _) = ty.kind()
+            && ty.to_string() == spec_ty
+        {
+            return format!("({}).unwrap()", pprust::expr_to_string(&call.receiver));
+        }
+        if let ExprKind::AddrOf(_, _, e) = &unwrap_cast_and_paren(arg).kind
+            && let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx).unwrap()
+            && let typeck = self.tcx.typeck(hir_e.hir_id.owner)
+            && let ty = typeck.expr_ty(hir_e).to_string()
+            && ty == spec_ty
+        {
+            return format!("&mut ({})", pprust::expr_to_string(e));
+        }
+        format!(
+            "&mut *(({}) as *mut {})",
+            pprust::expr_to_string(arg),
+            spec_ty,
+        )
+    }
 }
 
 struct ParsingFunction {
@@ -201,18 +196,17 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
     )
     .unwrap();
     let mut body = String::new();
-    let consume_whitespace = specs[0].leading_space || skips_leading_whitespace(&specs[0]);
-    writeln!(
-        body,
-        "    if is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), {consume_whitespace}) {{
-        return -1;
-    }}"
-    )
-    .unwrap();
+    let has_num = specs
+        .iter()
+        .any(|spec| matches!(&spec.conversion, Conversion::Num));
+    if has_num {
+        lib_items.push(LibItem::CountingBufRead);
+        writeln!(body, "    let mut stream = CountingBufRead::new(stream);").unwrap();
+    }
     writeln!(body, "    let mut count = 0;").unwrap();
     let mut i = 0;
+    let mut checked_initial_eof = false;
     for spec in specs {
-        let ty = spec.ty();
         if !spec.assign {
             write!(name, "_no_assign").unwrap();
         }
@@ -249,6 +243,29 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
             write!(name, "_trail_ws").unwrap();
         }
 
+        if matches!(&spec.conversion, Conversion::Num) {
+            let Some(ty) = spec.num_ty() else { todo!() };
+            if spec.leading_space {
+                writeln!(
+                    body,
+                    "    let _ = is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), true);",
+                )
+                .unwrap();
+            }
+            i += 1;
+            write!(args, ", v{i}: &mut {ty}").unwrap();
+            writeln!(body, "    *v{i} = stream.consumed() as {ty};").unwrap();
+            if spec.trailing_space {
+                writeln!(
+                    body,
+                    "    let _ = is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), true);",
+                )
+                .unwrap();
+            }
+            continue;
+        }
+
+        let ty = spec.ty();
         let assign = if !spec.assign {
             "".to_string()
         } else {
@@ -335,13 +352,23 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
                 "parse_char"
             }
             Conversion::Pointer => todo!(),
-            Conversion::Num => todo!(),
+            Conversion::Num => unreachable!(),
             Conversion::C => todo!(),
             Conversion::S => todo!(),
             Conversion::Percent => todo!(),
         };
         let width = spec.width;
-        if spec.leading_space && !skips_leading_whitespace(spec) {
+        if !checked_initial_eof {
+            checked_initial_eof = true;
+            let consume_whitespace = spec.leading_space || skips_leading_whitespace(spec);
+            writeln!(
+                body,
+                "    if is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), {consume_whitespace}) {{
+        return -1;
+    }}"
+            )
+            .unwrap();
+        } else if spec.leading_space && !skips_leading_whitespace(spec) {
             writeln!(
                 body,
                 "    let _ = is_eof(&mut stream, err.as_deref_mut(), eof.as_deref_mut(), true);",
@@ -385,7 +412,10 @@ fn make_parsing_function(specs: &[ConversionSpec]) -> ParsingFunction {
 }
 
 fn skips_leading_whitespace(spec: &ConversionSpec) -> bool {
-    !matches!(spec.conversion, Conversion::Seq | Conversion::ScanSet(_))
+    !matches!(
+        &spec.conversion,
+        Conversion::Seq | Conversion::ScanSet(_) | Conversion::Num
+    )
 }
 
 pub(super) static PARSE_CHAR: &str = r#"

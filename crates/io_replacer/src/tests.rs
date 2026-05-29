@@ -204,6 +204,30 @@ unsafe fn f() -> libc::c_int {
 }
 
 #[test]
+fn test_scanf_num_conversion() {
+    run_test(
+        r#"
+unsafe fn f() -> libc::c_int {
+    let mut x: libc::c_int = 0;
+    let mut n: size_t = 0;
+    let r = scanf(
+        b"%d%zn\0" as *const u8 as *const libc::c_char,
+        &mut x as *mut libc::c_int,
+        &mut n as *mut size_t,
+    );
+    return r + x + n as libc::c_int;
+}"#,
+        &[
+            "stdin",
+            "scan_d_z_n",
+            "CountingBufRead",
+            "stream.consumed()",
+        ],
+        &["scanf"],
+    );
+}
+
+#[test]
 fn test_fscanf_numbers() {
     run_test(
         r#"
@@ -230,6 +254,30 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     );
 }"#,
         &["BufRead", "scan_d_h_d_l_d_u_h_u_l_u_g_l_g", "TT"],
+        &["FILE", "fscanf"],
+    );
+}
+
+#[test]
+fn test_fscanf_leading_num_conversion() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    let mut consumed: libc::c_int = 0;
+    let mut x: libc::c_int = 0;
+    return fscanf(
+        stream,
+        b"%n%d\0" as *const u8 as *const libc::c_char,
+        &mut consumed as *mut libc::c_int,
+        &mut x as *mut libc::c_int,
+    );
+}"#,
+        &[
+            "BufRead",
+            "scan_n_d",
+            "CountingBufRead",
+            "stream.consumed()",
+        ],
         &["FILE", "fscanf"],
     );
 }

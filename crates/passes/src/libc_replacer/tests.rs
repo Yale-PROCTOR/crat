@@ -459,11 +459,66 @@ extern "C" {
 
 pub unsafe fn foo(mut out: *mut i8, mut input: &[i8], mut n: i32, mut consumed: usize) {
     sprintf(out, b"%d\0" as *const u8 as *const i8, n);
-    sscanf(input.as_ptr(), b"%d%zn\0" as *const u8 as *const i8, &raw mut n, &raw mut consumed);
+    sscanf(input.as_ptr(), b"%s\0" as *const u8 as *const i8, out);
 }
         "#,
         &["sprintf(out", "sscanf(input.as_ptr"],
         &["std::io::Cursor::new"],
+    );
+}
+
+#[test]
+fn test_string_stdio_rewrites_sscanf_num_conversion() {
+    run_test(
+        r#"
+extern "C" {
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut input: &[i8], mut i: usize) -> i32 {
+    let mut data = [0i32; 4];
+    let mut consumed: usize = 0;
+    sscanf(
+        input.as_ptr(),
+        b"%d%zn\0" as *const u8 as *const i8,
+        (&mut data)[i..].as_mut_ptr(),
+        &raw mut consumed,
+    )
+}
+        "#,
+        &[
+            "crate::c_lib::sscanf_scan_d_zn",
+            "CountingBufRead",
+            "stream.consumed()",
+            "&mut ((&mut data)[i..])[0]",
+        ],
+        &["sscanf(input.as_ptr"],
+    );
+}
+
+#[test]
+fn test_string_stdio_rewrites_leading_sscanf_num_conversion() {
+    run_test(
+        r#"
+extern "C" {
+    fn sscanf(__s: *const i8, __format: *const i8, ...) -> i32;
+}
+
+pub unsafe fn foo(mut input: &[i8], mut consumed: i32, mut n: i32) -> i32 {
+    sscanf(
+        input.as_ptr(),
+        b"%n%d\0" as *const u8 as *const i8,
+        &raw mut consumed,
+        &raw mut n,
+    )
+}
+        "#,
+        &[
+            "crate::c_lib::sscanf_scan_n_d",
+            "*v1 = stream.consumed() as i32",
+            "return -1",
+        ],
+        &["sscanf(input.as_ptr"],
     );
 }
 

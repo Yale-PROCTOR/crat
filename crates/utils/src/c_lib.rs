@@ -17,6 +17,42 @@ fn peek<R: std::io::BufRead>(mut stream: R, err: Option<&mut i32>, eof: Option<&
 }
 "#;
 
+pub static COUNTING_BUF_READ: &str = r#"
+struct CountingBufRead<R> {
+    inner: R,
+    consumed: usize,
+}
+
+impl<R> CountingBufRead<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, consumed: 0 }
+    }
+
+    fn consumed(&self) -> usize {
+        self.consumed
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingBufRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.consumed += n;
+        Ok(n)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::BufRead for CountingBufRead<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.consumed += amt;
+        self.inner.consume(amt);
+    }
+}
+"#;
+
 pub static PARSE_INTEGER: &str = r#"
 #[inline]
 fn parse_integer<R: std::io::BufRead>(
