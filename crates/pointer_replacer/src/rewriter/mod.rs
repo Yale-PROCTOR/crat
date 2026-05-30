@@ -36,6 +36,7 @@ use crate::{
 mod array_local_index_rewriter;
 pub(crate) mod collector;
 pub(crate) mod decision;
+pub(crate) mod diagnostics;
 mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
@@ -167,6 +168,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         &fn_ptr_groups,
     );
 
+    let diagnostics = diagnostics::DecisionDiagnostics::from_env();
     let mut visitor = TransformVisitor::new(
         config,
         &input,
@@ -174,6 +176,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         ast_to_hir,
         fn_ptr_groups,
         fn_ptr_rewrite,
+        diagnostics,
     );
     visitor.visit_crate(&mut krate);
 
@@ -184,6 +187,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         code.push('\n');
         code.push_str(slice_cursor_mod_str());
     }
+
+    visitor.emit_diagnostics();
 
     (code, visitor.bytemuck_dependency())
 }

@@ -11,7 +11,11 @@ use rustc_middle::{
 };
 use rustc_span::{Symbol, def_id::LocalDefId};
 
-use super::{Analysis, collector::collect_fn_ptrs};
+use super::{
+    Analysis,
+    collector::collect_fn_ptrs,
+    diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
+};
 use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +97,20 @@ pub struct DecisionMaker<'tcx> {
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
     non_null_locals: DenseBitSet<Local>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionInfo {
+    pub kind: Option<PtrKind>,
+    pub events: Vec<DecisionInfoEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionInfoEvent {
+    pub before: Option<PtrKind>,
+    pub after: Option<PtrKind>,
+    pub reason: DecisionReason,
+    pub detail: Option<String>,
 }
 
 impl<'tcx> DecisionMaker<'tcx> {
@@ -183,66 +201,163 @@ impl<'tcx> DecisionMaker<'tcx> {
         decl: &LocalDecl<'tcx>,
         aliases: Option<&FxHashSet<Local>>,
     ) -> Option<PtrKind> {
-        let (ty, m) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)?;
+        self.decide_with_info(local, decl, aliases).kind
+    }
+
+    pub fn decide_with_info(
+        &self,
+        local: Local,
+        decl: &LocalDecl<'tcx>,
+        aliases: Option<&FxHashSet<Local>>,
+    ) -> DecisionInfo {
+        let mut events = Vec::new();
+        let Some((ty, m)) = super::transform::unwrap_ptr_from_mir_ty(decl.ty) else {
+            return DecisionInfo { kind: None, events };
+        };
         let is_local_struct = matches!(
             ty.kind(),
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
         );
-        let decision = if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
-            Some(PtrKind::Raw(m.is_mut()))
-        } else if aliases.is_some_and(|aliases| {
-            std::iter::once(local)
-                .chain(aliases.iter().copied())
-                .any(|l| self.mutable_pointers[l])
-        }) {
-            Some(PtrKind::Raw(self.mutable_pointers[local]))
-        } else if self._owning_pointers[local] && self.array_pointers[local] {
-            if self._output_params.contains(local) {
-                Some(PtrKind::Slice(true))
-            } else if is_local_struct {
-                Some(PtrKind::Raw(self.mutable_pointers[local]))
-            } else {
-                Some(PtrKind::OptBoxedSlice)
-            }
-        } else if self._owning_pointers[local] {
-            if self._output_params.contains(local) {
-                Some(PtrKind::OptRef(true))
-            } else if matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
-                Some(PtrKind::Raw(self.mutable_pointers[local]))
-            } else {
-                Some(PtrKind::OptBox)
-            }
-        } else if self.array_pointers[local] {
-            if self.promoted_shared_refs.contains(local) {
-                if self.needs_cursor.contains(local) {
-                    Some(PtrKind::SliceCursor(false))
+        let (mut decision, reason) =
+            if ty.is_c_void(self.tcx) || utils::file::contains_file_ty(ty, self.tcx) {
+                (
+                    Some(PtrKind::Raw(m.is_mut())),
+                    DecisionReason::CVoidOrFilePointee,
+                )
+            } else if aliases.is_some_and(|aliases| {
+                std::iter::once(local)
+                    .chain(aliases.iter().copied())
+                    .any(|l| self.mutable_pointers[l])
+            }) {
+                (
+                    Some(PtrKind::Raw(self.mutable_pointers[local])),
+                    DecisionReason::MutableAliasCluster,
+                )
+            } else if self._owning_pointers[local] && self.array_pointers[local] {
+                if self._output_params.contains(local) {
+                    (
+                        Some(PtrKind::Slice(true)),
+                        DecisionReason::OwningArrayOutputParam,
+                    )
+                } else if is_local_struct {
+                    (
+                        Some(PtrKind::Raw(self.mutable_pointers[local])),
+                        DecisionReason::OwningArrayLocalStruct,
+                    )
                 } else {
-                    Some(PtrKind::Slice(false))
+                    (
+                        Some(PtrKind::OptBoxedSlice),
+                        DecisionReason::OwningArrayBoxedSlice,
+                    )
                 }
+            } else if self._owning_pointers[local] {
+                if self._output_params.contains(local) {
+                    (
+                        Some(PtrKind::OptRef(true)),
+                        DecisionReason::OwningScalarOutputParam,
+                    )
+                } else if matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)) {
+                    (
+                        Some(PtrKind::Raw(self.mutable_pointers[local])),
+                        DecisionReason::OwningScalarNestedPointer,
+                    )
+                } else {
+                    (Some(PtrKind::OptBox), DecisionReason::OwningScalarBox)
+                }
+            } else if self.array_pointers[local] {
+                if self.promoted_shared_refs.contains(local) {
+                    if self.needs_cursor.contains(local) {
+                        (
+                            Some(PtrKind::SliceCursor(false)),
+                            DecisionReason::ArrayBorrowPromotedShared,
+                        )
+                    } else {
+                        (
+                            Some(PtrKind::Slice(false)),
+                            DecisionReason::ArrayBorrowPromotedShared,
+                        )
+                    }
+                } else if self.promoted_mut_refs.contains(local) {
+                    if self.needs_cursor.contains(local) {
+                        (
+                            Some(PtrKind::SliceCursor(true)),
+                            DecisionReason::ArrayBorrowPromotedMut,
+                        )
+                    } else {
+                        (
+                            Some(PtrKind::Slice(true)),
+                            DecisionReason::ArrayBorrowPromotedMut,
+                        )
+                    }
+                } else {
+                    (
+                        Some(PtrKind::Raw(self.mutable_pointers[local])),
+                        DecisionReason::RawPtrNotBorrowPromoted,
+                    )
+                }
+            } else if self.promoted_shared_refs.contains(local) {
+                (
+                    Some(PtrKind::OptRef(false)),
+                    DecisionReason::BorrowPromotedShared,
+                )
             } else if self.promoted_mut_refs.contains(local) {
-                if self.needs_cursor.contains(local) {
-                    Some(PtrKind::SliceCursor(true))
-                } else {
-                    Some(PtrKind::Slice(true))
-                }
+                (
+                    Some(PtrKind::OptRef(true)),
+                    DecisionReason::BorrowPromotedMut,
+                )
+            } else if decl.ty.is_raw_ptr() {
+                (
+                    Some(PtrKind::Raw(self.mutable_pointers[local])),
+                    DecisionReason::RawPtrNotBorrowPromoted,
+                )
             } else {
-                Some(PtrKind::Raw(self.mutable_pointers[local]))
+                (None, DecisionReason::RawPtrNotBorrowPromoted)
+            };
+        if decision.is_some() {
+            events.push(DecisionInfoEvent {
+                before: None,
+                after: decision,
+                reason,
+                detail: None,
+            });
+            if matches!(decision, Some(PtrKind::SliceCursor(_))) {
+                events.push(DecisionInfoEvent {
+                    before: decision.map(|kind| match kind {
+                        PtrKind::SliceCursor(m) => PtrKind::Slice(m),
+                        other => other,
+                    }),
+                    after: decision,
+                    reason: DecisionReason::ArrayNeedsCursor,
+                    detail: None,
+                });
             }
-        } else if self.promoted_shared_refs.contains(local) {
-            Some(PtrKind::OptRef(false))
-        } else if self.promoted_mut_refs.contains(local) {
-            Some(PtrKind::OptRef(true))
-        } else if decl.ty.is_raw_ptr() {
-            Some(PtrKind::Raw(self.mutable_pointers[local]))
-        } else {
-            None
-        };
+        }
 
-        let decision = self.preserve_original_pointer_constness(decision, m.is_mut());
+        let const_preserved = self.preserve_original_pointer_constness(decision, m.is_mut());
+        if const_preserved != decision {
+            events.push(DecisionInfoEvent {
+                before: decision,
+                after: const_preserved,
+                reason: DecisionReason::PreserveOriginalConstness,
+                detail: None,
+            });
+        }
+        decision = const_preserved;
         if self.non_null_locals.contains(local) {
-            decision.map(PtrKind::non_null_variant)
-        } else {
-            decision
+            let non_null = decision.map(PtrKind::non_null_variant);
+            if non_null != decision {
+                events.push(DecisionInfoEvent {
+                    before: decision,
+                    after: non_null,
+                    reason: DecisionReason::ProvenNonNull,
+                    detail: None,
+                });
+            }
+            decision = non_null;
+        }
+        DecisionInfo {
+            kind: decision,
+            events,
         }
     }
 }
@@ -298,11 +413,22 @@ pub struct SigDecisions {
 }
 
 impl SigDecisions {
+    #[allow(dead_code)]
     pub fn new(
         rust_program: &RustProgram,
         analysis: &Analysis,
         lifetime_plans: &super::lifetimes::LifetimePlans,
         fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+    ) -> Self {
+        Self::new_with_diagnostics(rust_program, analysis, lifetime_plans, fn_ptr_groups, None)
+    }
+
+    pub fn new_with_diagnostics(
+        rust_program: &RustProgram,
+        analysis: &Analysis,
+        lifetime_plans: &super::lifetimes::LifetimePlans,
+        fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+        mut diagnostics: Option<&mut DecisionDiagnostics>,
     ) -> Self {
         let mut data = FxHashMap::default();
         data.reserve(rust_program.functions.len());
@@ -323,6 +449,16 @@ impl SigDecisions {
                     .get(did)
                     .and_then(|rep| fn_ptr_groups.group_decisions.get(rep).cloned())
                     .unwrap_or_else(|| vec![None; input_len]);
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    record_param_decisions(
+                        diagnostics,
+                        rust_program.tcx,
+                        *did,
+                        &input_decs,
+                        DecisionStage::Signature,
+                        DecisionReason::FnPtrGroupDecision,
+                    );
+                }
                 // don't rewrite output for fn-ptr group members: the fn-ptr type
                 // annotations (casts, parameter types) don't yet track output types,
                 // and the existing internal local-variable transformation handles
@@ -362,32 +498,91 @@ impl SigDecisions {
 
             let aliases = analysis.aliases.get(did);
 
-            let input_decs = body
+            let mut input_decs = Vec::new();
+            for (idx, (param, param_decl)) in body
                 .local_decls
                 .iter_enumerated()
                 .skip(1)
                 .take(input_len)
-                .map(|(param, param_decl)| {
-                    let aliases = aliases.and_then(|aliases| aliases.get(&param));
-                    decision_maker.decide(param, param_decl, aliases)
-                })
-                .collect();
+                .enumerate()
+            {
+                let aliases = aliases.and_then(|aliases| aliases.get(&param));
+                let info = decision_maker.decide_with_info(param, param_decl, aliases);
+                if let Some(diagnostics) = diagnostics.as_deref_mut()
+                    && let Some(hir_id) = param_hir_id(rust_program.tcx, *did, idx)
+                {
+                    let subject = DecisionSubject::Param {
+                        did: *did,
+                        index: idx,
+                        hir_id,
+                        local: param,
+                    };
+                    record_decision_info(diagnostics, subject, DecisionStage::Initial, &info);
+                }
+                input_decs.push(info.kind);
+            }
 
             let return_local = Local::from_u32(0);
             let return_decl = &body.local_decls[return_local];
             let return_aliases = aliases.and_then(|a| a.get(&return_local));
-            let direct_output_dec =
-                match decision_maker.decide(return_local, return_decl, return_aliases) {
-                    Some(kind @ (PtrKind::Ref(_) | PtrKind::OptRef(_)))
-                        if output_lifetime.is_some() =>
-                    {
-                        Some(kind)
-                    }
-                    other => get_direct_output_dec(other),
-                };
-            let returned_local_output_dec =
-                infer_returned_local_box_kind(body, &decision_maker, aliases, return_local);
+            let return_info =
+                decision_maker.decide_with_info(return_local, return_decl, return_aliases);
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                let subject = DecisionSubject::Return { did: *did };
+                record_decision_info(diagnostics, subject, DecisionStage::Initial, &return_info);
+            }
+            let direct_output_dec = match return_info.kind {
+                Some(kind @ (PtrKind::Ref(_) | PtrKind::OptRef(_)))
+                    if output_lifetime.is_some() =>
+                {
+                    Some(kind)
+                }
+                other => get_direct_output_dec(other),
+            };
+            if let Some(diagnostics) = diagnostics.as_deref_mut()
+                && let Some(direct_output_dec) = direct_output_dec
+            {
+                diagnostics.record(
+                    DecisionSubject::Return { did: *did },
+                    DecisionStage::ReturnInference,
+                    return_info.kind,
+                    Some(direct_output_dec),
+                    DecisionReason::ReturnDirectCandidate,
+                    None,
+                );
+            }
+            let returned_local_output_dec = infer_returned_local_box_kind_with_local(
+                body,
+                &decision_maker,
+                aliases,
+                return_local,
+            );
+            if let Some(diagnostics) = diagnostics.as_deref_mut()
+                && let Some((local, kind)) = returned_local_output_dec
+            {
+                diagnostics.record(
+                    DecisionSubject::Return { did: *did },
+                    DecisionStage::ReturnInference,
+                    direct_output_dec,
+                    Some(kind),
+                    DecisionReason::ReturnFromLocalBoxCandidate,
+                    Some(format!("local={local:?}")),
+                );
+            }
+            let returned_local_output_dec = returned_local_output_dec.map(|(_, kind)| kind);
             let output_dec = get_output_dec(direct_output_dec, returned_local_output_dec);
+            if let Some(diagnostics) = diagnostics.as_deref_mut()
+                && output_dec.is_some()
+            {
+                diagnostics.record(
+                    DecisionSubject::Return { did: *did },
+                    DecisionStage::ReturnInference,
+                    direct_output_dec,
+                    output_dec,
+                    DecisionReason::ReturnDecisionMerge,
+                    None,
+                );
+            }
 
             data.insert(*did, {
                 let mut sig_dec = SigDecision {
@@ -403,6 +598,7 @@ impl SigDecisions {
                     &lifetime_plan,
                     &decision_maker,
                     &mut sig_dec,
+                    diagnostics.as_deref_mut(),
                 );
                 sig_dec.normalize_lifetimes();
                 sig_dec
@@ -418,6 +614,7 @@ fn apply_return_borrow_lifetime_plan<'tcx>(
     lifetime_plan: &super::lifetimes::FnLifetimePlan,
     decision_maker: &DecisionMaker<'tcx>,
     sig_dec: &mut SigDecision,
+    mut diagnostics: Option<&mut DecisionDiagnostics>,
 ) {
     let Some(output_lifetime) = lifetime_plan.output_lifetime else {
         return;
@@ -452,12 +649,23 @@ fn apply_return_borrow_lifetime_plan<'tcx>(
         return;
     }
 
-    let return_kind =
-        if return_place_may_receive_null_constructor(body, decision_maker.tcx, return_local) {
-            PtrKind::OptRef(output_mutability.is_mut())
-        } else {
-            PtrKind::Ref(output_mutability.is_mut())
-        };
+    let return_nullable =
+        return_place_may_receive_null_constructor(body, decision_maker.tcx, return_local);
+    let return_kind = if return_nullable {
+        PtrKind::OptRef(output_mutability.is_mut())
+    } else {
+        PtrKind::Ref(output_mutability.is_mut())
+    };
+    if return_nullable && let Some(diagnostics) = diagnostics.as_deref_mut() {
+        diagnostics.record(
+            DecisionSubject::Return { did },
+            DecisionStage::LifetimePlan,
+            sig_dec.output_dec,
+            Some(return_kind),
+            DecisionReason::ReturnNullable,
+            None,
+        );
+    }
     for (idx, is_mut) in returned_inputs {
         let input_kind = if return_kind.is_optional()
             || returned_input_is_observed_nullable(decision_maker.tcx, did, idx)
@@ -466,11 +674,108 @@ fn apply_return_borrow_lifetime_plan<'tcx>(
         } else {
             PtrKind::Ref
         };
+        let before = sig_dec.input_decs.get(idx).copied().flatten();
+        let after = Some(input_kind(is_mut));
         sig_dec.set_input_dec(idx, Some(input_kind(is_mut)));
         sig_dec.input_lifetimes[idx] = Some(output_lifetime);
+        if let Some(diagnostics) = diagnostics.as_deref_mut()
+            && before != after
+            && let Some(hir_id) = param_hir_id(decision_maker.tcx, did, idx)
+        {
+            diagnostics.record(
+                DecisionSubject::Param {
+                    did,
+                    index: idx,
+                    hir_id,
+                    local: Local::from_usize(idx + 1),
+                },
+                DecisionStage::LifetimePlan,
+                before,
+                after,
+                DecisionReason::ReturnBorrowLifetimePlan,
+                Some(format!("lifetime={output_lifetime}")),
+            );
+        }
     }
+    let before = sig_dec.output_dec;
     sig_dec.set_output_dec(Some(return_kind));
     sig_dec.output_lifetime = Some(output_lifetime);
+    if before != Some(return_kind)
+        && let Some(diagnostics) = diagnostics
+    {
+        diagnostics.record(
+            DecisionSubject::Return { did },
+            DecisionStage::LifetimePlan,
+            before,
+            Some(return_kind),
+            DecisionReason::ReturnBorrowLifetimePlan,
+            Some(format!("lifetime={output_lifetime}")),
+        );
+    }
+}
+
+fn record_decision_info(
+    diagnostics: &mut DecisionDiagnostics,
+    subject: DecisionSubject,
+    stage: DecisionStage,
+    info: &DecisionInfo,
+) {
+    for event in &info.events {
+        diagnostics.record(
+            subject,
+            stage,
+            event.before,
+            event.after,
+            event.reason,
+            event.detail.clone(),
+        );
+    }
+}
+
+fn record_param_decisions(
+    diagnostics: &mut DecisionDiagnostics,
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    input_decs: &[Option<PtrKind>],
+    stage: DecisionStage,
+    reason: DecisionReason,
+) {
+    for (index, decision) in input_decs.iter().copied().enumerate() {
+        let Some(decision) = decision else {
+            continue;
+        };
+        let Some(hir_id) = param_hir_id(tcx, did, index) else {
+            continue;
+        };
+        diagnostics.record(
+            DecisionSubject::Param {
+                did,
+                index,
+                hir_id,
+                local: Local::from_usize(index + 1),
+            },
+            stage,
+            None,
+            Some(decision),
+            reason,
+            None,
+        );
+    }
+}
+
+fn param_hir_id(tcx: TyCtxt<'_>, did: LocalDefId, index: usize) -> Option<HirId> {
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return None;
+    };
+    let hir::ItemKind::Fn { body, .. } = item.kind else {
+        return None;
+    };
+    let body = tcx.hir_body(body);
+    let param = body.params.get(index)?;
+    let hir::PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+        return None;
+    };
+    Some(hir_id)
 }
 
 fn returned_input_is_observed_nullable(tcx: TyCtxt<'_>, did: LocalDefId, idx: usize) -> bool {
@@ -621,12 +926,12 @@ fn return_place_may_receive_null_constructor<'tcx>(
     nullable.contains(return_local)
 }
 
-fn infer_returned_local_box_kind<'tcx>(
+fn infer_returned_local_box_kind_with_local<'tcx>(
     body: &rustc_middle::mir::Body<'tcx>,
     decision_maker: &DecisionMaker<'tcx>,
     aliases: Option<&FxHashMap<Local, FxHashSet<Local>>>,
     return_local: Local,
-) -> Option<PtrKind> {
+) -> Option<(Local, PtrKind)> {
     fn is_null_like_return_call<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> bool {
         let Some(func_const) = func.constant() else {
             return false;
@@ -679,9 +984,9 @@ fn infer_returned_local_box_kind<'tcx>(
     let aliases = aliases.and_then(|aliases| aliases.get(&local));
     let return_non_null = decision_maker.non_null_locals.contains(return_local);
     match decision_maker.decide(local, decl, aliases) {
-        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some(kind),
-        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) if return_non_null => Some(kind),
-        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => Some(kind.optional_variant()),
+        Some(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) => Some((local, kind)),
+        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) if return_non_null => Some((local, kind)),
+        Some(kind @ (PtrKind::Box | PtrKind::BoxedSlice)) => Some((local, kind.optional_variant())),
         _ => None,
     }
 }
@@ -1042,6 +1347,7 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     #[test]
     fn alias_overlap_takes_precedence_over_owning_output_promotion() {
         let mut decision = None;
+        let mut reasons = Vec::new();
         let code = r#"
 pub unsafe fn foo(p: *mut i32, q: *mut i32) {
     let _ = (p, q);
@@ -1054,13 +1360,37 @@ pub unsafe fn foo(p: *mut i32, q: *mut i32) {
             );
             let decl = &body.local_decls[local];
             let aliases = FxHashSet::from_iter([Local::from_u32(2)]);
-            decision = Some(
-                decision_maker
-                    .decide(local, decl, Some(&aliases))
-                    .expect("expected pointer decision"),
-            );
+            let info = decision_maker.decide_with_info(local, decl, Some(&aliases));
+            reasons = info.events.iter().map(|event| event.reason).collect();
+            decision = Some(info.kind.expect("expected pointer decision"));
         });
         assert_eq!(decision, Some(PtrKind::Raw(true)));
+        assert!(reasons.contains(&DecisionReason::MutableAliasCluster));
+    }
+
+    #[test]
+    fn decide_with_info_records_constness_adjustment() {
+        let mut events = Vec::new();
+        let code = r#"
+pub unsafe fn foo(p: *const i32) {
+    let _ = p;
+}
+"#;
+        with_test_fn_body(code, |tcx, _did, body| {
+            let local = Local::from_u32(1);
+            let decision_maker = synthetic_decision_maker_with_non_null(
+                tcx, body, local, true, false, false, false, true, false, false, false,
+            );
+            let decl = &body.local_decls[local];
+            events = decision_maker.decide_with_info(local, decl, None).events;
+        });
+        assert_eq!(
+            events.iter().map(|event| event.reason).collect::<Vec<_>>(),
+            vec![
+                DecisionReason::BorrowPromotedMut,
+                DecisionReason::PreserveOriginalConstness,
+            ],
+        );
     }
 
     #[test]
