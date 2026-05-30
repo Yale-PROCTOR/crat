@@ -7484,15 +7484,13 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut q_idx: usize = (3) as usize"), "{s}");
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
     assert!(
-        s.contains("*((p).offset(q_idx as isize) as *mut i32) = 3"),
+        s.contains("*((p).offset(q_idx) as *mut i32) = 3"),
         "{s}"
     );
     assert!(
-        s.matches("*((p).offset(q_idx as isize) as *mut i32)")
-            .count()
-            >= 2,
+        s.matches("*((p).offset(q_idx) as *mut i32)").count() >= 2,
         "{s}"
     );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
@@ -7514,11 +7512,11 @@ pub unsafe fn foo(mut p: *mut i32, mut k: isize) -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut q_idx: Option<usize> = None"), "{s}");
+    assert!(s.contains("let mut q_idx: Option<isize> = None"), "{s}");
     assert!(s.contains("if q_idx.is_none()"), "{s}");
-    assert!(s.contains("q_idx = Some((k) as usize)"), "{s}");
+    assert!(s.contains("q_idx = Some(k)"), "{s}");
     assert!(
-        s.contains("*((p).offset(q_idx.unwrap() as isize) as *mut i32) = 7"),
+        s.contains("*((p).offset(q_idx.unwrap()) as *mut i32) = 7"),
         "{s}"
     );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
@@ -7539,14 +7537,14 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut q_idx: Option<usize> = None"), "{s}");
-    assert!(s.contains("q_idx = Some((2) as usize)"), "{s}");
+    assert!(s.contains("let mut q_idx: Option<isize> = None"), "{s}");
+    assert!(s.contains("q_idx = Some((2) as isize)"), "{s}");
     assert!(
         s.contains("q_idx.map_or(std::ptr::null_mut() as *mut i32"),
         "{s}"
     );
     assert!(
-        s.contains("|idx| ((p).offset(idx as isize)) as *mut i32"),
+        s.contains("|idx| ((p).offset(idx)) as *mut i32"),
         "{s}"
     );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
@@ -7570,7 +7568,7 @@ pub unsafe fn foo(mut raw: *mut i32, mut take: bool, mut k: isize) -> *mut i32 {
     let compact = s.split_whitespace().collect::<String>();
     assert!(
         compact.contains(
-            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|idx|((raw)[(idxasisize)asusize..]).as_mut_ptr())"
+            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|idx|((raw)[(idx)asusize..]).as_mut_ptr())"
         ),
         "{s}"
     );
@@ -7668,14 +7666,31 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut q_idx: usize = (1) as usize"), "{s}");
+    assert!(s.contains("let mut q_idx: isize = (1) as isize"), "{s}");
     assert!(s.contains("q_idx ="), "{s}");
-    assert!(s.contains("as isize +"), "{s}");
+    assert!(s.contains("(q_idx) + ((2) as isize)"), "{s}");
     assert!(
-        s.contains("*((p).offset(q_idx as isize) as *mut i32) = 9"),
+        s.contains("*((p).offset(q_idx) as *mut i32) = 9"),
         "{s}"
     );
     assert!(!s.contains("q = q.offset"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_parenthesizes_compound_relative_offset() {
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, n: isize, mask: isize) -> i32 {
+    let mut q: *mut i32 = p.offset(1);
+    *p = 1;
+    q = q.offset(n & mask);
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx = (q_idx) + (n & mask)"), "{s}");
+    assert!(!s.contains("q_idx = q_idx + n & mask"), "{s}");
 }
 
 #[test]
@@ -7722,19 +7737,13 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut p_idx: usize = 0usize"), "{s}");
-    assert!(s.contains("let mut q_idx: usize"), "{s}");
+    assert!(s.contains("let mut p_idx: isize = 0isize"), "{s}");
+    assert!(s.contains("let mut q_idx: isize"), "{s}");
+    assert!(s.contains("(p_idx) + ((1) as isize)"), "{s}");
+    assert!(s.contains("p_idx = (p_idx) + ((1) as isize)"), "{s}");
     assert!(
-        s.contains("((p_idx) as isize + ((1) as usize) as isize) as usize"),
-        "{s}"
-    );
-    assert!(
-        s.contains("p_idx = ((p_idx) as isize + ((1) as usize) as isize) as usize"),
-        "{s}"
-    );
-    assert!(
-        s.contains("*((p).offset(q_idx as isize) as *mut i32)")
-            && s.contains("*((p).offset(p_idx as isize) as *mut i32)"),
+        s.contains("*((p).offset(q_idx) as *mut i32)")
+            && s.contains("*((p).offset(p_idx) as *mut i32)"),
         "{s}"
     );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
@@ -7753,15 +7762,12 @@ pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut p_idx: usize = 0usize"), "{s}");
-    assert!(s.contains("let mut prev_idx: usize = p_idx"), "{s}");
+    assert!(s.contains("let mut p_idx: isize = 0isize"), "{s}");
+    assert!(s.contains("let mut prev_idx: isize = p_idx"), "{s}");
+    assert!(s.contains("p_idx = (p_idx) + (n)"), "{s}");
     assert!(
-        s.contains("p_idx = ((p_idx) as isize + ((n) as usize) as isize) as usize"),
-        "{s}"
-    );
-    assert!(
-        s.contains("*((p).offset(prev_idx as isize) as *mut i32)")
-            && s.contains("*((p).offset(p_idx as isize) as *mut i32)"),
+        s.contains("*((p).offset(prev_idx) as *mut i32)")
+            && s.contains("*((p).offset(p_idx) as *mut i32)"),
         "{s}"
     );
     assert!(!s.contains("let mut prev: *mut i32"), "{s}");
