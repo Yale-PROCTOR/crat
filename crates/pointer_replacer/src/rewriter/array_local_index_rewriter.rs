@@ -732,9 +732,9 @@ fn rewrite_binding_pat(pat: &mut Pat, index_name: &str) -> bool {
 
 fn index_ty(nullable: bool) -> P<Ty> {
     if nullable {
-        P(utils::ty!("Option<usize>"))
+        P(utils::ty!("Option<isize>"))
     } else {
-        P(utils::ty!("usize"))
+        P(utils::ty!("isize"))
     }
 }
 
@@ -760,25 +760,21 @@ fn is_null_expr(expr: &Expr) -> bool {
     }
 }
 
-fn offset_index_arg_expr(_name: &str, arg: &Expr) -> Expr {
-    utils::expr!("({}) as usize", pprust::expr_to_string(arg))
+fn offset_index_arg_expr(name: &str, arg: &Expr) -> Expr {
+    if name == "add" || matches!(unwrap_cast_and_paren(arg).kind, ExprKind::Lit(_)) {
+        utils::expr!("({}) as isize", pprust::expr_to_string(arg))
+    } else {
+        utils::expr!("{}", pprust::expr_to_string(arg))
+    }
 }
 
-fn add_usize_index_expr(current: &str, offset: &Expr) -> Expr {
-    utils::expr!(
-        "(({}) as isize + ({}) as isize) as usize",
-        current,
-        pprust::expr_to_string(offset)
-    )
+fn add_index_expr(current: &str, offset: &Expr) -> Expr {
+    utils::expr!("({}) + ({})", current, pprust::expr_to_string(offset))
 }
 
 fn relative_index_expr(current: &str, method_name: &str, arg: &Expr) -> Expr {
-    let delta = if method_name == "add" {
-        format!("({}) as isize", pprust::expr_to_string(arg))
-    } else {
-        pprust::expr_to_string(arg)
-    };
-    utils::expr!("(({}) as isize + ({})) as usize", current, delta)
+    let offset = offset_index_arg_expr(method_name, arg);
+    add_index_expr(current, &offset)
 }
 
 fn base_current_index_expr(rewrite: &BindingRewrite) -> Option<&str> {
@@ -834,7 +830,7 @@ fn offset_from_base_expr(
     if hir_id_of_ast_expr(ast_to_hir, tcx, expr.id) == Some(rewrite.base_hir_id) {
         return IndexExpr::Plain(match base_current_index_expr(rewrite) {
             Some(base_index_name) => utils::expr!("{}", base_index_name),
-            None => utils::expr!("0usize"),
+            None => utils::expr!("0isize"),
         });
     }
     let ExprKind::MethodCall(call) = &expr.kind else {
@@ -850,7 +846,7 @@ fn offset_from_base_expr(
     }
     let offset = offset_index_arg_expr(name, &call.args[0]);
     if let Some(base_index_name) = base_current_index_expr(rewrite) {
-        IndexExpr::Plain(add_usize_index_expr(base_index_name, &offset))
+        IndexExpr::Plain(add_index_expr(base_index_name, &offset))
     } else {
         IndexExpr::Plain(offset)
     }
@@ -920,7 +916,7 @@ fn base_assignment_index_expr(
         || receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_rewrite.base_hir_id)
     {
         let offset = offset_index_arg_expr(name, &call.args[0]);
-        return IndexExpr::Plain(add_usize_index_expr(&base_rewrite.index_name, &offset));
+        return IndexExpr::Plain(add_index_expr(&base_rewrite.index_name, &offset));
     }
     if let Some(rewrite) = receiver_hir_id.and_then(|hir_id| planned_rewrites.get(&hir_id))
         && rewrite.base_hir_id == base_rewrite.base_hir_id
@@ -959,9 +955,9 @@ fn idx_read_expr(rewrite: &BindingRewrite) -> String {
 
 fn base_offset_expr_for_parts(base_name: &str, base_is_raw_ptr: bool, index_expr: &str) -> String {
     if base_is_raw_ptr {
-        format!("({base_name}).offset({index_expr} as isize)")
+        format!("({base_name}).offset({index_expr})")
     } else {
-        format!("({base_name}).as_ptr().offset({index_expr} as isize)")
+        format!("({base_name}).as_ptr().offset({index_expr})")
     }
 }
 
@@ -1039,7 +1035,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 for rewrite in cursors.into_iter().rev() {
                     stmts.insert(
                         0,
-                        utils::stmt!("let mut {}: usize = 0usize;", rewrite.index_name),
+                        utils::stmt!("let mut {}: isize = 0isize;", rewrite.index_name),
                     );
                 }
                 self.changed = true;

@@ -28,7 +28,10 @@ mod analyses;
 mod rewriter;
 mod utils;
 
-pub use rewriter::{BytemuckDependency, Config, replace_local_borrows, rewrite_struct_arrays, rewrite_array_local_provenance};
+pub use rewriter::{
+    BytemuckDependency, Config, replace_local_borrows, rewrite_array_local_provenance,
+    rewrite_struct_arrays,
+};
 
 #[cfg(test)]
 mod tests;
