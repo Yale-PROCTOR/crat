@@ -29,8 +29,9 @@ use utils::{
 
 use super::{
     Analysis, BytemuckDependency, Config,
-    collector::collect_diffs,
+    collector::{collect_diffs, collect_diffs_with_diagnostics},
     decision::{PtrKind, SigDecision, SigDecisions},
+    diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
     analyses::{
@@ -67,6 +68,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     bytemuck_derives: RefCell<BytemuckDerivePlan>,
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
+    diagnostics: DecisionDiagnostics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -363,7 +365,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
 
-                let adjusted_output_dec = sig_dec.output_dec.map(|output_dec| {
+                let output_dec_before = sig_dec.output_dec;
+                let output_lifetime = sig_dec.output_lifetime;
+                let adjusted_output_dec = output_dec_before.map(|output_dec| {
                     let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
                     let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) else {
                         return output_dec;
@@ -391,13 +395,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     {
                         *ret_ty = P(match output_dec {
                             PtrKind::Ref(m) => {
-                                self.mk_ref_ty_with_lifetime(inner_ty, m, sig_dec.output_lifetime)
+                                self.mk_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
                             }
-                            PtrKind::OptRef(m) => self.mk_opt_ref_ty_with_lifetime(
-                                inner_ty,
-                                m,
-                                sig_dec.output_lifetime,
-                            ),
+                            PtrKind::OptRef(m) => {
+                                self.mk_opt_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
+                            }
                             PtrKind::Box => self.mk_box_ty(inner_ty),
                             PtrKind::OptBox => self.mk_opt_box_ty(inner_ty),
                             PtrKind::Raw(m) => self.mk_raw_ptr_ty(inner_ty, m),
@@ -410,6 +412,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                         });
                     }
+                }
+                if adjusted_output_dec != output_dec_before
+                    && let Some(after) = adjusted_output_dec
+                {
+                    self.diagnostics.record(
+                        DecisionSubject::Return { did: def_id },
+                        DecisionStage::AstRewriteFallback,
+                        output_dec_before,
+                        Some(after),
+                        DecisionReason::AstRewriteUnsupportedBoxRhs,
+                        None,
+                    );
                 }
 
                 let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
@@ -556,28 +570,47 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             let lhs_ty = typeck.node_type(hir_id);
             let (lhs_inner_ty, lhs_mutability) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
             let original_lhs_kind = lhs_kind;
+            let mut fallback_events = Vec::new();
             if let Some(init) = let_stmt.init
                 && matches!(
                     self.forced_local_callee_output_kind(init),
                     Some(PtrKind::Raw(_))
                 )
             {
+                fallback_events.push((
+                    lhs_kind,
+                    PtrKind::Raw(lhs_mutability.is_mut()),
+                    DecisionReason::AstRewriteForcedRawCalleeOutput,
+                ));
                 lhs_kind = PtrKind::Raw(lhs_mutability.is_mut());
             }
             if lhs_kind.is_owning_box_like()
                 && let Some(init) = let_stmt.init
                 && !self.rhs_supports_box_target(init, lhs_kind, lhs_inner_ty)
             {
+                fallback_events.push((
+                    lhs_kind,
+                    PtrKind::Raw(true),
+                    DecisionReason::AstRewriteUnsupportedBoxRhs,
+                ));
                 lhs_kind = PtrKind::Raw(true);
             }
             if lhs_kind.is_owning_box_like()
                 && self.fn_has_unsupported_box_assignment(hir_id, lhs_kind, lhs_inner_ty)
             {
+                fallback_events.push((
+                    lhs_kind,
+                    PtrKind::Raw(true),
+                    DecisionReason::AstRewriteUnsupportedBoxAssignment,
+                ));
                 lhs_kind = PtrKind::Raw(true);
             }
             if lhs_kind != original_lhs_kind && matches!(lhs_kind, PtrKind::Raw(_)) {
                 self.ptr_kinds.insert(hir_id, lhs_kind);
                 self.forced_raw_bindings.insert(hir_id);
+                for (before, after, reason) in fallback_events {
+                    self.record_ast_fallback_binding(hir_id, before, after, reason);
+                }
             }
 
             match lhs_kind {
@@ -705,25 +738,46 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     PtrKind::Raw(m.is_mut())
                 };
                 let original_lhs_kind = lhs_kind;
+                let mut fallback_events = Vec::new();
                 if matches!(
                     self.forced_local_callee_output_kind(hir_rhs),
                     Some(PtrKind::Raw(_))
                 ) {
+                    fallback_events.push((
+                        lhs_kind,
+                        PtrKind::Raw(m.is_mut()),
+                        DecisionReason::AstRewriteForcedRawCalleeOutput,
+                    ));
                     lhs_kind = PtrKind::Raw(m.is_mut());
                 }
                 if lhs_kind.is_owning_box_like()
                     && !self.rhs_supports_box_target(hir_rhs, lhs_kind, lhs_inner_ty)
                 {
+                    fallback_events.push((
+                        lhs_kind,
+                        PtrKind::Raw(true),
+                        DecisionReason::AstRewriteUnsupportedBoxRhs,
+                    ));
                     lhs_kind = PtrKind::Raw(true);
                 } else if matches!(lhs_kind, PtrKind::Box | PtrKind::OptBox) {
                     if hir_is_unsupported_scalar_box_allocator_root(self.tcx, lhs_inner_ty, hir_rhs)
                     {
+                        fallback_events.push((
+                            lhs_kind,
+                            PtrKind::Raw(true),
+                            DecisionReason::AstRewriteUnsupportedScalarBoxAllocator,
+                        ));
                         lhs_kind = PtrKind::Raw(true);
                     }
                     if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_rhs.kind
                         && let Res::Local(rhs_hir_id) = path.res
                         && matches!(self.effective_ptr_kind(rhs_hir_id), Some(PtrKind::Raw(_)))
                     {
+                        fallback_events.push((
+                            lhs_kind,
+                            PtrKind::Raw(true),
+                            DecisionReason::AstRewriteRawRhsLocal,
+                        ));
                         lhs_kind = PtrKind::Raw(true);
                     }
                 }
@@ -733,6 +787,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 {
                     self.ptr_kinds.insert(hir_id, lhs_kind);
                     self.forced_raw_bindings.insert(hir_id);
+                    for (before, after, reason) in fallback_events {
+                        self.record_ast_fallback_binding(hir_id, before, after, reason);
+                    }
                 }
 
                 match lhs_kind {
@@ -1463,12 +1520,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ast_to_hir: AstToHir,
         fn_ptr_groups: FnPtrGroups,
         fn_ptr_rewrite: FnPtrRewriteDecision,
+        diagnostics: DecisionDiagnostics,
     ) -> TransformVisitor<'analysis, 'tcx> {
+        let mut diagnostics = diagnostics;
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
-        let mut sig_decs =
-            SigDecisions::new(rust_program, analysis, &lifetime_plans, &fn_ptr_groups);
+        let mut sig_decs = SigDecisions::new_with_diagnostics(
+            rust_program,
+            analysis,
+            &lifetime_plans,
+            &fn_ptr_groups,
+            Some(&mut diagnostics),
+        );
         let initial_sig_decs = sig_decs.clone();
-        let mut ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+        let mut ptr_kinds = collect_diffs_with_diagnostics(
+            rust_program,
+            analysis,
+            &sig_decs,
+            &fn_ptr_groups,
+            Some(&mut diagnostics),
+        );
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
@@ -1476,11 +1546,74 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             collect_local_raw_param_summaries(rust_program.tcx, &sig_decs, &free_like_wrappers);
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
+        record_binding_events(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &forced_raw_bindings,
+            DecisionReason::UnsupportedAllocatorRoot,
+        );
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         loop {
             let mut changed = false;
             let local_struct_downgrades =
                 downgrade_local_struct_bindings(rust_program.tcx, &mut sig_decs, &ptr_kinds);
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.call_conflict,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructCallConflict,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.call_binding_conflict,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructCallBindingConflict,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.field_borrow_conflict,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructFieldBorrowConflict,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.reborrow_assignment,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructReborrowAssignment,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.field_mut_ptr,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructFieldMutPtr,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.static_projection,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructStaticProjection,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &local_struct_downgrades.foreign_mut_call,
+                &forced_raw_bindings,
+                DecisionReason::LocalStructForeignMutCall,
+            );
             if local_struct_downgrades.changed {
                 changed = true;
             }
@@ -1490,24 +1623,89 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     &mut sig_decs,
                     &local_raw_free_summaries,
                 );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &unsupported_box_input_bindings,
+                &forced_raw_bindings,
+                DecisionReason::UnsupportedBoxInput,
+            );
             if box_input_changed {
                 changed = true;
             }
-            if downgrade_unsupported_box_outputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
+            let unsupported_box_outputs =
+                downgrade_unsupported_box_outputs(rust_program.tcx, &mut sig_decs, &ptr_kinds);
+            for did in &unsupported_box_outputs {
+                record_signature_output_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    *did,
+                    DecisionReason::UnsupportedBoxOutput,
+                );
+            }
+            if !unsupported_box_outputs.is_empty() {
                 changed = true;
             }
-            if downgrade_freed_borrow_outputs(rust_program.tcx, &mut sig_decs, &free_like_wrappers)
-            {
+            let freed_borrow_outputs = downgrade_freed_borrow_outputs(
+                rust_program.tcx,
+                &mut sig_decs,
+                &free_like_wrappers,
+            );
+            for did in &freed_borrow_outputs.outputs {
+                record_signature_output_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    *did,
+                    DecisionReason::FreedBorrowOutput,
+                );
+            }
+            for &(did, idx) in &freed_borrow_outputs.tied_inputs {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::FreedBorrowOutputTiedInput,
+                );
+            }
+            if freed_borrow_outputs.changed() {
                 changed = true;
             }
-            if downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds) {
+            let raw_cast_call_inputs =
+                downgrade_raw_cast_call_inputs(rust_program.tcx, &mut sig_decs, &ptr_kinds);
+            for &(did, idx) in &raw_cast_call_inputs {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::RawCastCallInput,
+                );
+            }
+            if !raw_cast_call_inputs.is_empty() {
                 changed = true;
             }
-            if downgrade_cursor_inputs_from_unanchored_raw_callers(
+            let cursor_input_downgrades = downgrade_cursor_inputs_from_unanchored_raw_callers(
                 rust_program.tcx,
                 &mut sig_decs,
                 &ptr_kinds,
-            ) {
+            );
+            for &(did, idx) in &cursor_input_downgrades {
+                record_signature_input_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    did,
+                    idx,
+                    DecisionReason::CursorInputFromUnanchoredRawCaller,
+                );
+            }
+            if !cursor_input_downgrades.is_empty() {
                 changed = true;
             }
             let owned_field_free_bindings = collect_owned_field_free_owner_bindings(
@@ -1519,6 +1717,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             );
             for hir_id in owned_field_free_bindings {
                 if force_signature_input_mut_for_binding(rust_program.tcx, &mut sig_decs, hir_id) {
+                    if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, hir_id) {
+                        record_signature_input_event(
+                            &mut diagnostics,
+                            rust_program.tcx,
+                            &sig_decs,
+                            did,
+                            idx,
+                            DecisionReason::OwnedFieldFreeRequiresMutableInput,
+                        );
+                    }
                     changed = true;
                 }
             }
@@ -1526,6 +1734,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 collect_raw_call_result_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
                 collect_raw_local_assignment_bindings(rust_program.tcx, &ptr_kinds);
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &raw_call_result_bindings,
+                &forced_raw_bindings,
+                DecisionReason::RawCallResult,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &raw_local_assignment_bindings,
+                &forced_raw_bindings,
+                DecisionReason::RawLocalAssignment,
+            );
             for hir_id in &raw_local_assignment_bindings {
                 if param_index_for_binding(rust_program.tcx, *hir_id).is_some()
                     && force_signature_input_raw_for_binding(
@@ -1534,17 +1758,69 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *hir_id,
                     )
                 {
+                    if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, *hir_id) {
+                        record_signature_input_event(
+                            &mut diagnostics,
+                            rust_program.tcx,
+                            &sig_decs,
+                            did,
+                            idx,
+                            DecisionReason::RawLocalAssignment,
+                        );
+                    }
                     changed = true;
                 }
             }
             let unsupported_box_target_bindings =
                 collect_unsupported_box_target_bindings(rust_program.tcx, &sig_decs, &ptr_kinds);
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &unsupported_box_target_bindings,
+                &forced_raw_bindings,
+                DecisionReason::UnsupportedBoxTarget,
+            );
+            let unsupported_box_usage_subreasons = if diagnostics.is_enabled() {
+                collect_unsupported_box_usage_subreasons(
+                    rust_program.tcx,
+                    &ptr_kinds,
+                    &free_like_wrappers,
+                    &local_raw_param_summaries,
+                )
+            } else {
+                FxHashMap::default()
+            };
             let unsupported_box_usage_bindings = collect_unsupported_box_usage_bindings(
                 rust_program.tcx,
                 &ptr_kinds,
                 &free_like_wrappers,
                 &local_raw_param_summaries,
             );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &unsupported_box_usage_bindings,
+                &forced_raw_bindings,
+                DecisionReason::UnsupportedBoxUsage,
+            );
+            for hir_id in &unsupported_box_usage_bindings {
+                if forced_raw_bindings.contains(hir_id) {
+                    continue;
+                }
+                if let Some(reasons) = unsupported_box_usage_subreasons.get(hir_id) {
+                    for &reason in reasons {
+                        record_binding_event(
+                            &mut diagnostics,
+                            rust_program.tcx,
+                            &ptr_kinds,
+                            *hir_id,
+                            reason,
+                        );
+                    }
+                }
+            }
             let old_len = forced_raw_bindings.len();
             local_struct_downgrades.extend_forced_raw_bindings(&mut forced_raw_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
@@ -1575,14 +1851,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
         let demoted_fields =
             collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
-        emit_promotion_diagnostics(
-            rust_program.tcx,
-            analysis,
-            &lifetime_plans,
-            &sig_decs,
-            &ptr_kinds,
-            &demoted_fields,
-        );
         let (demoted_field_source_bindings, raw_field_source_callees) =
             collect_raw_field_source_bindings(
                 rust_program.tcx,
@@ -1593,18 +1861,45 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             );
         let mut sig_changed = false;
         for hir_id in &demoted_field_source_bindings {
-            sig_changed |=
-                force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id);
+            if force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id) {
+                sig_changed = true;
+                if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, *hir_id) {
+                    record_signature_input_event(
+                        &mut diagnostics,
+                        rust_program.tcx,
+                        &sig_decs,
+                        did,
+                        idx,
+                        DecisionReason::DemotedFieldSource,
+                    );
+                }
+            }
         }
+        record_binding_events_excluding(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &demoted_field_source_bindings,
+            &forced_raw_bindings,
+            DecisionReason::DemotedFieldSource,
+        );
         for callee_did in raw_field_source_callees {
-            sig_changed |= force_signature_output_raw(rust_program.tcx, &mut sig_decs, callee_did);
+            if force_signature_output_raw(rust_program.tcx, &mut sig_decs, callee_did) {
+                sig_changed = true;
+                record_signature_output_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    callee_did,
+                    DecisionReason::DemotedFieldSourceCalleeOutput,
+                );
+            }
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
         if sig_changed {
             ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
-        emit_ownership_field_diagnostics(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
         apply_field_storage_input_lifetimes(
             rust_program.tcx,
             analysis,
@@ -1623,7 +1918,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let borrowed_raw_params =
             collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &sig_decs);
 
-        TransformVisitor {
+        let mut visitor = TransformVisitor {
             tcx: rust_program.tcx,
             analysis,
             sig_decs,
@@ -1647,7 +1942,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
-        }
+            diagnostics,
+        };
+        visitor.record_field_decisions();
+        visitor
     }
 
     pub(crate) fn bytemuck_dependency(&self) -> BytemuckDependency {
@@ -1655,6 +1953,33 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             self.bytemuck.get(),
             !self.bytemuck_derives.borrow().is_empty(),
         )
+    }
+
+    pub(crate) fn emit_diagnostics(&self) {
+        self.diagnostics.emit(self.tcx);
+    }
+
+    fn record_ast_fallback_binding(
+        &mut self,
+        hir_id: HirId,
+        before: PtrKind,
+        after: PtrKind,
+        reason: DecisionReason,
+    ) {
+        if !self.diagnostics.is_enabled() || before == after {
+            return;
+        }
+        let Some(subject) = subject_for_binding(self.tcx, hir_id) else {
+            return;
+        };
+        self.diagnostics.record(
+            subject,
+            DecisionStage::AstRewriteFallback,
+            Some(before),
+            Some(after),
+            reason,
+            None,
+        );
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
@@ -1693,6 +2018,242 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if self.demoted_fields.contains(&field) {
             return None;
         }
+        let mutability = if self
+            .analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            true
+        } else if self
+            .analysis
+            .borrow_promotion_result
+            .shared_fields
+            .contains(&field)
+        {
+            false
+        } else {
+            return None;
+        };
+        if self.field_is_array_like(field) {
+            if self.field_cursor_fields.contains(&field) {
+                Some(PtrKind::SliceCursor(mutability))
+            } else {
+                Some(PtrKind::Slice(mutability))
+            }
+        } else {
+            Some(PtrKind::OptRef(mutability))
+        }
+    }
+
+    fn record_field_decisions(&mut self) {
+        if !self.diagnostics.is_enabled() {
+            return;
+        }
+        let mut promoted_fields = self.analysis.borrow_promotion_result.mutable_fields.clone();
+        promoted_fields.extend(
+            self.analysis
+                .borrow_promotion_result
+                .shared_fields
+                .iter()
+                .copied(),
+        );
+        let shape_demoted = collect_struct_shape_demoted_field_reasons(
+            self.tcx,
+            &promoted_fields,
+            &self.analysis.borrow_promotion_result.mutable_fields,
+            &self.analysis.struct_copy_result,
+            &self.sig_decs,
+            &self.ptr_kinds,
+        );
+        let conflict_reasons = collect_field_conflict_demotion_reasons(
+            self.tcx,
+            self.analysis,
+            &self.sig_decs,
+            &self.ptr_kinds,
+        );
+
+        let mut scalar_fields = FxHashMap::default();
+        for field in local_struct_fields(self.tcx) {
+            if let Some(Ok(inner_ty)) =
+                owning_struct_field_scalar_inner_ty(self.tcx, self.analysis, field)
+            {
+                scalar_fields.insert(field, inner_ty);
+            }
+        }
+        let ownership_block_reasons = collect_ownership_field_rhs_block_reasons(
+            self.tcx,
+            &self.sig_decs,
+            &self.ptr_kinds,
+            &scalar_fields,
+        );
+
+        for field in local_struct_fields(self.tcx) {
+            let subject = DecisionSubject::Field {
+                struct_did: field.struct_did,
+                field_index: field.field_index,
+            };
+            let start_len = self.diagnostics.events().len();
+            let pre_gate_kind = if struct_field_is_exactly_owning(self.analysis, field) {
+                match owning_struct_field_scalar_inner_ty(self.tcx, self.analysis, field) {
+                    Some(Ok(_)) => {
+                        if let Some(reasons) = ownership_block_reasons.get(&field) {
+                            for &reason in reasons {
+                                self.diagnostics.record(
+                                    subject,
+                                    DecisionStage::OwnershipAnalysis,
+                                    None,
+                                    None,
+                                    ownership_reason_to_decision_reason(reason),
+                                    None,
+                                );
+                            }
+                            None
+                        } else {
+                            self.diagnostics.record(
+                                subject,
+                                DecisionStage::OwnershipAnalysis,
+                                None,
+                                Some(PtrKind::OptBox),
+                                DecisionReason::OwnershipFieldSelectedOptBox,
+                                None,
+                            );
+                            Some(PtrKind::OptBox)
+                        }
+                    }
+                    Some(Err(reason)) => {
+                        self.diagnostics.record(
+                            subject,
+                            DecisionStage::OwnershipAnalysis,
+                            None,
+                            None,
+                            ownership_reason_to_decision_reason(reason),
+                            None,
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                if promoted_fields.contains(&field) {
+                    let mutability = self
+                        .analysis
+                        .borrow_promotion_result
+                        .mutable_fields
+                        .contains(&field);
+                    self.diagnostics.record(
+                        subject,
+                        DecisionStage::BorrowAnalysis,
+                        None,
+                        self.promoted_field_kind(field),
+                        if mutability {
+                            DecisionReason::BorrowFieldPromotedMutable
+                        } else {
+                            DecisionReason::BorrowFieldPromotedShared
+                        },
+                        None,
+                    );
+                    if self.field_is_array_like(field) {
+                        self.diagnostics.record(
+                            subject,
+                            DecisionStage::BorrowAnalysis,
+                            None,
+                            self.promoted_field_kind(field),
+                            DecisionReason::BorrowFieldArrayLike,
+                            None,
+                        );
+                    }
+                    if self.field_cursor_fields.contains(&field) {
+                        self.diagnostics.record(
+                            subject,
+                            DecisionStage::BorrowAnalysis,
+                            None,
+                            self.promoted_field_kind(field),
+                            DecisionReason::BorrowFieldNeedsCursor,
+                            None,
+                        );
+                    }
+                    if self.demoted_fields.contains(&field) {
+                        for &reason in shape_demoted.get(&field).into_iter().flatten() {
+                            self.diagnostics.record(
+                                subject,
+                                DecisionStage::FieldDemotion,
+                                self.promoted_field_kind_without_demotions(field),
+                                None,
+                                reason,
+                                None,
+                            );
+                        }
+                        if let Some(reasons) = conflict_reasons.get(&field) {
+                            self.diagnostics.record(
+                                subject,
+                                DecisionStage::FieldDemotion,
+                                self.promoted_field_kind_without_demotions(field),
+                                None,
+                                DecisionReason::BorrowFieldConflictDemotion,
+                                None,
+                            );
+                            for &reason in reasons {
+                                self.diagnostics.record(
+                                    subject,
+                                    DecisionStage::FieldDemotion,
+                                    self.promoted_field_kind_without_demotions(field),
+                                    None,
+                                    conflict_reason_to_decision_reason(reason),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                } else if hir_field_is_raw_ptr(self.tcx, field) {
+                    self.diagnostics.record(
+                        subject,
+                        DecisionStage::OwnershipAnalysis,
+                        None,
+                        None,
+                        DecisionReason::OwnershipFieldNotExactlyOwning,
+                        None,
+                    );
+                }
+                self.promoted_field_kind(field)
+            };
+
+            let final_kind = self.field_ptr_kind(field);
+            if pre_gate_kind.is_some() && final_kind.is_none() {
+                let reason = if self.c_exposed_abi_fields.contains(&field) {
+                    Some(DecisionReason::CExposedAbiField)
+                } else if self.c_exposed_thin_abi_fields.contains(&field) {
+                    Some(DecisionReason::CExposedThinAbiField)
+                } else if self.c_exposed_cursor_abi_fields.contains(&field) {
+                    Some(DecisionReason::CExposedCursorAbiField)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    self.diagnostics.record(
+                        subject,
+                        DecisionStage::AbiPreservation,
+                        pre_gate_kind,
+                        None,
+                        reason,
+                        None,
+                    );
+                }
+            }
+            if final_kind.is_some() || self.diagnostics.events().len() != start_len {
+                self.diagnostics.record(
+                    subject,
+                    DecisionStage::Final,
+                    final_kind,
+                    final_kind,
+                    DecisionReason::FinalDecision,
+                    None,
+                );
+            }
+        }
+    }
+
+    fn promoted_field_kind_without_demotions(&self, field: StructFieldSlot) -> Option<PtrKind> {
         let mutability = if self
             .analysis
             .borrow_promotion_result
@@ -8845,6 +9406,140 @@ fn param_index_for_binding(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<(LocalDefId
         })
 }
 
+fn record_binding_events(
+    diagnostics: &mut DecisionDiagnostics,
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    bindings: &FxHashSet<HirId>,
+    reason: DecisionReason,
+) {
+    for &hir_id in bindings {
+        record_binding_event(diagnostics, tcx, ptr_kinds, hir_id, reason);
+    }
+}
+
+fn record_binding_events_excluding(
+    diagnostics: &mut DecisionDiagnostics,
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    bindings: &FxHashSet<HirId>,
+    existing: &FxHashSet<HirId>,
+    reason: DecisionReason,
+) {
+    for &hir_id in bindings {
+        if !existing.contains(&hir_id) {
+            record_binding_event(diagnostics, tcx, ptr_kinds, hir_id, reason);
+        }
+    }
+}
+
+fn record_binding_event(
+    diagnostics: &mut DecisionDiagnostics,
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    hir_id: HirId,
+    reason: DecisionReason,
+) {
+    if !diagnostics.is_enabled() {
+        return;
+    }
+    let Some(subject) = subject_for_binding(tcx, hir_id) else {
+        return;
+    };
+    let before = ptr_kinds.get(&hir_id).copied();
+    let after = raw_kind_for_hir_id(tcx, hir_id).or(before);
+    diagnostics.record(
+        subject,
+        DecisionStage::Downgrade,
+        before,
+        after,
+        reason,
+        None,
+    );
+}
+
+fn record_signature_input_event(
+    diagnostics: &mut DecisionDiagnostics,
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    did: LocalDefId,
+    idx: usize,
+    reason: DecisionReason,
+) {
+    if !diagnostics.is_enabled() {
+        return;
+    }
+    let Some(sig_dec) = sig_decs.data.get(&did) else {
+        return;
+    };
+    let Some(after) = sig_dec.input_decs.get(idx).copied().flatten() else {
+        return;
+    };
+    let Some(hir_id) = callee_input_param_binding(tcx, did, idx) else {
+        return;
+    };
+    diagnostics.record(
+        DecisionSubject::Param {
+            did,
+            index: idx,
+            hir_id,
+            local: rustc_middle::mir::Local::from_usize(idx + 1),
+        },
+        DecisionStage::Downgrade,
+        None,
+        Some(after),
+        reason,
+        None,
+    );
+}
+
+fn record_signature_output_event(
+    diagnostics: &mut DecisionDiagnostics,
+    _tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    did: LocalDefId,
+    reason: DecisionReason,
+) {
+    if !diagnostics.is_enabled() {
+        return;
+    }
+    let Some(after) = sig_decs
+        .data
+        .get(&did)
+        .and_then(|sig_dec| sig_dec.output_dec)
+    else {
+        return;
+    };
+    diagnostics.record(
+        DecisionSubject::Return { did },
+        DecisionStage::Downgrade,
+        None,
+        Some(after),
+        reason,
+        None,
+    );
+}
+
+fn subject_for_binding(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<DecisionSubject> {
+    if let Some((did, index)) = param_index_for_binding(tcx, hir_id) {
+        return Some(DecisionSubject::Param {
+            did,
+            index,
+            hir_id,
+            local: rustc_middle::mir::Local::from_usize(index + 1),
+        });
+    }
+    let did = hir_id.owner.def_id;
+    let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+    let local = hir_to_mir.binding_to_local.get(&hir_id).copied()?;
+    Some(DecisionSubject::Local { did, hir_id, local })
+}
+
+fn raw_kind_for_hir_id(tcx: TyCtxt<'_>, hir_id: HirId) -> Option<PtrKind> {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+        .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
+}
+
 fn hir_whole_ptr_root_for_local_struct_arg<'tcx>(
     tcx: TyCtxt<'tcx>,
     typeck: &rustc_middle::ty::TypeckResults<'tcx>,
@@ -9140,11 +9835,23 @@ fn downgrade_unsupported_box_inputs(
     (changed, bindings)
 }
 
+#[derive(Default)]
+struct FreedBorrowOutputDowngrades {
+    outputs: FxHashSet<LocalDefId>,
+    tied_inputs: FxHashSet<(LocalDefId, usize)>,
+}
+
+impl FreedBorrowOutputDowngrades {
+    fn changed(&self) -> bool {
+        !self.outputs.is_empty() || !self.tied_inputs.is_empty()
+    }
+}
+
 fn downgrade_freed_borrow_outputs(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
     free_like_wrappers: &FxHashSet<LocalDefId>,
-) -> bool {
+) -> FreedBorrowOutputDowngrades {
     struct FreedBorrowOutputVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
@@ -9234,7 +9941,7 @@ fn downgrade_freed_borrow_outputs(
         callees_to_raw.extend(visitor.freed_call_results);
     }
 
-    let mut changed = false;
+    let mut changed = FreedBorrowOutputDowngrades::default();
     for callee_did in callees_to_raw {
         let Some(sig_dec) = sig_decs.data.get_mut(&callee_did) else {
             continue;
@@ -9250,6 +9957,7 @@ fn downgrade_freed_borrow_outputs(
         }
         let output_lifetime = sig_dec.output_lifetime;
         sig_dec.set_output_dec(Some(PtrKind::Raw(output_kind.is_mut())));
+        changed.outputs.insert(callee_did);
         if let Some(output_lifetime) = output_lifetime {
             for idx in 0..sig_dec.input_decs.len() {
                 if sig_dec.input_lifetimes.get(idx).copied().flatten() != Some(output_lifetime) {
@@ -9260,6 +9968,7 @@ fn downgrade_freed_borrow_outputs(
                 };
                 if is_borrow_like_decision(input_kind) {
                     sig_dec.set_input_dec(idx, Some(PtrKind::Raw(input_kind.is_mut())));
+                    changed.tied_inputs.insert((callee_did, idx));
                 }
             }
         } else if output_kind.is_owning_box_like() {
@@ -9268,9 +9977,9 @@ fn downgrade_freed_borrow_outputs(
                     continue;
                 };
                 sig_dec.set_input_dec(idx, Some(PtrKind::Raw(input_kind.is_mut())));
+                changed.tied_inputs.insert((callee_did, idx));
             }
         }
-        changed = true;
     }
     changed
 }
@@ -9279,12 +9988,12 @@ fn downgrade_raw_cast_call_inputs(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) -> bool {
+) -> FxHashSet<(LocalDefId, usize)> {
     struct RawCastCallVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         sig_decs: &'a mut SigDecisions,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
-        changed: bool,
+        changed: FxHashSet<(LocalDefId, usize)>,
     }
 
     impl<'tcx> Visitor<'tcx> for RawCastCallVisitor<'_, 'tcx> {
@@ -9328,14 +10037,14 @@ fn downgrade_raw_cast_call_inputs(
                 let raw = PtrKind::Raw(mutability.is_mut());
                 if sig_dec.input_decs.get(idx).copied().flatten() != Some(raw) {
                     sig_dec.set_input_dec(idx, Some(raw));
-                    self.changed = true;
+                    self.changed.insert((callee_did, idx));
                 }
             }
             intravisit::walk_expr(self, expr);
         }
     }
 
-    let mut changed = false;
+    let mut changed = FxHashSet::default();
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
             continue;
@@ -9351,10 +10060,10 @@ fn downgrade_raw_cast_call_inputs(
             tcx,
             sig_decs,
             ptr_kinds,
-            changed: false,
+            changed: FxHashSet::default(),
         };
         visitor.visit_body(body);
-        changed |= visitor.changed;
+        changed.extend(visitor.changed);
     }
     changed
 }
@@ -9363,7 +10072,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) -> bool {
+) -> FxHashSet<(LocalDefId, usize)> {
     let raw_origin_locals = collect_unanchored_raw_pointer_locals(tcx, sig_decs, ptr_kinds);
 
     struct CursorInputVisitor<'a, 'tcx> {
@@ -9371,7 +10080,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
         sig_decs: &'a mut SigDecisions,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         raw_origin_locals: &'a FxHashSet<HirId>,
-        changed: bool,
+        changed: FxHashSet<(LocalDefId, usize)>,
     }
 
     impl<'tcx> Visitor<'tcx> for CursorInputVisitor<'_, 'tcx> {
@@ -9426,7 +10135,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
                         Some(PtrKind::SliceCursor(_))
                     ) {
                         sig_dec.set_input_dec(idx, Some(PtrKind::Raw(m)));
-                        self.changed = true;
+                        self.changed.insert((callee_did, idx));
                     }
                 }
             }
@@ -9435,7 +10144,7 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
         }
     }
 
-    let mut changed = false;
+    let mut changed = FxHashSet::default();
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
             continue;
@@ -9452,10 +10161,10 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
             sig_decs,
             ptr_kinds,
             raw_origin_locals: &raw_origin_locals,
-            changed: false,
+            changed: FxHashSet::default(),
         };
         visitor.visit_body(body);
-        changed |= visitor.changed;
+        changed.extend(visitor.changed);
     }
     changed
 }
@@ -9741,7 +10450,7 @@ fn downgrade_unsupported_box_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     sig_decs: &mut SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) -> bool {
+) -> FxHashSet<LocalDefId> {
     let mut to_raw = Vec::new();
     for (did, sig_dec) in &sig_decs.data {
         let Some(output_kind) = sig_dec.output_dec else {
@@ -9768,10 +10477,11 @@ fn downgrade_unsupported_box_outputs<'tcx>(
             to_raw.push(*did);
         }
     }
-    let changed = !to_raw.is_empty();
+    let mut changed = FxHashSet::default();
     for did in to_raw {
         if let Some(sig_dec) = sig_decs.data.get_mut(&did) {
             sig_dec.set_output_dec(Some(PtrKind::Raw(true)));
+            changed.insert(did);
         }
     }
     changed
@@ -12342,6 +13052,151 @@ fn collect_unsupported_box_usage_bindings(
     bindings
 }
 
+fn collect_unsupported_box_usage_subreasons(
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    free_like_wrappers: &FxHashSet<LocalDefId>,
+    local_raw_param_summaries: &FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
+) -> FxHashMap<HirId, Vec<DecisionReason>> {
+    struct UsageSubreasonVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        free_like_wrappers: &'a FxHashSet<LocalDefId>,
+        local_raw_param_summaries: &'a FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
+        byte_view_roots: FxHashMap<HirId, HirId>,
+        reasons: FxHashMap<HirId, FxHashSet<DecisionReason>>,
+    }
+
+    impl<'tcx> UsageSubreasonVisitor<'_, 'tcx> {
+        fn record(&mut self, root: HirId, reason: DecisionReason) {
+            self.reasons.entry(root).or_default().insert(reason);
+        }
+
+        fn owning_root_of(&self, hir_id: HirId) -> Option<HirId> {
+            if self
+                .ptr_kinds
+                .get(&hir_id)
+                .is_some_and(PtrKind::is_owning_box_like)
+            {
+                Some(hir_id)
+            } else {
+                self.byte_view_roots.get(&hir_id).copied()
+            }
+        }
+
+        fn maybe_mark_byte_view_alias(
+            &mut self,
+            lhs_hir_id: HirId,
+            lhs_ty: ty::Ty<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                return;
+            };
+            if !ty_is_byte_sized_raw_inner(lhs_inner_ty) {
+                return;
+            }
+            let Some(rhs_hir_id) = hir_unwrapped_local_id(rhs) else {
+                return;
+            };
+            let Some(root) = self.owning_root_of(rhs_hir_id) else {
+                return;
+            };
+            let rhs_ty = self.tcx.typeck(rhs_hir_id.owner).node_type(rhs_hir_id);
+            let Some((rhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(rhs_ty) else {
+                return;
+            };
+            if !ty_is_byte_sized_raw_inner(rhs_inner_ty) || !hir_is_casted_local(rhs, rhs_hir_id) {
+                return;
+            }
+            self.byte_view_roots.insert(lhs_hir_id, root);
+            self.record(root, DecisionReason::UnsupportedBoxUsageByteViewAlias);
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for UsageSubreasonVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+                self.maybe_mark_byte_view_alias(hir_id, lhs_ty, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && let Res::Local(lhs_hir_id) = path.res
+            {
+                let lhs_ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(lhs);
+                self.maybe_mark_byte_view_alias(lhs_hir_id, lhs_ty, rhs);
+            }
+
+            if let Some(local_callee) = hir_called_local_fn(self.tcx, expr)
+                && let hir::ExprKind::Call(_, args) = expr.kind
+            {
+                for (arg_index, arg) in args.iter().enumerate() {
+                    let Some(hir_id) = hir_unwrapped_local_id(arg) else {
+                        continue;
+                    };
+                    let Some(root) = self.owning_root_of(hir_id) else {
+                        continue;
+                    };
+                    if !self
+                        .local_raw_param_summaries
+                        .get(&(local_callee, arg_index))
+                        .copied()
+                        .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
+                    {
+                        self.record(
+                            root,
+                            DecisionReason::UnsupportedBoxUsageLocalCalleeNonBorrowOnly,
+                        );
+                    }
+                }
+            }
+
+            if let Some((hir_id, _)) =
+                hir_free_like_arg_local_id(self.tcx, expr, self.free_like_wrappers)
+                && let Some(root) = self.owning_root_of(hir_id)
+            {
+                let is_direct_free = hir_call_matches_foreign_name(self.tcx, expr, "free");
+                let direct_box_consume = is_direct_free
+                    && hir_id == root
+                    && self
+                        .ptr_kinds
+                        .get(&hir_id)
+                        .is_some_and(PtrKind::is_owning_box_like);
+                if !direct_box_consume {
+                    self.record(root, DecisionReason::UnsupportedBoxUsageFreeLikeWrapper);
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = UsageSubreasonVisitor {
+        tcx,
+        ptr_kinds,
+        free_like_wrappers,
+        local_raw_param_summaries,
+        byte_view_roots: FxHashMap::default(),
+        reasons: FxHashMap::default(),
+    };
+    for_each_hir_fn_body(tcx, |body, _typeck| visitor.visit_body(body));
+    let mut out = FxHashMap::default();
+    for (hir_id, reasons) in visitor.reasons {
+        let mut reasons = reasons.into_iter().collect::<Vec<_>>();
+        reasons.sort_by_key(|reason| reason.as_str());
+        out.insert(hir_id, reasons);
+    }
+    out
+}
+
 fn collect_owned_field_free_owner_bindings(
     tcx: TyCtxt<'_>,
     analysis: &Analysis,
@@ -12436,6 +13291,7 @@ fn collect_demoted_promoted_fields(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[allow(dead_code)]
 enum ConflictDemotionReason {
     ActiveBorrowOverlap,
     LocalAssignmentWhileBorrowed,
@@ -12451,6 +13307,7 @@ enum ConflictDemotionReason {
 }
 
 impl ConflictDemotionReason {
+    #[allow(dead_code)]
     const ALL: [Self; 11] = [
         Self::ActiveBorrowOverlap,
         Self::LocalAssignmentWhileBorrowed,
@@ -12465,6 +13322,7 @@ impl ConflictDemotionReason {
         Self::RawUnknownCallArg,
     ];
 
+    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             Self::ActiveBorrowOverlap => "active_borrow_overlap",
@@ -13147,6 +14005,7 @@ impl OwnershipFieldBlockReason {
         Self::CStringOrStrFunctionPattern,
     ];
 
+    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             Self::NonRawFieldType => "non_raw_field_type",
@@ -13163,6 +14022,7 @@ impl OwnershipFieldBlockReason {
     }
 }
 
+#[cfg(test)]
 #[derive(Default, Debug)]
 struct OwnershipFieldDiagnostics {
     total: usize,
@@ -13171,6 +14031,7 @@ struct OwnershipFieldDiagnostics {
     block_reason_counts: FxHashMap<OwnershipFieldBlockReason, usize>,
 }
 
+#[cfg(test)]
 impl OwnershipFieldDiagnostics {
     fn record_blocked(&mut self, reasons: impl IntoIterator<Item = OwnershipFieldBlockReason>) {
         self.blocked_total += 1;
@@ -13671,6 +14532,7 @@ fn raw_local_has_supported_scalar_box_source<'tcx>(
     visitor.saw_supported_source && !visitor.saw_unsupported_source
 }
 
+#[cfg(test)]
 fn collect_ownership_field_diagnostics<'tcx>(
     tcx: TyCtxt<'tcx>,
     analysis: &Analysis,
@@ -13729,42 +14591,6 @@ fn collect_ownership_field_diagnostics<'tcx>(
     diagnostics
 }
 
-fn emit_ownership_field_diagnostics(
-    tcx: TyCtxt<'_>,
-    analysis: &Analysis,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) {
-    let mode = std::env::var("CRAT_POINTER_OWNERSHIP_FIELD_DIAGNOSTICS").ok();
-    if !diagnostics_env_value_enabled(mode.as_deref()) {
-        return;
-    }
-
-    let diagnostics = collect_ownership_field_diagnostics(tcx, analysis, sig_decs, ptr_kinds);
-    eprintln!(
-        "[pointer-ownership-fields] fields total={} selected_opt_box={} blocked={}",
-        diagnostics.total, diagnostics.selected_opt_box, diagnostics.blocked_total,
-    );
-    for reason in OwnershipFieldBlockReason::ALL {
-        let fields = diagnostics
-            .block_reason_counts
-            .get(&reason)
-            .copied()
-            .unwrap_or_default();
-        if fields > 0 {
-            eprintln!(
-                "[pointer-ownership-fields] block reason={} fields={}",
-                reason.as_str(),
-                fields,
-            );
-        }
-    }
-}
-
-fn diagnostics_env_value_enabled(mode: Option<&str>) -> bool {
-    mode.is_some_and(|mode| !mode.is_empty() && mode != "0" && !mode.eq_ignore_ascii_case("false"))
-}
-
 fn collect_struct_shape_demoted_fields(
     tcx: TyCtxt<'_>,
     promoted_fields: &FxHashSet<StructFieldSlot>,
@@ -13773,14 +14599,42 @@ fn collect_struct_shape_demoted_fields(
     sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> FxHashSet<StructFieldSlot> {
-    let mut demoted = FxHashSet::default();
+    collect_struct_shape_demoted_field_reasons(
+        tcx,
+        promoted_fields,
+        mutable_fields,
+        struct_copy_result,
+        sig_decs,
+        ptr_kinds,
+    )
+    .into_keys()
+    .collect()
+}
+
+fn collect_struct_shape_demoted_field_reasons(
+    tcx: TyCtxt<'_>,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+    mutable_fields: &FxHashSet<StructFieldSlot>,
+    struct_copy_result: &crate::analyses::struct_copy::StructCopyAnalysisResult,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<DecisionReason>> {
+    let mut demoted = FxHashMap::<StructFieldSlot, FxHashSet<DecisionReason>>::default();
 
     for &field in promoted_fields {
-        if !struct_has_named_fields(tcx, field.struct_did)
-            || (mutable_fields.contains(&field)
-                && struct_copy_result.must_preserve_copy(field.struct_did))
+        if !struct_has_named_fields(tcx, field.struct_did) {
+            demoted
+                .entry(field)
+                .or_default()
+                .insert(DecisionReason::BorrowFieldShapeUnnamedFields);
+        }
+        if mutable_fields.contains(&field)
+            && struct_copy_result.must_preserve_copy(field.struct_did)
         {
-            demoted.insert(field);
+            demoted
+                .entry(field)
+                .or_default()
+                .insert(DecisionReason::BorrowFieldShapePreserveCopy);
         }
     }
 
@@ -13802,192 +14656,24 @@ fn collect_struct_shape_demoted_fields(
         {
             continue;
         }
-        collect_promoted_fields_in_by_value_ty(sig.output(), promoted_fields, &mut demoted);
+        let mut by_value_demoted = FxHashSet::default();
+        collect_promoted_fields_in_by_value_ty(
+            sig.output(),
+            promoted_fields,
+            &mut by_value_demoted,
+        );
+        for field in by_value_demoted {
+            demoted
+                .entry(field)
+                .or_default()
+                .insert(DecisionReason::BorrowFieldShapeByValueOutput);
+        }
     }
 
     demoted
 }
 
-fn emit_promotion_diagnostics(
-    tcx: TyCtxt<'_>,
-    analysis: &Analysis,
-    lifetime_plans: &super::lifetimes::LifetimePlans,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    demoted_fields: &FxHashSet<StructFieldSlot>,
-) {
-    let Ok(mode) = std::env::var("CRAT_POINTER_PROMOTION_DIAGNOSTICS") else {
-        return;
-    };
-    if mode.is_empty() || mode == "0" || mode.eq_ignore_ascii_case("false") {
-        return;
-    }
-
-    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
-    promoted_fields.extend(
-        analysis
-            .borrow_promotion_result
-            .shared_fields
-            .iter()
-            .copied(),
-    );
-    let shape_demoted = collect_struct_shape_demoted_fields(
-        tcx,
-        &promoted_fields,
-        &analysis.borrow_promotion_result.mutable_fields,
-        &analysis.struct_copy_result,
-        sig_decs,
-        ptr_kinds,
-    );
-    let conflict_reasons =
-        collect_field_conflict_demotion_reasons(tcx, analysis, sig_decs, ptr_kinds);
-    let usage_counts = count_promoted_field_usages(tcx, &promoted_fields);
-    let live_fields = promoted_fields
-        .iter()
-        .filter(|field| !demoted_fields.contains(field))
-        .count();
-    let promoted_structs = promoted_fields
-        .iter()
-        .map(|field| field.struct_did)
-        .collect::<FxHashSet<_>>()
-        .len();
-    let blocked_structs = promoted_fields
-        .iter()
-        .filter(|field| demoted_fields.contains(field))
-        .map(|field| field.struct_did)
-        .collect::<FxHashSet<_>>()
-        .len();
-    let promoted_field_usages = promoted_fields
-        .iter()
-        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
-        .sum::<usize>();
-    let blocked_field_usages = promoted_fields
-        .iter()
-        .filter(|field| demoted_fields.contains(field))
-        .map(|field| usage_counts.get(field).copied().unwrap_or_default())
-        .sum::<usize>();
-    let planned_return_lifetimes = lifetime_plans.functions.len();
-    let promoted_return_lifetimes = lifetime_plans
-        .functions
-        .keys()
-        .filter(|did| {
-            sig_decs.data.get(did).is_some_and(|sig_dec| {
-                sig_dec.output_lifetime.is_some()
-                    && matches!(
-                        sig_dec.output_dec,
-                        Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
-                    )
-            })
-        })
-        .count();
-
-    eprintln!(
-        "[pointer-promotion] fields total={} structs={} usages={} mutable={} shared={} shape_demoted={} final_demoted={} blocked_structs={} blocked_usages={} live={} returns_planned={} returns_live={}",
-        promoted_fields.len(),
-        promoted_structs,
-        promoted_field_usages,
-        analysis.borrow_promotion_result.mutable_fields.len(),
-        analysis.borrow_promotion_result.shared_fields.len(),
-        shape_demoted.len(),
-        demoted_fields.len(),
-        blocked_structs,
-        blocked_field_usages,
-        live_fields,
-        planned_return_lifetimes,
-        promoted_return_lifetimes,
-    );
-
-    let mut conflict_reason_stats = FxHashMap::<ConflictDemotionReason, (usize, usize)>::default();
-    for (field, reasons) in &conflict_reasons {
-        for &reason in reasons {
-            let usage_count = usage_counts.get(field).copied().unwrap_or_default();
-            let entry = conflict_reason_stats.entry(reason).or_default();
-            entry.0 += 1;
-            entry.1 += usage_count;
-        }
-    }
-    for reason in ConflictDemotionReason::ALL {
-        let (fields, usages) = conflict_reason_stats
-            .get(&reason)
-            .copied()
-            .unwrap_or_default();
-        eprintln!(
-            "[pointer-promotion] conflict reason={} fields={} usages={}",
-            reason.as_str(),
-            fields,
-            usages,
-        );
-    }
-
-    if mode != "full" {
-        return;
-    }
-
-    let mut fields = promoted_fields.iter().copied().collect::<Vec<_>>();
-    fields.sort_by_key(|field| field_slot_label(tcx, *field));
-    for field in fields {
-        let mutability = if analysis
-            .borrow_promotion_result
-            .mutable_fields
-            .contains(&field)
-        {
-            "mut"
-        } else {
-            "shared"
-        };
-        let reason = if demoted_fields.contains(&field) {
-            if shape_demoted.contains(&field) {
-                "demoted_shape"
-            } else {
-                "demoted_conflict"
-            }
-        } else {
-            "live"
-        };
-        let label = field_slot_label(tcx, field);
-        eprintln!(
-            "[pointer-promotion] field {reason} {mutability} uses={} {}",
-            usage_counts.get(&field).copied().unwrap_or_default(),
-            label,
-        );
-        if let Some(reasons) = conflict_reasons.get(&field) {
-            let mut reason_names = reasons
-                .iter()
-                .map(|reason| reason.as_str())
-                .collect::<Vec<_>>();
-            reason_names.sort();
-            eprintln!(
-                "[pointer-promotion] field-conflict reasons={} uses={} {}",
-                reason_names.join(","),
-                usage_counts.get(&field).copied().unwrap_or_default(),
-                label,
-            );
-        }
-    }
-
-    let mut planned_returns = lifetime_plans.functions.keys().copied().collect::<Vec<_>>();
-    planned_returns.sort_by_key(|did| tcx.def_path_str(*did));
-    for did in planned_returns {
-        let Some(sig_dec) = sig_decs.data.get(&did) else {
-            continue;
-        };
-        let state = if sig_dec.output_lifetime.is_some()
-            && matches!(
-                sig_dec.output_dec,
-                Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
-            ) {
-            "live"
-        } else {
-            "demoted"
-        };
-        eprintln!(
-            "[pointer-promotion] return {state} {} {:?}",
-            tcx.def_path_str(did),
-            sig_dec.output_dec
-        );
-    }
-}
-
+#[cfg(test)]
 fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
     let struct_name = tcx.def_path_str(field.struct_did);
     let field_name = tcx
@@ -14001,6 +14687,74 @@ fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
     format!("{struct_name}.{field_name}")
 }
 
+fn local_struct_fields(tcx: TyCtxt<'_>) -> Vec<StructFieldSlot> {
+    let mut fields = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        if !matches!(item.kind, hir::ItemKind::Struct(..)) {
+            continue;
+        }
+        let struct_did = item.owner_id.def_id;
+        let field_count = tcx.adt_def(struct_did).non_enum_variant().fields.len();
+        for field_index in 0..field_count {
+            fields.push(StructFieldSlot {
+                struct_did,
+                field_index,
+            });
+        }
+    }
+    fields
+}
+
+fn conflict_reason_to_decision_reason(reason: ConflictDemotionReason) -> DecisionReason {
+    match reason {
+        ConflictDemotionReason::ActiveBorrowOverlap => DecisionReason::ActiveBorrowOverlap,
+        ConflictDemotionReason::LocalAssignmentWhileBorrowed => {
+            DecisionReason::LocalAssignmentWhileBorrowed
+        }
+        ConflictDemotionReason::ConflictingReborrow => DecisionReason::ConflictingReborrow,
+        ConflictDemotionReason::MutableFieldCopy => DecisionReason::MutableFieldCopy,
+        ConflictDemotionReason::RawPointeeFieldMove => DecisionReason::RawPointeeFieldMove,
+        ConflictDemotionReason::RawFieldPointerProjection => {
+            DecisionReason::RawFieldPointerProjection
+        }
+        ConflictDemotionReason::RawStorageAllocator => DecisionReason::RawStorageAllocator,
+        ConflictDemotionReason::RawStoragePointer => DecisionReason::RawStoragePointer,
+        ConflictDemotionReason::RawBindingFromField => DecisionReason::RawBindingFromField,
+        ConflictDemotionReason::RawLocalCallArg => DecisionReason::RawLocalCallArg,
+        ConflictDemotionReason::RawUnknownCallArg => DecisionReason::RawUnknownCallArg,
+    }
+}
+
+fn ownership_reason_to_decision_reason(reason: OwnershipFieldBlockReason) -> DecisionReason {
+    match reason {
+        OwnershipFieldBlockReason::NonRawFieldType => DecisionReason::NonRawFieldType,
+        OwnershipFieldBlockReason::NonScalarPointee => DecisionReason::NonScalarPointee,
+        OwnershipFieldBlockReason::CVoidOrFilePointee => DecisionReason::CVoidOrFilePointee,
+        OwnershipFieldBlockReason::UnsupportedStructLiteralRhs => {
+            DecisionReason::UnsupportedStructLiteralRhs
+        }
+        OwnershipFieldBlockReason::UnsupportedAssignmentRhs => {
+            DecisionReason::UnsupportedAssignmentRhs
+        }
+        OwnershipFieldBlockReason::UnsupportedCallRhs => DecisionReason::UnsupportedCallRhs,
+        OwnershipFieldBlockReason::UnsupportedRawLocalSource => {
+            DecisionReason::UnsupportedRawLocalSource
+        }
+        OwnershipFieldBlockReason::AllocatorSizeMismatch => DecisionReason::AllocatorSizeMismatch,
+        OwnershipFieldBlockReason::ReallocOrBufferPattern => DecisionReason::ReallocOrBufferPattern,
+        OwnershipFieldBlockReason::CStringOrStrFunctionPattern => {
+            DecisionReason::CStringOrStrFunctionPattern
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn count_promoted_field_usages(
     tcx: TyCtxt<'_>,
     promoted_fields: &FxHashSet<StructFieldSlot>,
@@ -15068,15 +15822,86 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
         );
     }
 
+    fn unified_decision_events_for_code(
+        code: &str,
+    ) -> Vec<crate::rewriter::diagnostics::DecisionEvent> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let mut krate = utils::ast::expanded_ast(tcx);
+            let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+            utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+            let (input, analysis) = build_analysis(tcx);
+            let visitor = TransformVisitor::new(
+                &Config::default(),
+                &input,
+                &analysis,
+                ast_to_hir,
+                FnPtrGroups::default(),
+                FnPtrRewriteDecision::default(),
+                crate::rewriter::diagnostics::DecisionDiagnostics::for_test(
+                    crate::rewriter::diagnostics::DiagnosticsMode::Full,
+                ),
+            );
+            visitor.diagnostics.events().to_vec()
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn diagnostics_env_value_enabled_requires_truthy_value() {
-        assert!(!diagnostics_env_value_enabled(None));
-        assert!(!diagnostics_env_value_enabled(Some("")));
-        assert!(!diagnostics_env_value_enabled(Some("0")));
-        assert!(!diagnostics_env_value_enabled(Some("false")));
-        assert!(!diagnostics_env_value_enabled(Some("FALSE")));
-        assert!(diagnostics_env_value_enabled(Some("1")));
-        assert!(diagnostics_env_value_enabled(Some("full")));
+    fn unified_decision_diagnostics_record_ownership_field_reasons() {
+        let events = unified_decision_events_for_code(
+            r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+}
+
+#[repr(C)]
+pub struct Good {
+    pub data: *mut i32,
+}
+
+#[repr(C)]
+pub struct Bad {
+    pub data: *mut i32,
+}
+
+pub unsafe fn stash_good(owner: *mut Good) {
+    (*owner).data = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn stash_bad(owner: *mut Bad) {
+    (*owner).data = malloc(2 * std::mem::size_of::<i32>());
+}
+"#,
+        );
+        let reasons = events
+            .iter()
+            .map(|event| event.reason)
+            .collect::<FxHashSet<_>>();
+        assert!(
+            reasons.contains(&DecisionReason::OwnershipFieldSelectedOptBox),
+            "missing selected ownership field event: {events:#?}"
+        );
+        assert!(
+            reasons.contains(&DecisionReason::AllocatorSizeMismatch),
+            "missing allocator-size block event: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn unified_decision_diagnostics_record_raw_local_assignment() {
+        let events = unified_decision_events_for_code(
+            r#"
+pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
+    p = q;
+}
+"#,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.reason == DecisionReason::RawLocalAssignment),
+            "missing raw local assignment event: {events:#?}"
+        );
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15896,13 +16721,15 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
             if box_input_changed {
                 changed = true;
             }
-            if downgrade_unsupported_box_outputs(tcx, &mut sig_decs, &ptr_kinds) {
+            if !downgrade_unsupported_box_outputs(tcx, &mut sig_decs, &ptr_kinds).is_empty() {
                 changed = true;
             }
-            if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers) {
+            if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers).changed() {
                 changed = true;
             }
-            if downgrade_cursor_inputs_from_unanchored_raw_callers(tcx, &mut sig_decs, &ptr_kinds) {
+            if !downgrade_cursor_inputs_from_unanchored_raw_callers(tcx, &mut sig_decs, &ptr_kinds)
+                .is_empty()
+            {
                 changed = true;
             }
 
