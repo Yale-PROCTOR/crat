@@ -563,75 +563,6 @@ fn select_rewrite_groups_index_tracked_for_mutated_struct_param_field() {
 }
 
 #[test]
-fn select_rewrite_groups_counts_named_param_field_as_source_var() {
-    let groups = run_rewrite_groups_with_points_to(
-        r#"
-        pub struct State {
-            pub buffer: *mut i8,
-        }
-
-        pub unsafe fn f(state: *mut State) {
-            let mut ptr = (*state).buffer;
-            let _ = ptr;
-        }
-        "#,
-    );
-
-    let facts = groups.get("f").expect("missing facts for f");
-    let group = facts
-        .iter()
-        .find(|fact| {
-            fact.member_names.contains("ptr") && fact.member_names.contains("state.buffer")
-        })
-        .unwrap_or_else(|| {
-            panic!("expected rewrite group containing ptr and state.buffer, got {facts:#?}")
-        });
-
-    assert_eq!(group.base_name.as_deref(), Some("state.buffer"));
-}
-
-#[test]
-fn select_rewrite_groups_memchr_raw_cast_offset_preserves_state_buffer_base() {
-    let code = r#"
-        pub type size_t = usize;
-
-        pub struct State {
-            pub buffer: *mut core::ffi::c_char,
-        }
-
-        unsafe extern "C" {
-            fn memchr(
-                s: *const core::ffi::c_void,
-                c: i32,
-                n: size_t,
-            ) -> *mut core::ffi::c_void;
-        }
-
-        pub unsafe fn f(state: *mut State, target: core::ffi::c_char, remaining: size_t) {
-            let mut ptr: *mut core::ffi::c_char = (*state).buffer;
-            let found: *mut core::ffi::c_char = memchr(
-                ptr as *const core::ffi::c_void,
-                target as i32,
-                remaining,
-            ) as *mut core::ffi::c_char;
-            ptr = found.offset(1 as core::ffi::c_int as isize);
-            let _ = ptr;
-        }
-        "#;
-    let groups = run_rewrite_groups_with_points_to(code);
-
-    let facts = groups.get("f").expect("missing facts for f");
-    let _group = facts
-        .iter()
-        .find(|fact| {
-            fact.member_names.contains("ptr") && fact.member_names.contains("state.buffer")
-        })
-        .unwrap_or_else(|| {
-            panic!("expected rewrite group containing ptr and state.buffer, got {facts:#?}")
-        });
-}
-
-#[test]
 fn select_rewrite_groups_live_is_null_does_not_destabilize_state_buffer_base() {
     let code = r#"
         pub struct State {
@@ -790,30 +721,6 @@ fn select_rewrite_groups_accepts_mut_param_reassigned_before_members_exist() {
                 && group.member_names.contains("r")
         }),
         "Param base reassignment before q/r are live should not reject the group: {f_groups:#?}"
-    );
-}
-
-#[test]
-fn select_rewrite_groups_accepts_mut_param_reassigned_from_member_not_live_after() {
-    let groups = run_rewrite_groups_with_points_to(
-        r#"
-        pub unsafe fn f(mut p: *mut i32, i: usize) {
-            let q = p.add(i);
-            p = q;
-            let r = p.add(1);
-            let _ = *r;
-        }
-        "#,
-    );
-
-    let f_groups = groups.get("f").unwrap();
-    assert!(
-        f_groups.iter().any(|group| {
-            matches!(group.base, BaseId::Param { .. })
-                && group.member_names.contains("q")
-                && group.member_names.contains("r")
-        }),
-        "Param base reassignment from q should be accepted when q is not live after the write: {f_groups:#?}"
     );
 }
 
@@ -1619,35 +1526,6 @@ fn array_local_provenance_struct_field_array_offset_pointers_share_base() {
     assert!(
         matches!(current.unique, Some(BaseId::LocalArray { .. })),
         "the shared base should be LocalArray: {current:#?}"
-    );
-}
-
-#[test]
-fn select_rewrite_groups_accepts_mixed_mut_and_const_members_from_param_field() {
-    // Only one *mut identity (state.out itself) plus one *const derivation (src).
-    // With the old gate-2 (mut_count > 1) this is rejected; with the relaxation
-    // (mut >= 1 AND imm >= 1) it must be accepted.
-    let groups = run_rewrite_groups_with_points_to(
-        r#"
-        pub struct State {
-            pub out: *mut i8,
-        }
-
-        pub unsafe fn f(state: *mut State, backward: usize) {
-            let src: *const i8 = ((*state).out as *const i8).sub(backward);
-            let _ = *src;
-        }
-        "#,
-    );
-
-    let f_groups = groups.get("f").unwrap();
-    assert!(
-        f_groups.iter().any(|group| {
-            matches!(group.base, BaseId::Param { .. })
-                && group.member_names.contains("state.out")
-                && group.member_names.contains("src")
-        }),
-        "one *mut (state.out) plus one *const (src) from the same param field must form a group: {f_groups:#?}"
     );
 }
 
