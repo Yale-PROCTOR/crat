@@ -5391,8 +5391,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 /// Slice q = Slice p, with type cast. Both use .offset() → both Slice.
-/// p is struct Pair (non-numeric), q is c_int. At least one non-numeric type
-/// → non-bytemuck cast via from_raw_parts.
+/// p is a bytemuck-derivable struct Pair, q is c_int, so the reinterpreted
+/// slice view can use bytemuck instead of an open-ended raw-parts fallback.
 /// Conversion: slice_from_slice (pointer-cast else branch).
 #[test]
 fn test_slice_eq_slice_cast() {
@@ -5418,8 +5418,12 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(1 as isize);
 }
 "#,
-        &["from_raw_parts_mut", "as *mut i32", "&mut [i32]"],
-        &["bytemuck"],
+        &[
+            "#[derive(bytemuck::Zeroable, bytemuck::Pod)]",
+            "bytemuck::cast_slice_mut::<_, i32>",
+            "&mut [i32]",
+        ],
+        &["from_raw_parts_mut", "1_000_000"],
     );
 }
 
@@ -5693,7 +5697,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
-fn test_addr_of_fixed_array_slice_cast_keeps_raw_parts_fallback() {
+fn test_addr_of_fixed_array_slice_cast_uses_bytemuck() {
     run_test(
         r#"
 use ::libc;
@@ -5705,8 +5709,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &["from_raw_parts_mut", "&mut [i16]", "1_000_000"],
-        &["bytemuck", "std::mem::size_of::<[i32; 10]>()"],
+        &["bytemuck::cast_slice_mut::<_, i16>", "&mut [i16]"],
+        &["from_raw_parts_mut", "1_000_000", "&raw mut"],
     );
 }
 
@@ -6675,10 +6679,9 @@ pub unsafe fn foo(n: usize) {
     );
 }
 
-/// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
-/// Non-numeric rhs_inner_ty keeps the existing raw-parts fallback.
+/// as_ptr + Slice, bytemuck-derivable cast: struct array cast to c_int pointer.
 #[test]
-fn test_as_ptr_slice_raw_parts_keeps_open_fallback_for_reinterpretation() {
+fn test_as_ptr_slice_reinterpretation_uses_bytemuck() {
     run_test(
         r#"
 use ::libc;
@@ -6699,11 +6702,46 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize);
 }
 "#,
-        &["from_raw_parts", "1_000_000"],
         &[
-            "bytemuck",
-            "((arr).len() * std::mem::size_of::<crate::Pair>())",
+            "#[derive(bytemuck::Zeroable, bytemuck::Pod)]",
+            "bytemuck::cast_slice_mut::<_, i32>",
+            "&mut [i32]",
         ],
+        &["from_raw_parts", "1_000_000"],
+    );
+}
+
+#[test]
+fn test_indexed_slice_reinterpretation_avoids_bytemuck_cast() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Header {
+    pub a: libc::c_int,
+    pub b: libc::c_int,
+}
+impl Copy for Header {}
+impl Clone for Header {
+    fn clone(&self) -> Self { *self }
+}
+#[repr(C)]
+pub struct Chunk {
+    pub a: libc::c_int,
+    pub b: libc::c_int,
+}
+impl Copy for Chunk {}
+impl Clone for Chunk {
+    fn clone(&self) -> Self { *self }
+}
+pub unsafe extern "C" fn foo(data: *const Header) -> libc::c_int {
+    let header: *const Header = data;
+    let chunk: *const Chunk = header.offset(1 as isize) as *const Chunk;
+    return (*chunk).a;
+}
+"#,
+        &["first().map", "_x as *const _ as *const _"],
+        &["bytemuck::cast_slice::<_, crate::Chunk>"],
     );
 }
 
