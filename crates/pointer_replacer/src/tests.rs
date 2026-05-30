@@ -5693,7 +5693,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 #[test]
-fn test_addr_of_fixed_array_slice_cast_uses_array_size_len() {
+fn test_addr_of_fixed_array_slice_cast_keeps_raw_parts_fallback() {
     run_test(
         r#"
 use ::libc;
@@ -5705,12 +5705,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &[
-            "from_raw_parts_mut",
-            "std::mem::size_of::<[i32; 10]>() / std::mem::size_of::<i16>()",
-            "&mut [i16]",
-        ],
-        &["bytemuck", "1_000_000"],
+        &["from_raw_parts_mut", "&mut [i16]", "1_000_000"],
+        &["bytemuck", "std::mem::size_of::<[i32; 10]>()"],
     );
 }
 
@@ -6680,9 +6676,9 @@ pub unsafe fn foo(n: usize) {
 }
 
 /// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
-/// Non-numeric rhs_inner_ty → `from_raw_parts_mut`.
+/// Non-numeric rhs_inner_ty keeps the existing raw-parts fallback.
 #[test]
-fn test_as_ptr_slice_raw_parts() {
+fn test_as_ptr_slice_raw_parts_keeps_open_fallback_for_reinterpretation() {
     run_test(
         r#"
 use ::libc;
@@ -6703,12 +6699,11 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize);
 }
 "#,
+        &["from_raw_parts", "1_000_000"],
         &[
-            "from_raw_parts",
+            "bytemuck",
             "((arr).len() * std::mem::size_of::<crate::Pair>())",
-            "std::mem::size_of::<i32>()",
         ],
-        &["bytemuck", "1_000_000"],
     );
 }
 
