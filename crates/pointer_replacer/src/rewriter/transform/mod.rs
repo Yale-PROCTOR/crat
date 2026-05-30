@@ -3883,7 +3883,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::OptRef(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    *ptr = self.slice_from_raw(e, m, rhs_mut.is_mut(), lhs_inner_ty, rhs_inner_ty);
+                    *ptr = self.slice_from_raw(
+                        e,
+                        m,
+                        rhs_mut.is_mut(),
+                        lhs_inner_ty,
+                        rhs_inner_ty,
+                        None,
+                    );
                     return PtrKind::Slice(m);
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
@@ -4299,11 +4306,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             pprust::expr_to_string(e),
                         );
                     } else {
+                        let lhs_ty_str = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        let source_ty_str = mir_ty_to_string(pe.base_ty, self.tcx);
                         *ptr = utils::expr!(
-                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} _, 1_000_000)",
+                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} {3}, std::mem::size_of::<{4}>() / std::mem::size_of::<{3}>())",
                             if m { "_mut" } else { "" },
                             if m { "mut" } else { "const" },
                             pprust::expr_to_string(e),
+                            lhs_ty_str,
+                            source_ty_str,
                         );
                     }
                     return PtrKind::Slice(m);
@@ -4440,12 +4451,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::SliceCursor(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
+                    let len = self.raw_parts_len_from_ptr_expr(&pe, lhs_inner_ty);
                     *ptr = self.slice_from_raw(
                         &raw_expr,
                         m,
                         pe.as_mut_ptr,
                         lhs_inner_ty,
                         rhs_inner_ty,
+                        len,
                     );
                     return PtrKind::Slice(m);
                 }
@@ -4739,7 +4752,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::Raw(m1)) => {
                     // // Raw → slice: delegate via cursor then unwrap.
                     // to keep offsets, we use `e` instead of `pe.base`
-                    *ptr = self.slice_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    *ptr = self.slice_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty, None);
                     return PtrKind::Slice(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::Ref(m1)) => {
@@ -5102,7 +5115,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 PtrKind::SliceCursor(m)
             }
             PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                *ptr = self.slice_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                *ptr = self.slice_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty, None);
                 PtrKind::Slice(m)
             }
         }
@@ -6440,6 +6453,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         m1: bool,
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
+        proven_len: Option<String>,
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let cast_mut = if m && !m1 { " as *mut _" } else { "" };
@@ -6448,20 +6462,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
+            let len = proven_len
+                .or_else(|| self.raw_parts_len_from_as_ptr_receiver(e, lhs_inner_ty))
+                .unwrap_or_else(|| "1_000_000".to_string());
             if !need_cast {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){}, 1_000_000)",
+                    "std::slice::from_raw_parts{}(({}){}, {})",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
+                    len,
                 )
             } else {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
+                    "std::slice::from_raw_parts{}(({}){} as *{} _, {})",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
                     if m { "mut" } else { "const" },
+                    len,
                 )
             }
         } else if !utils::ast::has_side_effects(e) {
@@ -6525,6 +6544,63 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn raw_parts_len_from_ptr_expr(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        target_inner_ty: ty::Ty<'tcx>,
+    ) -> Option<String> {
+        if !pe.as_ptr
+            || utils::ast::has_side_effects(pe.base)
+            || pe.projs.iter().any(|proj| {
+                matches!(
+                    proj,
+                    PtrExprProj::Offset(_)
+                        | PtrExprProj::IntegerOp(..)
+                        | PtrExprProj::IntegerBinOp(..)
+                )
+            })
+        {
+            return None;
+        }
+        let source_inner_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)?;
+        Some(format!(
+            "(({}).len() * std::mem::size_of::<{}>()) / std::mem::size_of::<{}>()",
+            pprust::expr_to_string(pe.base),
+            mir_ty_to_string(source_inner_ty, self.tcx),
+            mir_ty_to_string(target_inner_ty, self.tcx),
+        ))
+    }
+
+    fn raw_parts_len_from_as_ptr_receiver(
+        &self,
+        e: &Expr,
+        target_inner_ty: ty::Ty<'tcx>,
+    ) -> Option<String> {
+        let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(e).kind else {
+            return None;
+        };
+        if !matches!(call.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+            || utils::ast::has_side_effects(&call.receiver)
+        {
+            return None;
+        }
+
+        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx)?;
+        let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = hir_unwrap_casts(hir_e).kind else {
+            return None;
+        };
+        let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+        let source_inner_ty =
+            slice_like_container_inner_ty(typeck.expr_ty(hir_receiver), self.tcx)?;
+
+        Some(format!(
+            "(({}).len() * std::mem::size_of::<{}>()) / std::mem::size_of::<{}>()",
+            pprust::expr_to_string(&call.receiver),
+            mir_ty_to_string(source_inner_ty, self.tcx),
+            mir_ty_to_string(target_inner_ty, self.tcx),
+        ))
+    }
+
     fn slice_from_ref(
         &self,
         e: &Expr,
@@ -6556,7 +6632,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             )
         } else {
             let raw = self.raw_from_ref(e, m, m1, lhs_inner_ty, rhs_inner_ty);
-            self.slice_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+            self.slice_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty, None)
         }
     }
 

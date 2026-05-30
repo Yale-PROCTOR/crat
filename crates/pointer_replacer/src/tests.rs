@@ -5692,6 +5692,28 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_addr_of_fixed_array_slice_cast_uses_array_size_len() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_short = &mut arr as *mut [libc::c_int; 10] as *mut libc::c_short;
+    *p.offset(0 as isize) = 10 as libc::c_short;
+    *p.offset(1 as isize) = 20 as libc::c_short;
+    return *p.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &[
+            "from_raw_parts_mut",
+            "std::mem::size_of::<[i32; 10]>() / std::mem::size_of::<i16>()",
+            "&mut [i16]",
+        ],
+        &["bytemuck", "1_000_000"],
+    );
+}
+
 // --- Non-usize cast + offset ---
 
 /// OptRef q = Slice (p as *mut c_uint).offset(2): projected_expr first
@@ -6656,8 +6678,12 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize);
 }
 "#,
-        &["from_raw_parts"],
-        &["bytemuck"],
+        &[
+            "from_raw_parts",
+            "((arr).len() * std::mem::size_of::<crate::Pair>())",
+            "std::mem::size_of::<i32>()",
+        ],
+        &["bytemuck", "1_000_000"],
     );
 }
 
