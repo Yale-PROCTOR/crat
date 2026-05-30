@@ -10,7 +10,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    self as hir, HirId,
+    self as hir, HirId, LangItem,
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
@@ -641,6 +641,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         mut_visit::walk_expr(self, expr);
+        let expr_id = expr.id;
 
         match &mut expr.kind {
             ExprKind::Field(base, _) => {
@@ -663,6 +664,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::Struct(se) => {
                 self.rewrite_struct_literal_fields(expr.id, se);
+            }
+            ExprKind::MethodCall(call)
+                if call.seg.ident.name.as_str() == "map_or" && call.args.len() == 2 =>
+            {
+                if let Some((m, body, hir_body)) =
+                    raw_pointer_map_or_closure_body(self.tcx, &self.ast_to_hir, expr_id, call)
+                {
+                    self.transform_ptr(body, hir_body, PtrCtx::Rhs(PtrKind::Raw(m)));
+                }
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
@@ -9663,6 +9673,48 @@ fn is_cursor_anchor_decision(kind: PtrKind) -> bool {
 
 fn hir_expr_ty_is_raw_ptr(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
     unwrap_ptr_from_mir_ty(tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr)).is_some()
+}
+
+fn raw_pointer_map_or_closure_body<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &AstToHir,
+    expr_id: NodeId,
+    ast_call: &'a mut MethodCall,
+) -> Option<(bool, &'a mut Expr, &'tcx hir::Expr<'tcx>)> {
+    if ast_call.seg.ident.name.as_str() != "map_or" || ast_call.args.len() != 2 {
+        return None;
+    }
+    let ExprKind::Closure(box ast_closure) = &mut ast_call.args[1].kind else {
+        return None;
+    };
+
+    let hir_expr = ast_to_hir.get_expr(expr_id, tcx)?;
+    let typeck = tcx.typeck(hir_expr.hir_id.owner);
+    let (_, raw_mutability) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_expr))?;
+
+    let hir::ExprKind::MethodCall(_, hir_receiver, hir_args, _) = hir_expr.kind else {
+        return None;
+    };
+    let ty::TyKind::Adt(adt_def, _) = typeck.expr_ty_adjusted(hir_receiver).kind() else {
+        return None;
+    };
+    if !tcx.is_lang_item(adt_def.did(), LangItem::Option) {
+        return None;
+    }
+    let hir_closure_arg = hir_args.get(1)?;
+    let hir::ExprKind::Closure(hir::Closure { body, .. }) = hir_closure_arg.kind else {
+        return None;
+    };
+    let hir_body = tcx.hir_body(*body);
+    let ty::TyKind::RawPtr(_, _) = typeck.expr_ty(hir_body.value).kind() else {
+        return None;
+    };
+
+    Some((
+        raw_mutability.is_mut(),
+        &mut ast_closure.body,
+        hir_body.value,
+    ))
 }
 
 fn tcx_node_ty_is_raw_ptr(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {

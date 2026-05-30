@@ -54,10 +54,10 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), bool> {
             let body = tcx.hir_body_owned_by(did);
             let bindings = collect_bindings(body);
             for (hir_id, local) in &hir_to_mir.binding_to_local {
-                if cursor_locals.contains(*local) {
-                    if let Some(var_name) = bindings.get(hir_id) {
-                        map.insert((fn_name.clone(), var_name.clone()), true);
-                    }
+                if cursor_locals.contains(*local)
+                    && let Some(var_name) = bindings.get(hir_id)
+                {
+                    map.insert((fn_name.clone(), var_name.clone()), true);
                 }
             }
         }
