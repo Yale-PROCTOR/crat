@@ -330,7 +330,7 @@ mod tests {
 
     fn has_name(tcx: TyCtxt<'_>, did: DefId, name: &str) -> bool {
         let path = tcx.def_path_str(did);
-        path.rsplit("::").next().map_or(false, |last| last == name)
+        path.rsplit("::").next() == Some(name)
     }
 
     #[test]

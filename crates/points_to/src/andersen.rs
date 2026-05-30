@@ -202,6 +202,7 @@ pub struct AnalysisResult {
     pub call_graph_sccs: graph::Sccs<LocalDefId, false>,
     pub reachables: RefCell<FxHashMap<SccId, FxHashSet<SccId>>>,
 
+    pub all_writes: FxHashMap<LocalDefId, FxHashMap<Location, ChunkedBitSet<Loc>>>,
     pub writes: FxHashMap<LocalDefId, FxHashMap<Location, ChunkedBitSet<Loc>>>,
     pub bitfield_writes: FxHashMap<LocalDefId, FxHashMap<Location, ChunkedBitSet<Loc>>>,
     pub fn_writes: FxHashMap<LocalDefId, ChunkedBitSet<Loc>>,
@@ -978,6 +979,8 @@ pub fn post_analyze<'a, 'tcx>(
             }
         }
     }
+    let all_writes = writes.clone();
+
     // only keep poinatble writes
     for writes in writes.values_mut() {
         for writes in writes.values_mut() {
@@ -1027,6 +1030,7 @@ pub fn post_analyze<'a, 'tcx>(
         indirect_calls,
         call_graph_sccs,
         reachables: RefCell::new(FxHashMap::default()),
+        all_writes,
         writes,
         bitfield_writes,
         fn_writes,

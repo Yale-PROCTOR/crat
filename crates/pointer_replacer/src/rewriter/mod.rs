@@ -33,6 +33,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+mod array_local_index_rewriter;
 pub(crate) mod collector;
 pub(crate) mod decision;
 mod lifetimes;
@@ -208,6 +209,50 @@ pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         &mut krate,
         &candidates,
         tcx,
+        &ast_to_hir,
+    );
+
+    (pprust::crate_to_string_for_macros(&krate), changed)
+}
+
+pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let input = collect_input(tcx);
+    let arena = typed_arena::Arena::new();
+    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let andersen_config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
+    };
+    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    let alloc_fns = pre_points_to.alloc_fns.clone();
+    let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    let points_to = andersen::post_analyze(
+        &andersen_config,
+        pre_points_to,
+        points_to_solutions,
+        &tss,
+        tcx,
+    );
+    let mutability_result =
+        analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+    let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
+    let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
+    nullity_result.non_null_locals =
+        source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+    let provenances =
+        analyses::array_local_provenance::array_local_provenance_analysis(&input, &alloc_fns);
+
+    let changed = array_local_index_rewriter::apply_array_local_index_rewrite(
+        &mut krate,
+        &input,
+        &provenances,
+        &mutability_result,
+        &nullity_result,
+        &points_to,
         &ast_to_hir,
     );
 
