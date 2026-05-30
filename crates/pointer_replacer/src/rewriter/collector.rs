@@ -12,7 +12,8 @@ use rustc_span::def_id::LocalDefId;
 
 use super::{
     Analysis,
-    decision::{PtrKind, SigDecisions},
+    decision::{DecisionInfo, PtrKind, SigDecisions},
+    diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
     analyses::borrow::StructFieldSlot, rewriter::decision::DecisionMaker, utils::rustc::RustProgram,
@@ -23,6 +24,16 @@ pub fn collect_diffs<'tcx>(
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+) -> FxHashMap<HirId, PtrKind> {
+    collect_diffs_with_diagnostics(rust_program, analysis, sig_decs, fn_ptr_groups, None)
+}
+
+pub fn collect_diffs_with_diagnostics<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+    mut diagnostics: Option<&mut DecisionDiagnostics>,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
     let non_outermost_owning_locals = collect_non_outermost_owning_hir_locals(rust_program);
@@ -92,18 +103,62 @@ pub fn collect_diffs<'tcx>(
                 None
             };
 
+            let mut decision_info = None;
             let decision = if is_input && used_as_fn_ptr {
-                sig_input_dec.or(group_input_dec)
+                let decision = sig_input_dec.or(group_input_dec);
+                if sig_input_dec.is_none()
+                    && let Some(group_input_dec) = group_input_dec
+                {
+                    decision_info = Some(DecisionInfo {
+                        kind: Some(group_input_dec),
+                        events: vec![super::decision::DecisionInfoEvent {
+                            before: None,
+                            after: Some(group_input_dec),
+                            reason: DecisionReason::FnPtrGroupDecision,
+                            detail: None,
+                        }],
+                    });
+                }
+                decision
+            } else if let Some(sig_input_dec) = sig_input_dec {
+                Some(sig_input_dec)
+            } else if let Some(returned_kind) = returned_output_locals.get(&local).copied() {
+                decision_info = Some(DecisionInfo {
+                    kind: Some(returned_kind),
+                    events: vec![super::decision::DecisionInfoEvent {
+                        before: None,
+                        after: Some(returned_kind),
+                        reason: DecisionReason::ReturnedOutputLocal,
+                        detail: None,
+                    }],
+                });
+                Some(returned_kind)
             } else {
-                sig_input_dec
-                    .or_else(|| returned_output_locals.get(&local).copied())
-                    .or_else(|| decision_maker.decide(local, decl, aliases))
+                let info = decision_maker.decide_with_info(local, decl, aliases);
+                let decision = info.kind;
+                decision_info = Some(info);
+                decision
             };
 
             if let Some(mut ptr_kind) = decision {
                 let Some(hir_id) = local_to_binding.get(&local) else {
                     continue;
                 };
+                if !is_input
+                    && let Some(diagnostics) = diagnostics.as_deref_mut()
+                    && let Some(info) = decision_info.as_ref()
+                {
+                    record_decision_info(
+                        diagnostics,
+                        DecisionSubject::Local {
+                            did: *did,
+                            hir_id: *hir_id,
+                            local,
+                        },
+                        DecisionStage::Initial,
+                        info,
+                    );
+                }
                 if !is_input && let Some(init) = binding_inits.get(hir_id).copied() {
                     if let Some(alias_kind) = cursor_field_offset_alias_kind(
                         rust_program.tcx,
@@ -112,6 +167,15 @@ pub fn collect_diffs<'tcx>(
                         &ptr_kinds,
                         ptr_kind,
                     ) {
+                        record_local_collection_event(
+                            diagnostics.as_deref_mut(),
+                            *did,
+                            *hir_id,
+                            local,
+                            ptr_kind,
+                            alias_kind,
+                            DecisionReason::CursorFieldOffsetAlias,
+                        );
                         ptr_kind = alias_kind;
                     } else if let PtrKind::Raw(raw_mutability) = ptr_kind {
                         let needs_cursor = local_needs_cursor(analysis, *did, local);
@@ -122,6 +186,15 @@ pub fn collect_diffs<'tcx>(
                             raw_mutability,
                             needs_cursor,
                         ) {
+                            record_local_collection_event(
+                                diagnostics.as_deref_mut(),
+                                *did,
+                                *hir_id,
+                                local,
+                                ptr_kind,
+                                alias_kind,
+                                DecisionReason::ArrayFieldPointerAlias,
+                            );
                             ptr_kind = alias_kind;
                         } else if let Some(alias_kind) = pointer_field_alias_kind(
                             rust_program.tcx,
@@ -130,11 +203,29 @@ pub fn collect_diffs<'tcx>(
                             &ptr_kinds,
                             raw_mutability,
                         ) {
+                            record_local_collection_event(
+                                diagnostics.as_deref_mut(),
+                                *did,
+                                *hir_id,
+                                local,
+                                ptr_kind,
+                                alias_kind,
+                                DecisionReason::PointerFieldAlias,
+                            );
                             ptr_kind = alias_kind;
                         }
                     }
                 }
                 if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
+                    record_local_collection_event(
+                        diagnostics.as_deref_mut(),
+                        *did,
+                        *hir_id,
+                        local,
+                        ptr_kind,
+                        PtrKind::Raw(ptr_kind.is_mut()),
+                        DecisionReason::NonOutermostOwningLocal,
+                    );
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
                 }
                 ptr_kinds.insert(*hir_id, ptr_kind);
@@ -143,6 +234,49 @@ pub fn collect_diffs<'tcx>(
     }
 
     ptr_kinds
+}
+
+fn record_decision_info(
+    diagnostics: &mut DecisionDiagnostics,
+    subject: DecisionSubject,
+    stage: DecisionStage,
+    info: &DecisionInfo,
+) {
+    for event in &info.events {
+        diagnostics.record(
+            subject,
+            stage,
+            event.before,
+            event.after,
+            event.reason,
+            event.detail.clone(),
+        );
+    }
+}
+
+fn record_local_collection_event(
+    diagnostics: Option<&mut DecisionDiagnostics>,
+    did: LocalDefId,
+    hir_id: HirId,
+    local: Local,
+    before: PtrKind,
+    after: PtrKind,
+    reason: DecisionReason,
+) {
+    let Some(diagnostics) = diagnostics else {
+        return;
+    };
+    if before == after {
+        return;
+    }
+    diagnostics.record(
+        DecisionSubject::Local { did, hir_id, local },
+        DecisionStage::LocalCollection,
+        Some(before),
+        Some(after),
+        reason,
+        None,
+    );
 }
 
 fn collect_returned_output_locals(
