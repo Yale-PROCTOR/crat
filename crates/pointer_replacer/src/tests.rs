@@ -6599,6 +6599,31 @@ pub unsafe fn transform(m: *mut Md5) -> u32 {
 }
 
 #[test]
+fn test_raw_root_array_field_as_mut_ptr_slice_arg_uses_direct_borrow() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub data: [i8; 4],
+}
+
+static mut SLOT: *mut Info = 0 as *mut Info;
+
+pub unsafe fn consume(data: *const i8) -> i32 {
+    *data.offset(0) as i32
+}
+
+pub unsafe fn foo() -> i32 {
+    let info = SLOT;
+    consume((*info).data.as_ptr())
+}
+"#,
+        &["consume(&(&((*info).data))[..])"],
+        &["from_raw_parts", ".data.as_ptr()"],
+    );
+}
+
+#[test]
 fn test_array_field_const_offset_raw_arg_uses_slice_suffix_ptr() {
     run_test(
         r#"

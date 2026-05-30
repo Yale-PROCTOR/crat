@@ -6462,6 +6462,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
+            if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {
+                return slice;
+            }
             let len = proven_len
                 .or_else(|| self.raw_parts_len_from_as_ptr_receiver(e, lhs_inner_ty))
                 .unwrap_or_else(|| "1_000_000".to_string());
@@ -6541,6 +6544,47 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 cast_mut,
                 if m { "mut" } else { "const" },
             )
+        }
+    }
+
+    fn plain_slice_from_as_ptr_receiver(
+        &self,
+        e: &Expr,
+        target_mut: bool,
+        target_inner_ty: ty::Ty<'tcx>,
+    ) -> Option<Expr> {
+        let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(e).kind else {
+            return None;
+        };
+        let name = call.seg.ident.name.as_str();
+        if !matches!(name, "as_ptr" | "as_mut_ptr")
+            || target_mut && name != "as_mut_ptr"
+            || utils::ast::has_side_effects(&call.receiver)
+        {
+            return None;
+        }
+
+        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx)?;
+        let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = hir_unwrap_casts(hir_e).kind else {
+            return None;
+        };
+        let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+        let source_inner_ty =
+            slice_like_container_inner_ty(typeck.expr_ty(hir_receiver), self.tcx)?;
+        if source_inner_ty != target_inner_ty {
+            return None;
+        }
+
+        if target_mut {
+            Some(utils::expr!(
+                "&mut (&mut ({}))[..]",
+                pprust::expr_to_string(&call.receiver),
+            ))
+        } else {
+            Some(utils::expr!(
+                "&(&({}))[..]",
+                pprust::expr_to_string(&call.receiver),
+            ))
         }
     }
 
