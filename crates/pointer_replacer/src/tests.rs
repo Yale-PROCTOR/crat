@@ -7485,10 +7485,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
-    assert!(
-        s.contains("*((p).offset(q_idx) as *mut i32) = 3"),
-        "{s}"
-    );
+    assert!(s.contains("*((p).offset(q_idx) as *mut i32) = 3"), "{s}");
     assert!(
         s.matches("*((p).offset(q_idx) as *mut i32)").count() >= 2,
         "{s}"
@@ -7543,10 +7540,7 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
         s.contains("q_idx.map_or(std::ptr::null_mut() as *mut i32"),
         "{s}"
     );
-    assert!(
-        s.contains("|idx| ((p).offset(idx)) as *mut i32"),
-        "{s}"
-    );
+    assert!(s.contains("|idx| ((p).offset(idx)) as *mut i32"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
 }
 
@@ -7669,10 +7663,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert!(s.contains("let mut q_idx: isize = (1) as isize"), "{s}");
     assert!(s.contains("q_idx ="), "{s}");
     assert!(s.contains("(q_idx) + ((2) as isize)"), "{s}");
-    assert!(
-        s.contains("*((p).offset(q_idx) as *mut i32) = 9"),
-        "{s}"
-    );
+    assert!(s.contains("*((p).offset(q_idx) as *mut i32) = 9"), "{s}");
     assert!(!s.contains("q = q.offset"), "{s}");
 }
 
