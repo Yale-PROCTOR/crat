@@ -5391,8 +5391,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 /// Slice q = Slice p, with type cast. Both use .offset() → both Slice.
-/// p is struct Pair (non-numeric), q is c_int. At least one non-numeric type
-/// → non-bytemuck cast via from_raw_parts.
+/// p is a bytemuck-derivable struct Pair, q is c_int, so the reinterpreted
+/// slice view can use bytemuck instead of an open-ended raw-parts fallback.
 /// Conversion: slice_from_slice (pointer-cast else branch).
 #[test]
 fn test_slice_eq_slice_cast() {
@@ -5418,8 +5418,12 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(1 as isize);
 }
 "#,
-        &["from_raw_parts_mut", "as *mut i32", "&mut [i32]"],
-        &["bytemuck"],
+        &[
+            "#[derive(bytemuck::Zeroable, bytemuck::Pod)]",
+            "bytemuck::cast_slice_mut::<_, i32>",
+            "&mut [i32]",
+        ],
+        &["from_raw_parts_mut", "1_000_000"],
     );
 }
 
@@ -5689,6 +5693,24 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 "#,
         &["from_raw_parts_mut", "&raw mut", "&mut [i16]"],
         &["bytemuck"],
+    );
+}
+
+#[test]
+fn test_addr_of_fixed_array_slice_cast_uses_bytemuck() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    let mut arr: [libc::c_int; 10] = [0; 10];
+    let mut p: *mut libc::c_short = &mut arr as *mut [libc::c_int; 10] as *mut libc::c_short;
+    *p.offset(0 as isize) = 10 as libc::c_short;
+    *p.offset(1 as isize) = 20 as libc::c_short;
+    return *p.offset(0 as isize) as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_slice_mut::<_, i16>", "&mut [i16]"],
+        &["from_raw_parts_mut", "1_000_000", "&raw mut"],
     );
 }
 
@@ -6577,6 +6599,31 @@ pub unsafe fn transform(m: *mut Md5) -> u32 {
 }
 
 #[test]
+fn test_raw_root_array_field_as_mut_ptr_slice_arg_uses_direct_borrow() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Info {
+    pub data: [i8; 4],
+}
+
+static mut SLOT: *mut Info = 0 as *mut Info;
+
+pub unsafe fn consume(data: *const i8) -> i32 {
+    *data.offset(0) as i32
+}
+
+pub unsafe fn foo() -> i32 {
+    let info = SLOT;
+    consume((*info).data.as_ptr())
+}
+"#,
+        &["consume(&(&((*info).data))[..])"],
+        &["from_raw_parts", ".data.as_ptr()"],
+    );
+}
+
+#[test]
 fn test_array_field_const_offset_raw_arg_uses_slice_suffix_ptr() {
     run_test(
         r#"
@@ -6632,10 +6679,9 @@ pub unsafe fn foo(n: usize) {
     );
 }
 
-/// as_ptr + Slice, non-bytemuck cast: struct array cast to c_int pointer.
-/// Non-numeric rhs_inner_ty → `from_raw_parts_mut`.
+/// as_ptr + Slice, bytemuck-derivable cast: struct array cast to c_int pointer.
 #[test]
-fn test_as_ptr_slice_raw_parts() {
+fn test_as_ptr_slice_reinterpretation_uses_bytemuck() {
     run_test(
         r#"
 use ::libc;
@@ -6656,8 +6702,46 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *p.offset(0 as isize);
 }
 "#,
-        &["from_raw_parts"],
-        &["bytemuck"],
+        &[
+            "#[derive(bytemuck::Zeroable, bytemuck::Pod)]",
+            "bytemuck::cast_slice_mut::<_, i32>",
+            "&mut [i32]",
+        ],
+        &["from_raw_parts", "1_000_000"],
+    );
+}
+
+#[test]
+fn test_indexed_slice_reinterpretation_avoids_bytemuck_cast() {
+    run_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct Header {
+    pub a: libc::c_int,
+    pub b: libc::c_int,
+}
+impl Copy for Header {}
+impl Clone for Header {
+    fn clone(&self) -> Self { *self }
+}
+#[repr(C)]
+pub struct Chunk {
+    pub a: libc::c_int,
+    pub b: libc::c_int,
+}
+impl Copy for Chunk {}
+impl Clone for Chunk {
+    fn clone(&self) -> Self { *self }
+}
+pub unsafe extern "C" fn foo(data: *const Header) -> libc::c_int {
+    let header: *const Header = data;
+    let chunk: *const Chunk = header.offset(1 as isize) as *const Chunk;
+    return (*chunk).a;
+}
+"#,
+        &["first().map", "_x as *const _ as *const _"],
+        &["bytemuck::cast_slice::<_, crate::Chunk>"],
     );
 }
 
