@@ -421,6 +421,64 @@ fn test_ignore_param_type() {
             ..Default::default()
         },
         &["as *mut f64", "use crate::b::bar"],
+        &["extern \"C\" {", "as *mut f32 as *mut f64"],
+    );
+}
+
+#[test]
+fn test_ignore_param_type_ref_arg_casts_via_resolved_extern_type() {
+    run_extern_test(
+        "
+    #![feature(extern_types)]
+    mod b {
+        #[repr(C)]
+        pub struct s {
+            pub a: core::ffi::c_int,
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn bar(mut x: *mut s) -> core::ffi::c_int {
+            return (*x).a;
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn baz(mut x: *const s) -> core::ffi::c_int {
+            return (*x).a;
+        }
+    }
+    mod y {
+        #[repr(C)]
+        pub struct s {
+            pub a: core::ffi::c_int,
+            pub b: core::ffi::c_int,
+        }
+    }
+    mod z {
+        #[repr(C)]
+        pub struct s {
+            pub a: core::ffi::c_int,
+            pub b: core::ffi::c_int,
+        }
+        extern \"C\" {
+            pub fn bar(_: *mut s) -> core::ffi::c_int;
+            pub fn baz(_: *const s) -> core::ffi::c_int;
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn foo() -> core::ffi::c_int {
+            let mut x: s = s { a: 1, b: 2 };
+            return bar(&mut x) + baz(&mut x);
+        }
+    }
+",
+        super::Config {
+            ignore_param_type: true,
+            ..Default::default()
+        },
+        &[
+            "as *mut crate::y::s as *mut crate::b::s",
+            "as *const crate::y::s as *const crate::b::s",
+            "use crate::b::bar",
+            "use crate::b::baz",
+            "use crate::y::s",
+        ],
         &["extern \"C\" {"],
     );
 }
