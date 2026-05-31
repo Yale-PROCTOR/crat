@@ -31,6 +31,7 @@ struct RawTranslation {
 struct Translation {
     dir: PathBuf,
     config: BTreeMap<String, String>,
+    boolean_params: BTreeSet<String>,
     features: Vec<String>,
 }
 
@@ -71,6 +72,12 @@ struct OrderedItem {
     bucket: ItemBucket,
     group_name: Option<String>,
     first_seen: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CfgValueCondition {
+    Feature(String),
+    NotFeature(String),
 }
 
 pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String> {
@@ -124,6 +131,7 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
     let base_dir = translations_json.parent().unwrap_or_else(|| Path::new("."));
     let expected_keys: BTreeSet<String> = raw[0].config.keys().cloned().collect();
     let varying_params = varying_params(&raw, &expected_keys)?;
+    let boolean_params = boolean_params(&raw, &expected_keys);
     let mut feature_map = BTreeMap::<String, (String, String)>::new();
     let mut seen_configs = BTreeSet::<BTreeMap<String, String>>::new();
     let mut translations = Vec::with_capacity(raw.len());
@@ -146,8 +154,10 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         let mut features = Vec::with_capacity(varying_params.len());
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
-            if varying_params.contains(&param) {
-                let feature = make_feature_name(&param, &raw_value);
+            if varying_params.contains(&param)
+                && let Some(feature) =
+                    feature_name_for_config_value(&param, &raw_value, &boolean_params)
+            {
                 if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
                     if existing_param != &param || existing_value != &raw_value {
                         return Err(format!(
@@ -169,6 +179,7 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         translations.push(Translation {
             dir,
             config,
+            boolean_params: boolean_params.clone(),
             features,
         });
     }
@@ -206,6 +217,17 @@ fn varying_params(
         .collect())
 }
 
+fn boolean_params(raw: &[RawTranslation], expected_keys: &BTreeSet<String>) -> BTreeSet<String> {
+    expected_keys
+        .iter()
+        .filter(|param| {
+            raw.iter()
+                .all(|entry| matches!(entry.config.get(*param), Some(Value::Bool(_))))
+        })
+        .cloned()
+        .collect()
+}
+
 fn resolve_dir(base_dir: &Path, dir: &Path) -> PathBuf {
     if dir.is_absolute() {
         dir.to_path_buf()
@@ -227,6 +249,18 @@ fn config_value_to_string(param: &str, value: &Value) -> Result<String, String> 
 
 fn make_feature_name(param: &str, value: &str) -> String {
     format!("{param}_{value}")
+}
+
+fn feature_name_for_config_value(
+    param: &str,
+    value: &str,
+    boolean_params: &BTreeSet<String>,
+) -> Option<String> {
+    if boolean_params.contains(param) {
+        (value == "true").then(|| param.to_string())
+    } else {
+        Some(make_feature_name(param, value))
+    }
 }
 
 fn common_dir_name(translations: &[Translation]) -> Result<OsString, String> {
@@ -561,13 +595,15 @@ fn simplified_cfg_condition(
                 .collect::<BTreeMap<_, _>>()
         })
         .collect::<Vec<_>>();
-    let feature_lists = params
+    let cfg_value_conditions = params
         .iter()
         .zip(&value_lists)
         .map(|(param, values)| {
             values
                 .iter()
-                .map(|value| make_feature_name(param, value))
+                .map(|value| {
+                    cfg_value_condition(param, value, &translations[variants[0].0].boolean_params)
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -586,24 +622,42 @@ fn simplified_cfg_condition(
     }
 
     let expr = Solver::new(&universe).solve(target);
-    lower_cfg_expr(&expr, &feature_lists)
+    lower_cfg_expr(&expr, &cfg_value_conditions)
 }
 
-fn lower_cfg_expr(expr: &Expr, feature_lists: &[Vec<String>]) -> String {
-    match expr {
-        Expr::True => "all()".to_string(),
-        Expr::False => "any()".to_string(),
-        Expr::Lit { coord, values } => lower_cfg_literal(*coord, values, feature_lists),
-        Expr::Not(expr) => format!("not({})", lower_cfg_expr(expr, feature_lists)),
-        Expr::And(args) => lower_cfg_operator("all", args, feature_lists),
-        Expr::Or(args) => lower_cfg_operator("any", args, feature_lists),
+fn cfg_value_condition(
+    param: &str,
+    value: &str,
+    boolean_params: &BTreeSet<String>,
+) -> CfgValueCondition {
+    if boolean_params.contains(param) && value == "false" {
+        CfgValueCondition::NotFeature(param.to_string())
+    } else if boolean_params.contains(param) {
+        CfgValueCondition::Feature(param.to_string())
+    } else {
+        CfgValueCondition::Feature(make_feature_name(param, value))
     }
 }
 
-fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<String>]) -> String {
+fn lower_cfg_expr(expr: &Expr, cfg_value_conditions: &[Vec<CfgValueCondition>]) -> String {
+    match expr {
+        Expr::True => "all()".to_string(),
+        Expr::False => "any()".to_string(),
+        Expr::Lit { coord, values } => lower_cfg_literal(*coord, values, cfg_value_conditions),
+        Expr::Not(expr) => format!("not({})", lower_cfg_expr(expr, cfg_value_conditions)),
+        Expr::And(args) => lower_cfg_operator("all", args, cfg_value_conditions),
+        Expr::Or(args) => lower_cfg_operator("any", args, cfg_value_conditions),
+    }
+}
+
+fn lower_cfg_operator(
+    name: &str,
+    args: &[Expr],
+    cfg_value_conditions: &[Vec<CfgValueCondition>],
+) -> String {
     let args = args
         .iter()
-        .map(|arg| lower_cfg_expr(arg, feature_lists))
+        .map(|arg| lower_cfg_expr(arg, cfg_value_conditions))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({args})")
@@ -612,9 +666,9 @@ fn lower_cfg_operator(name: &str, args: &[Expr], feature_lists: &[Vec<String>]) 
 fn lower_cfg_literal(
     coord: usize,
     values: &BTreeSet<usize>,
-    feature_lists: &[Vec<String>],
+    cfg_value_conditions: &[Vec<CfgValueCondition>],
 ) -> String {
-    let domain_size = feature_lists[coord].len();
+    let domain_size = cfg_value_conditions[coord].len();
     if values.is_empty() {
         return "any()".to_string();
     }
@@ -622,7 +676,9 @@ fn lower_cfg_literal(
         return "all()".to_string();
     }
     if values.len() == 1 {
-        return feature_clause(&feature_lists[coord][*values.iter().next().unwrap()]);
+        return cfg_value_condition_clause(
+            &cfg_value_conditions[coord][*values.iter().next().unwrap()],
+        );
     }
 
     let positive_cost = values.len() + 1;
@@ -638,18 +694,18 @@ fn lower_cfg_literal(
     if positive_cost <= negative_cost {
         let clauses = values
             .iter()
-            .map(|value| feature_clause(&feature_lists[coord][*value]))
+            .map(|value| cfg_value_condition_clause(&cfg_value_conditions[coord][*value]))
             .collect::<Vec<_>>();
         lower_cfg_primitive_or(&clauses)
     } else if excluded.len() == 1 {
         format!(
             "not({})",
-            feature_clause(&feature_lists[coord][excluded[0]])
+            cfg_value_condition_clause(&cfg_value_conditions[coord][excluded[0]])
         )
     } else {
         let clauses = excluded
             .into_iter()
-            .map(|value| feature_clause(&feature_lists[coord][value]))
+            .map(|value| cfg_value_condition_clause(&cfg_value_conditions[coord][value]))
             .collect::<Vec<_>>();
         format!("not({})", lower_cfg_primitive_or(&clauses))
     }
@@ -665,6 +721,13 @@ fn lower_cfg_primitive_or(clauses: &[String]) -> String {
 
 fn feature_clause(feature: &str) -> String {
     format!("feature = {feature:?}")
+}
+
+fn cfg_value_condition_clause(condition: &CfgValueCondition) -> String {
+    match condition {
+        CfgValueCondition::Feature(feature) => feature_clause(feature),
+        CfgValueCondition::NotFeature(feature) => format!("not({})", feature_clause(feature)),
+    }
 }
 
 fn varying_config_params(
@@ -818,23 +881,34 @@ mod tests {
     };
 
     use super::{
-        ItemBucket, OrderedItem, Translation, make_feature_name, merged_cfg_attribute,
-        reorder_items,
+        ItemBucket, OrderedItem, Translation, feature_name_for_config_value, feature_union,
+        merged_cfg_attribute, reorder_items,
     };
 
     fn translation_with_features(
         config: BTreeMap<String, String>,
         varying_params: &BTreeSet<String>,
     ) -> Translation {
+        translation_with_boolean_features(config, varying_params, &BTreeSet::new())
+    }
+
+    fn translation_with_boolean_features(
+        config: BTreeMap<String, String>,
+        varying_params: &BTreeSet<String>,
+        boolean_params: &BTreeSet<String>,
+    ) -> Translation {
         let features = config
             .iter()
             .filter(|(param, _)| varying_params.contains(*param))
-            .map(|(param, value)| make_feature_name(param, value))
+            .filter_map(|(param, value)| {
+                feature_name_for_config_value(param, value, boolean_params)
+            })
             .collect::<Vec<_>>();
 
         Translation {
             dir: PathBuf::new(),
             config,
+            boolean_params: boolean_params.clone(),
             features,
         }
     }
@@ -942,6 +1016,106 @@ mod tests {
         assert_eq!(cfg, Some("#[cfg(feature = \"arch_x86\")]".to_string()));
         assert_eq!(translations[0].features, vec!["arch_x86".to_string()]);
         assert_eq!(translations[1].features, vec!["arch_arm".to_string()]);
+    }
+
+    #[test]
+    fn merge_boolean_parameter_uses_single_feature_and_absence_for_false() {
+        let varying_params = ["ENABLE_EXTRA".to_string(), "WORD_SIZE".to_string()]
+            .into_iter()
+            .collect();
+        let boolean_params = ["ENABLE_EXTRA".to_string()].into_iter().collect();
+        let translations = vec![
+            translation_with_boolean_features(
+                [("ENABLE_EXTRA", "true"), ("WORD_SIZE", "32")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+                &boolean_params,
+            ),
+            translation_with_boolean_features(
+                [("ENABLE_EXTRA", "false"), ("WORD_SIZE", "32")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+                &boolean_params,
+            ),
+            translation_with_boolean_features(
+                [("ENABLE_EXTRA", "true"), ("WORD_SIZE", "64")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+                &boolean_params,
+            ),
+            translation_with_boolean_features(
+                [("ENABLE_EXTRA", "false"), ("WORD_SIZE", "64")]
+                    .into_iter()
+                    .map(|(param, value)| (param.to_string(), value.to_string()))
+                    .collect(),
+                &varying_params,
+                &boolean_params,
+            ),
+        ];
+        let variants = vec![
+            (0, PathBuf::from("true-32.rs")),
+            (1, PathBuf::from("false-32.rs")),
+            (2, PathBuf::from("true-64.rs")),
+            (3, PathBuf::from("false-64.rs")),
+        ];
+        let mut item_variants = BTreeMap::<String, BTreeSet<usize>>::new();
+        item_variants.insert(
+            "pub fn extra() {}".to_string(),
+            [0usize, 2usize].into_iter().collect(),
+        );
+        item_variants.insert(
+            "pub fn base() {}".to_string(),
+            [1usize, 3usize].into_iter().collect(),
+        );
+        item_variants.insert(
+            "pub fn size32() {}".to_string(),
+            [0usize, 1usize].into_iter().collect(),
+        );
+        item_variants.insert(
+            "pub fn both() {}".to_string(),
+            [0usize].into_iter().collect(),
+        );
+
+        assert_eq!(
+            feature_union(&translations),
+            vec![
+                "ENABLE_EXTRA".to_string(),
+                "WORD_SIZE_32".to_string(),
+                "WORD_SIZE_64".to_string()
+            ]
+        );
+        assert_eq!(
+            merged_cfg_attribute(
+                "pub fn extra() {}",
+                &item_variants,
+                &translations,
+                &variants
+            ),
+            Some("#[cfg(feature = \"ENABLE_EXTRA\")]".to_string())
+        );
+        assert_eq!(
+            merged_cfg_attribute("pub fn base() {}", &item_variants, &translations, &variants),
+            Some("#[cfg(not(feature = \"ENABLE_EXTRA\"))]".to_string())
+        );
+        assert_eq!(
+            merged_cfg_attribute(
+                "pub fn size32() {}",
+                &item_variants,
+                &translations,
+                &variants
+            ),
+            Some("#[cfg(feature = \"WORD_SIZE_32\")]".to_string())
+        );
+        assert_eq!(
+            merged_cfg_attribute("pub fn both() {}", &item_variants, &translations, &variants),
+            Some("#[cfg(all(feature = \"ENABLE_EXTRA\", feature = \"WORD_SIZE_32\"))]".to_string())
+        );
     }
 
     #[test]
