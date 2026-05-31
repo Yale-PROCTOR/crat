@@ -33,7 +33,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-mod array_local_index_rewriter;
+pub(crate) mod array_local_index_rewriter;
 pub(crate) mod collector;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;

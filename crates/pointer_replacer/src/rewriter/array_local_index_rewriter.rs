@@ -11,7 +11,7 @@ use rustc_hir::{
     self as hir, HirId, def::Res, def_id::LocalDefId, intravisit::Visitor as HirVisitor,
 };
 use rustc_middle::{
-    mir::Local,
+    mir::{Local, TerminatorKind},
     ty::{self, TyCtxt},
 };
 use rustc_span::Symbol;
@@ -24,7 +24,8 @@ use crate::{
     analyses::{
         self,
         array_local_provenance::{
-            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteSelectionContext,
+            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteSelectionContext, SlotPathElem,
+            named_struct_field,
         },
         type_qualifier::foster::mutability::MutabilityResult,
     },
@@ -42,6 +43,7 @@ struct BindingRewrite {
     nullable: bool,
     ptr_ty: String,
     ptr_mut: bool,
+    base_proxy_hir_ids: FxHashSet<HirId>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,61 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     };
     visitor.visit_crate(krate);
     visitor.changed
+}
+
+#[allow(dead_code)]
+pub(crate) fn group_has_rewritable_binding<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    body: &rustc_middle::mir::Body<'tcx>,
+    provenance: &ArrayLocalProvenance,
+    group: &RewriteGroup,
+) -> bool {
+    // index_tracked with a field base is unsupported.
+    if group.base_slot_offset != 0 && group.index_tracked {
+        return false;
+    }
+    let hir_to_mir = utils::ir::map_thir_to_mir(def_id, false, tcx);
+    let local_to_hir: FxHashMap<Local, HirId> = hir_to_mir
+        .binding_to_local
+        .iter()
+        .map(|(hir_id, local)| (*local, *hir_id))
+        .collect();
+    if !local_to_hir.contains_key(&group.base_local) {
+        return false;
+    }
+    if group.index_tracked
+        && !matches!(
+            body.local_decls[group.base_local].ty.kind(),
+            ty::TyKind::RawPtr(..)
+        )
+    {
+        return false;
+    }
+
+    group.members.iter().any(|&slot_idx| {
+        let Some(info) = provenance.slot_table.slot_infos.get(slot_idx) else {
+            return false;
+        };
+        if info.root == group.base_local || !info.path.is_empty() {
+            return false;
+        }
+        if !local_to_hir.contains_key(&info.root) {
+            return false;
+        }
+        if !matches!(
+            body.local_decls[info.root].ty.kind(),
+            ty::TyKind::RawPtr(..)
+        ) {
+            return false;
+        }
+        // for field-base groups, a member is rewritable only if it is NOT a proxy
+        // (proxies hold the base at offset 0 and are left unchanged).
+        if group.base_slot_offset > 0 {
+            return !local_only_directly_assigned(body, info.root);
+        }
+        true
+    })
 }
 
 fn build_rewrite_plan<'tcx>(
@@ -318,13 +375,56 @@ struct GroupPlanContext<'a, 'tcx> {
 }
 
 fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGroup) {
-    if group.base_slot_offset != 0 {
+    // index_tracked with a field base is unsupported.
+    if group.base_slot_offset != 0 && group.index_tracked {
         return;
     }
     let Some(&base_hir_id) = context.local_to_hir.get(&group.base_local) else {
         return;
     };
-    let base_name = context.tcx.hir_name(base_hir_id).to_string();
+
+    // Compute (base_name, proxy_hir_ids) depending on whether the base is a
+    // direct local (offset 0) or a field path (offset > 0).
+    let (base_name, proxy_hir_ids): (String, FxHashSet<HirId>) = if group.base_slot_offset == 0 {
+        (
+            context.tcx.hir_name(base_hir_id).to_string(),
+            FxHashSet::default(),
+        )
+    } else {
+        let Some(base_slot_info) =
+            analyses::array_local_provenance::base_slot_info(context.provenance, group)
+        else {
+            return;
+        };
+        let local_name = context.tcx.hir_name(base_hir_id).to_string();
+        let base_ty = context.body.local_decls[group.base_local].ty;
+        let Some(name) =
+            slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
+        else {
+            return;
+        };
+        // proxies: direct-local RawPtr members never assigned via a Call
+        let proxies = group
+            .members
+            .iter()
+            .filter_map(|&slot_idx| {
+                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                if !info.path.is_empty() || info.root == group.base_local {
+                    return None;
+                }
+                if !matches!(
+                    context.body.local_decls[info.root].ty.kind(),
+                    ty::TyKind::RawPtr(..)
+                ) {
+                    return None;
+                }
+                let &hir_id = context.local_to_hir.get(&info.root)?;
+                local_only_directly_assigned(context.body, info.root).then_some(hir_id)
+            })
+            .collect();
+        (name, proxies)
+    };
+
     let base_is_raw_ptr = matches!(
         context.body.local_decls[group.base_local].ty.kind(),
         ty::TyKind::RawPtr(..)
@@ -379,6 +479,10 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         let Some(&source_hir_id) = context.local_to_hir.get(&info.root) else {
             continue;
         };
+        // skip proxy locals — they hold the base at offset 0 and stay as-is.
+        if proxy_hir_ids.contains(&source_hir_id) {
+            continue;
+        }
         if context.plan.by_hir_id.contains_key(&source_hir_id) {
             continue;
         }
@@ -418,6 +522,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 nullable,
                 ptr_ty,
                 ptr_mut: mutability.is_mut(),
+                base_proxy_hir_ids: proxy_hir_ids.clone(),
             },
         );
     }
@@ -432,6 +537,42 @@ fn fresh_index_name(source_name: &str, existing_names: &mut FxHashSet<String>) -
     }
     existing_names.insert(candidate.clone());
     candidate
+}
+
+fn slot_path_to_expr_string<'tcx>(
+    local_name: &str,
+    path: &[SlotPathElem],
+    mut ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<String> {
+    let mut expr = local_name.to_string();
+    for elem in path {
+        match elem {
+            SlotPathElem::Pointee => {
+                ty = ty.builtin_deref(true)?;
+                expr = format!("(*{expr})");
+            }
+            SlotPathElem::Field(field) => {
+                let (field_name, field_ty) = named_struct_field(tcx, ty, *field)?;
+                expr = format!("{expr}.{field_name}");
+                ty = field_ty;
+            }
+            SlotPathElem::Element => return None,
+        }
+    }
+    Some(expr)
+}
+
+fn local_only_directly_assigned(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
+    for block_data in body.basic_blocks.iter() {
+        if let Some(terminator) = &block_data.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+            && destination.local == local
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn prune_unsupported_direct_place_uses(
@@ -642,7 +783,8 @@ fn assignment_index_arg_contains_planned_local(
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
     let receiver_is_base = receiver_hir_id == Some(rewrite.base_hir_id)
-        || receiver_is_base_as_ptr(receiver, ast_to_hir, tcx, rewrite);
+        || receiver_is_base_as_ptr(receiver, ast_to_hir, tcx, rewrite)
+        || receiver_hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id));
     if !receiver_is_base && receiver_hir_id != Some(rewrite.source_hir_id) {
         return false;
     }
@@ -813,8 +955,10 @@ fn receiver_is_base_pointer_expr(
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
 ) -> bool {
-    hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) == Some(rewrite.base_hir_id)
+    let hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
+    hir_id == Some(rewrite.base_hir_id)
         || receiver_is_base_as_ptr(receiver, ast_to_hir, tcx, rewrite)
+        || hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id))
 }
 
 fn offset_from_base_expr(
@@ -827,7 +971,10 @@ fn offset_from_base_expr(
         return IndexExpr::Null;
     }
     let expr = unwrap_cast_and_paren(expr);
-    if hir_id_of_ast_expr(ast_to_hir, tcx, expr.id) == Some(rewrite.base_hir_id) {
+    let expr_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, expr.id);
+    if expr_hir_id == Some(rewrite.base_hir_id)
+        || expr_hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id))
+    {
         return IndexExpr::Plain(match base_current_index_expr(rewrite) {
             Some(base_index_name) => utils::expr!("{}", base_index_name),
             None => utils::expr!("0isize"),
