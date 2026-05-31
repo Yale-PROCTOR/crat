@@ -4141,25 +4141,47 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             match ctx {
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    if let Some(slice) = self.try_byte_slice_from_addr_of(
-                        e,
-                        pe.base_ty,
-                        lhs_inner_ty,
-                        m,
-                        addr_source_mut,
-                    ) {
+                    if let Some(slice) = self
+                        .try_byte_slice_from_addr_of(
+                            e,
+                            pe.base_ty,
+                            lhs_inner_ty,
+                            m,
+                            addr_source_mut,
+                        )
+                        .or_else(|| {
+                            self.try_bytemuck_slice_from_addr_of(
+                                e,
+                                pe.base_ty,
+                                lhs_inner_ty,
+                                m,
+                                addr_source_mut,
+                            )
+                        })
+                    {
                         *ptr = slice;
                         return PtrKind::Slice(m);
                     }
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
-                    if let Some(slice) = self.try_byte_slice_from_addr_of(
-                        e,
-                        pe.base_ty,
-                        lhs_inner_ty,
-                        m,
-                        addr_source_mut,
-                    ) {
+                    if let Some(slice) = self
+                        .try_byte_slice_from_addr_of(
+                            e,
+                            pe.base_ty,
+                            lhs_inner_ty,
+                            m,
+                            addr_source_mut,
+                        )
+                        .or_else(|| {
+                            self.try_bytemuck_slice_from_addr_of(
+                                e,
+                                pe.base_ty,
+                                lhs_inner_ty,
+                                m,
+                                addr_source_mut,
+                            )
+                        })
+                    {
                         let cursor_ty = if m {
                             "crate::slice_cursor::SliceCursorMut"
                         } else {
@@ -5360,14 +5382,32 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             } else {
                 e.clone()
             }
-        } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
+        } else if (lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric())
+            || (!matches!(e.kind, ExprKind::Index(..))
+                && self.try_require_bytemuck_slice_cast(rhs_inner_ty, lhs_inner_ty, m))
+        {
             self.bytemuck.set(true);
-            utils::expr!(
-                "bytemuck::cast_slice{}::<_, {}>({})",
-                if m { "_mut" } else { "" },
-                lhs_ty,
-                pprust::expr_to_string(e),
-            )
+            let reference = if matches!(e.kind, ExprKind::Index(..)) {
+                if m { "&mut " } else { "&" }
+            } else {
+                ""
+            };
+            if reference.is_empty() {
+                utils::expr!(
+                    "bytemuck::cast_slice{}::<_, {}>({})",
+                    if m { "_mut" } else { "" },
+                    lhs_ty,
+                    pprust::expr_to_string(e),
+                )
+            } else {
+                utils::expr!(
+                    "bytemuck::cast_slice{}::<_, {}>({}({}))",
+                    if m { "_mut" } else { "" },
+                    lhs_ty,
+                    reference,
+                    pprust::expr_to_string(e),
+                )
+            }
         } else {
             let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
             utils::expr!(
@@ -5409,6 +5449,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if self.safe_slice_view_cast_allowed(
                 source_inner_ty,
                 target_inner_ty,
+                want_mut,
                 def_id,
                 allow_resized_numeric_casts,
             ) {
@@ -5436,6 +5477,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if !self.safe_slice_view_cast_allowed(
                         source_inner_ty,
                         to_ty,
+                        want_mut,
                         def_id,
                         allow_resized_numeric_casts,
                     ) {
@@ -5450,6 +5492,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if !self.safe_slice_view_cast_allowed(
             source_inner_ty,
             target_inner_ty,
+            want_mut,
             def_id,
             allow_resized_numeric_casts,
         ) {
@@ -5521,6 +5564,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         &self,
         from_ty: ty::Ty<'tcx>,
         to_ty: ty::Ty<'tcx>,
+        mutable: bool,
         def_id: LocalDefId,
         allow_resized_numeric_casts: bool,
     ) -> bool {
@@ -5528,6 +5572,57 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             || (from_ty.is_numeric()
                 && to_ty.is_numeric()
                 && (allow_resized_numeric_casts || self.same_size(from_ty, to_ty, def_id)))
+            || (!(from_ty.is_numeric() && to_ty.is_numeric())
+                && self.bytemuck_slice_cast_allowed(from_ty, to_ty, mutable))
+    }
+
+    fn bytemuck_slice_cast_allowed(
+        &self,
+        from_ty: ty::Ty<'tcx>,
+        to_ty: ty::Ty<'tcx>,
+        mutable: bool,
+    ) -> bool {
+        let (from_requirement, to_requirement) = if mutable {
+            (BytemuckRequirement::Pod, BytemuckRequirement::Pod)
+        } else {
+            (
+                BytemuckRequirement::NoUninit,
+                BytemuckRequirement::AnyBitPattern,
+            )
+        };
+
+        let mut classifier = self.bytemuck_classifier.borrow_mut();
+        classifier.satisfies_requirement(from_ty, from_requirement)
+            && classifier.satisfies_requirement(to_ty, to_requirement)
+    }
+
+    fn try_require_bytemuck_slice_cast(
+        &self,
+        from_ty: ty::Ty<'tcx>,
+        to_ty: ty::Ty<'tcx>,
+        mutable: bool,
+    ) -> bool {
+        if !self.bytemuck_slice_cast_allowed(from_ty, to_ty, mutable) {
+            return false;
+        }
+
+        let (from_requirement, to_requirement) = if mutable {
+            (BytemuckRequirement::Pod, BytemuckRequirement::Pod)
+        } else {
+            (
+                BytemuckRequirement::NoUninit,
+                BytemuckRequirement::AnyBitPattern,
+            )
+        };
+
+        let mut derives = self.bytemuck_derives.borrow_mut();
+        let mut classifier = self.bytemuck_classifier.borrow_mut();
+        let from_required =
+            derives.require_type(self.tcx, &mut classifier, from_ty, from_requirement);
+        let to_required = derives.require_type(self.tcx, &mut classifier, to_ty, to_requirement);
+        debug_assert!(from_required && to_required);
+        self.bytemuck.set(true);
+        true
     }
 
     fn plain_slice_from_safe_view(
@@ -5650,6 +5745,38 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             _ => None,
         }
+    }
+
+    fn try_bytemuck_slice_from_addr_of(
+        &self,
+        pointee: &Expr,
+        pointee_ty: ty::Ty<'tcx>,
+        target_inner_ty: ty::Ty<'tcx>,
+        mutable: bool,
+        source_mut: bool,
+    ) -> Option<Expr> {
+        if mutable && !source_mut {
+            return None;
+        }
+        if place_expr_contains_deref(pointee) {
+            return None;
+        }
+        let ty::TyKind::Array(source_inner_ty, _) = pointee_ty.kind() else {
+            return None;
+        };
+        if *source_inner_ty == target_inner_ty
+            || !self.try_require_bytemuck_slice_cast(*source_inner_ty, target_inner_ty, mutable)
+        {
+            return None;
+        }
+
+        Some(utils::expr!(
+            "bytemuck::cast_slice{}::<_, {}>(&{}({}))",
+            if mutable { "_mut" } else { "" },
+            mir_ty_to_string(target_inner_ty, self.tcx),
+            if mutable { "mut " } else { "" },
+            pprust::expr_to_string(pointee),
+        ))
     }
 
     fn projected_opt_boxed_slice_expr(
@@ -6448,6 +6575,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
+            if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {
+                return slice;
+            }
             if !need_cast {
                 utils::expr!(
                     "std::slice::from_raw_parts{}(({}){}, 1_000_000)",
@@ -6522,6 +6652,47 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 cast_mut,
                 if m { "mut" } else { "const" },
             )
+        }
+    }
+
+    fn plain_slice_from_as_ptr_receiver(
+        &self,
+        e: &Expr,
+        target_mut: bool,
+        target_inner_ty: ty::Ty<'tcx>,
+    ) -> Option<Expr> {
+        let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(e).kind else {
+            return None;
+        };
+        let name = call.seg.ident.name.as_str();
+        if !matches!(name, "as_ptr" | "as_mut_ptr")
+            || target_mut && name != "as_mut_ptr"
+            || utils::ast::has_side_effects(&call.receiver)
+        {
+            return None;
+        }
+
+        let hir_e = self.ast_to_hir.get_expr(e.id, self.tcx)?;
+        let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = hir_unwrap_casts(hir_e).kind else {
+            return None;
+        };
+        let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
+        let source_inner_ty =
+            slice_like_container_inner_ty(typeck.expr_ty(hir_receiver), self.tcx)?;
+        if source_inner_ty != target_inner_ty {
+            return None;
+        }
+
+        if target_mut {
+            Some(utils::expr!(
+                "&mut (&mut ({}))[..]",
+                pprust::expr_to_string(&call.receiver),
+            ))
+        } else {
+            Some(utils::expr!(
+                "&(&({}))[..]",
+                pprust::expr_to_string(&call.receiver),
+            ))
         }
     }
 
@@ -6716,12 +6887,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pe.base_kind != PtrExprBaseKind::Alloca && !is_rewritten_slice_like_local,
             );
             utils::expr!("{}({})", reference, pprust::expr_to_string(e),)
-        } else if lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric() {
+        } else if (lhs_inner_ty.is_numeric() && rhs_inner_ty.is_numeric())
+            || (!matches!(e.kind, ExprKind::Index(..))
+                && self.try_require_bytemuck_slice_cast(rhs_inner_ty, lhs_inner_ty, m))
+        {
             self.bytemuck.set(true);
             let reference = get_reference(
-                !matches!(e.kind, ExprKind::Index(..))
-                    && pe.base_kind != PtrExprBaseKind::Alloca
-                    && !is_rewritten_slice_like_local,
+                matches!(e.kind, ExprKind::Index(..))
+                    || (pe.base_kind != PtrExprBaseKind::Alloca && !is_rewritten_slice_like_local),
             );
             // can be used for deref, so type must be specified
             utils::expr!(
