@@ -100,6 +100,57 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_fopen_slice_path() {
+    run_test(
+        r#"
+unsafe fn f(filename: &[libc::c_char]) {
+    let mut stream: *mut FILE = fopen(
+        filename.as_ptr(),
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice(&(filename))",
+            "std::fs::File::open",
+            "crate::c_lib::rs_fgetc",
+            "drop",
+        ],
+        &["std::ffi::CStr::from_ptr", "fopen", "fclose"],
+    );
+}
+
+#[test]
+fn test_fopen_u8_array_path() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let filename = [b'a', 0];
+    let mut stream: *mut FILE = fopen(
+        filename.as_ptr() as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    fputc('a' as i32, stream);
+    fclose(stream);
+}"#,
+        &[
+            "std::ffi::CStr::from_bytes_until_nul(&(filename))",
+            "std::fs::File::create",
+            "crate::c_lib::rs_fputc",
+            "drop",
+        ],
+        &[
+            "std::ffi::CStr::from_ptr",
+            "bytemuck::cast_slice",
+            "fopen",
+            "fclose",
+        ],
+    );
+}
+
+#[test]
 fn test_file_buf_read() {
     run_test(
         r#"
