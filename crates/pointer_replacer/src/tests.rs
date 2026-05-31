@@ -3861,6 +3861,205 @@ pub unsafe fn baz() {
 }
 
 #[test]
+fn test_rewriter_keeps_nullable_owned_returner_boxed_when_result_is_freed() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn make_owned(flag: i32) -> *mut i32 {
+    if flag == 0 {
+        return std::ptr::null_mut();
+    }
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    p
+}
+
+pub unsafe fn cleanup(flag: i32) {
+    let p: *mut i32 = make_owned(flag);
+    if !p.is_null() {
+        free(p as *mut core::ffi::c_void);
+    }
+}
+"#,
+        &[
+            "pub unsafe fn make_owned(flag: i32) -> Option<Box<i32>>",
+            "let mut p: Option<Box<i32>>",
+            "if !p.is_none()",
+            "drop((p).take());",
+        ],
+        &[
+            "pub unsafe fn make_owned(flag: i32) -> *mut i32",
+            "free(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_c_exposed_owned_returner_raw() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("make_owned".to_string());
+    run_test_with_config(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn make_owned(flag: i32) -> *mut i32 {
+    if flag == 0 {
+        return std::ptr::null_mut();
+    }
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    p
+}
+"#,
+        &config,
+        &[
+            "pub unsafe extern \"C\" fn make_owned(flag: i32) -> *mut i32",
+            "Box::into_raw(",
+        ],
+        &["pub unsafe extern \"C\" fn make_owned(flag: i32) -> Option<Box<i32>>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_predeclared_nullable_owned_call_result_boxed() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn make_buffer(flag: i32) -> *mut i8 {
+    if flag == 0 {
+        return std::ptr::null_mut();
+    }
+    let p: *mut i8 = malloc(4) as *mut i8;
+    p
+}
+
+pub unsafe fn first_byte(buffer: *const i8) -> *const i8 {
+    if buffer.is_null() {
+        return std::ptr::null();
+    }
+    buffer
+}
+
+pub unsafe fn cleanup(flag: i32) {
+    let mut buffer: *mut i8 = std::ptr::null_mut();
+    let mut found: *const i8 = std::ptr::null();
+    buffer = make_buffer(flag);
+    if !buffer.is_null() {
+        found = first_byte(buffer);
+        if !found.is_null() {
+            let _offset = found.offset_from(buffer);
+        }
+        free(buffer as *mut core::ffi::c_void);
+        buffer = std::ptr::null_mut();
+    }
+}
+"#,
+        &[
+            "pub unsafe fn make_buffer(flag: i32) -> Option<Box<[i8]>>",
+            "let mut buffer: Option<Box<[i8]>> = None;",
+            "buffer = make_buffer(flag);",
+            "if !buffer.is_none()",
+            "drop((buffer).take());",
+            "buffer = None;",
+        ],
+        &[
+            "pub unsafe fn make_buffer(flag: i32) -> *mut i8",
+            "let mut buffer: *mut i8",
+            "free(buffer as *mut core::ffi::c_void);",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_does_not_move_box_into_later_freed_alias() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn compare_allocations(val: i32) -> i32 {
+    let ptr1: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    let mut alias: *mut i32 = std::ptr::null_mut();
+    if ptr1.is_null() {
+        free(ptr1 as *mut core::ffi::c_void);
+        return -1;
+    }
+    *ptr1 = val;
+    alias = ptr1;
+    let result = *alias;
+    free(ptr1 as *mut core::ffi::c_void);
+    result
+}
+"#,
+        &["drop(ptr1);"],
+        &["alias = Some(ptr1);"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_wrapper_freed_local_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn cleanup_resources(ptr: *mut i8) {
+    if !ptr.is_null() {
+        free(ptr as *mut core::ffi::c_void);
+    }
+}
+
+pub unsafe fn cleanup() {
+    let mut dynamic_str: *mut i8 = std::ptr::null_mut();
+    dynamic_str = malloc(50) as *mut i8;
+    cleanup_resources(dynamic_str);
+}
+"#,
+        &[
+            "let mut dynamic_str: *mut i8 = std::ptr::null_mut();",
+            "cleanup_resources((dynamic_str).as_ref());",
+        ],
+        &["let mut dynamic_str: Option<Box<[i8]>>"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_raw_storage_call_result_raw() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn dup() -> *mut i8 {
+    let p: *mut i8 = malloc(8) as *mut i8;
+    p
+}
+
+pub unsafe fn store(slot: *mut *mut i8) {
+    *slot = dup();
+}
+"#,
+        &["pub unsafe fn dup() -> *mut i8", "*slot = dup();"],
+        &["pub unsafe fn dup() -> Option<Box<[i8]>>"],
+    );
+}
+
+#[test]
 fn test_rewriter_consumes_direct_owned_call_result_free() {
     run_test(
         r#"
@@ -4311,11 +4510,18 @@ pub unsafe fn helper() -> i32 {
     result
 }
 "#,
-        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "let mut s: Box<crate::State>",
+            "unsafe fn touch_with_alias(mut state: &mut crate::State) -> i32",
+            "let result = touch_with_alias((Some(&mut *((s).as_mut()))).unwrap());",
+            "drop(s);",
+        ],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(s as *mut core::ffi::c_void);",
             "Box::into_raw(",
+            "Box::leak(",
+            "Box::from_raw(",
         ],
     );
 }
@@ -4476,11 +4682,18 @@ pub unsafe fn helper() -> i32 {
     result
 }
 "#,
-        &["Box::leak(Box::new(", "Box::from_raw("],
+        &[
+            "let mut s: Box<crate::State>",
+            "unsafe fn print_preallocated_like(mut buffer: *mut crate::State,",
+            "print_preallocated_like(((s).as_mut()) as *mut crate::State, 1)",
+            "drop(s);",
+        ],
         &[
             "calloc(1, std::mem::size_of::<State>())",
             "free(s as *mut core::ffi::c_void);",
             "Box::into_raw(",
+            "Box::leak(",
+            "Box::from_raw(",
         ],
     );
 }
@@ -4600,7 +4813,7 @@ pub unsafe fn driver_like(length: usize) -> i32 {
             "malloc(length.wrapping_add(1))",
             "free(task as *mut core::ffi::c_void);",
         ],
-        &["Box::into_raw(", "Box::leak("],
+        &["Box::into_raw(", "Box::leak(", "Box::from_raw("],
     );
 }
 
