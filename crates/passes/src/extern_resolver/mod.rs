@@ -193,12 +193,12 @@ fn make_resolve_map(
 }
 
 /// For each extern fn in `resolve_map`, compare parameter types with the resolved fn.
-/// Returns a map from the extern fn's def_id to a vec of target parameter types (as strings)
+/// Returns a map from the extern fn's def_id to a vec of source and target parameter types
 /// for parameters where the types differ. `None` means no cast needed for that parameter.
-fn make_cast_map(
+fn make_cast_map<'tcx>(
     resolve_map: &FxHashMap<LocalDefId, LocalDefId>,
-    tcx: TyCtxt<'_>,
-) -> FxHashMap<LocalDefId, Vec<Option<String>>> {
+    tcx: TyCtxt<'tcx>,
+) -> FxHashMap<LocalDefId, Vec<Option<Cast<'tcx>>>> {
     let mut cast_map = FxHashMap::default();
     for (&extern_id, &resolved_id) in resolve_map {
         if !tcx.def_kind(extern_id).is_fn_like() {
@@ -211,12 +211,15 @@ fn make_cast_map(
         if extern_inputs.len() != resolved_inputs.len() {
             continue;
         }
-        let casts: Vec<Option<String>> = extern_inputs
+        let casts: Vec<Option<Cast<'tcx>>> = extern_inputs
             .iter()
             .zip(resolved_inputs)
             .map(|(extern_ty, resolved_ty)| {
                 if !tys_equal_after_resolution(*extern_ty, *resolved_ty, resolve_map) {
-                    Some(utils::ir::mir_ty_to_string(*resolved_ty, tcx))
+                    Some(Cast {
+                        extern_ty: *extern_ty,
+                        target_ty: *resolved_ty,
+                    })
                 } else {
                     None
                 }
@@ -227,6 +230,11 @@ fn make_cast_map(
         }
     }
     cast_map
+}
+
+struct Cast<'tcx> {
+    extern_ty: ty::Ty<'tcx>,
+    target_ty: ty::Ty<'tcx>,
 }
 
 /// Compare two types for equality, considering that ADT def_ids in `resolve_map`
@@ -275,6 +283,79 @@ fn resolve_def_id(
         return resolved.to_def_id();
     }
     def_id
+}
+
+fn ty_to_string_after_resolution<'tcx>(
+    ty: ty::Ty<'tcx>,
+    resolve_map: &FxHashMap<LocalDefId, LocalDefId>,
+    tcx: TyCtxt<'tcx>,
+) -> String {
+    use ty::*;
+    match ty.kind() {
+        Adt(adt_def, args) => {
+            let def_id = adt_def.did();
+            let path_str = if let Some(local) = def_id.as_local()
+                && let Some(resolved) = resolve_map.get(&local)
+            {
+                format!("crate::{}", tcx.def_path_str(*resolved))
+            } else {
+                let path_str = tcx.def_path_str(def_id);
+                if path_str.starts_with("std") {
+                    let name = tcx.item_name(def_id);
+                    let name = name.as_str();
+                    if matches!(name, "Option" | "Result" | "Vec" | "String" | "Box") {
+                        name.to_string()
+                    } else {
+                        path_str
+                    }
+                } else if def_id.is_local() {
+                    format!("crate::{path_str}")
+                } else {
+                    path_str
+                }
+            };
+
+            if args.is_empty() {
+                path_str
+            } else {
+                let args = args
+                    .iter()
+                    .map(|arg| {
+                        use rustc_type_ir::GenericArgKind::*;
+                        match arg.kind() {
+                            Type(ty) => ty_to_string_after_resolution(ty, resolve_map, tcx),
+                            Const(cnst) => cnst.to_string(),
+                            Lifetime(_) => "'_".to_string(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{path_str}<{args}>")
+            }
+        }
+        RawPtr(ty, mutability) => {
+            let m = if mutability.is_mut() { "mut" } else { "const" };
+            format!(
+                "*{m} {}",
+                ty_to_string_after_resolution(*ty, resolve_map, tcx)
+            )
+        }
+        Ref(_, ty, mutability) => {
+            let m = if mutability.is_mut() { "mut " } else { "" };
+            format!(
+                "&{m}{}",
+                ty_to_string_after_resolution(*ty, resolve_map, tcx)
+            )
+        }
+        Array(ty, cnst) => {
+            format!(
+                "[{}; {cnst}]",
+                ty_to_string_after_resolution(*ty, resolve_map, tcx)
+            )
+        }
+        Slice(ty) => format!("[{}]", ty_to_string_after_resolution(*ty, resolve_map, tcx)),
+        _ => utils::ir::mir_ty_to_string(ty, tcx),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -857,7 +938,7 @@ struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
     resolve_map: FxHashMap<LocalDefId, LocalDefId>,
-    cast_map: FxHashMap<LocalDefId, Vec<Option<String>>>,
+    cast_map: FxHashMap<LocalDefId, Vec<Option<Cast<'tcx>>>>,
     used_stack: Vec<FxHashSet<LocalDefId>>,
     updated: bool,
 }
@@ -956,9 +1037,30 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && let Some(casts) = self.cast_map.get(&def_id)
         {
             for (arg, cast) in args.iter_mut().zip(casts) {
-                if let Some(target_ty) = cast {
+                if let Some(cast) = cast {
                     let arg_str = pprust::expr_to_string(arg);
-                    *arg = P(expr!("({}) as {}", arg_str, target_ty));
+                    let target_ty =
+                        ty_to_string_after_resolution(cast.target_ty, &self.resolve_map, self.tcx);
+                    if matches!(cast.extern_ty.kind(), ty::TyKind::RawPtr(..))
+                        && matches!(cast.target_ty.kind(), ty::TyKind::RawPtr(..))
+                        && let Some(hir_arg) = self.ast_to_hir.get_expr(arg.id, self.tcx)
+                        && matches!(
+                            self.tcx
+                                .typeck(hir_arg.hir_id.owner)
+                                .expr_ty(hir_arg)
+                                .kind(),
+                            ty::TyKind::Ref(..)
+                        )
+                    {
+                        let extern_ty = ty_to_string_after_resolution(
+                            cast.extern_ty,
+                            &self.resolve_map,
+                            self.tcx,
+                        );
+                        *arg = P(expr!("({}) as {} as {}", arg_str, extern_ty, target_ty));
+                    } else {
+                        *arg = P(expr!("({}) as {}", arg_str, target_ty));
+                    }
                 }
             }
         }
