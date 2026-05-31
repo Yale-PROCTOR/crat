@@ -2,9 +2,12 @@ use lazy_static::lazy_static;
 use utils::compilation;
 
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
+    run_test_with_config(s, super::Config::default(), includes, excludes)
+}
+
+fn run_test_with_config(s: &str, config: super::Config, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let config = super::Config::default();
     let res =
         compilation::run_compiler_on_str(&code, |tcx| super::replace_io(config, tcx)).unwrap();
     let stripped = res
@@ -553,6 +556,30 @@ unsafe fn f(mut entry: Entry) {
 }"#,
         &["std::ffi::CStr::from_ptr((entry).key as _)", "write!"],
         &["printf"],
+    );
+}
+
+#[test]
+fn test_printf_assume_to_str_ok_local_array_string() {
+    run_test_with_config(
+        r#"
+unsafe fn f() {
+    let mut buf: [libc::c_char; 10] = [0; 10];
+    printf(
+        b"%s\n\0" as *const u8 as *const libc::c_char,
+        buf.as_mut_ptr(),
+    );
+}"#,
+        super::Config {
+            assume_to_str_ok: true,
+        },
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice",
+            ".to_str().unwrap()",
+            "write!",
+        ],
+        &["std::ffi::CStr::from_ptr", "printf"],
     );
 }
 
