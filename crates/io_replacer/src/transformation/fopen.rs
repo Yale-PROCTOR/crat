@@ -44,10 +44,9 @@ impl TransformVisitor<'_, '_, '_> {
     }
 
     fn make_open_expr(&self, open_mode: OpenMode, path: &Expr, mode: &Expr) -> Expr {
-        let path = pprust::expr_to_string(path);
-        let path_str = format!("std::ffi::CStr::from_ptr(({path}) as _).to_str().unwrap()");
         match open_mode {
             OpenMode::Read(plus) => {
+                let path_str = self.path_to_str_expr(path);
                 if plus {
                     expr!(
                         "std::fs::OpenOptions::new()
@@ -62,6 +61,7 @@ impl TransformVisitor<'_, '_, '_> {
                 }
             }
             OpenMode::Write(plus) => {
+                let path_str = self.path_to_str_expr(path);
                 if plus {
                     expr!(
                         "std::fs::OpenOptions::new()
@@ -78,6 +78,7 @@ impl TransformVisitor<'_, '_, '_> {
                 }
             }
             OpenMode::Append(plus) => {
+                let path_str = self.path_to_str_expr(path);
                 if plus {
                     expr!(
                         "std::fs::OpenOptions::new()
@@ -100,6 +101,7 @@ impl TransformVisitor<'_, '_, '_> {
                 }
             }
             OpenMode::Unknown => {
+                let path = pprust::expr_to_string(path);
                 self.lib_items.borrow_mut().insert(LibItem::Fopen);
                 expr!(
                     "crate::c_lib::rs_fopen({}, {})",
@@ -108,6 +110,14 @@ impl TransformVisitor<'_, '_, '_> {
                 )
             }
         }
+    }
+
+    fn path_to_str_expr(&self, path: &Expr) -> String {
+        let path_str = pprust::expr_to_string(path);
+        let cstr = self
+            .cstr_from_as_ptr(path)
+            .unwrap_or_else(|| format!("std::ffi::CStr::from_ptr(({path_str}) as _)"));
+        format!("{cstr}.to_str().unwrap()")
     }
 }
 
