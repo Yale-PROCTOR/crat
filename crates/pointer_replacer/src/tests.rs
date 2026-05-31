@@ -3804,17 +3804,13 @@ fn test_rewriter_box_from_raw_free_evaluates_argument_once() {
     run_test(
         r#"
 extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);
+    fn alloc_node() -> *mut Node;
 }
 
 #[repr(C)]
 pub struct Node {
     pub value: i32,
-}
-
-pub unsafe fn alloc_node() -> *mut Node {
-    malloc(std::mem::size_of::<Node>()) as *mut Node
 }
 
 pub unsafe fn cleanup() {
@@ -3823,6 +3819,75 @@ pub unsafe fn cleanup() {
 "#,
         &["let __crat_raw_free =", "Box::from_raw((__crat_raw_free)"],
         &["Box::from_raw((alloc_node()", "unsafe {"],
+    );
+}
+
+#[test]
+fn test_rewriter_keeps_owned_returners_boxed_when_one_result_is_freed() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn foo() -> *mut i32 {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    p
+}
+
+pub unsafe fn bar() -> *mut i32 {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    p
+}
+
+pub unsafe fn baz() {
+    let p: *mut i32 = bar();
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub unsafe fn foo() -> Box<i32>",
+            "pub unsafe fn bar() -> Box<i32>",
+            "let mut p: Box<i32>",
+            "drop(p);",
+        ],
+        &[
+            "pub unsafe fn bar() -> *mut i32",
+            "free(p as *mut core::ffi::c_void);",
+            "Box::into_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_consumes_direct_owned_call_result_free() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn make_owned() -> *mut i32 {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
+    p
+}
+
+pub unsafe fn cleanup() {
+    free(make_owned() as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub unsafe fn make_owned() -> Box<i32>",
+            "drop(make_owned());",
+        ],
+        &[
+            "pub unsafe fn make_owned() -> *mut i32",
+            "free(make_owned() as *mut core::ffi::c_void);",
+            "Box::from_raw(",
+            "Box::into_raw(",
+        ],
     );
 }
 
