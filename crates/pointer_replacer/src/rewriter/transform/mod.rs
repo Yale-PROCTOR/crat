@@ -3207,6 +3207,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if let Some(field_free) = self.rewrite_owned_field_free_call(hir_expr, args) {
             return Some(field_free);
         }
+        if let Some(call_result_free) = self.rewrite_owned_call_result_free_call(hir_expr) {
+            return Some(call_result_free);
+        }
         if let Some((hir_id, _harg)) =
             hir_free_like_arg_local_id(self.tcx, hir_expr, &self.free_like_wrappers)
         {
@@ -3247,6 +3250,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
         self.rewrite_scalar_box_from_raw_free_call(hir_expr, args)
+    }
+
+    fn rewrite_owned_call_result_free_call(&self, hir_expr: &'tcx hir::Expr<'tcx>) -> Option<Expr> {
+        if !hir_call_matches_foreign_name(self.tcx, hir_expr, "free") {
+            return None;
+        }
+        let hir::ExprKind::Call(_, hir_args) = hir_expr.kind else {
+            return None;
+        };
+        let [hir_arg] = hir_args else { return None };
+        let hir_arg = hir_unwrap_casts(hir_arg);
+        if !matches!(
+            hir_callee_output_kind(self.tcx, &self.sig_decs, &self.ptr_kinds, hir_arg),
+            Some(PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
+        ) {
+            return None;
+        }
+        let call_expr = hir_expr_snippet(self.tcx, hir_arg)?;
+        Some(utils::expr!("drop({call_expr})"))
     }
 
     fn rewrite_scalar_box_from_raw_free_call(
@@ -10125,7 +10147,9 @@ fn downgrade_freed_borrow_outputs(
         let Some(output_kind) = sig_dec.output_dec else {
             continue;
         };
-        if !is_borrow_like_decision(output_kind) && !output_kind.is_owning_box_like() {
+        let should_downgrade = is_borrow_like_decision(output_kind)
+            || output_kind.is_owning_box_like() && fn_output_may_return_input(tcx, callee_did);
+        if !should_downgrade {
             continue;
         }
         let output_lifetime = sig_dec.output_lifetime;
@@ -10155,6 +10179,55 @@ fn downgrade_freed_borrow_outputs(
         }
     }
     changed
+}
+
+fn fn_output_may_return_input(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
+    let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+    let input_len = sig.inputs().len();
+    let return_local = rustc_middle::mir::Local::from_u32(0);
+    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if place.as_local() != Some(return_local) {
+                continue;
+            }
+            if rvalue_uses_input_local(rvalue, input_len) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn rvalue_uses_input_local(rvalue: &rustc_middle::mir::Rvalue<'_>, input_len: usize) -> bool {
+    match rvalue {
+        rustc_middle::mir::Rvalue::Use(operand)
+        | rustc_middle::mir::Rvalue::Cast(_, operand, _) => {
+            operand_uses_input_local(operand, input_len)
+        }
+        rustc_middle::mir::Rvalue::Ref(_, _, place) => place_uses_input_local(place, input_len),
+        _ => false,
+    }
+}
+
+fn operand_uses_input_local(operand: &rustc_middle::mir::Operand<'_>, input_len: usize) -> bool {
+    match operand {
+        rustc_middle::mir::Operand::Copy(place) | rustc_middle::mir::Operand::Move(place) => {
+            place_uses_input_local(place, input_len)
+        }
+        rustc_middle::mir::Operand::Constant(_) => false,
+    }
+}
+
+fn place_uses_input_local(place: &rustc_middle::mir::Place<'_>, input_len: usize) -> bool {
+    place
+        .as_local()
+        .is_some_and(|local| (1..=input_len).contains(&local.as_usize()))
 }
 
 fn downgrade_raw_cast_call_inputs(
