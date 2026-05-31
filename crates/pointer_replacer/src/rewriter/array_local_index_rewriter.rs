@@ -11,7 +11,10 @@ use rustc_hir::{
     self as hir, HirId, def::Res, def_id::LocalDefId, intravisit::Visitor as HirVisitor,
 };
 use rustc_middle::{
-    mir::{Local, TerminatorKind},
+    mir::{
+        Local, Location, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        visit::{PlaceContext, Visitor as MirVisitor},
+    },
     ty::{self, TyCtxt},
 };
 use rustc_span::Symbol;
@@ -24,8 +27,8 @@ use crate::{
     analyses::{
         self,
         array_local_provenance::{
-            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteSelectionContext, SlotPathElem,
-            named_struct_field,
+            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteSelectionContext, SlotInfo,
+            SlotPathElem, named_struct_field,
         },
         type_qualifier::foster::mutability::MutabilityResult,
     },
@@ -43,7 +46,9 @@ struct BindingRewrite {
     nullable: bool,
     ptr_ty: String,
     ptr_mut: bool,
+    field_base: bool,
     base_proxy_hir_ids: FxHashSet<HirId>,
+    group_member_hir_ids: FxHashSet<HirId>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,12 +59,15 @@ struct BaseCursorRewrite {
     index_name: String,
     base_is_raw_ptr: bool,
     ptr_ty: String,
+    field_base: bool,
 }
+
+type BaseCursorKey = (HirId, String);
 
 #[derive(Default)]
 struct RewritePlan {
     by_hir_id: FxHashMap<HirId, BindingRewrite>,
-    base_by_hir_id: FxHashMap<HirId, BaseCursorRewrite>,
+    base_by_key: FxHashMap<BaseCursorKey, BaseCursorRewrite>,
     index_names_by_fn: FxHashMap<LocalDefId, FxHashSet<String>>,
 }
 
@@ -145,7 +153,7 @@ pub(crate) fn group_has_rewritable_binding<'tcx>(
         // for field-base groups, a member is rewritable only if it is NOT a proxy
         // (proxies hold the base at offset 0 and are left unchanged).
         if group.base_slot_offset > 0 {
-            return !local_only_directly_assigned(body, info.root);
+            return !local_is_pure_field_base_proxy(body, info.root);
         }
         true
     })
@@ -219,14 +227,14 @@ fn refine_base_pointer_kinds_from_ast(
         .by_hir_id
         .values()
         .map(|rewrite| rewrite.base_hir_id)
-        .chain(plan.base_by_hir_id.keys().copied())
+        .chain(plan.base_by_key.values().map(|rewrite| rewrite.base_hir_id))
         .collect();
     let base_names = plan
         .by_hir_id
         .values()
         .map(|rewrite| rewrite.base_name.clone())
         .chain(
-            plan.base_by_hir_id
+            plan.base_by_key
                 .values()
                 .map(|rewrite| rewrite.base_name.clone()),
         )
@@ -250,7 +258,7 @@ fn refine_base_pointer_kinds_from_ast(
             rewrite.base_is_raw_ptr = *base_is_raw_ptr;
         }
     }
-    for rewrite in plan.base_by_hir_id.values_mut() {
+    for rewrite in plan.base_by_key.values_mut() {
         if let Some(&base_is_raw_ptr) = visitor.base_is_raw_ptr_by_hir_id.get(&rewrite.base_hir_id)
         {
             rewrite.base_is_raw_ptr = base_is_raw_ptr;
@@ -375,10 +383,6 @@ struct GroupPlanContext<'a, 'tcx> {
 }
 
 fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGroup) {
-    // index_tracked with a field base is unsupported.
-    if group.base_slot_offset != 0 && group.index_tracked {
-        return;
-    }
     let Some(&base_hir_id) = context.local_to_hir.get(&group.base_local) else {
         return;
     };
@@ -419,7 +423,8 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                     return None;
                 }
                 let &hir_id = context.local_to_hir.get(&info.root)?;
-                local_only_directly_assigned(context.body, info.root).then_some(hir_id)
+                (!group.index_tracked && local_is_pure_field_base_proxy(context.body, info.root))
+                    .then_some(hir_id)
             })
             .collect();
         (name, proxies)
@@ -429,16 +434,51 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         context.body.local_decls[group.base_local].ty.kind(),
         ty::TyKind::RawPtr(..)
     );
+    let base_cursor_key = base_cursor_key(base_hir_id, &base_name);
+    let group_member_hir_ids = group
+        .members
+        .iter()
+        .filter_map(|&slot_idx| {
+            let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+            if !info.path.is_empty() || info.root == group.base_local {
+                return None;
+            }
+            if !matches!(
+                context.body.local_decls[info.root].ty.kind(),
+                ty::TyKind::RawPtr(..)
+            ) {
+                return None;
+            }
+            context.local_to_hir.get(&info.root).copied()
+        })
+        .collect::<FxHashSet<_>>();
     let base_index_name = if group.index_tracked {
-        if let Some(rewrite) = context.plan.base_by_hir_id.get(&base_hir_id) {
+        if let Some(rewrite) = context.plan.base_by_key.get(&base_cursor_key) {
             Some(rewrite.index_name.clone())
         } else {
-            let ty::TyKind::RawPtr(pointee, mutability) =
-                context.body.local_decls[group.base_local].ty.kind()
+            let Some(base_info) =
+                analyses::array_local_provenance::base_slot_info(context.provenance, group)
             else {
                 return;
             };
-            let index_name = fresh_index_name(&base_name, context.existing_names);
+            let Some(base_ptr_ty) = slot_ty(context.body, context.tcx, base_info) else {
+                return;
+            };
+            let ty::TyKind::RawPtr(pointee, mutability) = base_ptr_ty.kind() else {
+                return;
+            };
+            let index_stem = if group.base_slot_offset == 0 {
+                base_name.clone()
+            } else {
+                slot_path_to_index_stem(
+                    &context.tcx.hir_name(base_hir_id).to_string(),
+                    &base_info.path,
+                    context.body.local_decls[group.base_local].ty,
+                    context.tcx,
+                )
+                .unwrap_or_else(|| context.tcx.hir_name(base_hir_id).to_string())
+            };
+            let index_name = fresh_index_name(&index_stem, context.existing_names);
             let pointee = utils::ir::mir_ty_to_string(*pointee, context.tcx);
             let ptr_ty = format!(
                 "*{} {}",
@@ -451,8 +491,8 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 .entry(context.def_id)
                 .or_default()
                 .insert(index_name.clone());
-            context.plan.base_by_hir_id.insert(
-                base_hir_id,
+            context.plan.base_by_key.insert(
+                base_cursor_key,
                 BaseCursorRewrite {
                     fn_def_id: context.def_id,
                     base_hir_id,
@@ -460,6 +500,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                     index_name: index_name.clone(),
                     base_is_raw_ptr,
                     ptr_ty,
+                    field_base: group.base_slot_offset != 0,
                 },
             );
             Some(index_name)
@@ -522,10 +563,45 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 nullable,
                 ptr_ty,
                 ptr_mut: mutability.is_mut(),
+                field_base: group.base_slot_offset != 0,
                 base_proxy_hir_ids: proxy_hir_ids.clone(),
+                group_member_hir_ids: group_member_hir_ids.clone(),
             },
         );
     }
+}
+
+fn slot_ty<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    info: &SlotInfo,
+) -> Option<ty::Ty<'tcx>> {
+    let mut ty = body.local_decls[info.root].ty;
+
+    for elem in &info.path {
+        match elem {
+            SlotPathElem::Pointee => {
+                ty = ty.builtin_deref(true)?;
+            }
+            SlotPathElem::Field(field) => {
+                ty = match ty.kind() {
+                    ty::TyKind::Adt(adt_def, args) => {
+                        if !adt_def.is_struct() || adt_def.is_union() {
+                            return None;
+                        }
+                        adt_def.all_fields().nth(field.index())?.ty(tcx, args)
+                    }
+                    ty::TyKind::Tuple(tys) => tys.iter().nth(field.index())?,
+                    _ => return None,
+                };
+            }
+            SlotPathElem::Element => {
+                ty = ty.builtin_index()?;
+            }
+        }
+    }
+
+    Some(ty)
 }
 
 fn fresh_index_name(source_name: &str, existing_names: &mut FxHashSet<String>) -> String {
@@ -537,6 +613,33 @@ fn fresh_index_name(source_name: &str, existing_names: &mut FxHashSet<String>) -
     }
     existing_names.insert(candidate.clone());
     candidate
+}
+
+fn slot_path_to_index_stem<'tcx>(
+    local_name: &str,
+    path: &[SlotPathElem],
+    mut ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for elem in path {
+        match elem {
+            SlotPathElem::Pointee => {
+                ty = ty.builtin_deref(true)?;
+            }
+            SlotPathElem::Field(field) => {
+                let (field_name, field_ty) = named_struct_field(tcx, ty, *field)?;
+                parts.push(field_name);
+                ty = field_ty;
+            }
+            SlotPathElem::Element => return None,
+        }
+    }
+    if parts.is_empty() {
+        Some(local_name.to_string())
+    } else {
+        Some(parts.join("_"))
+    }
 }
 
 fn slot_path_to_expr_string<'tcx>(
@@ -563,16 +666,91 @@ fn slot_path_to_expr_string<'tcx>(
     Some(expr)
 }
 
-fn local_only_directly_assigned(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
-    for block_data in body.basic_blocks.iter() {
+fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
+    let mut has_call_destination = false;
+    let mut has_non_assignment_use = false;
+
+    for (block, block_data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in block_data.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            if let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind {
+                if lhs.local == local && lhs.projection.is_empty() {
+                    if rvalue_mentions_local(rvalue, local, location) {
+                        has_non_assignment_use = true;
+                    }
+                    continue;
+                }
+            }
+            if statement_mentions_local(statement, local, location) {
+                has_non_assignment_use = true;
+            }
+        }
         if let Some(terminator) = &block_data.terminator
             && let TerminatorKind::Call { destination, .. } = &terminator.kind
-            && destination.local == local
         {
-            return false;
+            if destination.local == local {
+                has_call_destination = true;
+            }
+        }
+        if let Some(terminator) = &block_data.terminator {
+            let location = Location {
+                block,
+                statement_index: block_data.statements.len(),
+            };
+            if terminator_mentions_local(terminator, local, location) {
+                has_non_assignment_use = true;
+            }
         }
     }
-    true
+
+    !has_call_destination && !has_non_assignment_use
+}
+
+struct LocalMentionVisitor {
+    local: Local,
+    found: bool,
+}
+
+impl<'tcx> MirVisitor<'tcx> for LocalMentionVisitor {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
+        if local == self.local && !matches!(context, PlaceContext::NonUse(_)) {
+            self.found = true;
+        }
+    }
+}
+
+fn rvalue_mentions_local(rvalue: &Rvalue<'_>, local: Local, location: Location) -> bool {
+    let mut visitor = LocalMentionVisitor {
+        local,
+        found: false,
+    };
+    visitor.visit_rvalue(rvalue, location);
+    visitor.found
+}
+
+fn statement_mentions_local(statement: &Statement<'_>, local: Local, location: Location) -> bool {
+    let mut visitor = LocalMentionVisitor {
+        local,
+        found: false,
+    };
+    visitor.visit_statement(statement, location);
+    visitor.found
+}
+
+fn terminator_mentions_local(
+    terminator: &Terminator<'_>,
+    local: Local,
+    location: Location,
+) -> bool {
+    let mut visitor = LocalMentionVisitor {
+        local,
+        found: false,
+    };
+    visitor.visit_terminator(terminator, location);
+    visitor.found
 }
 
 fn prune_unsupported_direct_place_uses(
@@ -589,7 +767,7 @@ fn prune_unsupported_direct_place_uses(
         ast_to_hir,
         tcx,
         planned_rewrites: plan.by_hir_id.clone(),
-        base_rewrites: plan.base_by_hir_id.clone(),
+        base_rewrites: plan.base_by_key.clone(),
         unsupported_hir_ids: FxHashSet::default(),
     };
     visitor.visit_crate(krate);
@@ -601,21 +779,21 @@ fn prune_unsupported_direct_place_uses(
 }
 
 fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
-    let live_base_hir_ids = plan
+    let live_base_keys = plan
         .by_hir_id
         .values()
         .filter(|rewrite| rewrite.base_index_name.is_some())
-        .map(|rewrite| rewrite.base_hir_id)
+        .map(|rewrite| base_cursor_key(rewrite.base_hir_id, &rewrite.base_name))
         .collect::<FxHashSet<_>>();
-    plan.base_by_hir_id
-        .retain(|base_hir_id, _| live_base_hir_ids.contains(base_hir_id));
+    plan.base_by_key
+        .retain(|base_key, _| live_base_keys.contains(base_key));
 }
 
 struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
     ast_to_hir: &'a AstToHir,
     tcx: TyCtxt<'tcx>,
     planned_rewrites: FxHashMap<HirId, BindingRewrite>,
-    base_rewrites: FxHashMap<HirId, BaseCursorRewrite>,
+    base_rewrites: FxHashMap<BaseCursorKey, BaseCursorRewrite>,
     unsupported_hir_ids: FxHashSet<HirId>,
 }
 
@@ -648,8 +826,10 @@ impl AstVisitor<'_> for UnsupportedDirectPlaceUseVisitor<'_, '_> {
 
 impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
     fn check_assignment(&mut self, lhs: &Expr, rhs: &Expr) {
-        if let Some(base_hir_id) = direct_local_hir_id(self.ast_to_hir, self.tcx, lhs) {
-            if let Some(base_rewrite) = self.base_rewrites.get(&base_hir_id) {
+        if let Some(base_key) =
+            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.base_rewrites, lhs)
+        {
+            if let Some(base_rewrite) = self.base_rewrites.get(&base_key) {
                 let index = base_assignment_index_expr(
                     rhs,
                     self.ast_to_hir,
@@ -666,11 +846,11 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                         base_rewrite,
                     );
                 if unsupported {
-                    self.mark_rewrites_for_base_unsupported(base_hir_id);
+                    self.mark_rewrites_for_base_unsupported(&base_key);
                 }
                 return;
             } else {
-                self.mark_rewrites_for_base_unsupported(base_hir_id);
+                self.mark_rewrites_for_base_unsupported(&base_key);
             }
         }
 
@@ -683,7 +863,14 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
         let Some(rewrite) = self.planned_rewrites.get(&hir_id) else {
             return;
         };
-        let index = assignment_index_expr(rhs, self.ast_to_hir, self.tcx, rewrite);
+        let index = assignment_index_expr(
+            rhs,
+            self.ast_to_hir,
+            self.tcx,
+            &self.planned_rewrites,
+            None,
+            rewrite,
+        );
         if index_init_expr(index, rewrite.nullable).is_none()
             || assignment_index_arg_contains_planned_local(
                 rhs,
@@ -697,19 +884,20 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
         }
     }
 
-    fn mark_rewrites_for_base_unsupported(&mut self, base_hir_id: HirId) {
+    fn mark_rewrites_for_base_unsupported(&mut self, base_key: &BaseCursorKey) {
         for rewrite in self.planned_rewrites.values() {
-            if rewrite.base_hir_id == base_hir_id {
+            if base_cursor_key(rewrite.base_hir_id, &rewrite.base_name) == *base_key {
                 self.unsupported_hir_ids.insert(rewrite.source_hir_id);
             }
         }
     }
 
     fn mark_direct_base_cursor(&mut self, expr: &Expr) -> Option<HirId> {
-        let hir_id = direct_local_hir_id(self.ast_to_hir, self.tcx, expr)?;
-        if self.base_rewrites.contains_key(&hir_id) {
-            self.mark_rewrites_for_base_unsupported(hir_id);
-            Some(hir_id)
+        let base_key =
+            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.base_rewrites, expr)?;
+        if self.base_rewrites.contains_key(&base_key) {
+            self.mark_rewrites_for_base_unsupported(&base_key);
+            Some(base_key.0)
         } else {
             None
         }
@@ -784,7 +972,10 @@ fn assignment_index_arg_contains_planned_local(
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
     let receiver_is_base = receiver_hir_id == Some(rewrite.base_hir_id)
         || receiver_is_base_as_ptr(receiver, ast_to_hir, tcx, rewrite)
-        || receiver_hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id));
+        || receiver_hir_id.is_some_and(|id| {
+            rewrite.base_proxy_hir_ids.contains(&id)
+                || (rewrite.field_base && rewrite.group_member_hir_ids.contains(&id))
+        });
     if !receiver_is_base && receiver_hir_id != Some(rewrite.source_hir_id) {
         return false;
     }
@@ -808,13 +999,22 @@ fn base_assignment_index_arg_contains_planned_local(
     }
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
-    let receiver_is_base = receiver_hir_id == Some(base_rewrite.base_hir_id)
-        || receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_rewrite.base_hir_id);
+    let receiver_is_base = (!base_rewrite.field_base
+        && receiver_hir_id == Some(base_rewrite.base_hir_id))
+        || receiver_is_base_as_ptr_for_context(
+            receiver,
+            ast_to_hir,
+            tcx,
+            base_rewrite.base_hir_id,
+            &base_rewrite.base_name,
+            base_rewrite.field_base,
+        )
+        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
     if !receiver_is_base
         && !receiver_hir_id.is_some_and(|hir_id| {
             planned_rewrites
                 .get(&hir_id)
-                .is_some_and(|rewrite| rewrite.base_hir_id == base_rewrite.base_hir_id)
+                .is_some_and(|rewrite| same_rewrite_base(rewrite, base_rewrite))
         })
     {
         return false;
@@ -832,14 +1032,41 @@ fn direct_planned_local_hir_id(
     planned_rewrites.contains_key(&hir_id).then_some(hir_id)
 }
 
+fn same_rewrite_base(rewrite: &BindingRewrite, base_rewrite: &BaseCursorRewrite) -> bool {
+    rewrite.base_hir_id == base_rewrite.base_hir_id && rewrite.base_name == base_rewrite.base_name
+}
+
+fn base_cursor_key(base_hir_id: HirId, base_name: &str) -> BaseCursorKey {
+    (base_hir_id, base_name.to_string())
+}
+
 fn direct_base_cursor_hir_id(
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
-    base_rewrites: &FxHashMap<HirId, BaseCursorRewrite>,
+    base_rewrites: &FxHashMap<BaseCursorKey, BaseCursorRewrite>,
     expr: &Expr,
-) -> Option<HirId> {
+) -> Option<BaseCursorKey> {
     let hir_id = direct_local_hir_id(ast_to_hir, tcx, expr)?;
-    base_rewrites.contains_key(&hir_id).then_some(hir_id)
+    base_rewrites.iter().find_map(|(key, rewrite)| {
+        (!rewrite.field_base && rewrite.base_hir_id == hir_id).then_some(key.clone())
+    })
+}
+
+fn direct_base_cursor_key(
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base_rewrites: &FxHashMap<BaseCursorKey, BaseCursorRewrite>,
+    expr: &Expr,
+) -> Option<BaseCursorKey> {
+    if let Some(base_key) = direct_base_cursor_hir_id(ast_to_hir, tcx, base_rewrites, expr) {
+        return Some(base_key);
+    }
+    base_rewrites.iter().find_map(|(key, rewrite)| {
+        (rewrite.field_base
+            && expr_matches_base_name(expr, &rewrite.base_name)
+            && expr_is_projection_from_base_hir(expr, ast_to_hir, tcx, rewrite.base_hir_id))
+        .then_some(key.clone())
+    })
 }
 
 fn direct_local_hir_id(ast_to_hir: &AstToHir, tcx: TyCtxt<'_>, expr: &Expr) -> Option<HirId> {
@@ -902,6 +1129,25 @@ fn is_null_expr(expr: &Expr) -> bool {
     }
 }
 
+fn unwrap_pointer_producing_expr(expr: &Expr) -> &Expr {
+    let expr = unwrap_cast_and_paren(expr);
+    match &expr.kind {
+        ExprKind::AddrOf(_, _, inner) => {
+            let inner = unwrap_cast_and_paren(inner);
+            if let ExprKind::Unary(UnOp::Deref, deref_inner) = &inner.kind {
+                return unwrap_pointer_producing_expr(deref_inner);
+            }
+            expr
+        }
+        _ => expr,
+    }
+}
+
+fn expr_matches_base_name(expr: &Expr, base_name: &str) -> bool {
+    pprust::expr_to_string(unwrap_cast_and_paren(expr)).replace(' ', "")
+        == base_name.replace(' ', "")
+}
+
 fn offset_index_arg_expr(name: &str, arg: &Expr) -> Expr {
     if name == "add" || matches!(unwrap_cast_and_paren(arg).kind, ExprKind::Lit(_)) {
         utils::expr!("({}) as isize", pprust::expr_to_string(arg))
@@ -923,6 +1169,26 @@ fn base_current_index_expr(rewrite: &BindingRewrite) -> Option<&str> {
     rewrite.base_index_name.as_deref()
 }
 
+fn expr_is_projection_from_base_hir(
+    expr: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base_hir_id: HirId,
+) -> bool {
+    let expr = unwrap_cast_and_paren(expr);
+    if hir_id_of_ast_expr(ast_to_hir, tcx, expr.id) == Some(base_hir_id) {
+        return true;
+    }
+    match &expr.kind {
+        ExprKind::AddrOf(_, _, inner)
+        | ExprKind::Field(inner, _)
+        | ExprKind::Unary(UnOp::Deref, inner) => {
+            expr_is_projection_from_base_hir(inner, ast_to_hir, tcx, base_hir_id)
+        }
+        _ => false,
+    }
+}
+
 fn receiver_is_base_as_ptr_hir(
     receiver: &Expr,
     ast_to_hir: &AstToHir,
@@ -936,8 +1202,33 @@ fn receiver_is_base_as_ptr_hir(
     if !matches!(name, "as_ptr" | "as_mut_ptr") || !call.args.is_empty() {
         return false;
     }
-    hir_id_of_ast_expr(ast_to_hir, tcx, unwrap_cast_and_paren(&call.receiver).id)
-        == Some(base_hir_id)
+    expr_is_projection_from_base_hir(&call.receiver, ast_to_hir, tcx, base_hir_id)
+}
+
+fn receiver_is_field_base_as_ptr(receiver: &Expr, base_name: &str) -> bool {
+    let ExprKind::MethodCall(call) = &receiver.kind else {
+        return false;
+    };
+    let name = call.seg.ident.name.as_str();
+    if !matches!(name, "as_ptr" | "as_mut_ptr") || !call.args.is_empty() {
+        return false;
+    }
+    expr_matches_base_name(&call.receiver, base_name)
+}
+
+fn receiver_is_base_as_ptr_for_context(
+    receiver: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base_hir_id: HirId,
+    base_name: &str,
+    field_base: bool,
+) -> bool {
+    if field_base {
+        receiver_is_field_base_as_ptr(receiver, base_name)
+    } else {
+        receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_hir_id)
+    }
 }
 
 fn receiver_is_base_as_ptr(
@@ -946,19 +1237,56 @@ fn receiver_is_base_as_ptr(
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
 ) -> bool {
-    receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, rewrite.base_hir_id)
+    receiver_is_base_as_ptr_for_context(
+        receiver,
+        ast_to_hir,
+        tcx,
+        rewrite.base_hir_id,
+        &rewrite.base_name,
+        rewrite.field_base,
+    )
 }
 
-fn receiver_is_base_pointer_expr(
-    receiver: &Expr,
+fn slice_base_expr_from_as_ptr_receiver(receiver: &Expr) -> &Expr {
+    let receiver = unwrap_cast_and_paren(receiver);
+    if let ExprKind::AddrOf(_, _, inner) = &receiver.kind {
+        unwrap_cast_and_paren(inner)
+    } else {
+        receiver
+    }
+}
+
+fn projected_as_ptr_receiver_base_name(
+    expr: &Expr,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
-) -> bool {
-    let hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
-    hir_id == Some(rewrite.base_hir_id)
-        || receiver_is_base_as_ptr(receiver, ast_to_hir, tcx, rewrite)
-        || hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id))
+) -> Option<String> {
+    if rewrite.field_base {
+        return None;
+    }
+    let expr = unwrap_pointer_producing_expr(expr);
+    let ExprKind::MethodCall(offset_call) = &expr.kind else {
+        return None;
+    };
+    let name = offset_call.seg.ident.name.as_str();
+    if !matches!(name, "offset" | "add") || offset_call.args.len() != 1 {
+        return None;
+    }
+    let receiver = unwrap_cast_and_paren(&offset_call.receiver);
+    let ExprKind::MethodCall(as_ptr_call) = &receiver.kind else {
+        return None;
+    };
+    let as_ptr_name = as_ptr_call.seg.ident.name.as_str();
+    if !matches!(as_ptr_name, "as_ptr" | "as_mut_ptr") || !as_ptr_call.args.is_empty() {
+        return None;
+    }
+    let base_expr = slice_base_expr_from_as_ptr_receiver(&as_ptr_call.receiver);
+    if hir_id_of_ast_expr(ast_to_hir, tcx, base_expr.id) == Some(rewrite.base_hir_id) {
+        return None;
+    }
+    expr_is_projection_from_base_hir(base_expr, ast_to_hir, tcx, rewrite.base_hir_id)
+        .then(|| pprust::expr_to_string(base_expr))
 }
 
 fn offset_from_base_expr(
@@ -967,19 +1295,44 @@ fn offset_from_base_expr(
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
 ) -> IndexExpr {
+    pointer_index_from_base_expr(
+        expr,
+        ast_to_hir,
+        tcx,
+        rewrite.base_hir_id,
+        &rewrite.base_name,
+        rewrite.field_base,
+        &rewrite.base_proxy_hir_ids,
+        base_current_index_expr(rewrite),
+    )
+}
+
+fn pointer_index_from_base_expr(
+    expr: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base_hir_id: HirId,
+    base_name: &str,
+    field_base: bool,
+    base_proxy_hir_ids: &FxHashSet<HirId>,
+    base_index_name: Option<&str>,
+) -> IndexExpr {
     if is_null_expr(expr) {
         return IndexExpr::Null;
     }
-    let expr = unwrap_cast_and_paren(expr);
+
+    let expr = unwrap_pointer_producing_expr(expr);
     let expr_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, expr.id);
-    if expr_hir_id == Some(rewrite.base_hir_id)
-        || expr_hir_id.is_some_and(|id| rewrite.base_proxy_hir_ids.contains(&id))
+    if (!field_base && expr_hir_id == Some(base_hir_id))
+        || expr_hir_id.is_some_and(|id| base_proxy_hir_ids.contains(&id))
+        || (field_base && expr_matches_base_name(expr, base_name))
     {
-        return IndexExpr::Plain(match base_current_index_expr(rewrite) {
-            Some(base_index_name) => utils::expr!("{}", base_index_name),
+        return IndexExpr::Plain(match base_index_name {
+            Some(index_name) => utils::expr!("{}", index_name),
             None => utils::expr!("0isize"),
         });
     }
+
     let ExprKind::MethodCall(call) = &expr.kind else {
         return IndexExpr::Unsupported;
     };
@@ -988,29 +1341,35 @@ fn offset_from_base_expr(
         return IndexExpr::Unsupported;
     }
     let receiver = unwrap_cast_and_paren(&call.receiver);
-    if !receiver_is_base_pointer_expr(receiver, ast_to_hir, tcx, rewrite) {
+    let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
+    let receiver_is_base = (!field_base && receiver_hir_id == Some(base_hir_id))
+        || receiver_is_base_as_ptr_for_context(
+            receiver,
+            ast_to_hir,
+            tcx,
+            base_hir_id,
+            base_name,
+            field_base,
+        )
+        || (field_base && expr_matches_base_name(receiver, base_name))
+        || receiver_hir_id.is_some_and(|id| base_proxy_hir_ids.contains(&id));
+    if !receiver_is_base {
         return IndexExpr::Unsupported;
     }
     let offset = offset_index_arg_expr(name, &call.args[0]);
-    if let Some(base_index_name) = base_current_index_expr(rewrite) {
-        IndexExpr::Plain(add_index_expr(base_index_name, &offset))
-    } else {
-        IndexExpr::Plain(offset)
+    match base_index_name {
+        Some(index_name) => IndexExpr::Plain(add_index_expr(index_name, &offset)),
+        None => IndexExpr::Plain(offset),
     }
 }
 
-fn assignment_index_expr(
+fn group_member_pointer_assignment_index_expr(
     rhs: &Expr,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
 ) -> IndexExpr {
-    match offset_from_base_expr(rhs, ast_to_hir, tcx, rewrite) {
-        IndexExpr::Unsupported => {}
-        index => return index,
-    }
-
-    let rhs = unwrap_paren(rhs);
+    let rhs = unwrap_pointer_producing_expr(rhs);
     let ExprKind::MethodCall(call) = &rhs.kind else {
         return IndexExpr::Unsupported;
     };
@@ -1018,9 +1377,95 @@ fn assignment_index_expr(
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
         return IndexExpr::Unsupported;
     }
-    let receiver = unwrap_paren(&call.receiver);
-    if hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) != Some(rewrite.source_hir_id) {
+    let receiver = unwrap_pointer_producing_expr(&call.receiver);
+    let Some(receiver_hir_id) = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) else {
         return IndexExpr::Unsupported;
+    };
+    if !rewrite.group_member_hir_ids.contains(&receiver_hir_id) {
+        return IndexExpr::Unsupported;
+    }
+
+    let rhs_ptr = pprust::expr_to_string(rhs);
+    let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
+    let base_ptr = base_offset_expr_for_index(rewrite, base_index);
+    let relative = utils::expr!("({}).offset_from({})", rhs_ptr, base_ptr);
+    match base_current_index_expr(rewrite) {
+        Some(index_name) => IndexExpr::Plain(add_index_expr(index_name, &relative)),
+        None => IndexExpr::Plain(relative),
+    }
+}
+
+fn introduced_group_member_assignment_index_expr(
+    rhs: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    planned_rewrites: &FxHashMap<HirId, BindingRewrite>,
+    introduced_hir_ids: &FxHashSet<HirId>,
+    rewrite: &BindingRewrite,
+) -> IndexExpr {
+    let rhs = unwrap_pointer_producing_expr(rhs);
+    let ExprKind::MethodCall(call) = &rhs.kind else {
+        return IndexExpr::Unsupported;
+    };
+    let name = call.seg.ident.name.as_str();
+    if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return IndexExpr::Unsupported;
+    }
+    let receiver = unwrap_pointer_producing_expr(&call.receiver);
+    let Some(receiver_hir_id) = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) else {
+        return IndexExpr::Unsupported;
+    };
+    if !rewrite.group_member_hir_ids.contains(&receiver_hir_id)
+        || !introduced_hir_ids.contains(&receiver_hir_id)
+    {
+        return IndexExpr::Unsupported;
+    }
+    let Some(receiver_rewrite) = planned_rewrites.get(&receiver_hir_id) else {
+        return IndexExpr::Unsupported;
+    };
+    if receiver_rewrite.base_hir_id != rewrite.base_hir_id
+        || receiver_rewrite.base_name != rewrite.base_name
+    {
+        return IndexExpr::Unsupported;
+    }
+    IndexExpr::Plain(relative_index_expr(
+        &idx_read_expr(receiver_rewrite),
+        name,
+        &call.args[0],
+    ))
+}
+
+fn assignment_index_expr(
+    rhs: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    planned_rewrites: &FxHashMap<HirId, BindingRewrite>,
+    introduced_hir_ids: Option<&FxHashSet<HirId>>,
+    rewrite: &BindingRewrite,
+) -> IndexExpr {
+    match offset_from_base_expr(rhs, ast_to_hir, tcx, rewrite) {
+        IndexExpr::Unsupported => {}
+        index => return index,
+    }
+
+    let rhs = unwrap_pointer_producing_expr(rhs);
+    let ExprKind::MethodCall(call) = &rhs.kind else {
+        return IndexExpr::Unsupported;
+    };
+    let name = call.seg.ident.name.as_str();
+    if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return IndexExpr::Unsupported;
+    }
+    let receiver = unwrap_pointer_producing_expr(&call.receiver);
+    let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
+    if receiver_hir_id != Some(rewrite.source_hir_id) {
+        if receiver_hir_id.is_some_and(|hir_id| {
+            planned_rewrites.contains_key(&hir_id)
+                && introduced_hir_ids.is_some_and(|introduced| introduced.contains(&hir_id))
+        }) {
+            return IndexExpr::Unsupported;
+        }
+        return group_member_pointer_assignment_index_expr(rhs, ast_to_hir, tcx, rewrite);
     }
     IndexExpr::Plain(relative_index_expr(
         &idx_read_expr(rewrite),
@@ -1040,12 +1485,17 @@ fn base_assignment_index_expr(
         return IndexExpr::Null;
     }
     let rhs = unwrap_cast_and_paren(rhs);
-    if hir_id_of_ast_expr(ast_to_hir, tcx, rhs.id) == Some(base_rewrite.base_hir_id) {
+    if !base_rewrite.field_base
+        && hir_id_of_ast_expr(ast_to_hir, tcx, rhs.id) == Some(base_rewrite.base_hir_id)
+    {
+        return IndexExpr::Plain(utils::expr!("{}", base_rewrite.index_name));
+    }
+    if base_rewrite.field_base && expr_matches_base_name(rhs, &base_rewrite.base_name) {
         return IndexExpr::Plain(utils::expr!("{}", base_rewrite.index_name));
     }
     if let Some(rewrite) = direct_planned_local_hir_id(ast_to_hir, tcx, planned_rewrites, rhs)
         .and_then(|hir_id| planned_rewrites.get(&hir_id))
-        && rewrite.base_hir_id == base_rewrite.base_hir_id
+        && same_rewrite_base(rewrite, base_rewrite)
     {
         return IndexExpr::Plain(utils::expr!("{}", idx_read_expr(rewrite)));
     }
@@ -1059,14 +1509,23 @@ fn base_assignment_index_expr(
     }
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
-    if receiver_hir_id == Some(base_rewrite.base_hir_id)
-        || receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_rewrite.base_hir_id)
-    {
+    let receiver_is_base = (!base_rewrite.field_base
+        && receiver_hir_id == Some(base_rewrite.base_hir_id))
+        || receiver_is_base_as_ptr_for_context(
+            receiver,
+            ast_to_hir,
+            tcx,
+            base_rewrite.base_hir_id,
+            &base_rewrite.base_name,
+            base_rewrite.field_base,
+        )
+        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
+    if receiver_is_base {
         let offset = offset_index_arg_expr(name, &call.args[0]);
         return IndexExpr::Plain(add_index_expr(&base_rewrite.index_name, &offset));
     }
     if let Some(rewrite) = receiver_hir_id.and_then(|hir_id| planned_rewrites.get(&hir_id))
-        && rewrite.base_hir_id == base_rewrite.base_hir_id
+        && same_rewrite_base(rewrite, base_rewrite)
     {
         return IndexExpr::Plain(relative_index_expr(
             &idx_read_expr(rewrite),
@@ -1171,7 +1630,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         {
             let mut cursors = self
                 .plan
-                .base_by_hir_id
+                .base_by_key
                 .values()
                 .filter(|rewrite| rewrite.fn_def_id == def_id)
                 .cloned()
@@ -1200,7 +1659,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             mut_visit::walk_local(self, local);
             return;
         };
-        let Some(rewrite) = self.plan.by_hir_id.get(&hir_id).cloned() else {
+        let Some(mut rewrite) = self.plan.by_hir_id.get(&hir_id).cloned() else {
             mut_visit::walk_local(self, local);
             return;
         };
@@ -1208,7 +1667,24 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             mut_visit::walk_local(self, local);
             return;
         };
-        let index = offset_from_base_expr(init, self.ast_to_hir, self.tcx, &rewrite);
+        if let Some(base_name) =
+            projected_as_ptr_receiver_base_name(init, self.ast_to_hir, self.tcx, &rewrite)
+        {
+            rewrite.base_name = base_name;
+            rewrite.base_is_raw_ptr = false;
+            self.plan.by_hir_id.insert(hir_id, rewrite.clone());
+        }
+        let mut index = offset_from_base_expr(init, self.ast_to_hir, self.tcx, &rewrite);
+        if let IndexExpr::Unsupported = index {
+            index = introduced_group_member_assignment_index_expr(
+                init,
+                self.ast_to_hir,
+                self.tcx,
+                &self.plan.by_hir_id,
+                &self.introduced_hir_ids,
+                &rewrite,
+            );
+        }
         let Some(new_init) = index_init_expr(index, rewrite.nullable) else {
             mut_visit::walk_local(self, local);
             return;
@@ -1226,12 +1702,9 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
     fn visit_expr(&mut self, expr: &mut Expr) {
         match &mut expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
-                if let Some(hir_id) = direct_base_cursor_hir_id(
-                    self.ast_to_hir,
-                    self.tcx,
-                    &self.plan.base_by_hir_id,
-                    lhs,
-                ) && let Some(rewrite) = self.plan.base_by_hir_id.get(&hir_id)
+                if let Some(base_key) =
+                    direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
+                    && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
                 {
                     let index = base_assignment_index_expr(
                         rhs,
@@ -1256,7 +1729,24 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                     lhs,
                 ) && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id)
                 {
-                    let index = assignment_index_expr(rhs, self.ast_to_hir, self.tcx, rewrite);
+                    let mut index = introduced_group_member_assignment_index_expr(
+                        rhs,
+                        self.ast_to_hir,
+                        self.tcx,
+                        &self.plan.by_hir_id,
+                        &self.introduced_hir_ids,
+                        rewrite,
+                    );
+                    if let IndexExpr::Unsupported = index {
+                        index = assignment_index_expr(
+                            rhs,
+                            self.ast_to_hir,
+                            self.tcx,
+                            &self.plan.by_hir_id,
+                            Some(&self.introduced_hir_ids),
+                            rewrite,
+                        );
+                    }
                     if let Some(new_rhs) = index_assignment_rhs_expr(index, rewrite.nullable) {
                         *lhs = P(utils::expr!("{}", rewrite.index_name));
                         *rhs = P(new_rhs);
@@ -1271,13 +1761,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 return;
             }
             ExprKind::AssignOp(_, lhs, rhs) => {
-                if direct_base_cursor_hir_id(
-                    self.ast_to_hir,
-                    self.tcx,
-                    &self.plan.base_by_hir_id,
-                    lhs,
-                )
-                .is_none()
+                if direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
+                    .is_none()
                     && introduced_planned_local_hir_id(
                         self.ast_to_hir,
                         self.tcx,
@@ -1292,13 +1777,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 return;
             }
             ExprKind::AddrOf(_, _, inner) => {
-                if direct_base_cursor_hir_id(
-                    self.ast_to_hir,
-                    self.tcx,
-                    &self.plan.base_by_hir_id,
-                    inner,
-                )
-                .is_none()
+                if direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, inner)
+                    .is_none()
                     && introduced_planned_local_hir_id(
                         self.ast_to_hir,
                         self.tcx,
@@ -1332,9 +1812,56 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             }
         }
 
+        if let ExprKind::Binary(op, lhs, rhs) = &expr.kind
+            && matches!(
+                op.node,
+                BinOpKind::Eq
+                    | BinOpKind::Ne
+                    | BinOpKind::Lt
+                    | BinOpKind::Le
+                    | BinOpKind::Gt
+                    | BinOpKind::Ge
+            )
+        {
+            let lhs_hir =
+                hir_id_of_ast_expr(self.ast_to_hir, self.tcx, unwrap_cast_and_paren(lhs).id);
+            let rhs_hir =
+                hir_id_of_ast_expr(self.ast_to_hir, self.tcx, unwrap_cast_and_paren(rhs).id);
+            let lhs_rewrite = lhs_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
+            let rhs_rewrite = rhs_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
+            let lhs_introduced =
+                lhs_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
+            let rhs_introduced =
+                rhs_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
+            if let (Some(lhs_rewrite), Some(rhs_rewrite)) = (lhs_rewrite, rhs_rewrite)
+                && lhs_introduced
+                && rhs_introduced
+                && !lhs_rewrite.nullable
+                && !rhs_rewrite.nullable
+                && lhs_rewrite.base_hir_id == rhs_rewrite.base_hir_id
+                && lhs_rewrite.base_name == rhs_rewrite.base_name
+                && lhs_rewrite.ptr_ty == rhs_rewrite.ptr_ty
+            {
+                let lhs_idx = idx_read_expr(lhs_rewrite);
+                let rhs_idx = idx_read_expr(rhs_rewrite);
+                *expr = match op.node {
+                    BinOpKind::Eq => utils::expr!("{lhs_idx} == {rhs_idx}"),
+                    BinOpKind::Ne => utils::expr!("{lhs_idx} != {rhs_idx}"),
+                    BinOpKind::Lt => utils::expr!("{lhs_idx} < {rhs_idx}"),
+                    BinOpKind::Le => utils::expr!("{lhs_idx} <= {rhs_idx}"),
+                    BinOpKind::Gt => utils::expr!("{lhs_idx} > {rhs_idx}"),
+                    BinOpKind::Ge => utils::expr!("{lhs_idx} >= {rhs_idx}"),
+                    _ => unreachable!(),
+                };
+                self.changed = true;
+                return;
+            }
+        }
+
         if let ExprKind::Unary(UnOp::Deref, inner) = &mut expr.kind
-            && let Some(hir_id) = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, inner.id)
-            && let Some(rewrite) = self.plan.base_by_hir_id.get(&hir_id)
+            && let Some(base_key) =
+                direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, inner)
+            && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
         {
             let ptr = base_cursor_pointer_expr(rewrite);
             *expr = utils::expr!("*({})", pprust::expr_to_string(&ptr));
@@ -1353,10 +1880,55 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             return;
         }
 
+        if let ExprKind::MethodCall(call) = &expr.kind
+            && call.seg.ident.name.as_str() == "offset_from"
+            && call.args.len() == 1
+        {
+            let receiver = unwrap_cast_and_paren(&call.receiver);
+            let arg = unwrap_cast_and_paren(&call.args[0]);
+            let receiver_hir = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, receiver.id);
+            let arg_hir = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, arg.id);
+            let receiver_rewrite = receiver_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
+            let arg_rewrite = arg_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
+            let receiver_introduced =
+                receiver_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
+            let arg_introduced =
+                arg_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
+            let replacement = if let (Some(lhs), Some(rhs)) = (receiver_rewrite, arg_rewrite)
+                && lhs.base_hir_id == rhs.base_hir_id
+                && lhs.base_name == rhs.base_name
+            {
+                if receiver_introduced && arg_introduced {
+                    Some(utils::expr!(
+                        "({}) - ({})",
+                        idx_read_expr(lhs),
+                        idx_read_expr(rhs)
+                    ))
+                } else if arg_introduced {
+                    let base_ptr = base_offset_expr_for_index(rhs, &idx_read_expr(rhs));
+                    Some(utils::expr!(
+                        "({}).offset_from({})",
+                        pprust::expr_to_string(receiver),
+                        base_ptr
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
+                *expr = replacement;
+                self.changed = true;
+                return;
+            }
+        }
+
         mut_visit::walk_expr(self, expr);
 
-        if let Some(hir_id) = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, expr.id)
-            && let Some(rewrite) = self.plan.base_by_hir_id.get(&hir_id)
+        if let Some(base_key) =
+            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, expr)
+            && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
         {
             *expr = base_cursor_pointer_expr(rewrite);
             self.changed = true;
