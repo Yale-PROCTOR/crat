@@ -119,7 +119,6 @@ struct Args {
         help = "Enable verbose ownership solver output for the pointer pass"
     )]
     pointer_verbose: bool,
-
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]

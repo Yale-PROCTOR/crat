@@ -9071,3 +9071,49 @@ pub unsafe fn make_holder() -> Holder {
         );
     }
 }
+
+#[test]
+fn test_array_local_rewriter_field_base_group_rewrites_loop_pointers() {
+    let code = r#"
+#[repr(C)]
+pub struct Image {
+    pub pix: *mut u8,
+    pub w: i32,
+    pub h: i32,
+}
+pub unsafe fn flip(mut img: *mut Image) {
+    let mut pix: *mut u8 = (*img).pix;
+    let mut w: i32 = (*img).w;
+    let mut h: i32 = (*img).h;
+    let mut flips: i32 = h / 2;
+    let mut i: i32 = 0;
+    while i < flips {
+        let mut a: *mut u8 = pix.offset((w * i) as isize);
+        let mut b: *mut u8 = pix.offset((w * (h - i - 1)) as isize);
+        let mut j: i32 = 0;
+        while j < w {
+            let t: u8 = *a;
+            *a = *b;
+            *b = t;
+            a = a.offset(1);
+            b = b.offset(1);
+            j += 1;
+        }
+        i += 1;
+    }
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    eprintln!("changed={changed}\n{s}");
+    assert!(changed, "expected rewrite to change the code:\n{s}");
+    assert!(s.contains("a_idx"), "expected a_idx in:\n{s}");
+    assert!(s.contains("b_idx"), "expected b_idx in:\n{s}");
+    assert!(
+        !s.contains("let mut a: *mut u8"),
+        "expected a to be rewritten in:\n{s}"
+    );
+    assert!(
+        !s.contains("let mut b: *mut u8"),
+        "expected b to be rewritten in:\n{s}"
+    );
+}
