@@ -8164,6 +8164,44 @@ pub unsafe fn foo(p: &[i32], n: isize) -> i32 {
 }
 
 #[test]
+fn test_array_local_rewriter_rewrites_wrapped_array_field_pointer_initializers() {
+    let code = r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct ResultArray {
+    pub data: [Item; 8],
+    pub count: i32,
+}
+
+pub unsafe fn weighted(mut arr: *mut ResultArray, mut i: isize) -> i32 {
+    let mut current: *mut Item =
+        &mut *((*arr).data).as_mut_ptr().offset(i) as *mut Item;
+    let mut base: *mut Item =
+        &mut *((*arr).data).as_mut_ptr().offset(0) as *mut Item;
+    let cmp: i32 = if current > base { 1 } else { 0 };
+    let weight: isize = current.offset_from(base);
+    (*current).value + weight as i32 + cmp
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected wrapped pointer initializers to be rewritten:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut current_idx: isize = i"), "{s}");
+    assert!(s.contains("let mut base_idx: isize = (0) as isize"), "{s}");
+    assert!(s.contains("if current_idx > base_idx"), "{s}");
+    assert!(s.contains(".data).as_ptr().offset(current_idx)"), "{s}");
+    assert!(!s.contains("let mut current: *mut Item"), "{s}");
+    assert!(!s.contains("let mut base: *mut Item"), "{s}");
+}
+
+#[test]
 fn test_struct_array_field_run_from_field_rooted_offset() {
     let code = r#"
 #[repr(C)]
@@ -9116,4 +9154,108 @@ pub unsafe fn flip(mut img: *mut Image) {
         !s.contains("let mut b: *mut u8"),
         "expected b to be rewritten in:\n{s}"
     );
+}
+
+#[test]
+fn test_array_local_rewriter_tracks_index_for_reassigned_field_base() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+    pub out_end: *mut i8,
+}
+
+pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance: isize) -> i32 {
+    let mut src: *mut i8 = (*s).out.offset(-distance);
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst as i32 + *src as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected field-base index tracking to rewrite:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("out_idx") || s.contains("s_out_idx"), "{s}");
+    assert!(s.contains("src_idx"), "{s}");
+    assert!(s.contains("dst_idx"), "{s}");
+    assert!(!s.contains("let mut src: *mut i8"), "{s}");
+    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
+    assert!(!s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_distinct_indexes_for_two_reassigned_field_bases() {
+    let code = r#"
+#[repr(C)]
+pub struct Pair {
+    pub a: *mut i8,
+    pub b: *mut i16,
+}
+
+pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
+    let mut ax: *mut i8 = (*p).a.offset(1);
+    let mut bx: *mut i16 = (*p).b.offset(1);
+    (*p).a = (*p).a.offset(da);
+    (*p).b = (*p).b.offset(db);
+    ax = ax.offset(1);
+    bx = bx.offset(1);
+    *ax as i32 + *bx as i32
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected both reassigned field bases to be rewritten:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut a_idx: isize"), "{s}");
+    assert!(s.contains("let mut b_idx: isize"), "{s}");
+    assert!(s.contains("ax_idx"), "{s}");
+    assert!(s.contains("bx_idx"), "{s}");
+    assert!(!s.contains("let mut ax: *mut i8"), "{s}");
+    assert!(!s.contains("let mut bx: *mut i16"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_field_base_cursor_local_used_in_offset_from() {
+    let code = r#"
+#[repr(C)]
+pub struct ProcessState {
+    pub buffer: *mut i8,
+}
+
+unsafe extern "C" {
+    fn memchr(ptr: *const core::ffi::c_void, ch: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut remaining: usize) -> i32 {
+    let mut count: i32 = 0;
+    let mut ptr: *mut i8 = (*state).buffer;
+    while remaining > 0 {
+        let mut found: *mut i8 = memchr(ptr as *const core::ffi::c_void, target as i32, remaining) as *mut i8;
+        if found.is_null() {
+            break;
+        }
+        count += 1;
+        remaining = remaining.wrapping_sub((found.offset_from(ptr) + 1) as usize);
+        ptr = found.offset(1);
+    }
+    count
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected field-base cursor local to be rewritten:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("ptr_idx"), "{s}");
+    assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
+    assert!(!s.contains("ptr = found.offset(1)"), "{s}");
 }
