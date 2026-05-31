@@ -154,6 +154,59 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_remove_slice_path() {
+    run_test(
+        r#"
+unsafe fn f(path: &mut [libc::c_char]) -> libc::c_int {
+    remove(path.as_mut_ptr())
+}"#,
+        &[
+            "crate::c_lib::rs_remove",
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice",
+            "pub(crate) fn rs_remove(path: &str)",
+            "std::fs::remove_file(path)",
+        ],
+        &["std::ffi::CStr::from_ptr", "pub(crate) unsafe fn rs_remove"],
+    );
+}
+
+#[test]
+fn test_remove_raw_path_fallback() {
+    run_test(
+        r#"
+unsafe fn f(path: *mut libc::c_char) -> libc::c_int {
+    remove(path)
+}"#,
+        &[
+            "crate::c_lib::rs_remove",
+            "std::ffi::CStr::from_ptr((path) as",
+            ".to_str().unwrap()",
+            "pub(crate) fn rs_remove(path: &str)",
+        ],
+        &["pub(crate) unsafe fn rs_remove"],
+    );
+}
+
+#[test]
+fn test_rename_slice_paths() {
+    run_test(
+        r#"
+unsafe fn f(old_path: &mut [libc::c_char], new_path: &mut [libc::c_char]) -> libc::c_int {
+    rename(old_path.as_mut_ptr(), new_path.as_mut_ptr())
+}"#,
+        &[
+            "crate::c_lib::rs_rename",
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice",
+            "pub(crate) fn rs_rename(old: &str, new: &str)",
+            "std::fs::rename(old, new)",
+        ],
+        &["std::ffi::CStr::from_ptr", "pub(crate) unsafe fn rs_rename"],
+    );
+}
+
+#[test]
 fn test_file_buf_read() {
     run_test(
         r#"
@@ -580,6 +633,31 @@ unsafe fn f() {
             "write!",
         ],
         &["std::ffi::CStr::from_ptr", "printf"],
+    );
+}
+
+#[test]
+fn test_fprintf_assume_to_str_ok_local_array_string() {
+    run_test_with_config(
+        r#"
+unsafe fn f(stream: *mut FILE) {
+    let mut buf: [libc::c_char; 10] = [0; 10];
+    fprintf(
+        stream,
+        b"%s\n\0" as *const u8 as *const libc::c_char,
+        buf.as_mut_ptr(),
+    );
+}"#,
+        super::Config {
+            assume_to_str_ok: true,
+        },
+        &[
+            "std::ffi::CStr::from_bytes_until_nul",
+            "bytemuck::cast_slice",
+            ".to_str().unwrap()",
+            "write!",
+        ],
+        &["std::ffi::CStr::from_ptr", "fprintf"],
     );
 }
 
