@@ -102,6 +102,8 @@ struct BorrowedRawParamInfo {
 enum LocalRawParamSummary {
     BorrowOnly,
     ReturnedToOwningOutput,
+    ReturnedToBorrowedOutput,
+    Freed,
     Escapes,
 }
 
@@ -109,7 +111,9 @@ impl LocalRawParamSummary {
     fn preserves_owning_call_boundary(self) -> bool {
         matches!(
             self,
-            LocalRawParamSummary::BorrowOnly | LocalRawParamSummary::ReturnedToOwningOutput
+            LocalRawParamSummary::BorrowOnly
+                | LocalRawParamSummary::ReturnedToOwningOutput
+                | LocalRawParamSummary::ReturnedToBorrowedOutput
         )
     }
 }
@@ -1554,6 +1558,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             DecisionReason::UnsupportedAllocatorRoot,
         );
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
+        normalize_owning_call_result_bindings(
+            rust_program.tcx,
+            &sig_decs,
+            &mut ptr_kinds,
+            &forced_raw_bindings,
+        );
         loop {
             let mut changed = false;
             let local_struct_downgrades =
@@ -1634,8 +1644,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if box_input_changed {
                 changed = true;
             }
-            let unsupported_box_outputs =
-                downgrade_unsupported_box_outputs(rust_program.tcx, &mut sig_decs, &ptr_kinds);
+            let unsupported_box_outputs = downgrade_unsupported_box_outputs(
+                rust_program.tcx,
+                &mut sig_decs,
+                &ptr_kinds,
+                &config.c_exposed_fns,
+            );
             for did in &unsupported_box_outputs {
                 record_signature_output_event(
                     &mut diagnostics,
@@ -1784,6 +1798,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             let unsupported_box_usage_subreasons = if diagnostics.is_enabled() {
                 collect_unsupported_box_usage_subreasons(
                     rust_program.tcx,
+                    &sig_decs,
                     &ptr_kinds,
                     &free_like_wrappers,
                     &local_raw_param_summaries,
@@ -1793,6 +1808,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             };
             let unsupported_box_usage_bindings = collect_unsupported_box_usage_bindings(
                 rust_program.tcx,
+                &sig_decs,
                 &ptr_kinds,
                 &free_like_wrappers,
                 &local_raw_param_summaries,
@@ -1835,12 +1851,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     &mut ptr_kinds,
                     &forced_raw_bindings,
                 );
+                normalize_owning_call_result_bindings(
+                    rust_program.tcx,
+                    &sig_decs,
+                    &mut ptr_kinds,
+                    &forced_raw_bindings,
+                );
             }
             if !changed {
                 break;
             }
             ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
             normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
+            normalize_owning_call_result_bindings(
+                rust_program.tcx,
+                &sig_decs,
+                &mut ptr_kinds,
+                &forced_raw_bindings,
+            );
         }
 
         let alloc_wrappers = collect_local_allocator_wrappers(rust_program.tcx);
@@ -1900,6 +1928,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
+        normalize_owning_call_result_bindings(
+            rust_program.tcx,
+            &sig_decs,
+            &mut ptr_kinds,
+            &forced_raw_bindings,
+        );
         apply_field_storage_input_lifetimes(
             rust_program.tcx,
             analysis,
@@ -3444,16 +3478,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         let callee_output = self.forced_local_callee_output_kind(hir_expr);
-        if callee_output == Some(target_kind)
-            || callee_output == Some(target_kind.optional_variant())
-        {
+        if callee_output.is_some_and(|kind| ptr_kind_supports_box_target(kind, target_kind)) {
             return true;
         }
 
         if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind
             && let Res::Local(hir_id) = path.res
             && let Some(rhs_kind) = self.effective_ptr_kind(hir_id)
-            && (rhs_kind == target_kind || rhs_kind == target_kind.optional_variant())
+            && ptr_kind_supports_box_target(rhs_kind, target_kind)
         {
             return true;
         }
@@ -8510,7 +8542,9 @@ fn fn_tail_returns_unsupported_box_binding<'tcx>(
         target_kind: PtrKind,
         lhs_inner_ty: ty::Ty<'tcx>,
     ) -> bool {
-        if !hir_rhs_supports_box_target(tcx, sig_decs, ptr_kinds, expr, target_kind, lhs_inner_ty) {
+        if !hir_rhs_supports_box_target(tcx, sig_decs, ptr_kinds, expr, target_kind, lhs_inner_ty)
+            && !hir_rhs_supports_optional_box_return(tcx, sig_decs, ptr_kinds, expr, target_kind)
+        {
             return true;
         }
         let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_unwrap_casts(expr).kind else {
@@ -8596,6 +8630,79 @@ fn normalize_forced_raw_bindings(
                 .unwrap_or_else(|| kind.is_mut());
             *kind = PtrKind::Raw(raw_mut);
         }
+    }
+}
+
+fn normalize_owning_call_result_bindings(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &mut FxHashMap<HirId, PtrKind>,
+    forced_raw_bindings: &FxHashSet<HirId>,
+) {
+    struct OwningCallResultVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a mut FxHashMap<HirId, PtrKind>,
+        forced_raw_bindings: &'a FxHashSet<HirId>,
+    }
+
+    impl<'tcx> OwningCallResultVisitor<'_, 'tcx> {
+        fn normalize_binding(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            if self.forced_raw_bindings.contains(&hir_id) {
+                return;
+            }
+            let Some(output_kind) =
+                hir_callee_output_kind(self.tcx, self.sig_decs, self.ptr_kinds, rhs)
+            else {
+                return;
+            };
+            if output_kind.is_owning_box_like() {
+                self.ptr_kinds.insert(hir_id, output_kind);
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for OwningCallResultVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.normalize_binding(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = lhs.kind
+                && let Res::Local(hir_id) = path.res
+            {
+                self.normalize_binding(hir_id, rhs);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let crate_hir = tcx.hir_crate(());
+    for maybe_owner in crate_hir.owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        let mut visitor = OwningCallResultVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            forced_raw_bindings,
+        };
+        visitor.visit_body(body);
     }
 }
 
@@ -9402,6 +9509,22 @@ fn is_borrow_like_decision(kind: PtrKind) -> bool {
         kind,
         PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
     )
+}
+
+fn local_callee_arg_preserves_owning_usage(
+    sig_decs: &SigDecisions,
+    local_raw_param_summaries: &FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
+    callee: LocalDefId,
+    arg_index: usize,
+) -> bool {
+    if let Some(summary) = local_raw_param_summaries.get(&(callee, arg_index)).copied() {
+        return summary.preserves_owning_call_boundary();
+    }
+    sig_decs
+        .data
+        .get(&callee)
+        .and_then(|sig_dec| sig_dec.input_decs.get(arg_index).copied().flatten())
+        .is_some_and(is_borrow_like_decision)
 }
 
 fn is_mutable_borrow_like_decision(kind: PtrKind) -> bool {
@@ -10696,6 +10819,7 @@ fn downgrade_unsupported_box_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     sig_decs: &mut SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    c_exposed_fns: &FxHashSet<String>,
 ) -> FxHashSet<LocalDefId> {
     let mut to_raw = Vec::new();
     for (did, sig_dec) in &sig_decs.data {
@@ -10711,14 +10835,16 @@ fn downgrade_unsupported_box_outputs<'tcx>(
         else {
             continue;
         };
-        if fn_tail_returns_unsupported_box_binding(
-            tcx,
-            sig_decs,
-            ptr_kinds,
-            *did,
-            output_kind,
-            inner_ty,
-        ) || fn_output_has_nonowning_local_consumers(tcx, ptr_kinds, *did, output_kind)
+        if is_c_exposed_fn(tcx, *did, c_exposed_fns)
+            || fn_tail_returns_unsupported_box_binding(
+                tcx,
+                sig_decs,
+                ptr_kinds,
+                *did,
+                output_kind,
+                inner_ty,
+            )
+            || fn_output_has_unsupported_nonlocal_consumers(tcx, ptr_kinds, *did, output_kind)
         {
             to_raw.push(*did);
         }
@@ -10733,13 +10859,13 @@ fn downgrade_unsupported_box_outputs<'tcx>(
     changed
 }
 
-fn fn_output_has_nonowning_local_consumers(
+fn fn_output_has_unsupported_nonlocal_consumers(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
     callee_did: LocalDefId,
     output_kind: PtrKind,
 ) -> bool {
-    struct NonOwningCallConsumerVisitor<'a, 'tcx> {
+    struct NonlocalCallConsumerVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         callee_did: LocalDefId,
@@ -10747,25 +10873,7 @@ fn fn_output_has_nonowning_local_consumers(
         found: bool,
     }
 
-    impl<'tcx> NonOwningCallConsumerVisitor<'_, 'tcx> {
-        fn local_target_kind(&self, hir_id: HirId) -> Option<PtrKind> {
-            self.ptr_kinds.get(&hir_id).copied().or_else(|| {
-                let ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
-                unwrap_ptr_from_mir_ty(ty).map(|(_, m)| PtrKind::Raw(m.is_mut()))
-            })
-        }
-
-        fn expr_target_kind(&self, expr: &'tcx hir::Expr<'tcx>) -> Option<PtrKind> {
-            let expr = hir_unwrap_casts(expr);
-            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind
-                && let Res::Local(hir_id) = path.res
-            {
-                return self.local_target_kind(hir_id);
-            }
-            let ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(expr);
-            unwrap_ptr_from_mir_ty(ty).map(|(_, m)| PtrKind::Raw(m.is_mut()))
-        }
-
+    impl<'tcx> NonlocalCallConsumerVisitor<'_, 'tcx> {
         fn call_targets_callee(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
             let expr = hir_unwrap_casts(expr);
             let hir::ExprKind::Call(func, _) = expr.kind else {
@@ -10781,38 +10889,43 @@ fn fn_output_has_nonowning_local_consumers(
             def_id.as_local() == Some(self.callee_did)
         }
 
-        fn target_kind_is_nonowning(&self, kind: Option<PtrKind>) -> bool {
-            kind != Some(self.output_kind)
+        fn expr_target_kind(&self, expr: &'tcx hir::Expr<'tcx>) -> Option<PtrKind> {
+            let expr = hir_unwrap_casts(expr);
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind
+                && let Res::Local(hir_id) = path.res
+            {
+                return self.ptr_kinds.get(&hir_id).copied();
+            }
+            let ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(expr);
+            unwrap_ptr_from_mir_ty(ty).map(|(_, m)| PtrKind::Raw(m.is_mut()))
         }
     }
 
-    impl<'tcx> Visitor<'tcx> for NonOwningCallConsumerVisitor<'_, 'tcx> {
-        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
-            if self.found {
-                return;
-            }
-            if let hir::StmtKind::Let(let_stmt) = stmt.kind
-                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-                && let Some(init) = let_stmt.init
-                && self.call_targets_callee(init)
-                && self.target_kind_is_nonowning(self.local_target_kind(hir_id))
-            {
-                self.found = true;
-                return;
-            }
-            intravisit::walk_stmt(self, stmt);
-        }
-
+    impl<'tcx> Visitor<'tcx> for NonlocalCallConsumerVisitor<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             if self.found {
                 return;
             }
             if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
                 && self.call_targets_callee(rhs)
-                && self.target_kind_is_nonowning(self.expr_target_kind(lhs))
             {
-                self.found = true;
-                return;
+                if matches!(
+                    hir_unwrap_casts(lhs).kind,
+                    hir::ExprKind::Path(hir::QPath::Resolved(
+                        _,
+                        hir::Path {
+                            res: Res::Local(_),
+                            ..
+                        }
+                    ))
+                ) {
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                if self.expr_target_kind(lhs) != Some(self.output_kind) {
+                    self.found = true;
+                    return;
+                }
             }
             intravisit::walk_expr(self, expr);
         }
@@ -10830,7 +10943,7 @@ fn fn_output_has_nonowning_local_consumers(
             continue;
         };
         let body = tcx.hir_body(body);
-        let mut visitor = NonOwningCallConsumerVisitor {
+        let mut visitor = NonlocalCallConsumerVisitor {
             tcx,
             ptr_kinds,
             callee_did,
@@ -10864,24 +10977,11 @@ fn local_called_fn_def_id(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<L
 fn effective_callee_output_kind(
     tcx: TyCtxt<'_>,
     sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    _ptr_kinds: &FxHashMap<HirId, PtrKind>,
     def_id: LocalDefId,
 ) -> Option<PtrKind> {
     let sig_dec = sig_decs.data.get(&def_id)?;
     if let Some(output_dec) = sig_dec.output_dec {
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
-        let Some((inner_ty, _)) =
-            unwrap_ptr_from_mir_ty(body.local_decls[rustc_middle::mir::Local::from_u32(0)].ty)
-        else {
-            return Some(output_dec);
-        };
-        if output_dec.is_owning_box_like()
-            && (fn_tail_returns_unsupported_box_binding(
-                tcx, sig_decs, ptr_kinds, def_id, output_dec, inner_ty,
-            ) || fn_output_has_nonowning_local_consumers(tcx, ptr_kinds, def_id, output_dec))
-        {
-            return Some(PtrKind::Raw(true));
-        }
         return Some(output_dec);
     }
     let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
@@ -10951,6 +11051,7 @@ fn hir_is_borrow_only_foreign_buffer_arg(
     };
     match name.as_str() {
         "memcpy" | "memmove" => arg_index < 2,
+        "memchr" => arg_index == 0,
         "memset" => arg_index == 0,
         "strncpy" => arg_index < 2,
         _ => false,
@@ -12143,8 +12244,10 @@ fn collect_local_raw_param_summaries(
 ) -> FxHashMap<(LocalDefId, usize), LocalRawParamSummary> {
     #[derive(Default)]
     struct ParamFacts {
+        direct_free: bool,
         direct_escape: bool,
         returned_to_owning_output: bool,
+        returned_to_borrowed_output: bool,
         deps: FxHashSet<(LocalDefId, usize)>,
     }
 
@@ -12187,7 +12290,8 @@ fn collect_local_raw_param_summaries(
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
         raw_params_by_fn: &'a FxHashMap<LocalDefId, FxHashMap<HirId, usize>>,
         current_raw_params: &'a FxHashMap<HirId, usize>,
-        returns_owning_output: bool,
+        output_dec: Option<PtrKind>,
+        local_storage_params: FxHashMap<HirId, FxHashSet<usize>>,
         facts: FxHashMap<usize, ParamFacts>,
     }
 
@@ -12197,8 +12301,43 @@ fn collect_local_raw_param_summaries(
             self.current_raw_params.get(&hir_id).copied()
         }
 
+        fn param_indices_in_expr(&self, expr: &'tcx hir::Expr<'tcx>) -> FxHashSet<usize> {
+            let mut params = FxHashSet::default();
+            if let Some(param_index) = self.param_index(expr) {
+                params.insert(param_index);
+            }
+            if let Some(root) = hir_local_place_root_without_deref(expr)
+                && let Some(stored_params) = self.local_storage_params.get(&root)
+            {
+                params.extend(stored_params.iter().copied());
+            }
+            params
+        }
+
+        fn track_local_storage(
+            &mut self,
+            lhs: &'tcx hir::Expr<'tcx>,
+            params: &FxHashSet<usize>,
+        ) -> bool {
+            let Some(root) = hir_local_place_root_without_deref(lhs) else {
+                return false;
+            };
+            if self.current_raw_params.contains_key(&root) {
+                return false;
+            }
+            self.local_storage_params
+                .entry(root)
+                .or_default()
+                .extend(params.iter().copied());
+            true
+        }
+
         fn mark_escape(&mut self, param_index: usize) {
             self.facts.entry(param_index).or_default().direct_escape = true;
+        }
+
+        fn mark_free(&mut self, param_index: usize) {
+            self.facts.entry(param_index).or_default().direct_free = true;
         }
 
         fn mark_returned_to_owning_output(&mut self, param_index: usize) {
@@ -12206,6 +12345,25 @@ fn collect_local_raw_param_summaries(
                 .entry(param_index)
                 .or_default()
                 .returned_to_owning_output = true;
+        }
+
+        fn mark_returned_to_borrowed_output(&mut self, param_index: usize) {
+            self.facts
+                .entry(param_index)
+                .or_default()
+                .returned_to_borrowed_output = true;
+        }
+
+        fn mark_return(&mut self, param_index: usize) {
+            match self.output_dec {
+                Some(kind) if kind.is_owning_box_like() => {
+                    self.mark_returned_to_owning_output(param_index);
+                }
+                Some(kind) if is_borrow_bridgeable_source_decision(kind) => {
+                    self.mark_returned_to_borrowed_output(param_index);
+                }
+                _ => self.mark_escape(param_index),
+            }
         }
 
         fn add_dep(&mut self, param_index: usize, dep: (LocalDefId, usize)) {
@@ -12216,10 +12374,16 @@ fn collect_local_raw_param_summaries(
     impl<'tcx> Visitor<'tcx> for RawParamSummaryVisitor<'_, 'tcx> {
         fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
             if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
                 && let Some(init) = let_stmt.init
-                && let Some(param_index) = self.param_index(init)
             {
-                self.mark_escape(param_index);
+                let params = self.param_indices_in_expr(init);
+                if !params.is_empty() {
+                    self.local_storage_params
+                        .entry(hir_id)
+                        .or_default()
+                        .extend(params);
+                }
             }
             intravisit::walk_stmt(self, stmt);
         }
@@ -12227,17 +12391,19 @@ fn collect_local_raw_param_summaries(
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             match expr.kind {
                 hir::ExprKind::Assign(_, rhs, _) => {
-                    if let Some(param_index) = self.param_index(rhs) {
-                        self.mark_escape(param_index);
+                    let params = self.param_indices_in_expr(rhs);
+                    if !params.is_empty()
+                        && let hir::ExprKind::Assign(lhs, _, _) = expr.kind
+                        && !self.track_local_storage(lhs, &params)
+                    {
+                        for param_index in params {
+                            self.mark_escape(param_index);
+                        }
                     }
                 }
                 hir::ExprKind::Ret(Some(ret)) => {
-                    if let Some(param_index) = self.param_index(ret) {
-                        if self.returns_owning_output {
-                            self.mark_returned_to_owning_output(param_index);
-                        } else {
-                            self.mark_escape(param_index);
-                        }
+                    for param_index in self.param_indices_in_expr(ret) {
+                        self.mark_return(param_index);
                     }
                 }
                 hir::ExprKind::Call(_, args) => {
@@ -12246,34 +12412,42 @@ fn collect_local_raw_param_summaries(
                             .map(|(hir_id, _)| hir_id);
                     let local_callee = hir_called_local_fn(self.tcx, expr);
                     for (arg_index, arg) in args.iter().enumerate() {
-                        let Some(hir_id) = hir_unwrapped_local_id(arg) else {
+                        let params = self.param_indices_in_expr(arg);
+                        if params.is_empty() {
                             continue;
-                        };
-                        let Some(param_index) = self.current_raw_params.get(&hir_id).copied()
-                        else {
-                            continue;
-                        };
-                        if Some(hir_id) == free_arg {
-                            self.mark_escape(param_index);
+                        }
+                        let arg_hir_id = hir_unwrapped_local_id(arg);
+                        if arg_hir_id == free_arg {
+                            for param_index in params {
+                                self.mark_free(param_index);
+                            }
                             continue;
                         }
                         match local_callee {
                             Some(callee) => {
                                 let Some(callee_raw_params) = self.raw_params_by_fn.get(&callee)
                                 else {
-                                    self.mark_escape(param_index);
+                                    for param_index in params {
+                                        self.mark_escape(param_index);
+                                    }
                                     continue;
                                 };
                                 if callee_raw_params.values().any(|idx| *idx == arg_index) {
-                                    self.add_dep(param_index, (callee, arg_index));
+                                    for param_index in params {
+                                        self.add_dep(param_index, (callee, arg_index));
+                                    }
                                 } else {
-                                    self.mark_escape(param_index);
+                                    for param_index in params {
+                                        self.mark_escape(param_index);
+                                    }
                                 }
                             }
                             None => {
                                 if !hir_is_borrow_only_foreign_buffer_arg(self.tcx, expr, arg_index)
                                 {
-                                    self.mark_escape(param_index);
+                                    for param_index in params {
+                                        self.mark_escape(param_index);
+                                    }
                                 }
                             }
                         }
@@ -12293,12 +12467,8 @@ fn collect_local_raw_param_summaries(
                 };
                 tail = expr;
             }
-            if let Some(param_index) = self.param_index(tail) {
-                if self.returns_owning_output {
-                    self.mark_returned_to_owning_output(param_index);
-                } else {
-                    self.mark_escape(param_index);
-                }
+            for param_index in self.param_indices_in_expr(tail) {
+                self.mark_return(param_index);
             }
         }
     }
@@ -12315,21 +12485,25 @@ fn collect_local_raw_param_summaries(
             continue;
         };
         let body = tcx.hir_body(body);
-        let returns_owning_output = sig_decs.data.get(def_id).is_some_and(|sig_dec| {
-            sig_dec
-                .output_dec
-                .is_some_and(|kind| kind.is_owning_box_like())
-        });
+        let output_dec = sig_decs
+            .data
+            .get(def_id)
+            .and_then(|sig_dec| sig_dec.output_dec);
         let mut visitor = RawParamSummaryVisitor {
             tcx,
             free_like_wrappers,
             raw_params_by_fn: &raw_params_by_fn,
             current_raw_params: raw_params,
-            returns_owning_output,
+            output_dec,
+            local_storage_params: FxHashMap::default(),
             facts: FxHashMap::default(),
         };
         visitor.visit_body(body);
         for (param_index, facts) in visitor.facts {
+            facts_by_param
+                .entry((*def_id, param_index))
+                .or_default()
+                .direct_free |= facts.direct_free;
             facts_by_param
                 .entry((*def_id, param_index))
                 .or_default()
@@ -12338,6 +12512,10 @@ fn collect_local_raw_param_summaries(
                 .entry((*def_id, param_index))
                 .or_default()
                 .returned_to_owning_output |= facts.returned_to_owning_output;
+            facts_by_param
+                .entry((*def_id, param_index))
+                .or_default()
+                .returned_to_borrowed_output |= facts.returned_to_borrowed_output;
             facts_by_param
                 .entry((*def_id, param_index))
                 .or_default()
@@ -12354,7 +12532,9 @@ fn collect_local_raw_param_summaries(
     loop {
         let mut changed = false;
         for (key, facts) in &facts_by_param {
-            let next = if facts.direct_escape
+            let next = if facts.direct_free {
+                LocalRawParamSummary::Freed
+            } else if facts.direct_escape
                 || facts
                     .deps
                     .iter()
@@ -12363,6 +12543,8 @@ fn collect_local_raw_param_summaries(
                 LocalRawParamSummary::Escapes
             } else if facts.returned_to_owning_output {
                 LocalRawParamSummary::ReturnedToOwningOutput
+            } else if facts.returned_to_borrowed_output {
+                LocalRawParamSummary::ReturnedToBorrowedOutput
             } else {
                 LocalRawParamSummary::BorrowOnly
             };
@@ -13017,7 +13199,7 @@ fn hir_rhs_supports_box_target<'tcx>(
 
     if let hir::ExprKind::Call(..) = hir_expr.kind
         && let Some(output_kind) = hir_callee_output_kind(tcx, sig_decs, ptr_kinds, hir_expr)
-        && (output_kind == target_kind || output_kind == target_kind.optional_variant())
+        && ptr_kind_supports_box_target(output_kind, target_kind)
     {
         return true;
     }
@@ -13025,11 +13207,39 @@ fn hir_rhs_supports_box_target<'tcx>(
     if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind
         && let Res::Local(hir_id) = path.res
         && let Some(rhs_kind) = ptr_kinds.get(&hir_id).copied()
-        && (rhs_kind == target_kind || rhs_kind == target_kind.optional_variant())
+        && ptr_kind_supports_box_target(rhs_kind, target_kind)
     {
         return true;
     }
 
+    false
+}
+
+fn ptr_kind_supports_box_target(source_kind: PtrKind, target_kind: PtrKind) -> bool {
+    source_kind == target_kind || source_kind == target_kind.optional_variant()
+}
+
+fn hir_rhs_supports_optional_box_return(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    hir_expr: &hir::Expr<'_>,
+    target_kind: PtrKind,
+) -> bool {
+    if !matches!(target_kind, PtrKind::OptBox | PtrKind::OptBoxedSlice) {
+        return false;
+    }
+    if let hir::ExprKind::Call(..) = hir_expr.kind
+        && let Some(output_kind) = hir_callee_output_kind(tcx, sig_decs, ptr_kinds, hir_expr)
+    {
+        return output_kind.optional_variant() == target_kind;
+    }
+    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = hir_expr.kind
+        && let Res::Local(hir_id) = path.res
+        && let Some(rhs_kind) = ptr_kinds.get(&hir_id).copied()
+    {
+        return rhs_kind.optional_variant() == target_kind;
+    }
     false
 }
 
@@ -13120,16 +13330,19 @@ fn collect_unsupported_box_target_bindings(
 
 fn collect_unsupported_box_usage_bindings(
     tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
     free_like_wrappers: &FxHashSet<LocalDefId>,
     local_raw_param_summaries: &FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
 ) -> FxHashSet<HirId> {
     struct UnsupportedBoxUsageVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
         local_raw_param_summaries: &'a FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
         byte_view_roots: FxHashMap<HirId, HirId>,
+        returned_alias_roots: FxHashMap<HirId, HirId>,
         bindings: FxHashSet<HirId>,
     }
 
@@ -13141,6 +13354,8 @@ fn collect_unsupported_box_usage_bindings(
                 .is_some_and(PtrKind::is_owning_box_like)
             {
                 Some(hir_id)
+            } else if let Some(root) = self.returned_alias_roots.get(&hir_id).copied() {
+                Some(root)
             } else {
                 self.byte_view_roots.get(&hir_id).copied()
             }
@@ -13173,6 +13388,36 @@ fn collect_unsupported_box_usage_bindings(
             }
             self.byte_view_roots.insert(lhs_hir_id, root);
             self.bindings.insert(root);
+        }
+
+        fn maybe_mark_returned_alias(&mut self, lhs_hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            let Some(local_callee) = hir_called_local_fn(self.tcx, rhs) else {
+                return;
+            };
+            let hir::ExprKind::Call(_, args) = rhs.kind else {
+                return;
+            };
+            let mut roots = FxHashSet::default();
+            for (arg_index, arg) in args.iter().enumerate() {
+                let Some(arg_hir_id) = hir_unwrapped_local_id(arg) else {
+                    continue;
+                };
+                let Some(root) = self.owning_root_of(arg_hir_id) else {
+                    continue;
+                };
+                if self
+                    .local_raw_param_summaries
+                    .get(&(local_callee, arg_index))
+                    == Some(&LocalRawParamSummary::ReturnedToBorrowedOutput)
+                {
+                    roots.insert(root);
+                }
+            }
+            if roots.len() == 1
+                && let Some(root) = roots.into_iter().next()
+            {
+                self.returned_alias_roots.insert(lhs_hir_id, root);
+            }
         }
 
         fn collect_owning_roots_in_expr(&self, expr: &'tcx hir::Expr<'tcx>) -> FxHashSet<HirId> {
@@ -13209,6 +13454,7 @@ fn collect_unsupported_box_usage_bindings(
             {
                 let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
                 self.maybe_mark_byte_view_alias(hir_id, lhs_ty, init);
+                self.maybe_mark_returned_alias(hir_id, init);
             }
             intravisit::walk_stmt(self, stmt);
         }
@@ -13220,6 +13466,7 @@ fn collect_unsupported_box_usage_bindings(
             {
                 let lhs_ty = self.tcx.typeck(expr.hir_id.owner).expr_ty(lhs);
                 self.maybe_mark_byte_view_alias(lhs_hir_id, lhs_ty, rhs);
+                self.maybe_mark_returned_alias(lhs_hir_id, rhs);
             }
 
             if let Some(local_callee) = hir_called_local_fn(self.tcx, expr)
@@ -13232,12 +13479,12 @@ fn collect_unsupported_box_usage_bindings(
                     let Some(root) = self.owning_root_of(hir_id) else {
                         continue;
                     };
-                    if !self
-                        .local_raw_param_summaries
-                        .get(&(local_callee, arg_index))
-                        .copied()
-                        .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
-                    {
+                    if !local_callee_arg_preserves_owning_usage(
+                        self.sig_decs,
+                        self.local_raw_param_summaries,
+                        local_callee,
+                        arg_index,
+                    ) {
                         self.bindings.insert(root);
                     }
                 }
@@ -13285,10 +13532,12 @@ fn collect_unsupported_box_usage_bindings(
         let body = tcx.hir_body(body);
         let mut visitor = UnsupportedBoxUsageVisitor {
             tcx,
+            sig_decs,
             ptr_kinds,
             free_like_wrappers,
             local_raw_param_summaries,
             byte_view_roots: FxHashMap::default(),
+            returned_alias_roots: FxHashMap::default(),
             bindings: FxHashSet::default(),
         };
         visitor.visit_body(body);
@@ -13300,12 +13549,14 @@ fn collect_unsupported_box_usage_bindings(
 
 fn collect_unsupported_box_usage_subreasons(
     tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
     free_like_wrappers: &FxHashSet<LocalDefId>,
     local_raw_param_summaries: &FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
 ) -> FxHashMap<HirId, Vec<DecisionReason>> {
     struct UsageSubreasonVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
         free_like_wrappers: &'a FxHashSet<LocalDefId>,
         local_raw_param_summaries: &'a FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
@@ -13391,12 +13642,12 @@ fn collect_unsupported_box_usage_subreasons(
                     let Some(root) = self.owning_root_of(hir_id) else {
                         continue;
                     };
-                    if !self
-                        .local_raw_param_summaries
-                        .get(&(local_callee, arg_index))
-                        .copied()
-                        .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
-                    {
+                    if !local_callee_arg_preserves_owning_usage(
+                        self.sig_decs,
+                        self.local_raw_param_summaries,
+                        local_callee,
+                        arg_index,
+                    ) {
                         self.record(
                             root,
                             DecisionReason::UnsupportedBoxUsageLocalCalleeNonBorrowOnly,
@@ -13427,6 +13678,7 @@ fn collect_unsupported_box_usage_subreasons(
 
     let mut visitor = UsageSubreasonVisitor {
         tcx,
+        sig_decs,
         ptr_kinds,
         free_like_wrappers,
         local_raw_param_summaries,
@@ -15329,6 +15581,19 @@ fn hir_projection_root_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
     }
 }
 
+fn hir_local_place_root_without_deref(hir_expr: &hir::Expr<'_>) -> Option<HirId> {
+    match hir_unwrap_casts(hir_expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Field(base, _) | hir::ExprKind::Index(base, _, _) => {
+            hir_local_place_root_without_deref(base)
+        }
+        _ => None,
+    }
+}
+
 fn hir_field_access_expr_string(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<String> {
     match hir_unwrap_casts(hir_expr).kind {
         hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
@@ -16954,6 +17219,7 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                 .push("unsupported_allocator_root");
         }
         normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
+        normalize_owning_call_result_bindings(tcx, &sig_decs, &mut ptr_kinds, &forced_raw_bindings);
 
         loop {
             let mut changed = false;
@@ -16967,7 +17233,14 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
             if box_input_changed {
                 changed = true;
             }
-            if !downgrade_unsupported_box_outputs(tcx, &mut sig_decs, &ptr_kinds).is_empty() {
+            if !downgrade_unsupported_box_outputs(
+                tcx,
+                &mut sig_decs,
+                &ptr_kinds,
+                &FxHashSet::default(),
+            )
+            .is_empty()
+            {
                 changed = true;
             }
             if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers).changed() {
@@ -16978,6 +17251,12 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
             {
                 changed = true;
             }
+            normalize_owning_call_result_bindings(
+                tcx,
+                &sig_decs,
+                &mut ptr_kinds,
+                &forced_raw_bindings,
+            );
 
             let raw_call_result_bindings =
                 collect_raw_call_result_bindings(tcx, &sig_decs, &ptr_kinds);
@@ -16987,12 +17266,14 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                 collect_unsupported_box_target_bindings(tcx, &sig_decs, &ptr_kinds);
             let unsupported_box_usage_subreasons = collect_unsupported_box_usage_subreasons(
                 tcx,
+                &sig_decs,
                 &ptr_kinds,
                 &free_like_wrappers,
                 &local_raw_param_summaries,
             );
             let unsupported_box_usage_bindings = collect_unsupported_box_usage_bindings(
                 tcx,
+                &sig_decs,
                 &ptr_kinds,
                 &free_like_wrappers,
                 &local_raw_param_summaries,
@@ -17065,6 +17346,12 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
             if forced_raw_bindings.len() != old_len {
                 changed = true;
                 normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
+                normalize_owning_call_result_bindings(
+                    tcx,
+                    &sig_decs,
+                    &mut ptr_kinds,
+                    &forced_raw_bindings,
+                );
             }
 
             if !changed {
@@ -17077,12 +17364,14 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
 
     fn collect_unsupported_box_usage_subreasons(
         tcx: TyCtxt<'_>,
+        sig_decs: &SigDecisions,
         ptr_kinds: &FxHashMap<HirId, PtrKind>,
         free_like_wrappers: &FxHashSet<LocalDefId>,
         local_raw_param_summaries: &FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
     ) -> FxHashMap<HirId, Vec<&'static str>> {
         struct UsageSubreasonVisitor<'a, 'tcx> {
             tcx: TyCtxt<'tcx>,
+            sig_decs: &'a SigDecisions,
             ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
             free_like_wrappers: &'a FxHashSet<LocalDefId>,
             local_raw_param_summaries: &'a FxHashMap<(LocalDefId, usize), LocalRawParamSummary>,
@@ -17170,12 +17459,12 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                         let Some(root) = self.owning_root_of(hir_id) else {
                             continue;
                         };
-                        if !self
-                            .local_raw_param_summaries
-                            .get(&(local_callee, arg_index))
-                            .copied()
-                            .is_some_and(LocalRawParamSummary::preserves_owning_call_boundary)
-                        {
+                        if !local_callee_arg_preserves_owning_usage(
+                            self.sig_decs,
+                            self.local_raw_param_summaries,
+                            local_callee,
+                            arg_index,
+                        ) {
                             self.record(root, "local_callee_non_borrow_only");
                         }
                     }
@@ -17194,6 +17483,7 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
 
         let mut visitor = UsageSubreasonVisitor {
             tcx,
+            sig_decs,
             ptr_kinds,
             free_like_wrappers,
             local_raw_param_summaries,
