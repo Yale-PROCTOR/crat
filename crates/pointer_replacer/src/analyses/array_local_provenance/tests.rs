@@ -6,7 +6,8 @@ use utils::ty_shape;
 
 use super::{BaseAdmissibility, BaseId, PfgNode, analyze_body};
 use crate::{
-    analyses::type_qualifier::foster::mutability::mutability_analysis, utils::rustc::RustProgram,
+    analyses::type_qualifier::foster::mutability::mutability_analysis,
+    rewriter::array_local_index_rewriter::group_has_rewritable_binding, utils::rustc::RustProgram,
 };
 
 fn build_rust_program(tcx: rustc_middle::ty::TyCtxt<'_>) -> RustProgram<'_> {
@@ -112,6 +113,7 @@ struct RewriteGroupFacts {
     member_names: FxHashSet<String>,
     member_root_names: FxHashSet<String>,
     index_tracked: bool,
+    has_rewritable_binding: bool,
 }
 
 fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<RewriteGroupFacts>> {
@@ -157,9 +159,14 @@ fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<Rewrit
                 }
             }
 
+            let rewritable: Vec<bool> = groups
+                .iter()
+                .map(|g| group_has_rewritable_binding(tcx, did, &body, &result, g))
+                .collect();
             let group_facts = groups
                 .into_iter()
-                .map(|group| {
+                .zip(rewritable)
+                .map(|(group, has_rewritable_binding)| {
                     let member_names = group
                         .members
                         .iter()
@@ -187,6 +194,7 @@ fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<Rewrit
                         member_names,
                         member_root_names,
                         index_tracked: group.index_tracked,
+                        has_rewritable_binding,
                     }
                 })
                 .collect();
@@ -1685,5 +1693,34 @@ fn liveness_gate_accepts_group_when_mut_and_imm_locals_simultaneously_live() {
             .iter()
             .any(|g| { g.member_names.contains("q") && g.member_names.contains("r") }),
         "q (*mut) and r (*const) are simultaneously live — group must be selected: {f_groups:#?}"
+    );
+}
+
+#[test]
+fn group_has_rewritable_binding_for_field_base_group() {
+    let code = r#"
+        #[repr(C)]
+        pub struct Img {
+            pub pix: *mut u8,
+        }
+        pub unsafe fn process(mut img: *mut Img) {
+            let mut pix: *mut u8 = (*img).pix;
+            let mut a: *mut u8 = pix.offset(3);
+            let mut b: *mut u8 = pix.offset(5);
+            *a = *b;
+            a = a.offset(1);
+            b = b.offset(1);
+        }
+    "#;
+
+    let facts = run_rewrite_groups_with_points_to(code);
+    let process_groups = facts.get("process").expect("process not found");
+    assert!(
+        !process_groups.is_empty(),
+        "expected at least one rewrite group for process"
+    );
+    assert!(
+        process_groups.iter().any(|g| g.has_rewritable_binding),
+        "expected has_rewritable_binding=true for the field-base group, got: {process_groups:?}"
     );
 }

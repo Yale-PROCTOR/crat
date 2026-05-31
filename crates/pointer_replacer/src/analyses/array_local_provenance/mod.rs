@@ -464,7 +464,7 @@ fn source_var_identity_for_slot<'tcx, S: AsRef<str>>(
     saw_named_field.then_some(identity)
 }
 
-fn named_struct_field<'tcx>(
+pub(crate) fn named_struct_field<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
     field: FieldIdx,
@@ -1176,8 +1176,7 @@ fn dependent_member_locals(
         .collect()
 }
 
-#[allow(dead_code)]
-fn base_slot_info<'a>(
+pub(crate) fn base_slot_info<'a>(
     provenance: &'a ArrayLocalProvenance,
     group: &RewriteGroup,
 ) -> Option<&'a SlotInfo> {
