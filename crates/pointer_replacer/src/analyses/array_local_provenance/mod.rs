@@ -600,6 +600,17 @@ pub fn select_rewrite_groups<'a, 'tcx>(
         if !has_conflict {
             continue;
         }
+        if !member_pointer_elements_match_base_element(
+            body,
+            context.tcx,
+            base_local,
+            base_slot_offset,
+            &local_name,
+            &members,
+            provenance,
+        ) {
+            continue;
+        }
 
         // condition 2: the base variable binding must be stable for selection
         let stability_context = BaseStabilityContext {
@@ -635,6 +646,210 @@ pub fn select_rewrite_groups<'a, 'tcx>(
     }
 
     groups
+}
+
+fn member_pointer_elements_match_base_element<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    base_local: Local,
+    base_slot_offset: usize,
+    local_name: &FxHashMap<Local, &str>,
+    members: &[SlotIdx],
+    provenance: &ArrayLocalProvenance,
+) -> bool {
+    let Some(base_element_ty) =
+        slot_element_ty(body, tcx, provenance, base_local, base_slot_offset)
+    else {
+        return true;
+    };
+    members.iter().all(|&slot_idx| {
+        let Some(info) = provenance.slot_table.slot_infos.get(slot_idx) else {
+            return true;
+        };
+        if info.root == base_local || !info.path.is_empty() {
+            return true;
+        }
+        if !local_name.contains_key(&info.root) {
+            return true;
+        }
+        slot_ty(body, tcx, info)
+            .and_then(pointer_element_ty)
+            .is_none_or(|member_element_ty| {
+                if member_element_ty == base_element_ty {
+                    return true;
+                }
+                if matches!(
+                    base_element_ty.kind(),
+                    ty::TyKind::Adt(adt_def, _) if adt_def.is_struct()
+                ) {
+                    return local_origin_uses_pointer_arithmetic(body, tcx, info.root);
+                }
+                local_origin_uses_pointer_arithmetic(body, tcx, info.root)
+                    || local_origin_uses_pointer_cast(body, tcx, info.root)
+            })
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PointerOrigin {
+    source: Local,
+    uses_pointer_arithmetic: bool,
+    uses_pointer_cast: bool,
+}
+
+fn local_origin_uses_pointer_arithmetic<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    local: Local,
+) -> bool {
+    let origins = pointer_origin_map(body, tcx);
+    let mut visited = FxHashSet::default();
+    local_origin_uses_pointer_arithmetic_inner(local, &origins, &mut visited)
+}
+
+fn local_origin_uses_pointer_arithmetic_inner(
+    local: Local,
+    origins: &FxHashMap<Local, Vec<PointerOrigin>>,
+    visited: &mut FxHashSet<Local>,
+) -> bool {
+    if !visited.insert(local) {
+        return false;
+    }
+    origins.get(&local).is_some_and(|edges| {
+        edges.iter().any(|edge| {
+            edge.uses_pointer_arithmetic
+                || local_origin_uses_pointer_arithmetic_inner(edge.source, origins, visited)
+        })
+    })
+}
+
+fn local_origin_uses_pointer_cast<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    local: Local,
+) -> bool {
+    let origins = pointer_origin_map(body, tcx);
+    let mut visited = FxHashSet::default();
+    local_origin_uses_pointer_cast_inner(local, &origins, &mut visited)
+}
+
+fn local_origin_uses_pointer_cast_inner(
+    local: Local,
+    origins: &FxHashMap<Local, Vec<PointerOrigin>>,
+    visited: &mut FxHashSet<Local>,
+) -> bool {
+    if !visited.insert(local) {
+        return false;
+    }
+    origins.get(&local).is_some_and(|edges| {
+        edges.iter().any(|edge| {
+            edge.uses_pointer_cast
+                || local_origin_uses_pointer_cast_inner(edge.source, origins, visited)
+        })
+    })
+}
+
+fn pointer_origin_map<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> FxHashMap<Local, Vec<PointerOrigin>> {
+    let mut origins: FxHashMap<Local, Vec<PointerOrigin>> = FxHashMap::default();
+    for block_data in body.basic_blocks.iter() {
+        for statement in &block_data.statements {
+            let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                continue;
+            };
+            let Some(dst) = lhs.as_local() else { continue };
+            let source = match rvalue {
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => Some(PointerOrigin {
+                    source: place.local,
+                    uses_pointer_arithmetic: false,
+                    uses_pointer_cast: false,
+                }),
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                | Rvalue::CopyForDeref(place) => Some(PointerOrigin {
+                    source: place.local,
+                    uses_pointer_arithmetic: false,
+                    uses_pointer_cast: false,
+                }),
+                Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
+                    Some(PointerOrigin {
+                        source: place.local,
+                        uses_pointer_arithmetic: false,
+                        uses_pointer_cast: true,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(source) = source {
+                origins.entry(dst).or_default().push(source);
+            }
+        }
+
+        let Some(terminator) = &block_data.terminator else {
+            continue;
+        };
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &terminator.kind
+        else {
+            continue;
+        };
+        let Some(dst) = destination.as_local() else {
+            continue;
+        };
+        if let Some((_, name)) = call_name(tcx, func)
+            && (is_pointer_arithmetic(&name) || is_as_ptr(&name))
+            && let Some(arg) = args.first()
+            && let Some(place) = operand_place(&arg.node)
+        {
+            origins.entry(dst).or_default().push(PointerOrigin {
+                source: place.local,
+                uses_pointer_arithmetic: is_pointer_arithmetic(&name),
+                uses_pointer_cast: false,
+            });
+        }
+    }
+    origins
+}
+
+fn slot_element_ty<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    provenance: &ArrayLocalProvenance,
+    local: Local,
+    slot_offset: usize,
+) -> Option<Ty<'tcx>> {
+    let slots = provenance.slot_table.local_slots(local);
+    let slot = slots.start.checked_add(slot_offset)?;
+    let info = provenance.slot_table.slot_infos.get(slot)?;
+    slot_ty(body, tcx, info).and_then(cursor_element_ty)
+}
+
+fn cursor_element_ty<'tcx>(ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) => Some(*pointee),
+        ty::TyKind::Ref(_, referent, _) => sequence_element_ty(*referent),
+        ty::TyKind::Array(element, _) | ty::TyKind::Slice(element) => Some(*element),
+        _ => None,
+    }
+}
+
+fn pointer_element_ty<'tcx>(ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) => Some(*pointee),
+        _ => None,
+    }
+}
+
+fn sequence_element_ty<'tcx>(ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    match ty.kind() {
+        ty::TyKind::Array(element, _) | ty::TyKind::Slice(element) => Some(*element),
+        _ => None,
+    }
 }
 
 fn compute_live_after_by_location<'tcx>(
@@ -769,6 +984,13 @@ fn is_param_base_stable_for_selection(
                 );
                 if is_direct {
                     has_direct_write = true;
+                } else if location_writes_through_dependent_member(
+                    context.body,
+                    context.tcx,
+                    location,
+                    &dependent_locals,
+                ) {
+                    continue;
                 } else {
                     // only run alias/call sub-checks when the direct check did not
                     // already account for the write; Andersen's all_writes includes
@@ -818,6 +1040,13 @@ fn is_param_base_stable_for_selection(
                 );
                 if is_direct {
                     has_direct_write = true;
+                } else if location_writes_through_dependent_member(
+                    context.body,
+                    context.tcx,
+                    location,
+                    &dependent_locals,
+                ) {
+                    continue;
                 } else {
                     let is_alias = base_locs.as_ref().is_some_and(|base_locs| {
                         location_writes_base_storage(
@@ -1015,6 +1244,20 @@ fn aggregate_arg_may_write_base_storage<'tcx>(
     }
 
     false
+}
+
+fn location_writes_through_dependent_member<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    location: Location,
+    dependent_locals: &FxHashSet<Local>,
+) -> bool {
+    let Some(place) = written_place_at(body, location) else {
+        return false;
+    };
+    dependent_locals.contains(&place.local)
+        && slot_path_from_place(place).is_some_and(|path| path.contains(&SlotPathElem::Pointee))
+        && place.ty(body, tcx).ty.builtin_deref(true).is_none()
 }
 
 fn slot_path_from_place<'tcx>(place: Place<'tcx>) -> Option<Vec<SlotPathElem>> {
