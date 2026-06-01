@@ -55,11 +55,11 @@ pub fn libc_call<'tcx>(
             );
         }
         // all ptr args are fat, no dest effect
-        "strcmp" | "strcasecmp" | "strcspn" => {
+        "strcmp" | "strcasecmp" | "strcspn" | "fopen" => {
             mark_args_bottom(args, local_decls, locals, struct_fields, database);
         }
-        // first 2 ptr args are fat (third arg is size_t), no dest effect
-        "strncmp" | "strncasecmp" | "memcmp" => {
+        // first 2 ptr args are fat, no dest effect
+        "strncmp" | "strncasecmp" | "memcmp" | "setenv" | "rename" => {
             mark_args_bottom(
                 &args[..2.min(args.len())],
                 local_decls,
@@ -70,7 +70,7 @@ pub fn libc_call<'tcx>(
         }
         // first ptr arg is fat, no dest effect
         "strlen" | "strdup" | "atoi" | "atof" | "fgets" | "fputs" | "puts" | "fread" | "fwrite"
-        | "getenv" => {
+        | "getenv" | "remove" | "chmod" | "mkdir" | "rmdir" | "unlink" => {
             mark_args_bottom(
                 &args[..1.min(args.len())],
                 local_decls,
