@@ -7847,13 +7847,9 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
-    assert!(s.contains("*((p).offset(q_idx) as *mut i32) = 3"), "{s}");
-    assert!(
-        s.matches("*((p).offset(q_idx) as *mut i32)").count() >= 2,
-        "{s}"
-    );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
-    assert!(!s.contains("*q"), "{s}");
+    assert!(s.contains("*((p).offset(q_idx) as *mut i32) = 3"), "{s}");
+    assert!(s.contains("*((p).offset(q_idx) as *mut i32)"), "{s}");
 }
 
 #[test]
@@ -7904,6 +7900,74 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
     );
     assert!(s.contains("|idx| ((p).offset(idx)) as *mut i32"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_direct_base_write_cursor_index_only() {
+    let code = r#"
+pub unsafe fn wcscat_like(mut dst: *mut i32, mut num_elem: usize, mut src: *const i32) -> i32 {
+    let mut ptr: *mut i32 = dst.offset(0);
+    if dst.is_null() || num_elem == 0 {
+        return 22;
+    }
+    while ptr < dst.offset(num_elem as isize) && *ptr != 0 {
+        ptr = ptr.offset(1);
+    }
+    while ptr < dst.offset(num_elem as isize) {
+        let fresh = *src;
+        src = src.offset(1);
+        *ptr = fresh;
+        let seen = *ptr;
+        ptr = ptr.offset(1);
+        if seen == 0 {
+            return 0;
+        }
+    }
+    *dst = 0;
+    34
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut ptr_idx: isize"), "{s}");
+    assert!(!s.contains("let mut ptr: *mut i32"), "{s}");
+    assert!(!s.contains("*ptr"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_cast_cursor_index_only() {
+    let code = r#"
+fn parse_bool(c: i8) -> bool {
+    c == 89 || c == 121
+}
+
+pub unsafe fn validate_sequence(mut sequence: *mut i8, mut len: usize) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    let mut bools: *mut bool = sequence as *mut bool;
+    let mut i: usize = 0;
+    while i < len {
+        let val: bool = parse_bool(*sequence.offset(i as isize));
+        *bools.offset(i as isize) = val;
+        i = i.wrapping_add(1);
+    }
+    if !*bools.offset(0) {
+        return -10;
+    }
+    if len > 1 && (*bools.offset(len.wrapping_sub(1) as isize)) as i32 != 0 {
+        return -11;
+    }
+    0
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut bools_idx: isize"), "{s}");
+    assert!(!s.contains("let mut bools: *mut bool"), "{s}");
+    assert!(!s.contains("*bools.offset"), "{s}");
 }
 
 #[test]
@@ -8025,6 +8089,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert!(s.contains("let mut q_idx: isize = (1) as isize"), "{s}");
     assert!(s.contains("q_idx ="), "{s}");
     assert!(s.contains("(q_idx) + ((2) as isize)"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
     assert!(s.contains("*((p).offset(q_idx) as *mut i32) = 9"), "{s}");
     assert!(!s.contains("q = q.offset"), "{s}");
 }
@@ -8094,12 +8159,8 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     assert!(s.contains("let mut q_idx: isize"), "{s}");
     assert!(s.contains("(p_idx) + ((1) as isize)"), "{s}");
     assert!(s.contains("p_idx = (p_idx) + ((1) as isize)"), "{s}");
-    assert!(
-        s.contains("*((p).offset(q_idx) as *mut i32)")
-            && s.contains("*((p).offset(p_idx) as *mut i32)"),
-        "{s}"
-    );
-    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+    assert!(s.contains("let mut q: *mut i32"), "{s}");
+    assert!(s.contains("*q + *((p).offset(p_idx) as *mut i32)"), "{s}");
     assert!(!s.contains("p = p.offset(1)"), "{s}");
 }
 
@@ -8118,12 +8179,11 @@ pub unsafe fn foo(mut p: *mut i32, n: isize) -> i32 {
     assert!(s.contains("let mut p_idx: isize = 0isize"), "{s}");
     assert!(s.contains("let mut prev_idx: isize = p_idx"), "{s}");
     assert!(s.contains("p_idx = (p_idx) + (n)"), "{s}");
+    assert!(s.contains("let mut prev: *mut i32"), "{s}");
     assert!(
-        s.contains("*((p).offset(prev_idx) as *mut i32)")
-            && s.contains("*((p).offset(p_idx) as *mut i32)"),
+        s.contains("*prev + *((p).offset(p_idx) as *mut i32)"),
         "{s}"
     );
-    assert!(!s.contains("let mut prev: *mut i32"), "{s}");
     assert!(!s.contains("p = p.offset(n)"), "{s}");
 }
 
@@ -8141,6 +8201,7 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("q_idx"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
+    assert!(s.contains("(&mut ((p)[(q_idx) as usize..]))[0] = 3"), "{s}");
 }
 
 #[test]
@@ -8199,6 +8260,64 @@ pub unsafe fn weighted(mut arr: *mut ResultArray, mut i: isize) -> i32 {
     assert!(s.contains(".data).as_ptr().offset(current_idx)"), "{s}");
     assert!(!s.contains("let mut current: *mut Item"), "{s}");
     assert!(!s.contains("let mut base: *mut Item"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_materializes_read_only_field_base_local() {
+    let code = r#"
+#[repr(C)]
+pub struct Bucket {
+    pub hash: [usize; 8],
+    pub index: [isize; 8],
+}
+
+#[repr(C)]
+pub struct Table {
+    pub storage: *mut Bucket,
+    pub len: usize,
+}
+
+pub unsafe fn sum_hashes(mut table: *mut Table) -> usize {
+    let mut total: usize = 0;
+    let mut i: usize = 0;
+    while i < (*table).len {
+        let mut ob: *mut Bucket = (*table).storage.offset(i as isize);
+        let mut j: usize = 0;
+        while j < 8 {
+            if (*ob).index[j] >= 0 {
+                total = total.wrapping_add((*ob).hash[j]);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "expected materialized read-only rewrite:\n{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("ob_idx"), "{s}");
+    assert!(
+        s.contains("let ob: *mut Bucket")
+            || s.contains("let mut ob: *mut Bucket")
+            || s.contains("let ob: *mut crate::Bucket")
+            || s.contains("let mut ob: *mut crate::Bucket"),
+        "expected ob to stay materialized as a raw pointer before pointer rewriting:\n{s}"
+    );
+    assert!(
+        s.contains("(*ob).index[j as usize]") || s.contains("(*ob).index[j]"),
+        "{s}"
+    );
+    assert!(
+        s.contains("(*ob).hash[j as usize]") || s.contains("(*ob).hash[j]"),
+        "{s}"
+    );
+    let storage_offset_uses = s.matches("storage).offset(ob_idx)").count();
+    assert!(
+        storage_offset_uses <= 1,
+        "expected at most one storage offset to materialize ob, got {storage_offset_uses}:\n{s}"
+    );
 }
 
 #[test]
@@ -9147,13 +9266,115 @@ pub unsafe fn flip(mut img: *mut Image) {
     assert!(s.contains("a_idx"), "expected a_idx in:\n{s}");
     assert!(s.contains("b_idx"), "expected b_idx in:\n{s}");
     assert!(
-        !s.contains("let mut a: *mut u8"),
-        "expected a to be rewritten in:\n{s}"
+        s.contains("let mut a: *mut u8") || s.contains("let a: *mut u8"),
+        "expected a to stay materialized in:\n{s}"
     );
     assert!(
-        !s.contains("let mut b: *mut u8"),
-        "expected b to be rewritten in:\n{s}"
+        s.contains("let mut b: *mut u8") || s.contains("let b: *mut u8"),
+        "expected b to stay materialized in:\n{s}"
     );
+}
+
+#[test]
+fn test_array_local_rewriter_materializes_mutable_moving_cursors() {
+    let code = r#"
+#[repr(C)]
+pub struct Image {
+    pub pix: *mut u8,
+    pub w: i32,
+    pub h: i32,
+}
+
+pub unsafe fn flip(mut img: *mut Image) {
+    let mut pix: *mut u8 = (*img).pix;
+    let mut w: i32 = (*img).w;
+    let mut h: i32 = (*img).h;
+    let mut flips: i32 = h / 2;
+    let mut i: i32 = 0;
+    while i < flips {
+        let mut a: *mut u8 = pix.offset((w * i) as isize);
+        let mut b: *mut u8 = pix.offset((w * (h - i - 1)) as isize);
+        let mut j: i32 = 0;
+        while j < w {
+            let t: u8 = *a;
+            *a = *b;
+            *b = t;
+            a = a.offset(1);
+            b = b.offset(1);
+            j += 1;
+        }
+        i += 1;
+    }
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected materialized mutable cursor rewrite:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("a_idx"), "{s}");
+    assert!(s.contains("b_idx"), "{s}");
+    assert!(
+        s.contains("let mut a: *mut u8") || s.contains("let a: *mut u8"),
+        "expected materialized pointer local a to remain:\n{s}"
+    );
+    assert!(
+        s.contains("let mut b: *mut u8") || s.contains("let b: *mut u8"),
+        "expected materialized pointer local b to remain:\n{s}"
+    );
+    assert!(
+        s.contains("let t: u8 = *a") || s.contains("let mut t: u8 = *a"),
+        "expected read to use materialized a rather than rematerialized base offset:\n{s}"
+    );
+    assert!(s.contains("*a = *b"), "{s}");
+    assert!(s.contains("*b = t"), "{s}");
+    let a_offset_uses = s.matches("pix).offset(a_idx)").count();
+    let b_offset_uses = s.matches("pix).offset(b_idx)").count();
+    assert!(
+        a_offset_uses <= 2,
+        "expected a_idx offsets only for materializing/refreshing a, got {a_offset_uses}:\n{s}"
+    );
+    assert!(
+        b_offset_uses <= 2,
+        "expected b_idx offsets only for materializing/refreshing b, got {b_offset_uses}:\n{s}"
+    );
+    assert!(
+        s.contains("a_idx = (a_idx) +") || s.contains("a_idx = a_idx +") || s.contains("a_idx +="),
+        "expected a_idx to be advanced relative to itself:\n{s}"
+    );
+    assert!(
+        s.contains("b_idx = (b_idx) +") || s.contains("b_idx = b_idx +") || s.contains("b_idx +="),
+        "expected b_idx to be advanced relative to itself:\n{s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_skips_materialization_when_pointer_escapes() {
+    let code = r#"
+#[repr(C)]
+pub struct Holder {
+    pub data: *mut i32,
+}
+
+unsafe extern "C" {
+    fn store_pointer(p: *mut i32);
+}
+
+pub unsafe fn expose(mut h: *mut Holder, mut i: isize) {
+    let mut p: *mut i32 = (*h).data.offset(i);
+    store_pointer(p);
+    *p = 3;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    if changed {
+        assert!(
+            !s.contains("let p: &") && !s.contains("let mut p: &mut"),
+            "escaping pointer must not be materialized as a reference:\n{s}"
+        );
+    }
 }
 
 #[test]
@@ -9184,8 +9405,8 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
     assert!(s.contains("out_idx") || s.contains("s_out_idx"), "{s}");
     assert!(s.contains("src_idx"), "{s}");
     assert!(s.contains("dst_idx"), "{s}");
-    assert!(!s.contains("let mut src: *mut i8"), "{s}");
-    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
+    assert!(s.contains("let mut src: *mut i8"), "{s}");
+    assert!(s.contains("let mut dst: *mut i8"), "{s}");
     assert!(!s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
 }
 
@@ -9218,8 +9439,8 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
     assert!(s.contains("let mut b_idx: isize"), "{s}");
     assert!(s.contains("ax_idx"), "{s}");
     assert!(s.contains("bx_idx"), "{s}");
-    assert!(!s.contains("let mut ax: *mut i8"), "{s}");
-    assert!(!s.contains("let mut bx: *mut i16"), "{s}");
+    assert!(s.contains("let mut ax: *mut i8"), "{s}");
+    assert!(s.contains("let mut bx: *mut i16"), "{s}");
 }
 
 #[test]
@@ -9256,6 +9477,14 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("ptr_idx"), "{s}");
-    assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
+    assert!(
+        s.contains("let mut ptr: *mut i8") || s.contains("let ptr: *mut i8"),
+        "expected call argument cursor to stay materialized as a raw pointer:\n{s}"
+    );
     assert!(!s.contains("ptr = found.offset(1)"), "{s}");
+    assert!(
+        s.contains("ptr = ((*state).buffer).offset(ptr_idx) as *mut i8")
+            || s.contains("ptr = ((*state).buffer).offset(ptr_idx);"),
+        "expected ptr to refresh from ptr_idx after movement:\n{s}"
+    );
 }

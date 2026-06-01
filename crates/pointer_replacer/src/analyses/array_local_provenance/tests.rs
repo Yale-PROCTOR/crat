@@ -1481,6 +1481,42 @@ fn array_local_provenance_cast_single_slot_slot0_preserves_param_provenance() {
 }
 
 #[test]
+fn select_rewrite_groups_selects_cast_cursor_over_param_base() {
+    let groups = run_rewrite_groups_with_points_to(
+        r#"
+        fn parse_bool(c: i8) -> bool {
+            c == 89 || c == 121
+        }
+
+        pub unsafe fn f(sequence: *mut i8, len: usize) -> i32 {
+            let bools = sequence as *mut bool;
+            let mut i: usize = 0;
+            while i < len {
+                let val = parse_bool(*sequence.offset(i as isize));
+                *bools.offset(i as isize) = val;
+                i = i.wrapping_add(1);
+            }
+            if !*bools.offset(0) {
+                return -10;
+            }
+            0
+        }
+        "#,
+    );
+
+    let f_groups = groups.get("f").unwrap();
+    assert!(
+        f_groups.iter().any(|group| {
+            matches!(group.base, BaseId::Param { .. })
+                && group.base_name.as_deref() == Some("sequence")
+                && group.member_names.contains("bools")
+                && group.has_rewritable_binding
+        }),
+        "cast cursor over param base should be selected: {f_groups:#?}"
+    );
+}
+
+#[test]
 fn array_local_provenance_rawptr_double_ptr_tail_slot_preserves_param_provenance() {
     let map = run_analysis(
         r#"
@@ -1534,6 +1570,33 @@ fn array_local_provenance_struct_field_array_offset_pointers_share_base() {
     assert!(
         matches!(current.unique, Some(BaseId::LocalArray { .. })),
         "the shared base should be LocalArray: {current:#?}"
+    );
+}
+
+#[test]
+fn select_rewrite_groups_reject_struct_pointer_base_for_field_array_pointers() {
+    let groups = run_rewrite_groups_with_points_to(
+        r#"
+        pub struct Info {
+            pub steps: *mut u32,
+            pub leaf_addr: [u32; 8],
+            pub pk_addr: [u32; 8],
+        }
+
+        pub unsafe fn f(v_info: *mut Info) {
+            let info = v_info;
+            let leaf_addr = ((*info).leaf_addr).as_mut_ptr();
+            let pk_addr = ((*info).pk_addr).as_mut_ptr();
+            *leaf_addr = 1;
+            *pk_addr = 2;
+        }
+        "#,
+    );
+
+    let selected = groups.get("f").cloned().unwrap_or_default();
+    assert!(
+        selected.is_empty(),
+        "field-array pointers must not be selected as cursors over the enclosing struct pointer: {selected:#?}"
     );
 }
 
