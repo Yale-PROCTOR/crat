@@ -95,9 +95,11 @@ struct BindingUseSummary {
     comparison_count: usize,
     offset_from_count: usize,
     call_arg_count: usize,
+    inlineable_memory_call_count: usize,
     address_taken_count: usize,
     unsupported_escape: bool,
     writes_through_pointer: bool,
+    multi_cursor_deref_expr_count: usize,
 }
 
 impl BindingUseSummary {
@@ -171,6 +173,74 @@ mod binding_use_summary_tests {
             summary.materialization_kind(false),
             Some(MaterializationKind::RawPtr)
         );
+    }
+
+    #[test]
+    fn memchr_pointer_argument_does_not_force_materialization() {
+        let summaries = classifier_summaries(
+            r#"
+unsafe extern "C" {
+    fn memchr(ptr: *const core::ffi::c_void, ch: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(mut p: *mut i8, n: usize) {
+    let mut q: *mut i8 = p.offset(1);
+    let _found = memchr(q as *const core::ffi::c_void, 0, n);
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert_eq!(q.call_arg_count, 0);
+        assert_eq!(q.inlineable_memory_call_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+        assert_eq!(q.materialization_kind(false), None);
+    }
+
+    #[test]
+    fn memset_pointer_argument_does_not_force_materialization() {
+        let summaries = classifier_summaries(
+            r#"
+unsafe extern "C" {
+    fn memset(ptr: *mut core::ffi::c_void, value: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(mut p: *mut u8, n: usize) {
+    let mut q: *mut u8 = p.offset(1);
+    memset(q as *mut core::ffi::c_void, 0, n);
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert_eq!(q.call_arg_count, 0);
+        assert_eq!(q.inlineable_memory_call_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+        assert_eq!(q.materialization_kind(true), None);
+    }
+
+    #[test]
+    fn memory_call_deref_argument_marks_cursor_inlineable() {
+        let summaries = classifier_summaries(
+            r#"
+unsafe extern "C" {
+    fn memset(ptr: *mut core::ffi::c_void, value: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(mut p: *mut i8, mut q: *mut i8, n: usize) {
+    memset(q as *mut core::ffi::c_void, (*p) as i32, n);
+}
+"#,
+            &["p", "q"],
+        );
+        let p = summaries.get("p").expect("expected p summary");
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert_eq!(p.inlineable_memory_call_count, 1);
+        assert_eq!(q.inlineable_memory_call_count, 1);
+        assert_eq!(q.call_arg_count, 0);
     }
 
     #[test]
@@ -664,6 +734,26 @@ fn ast_ty_is_raw_ptr(ty: &Ty) -> bool {
     }
 }
 
+fn call_path_last_segment(expr: &Expr) -> Option<&str> {
+    let ExprKind::Path(_, path) = &unwrap_cast_and_paren(expr).kind else {
+        return None;
+    };
+    path.segments
+        .last()
+        .map(|segment| segment.ident.name.as_str())
+}
+
+fn inlineable_memory_pointer_arg(callee: &Expr, arg_index: usize) -> bool {
+    match call_path_last_segment(callee) {
+        Some("memchr" | "memset") => arg_index == 0,
+        _ => false,
+    }
+}
+
+fn inlineable_memory_call(callee: &Expr) -> bool {
+    matches!(call_path_last_segment(callee), Some("memchr" | "memset"))
+}
+
 fn binding_names_in_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> FxHashSet<String> {
     struct NameVisitor {
         names: FxHashSet<String>,
@@ -1127,6 +1217,16 @@ fn choose_binding_representations(
         let summary = summaries.remove(hir_id).unwrap_or_default();
         rewrite.has_index_benefit = summary.has_index_benefit();
         if let Some(kind) = summary.materialization_kind(rewrite.ptr_mut) {
+            if rewrite.field_base
+                && summary.inlineable_memory_call_count > 0
+                && summary.field_or_index_count == 0
+                && summary.pointer_value_count == 0
+                && summary.call_arg_count == 0
+                && summary.multi_cursor_deref_expr_count == 0
+            {
+                rewrite.representation = BindingRepresentation::IndexOnly;
+                continue;
+            }
             if matches!(kind, MaterializationKind::RawPtr)
                 && summary.writes_through_pointer
                 && summary.call_arg_count == 0
@@ -1408,6 +1508,7 @@ impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
                 return;
             }
             ExprKind::Assign(lhs, rhs, _) => {
+                self.record_multi_cursor_deref_expr([&**lhs, &**rhs]);
                 if let Some(hir_id) = self.direct_planned_local_hir_id(lhs) {
                     self.summaries.entry(hir_id).or_default().movement_count += 1;
                 }
@@ -1416,6 +1517,7 @@ impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
                 return;
             }
             ExprKind::AssignOp(_, lhs, rhs) => {
+                self.record_multi_cursor_deref_expr([&**lhs, &**rhs]);
                 self.record_write_through_pointer(lhs);
                 self.visit_expr(rhs);
                 return;
@@ -1432,21 +1534,34 @@ impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
                     return;
                 }
             }
-            ExprKind::Call(_, args) => {
+            ExprKind::Call(callee, args) => {
                 let mut handled_arg = false;
-                for arg in args {
+                for (index, arg) in args.iter().enumerate() {
                     if let Some(hir_id) = self.direct_planned_local_hir_id(arg) {
-                        self.summaries.entry(hir_id).or_default().call_arg_count += 1;
+                        if !inlineable_memory_pointer_arg(callee, index) {
+                            self.summaries.entry(hir_id).or_default().call_arg_count += 1;
+                        } else {
+                            self.summaries
+                                .entry(hir_id)
+                                .or_default()
+                                .inlineable_memory_call_count += 1;
+                        }
                         handled_arg = true;
+                    }
+                    if inlineable_memory_call(callee) {
+                        for hir_id in self.direct_pointer_deref_hir_ids(arg) {
+                            self.summaries
+                                .entry(hir_id)
+                                .or_default()
+                                .inlineable_memory_call_count += 1;
+                        }
                     }
                 }
                 if handled_arg {
-                    if let ExprKind::Call(callee, args) = &expr.kind {
-                        self.visit_expr(callee);
-                        for arg in args {
-                            if self.direct_planned_local_hir_id(arg).is_none() {
-                                self.visit_expr(arg);
-                            }
+                    self.visit_expr(callee);
+                    for arg in args {
+                        if self.direct_planned_local_hir_id(arg).is_none() {
+                            self.visit_expr(arg);
                         }
                     }
                     return;
@@ -1503,6 +1618,22 @@ impl BindingUseClassifier<'_, '_> {
                 .entry(hir_id)
                 .or_default()
                 .writes_through_pointer = true;
+        }
+    }
+
+    fn record_multi_cursor_deref_expr<const N: usize>(&mut self, exprs: [&Expr; N]) {
+        let mut hir_ids = FxHashSet::default();
+        for expr in exprs {
+            hir_ids.extend(self.direct_pointer_deref_hir_ids(expr));
+        }
+        if hir_ids.len() <= 1 {
+            return;
+        }
+        for hir_id in hir_ids {
+            self.summaries
+                .entry(hir_id)
+                .or_default()
+                .multi_cursor_deref_expr_count += 1;
         }
     }
 
