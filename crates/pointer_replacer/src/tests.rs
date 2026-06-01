@@ -9411,6 +9411,60 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 
 #[test]
+fn test_array_local_rewriter_keeps_field_base_memory_copy_cursors_index_only() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+}
+
+unsafe extern "C" {
+    fn memset(ptr: *mut core::ffi::c_void, value: i32, n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn copy_from_back(mut s: *mut State, mut length: i32, mut distance: i32) {
+    let mut src: *mut i8 = (*s).out.offset(-(distance as isize));
+    let mut dst: *mut i8 = (*s).out;
+    (*s).out = (*s).out.offset(length as isize);
+    if distance == 1 {
+        memset(dst as *mut core::ffi::c_void, (*src) as i32, length as usize);
+    } else {
+        while length != 0 {
+            length -= 1;
+            let fresh = *src;
+            src = src.offset(1);
+            *dst = fresh;
+            dst = dst.offset(1);
+        }
+    }
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected field-base memory copy cursors to be rewritten:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("src_idx"), "{s}");
+    assert!(s.contains("dst_idx"), "{s}");
+    assert!(!s.contains("let mut src: *mut i8"), "{s}");
+    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
+    assert!(
+        s.contains("memset(((*s).out).offset(dst_idx)")
+            || s.contains("memset((*s).out.offset(dst_idx)"),
+        "expected memset destination to inline dst_idx from the field base:\n{s}"
+    );
+    assert!(
+        s.contains("*(((*s).out).offset(src_idx)") || s.contains("*((*s).out.offset(src_idx)"),
+        "expected src deref to inline src_idx from the field base:\n{s}"
+    );
+    assert!(
+        s.contains("*(((*s).out).offset(dst_idx)") || s.contains("*((*s).out.offset(dst_idx)"),
+        "expected dst deref to inline dst_idx from the field base:\n{s}"
+    );
+}
+
+#[test]
 fn test_array_local_rewriter_keeps_distinct_indexes_for_two_reassigned_field_bases() {
     let code = r#"
 #[repr(C)]
@@ -9477,14 +9531,17 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("ptr_idx"), "{s}");
+    assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
+    assert!(!s.contains("let ptr: *mut i8"), "{s}");
     assert!(
-        s.contains("let mut ptr: *mut i8") || s.contains("let ptr: *mut i8"),
-        "expected call argument cursor to stay materialized as a raw pointer:\n{s}"
+        s.contains("memchr(((*state).buffer).offset(ptr_idx)")
+            || s.contains("memchr((*state).buffer.offset(ptr_idx)"),
+        "expected memchr to inline ptr_idx from the field base:\n{s}"
     );
+    assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
     assert!(!s.contains("ptr = found.offset(1)"), "{s}");
     assert!(
-        s.contains("ptr = ((*state).buffer).offset(ptr_idx) as *mut i8")
-            || s.contains("ptr = ((*state).buffer).offset(ptr_idx);"),
-        "expected ptr to refresh from ptr_idx after movement:\n{s}"
+        !s.contains("ptr = ((*state).buffer).offset(ptr_idx)"),
+        "{s}"
     );
 }
