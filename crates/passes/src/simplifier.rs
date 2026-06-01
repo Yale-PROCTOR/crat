@@ -62,7 +62,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
         let mut stmts = mut_visit::walk_flat_map_stmt(self, s);
         stmts.retain(|stmt| {
-            if let StmtKind::Semi(e) = &stmt.kind
+            if is_empty_block_stmt(stmt) {
+                false
+            } else if let StmtKind::Semi(e) = &stmt.kind
                 && let ExprKind::Assign(_, r, _) | ExprKind::AssignOp(_, _, r) = &e.kind
                 && !utils::ast::has_side_effects(r)
                 && let Some(hir_stmt) = self.ast_to_hir.get_stmt(stmt.id, self.tcx)
@@ -475,6 +477,16 @@ fn try_simplify_ref_deref(expr: &mut Expr) -> bool {
     true
 }
 
+fn is_empty_block_stmt(stmt: &Stmt) -> bool {
+    let (StmtKind::Expr(expr) | StmtKind::Semi(expr)) = &stmt.kind else {
+        return false;
+    };
+    let ExprKind::Block(block, _) = &expr.kind else {
+        return false;
+    };
+    block.stmts.is_empty()
+}
+
 fn is_libc_ty(ty: &str) -> bool {
     if ty.starts_with("c_") {
         return true;
@@ -839,6 +851,29 @@ mod tests {
             &["x.0"],
             &["((x.0))"],
         )
+    }
+
+    #[test]
+    fn test_empty_block_stmt() {
+        run_test(
+            r#"extern "C" { fn g(); } unsafe fn f() { {} 'a: {} {}; 'b: {}; g(); }"#,
+            &["g();"],
+            &["{}", "'a", "'b"],
+        )
+    }
+
+    #[test]
+    fn test_nested_empty_block_stmt() {
+        run_test(
+            r#"extern "C" { fn g(); } unsafe fn f() { { {}; } g(); }"#,
+            &["g();"],
+            &["{}"],
+        )
+    }
+
+    #[test]
+    fn test_keep_empty_block_value() {
+        run_test("fn f() { let _ = {}; }", &["let _ = {};"], &[])
     }
 
     #[test]
