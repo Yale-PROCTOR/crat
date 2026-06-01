@@ -12,7 +12,7 @@ use rustc_hir::{
 };
 use rustc_middle::{
     mir::{
-        Local, Location, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        Local, Location, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         visit::{PlaceContext, Visitor as MirVisitor},
     },
     ty::{self, TyCtxt},
@@ -792,46 +792,90 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
 
     // Compute (base_name, proxy_hir_ids) depending on whether the base is a
     // direct local (offset 0) or a field path (offset > 0).
-    let (base_name, proxy_hir_ids): (String, FxHashSet<HirId>) = if group.base_slot_offset == 0 {
-        (
-            context.tcx.hir_name(base_hir_id).to_string(),
-            FxHashSet::default(),
-        )
-    } else {
-        let Some(base_slot_info) =
-            analyses::array_local_provenance::base_slot_info(context.provenance, group)
-        else {
-            return;
-        };
-        let local_name = context.tcx.hir_name(base_hir_id).to_string();
-        let base_ty = context.body.local_decls[group.base_local].ty;
-        let Some(name) =
-            slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
-        else {
-            return;
-        };
-        // proxies: direct-local RawPtr members never assigned via a Call
-        let proxies = group
-            .members
-            .iter()
-            .filter_map(|&slot_idx| {
-                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
-                if !info.path.is_empty() || info.root == group.base_local {
-                    return None;
-                }
-                if !matches!(
-                    context.body.local_decls[info.root].ty.kind(),
-                    ty::TyKind::RawPtr(..)
-                ) {
-                    return None;
-                }
-                let &hir_id = context.local_to_hir.get(&info.root)?;
-                (!group.index_tracked && local_is_pure_field_base_proxy(context.body, info.root))
+    // (base_name, proxy_hir_ids, field_base)
+    let (base_name, proxy_hir_ids, field_base): (String, FxHashSet<HirId>, bool) =
+        if group.base_slot_offset == 0 {
+            (
+                context.tcx.hir_name(base_hir_id).to_string(),
+                FxHashSet::default(),
+                false,
+            )
+        } else {
+            let Some(base_slot_info) =
+                analyses::array_local_provenance::base_slot_info(context.provenance, group)
+            else {
+                return;
+            };
+            let local_name = context.tcx.hir_name(base_hir_id).to_string();
+            let base_ty = context.body.local_decls[group.base_local].ty;
+            let Some(field_path_name) =
+                slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
+            else {
+                return;
+            };
+            // collect raw-pointer members that can serve as proxies for the field base
+            let proxies: FxHashSet<HirId> = group
+                .members
+                .iter()
+                .filter_map(|&slot_idx| {
+                    let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                    if !info.path.is_empty() || info.root == group.base_local {
+                        return None;
+                    }
+                    if !matches!(
+                        context.body.local_decls[info.root].ty.kind(),
+                        ty::TyKind::RawPtr(..)
+                    ) {
+                        return None;
+                    }
+                    let &hir_id = context.local_to_hir.get(&info.root)?;
+                    (!group.index_tracked
+                        && (local_is_pure_field_base_proxy(context.body, info.root)
+                            || (local_is_never_mutated(context.body, info.root)
+                                && local_is_simple_copy_from_local(
+                                    context.body,
+                                    info.root,
+                                    group.base_local,
+                                ))))
                     .then_some(hir_id)
-            })
-            .collect();
-        (name, proxies)
-    };
+                })
+                .collect();
+            // a never-mutated member that holds the base pointer at offset 0 can be used as
+            // the effective base name, avoiding rewriting it to an index and allowing members
+            // to use IndexOnly representation (field_base = false).
+            let immutable_copy_name = if !group.index_tracked {
+                group.members.iter().find_map(|&slot_idx| {
+                    let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                    if !info.path.is_empty() || info.root == group.base_local {
+                        return None;
+                    }
+                    if !matches!(
+                        context.body.local_decls[info.root].ty.kind(),
+                        ty::TyKind::RawPtr(..)
+                    ) {
+                        return None;
+                    }
+                    if local_is_pure_field_base_proxy(context.body, info.root) {
+                        return None;
+                    }
+                    if !local_is_never_mutated(context.body, info.root) {
+                        return None;
+                    }
+                    // confirm the single init directly copies the field base (not a call result)
+                    if !local_is_simple_copy_from_local(context.body, info.root, group.base_local) {
+                        return None;
+                    }
+                    let &hir_id = context.local_to_hir.get(&info.root)?;
+                    Some(context.tcx.hir_name(hir_id).to_string())
+                })
+            } else {
+                None
+            };
+            match immutable_copy_name {
+                Some(name) => (name, proxies, false),
+                None => (field_path_name, proxies, true),
+            }
+        };
 
     let base_is_raw_ptr = matches!(
         context.body.local_decls[group.base_local].ty.kind(),
@@ -969,7 +1013,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 nullable,
                 ptr_ty,
                 ptr_mut: mutability.is_mut(),
-                field_base: group.base_slot_offset != 0,
+                field_base,
                 base_proxy_hir_ids: proxy_hir_ids.clone(),
                 group_member_hir_ids: group_member_hir_ids.clone(),
             },
@@ -1113,6 +1157,61 @@ fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Loc
     }
 
     !has_call_destination && !has_non_assignment_use
+}
+
+// returns true when `local` is assigned at most once and never via a call,
+// meaning it's an immutable copy after initialization (may still be used as a value).
+fn local_is_never_mutated(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
+    let mut assignment_count = 0usize;
+    for block_data in body.basic_blocks.iter() {
+        for statement in &block_data.statements {
+            if let StatementKind::Assign(box (lhs, _)) = &statement.kind
+                && lhs.local == local
+                && lhs.projection.is_empty()
+            {
+                assignment_count += 1;
+                if assignment_count > 1 {
+                    return false;
+                }
+            }
+        }
+        if let Some(terminator) = &block_data.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+            && destination.local == local
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// returns true when the local's single initialization statement copies (or casts from a copy of)
+// a place rooted at `source_local`, confirming it's a named alias of that local's value.
+fn local_is_simple_copy_from_local(
+    body: &rustc_middle::mir::Body<'_>,
+    local: Local,
+    source_local: Local,
+) -> bool {
+    for block_data in body.basic_blocks.iter() {
+        for statement in &block_data.statements {
+            if let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind
+                && lhs.local == local
+                && lhs.projection.is_empty()
+            {
+                let operand = match rvalue {
+                    Rvalue::Use(op) => op,
+                    Rvalue::Cast(_, op, _) => op,
+                    _ => return false,
+                };
+                let source = match operand {
+                    Operand::Copy(place) | Operand::Move(place) => place,
+                    _ => return false,
+                };
+                return source.local == source_local;
+            }
+        }
+    }
+    false
 }
 
 struct LocalMentionVisitor {
