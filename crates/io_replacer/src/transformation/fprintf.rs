@@ -2,10 +2,8 @@ use std::{fmt::Write as _, ops::Deref};
 
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
-use rustc_middle::ty;
 use rustc_span::Symbol;
 use utils::{
-    ast::unwrap_cast_and_paren,
     expr,
     file::fprintf::{self, Conversion, FlagChar, Width},
 };
@@ -112,61 +110,11 @@ impl TransformVisitor<'_, '_, '_> {
             let arg_str = pprust::expr_to_string(arg);
             match cast {
                 "&str" => {
-                    let cstr = match &unwrap_cast_and_paren(arg).kind {
-                        ExprKind::MethodCall(call)
-                            if call.seg.ident.name == rustc_span::sym::as_ptr =>
-                        {
-                            self.cstr_from_as_ptr(arg).unwrap_or_else(|| {
-                                let hir_receiver = self
-                                    .ast_to_hir
-                                    .get_expr(call.receiver.id, self.tcx)
-                                    .unwrap();
-                                let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
-                                let ty = typeck.expr_ty(hir_receiver);
-                                panic!("{arg_str} {ty}");
-                            })
-                        }
-                        ExprKind::AddrOf(_, _, pointee) => {
-                            if let ExprKind::Index(base, idx, _) =
-                                &unwrap_cast_and_paren(pointee).kind
-                            {
-                                let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
-                                let typeck = self.tcx.typeck(hir_base.hir_id.owner);
-                                let ty = typeck.expr_ty(hir_base);
-                                let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
-                                    ty.peel_refs().kind()
-                                else {
-                                    panic!("{arg_str} {ty}");
-                                };
-                                let base_str = pprust::expr_to_string(base);
-                                let idx_str = pprust::expr_to_string(idx);
-                                if *ety == self.tcx.types.u8 {
-                                    format!(
-                                        "
-    std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
-                                    )
-                                } else if ety.is_numeric() {
-                                    self.dependencies.bytemuck.set(true);
-                                    format!(
-                                    "
-    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
-                                )
-                                } else {
-                                    panic!("{arg_str} {ty}");
-                                }
-                            } else {
-                                format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
-                            }
-                        }
-                        _ => self
-                            .cstr_from_struct_first_field(arg, &arg_str)
-                            .unwrap_or_else(|| {
-                                format!("std::ffi::CStr::from_ptr(({arg_str}) as _)")
-                            }),
-                    };
                     if self.config.assume_to_str_ok {
-                        write!(args, "{cstr}.to_str().unwrap(), ").unwrap();
+                        let arg = self.cstr_to_str_expr(arg);
+                        write!(args, "{arg}, ").unwrap();
                     } else {
+                        let cstr = self.cstr_expr(arg);
                         write!(
                             args,
                             "{{
@@ -271,30 +219,6 @@ impl TransformVisitor<'_, '_, '_> {
             format!("crate::c_lib::rs_vfprintf({stream_str}, {fmt}, {args})"),
             stream,
         )
-    }
-
-    fn cstr_from_struct_first_field(&self, arg: &Expr, arg_str: &str) -> Option<String> {
-        let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx)?;
-        let typeck = self.tcx.typeck(hir_arg.hir_id.owner);
-        let ty = typeck.expr_ty(hir_arg).peel_refs();
-        let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() else {
-            return None;
-        };
-        if !adt_def.is_struct() {
-            return None;
-        }
-        let field = adt_def.all_fields().next()?;
-        let field_ty = field.ty(self.tcx, generic_args);
-        let ty::TyKind::RawPtr(pointee, _) = field_ty.kind() else {
-            return None;
-        };
-        if *pointee != self.tcx.types.i8 && *pointee != self.tcx.types.u8 {
-            return None;
-        }
-        let field_name = field.ident(self.tcx).name;
-        Some(format!(
-            "std::ffi::CStr::from_ptr(({arg_str}).{field_name} as _)"
-        ))
     }
 }
 

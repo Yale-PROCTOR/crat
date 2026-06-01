@@ -435,6 +435,81 @@ impl<'tcx, 'a> TransformVisitor<'tcx, 'a, '_> {
         ))
     }
 
+    pub(super) fn cstr_expr(&self, e: &Expr) -> String {
+        let e_str = pprust::expr_to_string(e);
+        self.cstr_from_as_ptr(e)
+            .unwrap_or_else(|| self.cstr_expr_fallback(e, &e_str))
+    }
+
+    pub(super) fn cstr_to_str_expr(&self, e: &Expr) -> String {
+        let cstr = self.cstr_expr(e);
+        format!("{cstr}.to_str().unwrap()")
+    }
+
+    fn cstr_expr_fallback(&self, e: &Expr, e_str: &str) -> String {
+        match &utils::ast::unwrap_cast_and_paren(e).kind {
+            ExprKind::AddrOf(_, _, pointee) => {
+                if let ExprKind::Index(base, idx, _) =
+                    &utils::ast::unwrap_cast_and_paren(pointee).kind
+                {
+                    let hir_base = self.ast_to_hir.get_expr(base.id, self.tcx).unwrap();
+                    let typeck = self.tcx.typeck(hir_base.hir_id.owner);
+                    let ty = typeck.expr_ty(hir_base);
+                    let (ty::TyKind::Array(ety, _) | ty::TyKind::Slice(ety)) =
+                        ty.peel_refs().kind()
+                    else {
+                        panic!("{e_str} {ty}");
+                    };
+                    let base_str = pprust::expr_to_string(base);
+                    let idx_str = pprust::expr_to_string(idx);
+                    if *ety == self.tcx.types.u8 {
+                        format!(
+                            "
+    std::ffi::CStr::from_bytes_until_nul(&({base_str})[{idx_str}..]).unwrap()"
+                        )
+                    } else if ety.is_numeric() {
+                        self.dependencies.bytemuck.set(true);
+                        format!(
+                            "
+    std::ffi::CStr::from_bytes_until_nul(bytemuck::cast_slice(&({base_str})[{idx_str}..])).unwrap()"
+                        )
+                    } else {
+                        panic!("{e_str} {ty}");
+                    }
+                } else {
+                    format!("std::ffi::CStr::from_ptr(({e_str}) as _)")
+                }
+            }
+            _ => self
+                .cstr_from_struct_first_field(e, e_str)
+                .unwrap_or_else(|| format!("std::ffi::CStr::from_ptr(({e_str}) as _)")),
+        }
+    }
+
+    fn cstr_from_struct_first_field(&self, arg: &Expr, arg_str: &str) -> Option<String> {
+        let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx)?;
+        let typeck = self.tcx.typeck(hir_arg.hir_id.owner);
+        let ty = typeck.expr_ty(hir_arg).peel_refs();
+        let ty::TyKind::Adt(adt_def, generic_args) = ty.kind() else {
+            return None;
+        };
+        if !adt_def.is_struct() {
+            return None;
+        }
+        let field = adt_def.all_fields().next()?;
+        let field_ty = field.ty(self.tcx, generic_args);
+        let ty::TyKind::RawPtr(pointee, _) = field_ty.kind() else {
+            return None;
+        };
+        if *pointee != self.tcx.types.i8 && *pointee != self.tcx.types.u8 {
+            return None;
+        }
+        let field_name = field.ident(self.tcx).name;
+        Some(format!(
+            "std::ffi::CStr::from_ptr(({arg_str}).{field_name} as _)"
+        ))
+    }
+
     fn byte_slice_from_as_ptr(&self, e: &Expr) -> Option<(String, ty::Ty<'tcx>)> {
         if let Some((array, elem_ty)) = self.array_of_as_ptr(e) {
             return Some((format!("&({})", pprust::expr_to_string(array)), elem_ty));
@@ -1332,14 +1407,17 @@ impl MutVisitor for TransformVisitor<'_, '_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "rename" => {
-                            let new_expr = expr!("crate::c_lib::rs_rename");
+                            let old = self.cstr_to_str_expr(&args[0]);
+                            let new = self.cstr_to_str_expr(&args[1]);
+                            let new_expr = expr!("crate::c_lib::rs_rename({}, {})", old, new);
                             self.lib_items.borrow_mut().insert(LibItem::Rename);
-                            self.replace_expr(callee, new_expr);
+                            self.replace_expr(expr, new_expr);
                         }
                         "remove" => {
-                            let new_expr = expr!("crate::c_lib::rs_remove");
+                            let path = self.cstr_to_str_expr(&args[0]);
+                            let new_expr = expr!("crate::c_lib::rs_remove({})", path);
                             self.lib_items.borrow_mut().insert(LibItem::Remove);
-                            self.replace_expr(callee, new_expr);
+                            self.replace_expr(expr, new_expr);
                         }
                         "setvbuf" | "setbuf" => {
                             if let Some(loc) = self.loc_if_unsupported(&args[0]) {
@@ -1832,17 +1910,14 @@ pub(super) struct IndicatorCheck<'a> {
 
 pub(super) const RENAME: &str = r#"
 #[inline]
-pub(crate) unsafe fn rs_rename(old: *const i8, new: *const i8) -> i32 {
-    let old = std::ffi::CStr::from_ptr(old as _).to_str().unwrap();
-    let new = std::ffi::CStr::from_ptr(new as _).to_str().unwrap();
+pub(crate) fn rs_rename(old: &str, new: &str) -> i32 {
     std::fs::rename(old, new).map_or(-1, |_| 0)
 }
 "#;
 
 pub(super) const REMOVE: &str = r#"
 #[inline]
-pub(crate) unsafe fn rs_remove(path: *const i8) -> i32 {
-    let path = std::ffi::CStr::from_ptr(path as _).to_str().unwrap();
+pub(crate) fn rs_remove(path: &str) -> i32 {
     match std::fs::remove_file(path) {
         Ok(()) => 0,
         Err(e) => {
