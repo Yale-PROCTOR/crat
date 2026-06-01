@@ -57,6 +57,7 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         "builtin_syntax",
         "rt",
         "libstd_sys_internals",
+        "structural_match",
     ]
     .into_iter()
     .collect();
