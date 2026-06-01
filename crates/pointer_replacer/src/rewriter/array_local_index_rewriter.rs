@@ -35,10 +35,25 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BindingRepresentation {
+    IndexOnly,
+    Materialized(MaterializationKind),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MaterializationKind {
+    SharedRef,
+    RawPtr,
+}
+
 #[derive(Clone, Debug)]
 struct BindingRewrite {
     source_hir_id: HirId,
     index_name: String,
+    representation: BindingRepresentation,
+    source_name: String,
+    has_index_benefit: bool,
     base_hir_id: HirId,
     base_name: String,
     base_index_name: Option<String>,
@@ -71,6 +86,303 @@ struct RewritePlan {
     index_names_by_fn: FxHashMap<LocalDefId, FxHashSet<String>>,
 }
 
+#[derive(Default, Clone, Debug)]
+struct BindingUseSummary {
+    deref_count: usize,
+    field_or_index_count: usize,
+    pointer_value_count: usize,
+    movement_count: usize,
+    comparison_count: usize,
+    offset_from_count: usize,
+    call_arg_count: usize,
+    address_taken_count: usize,
+    unsupported_escape: bool,
+    writes_through_pointer: bool,
+}
+
+impl BindingUseSummary {
+    fn value_use_count(&self) -> usize {
+        self.deref_count + self.field_or_index_count + self.pointer_value_count
+    }
+
+    fn has_index_benefit(&self) -> bool {
+        self.movement_count + self.comparison_count + self.offset_from_count > 0
+    }
+
+    fn materialization_kind(&self, ptr_mut: bool) -> Option<MaterializationKind> {
+        if self.unsupported_escape || self.address_taken_count > 0 {
+            return None;
+        }
+        if self.call_arg_count > 0 {
+            return Some(MaterializationKind::RawPtr);
+        }
+        if self.pointer_value_count > 0 {
+            return Some(MaterializationKind::RawPtr);
+        }
+        if self.writes_through_pointer {
+            return ptr_mut.then_some(MaterializationKind::RawPtr);
+        }
+        if self.value_use_count() > 0 {
+            return Some(MaterializationKind::SharedRef);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod binding_use_summary_tests {
+    use rustc_hash::FxHashMap;
+
+    use super::{
+        BindingUseSummary, MaterializationKind, collect_binding_use_summaries_for_names_for_test,
+    };
+
+    fn classifier_summaries(
+        code: &str,
+        planned_names: &[&str],
+    ) -> FxHashMap<String, BindingUseSummary> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            collect_binding_use_summaries_for_names_for_test(tcx, planned_names)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn direct_pointer_value_use_materializes_as_raw_pointer() {
+        let summary = BindingUseSummary {
+            pointer_value_count: 1,
+            ..BindingUseSummary::default()
+        };
+
+        assert_eq!(
+            summary.materialization_kind(false),
+            Some(MaterializationKind::RawPtr)
+        );
+    }
+
+    #[test]
+    fn call_argument_use_materializes_as_raw_pointer() {
+        let summary = BindingUseSummary {
+            call_arg_count: 1,
+            ..BindingUseSummary::default()
+        };
+
+        assert_eq!(
+            summary.materialization_kind(false),
+            Some(MaterializationKind::RawPtr)
+        );
+    }
+
+    #[test]
+    fn unsupported_escape_prevents_materialization() {
+        let summary = BindingUseSummary {
+            pointer_value_count: 1,
+            unsupported_escape: true,
+            ..BindingUseSummary::default()
+        };
+
+        assert_eq!(summary.materialization_kind(false), None);
+    }
+
+    #[test]
+    fn movement_and_comparison_operands_are_not_pointer_value_uses() {
+        let summaries = classifier_summaries(
+            r#"
+pub unsafe fn foo(mut p: *mut i32) -> bool {
+    let mut q: *mut i32 = p.offset(1);
+    let moved: *mut i32 = q.offset(2);
+    q == moved
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert_eq!(q.movement_count, 1);
+        assert_eq!(q.comparison_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+    }
+
+    #[test]
+    fn offset_from_records_receiver_and_direct_pointer_argument() {
+        let summaries = classifier_summaries(
+            r#"
+pub unsafe fn foo(mut p: *mut i32) -> isize {
+    let mut q: *mut i32 = p.offset(1);
+    let mut r: *mut i32 = p.offset(3);
+    q.offset_from(r)
+}
+"#,
+            &["q", "r"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+        let r = summaries.get("r").expect("expected r summary");
+
+        assert_eq!(q.offset_from_count, 1);
+        assert_eq!(r.offset_from_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+        assert_eq!(r.pointer_value_count, 0);
+    }
+
+    #[test]
+    fn field_and_index_through_pointer_deref_are_field_or_index_uses() {
+        let field_summaries = classifier_summaries(
+            r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn foo(mut p: *mut Item) -> i32 {
+    let mut q: *mut Item = p.offset(1);
+    (*q).value
+}
+"#,
+            &["q"],
+        );
+        let q = field_summaries.get("q").expect("expected field q summary");
+
+        assert_eq!(q.field_or_index_count, 1);
+        assert_eq!(q.deref_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+
+        let indexed_field_summaries = classifier_summaries(
+            r#"
+#[repr(C)]
+pub struct Item {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn foo(mut p: *mut Item, i: usize) -> i32 {
+    let mut q: *mut Item = p.offset(1);
+    (*q).values[i]
+}
+"#,
+            &["q"],
+        );
+        let q = indexed_field_summaries
+            .get("q")
+            .expect("expected indexed field q summary");
+
+        assert_eq!(q.field_or_index_count, 2);
+        assert_eq!(q.deref_count, 1);
+        assert_eq!(q.pointer_value_count, 0);
+    }
+
+    #[test]
+    fn escape_like_aggregate_and_return_uses_are_unsupported_escapes() {
+        let aggregate_summaries = classifier_summaries(
+            r#"
+pub unsafe fn aggregate(mut p: *mut i32) -> (*mut i32, [*mut i32; 1]) {
+    let mut q: *mut i32 = p.offset(1);
+    (q, [q])
+}
+"#,
+            &["q"],
+        );
+        let q = aggregate_summaries
+            .get("q")
+            .expect("expected aggregate q summary");
+
+        assert!(q.unsupported_escape);
+
+        let return_summaries = classifier_summaries(
+            r#"
+pub unsafe fn ret(mut p: *mut i32) -> *mut i32 {
+    let mut q: *mut i32 = p.offset(1);
+    return q;
+}
+"#,
+            &["q"],
+        );
+        let q = return_summaries
+            .get("q")
+            .expect("expected return q summary");
+
+        assert!(q.unsupported_escape);
+    }
+
+    #[test]
+    fn implicit_return_tail_use_is_an_unsupported_escape() {
+        let summaries = classifier_summaries(
+            r#"
+pub unsafe fn ret(mut p: *mut i32) -> *mut i32 {
+    let mut q: *mut i32 = p.offset(1);
+    q
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert!(q.unsupported_escape);
+        assert_eq!(q.pointer_value_count, 0);
+    }
+
+    #[test]
+    fn projected_assignment_sets_write_through_pointer() {
+        let summaries = classifier_summaries(
+            r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn foo(mut p: *mut Item) {
+    let mut q: *mut Item = p.offset(1);
+    (*q).value = 1;
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert!(q.writes_through_pointer);
+    }
+
+    #[test]
+    fn compound_assignment_sets_write_through_pointer() {
+        let summaries = classifier_summaries(
+            r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn foo(mut p: *mut Item) {
+    let mut q: *mut Item = p.offset(1);
+    (*q).value += 2;
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert!(q.writes_through_pointer);
+    }
+
+    #[test]
+    fn mutable_reborrow_sets_write_through_pointer() {
+        let summaries = classifier_summaries(
+            r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn foo(mut p: *mut Item) {
+    let mut q: *mut Item = p.offset(1);
+    let _borrow: &mut Item = &mut *q;
+}
+"#,
+            &["q"],
+        );
+        let q = summaries.get("q").expect("expected q summary");
+
+        assert!(q.writes_through_pointer);
+    }
+}
+
 pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     krate: &mut Crate,
     input: &RustProgram<'tcx>,
@@ -89,6 +401,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
     prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan);
+    choose_binding_representations(krate, ast_to_hir, input.tcx, &mut plan);
     if plan.by_hir_id.is_empty() {
         return false;
     }
@@ -556,6 +869,9 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             BindingRewrite {
                 source_hir_id,
                 index_name,
+                representation: BindingRepresentation::IndexOnly,
+                source_name: source_name.clone(),
+                has_index_benefit: false,
                 base_hir_id,
                 base_name: base_name.clone(),
                 base_index_name: base_index_name.clone(),
@@ -676,13 +992,14 @@ fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Loc
                 block,
                 statement_index,
             };
-            if let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind {
-                if lhs.local == local && lhs.projection.is_empty() {
-                    if rvalue_mentions_local(rvalue, local, location) {
-                        has_non_assignment_use = true;
-                    }
-                    continue;
+            if let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind
+                && lhs.local == local
+                && lhs.projection.is_empty()
+            {
+                if rvalue_mentions_local(rvalue, local, location) {
+                    has_non_assignment_use = true;
                 }
+                continue;
             }
             if statement_mentions_local(statement, local, location) {
                 has_non_assignment_use = true;
@@ -690,10 +1007,9 @@ fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Loc
         }
         if let Some(terminator) = &block_data.terminator
             && let TerminatorKind::Call { destination, .. } = &terminator.kind
+            && destination.local == local
         {
-            if destination.local == local {
-                has_call_destination = true;
-            }
+            has_call_destination = true;
         }
         if let Some(terminator) = &block_data.terminator {
             let location = Location {
@@ -787,6 +1103,454 @@ fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
         .collect::<FxHashSet<_>>();
     plan.base_by_key
         .retain(|base_key, _| live_base_keys.contains(base_key));
+}
+
+fn choose_binding_representations(
+    krate: &Crate,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    plan: &mut RewritePlan,
+) {
+    if plan.by_hir_id.is_empty() {
+        return;
+    }
+    let mut visitor = BindingUseClassifier {
+        ast_to_hir,
+        tcx,
+        planned_rewrites: &plan.by_hir_id,
+        summaries: FxHashMap::default(),
+    };
+    visitor.visit_crate(krate);
+    let mut summaries = std::mem::take(&mut visitor.summaries);
+    drop(visitor);
+    for (hir_id, rewrite) in &mut plan.by_hir_id {
+        let summary = summaries.remove(hir_id).unwrap_or_default();
+        rewrite.has_index_benefit = summary.has_index_benefit();
+        if let Some(kind) = summary.materialization_kind(rewrite.ptr_mut) {
+            if matches!(kind, MaterializationKind::RawPtr)
+                && summary.writes_through_pointer
+                && summary.call_arg_count == 0
+                && summary.pointer_value_count == 0
+                && !rewrite.field_base
+            {
+                rewrite.representation = BindingRepresentation::IndexOnly;
+                continue;
+            }
+            if rewrite.nullable && !matches!(kind, MaterializationKind::RawPtr) {
+                rewrite.representation = BindingRepresentation::IndexOnly;
+                continue;
+            }
+            rewrite.representation = BindingRepresentation::Materialized(kind);
+        } else if !summary.has_index_benefit() {
+            rewrite.representation = BindingRepresentation::IndexOnly;
+        }
+    }
+}
+
+#[cfg(test)]
+fn collect_binding_use_summaries_for_names_for_test(
+    tcx: TyCtxt<'_>,
+    planned_names: &[&str],
+) -> FxHashMap<String, BindingUseSummary> {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let mut binding_visitor = TestBindingHirIdVisitor {
+        ast_to_hir: &ast_to_hir,
+        tcx,
+        planned_names: planned_names.iter().copied().collect(),
+        hir_ids_by_name: FxHashMap::default(),
+    };
+    binding_visitor.visit_crate(&krate);
+    let planned_rewrites = binding_visitor
+        .hir_ids_by_name
+        .iter()
+        .map(|(name, &hir_id)| {
+            (
+                hir_id,
+                BindingRewrite {
+                    source_hir_id: hir_id,
+                    index_name: format!("{name}_idx"),
+                    representation: BindingRepresentation::IndexOnly,
+                    source_name: name.clone(),
+                    has_index_benefit: false,
+                    base_hir_id: hir_id,
+                    base_name: "base".to_string(),
+                    base_index_name: None,
+                    base_is_raw_ptr: true,
+                    nullable: false,
+                    ptr_ty: "*mut i32".to_string(),
+                    ptr_mut: true,
+                    field_base: false,
+                    base_proxy_hir_ids: FxHashSet::default(),
+                    group_member_hir_ids: FxHashSet::default(),
+                },
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+
+    let mut visitor = BindingUseClassifier {
+        ast_to_hir: &ast_to_hir,
+        tcx,
+        planned_rewrites: &planned_rewrites,
+        summaries: FxHashMap::default(),
+    };
+    visitor.visit_crate(&krate);
+    let mut summaries = std::mem::take(&mut visitor.summaries);
+    drop(visitor);
+
+    planned_rewrites
+        .iter()
+        .map(|(hir_id, rewrite)| {
+            (
+                rewrite.source_name.clone(),
+                summaries.remove(hir_id).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+struct TestBindingHirIdVisitor<'a, 'tcx> {
+    ast_to_hir: &'a AstToHir,
+    tcx: TyCtxt<'tcx>,
+    planned_names: FxHashSet<&'a str>,
+    hir_ids_by_name: FxHashMap<String, HirId>,
+}
+
+#[cfg(test)]
+impl AstVisitor<'_> for TestBindingHirIdVisitor<'_, '_> {
+    fn visit_param(&mut self, param: &Param) {
+        self.record_param(param);
+        visit::walk_param(self, param);
+    }
+
+    fn visit_local(&mut self, local: &rustc_ast::Local) {
+        self.record_local(local);
+        visit::walk_local(self, local);
+    }
+}
+
+#[cfg(test)]
+impl TestBindingHirIdVisitor<'_, '_> {
+    fn record_param(&mut self, param: &Param) {
+        let PatKind::Ident(_, ident, _) = &param.pat.kind else {
+            return;
+        };
+        let name = ident.name.to_string();
+        if !self.planned_names.contains(name.as_str()) {
+            return;
+        }
+        let Some(hir_param) = self.ast_to_hir.get_param(param.id, self.tcx) else {
+            return;
+        };
+        let hir::PatKind::Binding(_, hir_id, _, _) = hir_param.pat.kind else {
+            return;
+        };
+        self.hir_ids_by_name.insert(name, hir_id);
+    }
+
+    fn record_local(&mut self, local: &rustc_ast::Local) {
+        let PatKind::Ident(_, ident, _) = &local.pat.kind else {
+            return;
+        };
+        let name = ident.name.to_string();
+        if !self.planned_names.contains(name.as_str()) {
+            return;
+        }
+        let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx) else {
+            return;
+        };
+        let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
+            return;
+        };
+        self.hir_ids_by_name.insert(name, hir_id);
+    }
+}
+
+struct BindingUseClassifier<'a, 'tcx> {
+    ast_to_hir: &'a AstToHir,
+    tcx: TyCtxt<'tcx>,
+    planned_rewrites: &'a FxHashMap<HirId, BindingRewrite>,
+    summaries: FxHashMap<HirId, BindingUseSummary>,
+}
+
+impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
+    fn visit_block(&mut self, block: &Block) {
+        let Some((tail, stmts)) = block.stmts.split_last() else {
+            visit::walk_block(self, block);
+            return;
+        };
+        let StmtKind::Expr(tail_expr) = &tail.kind else {
+            visit::walk_block(self, block);
+            return;
+        };
+        if self.record_unsupported_escape_if_direct(tail_expr) {
+            for stmt in stmts {
+                self.visit_stmt(stmt);
+            }
+        } else {
+            visit::walk_block(self, block);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Some(hir_id) = direct_planned_local_hir_id(
+            self.ast_to_hir,
+            self.tcx,
+            self.planned_rewrites,
+            unwrap_cast_and_paren(expr),
+        ) {
+            self.summaries
+                .entry(hir_id)
+                .or_default()
+                .pointer_value_count += 1;
+        }
+
+        match &expr.kind {
+            ExprKind::Array(exprs) | ExprKind::Tup(exprs) => {
+                if self.visit_escape_like_exprs(exprs.iter().map(|expr| &**expr)) {
+                    return;
+                }
+            }
+            ExprKind::Repeat(elem, _) => {
+                if self.record_unsupported_escape_if_direct(elem) {
+                    return;
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, inner) => {
+                if let Some(hir_id) = self.direct_planned_local_hir_id(inner) {
+                    let summary = self.summaries.entry(hir_id).or_default();
+                    summary.deref_count += 1;
+                    summary.pointer_value_count = summary.pointer_value_count.saturating_sub(1);
+                    return;
+                }
+            }
+            ExprKind::Field(inner, _) | ExprKind::Index(inner, _, _) => {
+                if let Some(hir_id) = self.direct_planned_local_hir_id(inner) {
+                    let summary = self.summaries.entry(hir_id).or_default();
+                    summary.field_or_index_count += 1;
+                    summary.pointer_value_count = summary.pointer_value_count.saturating_sub(1);
+                    if let ExprKind::Index(_, index, _) = &expr.kind {
+                        self.visit_expr(index);
+                    }
+                    return;
+                } else {
+                    for hir_id in self.direct_pointer_deref_hir_ids(inner) {
+                        self.summaries
+                            .entry(hir_id)
+                            .or_default()
+                            .field_or_index_count += 1;
+                    }
+                }
+            }
+            ExprKind::MethodCall(call) => {
+                let name = call.seg.ident.name.as_str();
+                let mut handled_receiver = false;
+                if let Some(hir_id) = self.direct_planned_local_hir_id(&call.receiver) {
+                    let summary = self.summaries.entry(hir_id).or_default();
+                    match name {
+                        "offset" | "add" => {
+                            summary.movement_count += 1;
+                            handled_receiver = true;
+                        }
+                        "offset_from" => {
+                            summary.offset_from_count += 1;
+                            handled_receiver = true;
+                        }
+                        "as_ptr" | "as_mut_ptr" => {
+                            summary.pointer_value_count += 1;
+                            handled_receiver = true;
+                        }
+                        _ => {}
+                    }
+                }
+                let mut handled_arg = vec![false; call.args.len()];
+                if name == "offset_from" {
+                    for (index, arg) in call.args.iter().enumerate() {
+                        if let Some(hir_id) = self.direct_planned_local_hir_id(arg) {
+                            self.summaries.entry(hir_id).or_default().offset_from_count += 1;
+                            handled_arg[index] = true;
+                        }
+                    }
+                }
+                if handled_receiver || handled_arg.iter().any(|handled| *handled) {
+                    if !handled_receiver {
+                        self.visit_expr(&call.receiver);
+                    }
+                    for (arg, handled) in call.args.iter().zip(handled_arg) {
+                        if !handled {
+                            self.visit_expr(arg);
+                        }
+                    }
+                    return;
+                }
+            }
+            ExprKind::Binary(op, lhs, rhs)
+                if matches!(
+                    op.node,
+                    BinOpKind::Eq
+                        | BinOpKind::Ne
+                        | BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge
+                ) =>
+            {
+                for side in [lhs, rhs] {
+                    if let Some(hir_id) = self.direct_planned_local_hir_id(side) {
+                        self.summaries.entry(hir_id).or_default().comparison_count += 1;
+                    } else {
+                        self.visit_expr(side);
+                    }
+                }
+                return;
+            }
+            ExprKind::Assign(lhs, rhs, _) => {
+                if let Some(hir_id) = self.direct_planned_local_hir_id(lhs) {
+                    self.summaries.entry(hir_id).or_default().movement_count += 1;
+                }
+                self.record_write_through_pointer(lhs);
+                self.visit_expr(rhs);
+                return;
+            }
+            ExprKind::AssignOp(_, lhs, rhs) => {
+                self.record_write_through_pointer(lhs);
+                self.visit_expr(rhs);
+                return;
+            }
+            ExprKind::AddrOf(_, mutability, inner) => {
+                if mutability.is_mut() {
+                    self.record_write_through_pointer(inner);
+                }
+                if let Some(hir_id) = self.direct_planned_local_hir_id(inner) {
+                    self.summaries
+                        .entry(hir_id)
+                        .or_default()
+                        .address_taken_count += 1;
+                    return;
+                }
+            }
+            ExprKind::Call(_, args) => {
+                let mut handled_arg = false;
+                for arg in args {
+                    if let Some(hir_id) = self.direct_planned_local_hir_id(arg) {
+                        self.summaries.entry(hir_id).or_default().call_arg_count += 1;
+                        handled_arg = true;
+                    }
+                }
+                if handled_arg {
+                    if let ExprKind::Call(callee, args) = &expr.kind {
+                        self.visit_expr(callee);
+                        for arg in args {
+                            if self.direct_planned_local_hir_id(arg).is_none() {
+                                self.visit_expr(arg);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            ExprKind::Ret(Some(value))
+            | ExprKind::Break(_, Some(value))
+            | ExprKind::Become(value)
+            | ExprKind::Yeet(Some(value)) => {
+                if self.record_unsupported_escape_if_direct(value) {
+                    return;
+                }
+            }
+            ExprKind::Yield(kind) => {
+                if let Some(value) = kind.expr()
+                    && self.record_unsupported_escape_if_direct(value)
+                {
+                    return;
+                }
+            }
+            ExprKind::Struct(struct_expr) => {
+                let mut handled = false;
+                for field in &struct_expr.fields {
+                    if self.record_unsupported_escape_if_direct(&field.expr) {
+                        handled = true;
+                    } else {
+                        self.visit_expr(&field.expr);
+                    }
+                }
+                if handled {
+                    visit::walk_path(self, &struct_expr.path);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        visit::walk_expr(self, expr);
+    }
+}
+
+impl BindingUseClassifier<'_, '_> {
+    fn direct_planned_local_hir_id(&self, expr: &Expr) -> Option<HirId> {
+        direct_planned_local_hir_id(
+            self.ast_to_hir,
+            self.tcx,
+            self.planned_rewrites,
+            unwrap_cast_and_paren(expr),
+        )
+    }
+
+    fn record_write_through_pointer(&mut self, expr: &Expr) {
+        for hir_id in self.direct_pointer_deref_hir_ids(expr) {
+            self.summaries
+                .entry(hir_id)
+                .or_default()
+                .writes_through_pointer = true;
+        }
+    }
+
+    fn direct_pointer_deref_hir_ids(&self, expr: &Expr) -> FxHashSet<HirId> {
+        let mut hir_ids = FxHashSet::default();
+        self.collect_direct_pointer_deref_hir_ids(expr, &mut hir_ids);
+        hir_ids
+    }
+
+    fn collect_direct_pointer_deref_hir_ids(&self, expr: &Expr, hir_ids: &mut FxHashSet<HirId>) {
+        let expr = unwrap_cast_and_paren(expr);
+        match &expr.kind {
+            ExprKind::Unary(UnOp::Deref, inner) => {
+                if let Some(hir_id) = self.direct_planned_local_hir_id(inner) {
+                    hir_ids.insert(hir_id);
+                } else {
+                    self.collect_direct_pointer_deref_hir_ids(inner, hir_ids);
+                }
+            }
+            ExprKind::Field(inner, _) => {
+                self.collect_direct_pointer_deref_hir_ids(inner, hir_ids);
+            }
+            ExprKind::Index(inner, _, _) => {
+                self.collect_direct_pointer_deref_hir_ids(inner, hir_ids);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_unsupported_escape_if_direct(&mut self, expr: &Expr) -> bool {
+        let Some(hir_id) = self.direct_planned_local_hir_id(expr) else {
+            return false;
+        };
+        self.summaries.entry(hir_id).or_default().unsupported_escape = true;
+        true
+    }
+
+    fn visit_escape_like_exprs<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> bool {
+        let mut handled = false;
+        for expr in exprs {
+            if self.record_unsupported_escape_if_direct(expr) {
+                handled = true;
+            } else {
+                self.visit_expr(expr);
+            }
+        }
+        handled
+    }
 }
 
 struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
@@ -1295,28 +2059,21 @@ fn offset_from_base_expr(
     tcx: TyCtxt<'_>,
     rewrite: &BindingRewrite,
 ) -> IndexExpr {
-    pointer_index_from_base_expr(
-        expr,
-        ast_to_hir,
-        tcx,
-        rewrite.base_hir_id,
-        &rewrite.base_name,
-        rewrite.field_base,
-        &rewrite.base_proxy_hir_ids,
-        base_current_index_expr(rewrite),
-    )
+    pointer_index_from_base_expr(expr, ast_to_hir, tcx, rewrite)
 }
 
 fn pointer_index_from_base_expr(
     expr: &Expr,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
-    base_hir_id: HirId,
-    base_name: &str,
-    field_base: bool,
-    base_proxy_hir_ids: &FxHashSet<HirId>,
-    base_index_name: Option<&str>,
+    rewrite: &BindingRewrite,
 ) -> IndexExpr {
+    let base_hir_id = rewrite.base_hir_id;
+    let base_name = rewrite.base_name.as_str();
+    let field_base = rewrite.field_base;
+    let base_proxy_hir_ids = &rewrite.base_proxy_hir_ids;
+    let base_index_name = base_current_index_expr(rewrite);
+
     if is_null_expr(expr) {
         return IndexExpr::Null;
     }
@@ -1326,6 +2083,14 @@ fn pointer_index_from_base_expr(
     if (!field_base && expr_hir_id == Some(base_hir_id))
         || expr_hir_id.is_some_and(|id| base_proxy_hir_ids.contains(&id))
         || (field_base && expr_matches_base_name(expr, base_name))
+        || receiver_is_base_as_ptr_for_context(
+            expr,
+            ast_to_hir,
+            tcx,
+            base_hir_id,
+            base_name,
+            field_base,
+        )
     {
         return IndexExpr::Plain(match base_index_name {
             Some(index_name) => utils::expr!("{}", index_name),
@@ -1576,6 +2341,15 @@ fn pointer_expr_for_index(rewrite: &BindingRewrite) -> Expr {
     utils::expr!("{} as {}", base_offset, rewrite.ptr_ty)
 }
 
+fn materialized_init_expr(rewrite: &BindingRewrite, index_expr: &str) -> Expr {
+    let ptr = base_offset_expr_for_index(rewrite, index_expr);
+    utils::expr!("{} as {}", ptr, rewrite.ptr_ty)
+}
+
+fn materialized_ty(rewrite: &BindingRewrite) -> P<Ty> {
+    P(utils::ty!("{}", rewrite.ptr_ty))
+}
+
 fn pointer_value_expr(rewrite: &BindingRewrite) -> Expr {
     if rewrite.nullable {
         let null_fn = if rewrite.ptr_mut {
@@ -1615,12 +2389,145 @@ fn introduced_planned_local_hir_id(
     introduced_hir_ids.contains(&hir_id).then_some(hir_id)
 }
 
+fn planned_materialized_local_hir_id(
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    planned_rewrites: &FxHashMap<HirId, BindingRewrite>,
+    expr: &Expr,
+) -> Option<HirId> {
+    let hir_id = direct_planned_local_hir_id(ast_to_hir, tcx, planned_rewrites, expr)?;
+    planned_rewrites
+        .get(&hir_id)
+        .is_some_and(rewrite_uses_materialized_binding)
+        .then_some(hir_id)
+}
+
+fn introduced_materialized_local_hir_id(
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    planned_rewrites: &FxHashMap<HirId, BindingRewrite>,
+    introduced_hir_ids: &FxHashSet<HirId>,
+    expr: &Expr,
+) -> Option<HirId> {
+    let hir_id = planned_materialized_local_hir_id(ast_to_hir, tcx, planned_rewrites, expr)?;
+    introduced_hir_ids.contains(&hir_id).then_some(hir_id)
+}
+
+fn representation_uses_index_rewrite(representation: &BindingRepresentation) -> bool {
+    matches!(representation, BindingRepresentation::IndexOnly)
+}
+
+fn rewrite_uses_index_rewrite(rewrite: &BindingRewrite) -> bool {
+    representation_uses_index_rewrite(&rewrite.representation)
+        || (matches!(
+            rewrite.representation,
+            BindingRepresentation::Materialized(_)
+        ) && rewrite.nullable)
+}
+
+fn rewrite_uses_materialized_binding(rewrite: &BindingRewrite) -> bool {
+    matches!(
+        rewrite.representation,
+        BindingRepresentation::Materialized(_)
+    ) && !rewrite.nullable
+}
+
+fn introduced_index_rewritten_local_hir_id(
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    planned_rewrites: &FxHashMap<HirId, BindingRewrite>,
+    introduced_hir_ids: &FxHashSet<HirId>,
+    expr: &Expr,
+) -> Option<HirId> {
+    let hir_id = introduced_planned_local_hir_id(ast_to_hir, tcx, introduced_hir_ids, expr)?;
+    planned_rewrites
+        .get(&hir_id)
+        .is_some_and(rewrite_uses_index_rewrite)
+        .then_some(hir_id)
+}
+
 struct ArrayLocalIndexRewriteVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
     plan: RewritePlan,
     introduced_hir_ids: FxHashSet<HirId>,
     changed: bool,
+}
+
+impl ArrayLocalIndexRewriteVisitor<'_, '_> {
+    fn introduced_index_backed_rewrite(&self, hir_id: HirId) -> Option<&BindingRewrite> {
+        if !self.introduced_hir_ids.contains(&hir_id) {
+            return None;
+        }
+        let rewrite = self.plan.by_hir_id.get(&hir_id)?;
+        (rewrite_uses_index_rewrite(rewrite) || rewrite_uses_materialized_binding(rewrite))
+            .then_some(rewrite)
+    }
+
+    fn index_expr_for_operand(&self, expr: &Expr, anchor: &BindingRewrite) -> Option<String> {
+        if let Some(hir_id) =
+            hir_id_of_ast_expr(self.ast_to_hir, self.tcx, unwrap_cast_and_paren(expr).id)
+            && let Some(rewrite) = self.introduced_index_backed_rewrite(hir_id)
+            && !rewrite.nullable
+            && rewrite.base_hir_id == anchor.base_hir_id
+            && rewrite.base_name == anchor.base_name
+        {
+            return Some(idx_read_expr(rewrite));
+        }
+        match offset_from_base_expr(expr, self.ast_to_hir, self.tcx, anchor) {
+            IndexExpr::Plain(index) => Some(pprust::expr_to_string(&index)),
+            IndexExpr::Null | IndexExpr::Unsupported => None,
+        }
+    }
+
+    fn rewrite_materialized_local_stmt(&mut self, local: &mut rustc_ast::Local) -> Option<Stmt> {
+        let let_stmt = self.ast_to_hir.get_let_stmt(local.id, self.tcx)?;
+        let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
+            return None;
+        };
+        let mut rewrite = self.plan.by_hir_id.get(&hir_id)?.clone();
+        if !rewrite_uses_materialized_binding(&rewrite) {
+            return None;
+        }
+
+        let init = local.kind.init_mut()?;
+        if let Some(base_name) =
+            projected_as_ptr_receiver_base_name(init, self.ast_to_hir, self.tcx, &rewrite)
+        {
+            rewrite.base_name = base_name;
+            rewrite.base_is_raw_ptr = false;
+            self.plan.by_hir_id.insert(hir_id, rewrite.clone());
+        }
+
+        let mut index = offset_from_base_expr(init, self.ast_to_hir, self.tcx, &rewrite);
+        if let IndexExpr::Unsupported = index {
+            index = introduced_group_member_assignment_index_expr(
+                init,
+                self.ast_to_hir,
+                self.tcx,
+                &self.plan.by_hir_id,
+                &self.introduced_hir_ids,
+                &rewrite,
+            );
+        }
+        let new_index_init = index_init_expr(index, rewrite.nullable)?;
+        let index_name = rewrite.index_name.clone();
+        let index_stmt = utils::stmt!(
+            "let mut {}: isize = {};",
+            index_name,
+            pprust::expr_to_string(&new_index_init)
+        );
+        let materialized_init = materialized_init_expr(&rewrite, &idx_read_expr(&rewrite));
+
+        if !rewrite_binding_pat(&mut local.pat, &rewrite.source_name) {
+            return None;
+        }
+        local.ty = Some(materialized_ty(&rewrite));
+        *init = P(materialized_init);
+        self.introduced_hir_ids.insert(hir_id);
+        self.changed = true;
+        Some(index_stmt)
+    }
 }
 
 impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
@@ -1650,6 +2557,69 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         mut_visit::walk_item(self, item);
     }
 
+    fn visit_block(&mut self, block: &mut Block) {
+        let mut new_stmts = Vec::with_capacity(block.stmts.len());
+        for mut stmt in std::mem::take(&mut block.stmts) {
+            if let StmtKind::Let(local) = &mut stmt.kind
+                && let Some(index_stmt) = self.rewrite_materialized_local_stmt(local)
+            {
+                new_stmts.push(index_stmt);
+                new_stmts.push(stmt);
+                continue;
+            }
+            if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = &mut stmt.kind
+                && let ExprKind::Assign(lhs, rhs, _) = &mut expr.kind
+                && let Some(hir_id) = introduced_materialized_local_hir_id(
+                    self.ast_to_hir,
+                    self.tcx,
+                    &self.plan.by_hir_id,
+                    &self.introduced_hir_ids,
+                    lhs,
+                )
+                && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id).cloned()
+            {
+                let mut index = introduced_group_member_assignment_index_expr(
+                    rhs,
+                    self.ast_to_hir,
+                    self.tcx,
+                    &self.plan.by_hir_id,
+                    &self.introduced_hir_ids,
+                    &rewrite,
+                );
+                if let IndexExpr::Unsupported = index {
+                    index = assignment_index_expr(
+                        rhs,
+                        self.ast_to_hir,
+                        self.tcx,
+                        &self.plan.by_hir_id,
+                        Some(&self.introduced_hir_ids),
+                        &rewrite,
+                    );
+                }
+                if let Some(new_rhs) = index_assignment_rhs_expr(index, rewrite.nullable) {
+                    let idx_stmt = utils::stmt!(
+                        "{} = {};",
+                        rewrite.index_name,
+                        pprust::expr_to_string(&new_rhs)
+                    );
+                    let materialized_rhs =
+                        materialized_init_expr(&rewrite, &idx_read_expr(&rewrite));
+                    let value_stmt = utils::stmt!(
+                        "{} = {};",
+                        rewrite.source_name,
+                        pprust::expr_to_string(&materialized_rhs)
+                    );
+                    new_stmts.push(idx_stmt);
+                    new_stmts.push(value_stmt);
+                    self.changed = true;
+                    continue;
+                }
+            }
+            new_stmts.extend(self.flat_map_stmt(stmt));
+        }
+        block.stmts = new_stmts.into();
+    }
+
     fn visit_local(&mut self, local: &mut rustc_ast::Local) {
         let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx) else {
             mut_visit::walk_local(self, local);
@@ -1663,6 +2633,10 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             mut_visit::walk_local(self, local);
             return;
         };
+        if rewrite_uses_materialized_binding(&rewrite) {
+            mut_visit::walk_local(self, local);
+            return;
+        }
         let Some(init) = local.kind.init_mut() else {
             mut_visit::walk_local(self, local);
             return;
@@ -1728,6 +2702,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                     &self.introduced_hir_ids,
                     lhs,
                 ) && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id)
+                    && rewrite_uses_index_rewrite(rewrite)
                 {
                     let mut index = introduced_group_member_assignment_index_expr(
                         rhs,
@@ -1763,9 +2738,10 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             ExprKind::AssignOp(_, lhs, rhs) => {
                 if direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
                     .is_none()
-                    && introduced_planned_local_hir_id(
+                    && introduced_index_rewritten_local_hir_id(
                         self.ast_to_hir,
                         self.tcx,
+                        &self.plan.by_hir_id,
                         &self.introduced_hir_ids,
                         lhs,
                     )
@@ -1779,9 +2755,10 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             ExprKind::AddrOf(_, _, inner) => {
                 if direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, inner)
                     .is_none()
-                    && introduced_planned_local_hir_id(
+                    && introduced_index_rewritten_local_hir_id(
                         self.ast_to_hir,
                         self.tcx,
+                        &self.plan.by_hir_id,
                         &self.introduced_hir_ids,
                         inner,
                     )
@@ -1801,6 +2778,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 && let Some(hir_id) = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, receiver.id)
                 && self.introduced_hir_ids.contains(&hir_id)
                 && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id)
+                && rewrite_uses_index_rewrite(rewrite)
             {
                 *expr = if rewrite.nullable {
                     utils::expr!("{}.is_none()", rewrite.index_name)
@@ -1827,23 +2805,16 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 hir_id_of_ast_expr(self.ast_to_hir, self.tcx, unwrap_cast_and_paren(lhs).id);
             let rhs_hir =
                 hir_id_of_ast_expr(self.ast_to_hir, self.tcx, unwrap_cast_and_paren(rhs).id);
-            let lhs_rewrite = lhs_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
-            let rhs_rewrite = rhs_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
-            let lhs_introduced =
-                lhs_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
-            let rhs_introduced =
-                rhs_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
-            if let (Some(lhs_rewrite), Some(rhs_rewrite)) = (lhs_rewrite, rhs_rewrite)
-                && lhs_introduced
-                && rhs_introduced
-                && !lhs_rewrite.nullable
-                && !rhs_rewrite.nullable
-                && lhs_rewrite.base_hir_id == rhs_rewrite.base_hir_id
-                && lhs_rewrite.base_name == rhs_rewrite.base_name
-                && lhs_rewrite.ptr_ty == rhs_rewrite.ptr_ty
+            let lhs_rewrite =
+                lhs_hir.and_then(|hir_id| self.introduced_index_backed_rewrite(hir_id));
+            let rhs_rewrite =
+                rhs_hir.and_then(|hir_id| self.introduced_index_backed_rewrite(hir_id));
+            let anchor = lhs_rewrite.or(rhs_rewrite);
+            if let Some(anchor) = anchor
+                && !anchor.nullable
+                && let Some(lhs_idx) = self.index_expr_for_operand(lhs, anchor)
+                && let Some(rhs_idx) = self.index_expr_for_operand(rhs, anchor)
             {
-                let lhs_idx = idx_read_expr(lhs_rewrite);
-                let rhs_idx = idx_read_expr(rhs_rewrite);
                 *expr = match op.node {
                     BinOpKind::Eq => utils::expr!("{lhs_idx} == {rhs_idx}"),
                     BinOpKind::Ne => utils::expr!("{lhs_idx} != {rhs_idx}"),
@@ -1873,6 +2844,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             && let Some(hir_id) = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, inner.id)
             && self.introduced_hir_ids.contains(&hir_id)
             && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id)
+            && rewrite_uses_index_rewrite(rewrite)
         {
             let ptr = pointer_expr_for_index(rewrite);
             *expr = utils::expr!("*({})", pprust::expr_to_string(&ptr));
@@ -1888,35 +2860,19 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             let arg = unwrap_cast_and_paren(&call.args[0]);
             let receiver_hir = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, receiver.id);
             let arg_hir = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, arg.id);
-            let receiver_rewrite = receiver_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
-            let arg_rewrite = arg_hir.and_then(|hir_id| self.plan.by_hir_id.get(&hir_id));
-            let receiver_introduced =
-                receiver_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
-            let arg_introduced =
-                arg_hir.is_some_and(|hir_id| self.introduced_hir_ids.contains(&hir_id));
-            let replacement = if let (Some(lhs), Some(rhs)) = (receiver_rewrite, arg_rewrite)
-                && lhs.base_hir_id == rhs.base_hir_id
-                && lhs.base_name == rhs.base_name
-            {
-                if receiver_introduced && arg_introduced {
-                    Some(utils::expr!(
-                        "({}) - ({})",
-                        idx_read_expr(lhs),
-                        idx_read_expr(rhs)
-                    ))
-                } else if arg_introduced {
-                    let base_ptr = base_offset_expr_for_index(rhs, &idx_read_expr(rhs));
-                    Some(utils::expr!(
-                        "({}).offset_from({})",
-                        pprust::expr_to_string(receiver),
-                        base_ptr
-                    ))
-                } else {
-                    None
+            let receiver_rewrite =
+                receiver_hir.and_then(|hir_id| self.introduced_index_backed_rewrite(hir_id));
+            let arg_rewrite =
+                arg_hir.and_then(|hir_id| self.introduced_index_backed_rewrite(hir_id));
+            let anchor = receiver_rewrite.or(arg_rewrite);
+            let replacement = anchor.and_then(|anchor| {
+                if anchor.nullable {
+                    return None;
                 }
-            } else {
-                None
-            };
+                let receiver_idx = self.index_expr_for_operand(receiver, anchor)?;
+                let arg_idx = self.index_expr_for_operand(arg, anchor)?;
+                Some(utils::expr!("({}) - ({})", receiver_idx, arg_idx))
+            });
             if let Some(replacement) = replacement {
                 *expr = replacement;
                 self.changed = true;
@@ -1938,6 +2894,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         if let Some(hir_id) = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, expr.id)
             && self.introduced_hir_ids.contains(&hir_id)
             && let Some(rewrite) = self.plan.by_hir_id.get(&hir_id)
+            && rewrite_uses_index_rewrite(rewrite)
         {
             *expr = pointer_value_expr(rewrite);
             self.changed = true;
