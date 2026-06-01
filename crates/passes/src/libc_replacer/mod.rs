@@ -149,6 +149,9 @@ struct TransformVisitor<'tcx> {
 impl MutVisitor for TransformVisitor<'_> {
     fn flat_map_stmt(&mut self, stmt: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
         let mut stmts = mut_visit::walk_flat_map_stmt(self, stmt);
+        for stmt in &mut stmts {
+            replace_assert_stmt(stmt);
+        }
         stmts.retain(|stmt| {
             if let StmtKind::Semi(expr) = &stmt.kind
                 && let Some(hir_id) = self.ast_to_hir.local_map.get(&expr.id)
@@ -610,6 +613,47 @@ fn fn_body_has_raw_deref(body: &Block, ast_to_hir: &utils::ir::AstToHir, tcx: Ty
     };
     finder.visit_block(body);
     finder.found
+}
+
+fn replace_assert_stmt(stmt: &mut Stmt) {
+    let Some(condition) = assert_condition(stmt).map(pprust::expr_to_string) else {
+        return;
+    };
+    *stmt = utils::stmt!("assert!({condition});");
+}
+
+fn assert_condition(stmt: &Stmt) -> Option<&Expr> {
+    let StmtKind::Expr(expr) = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::If(condition, then_block, else_expr) = &expr.kind else {
+        return None;
+    };
+    if !then_block.stmts.is_empty() {
+        return None;
+    }
+    let ExprKind::Block(else_block, None) = &else_expr.as_ref()?.kind else {
+        return None;
+    };
+    let [else_stmt] = else_block.stmts.as_slice() else {
+        return None;
+    };
+    let StmtKind::Semi(else_expr) = &else_stmt.kind else {
+        return None;
+    };
+    let ExprKind::Call(callee, _) = &unwrap_paren(else_expr).kind else {
+        return None;
+    };
+    let ExprKind::Path(_, path) = &unwrap_paren(callee).kind else {
+        return None;
+    };
+    let [segment] = path.segments.as_slice() else {
+        return None;
+    };
+    if segment.ident.as_str() != "__assert_fail" {
+        return None;
+    }
+    Some(condition)
 }
 
 impl TransformVisitor<'_> {

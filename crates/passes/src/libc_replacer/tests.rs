@@ -660,6 +660,67 @@ pub unsafe fn foo() -> time_t {
 }
 
 #[test]
+fn test_assert_fail_block_rewrites_to_assert_statement() {
+    run_test(
+        r#"
+extern "C" {
+    fn __assert_fail(
+        __assertion: *const core::ffi::c_char,
+        __file: *const core::ffi::c_char,
+        __line: core::ffi::c_uint,
+        __function: *const core::ffi::c_char,
+    ) -> !;
+}
+
+pub unsafe fn foo(mut x: core::ffi::c_int) {
+    if x != 0 {} else {
+        __assert_fail(
+            b"x\0" as *const u8 as *const core::ffi::c_char,
+            b"a.c\0" as *const u8 as *const core::ffi::c_char,
+            5 as core::ffi::c_uint,
+            b"foo\0" as *const u8 as *const core::ffi::c_char,
+        );
+    }
+    x += 1;
+}
+        "#,
+        &["assert!(x != 0);", "x += 1;"],
+        &["b\"x\\0\""],
+    );
+}
+
+#[test]
+fn test_assert_fail_block_with_non_empty_then_is_left_alone() {
+    run_test(
+        r#"
+extern "C" {
+    fn __assert_fail(
+        __assertion: *const core::ffi::c_char,
+        __file: *const core::ffi::c_char,
+        __line: core::ffi::c_uint,
+        __function: *const core::ffi::c_char,
+    ) -> !;
+}
+
+pub unsafe fn foo(mut x: core::ffi::c_int) {
+    if x != 0 {
+        x += 1;
+    } else {
+        __assert_fail(
+            b"x\0" as *const u8 as *const core::ffi::c_char,
+            b"a.c\0" as *const u8 as *const core::ffi::c_char,
+            5 as core::ffi::c_uint,
+            b"foo\0" as *const u8 as *const core::ffi::c_char,
+        );
+    }
+}
+        "#,
+        &["__assert_fail", "x += 1;"],
+        &["assert!"],
+    );
+}
+
+#[test]
 fn test_trig_abs_and_difftime_calls_use_safe_replacements() {
     run_test(
         r#"
