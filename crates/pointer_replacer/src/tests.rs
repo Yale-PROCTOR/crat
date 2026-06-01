@@ -9265,13 +9265,27 @@ pub unsafe fn flip(mut img: *mut Image) {
     assert!(changed, "expected rewrite to change the code:\n{s}");
     assert!(s.contains("a_idx"), "expected a_idx in:\n{s}");
     assert!(s.contains("b_idx"), "expected b_idx in:\n{s}");
+    // pix is never reassigned so it stays as a raw pointer — not rewritten to an index
     assert!(
-        s.contains("let mut a: *mut u8") || s.contains("let a: *mut u8"),
-        "expected a to stay materialized in:\n{s}"
+        s.contains("let mut pix: *mut u8") || s.contains("let pix: *mut u8"),
+        "expected pix to remain as a raw pointer in:\n{s}"
+    );
+    // a and b are only used through indices into pix — no materialized pointer locals
+    assert!(
+        !s.contains("let mut a: *mut u8") && !s.contains("let a: *mut u8"),
+        "expected a NOT to be materialized in:\n{s}"
     );
     assert!(
-        s.contains("let mut b: *mut u8") || s.contains("let b: *mut u8"),
-        "expected b to stay materialized in:\n{s}"
+        !s.contains("let mut b: *mut u8") && !s.contains("let b: *mut u8"),
+        "expected b NOT to be materialized in:\n{s}"
+    );
+    assert!(
+        s.contains("pix).offset(a_idx)"),
+        "expected pix offset by a_idx in:\n{s}"
+    );
+    assert!(
+        s.contains("pix).offset(b_idx)"),
+        "expected pix offset by b_idx in:\n{s}"
     );
 }
 
@@ -9308,36 +9322,31 @@ pub unsafe fn flip(mut img: *mut Image) {
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected materialized mutable cursor rewrite:\n{s}"
-    );
+    assert!(changed, "expected rewrite to change the code:\n{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("a_idx"), "{s}");
     assert!(s.contains("b_idx"), "{s}");
+    // pix is never reassigned — stays as a raw pointer, not rewritten to an index
     assert!(
-        s.contains("let mut a: *mut u8") || s.contains("let a: *mut u8"),
-        "expected materialized pointer local a to remain:\n{s}"
+        s.contains("let mut pix: *mut u8") || s.contains("let pix: *mut u8"),
+        "expected pix to remain as raw pointer:\n{s}"
+    );
+    // a and b become index-only — no separate pointer locals
+    assert!(
+        !s.contains("let mut a: *mut u8") && !s.contains("let a: *mut u8"),
+        "expected a not to be materialized:\n{s}"
     );
     assert!(
-        s.contains("let mut b: *mut u8") || s.contains("let b: *mut u8"),
-        "expected materialized pointer local b to remain:\n{s}"
+        !s.contains("let mut b: *mut u8") && !s.contains("let b: *mut u8"),
+        "expected b not to be materialized:\n{s}"
     );
     assert!(
-        s.contains("let t: u8 = *a") || s.contains("let mut t: u8 = *a"),
-        "expected read to use materialized a rather than rematerialized base offset:\n{s}"
-    );
-    assert!(s.contains("*a = *b"), "{s}");
-    assert!(s.contains("*b = t"), "{s}");
-    let a_offset_uses = s.matches("pix).offset(a_idx)").count();
-    let b_offset_uses = s.matches("pix).offset(b_idx)").count();
-    assert!(
-        a_offset_uses <= 2,
-        "expected a_idx offsets only for materializing/refreshing a, got {a_offset_uses}:\n{s}"
+        s.contains("pix).offset(a_idx)"),
+        "expected reads/writes through pix offset by a_idx:\n{s}"
     );
     assert!(
-        b_offset_uses <= 2,
-        "expected b_idx offsets only for materializing/refreshing b, got {b_offset_uses}:\n{s}"
+        s.contains("pix).offset(b_idx)"),
+        "expected reads/writes through pix offset by b_idx:\n{s}"
     );
     assert!(
         s.contains("a_idx = (a_idx) +") || s.contains("a_idx = a_idx +") || s.contains("a_idx +="),
