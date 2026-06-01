@@ -12,9 +12,9 @@ use rustc_middle::{
     thir,
     ty::{self, TyCtxt},
 };
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use utils::{
-    ast::unwrap_cast_and_paren_mut,
+    ast::{unwrap_cast_and_paren_mut, unwrap_paren_mut},
     ir::{AstToHir, HirToThir, ThirToMir},
 };
 
@@ -62,7 +62,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     fn flat_map_stmt(&mut self, s: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
         let mut stmts = mut_visit::walk_flat_map_stmt(self, s);
         stmts.retain(|stmt| {
-            if let StmtKind::Semi(e) = &stmt.kind
+            if is_empty_block_stmt(stmt) {
+                false
+            } else if let StmtKind::Semi(e) = &stmt.kind
                 && let ExprKind::Assign(_, r, _) | ExprKind::AssignOp(_, _, r) = &e.kind
                 && !utils::ast::has_side_effects(r)
                 && let Some(hir_stmt) = self.ast_to_hir.get_stmt(stmt.id, self.tcx)
@@ -269,6 +271,10 @@ impl<'tcx> AstVisitor<'tcx> {
             _ => {}
         }
 
+        if self.try_simplify_some_unwrap(expr) || try_simplify_ref_deref(expr) {
+            return;
+        }
+
         match &mut expr.kind {
             ExprKind::Paren(e) => {
                 if is_atomic(e) {
@@ -309,6 +315,72 @@ impl<'tcx> AstVisitor<'tcx> {
             }
             _ => {}
         }
+    }
+
+    fn try_simplify_some_unwrap(&self, expr: &mut Expr) -> bool {
+        if !self.is_option_some_unwrap(expr.id) {
+            return false;
+        }
+
+        let ExprKind::MethodCall(call) = &mut expr.kind else {
+            return false;
+        };
+        if call.seg.ident.name != sym::unwrap || !call.args.is_empty() {
+            return false;
+        }
+
+        let receiver = unwrap_paren_mut(&mut call.receiver);
+        let ExprKind::Call(callee, args) = &mut receiver.kind else {
+            return false;
+        };
+        if !matches!(&callee.kind, ExprKind::Path(_, _)) {
+            return false;
+        }
+        let [arg] = &mut args[..] else {
+            return false;
+        };
+
+        *expr = utils::ast::take_expr(arg);
+        true
+    }
+
+    fn is_option_some_unwrap(&self, node_id: NodeId) -> bool {
+        let Some(hir_expr) = self.ast_to_hir.get_expr(node_id, self.tcx) else {
+            return false;
+        };
+        let hir::ExprKind::MethodCall(seg, receiver, [], _) = hir_expr.kind else {
+            return false;
+        };
+        if seg.ident.name != sym::unwrap {
+            return false;
+        }
+
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let ty::TyKind::Adt(receiver_def, _) = typeck.expr_ty(receiver).kind() else {
+            return false;
+        };
+        if !self
+            .tcx
+            .is_lang_item(receiver_def.did(), hir::LangItem::Option)
+        {
+            return false;
+        }
+
+        let hir::ExprKind::Call(callee, [_]) = receiver.kind else {
+            return false;
+        };
+        let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind else {
+            return false;
+        };
+        let Res::Def(hir::def::DefKind::Ctor(hir::def::CtorOf::Variant, _), def_id) = path.res
+        else {
+            return false;
+        };
+        let variant_def_id = self.tcx.parent(def_id);
+        self.tcx.item_name(variant_def_id) == sym::Some
+            && self
+                .tcx
+                .is_lang_item(self.tcx.parent(variant_def_id), hir::LangItem::Option)
     }
 
     fn eval_lit_cast(&self, expr: &hir::Expr) -> Option<Int> {
@@ -390,6 +462,29 @@ impl<'tcx> AstVisitor<'tcx> {
             _ => Some(vec![ty]),
         }
     }
+}
+
+fn try_simplify_ref_deref(expr: &mut Expr) -> bool {
+    let ExprKind::Unary(UnOp::Deref, inner) = &mut expr.kind else {
+        return false;
+    };
+    let inner = unwrap_paren_mut(inner);
+    let ExprKind::AddrOf(BorrowKind::Ref, _, borrowed) = &mut inner.kind else {
+        return false;
+    };
+
+    *expr = utils::ast::take_expr(borrowed);
+    true
+}
+
+fn is_empty_block_stmt(stmt: &Stmt) -> bool {
+    let (StmtKind::Expr(expr) | StmtKind::Semi(expr)) = &stmt.kind else {
+        return false;
+    };
+    let ExprKind::Block(block, _) = &expr.kind else {
+        return false;
+    };
+    block.stmts.is_empty()
 }
 
 fn is_libc_ty(ty: &str) -> bool {
@@ -755,6 +850,83 @@ mod tests {
             "struct S(i32); fn f(x: S) { ((x.0)); }",
             &["x.0"],
             &["((x.0))"],
+        )
+    }
+
+    #[test]
+    fn test_empty_block_stmt() {
+        run_test(
+            r#"extern "C" { fn g(); } unsafe fn f() { {} 'a: {} {}; 'b: {}; g(); }"#,
+            &["g();"],
+            &["{}", "'a", "'b"],
+        )
+    }
+
+    #[test]
+    fn test_nested_empty_block_stmt() {
+        run_test(
+            r#"extern "C" { fn g(); } unsafe fn f() { { {}; } g(); }"#,
+            &["g();"],
+            &["{}"],
+        )
+    }
+
+    #[test]
+    fn test_keep_empty_block_value() {
+        run_test("fn f() { let _ = {}; }", &["let _ = {};"], &[])
+    }
+
+    #[test]
+    fn test_some_unwrap_ref_arg() {
+        run_test(
+            "fn g(_: &mut i32) {} fn f() { let mut x = 0; g(Some(&mut x).unwrap()); }",
+            &["g(&mut x)"],
+            &["Some(&mut x).unwrap()"],
+        )
+    }
+
+    #[test]
+    fn test_some_unwrap_deref_assignment() {
+        run_test(
+            "fn f() -> i32 { let mut x = 0; *Some(&mut x).unwrap() = 1; x }",
+            &["x = 1; x"],
+            &["*Some(&mut x).unwrap()"],
+        )
+    }
+
+    #[test]
+    fn test_some_unwrap_deref_call_result() {
+        run_test(
+            "fn cast_ref<T>(x: &T) -> &T { x } fn f(x: i32) -> i32 { *Some(cast_ref(&x)).unwrap() }",
+            &["*cast_ref(&x)"],
+            &["Some(cast_ref(&x)).unwrap()"],
+        )
+    }
+
+    #[test]
+    fn test_ref_deref() {
+        run_test(
+            "fn f(seed: &mut i32) -> i32 { *seed = 69069 * *&*seed + 1; *&*seed }",
+            &["*seed = 69069 * *seed + 1", "; *seed }"],
+            &["*&"],
+        )
+    }
+
+    #[test]
+    fn test_do_not_simplify_shadowed_some_unwrap() {
+        run_test(
+            "struct W(i32); impl W { fn unwrap(self) -> i32 { self.0 } } fn Some(x: i32) -> W { W(x) } fn f() -> i32 { Some(1).unwrap() }",
+            &["Some(1).unwrap()"],
+            &[],
+        )
+    }
+
+    #[test]
+    fn test_do_not_simplify_raw_ref_deref() {
+        run_test(
+            "unsafe fn f(x: *mut i32) -> i32 { *(&raw const *x) }",
+            &["&raw const"],
+            &[],
         )
     }
 

@@ -57,6 +57,7 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         "builtin_syntax",
         "rt",
         "libstd_sys_internals",
+        "structural_match",
     ]
     .into_iter()
     .collect();
@@ -206,6 +207,12 @@ impl MutVisitor for AstVisitor<'_> {
     }
 
     fn flat_map_stmt(&mut self, stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+        if let Some(mut condition) = expanded_assert_condition(&stmt) {
+            self.visit_expr(&mut condition);
+            let condition = pprust::expr_to_string(&condition);
+            return smallvec![utils::stmt!("assert!({condition});")];
+        }
+
         let mut stmts = mut_visit::walk_flat_map_stmt(self, stmt);
         for stmt in &mut stmts {
             // { use std::io::Write; print!(..) }; => print!(..);
@@ -332,6 +339,49 @@ impl MutVisitor for AstVisitor<'_> {
         }
         mut_visit::walk_expr(self, expr);
     }
+}
+
+fn expanded_assert_condition(stmt: &Stmt) -> Option<Expr> {
+    let StmtKind::Semi(expr) = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::If(condition, then_block, else_expr) = &expr.kind else {
+        return None;
+    };
+    if else_expr.is_some() {
+        return None;
+    }
+    let ExprKind::Unary(UnOp::Not, condition) = &unwrap_paren(condition).kind else {
+        return None;
+    };
+    let [panic_stmt] = then_block.stmts.as_slice() else {
+        return None;
+    };
+    let StmtKind::Expr(panic_expr) = &panic_stmt.kind else {
+        return None;
+    };
+    let ExprKind::Call(callee, args) = &panic_expr.kind else {
+        return None;
+    };
+    let ExprKind::Path(None, path) = &callee.kind else {
+        return None;
+    };
+    let [.., module, func] = path.segments.as_slice() else {
+        return None;
+    };
+    if module.ident.name != sym::panicking || func.ident.name != sym::panic {
+        return None;
+    }
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    let ExprKind::Lit(lit) = &arg.kind else {
+        return None;
+    };
+    if !lit.symbol.as_str().starts_with("assertion failed:") {
+        return None;
+    }
+    Some(unwrap_paren(condition).clone())
 }
 
 fn unwrap_addr_of(expr: &Expr) -> &Expr {
@@ -618,6 +668,19 @@ fn f() {
             "#,
             &["eprint!"],
             &["stdout", "write_fmt", "format_args"],
+        )
+    }
+
+    #[test]
+    fn test_assert() {
+        run_test(
+            r#"
+fn f(x: i32) {
+    assert!(x != 0);
+}
+            "#,
+            &["assert!(x != 0);"],
+            &["panicking", "assertion failed"],
         )
     }
 
