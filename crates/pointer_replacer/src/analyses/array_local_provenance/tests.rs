@@ -4,7 +4,10 @@ use rustc_hir::{self as hir, ItemKind, OwnerNode, PatKind, intravisit};
 use typed_arena::Arena;
 use utils::ty_shape;
 
-use super::{BaseAdmissibility, BaseId, PfgNode, analyze_body};
+use super::{
+    BaseAdmissibility, BaseId, PfgNode, UnknownReason, analyze_body,
+    array_local_provenance_analysis,
+};
 use crate::{
     analyses::type_qualifier::foster::mutability::mutability_analysis,
     rewriter::array_local_index_rewriter::group_has_rewritable_binding, utils::rustc::RustProgram,
@@ -67,6 +70,58 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
             let fn_name = tcx.item_name(did.to_def_id()).to_string();
             let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
             let result = analyze_body(tcx, did, &body, &alloc_fns);
+            let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
+            let hir_body = tcx.hir_body_owned_by(did);
+            let bindings = collect_bindings(hir_body);
+
+            for (hir_id, local) in &hir_to_mir.binding_to_local {
+                let Some(var_name) = bindings.get(hir_id) else {
+                    continue;
+                };
+                let bases = result
+                    .slot_table
+                    .local_head_slot(*local)
+                    .and_then(|slot| {
+                        result
+                            .provenance
+                            .reachable_bases
+                            .get(&PfgNode::Slot(slot))
+                            .cloned()
+                    })
+                    .unwrap_or_default();
+                let unique = result.unique_base_of_local(*local);
+                let admissibility = unique
+                    .as_ref()
+                    .map(|base| result.admissibility_of_base(base));
+                facts.insert(
+                    (fn_name.clone(), var_name.clone()),
+                    LocalFacts {
+                        bases,
+                        unique,
+                        admissibility,
+                    },
+                );
+            }
+        }
+
+        facts
+    })
+    .unwrap()
+}
+
+fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let rust_program = build_rust_program(tcx);
+        let alloc_fns = FxHashSet::default();
+        let results = array_local_provenance_analysis(&rust_program, &alloc_fns);
+        let mut facts = FxHashMap::default();
+
+        for &did in &rust_program.functions {
+            let fn_name = tcx.item_name(did.to_def_id()).to_string();
+            let _body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let result = results
+                .get(&did)
+                .unwrap_or_else(|| panic!("missing provenance result for {fn_name}"));
             let hir_to_mir = utils::ir::map_thir_to_mir(did, false, tcx);
             let hir_body = tcx.hir_body_owned_by(did);
             let bindings = collect_bindings(hir_body);
@@ -223,6 +278,27 @@ fn assert_unique_param(fact: &LocalFacts) {
     assert_eq!(
         fact.admissibility,
         Some(BaseAdmissibility::DirectlyRewriteable)
+    );
+}
+
+fn assert_has_only_nulltransparent_base(fact: &LocalFacts, expected: &BaseId) {
+    let non_null_bases: Vec<_> = fact
+        .bases
+        .iter()
+        .filter(|base| {
+            !matches!(
+                base,
+                BaseId::Unknown {
+                    reason: UnknownReason::NullLike,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        non_null_bases,
+        vec![expected],
+        "expected exactly one non-null base {expected:?}, got {fact:#?}"
     );
 }
 
@@ -1159,6 +1235,301 @@ fn array_local_provenance_call_returning_raw_pointer_non_regression() {
         q.admissibility,
         Some(BaseAdmissibility::TrackOnly),
         "OpaqueReturn base must be TrackOnly: {q:#?}"
+    );
+}
+
+#[test]
+fn array_local_provenance_direct_callee_arg_write_preserves_base() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn helper(src: *mut i32, out: *mut *mut i32) {
+            *out = src;
+        }
+
+        pub unsafe fn f(p: *mut i32, i: usize) {
+            let q = p.add(i);
+            let mut into: *mut i32 = core::ptr::null_mut();
+            helper(q, &raw mut into);
+            let r = into.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    let into = facts(&map, "f", "into");
+    let r = facts(&map, "f", "r");
+    assert_unique_param(q);
+    assert_has_only_nulltransparent_base(into, q.unique.as_ref().unwrap());
+    assert_has_only_nulltransparent_base(r, q.unique.as_ref().unwrap());
+}
+
+#[test]
+fn array_local_provenance_direct_callee_arg_write_from_first_param_cjson_shape() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub type c_char = i8;
+
+        pub unsafe fn minify_string(src: *mut c_char, out: *mut *mut c_char) {
+            *out = src;
+        }
+
+        pub unsafe fn cjson_minify(json: *mut c_char) {
+            let mut into = json;
+            let q = json.add(1);
+            minify_string(q, &raw mut into);
+            let r = into.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let q = facts(&map, "cjson_minify", "q");
+    let into = facts(&map, "cjson_minify", "into");
+    let r = facts(&map, "cjson_minify", "r");
+    assert_unique_param(q);
+    assert_eq!(into.unique, q.unique, "into should keep q/json base: {into:#?}");
+    assert_eq!(r.unique, q.unique, "r should keep q/json base: {r:#?}");
+}
+
+#[test]
+fn array_local_provenance_direct_callee_unknown_arg_write_preserves_direct_param_copy_slot() {
+    let map = run_interprocedural_analysis(
+        r#"
+        unsafe extern "C" {
+            fn unknown(out: *mut *mut i32);
+        }
+
+        pub unsafe fn helper(out: *mut *mut i32) {
+            let alias = out;
+            unknown(alias);
+        }
+
+        pub unsafe fn f(out: *mut *mut i32) {
+            helper(out);
+            let q = *out;
+            let _ = q;
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    assert!(
+        matches!(q.unique, Some(BaseId::Param { .. })),
+        "summary fallback should preserve the direct-param base for q: {q:#?}"
+    );
+    assert!(
+        !q.bases.iter().any(|base| {
+            matches!(
+                base,
+                BaseId::Unknown {
+                    reason: UnknownReason::UnsupportedMemoryLoad,
+                    ..
+                }
+            )
+        }),
+        "summary fallback should not add UnsupportedMemoryLoad to q: {q:#?}"
+    );
+}
+
+#[test]
+fn array_local_provenance_direct_callee_unknown_arg_write_uses_summarized_param_index() {
+    let map = run_interprocedural_analysis(
+        r#"
+        unsafe extern "C" {
+            fn unknown(out: *mut *mut i32);
+        }
+
+        pub unsafe fn helper(scratch: *mut *mut i32, out: *mut *mut i32) {
+            let alias = out;
+            unknown(alias);
+            let _ = scratch;
+        }
+
+        pub unsafe fn f(p: *mut i32, out: *mut *mut i32) {
+            let mut local = p;
+            helper(&raw mut local, out);
+            let q = local;
+            let r = *out;
+            let _ = (q, r);
+        }
+        "#,
+    );
+
+    let local = facts(&map, "f", "local");
+    let q = facts(&map, "f", "q");
+    let r = facts(&map, "f", "r");
+
+    assert_unique_param(q);
+    assert_eq!(
+        local.unique, q.unique,
+        "wrong unknown-write summary target should not poison local: {local:#?}"
+    );
+    assert_unique_param(r);
+    assert_ne!(r.unique, q.unique, "r should track out, not p: {r:#?}");
+    assert!(
+        !q.bases.iter().any(|base| {
+            matches!(
+                base,
+                BaseId::Unknown {
+                    reason: UnknownReason::UnsupportedMemoryLoad,
+                    ..
+                }
+            )
+        }),
+        "q should not gain UnsupportedMemoryLoad from the scratch argument: {q:#?}"
+    );
+}
+
+#[test]
+fn array_local_provenance_direct_callee_return_preserves_param_base() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn advance(p: *mut i32, i: usize) -> *mut i32 {
+            p.add(i)
+        }
+
+        pub unsafe fn f(p: *mut i32, i: usize) {
+            let q = advance(p, i);
+            let r = q.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    let r = facts(&map, "f", "r");
+    assert_unique_param(q);
+    assert_eq!(r.unique, q.unique, "r should keep q's base: {r:#?}");
+}
+
+#[test]
+fn array_local_provenance_direct_callee_return_through_pointer_arithmetic() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn advance_twice(p: *mut i32, i: usize) -> *mut i32 {
+            let q = p.add(i);
+            q.add(1)
+        }
+
+        pub unsafe fn f(p: *mut i32, i: usize) {
+            let q = advance_twice(p, i);
+            let r = q.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    let r = facts(&map, "f", "r");
+    assert_unique_param(q);
+    assert_eq!(r.unique, q.unique, "r should keep q's base: {r:#?}");
+}
+
+#[test]
+fn array_local_provenance_extern_call_stays_conservative() {
+    let map = run_interprocedural_analysis(
+        r#"
+        unsafe extern "C" {
+            fn helper(src: *mut i32, out: *mut *mut i32);
+        }
+
+        pub unsafe fn f(p: *mut i32, i: usize) {
+            let q = p.add(i);
+            let mut into: *mut i32 = core::ptr::null_mut();
+            helper(q, &raw mut into);
+            let r = into.add(1);
+            let _ = r;
+        }
+        "#,
+    );
+
+    let into = facts(&map, "f", "into");
+    assert!(
+        !into.bases.iter().any(|base| matches!(base, BaseId::Param { .. })),
+        "unknown callee write should not introduce a param base: {into:#?}"
+    );
+    assert!(
+        into
+            .bases
+            .iter()
+            .any(|base| !matches!(
+                base,
+                BaseId::Unknown {
+                    reason: UnknownReason::NullLike,
+                    ..
+                }
+            )),
+        "unknown callee write should keep at least one non-null-like conservative base: {into:#?}"
+    );
+    assert!(
+        into.unique.is_none() || matches!(into.unique, Some(BaseId::Unknown { .. })),
+        "extern call should not be trusted as a direct local summary: {into:#?}"
+    );
+}
+
+#[test]
+fn array_local_provenance_direct_callee_unknown_write_stays_rejected() {
+    let map = run_interprocedural_analysis(
+        r#"
+        unsafe extern "C" {
+            fn make() -> *mut i32;
+        }
+
+        pub unsafe fn helper(out: *mut *mut i32) {
+            *out = make();
+        }
+
+        pub unsafe fn f(p: *mut i32, i: usize) {
+            let q = p.add(i);
+            let mut into: *mut i32 = core::ptr::null_mut();
+            helper(&raw mut into);
+            let r = into.add(1);
+            let _ = (q, r);
+        }
+        "#,
+    );
+
+    let into = facts(&map, "f", "into");
+    assert!(
+        into.unique.is_none() || into.admissibility != Some(BaseAdmissibility::DirectlyRewriteable),
+        "unknown callee write should not become rewriteable: {into:#?}"
+    );
+}
+
+#[test]
+fn array_local_provenance_recursive_summary_does_not_panic() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn rec(p: *mut i32, n: usize) -> *mut i32 {
+            if n == 0 {
+                p
+            } else {
+                rec(p.add(1), n - 1)
+            }
+        }
+
+        pub unsafe fn f(p: *mut i32, n: usize) {
+            let q = rec(p, n);
+            let _ = q;
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    assert!(
+        q.bases.iter().any(|base| matches!(base, BaseId::Param { .. })),
+        "recursive summary should keep a Param base in the conservative result: {q:#?}"
+    );
+    assert!(
+        q.bases
+            .iter()
+            .any(|base| matches!(base, BaseId::OpaqueReturn { .. })),
+        "recursive summary should keep an OpaqueReturn base in the conservative result: {q:#?}"
+    );
+    assert!(
+        q.unique.is_none(),
+        "recursive summary should stay conservative and non-unique: {q:#?}"
     );
 }
 
