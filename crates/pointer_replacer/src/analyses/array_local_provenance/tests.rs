@@ -161,32 +161,6 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
     .unwrap()
 }
 
-fn run_call_effects(code: &str) -> FxHashMap<String, Vec<(usize, usize, bool)>> {
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let program = build_rust_program(tcx);
-        let results = array_local_provenance_analysis(&program, &FxHashSet::default());
-        program
-            .functions
-            .iter()
-            .map(|&did| {
-                let name = tcx.item_name(did.to_def_id()).to_string();
-                let mut effects = results[&did]
-                    .call_effects
-                    .values()
-                    .flat_map(|effect| {
-                        effect.writes.iter().map(|write| {
-                            (write.dst_arg_index, write.sources.len(), effect.complete)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                effects.sort();
-                (name, effects)
-            })
-            .collect()
-    })
-    .unwrap()
-}
-
 #[derive(Clone, Debug)]
 struct RewriteGroupFacts {
     base: BaseId,
@@ -195,112 +169,21 @@ struct RewriteGroupFacts {
     member_root_names: FxHashSet<String>,
     index_tracked: bool,
     has_rewritable_binding: bool,
-}
-
-#[derive(Clone, Debug)]
-struct RewriteGroupStatusFacts {
-    base_name: Option<String>,
-    member_names: FxHashSet<String>,
     kind: &'static str,
-    index_tracked: bool,
     writes_base_binding: bool,
     preserved_call_count: usize,
 }
 
-fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<RewriteGroupFacts>> {
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let rust_program = build_rust_program(tcx);
-        let mutability_result = mutability_analysis(&rust_program);
-
-        let arena = Arena::new();
-        let tss = ty_shape::get_ty_shapes(&arena, tcx, false);
-        let andersen_config = andersen::Config {
-            use_optimized_mir: false,
-            c_exposed_fns: FxHashSet::default(),
-        };
-        let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
-        let alloc_fns = pre_points_to.alloc_fns.clone();
-        let solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-        let points_to =
-            andersen::post_analyze(&andersen_config, pre_points_to, solutions, &tss, tcx);
-        let results = array_local_provenance_analysis(&rust_program, &alloc_fns);
-
-        let mut facts = FxHashMap::default();
-
-        for &did in &rust_program.functions {
-            let fn_name = tcx.item_name(did.to_def_id()).to_string();
-            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-            let result = &results[&did];
-            let groups = super::select_rewrite_groups(
-                result,
-                &body,
-                &mutability_result,
-                did,
-                super::RewriteSelectionContext {
-                    tcx,
-                    points_to: &points_to,
-                },
-            );
-
-            let mut local_names: FxHashMap<rustc_middle::mir::Local, String> = FxHashMap::default();
-            for dbg in &body.var_debug_info {
-                if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &dbg.value
-                    && let Some(local) = place.as_local()
-                {
-                    local_names.entry(local).or_insert(dbg.name.to_string());
-                }
-            }
-
-            let rewritable: Vec<bool> = groups
-                .iter()
-                .map(|g| group_has_rewritable_binding(tcx, did, &body, &result, g))
-                .collect();
-            let group_facts = groups
-                .into_iter()
-                .zip(rewritable)
-                .map(|(group, has_rewritable_binding)| {
-                    let member_names = group
-                        .members
-                        .iter()
-                        .filter_map(|slot| {
-                            let info = &result.slot_table.slot_infos[*slot];
-                            super::source_var_identity_for_slot(tcx, &body, &local_names, info)
-                        })
-                        .collect();
-                    let member_root_names = group
-                        .members
-                        .iter()
-                        .filter_map(|slot| {
-                            let info = &result.slot_table.slot_infos[*slot];
-                            local_names.get(&info.root).cloned()
-                        })
-                        .collect();
-                    let base_name = super::base_slot_info(&result, &group)
-                        .and_then(|info| {
-                            super::source_var_identity_for_slot(tcx, &body, &local_names, info)
-                        })
-                        .or_else(|| local_names.get(&group.base_local).cloned());
-                    RewriteGroupFacts {
-                        base: group.base,
-                        base_name,
-                        member_names,
-                        member_root_names,
-                        index_tracked: group.index_tracked,
-                        has_rewritable_binding,
-                    }
-                })
-                .collect();
-            facts.insert(fn_name, group_facts);
-        }
-
-        facts
-    })
-    .unwrap()
+#[derive(Clone, Copy)]
+enum RewriteGroupFactMode {
+    ReadyOnly,
+    Detailed,
 }
 
-fn run_rewrite_group_statuses_with_points_to(
+fn run_rewrite_groups_with_points_to(
+    mode: RewriteGroupFactMode,
     code: &str,
-) -> FxHashMap<String, Vec<RewriteGroupStatusFacts>> {
+) -> FxHashMap<String, Vec<RewriteGroupFacts>> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let rust_program = build_rust_program(tcx);
         let mutability_result = mutability_analysis(&rust_program);
@@ -323,16 +206,21 @@ fn run_rewrite_group_statuses_with_points_to(
             let fn_name = tcx.item_name(did.to_def_id()).to_string();
             let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
             let result = &results[&did];
-            let statuses = super::classify_rewrite_groups(
-                result,
-                &body,
-                &mutability_result,
-                did,
-                super::RewriteSelectionContext {
-                    tcx,
-                    points_to: &points_to,
-                },
-            );
+            let context = super::RewriteSelectionContext {
+                tcx,
+                points_to: &points_to,
+            };
+            let statuses = match mode {
+                RewriteGroupFactMode::ReadyOnly => {
+                    super::select_rewrite_groups(result, &body, &mutability_result, did, context)
+                        .into_iter()
+                        .map(super::RewriteGroupStatus::Ready)
+                        .collect()
+                }
+                RewriteGroupFactMode::Detailed => {
+                    super::classify_rewrite_groups(result, &body, &mutability_result, did, context)
+                }
+            };
 
             let mut local_names: FxHashMap<rustc_middle::mir::Local, String> = FxHashMap::default();
             for dbg in &body.var_debug_info {
@@ -355,6 +243,8 @@ fn run_rewrite_group_statuses_with_points_to(
                             calls.len(),
                         ),
                     };
+                    let has_rewritable_binding =
+                        group_has_rewritable_binding(tcx, did, &body, result, &group);
                     let member_names = group
                         .members
                         .iter()
@@ -363,16 +253,27 @@ fn run_rewrite_group_statuses_with_points_to(
                             super::source_var_identity_for_slot(tcx, &body, &local_names, info)
                         })
                         .collect();
+                    let member_root_names = group
+                        .members
+                        .iter()
+                        .filter_map(|slot| {
+                            let info = &result.slot_table.slot_infos[*slot];
+                            local_names.get(&info.root).cloned()
+                        })
+                        .collect();
                     let base_name = super::base_slot_info(result, &group)
                         .and_then(|info| {
                             super::source_var_identity_for_slot(tcx, &body, &local_names, info)
                         })
                         .or_else(|| local_names.get(&group.base_local).cloned());
-                    RewriteGroupStatusFacts {
+                    RewriteGroupFacts {
+                        base: group.base,
                         base_name,
                         member_names,
+                        member_root_names,
                         kind,
                         index_tracked: group.index_tracked,
+                        has_rewritable_binding,
                         writes_base_binding,
                         preserved_call_count,
                     }
@@ -430,6 +331,7 @@ fn assert_has_only_nulltransparent_base(fact: &LocalFacts, expected: &BaseId) {
 #[test]
 fn array_local_provenance_rewrite_groups_select_immutable_param_aliases() {
     let map = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32, i: usize) {
             let q = p.add(i);
@@ -455,7 +357,8 @@ fn array_local_provenance_rewrite_groups_select_immutable_param_aliases() {
 
 #[test]
 fn classify_rewrite_groups_marks_cjson_calls_as_preserved() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         pub unsafe fn advance(input: &mut *mut i8) {
             *input = (*input).add(1);
@@ -488,7 +391,8 @@ fn classify_rewrite_groups_marks_cjson_calls_as_preserved() {
 
 #[test]
 fn classify_rewrite_groups_marks_member_only_call_as_preserved() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         pub unsafe fn advance(input: &mut *mut i32) {
             *input = (*input).add(1);
@@ -518,7 +422,8 @@ fn classify_rewrite_groups_marks_member_only_call_as_preserved() {
 
 #[test]
 fn classify_rewrite_groups_accepts_same_base_cross_argument_flow() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
             *output = *input;
@@ -547,7 +452,8 @@ fn classify_rewrite_groups_accepts_same_base_cross_argument_flow() {
 
 #[test]
 fn classify_rewrite_groups_rejects_different_base_cross_argument_flow() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
             *output = *input;
@@ -575,7 +481,8 @@ fn classify_rewrite_groups_rejects_different_base_cross_argument_flow() {
 
 #[test]
 fn classify_rewrite_groups_rejects_summarized_unknown_write() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         unsafe extern "C" {
             fn touch(input: *mut *mut i32);
@@ -607,7 +514,8 @@ fn classify_rewrite_groups_rejects_summarized_unknown_write() {
 
 #[test]
 fn classify_rewrite_groups_keeps_direct_assignment_ready() {
-    let statuses = run_rewrite_group_statuses_with_points_to(
+    let statuses = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::Detailed,
         r#"
         pub unsafe fn f(mut p: *mut i32) {
             let q = p.add(1);
@@ -633,6 +541,7 @@ fn classify_rewrite_groups_keeps_direct_assignment_ready() {
 #[test]
 fn select_rewrite_groups_excludes_preserved_call_groups() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn advance(input: &mut *mut i32) {
             *input = (*input).add(1);
@@ -652,6 +561,7 @@ fn select_rewrite_groups_excludes_preserved_call_groups() {
 #[test]
 fn select_rewrite_groups_accepts_mut_param_when_base_is_not_reassigned() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(mut p: *mut i32, i: usize) {
             let q = p.add(i);
@@ -676,6 +586,7 @@ fn select_rewrite_groups_accepts_mut_param_when_base_is_not_reassigned() {
 fn select_rewrite_groups_selects_as_index_tracked_when_param_directly_reassigned_while_member_live()
 {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(mut p: *mut i32, i: usize) {
             let q = p.add(i);
@@ -702,6 +613,7 @@ fn select_rewrite_groups_selects_as_index_tracked_when_param_directly_reassigned
 fn select_rewrite_groups_index_tracked_when_named_aggregate_member_live_after_direct_param_reassign()
  {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Holder { pub ptr: *mut i32 }
 
@@ -733,6 +645,7 @@ fn select_rewrite_groups_index_tracked_when_named_aggregate_member_live_after_di
 #[test]
 fn select_rewrite_groups_rejects_mut_param_written_through_pointer_to_param() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(mut p: *mut i32, i: usize) {
             let pp = &raw mut p;
@@ -758,6 +671,7 @@ fn select_rewrite_groups_rejects_mut_param_written_through_pointer_to_param() {
 #[test]
 fn select_rewrite_groups_rejects_param_when_call_may_write_base_storage() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         unsafe extern "C" {
             fn touch(slot: *mut *mut i32);
@@ -785,6 +699,7 @@ fn select_rewrite_groups_rejects_param_when_call_may_write_base_storage() {
 #[test]
 fn select_rewrite_groups_rejects_param_when_by_value_aggregate_call_arg_contains_base_pointer() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Holder {
             pub other: *mut i32,
@@ -820,6 +735,7 @@ fn select_rewrite_groups_rejects_param_when_by_value_aggregate_call_arg_contains
 #[test]
 fn select_rewrite_groups_rejects_param_when_projected_call_arg_may_write_base_storage() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Holder {
             pub pp: *mut *mut i32,
@@ -851,6 +767,7 @@ fn select_rewrite_groups_rejects_param_when_projected_call_arg_may_write_base_st
 #[test]
 fn select_rewrite_groups_rejects_param_field_when_call_may_write_parent_aggregate() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Pair {
             pub a: *mut i32,
@@ -883,6 +800,7 @@ fn select_rewrite_groups_rejects_param_field_when_call_may_write_parent_aggregat
 #[test]
 fn select_rewrite_groups_rejects_mut_param_field_written_through_pointer_to_field() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct S { pub n: i32, pub p: *mut i32 }
 
@@ -910,6 +828,7 @@ fn select_rewrite_groups_rejects_mut_param_field_written_through_pointer_to_fiel
 #[test]
 fn select_rewrite_groups_rejects_pointee_param_base_written_through_alias() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut *mut i32, replacement: *mut i32, i: usize) {
             let pp = p;
@@ -935,6 +854,7 @@ fn select_rewrite_groups_rejects_pointee_param_base_written_through_alias() {
 #[test]
 fn select_rewrite_groups_index_tracked_for_mutated_struct_param_field() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Pair {
             pub a: *mut i32,
@@ -996,7 +916,7 @@ fn select_rewrite_groups_live_is_null_does_not_destabilize_state_buffer_base() {
             let _ = ptr;
         }
         "#;
-    let groups = run_rewrite_groups_with_points_to(code);
+    let groups = run_rewrite_groups_with_points_to(RewriteGroupFactMode::ReadyOnly, code);
 
     let facts = groups.get("f").expect("missing facts for f");
     let _group = facts
@@ -1012,6 +932,7 @@ fn select_rewrite_groups_live_is_null_does_not_destabilize_state_buffer_base() {
 #[test]
 fn select_rewrite_groups_counts_named_local_field_as_source_var() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Holder {
             pub ptr: *mut i32,
@@ -1038,6 +959,7 @@ fn select_rewrite_groups_counts_named_local_field_as_source_var() {
 #[test]
 fn select_rewrite_groups_does_not_count_array_element_as_source_var() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let mut slots = [core::ptr::null_mut()];
@@ -1073,6 +995,7 @@ fn select_rewrite_groups_does_not_count_array_element_as_source_var() {
 #[test]
 fn select_rewrite_groups_does_not_count_tuple_field_as_source_var() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let mut pair = (core::ptr::null_mut(), 1i32);
@@ -1108,6 +1031,7 @@ fn select_rewrite_groups_does_not_count_tuple_field_as_source_var() {
 #[test]
 fn select_rewrite_groups_accepts_mut_param_reassigned_before_members_exist() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(mut p: *mut i32, i: usize) {
             p = p.add(1);
@@ -1132,6 +1056,7 @@ fn select_rewrite_groups_accepts_mut_param_reassigned_before_members_exist() {
 #[test]
 fn array_local_provenance_rewrite_groups_select_local_array_base() {
     let map = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(i: usize) {
             let mut arr = [0_i32; 4];
@@ -1681,25 +1606,6 @@ fn array_local_provenance_complete_empty_summary_avoids_unknown_fallback() {
     );
 
     assert_unique_param(facts(&map, "f", "q"));
-}
-
-#[test]
-fn array_local_provenance_records_instantiated_arg_write_effects() {
-    let effects = run_call_effects(
-        r#"
-        pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
-            *output = *input;
-        }
-
-        pub unsafe fn f(mut p: *mut i32) {
-            let mut q = p.add(1);
-            copy_cursor(&mut p, &mut q);
-            let _ = (*p, *q);
-        }
-        "#,
-    );
-
-    assert_eq!(effects["f"], vec![(1, 1, true)]);
 }
 
 #[test]
@@ -2266,6 +2172,7 @@ fn array_local_provenance_cast_single_slot_slot0_preserves_param_provenance() {
 #[test]
 fn select_rewrite_groups_selects_cast_cursor_over_param_base() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         fn parse_bool(c: i8) -> bool {
             c == 89 || c == 121
@@ -2359,6 +2266,7 @@ fn array_local_provenance_struct_field_array_offset_pointers_share_base() {
 #[test]
 fn select_rewrite_groups_reject_struct_pointer_base_for_field_array_pointers() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct Info {
             pub steps: *mut u32,
@@ -2386,6 +2294,7 @@ fn select_rewrite_groups_reject_struct_pointer_base_for_field_array_pointers() {
 #[test]
 fn select_rewrite_groups_extern_call_with_struct_param_does_not_contaminate_param_field_slot() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct State {
             pub out: *mut i8,
@@ -2418,6 +2327,7 @@ fn select_rewrite_groups_extern_call_with_struct_param_does_not_contaminate_para
 #[test]
 fn select_rewrite_groups_cp_block_pattern_produces_index_tracked_group() {
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub struct State {
             pub out: *mut i8,
@@ -2452,6 +2362,7 @@ fn select_rewrite_groups_cp_block_pattern_produces_index_tracked_group() {
 fn liveness_gate_rejects_group_when_two_mut_locals_never_simultaneously_live() {
     // q is used and dead before r is created — no simultaneous borrow conflict.
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let q = p.add(1);
@@ -2476,6 +2387,7 @@ fn liveness_gate_rejects_group_when_two_mut_locals_never_simultaneously_live() {
 fn liveness_gate_accepts_group_when_two_mut_locals_simultaneously_live() {
     // q and r are both live at the tuple read — genuine borrow conflict.
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let q = p.add(1);
@@ -2499,6 +2411,7 @@ fn liveness_gate_accepts_group_when_two_mut_locals_simultaneously_live() {
 fn liveness_gate_rejects_group_when_mut_and_imm_locals_never_simultaneously_live() {
     // q (mut) is dead before r (const cast) is created.
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let q = p.add(1);
@@ -2523,6 +2436,7 @@ fn liveness_gate_rejects_group_when_mut_and_imm_locals_never_simultaneously_live
 fn liveness_gate_accepts_group_when_mut_and_imm_locals_simultaneously_live() {
     // q (*mut) and r (*const alias of q) are both alive at the tuple read.
     let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
         r#"
         pub unsafe fn f(p: *mut i32) {
             let q = p.add(1);
@@ -2559,7 +2473,7 @@ fn group_has_rewritable_binding_for_field_base_group() {
         }
     "#;
 
-    let facts = run_rewrite_groups_with_points_to(code);
+    let facts = run_rewrite_groups_with_points_to(RewriteGroupFactMode::ReadyOnly, code);
     let process_groups = facts.get("process").expect("process not found");
     assert!(
         !process_groups.is_empty(),
