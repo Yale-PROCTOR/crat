@@ -7940,18 +7940,37 @@ fn cursor_offset_without_reborrow(expr: &Expr) -> Option<P<Expr>> {
 }
 
 fn cursor_offset_chain<'a>(expr: &'a Expr, offsets: &mut Vec<&'a Expr>) -> Option<&'a Expr> {
-    let ExprKind::MethodCall(call) = &unwrap_paren(expr).kind else {
-        return None;
-    };
-    match call.seg.ident.name.as_str() {
-        "offset_by" if call.args.len() == 1 => {
-            let base = cursor_offset_chain(&call.receiver, offsets)?;
-            offsets.push(&call.args[0]);
-            Some(base)
+    match &unwrap_paren(expr).kind {
+        ExprKind::MethodCall(call) => match call.seg.ident.name.as_str() {
+            "offset_by" if call.args.len() == 1 => {
+                let base = cursor_offset_chain(&call.receiver, offsets)?;
+                offsets.push(&call.args[0]);
+                Some(base)
+            }
+            "as_deref_mut" if call.args.is_empty() => Some(&call.receiver),
+            _ => None,
+        },
+        ExprKind::Call(callee, args) if args.len() == 1 && is_slice_cursor_new(callee) => {
+            let ExprKind::MethodCall(as_slice) = &unwrap_paren(&args[0]).kind else {
+                return None;
+            };
+            if as_slice.seg.ident.name.as_str() != "as_slice" || !as_slice.args.is_empty() {
+                return None;
+            }
+            cursor_offset_chain(&as_slice.receiver, offsets).or(Some(&as_slice.receiver))
         }
-        "as_deref_mut" if call.args.is_empty() => Some(&call.receiver),
         _ => None,
     }
+}
+
+fn is_slice_cursor_new(expr: &Expr) -> bool {
+    let ExprKind::Path(_, path) = &unwrap_paren(expr).kind else {
+        return false;
+    };
+    let segments = &path.segments;
+    segments.len() >= 2
+        && segments[segments.len() - 2].ident.name.as_str() == "SliceCursor"
+        && segments[segments.len() - 1].ident.name.as_str() == "new"
 }
 
 fn is_zero_integer_expr(expr: &Expr) -> bool {
@@ -16202,6 +16221,27 @@ mod tests {
             let expr = pprust::expr_to_string(&expr);
             assert_eq!(expr.matches("as_deref_mut").count(), 1, "{expr}");
             assert_eq!(expr.matches("offset_by").count(), 2, "{expr}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_removes_shared_cursor_constructors() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr = utils::expr!(
+                "crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(a)
+                        .as_slice()
+                )
+                .offset_by(b)[0usize]"
+            );
+            CursorProjectionSimplifier.visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert!(expr.contains("(raw)["), "{expr}");
+            assert!(expr.contains("wrapping_add"), "{expr}");
+            assert!(!expr.contains("SliceCursor::new"), "{expr}");
+            assert!(!expr.contains("offset_by"), "{expr}");
         })
         .unwrap();
     }

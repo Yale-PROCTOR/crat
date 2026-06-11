@@ -1892,10 +1892,13 @@ pub unsafe fn load_word(s: *const State) -> u32 {
 "#,
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
-            ".as_slice()",
-            ".offset_by((s.word_index",
+            "(s.words))[((s.word_index as isize))]",
         ],
-        &["let mut _c = ((*s).words);", "*(*s).words.offset"],
+        &[
+            "SliceCursor::new((s.words).as_slice())",
+            "let mut _c = ((*s).words);",
+            "*(*s).words.offset",
+        ],
     );
 }
 
@@ -7266,7 +7269,7 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
-fn test_param_byte_cast_offset_rewrites_to_slice_bytemuck() {
+fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
 #[repr(C)]
@@ -7284,20 +7287,21 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
-            "set_type((leaf_addr).as_slice_mut(), offset, value);",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
+            "set_type((leaf_addr).as_deref_mut(), offset, value);",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_slice_callee() {
+fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
     run_test(
         r#"
 #[repr(C)]
@@ -7321,14 +7325,16 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
             "set_type(if (leaf_addr).is_null()",
+            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
