@@ -7630,6 +7630,36 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
+    run_test(
+        r#"
+pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
+    *p.offset(a).offset(b) = 1;
+}
+"#,
+        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &["(p).as_deref_mut().offset_by"],
+    );
+}
+
+#[test]
+fn test_mut_cursor_multi_offset_call_reborrows_once() {
+    run_test(
+        r#"
+pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
+    if b == 0 {
+        return;
+    }
+    recurse(items.offset(a).offset(b), a, b - 1);
+    *items = b as i32;
+}
+"#,
+        &["as_deref_mut", ")).offset_by((b) as isize)"],
+        &["as_deref_mut().offset_by((b) as isize)"],
+    );
+}
+
+#[test]
 fn test_opt_boxed_slice_offset_cursor_uses_slice_view_base() {
     run_test(
         r#"

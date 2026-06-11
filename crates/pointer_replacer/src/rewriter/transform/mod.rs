@@ -121,6 +121,9 @@ impl LocalRawParamSummary {
 impl MutVisitor for TransformVisitor<'_, '_> {
     fn visit_crate(&mut self, krate: &mut Crate) {
         mut_visit::walk_crate(self, krate);
+        if self.slice_cursor.get() {
+            CursorProjectionSimplifier.visit_crate(krate);
+        }
 
         if self.bytemuck_derives.borrow().is_empty() {
             return;
@@ -1164,15 +1167,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.effective_ptr_kind(hir_id),
                             Some(PtrKind::SliceCursor(_))
                         )
-                        && pe.projs.len() == 1
-                        && let PtrExprProj::Offset(offset) = &pe.projs[0]
+                        && let Some(offset) = combined_cursor_offset(&pe.projs)
                         && !pe.addr_of
                         && !pe.as_ptr
                         && !pe.cast_int
                     {
                         let base_str = pprust::expr_to_string(pe.base);
-                        let offset_str = pprust::expr_to_string(offset);
-                        *expr = utils::expr!("({})[({}) as isize]", base_str, offset_str)
+                        let offset_str = pprust::expr_to_string(&offset);
+                        *expr = utils::expr!("({})[{}]", base_str, offset_str)
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
@@ -7429,6 +7431,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             );
         let is_mut_cursor_base =
             matches!(self.ptr_source_kind(pe), Some(PtrKind::SliceCursor(true)));
+        let mut owns_cursor = false;
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -7466,11 +7469,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         }
                     } else if is_mut_cursor_base {
                         if m {
-                            e = utils::expr!(
-                                "({}).as_deref_mut().offset_by(({}) as isize)",
-                                pprust::expr_to_string(&e),
-                                pprust::expr_to_string(offset),
-                            );
+                            if owns_cursor {
+                                e = utils::expr!(
+                                    "({}).offset_by(({}) as isize)",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                            } else {
+                                e = utils::expr!(
+                                    "({}).as_deref_mut().offset_by(({}) as isize)",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                                owns_cursor = true;
+                            }
                         } else if is_slice_cursor_mut_constructor_call(&e) {
                             e = utils::expr!(
                                 "({}).as_deref().offset_by(({}) as isize)",
@@ -7493,6 +7505,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                 }
                 PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    owns_cursor = false;
                     if is_raw {
                         e = utils::expr!("({}) as usize", pprust::expr_to_string(&e),);
                     } else {
@@ -7505,6 +7518,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     is_raw = true;
                 }
                 PtrExprProj::Cast(ty) => {
+                    owns_cursor = false;
                     let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
                     if is_raw {
                         e = utils::expr!(
@@ -7535,6 +7549,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                 }
                 PtrExprProj::IntegerOp(expr, op) => {
+                    owns_cursor = false;
                     let method = match op {
                         OpKind::WrappingAdd => "wrapping_add",
                         OpKind::WrappingSub => "wrapping_sub",
@@ -7547,6 +7562,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     );
                 }
                 PtrExprProj::IntegerBinOp(expr, op) => {
+                    owns_cursor = false;
                     let op_str = match op {
                         BinOpKind::BitAnd => "&",
                         BinOpKind::BitOr => "|",
@@ -7819,6 +7835,130 @@ impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
             && !self.addr_of
             && !self.as_ptr
     }
+}
+
+fn combined_offsets(offsets: &[&Expr], cast_to_isize: bool) -> Option<Expr> {
+    let (first, rest) = offsets.split_first()?;
+    let format_offset = |offset: &Expr| {
+        let offset = if cast_to_isize {
+            offset
+        } else {
+            remove_redundant_isize_casts(offset)
+        };
+        let offset = pprust::expr_to_string(offset);
+        if cast_to_isize {
+            format!("({offset}) as isize")
+        } else {
+            format!("({offset})")
+        }
+    };
+    let mut combined = format_offset(first);
+    for offset in rest {
+        combined = format!("({combined}).wrapping_add({})", format_offset(offset));
+    }
+    Some(utils::expr!("{combined}"))
+}
+
+fn remove_redundant_isize_casts(mut expr: &Expr) -> &Expr {
+    loop {
+        let ExprKind::Cast(inner, ty) = &unwrap_paren(expr).kind else {
+            return expr;
+        };
+        let ExprKind::Cast(_, inner_ty) = &unwrap_paren(inner).kind else {
+            return expr;
+        };
+        if !is_isize_ty(ty) || !is_isize_ty(inner_ty) {
+            return expr;
+        }
+        expr = inner;
+    }
+}
+
+fn is_isize_ty(ty: &Ty) -> bool {
+    let TyKind::Path(None, path) = &ty.kind else {
+        return false;
+    };
+    path.segments.len() == 1 && path.segments[0].ident.name.as_str() == "isize"
+}
+
+fn combined_cursor_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
+    let offsets = projs
+        .iter()
+        .map(|proj| match proj {
+            PtrExprProj::Offset(offset) => Some(*offset),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    combined_offsets(&offsets, true)
+}
+
+struct CursorProjectionSimplifier;
+
+impl MutVisitor for CursorProjectionSimplifier {
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        mut_visit::walk_expr(self, expr);
+
+        if let ExprKind::MethodCall(call) = &mut unwrap_paren_mut(expr).kind
+            && call.seg.ident.name.as_str() == "offset_by"
+            && let Some(receiver) = cursor_offset_without_reborrow(&call.receiver)
+        {
+            call.receiver = receiver;
+        }
+
+        let replacement = if let ExprKind::Index(base, index, _) = &unwrap_paren(expr).kind
+            && is_zero_integer_expr(index)
+        {
+            let mut offsets = Vec::new();
+            cursor_offset_chain(base, &mut offsets).and_then(|base| {
+                let base = pprust::expr_to_string(base);
+                let offset = combined_offsets(&offsets, false)?;
+                Some(utils::expr!(
+                    "({base})[{}]",
+                    pprust::expr_to_string(&offset),
+                ))
+            })
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            *expr = replacement;
+        }
+    }
+}
+
+fn cursor_offset_without_reborrow(expr: &Expr) -> Option<P<Expr>> {
+    let ExprKind::MethodCall(reborrow) = &unwrap_paren(expr).kind else {
+        return None;
+    };
+    if reborrow.seg.ident.name.as_str() != "as_deref_mut" || !reborrow.args.is_empty() {
+        return None;
+    }
+    let ExprKind::MethodCall(offset) = &unwrap_paren(&reborrow.receiver).kind else {
+        return None;
+    };
+    (offset.seg.ident.name.as_str() == "offset_by").then(|| reborrow.receiver.clone())
+}
+
+fn cursor_offset_chain<'a>(expr: &'a Expr, offsets: &mut Vec<&'a Expr>) -> Option<&'a Expr> {
+    let ExprKind::MethodCall(call) = &unwrap_paren(expr).kind else {
+        return None;
+    };
+    match call.seg.ident.name.as_str() {
+        "offset_by" if call.args.len() == 1 => {
+            let base = cursor_offset_chain(&call.receiver, offsets)?;
+            offsets.push(&call.args[0]);
+            Some(base)
+        }
+        "as_deref_mut" if call.args.is_empty() => Some(&call.receiver),
+        _ => None,
+    }
+}
+
+fn is_zero_integer_expr(expr: &Expr) -> bool {
+    let ExprKind::Lit(lit) = &unwrap_cast_and_paren(expr).kind else {
+        return false;
+    };
+    lit.kind == token::LitKind::Integer && lit.symbol.as_str() == "0"
 }
 
 fn unwrap_addr_of_deref(expr: &Expr) -> &Expr {
@@ -16037,6 +16177,34 @@ mod tests {
         rewriter::{Config, replace_local_borrows},
         utils::rustc::RustProgram,
     };
+
+    #[test]
+    fn cursor_projection_simplifier_combines_offset_index() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr = utils::expr!(
+                "p.as_deref_mut().offset_by(a).as_deref_mut().offset_by(b)[0 as usize]"
+            );
+            CursorProjectionSimplifier.visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert!(expr.contains("wrapping_add"), "{expr}");
+            assert!(!expr.contains("as_deref_mut"), "{expr}");
+            assert!(!expr.contains("offset_by"), "{expr}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_reborrows_once() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr =
+                utils::expr!("p.as_deref_mut().offset_by(a).as_deref_mut().offset_by(b)");
+            CursorProjectionSimplifier.visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert_eq!(expr.matches("as_deref_mut").count(), 1, "{expr}");
+            assert_eq!(expr.matches("offset_by").count(), 2, "{expr}");
+        })
+        .unwrap();
+    }
 
     fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         let mut functions = Vec::new();
