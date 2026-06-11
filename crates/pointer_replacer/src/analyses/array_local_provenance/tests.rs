@@ -161,6 +161,32 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
     .unwrap()
 }
 
+fn run_call_effects(code: &str) -> FxHashMap<String, Vec<(usize, usize, bool)>> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let results = array_local_provenance_analysis(&program, &FxHashSet::default());
+        program
+            .functions
+            .iter()
+            .map(|&did| {
+                let name = tcx.item_name(did.to_def_id()).to_string();
+                let mut effects = results[&did]
+                    .call_effects
+                    .values()
+                    .flat_map(|effect| {
+                        effect.writes.iter().map(|write| {
+                            (write.dst_arg_index, write.sources.len(), effect.complete)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                effects.sort();
+                (name, effects)
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
 #[derive(Clone, Debug)]
 struct RewriteGroupFacts {
     base: BaseId,
@@ -169,6 +195,16 @@ struct RewriteGroupFacts {
     member_root_names: FxHashSet<String>,
     index_tracked: bool,
     has_rewritable_binding: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RewriteGroupStatusFacts {
+    base_name: Option<String>,
+    member_names: FxHashSet<String>,
+    kind: &'static str,
+    index_tracked: bool,
+    writes_base_binding: bool,
+    preserved_call_count: usize,
 }
 
 fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<RewriteGroupFacts>> {
@@ -187,15 +223,16 @@ fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<Rewrit
         let solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
         let points_to =
             andersen::post_analyze(&andersen_config, pre_points_to, solutions, &tss, tcx);
+        let results = array_local_provenance_analysis(&rust_program, &alloc_fns);
 
         let mut facts = FxHashMap::default();
 
         for &did in &rust_program.functions {
             let fn_name = tcx.item_name(did.to_def_id()).to_string();
             let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-            let result = analyze_body(tcx, did, &body, &alloc_fns);
+            let result = &results[&did];
             let groups = super::select_rewrite_groups(
-                &result,
+                result,
                 &body,
                 &mutability_result,
                 did,
@@ -254,6 +291,94 @@ fn run_rewrite_groups_with_points_to(code: &str) -> FxHashMap<String, Vec<Rewrit
                 })
                 .collect();
             facts.insert(fn_name, group_facts);
+        }
+
+        facts
+    })
+    .unwrap()
+}
+
+fn run_rewrite_group_statuses_with_points_to(
+    code: &str,
+) -> FxHashMap<String, Vec<RewriteGroupStatusFacts>> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let rust_program = build_rust_program(tcx);
+        let mutability_result = mutability_analysis(&rust_program);
+
+        let arena = Arena::new();
+        let tss = ty_shape::get_ty_shapes(&arena, tcx, false);
+        let andersen_config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+        let alloc_fns = pre_points_to.alloc_fns.clone();
+        let solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+        let points_to =
+            andersen::post_analyze(&andersen_config, pre_points_to, solutions, &tss, tcx);
+        let results = array_local_provenance_analysis(&rust_program, &alloc_fns);
+
+        let mut facts = FxHashMap::default();
+        for &did in &rust_program.functions {
+            let fn_name = tcx.item_name(did.to_def_id()).to_string();
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let result = &results[&did];
+            let statuses = super::classify_rewrite_groups(
+                result,
+                &body,
+                &mutability_result,
+                did,
+                super::RewriteSelectionContext {
+                    tcx,
+                    points_to: &points_to,
+                },
+            );
+
+            let mut local_names: FxHashMap<rustc_middle::mir::Local, String> = FxHashMap::default();
+            for dbg in &body.var_debug_info {
+                if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &dbg.value
+                    && let Some(local) = place.as_local()
+                {
+                    local_names.entry(local).or_insert(dbg.name.to_string());
+                }
+            }
+
+            let status_facts = statuses
+                .into_iter()
+                .map(|status| {
+                    let (group, kind, writes_base_binding, preserved_call_count) = match status {
+                        super::RewriteGroupStatus::Ready(group) => (group, "ready", false, 0),
+                        super::RewriteGroupStatus::PreservedAcrossCalls { group, calls } => (
+                            group,
+                            "preserved_across_calls",
+                            calls.iter().any(|call| call.writes_base_binding),
+                            calls.len(),
+                        ),
+                    };
+                    let member_names = group
+                        .members
+                        .iter()
+                        .filter_map(|slot| {
+                            let info = &result.slot_table.slot_infos[*slot];
+                            super::source_var_identity_for_slot(tcx, &body, &local_names, info)
+                        })
+                        .collect();
+                    let base_name = super::base_slot_info(result, &group)
+                        .and_then(|info| {
+                            super::source_var_identity_for_slot(tcx, &body, &local_names, info)
+                        })
+                        .or_else(|| local_names.get(&group.base_local).cloned());
+                    RewriteGroupStatusFacts {
+                        base_name,
+                        member_names,
+                        kind,
+                        index_tracked: group.index_tracked,
+                        writes_base_binding,
+                        preserved_call_count,
+                    }
+                })
+                .collect();
+            facts.insert(fn_name, status_facts);
         }
 
         facts
@@ -326,6 +451,202 @@ fn array_local_provenance_rewrite_groups_select_immutable_param_aliases() {
         }),
         "expected Param rewrite group containing q and r: {groups:#?}"
     );
+}
+
+#[test]
+fn classify_rewrite_groups_marks_cjson_calls_as_preserved() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        pub unsafe fn advance(input: &mut *mut i8) {
+            *input = (*input).add(1);
+        }
+
+        pub unsafe fn minify(input: &mut *mut i8, output: &mut *mut i8) {
+            *input = (*input).add(1);
+            *output = (*output).add(1);
+        }
+
+        pub unsafe fn f(mut json: *mut i8) {
+            let mut into = json;
+            advance(&mut json);
+            minify(&mut json, &mut into);
+            let _ = (*json, *into);
+        }
+        "#,
+    );
+
+    let status = statuses["f"]
+        .iter()
+        .find(|status| {
+            status.base_name.as_deref() == Some("json") && status.member_names.contains("into")
+        })
+        .expect("expected json/into candidate");
+    assert_eq!(status.kind, "preserved_across_calls");
+    assert!(status.writes_base_binding);
+    assert_eq!(status.preserved_call_count, 2);
+}
+
+#[test]
+fn classify_rewrite_groups_marks_member_only_call_as_preserved() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        pub unsafe fn advance(input: &mut *mut i32) {
+            *input = (*input).add(1);
+        }
+
+        pub unsafe fn f(p: *mut i32) {
+            let mut q = p;
+            let r = p.add(1);
+            advance(&mut q);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    let status = statuses["f"]
+        .iter()
+        .find(|status| {
+            status.base_name.as_deref() == Some("p")
+                && status.member_names.contains("q")
+                && status.member_names.contains("r")
+        })
+        .expect("expected p/q/r candidate");
+    assert_eq!(status.kind, "preserved_across_calls");
+    assert!(!status.writes_base_binding);
+    assert_eq!(status.preserved_call_count, 1);
+}
+
+#[test]
+fn classify_rewrite_groups_accepts_same_base_cross_argument_flow() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
+            *output = *input;
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let mut q = p.add(1);
+            let r = p.add(2);
+            copy_cursor(&mut p, &mut q);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    let status = statuses["f"]
+        .iter()
+        .find(|status| {
+            status.base_name.as_deref() == Some("p")
+                && status.member_names.contains("q")
+                && status.member_names.contains("r")
+        })
+        .expect("expected same-base cross-argument candidate");
+    assert_eq!(status.kind, "preserved_across_calls");
+    assert!(!status.writes_base_binding);
+}
+
+#[test]
+fn classify_rewrite_groups_rejects_different_base_cross_argument_flow() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
+            *output = *input;
+        }
+
+        pub unsafe fn f(mut p: *mut i32, mut other: *mut i32) {
+            let q = p.add(1);
+            copy_cursor(&mut other, &mut p);
+            let r = q.add(1);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    assert!(
+        !statuses["f"].iter().any(|status| {
+            status.base_name.as_deref() == Some("p")
+                && status.member_names.contains("q")
+                && status.member_names.contains("r")
+        }),
+        "{:#?}",
+        statuses["f"]
+    );
+}
+
+#[test]
+fn classify_rewrite_groups_rejects_summarized_unknown_write() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        unsafe extern "C" {
+            fn touch(input: *mut *mut i32);
+        }
+
+        pub unsafe fn helper(input: &mut *mut i32) {
+            touch(input);
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let q = p.add(1);
+            helper(&mut p);
+            let r = q.add(1);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    assert!(
+        !statuses["f"].iter().any(|status| {
+            status.base_name.as_deref() == Some("p")
+                && status.member_names.contains("q")
+                && status.member_names.contains("r")
+        }),
+        "{:#?}",
+        statuses["f"]
+    );
+}
+
+#[test]
+fn classify_rewrite_groups_keeps_direct_assignment_ready() {
+    let statuses = run_rewrite_group_statuses_with_points_to(
+        r#"
+        pub unsafe fn f(mut p: *mut i32) {
+            let q = p.add(1);
+            p = p.add(2);
+            let r = q.add(1);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    let status = statuses["f"]
+        .iter()
+        .find(|status| {
+            status.base_name.as_deref() == Some("p")
+                && status.member_names.contains("q")
+                && status.member_names.contains("r")
+        })
+        .expect("expected direct-assignment candidate");
+    assert_eq!(status.kind, "ready");
+    assert!(status.index_tracked);
+}
+
+#[test]
+fn select_rewrite_groups_excludes_preserved_call_groups() {
+    let groups = run_rewrite_groups_with_points_to(
+        r#"
+        pub unsafe fn advance(input: &mut *mut i32) {
+            *input = (*input).add(1);
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let q = p;
+            advance(&mut p);
+            let _ = (*p, *q);
+        }
+        "#,
+    );
+
+    assert!(groups["f"].is_empty(), "{:#?}", groups["f"]);
 }
 
 #[test]
@@ -1288,8 +1609,97 @@ fn array_local_provenance_direct_callee_arg_write_from_first_param_cjson_shape()
     let into = facts(&map, "cjson_minify", "into");
     let r = facts(&map, "cjson_minify", "r");
     assert_unique_param(q);
-    assert_eq!(into.unique, q.unique, "into should keep q/json base: {into:#?}");
+    assert_eq!(
+        into.unique, q.unique,
+        "into should keep q/json base: {into:#?}"
+    );
     assert_eq!(r.unique, q.unique, "r should keep q/json base: {r:#?}");
+}
+
+#[test]
+fn array_local_provenance_reference_self_write_preserves_base() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn advance(input: &mut *mut i32) {
+            *input = (*input).add(1);
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let q = p;
+            advance(&mut p);
+            let r = q.add(1);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    let p = facts(&map, "f", "p");
+    let q = facts(&map, "f", "q");
+    let r = facts(&map, "f", "r");
+    assert_unique_param(p);
+    assert_eq!(q.unique, p.unique, "{q:#?}");
+    assert_eq!(r.unique, p.unique, "{r:#?}");
+}
+
+#[test]
+fn array_local_provenance_reference_cross_arg_same_base_preserves_base() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
+            *output = *input;
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let mut q = p.add(2);
+            copy_cursor(&mut p, &mut q);
+            let r = q.add(1);
+            let _ = (*p, *q, *r);
+        }
+        "#,
+    );
+
+    let p = facts(&map, "f", "p");
+    let q = facts(&map, "f", "q");
+    let r = facts(&map, "f", "r");
+    assert_unique_param(p);
+    assert_eq!(q.unique, p.unique, "{q:#?}");
+    assert_eq!(r.unique, p.unique, "{r:#?}");
+}
+
+#[test]
+fn array_local_provenance_complete_empty_summary_avoids_unknown_fallback() {
+    let map = run_interprocedural_analysis(
+        r#"
+        pub unsafe fn inspect(_input: &mut *mut i32) {}
+
+        pub unsafe fn f(mut p: *mut i32) {
+            inspect(&mut p);
+            let q = p.add(1);
+            let _ = *q;
+        }
+        "#,
+    );
+
+    assert_unique_param(facts(&map, "f", "q"));
+}
+
+#[test]
+fn array_local_provenance_records_instantiated_arg_write_effects() {
+    let effects = run_call_effects(
+        r#"
+        pub unsafe fn copy_cursor(input: &mut *mut i32, output: &mut *mut i32) {
+            *output = *input;
+        }
+
+        pub unsafe fn f(mut p: *mut i32) {
+            let mut q = p.add(1);
+            copy_cursor(&mut p, &mut q);
+            let _ = (*p, *q);
+        }
+        "#,
+    );
+
+    assert_eq!(effects["f"], vec![(1, 1, true)]);
 }
 
 #[test]
@@ -1446,20 +1856,20 @@ fn array_local_provenance_extern_call_stays_conservative() {
 
     let into = facts(&map, "f", "into");
     assert!(
-        !into.bases.iter().any(|base| matches!(base, BaseId::Param { .. })),
+        !into
+            .bases
+            .iter()
+            .any(|base| matches!(base, BaseId::Param { .. })),
         "unknown callee write should not introduce a param base: {into:#?}"
     );
     assert!(
-        into
-            .bases
-            .iter()
-            .any(|base| !matches!(
-                base,
-                BaseId::Unknown {
-                    reason: UnknownReason::NullLike,
-                    ..
-                }
-            )),
+        into.bases.iter().any(|base| !matches!(
+            base,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
         "unknown callee write should keep at least one non-null-like conservative base: {into:#?}"
     );
     assert!(
@@ -1518,7 +1928,9 @@ fn array_local_provenance_recursive_summary_does_not_panic() {
 
     let q = facts(&map, "f", "q");
     assert!(
-        q.bases.iter().any(|base| matches!(base, BaseId::Param { .. })),
+        q.bases
+            .iter()
+            .any(|base| matches!(base, BaseId::Param { .. })),
         "recursive summary should keep a Param base in the conservative result: {q:#?}"
     );
     assert!(
