@@ -10,7 +10,10 @@ use super::{
 };
 use crate::{
     analyses::type_qualifier::foster::mutability::mutability_analysis,
-    rewriter::array_local_index_rewriter::group_has_rewritable_binding, utils::rustc::RustProgram,
+    rewriter::array_local_index_rewriter::{
+        group_has_rewritable_binding, group_suppresses_caller_visible_store,
+    },
+    utils::rustc::RustProgram,
 };
 
 fn build_rust_program(tcx: rustc_middle::ty::TyCtxt<'_>) -> RustProgram<'_> {
@@ -169,6 +172,7 @@ struct RewriteGroupFacts {
     member_root_names: FxHashSet<String>,
     index_tracked: bool,
     has_rewritable_binding: bool,
+    suppresses_caller_visible_store: bool,
     kind: &'static str,
     writes_base_binding: bool,
     preserved_call_count: usize,
@@ -245,6 +249,8 @@ fn run_rewrite_groups_with_points_to(
                     };
                     let has_rewritable_binding =
                         group_has_rewritable_binding(tcx, did, &body, result, &group);
+                    let suppresses_caller_visible_store =
+                        group_suppresses_caller_visible_store(result, &group);
                     let member_names = group
                         .members
                         .iter()
@@ -274,6 +280,7 @@ fn run_rewrite_groups_with_points_to(
                         kind,
                         index_tracked: group.index_tracked,
                         has_rewritable_binding,
+                        suppresses_caller_visible_store,
                         writes_base_binding,
                         preserved_call_count,
                     }
@@ -2484,3 +2491,101 @@ fn group_has_rewritable_binding_for_field_base_group() {
         "expected has_rewritable_binding=true for the field-base group, got: {process_groups:?}"
     );
 }
+
+#[test]
+fn index_tracked_pointee_field_base_group_is_flagged_store_suppressing() {
+    // cp_block shape: the base slot (*state).out lives behind a parameter
+    // pointer; turning its direct store into an index update would hide the
+    // advanced pointer from the caller, so the rewriter must skip the group
+    // even though selection still classifies it as index_tracked.
+    let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
+        r#"
+        pub struct State {
+            pub out: *mut i8,
+        }
+
+        unsafe extern "C" {
+            fn process(state: *mut State);
+        }
+
+        pub unsafe fn f(state: *mut State, backward: usize, n: usize) {
+            process(state);
+            let src: *const i8 = ((*state).out as *const i8).sub(backward);
+            (*state).out = ((*state).out).add(n);
+            let _keep: *const i8 = src;
+        }
+        "#,
+    );
+
+    let f_groups = groups.get("f").unwrap();
+    let group = f_groups
+        .iter()
+        .find(|group| group.index_tracked && group.member_names.contains("state.out"))
+        .unwrap_or_else(|| panic!("expected index_tracked state.out group: {f_groups:#?}"));
+    assert!(
+        group.suppresses_caller_visible_store,
+        "index-tracked pointee field base must be flagged store-suppressing: {group:#?}"
+    );
+}
+
+#[test]
+fn index_tracked_by_value_field_base_group_is_not_flagged_store_suppressing() {
+    // pair.a lives in the by-value parameter copy; suppressing its store is
+    // invisible to the caller, so the group stays plannable.
+    let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
+        r#"
+        pub struct Pair {
+            pub a: *mut i32,
+            pub b: *mut i32,
+        }
+
+        pub unsafe fn f(mut pair: Pair, i: usize) {
+            let qa = pair.a.add(i);
+            let qb = pair.b.add(i);
+            pair.a = pair.a.add(1);
+            let ra = qa.add(1);
+            let rb = qb.add(1);
+            let _ = (*ra, *rb);
+        }
+        "#,
+    );
+
+    let f_groups = groups.get("f").unwrap();
+    let group = f_groups
+        .iter()
+        .find(|group| group.index_tracked && group.member_names.contains("qa"))
+        .unwrap_or_else(|| panic!("expected index_tracked pair.a group: {f_groups:#?}"));
+    assert!(
+        !group.suppresses_caller_visible_store,
+        "by-value field base writes a local copy and must stay plannable: {group:#?}"
+    );
+}
+
+#[test]
+fn index_tracked_top_level_param_group_is_not_flagged_store_suppressing() {
+    // p is a by-value parameter binding; reassigning it is caller-invisible.
+    let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
+        r#"
+        pub unsafe fn f(mut p: *mut i32, i: usize) {
+            let q = p.add(i);
+            p = p.add(1);
+            let r = q.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let f_groups = groups.get("f").unwrap();
+    let group = f_groups
+        .iter()
+        .find(|group| group.index_tracked && group.member_names.contains("q"))
+        .unwrap_or_else(|| panic!("expected index_tracked param group: {f_groups:#?}"));
+    assert!(
+        !group.suppresses_caller_visible_store,
+        "top-level param cursor must stay plannable: {group:#?}"
+    );
+}
+

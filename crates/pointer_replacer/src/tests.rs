@@ -9436,7 +9436,11 @@ pub unsafe fn expose(mut h: *mut Holder, mut i: isize) {
 }
 
 #[test]
-fn test_array_local_rewriter_tracks_index_for_reassigned_field_base() {
+fn test_array_local_rewriter_preserves_reassigned_pointee_field_base_store() {
+    // (*s).out lives behind the parameter pointer, so the caller observes it
+    // after return; index-tracking the reassignment would suppress that store.
+    // the group stays classified but must not be rewritten (see
+    // group_suppresses_caller_visible_store).
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9456,20 +9460,21 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(
-        changed,
-        "expected field-base index tracking to rewrite:\n{s}"
+        !changed,
+        "caller-visible field base reassignment must not be index-tracked:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("out_idx") || s.contains("s_out_idx"), "{s}");
-    assert!(s.contains("src_idx"), "{s}");
-    assert!(s.contains("dst_idx"), "{s}");
-    assert!(s.contains("let mut src: *mut i8"), "{s}");
-    assert!(s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(!s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    assert!(s.contains("(*s).out ="), "{s}");
+    assert!(!s.contains("out_idx"), "{s}");
+    assert!(!s.contains("src_idx"), "{s}");
+    assert!(!s.contains("dst_idx"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_field_base_memory_copy_cursors_index_only() {
+fn test_array_local_rewriter_skips_memory_copy_cursors_of_reassigned_pointee_field_base() {
+    // same caller-visibility constraint as
+    // test_array_local_rewriter_preserves_reassigned_pointee_field_base_store:
+    // (*s).out is reassigned, so the whole group must stay unrewritten.
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9499,31 +9504,21 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: i32, mut distance: i
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(
-        changed,
-        "expected field-base memory copy cursors to be rewritten:\n{s}"
+        !changed,
+        "cursors of a reassigned caller-visible field base must not be rewritten:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("src_idx"), "{s}");
-    assert!(s.contains("dst_idx"), "{s}");
-    assert!(!s.contains("let mut src: *mut i8"), "{s}");
-    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(
-        s.contains("memset(((*s).out).offset(dst_idx)")
-            || s.contains("memset((*s).out.offset(dst_idx)"),
-        "expected memset destination to inline dst_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(src_idx)") || s.contains("*((*s).out.offset(src_idx)"),
-        "expected src deref to inline src_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(dst_idx)") || s.contains("*((*s).out.offset(dst_idx)"),
-        "expected dst deref to inline dst_idx from the field base:\n{s}"
-    );
+    assert!(s.contains("(*s).out ="), "{s}");
+    assert!(!s.contains("src_idx"), "{s}");
+    assert!(!s.contains("dst_idx"), "{s}");
+    assert!(s.contains("let mut src: *mut i8"), "{s}");
+    assert!(s.contains("let mut dst: *mut i8"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_distinct_indexes_for_two_reassigned_field_bases() {
+fn test_array_local_rewriter_skips_two_reassigned_pointee_field_bases() {
+    // both (*p).a and (*p).b are reassigned caller-visible field bases, so
+    // neither group may be index-tracked.
     let code = r#"
 #[repr(C)]
 pub struct Pair {
@@ -9543,16 +9538,14 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     assert!(
-        changed,
-        "expected both reassigned field bases to be rewritten:\n{s}"
+        !changed,
+        "reassigned caller-visible field bases must not be rewritten:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut a_idx: isize"), "{s}");
-    assert!(s.contains("let mut b_idx: isize"), "{s}");
-    assert!(s.contains("ax_idx"), "{s}");
-    assert!(s.contains("bx_idx"), "{s}");
-    assert!(s.contains("let mut ax: *mut i8"), "{s}");
-    assert!(s.contains("let mut bx: *mut i16"), "{s}");
+    assert!(s.contains("(*p).a ="), "{s}");
+    assert!(s.contains("(*p).b ="), "{s}");
+    assert!(!s.contains("a_idx"), "{s}");
+    assert!(!s.contains("b_idx"), "{s}");
 }
 
 #[test]

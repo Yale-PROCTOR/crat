@@ -487,6 +487,21 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     visitor.changed
 }
 
+/// Returns true when rewriting this group would suppress a store the caller
+/// can observe: the base is index-tracked (its direct stores become index
+/// updates that are never written back) and the base slot lives behind a
+/// `Pointee` path, i.e. in memory reachable through a parameter. Such groups
+/// stay classified by selection (future write-back support may restore them)
+/// but must not be planned for rewriting.
+pub(crate) fn group_suppresses_caller_visible_store(
+    provenance: &ArrayLocalProvenance,
+    group: &RewriteGroup,
+) -> bool {
+    group.index_tracked
+        && analyses::array_local_provenance::base_slot_info(provenance, group)
+            .is_some_and(|info| info.path.contains(&SlotPathElem::Pointee))
+}
+
 #[allow(dead_code)]
 pub(crate) fn group_has_rewritable_binding<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -786,6 +801,12 @@ struct GroupPlanContext<'a, 'tcx> {
 }
 
 fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGroup) {
+    // rewriting an index-tracked base behind a pointee path would turn its
+    // direct stores into local index updates and never write the advanced
+    // pointer back to caller-visible memory; keep such groups out of the plan.
+    if group_suppresses_caller_visible_store(context.provenance, group) {
+        return;
+    }
     let Some(&base_hir_id) = context.local_to_hir.get(&group.base_local) else {
         return;
     };
