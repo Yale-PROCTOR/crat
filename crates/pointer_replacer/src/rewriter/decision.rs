@@ -235,10 +235,17 @@ impl<'tcx> DecisionMaker<'tcx> {
                 )
             } else if self._owning_pointers[local] && self.array_pointers[local] {
                 if self._output_params.contains(local) {
-                    (
-                        Some(PtrKind::Slice(true)),
-                        DecisionReason::OwningArrayOutputParam,
-                    )
+                    if self.needs_cursor.contains(local) {
+                        (
+                            Some(PtrKind::SliceCursor(true)),
+                            DecisionReason::OwningArrayOutputParam,
+                        )
+                    } else {
+                        (
+                            Some(PtrKind::Slice(true)),
+                            DecisionReason::OwningArrayOutputParam,
+                        )
+                    }
                 } else if is_local_struct {
                     (
                         Some(PtrKind::Raw(self.mutable_pointers[local])),
@@ -1241,10 +1248,10 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
-    fn owning_array_output_with_cursor_need_stays_mut_slice() {
+    fn owning_array_output_with_cursor_need_becomes_mut_cursor() {
         assert_eq!(
             decide_for_param(true, true, true, true, false, false, true),
-            PtrKind::Slice(true)
+            PtrKind::SliceCursor(true)
         );
     }
 

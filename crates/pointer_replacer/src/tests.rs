@@ -1870,9 +1870,15 @@ pub unsafe fn touch(buf: [i32; 4]) -> i32 {
         &[
             "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
             "crate::slice_cursor::SliceCursor::",
+            "(h.p)[",
+            "-1",
+        ],
+        &[
+            "pub p: Option<&'a i32>",
+            "pub p: *const i32",
+            "*h.p.offset",
             ".offset_by((-1) as isize)",
         ],
-        &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
     );
 }
 
@@ -1892,10 +1898,15 @@ pub unsafe fn load_word(s: *const State) -> u32 {
 "#,
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
-            ".as_slice()",
-            ".offset_by((s.word_index",
+            "(s.words)[",
+            "s.word_index",
         ],
-        &["let mut _c = ((*s).words);", "*(*s).words.offset"],
+        &[
+            "SliceCursor::new((s.words).as_slice())",
+            "(s.words).as_slice()",
+            "let mut _c = ((*s).words);",
+            "*(*s).words.offset",
+        ],
     );
 }
 
@@ -1916,9 +1927,14 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
+            "(s.words)[",
+            "s.word_index",
+        ],
+        &[
+            "pub words: Option<&'a u32>",
+            "*(*s).words.offset",
             ".offset_by((s.word_index",
         ],
-        &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
 }
 
@@ -7266,7 +7282,7 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
-fn test_param_byte_cast_offset_rewrites_to_slice_bytemuck() {
+fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
 #[repr(C)]
@@ -7284,20 +7300,21 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
-            "set_type((leaf_addr).as_slice_mut(), offset, value);",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
+            "set_type((leaf_addr).as_deref_mut(), offset, value);",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_slice_callee() {
+fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
     run_test(
         r#"
 #[repr(C)]
@@ -7321,14 +7338,16 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
             "set_type(if (leaf_addr).is_null()",
+            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
@@ -7626,6 +7645,36 @@ pub unsafe fn drive() -> u8 {
             "fn read_before(p: *const u8)",
             "fn read_before(mut p: *const u8)",
         ],
+    );
+}
+
+#[test]
+fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
+    run_test(
+        r#"
+pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
+    *p.offset(a).offset(b) = 1;
+}
+"#,
+        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &["(p).as_deref_mut().offset_by"],
+    );
+}
+
+#[test]
+fn test_mut_cursor_multi_offset_call_reborrows_once() {
+    run_test(
+        r#"
+pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
+    if b == 0 {
+        return;
+    }
+    recurse(items.offset(a).offset(b), a, b - 1);
+    *items = b as i32;
+}
+"#,
+        &["as_deref_mut", ")).offset_by((b) as isize)"],
+        &["as_deref_mut().offset_by((b) as isize)"],
     );
 }
 
