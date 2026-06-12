@@ -1870,9 +1870,15 @@ pub unsafe fn touch(buf: [i32; 4]) -> i32 {
         &[
             "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
             "crate::slice_cursor::SliceCursor::",
+            "(h.p)[",
+            "-1",
+        ],
+        &[
+            "pub p: Option<&'a i32>",
+            "pub p: *const i32",
+            "*h.p.offset",
             ".offset_by((-1) as isize)",
         ],
-        &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
     );
 }
 
@@ -1892,10 +1898,12 @@ pub unsafe fn load_word(s: *const State) -> u32 {
 "#,
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
-            "(s.words))[((s.word_index as isize))]",
+            "(s.words)[",
+            "s.word_index",
         ],
         &[
             "SliceCursor::new((s.words).as_slice())",
+            "(s.words).as_slice()",
             "let mut _c = ((*s).words);",
             "*(*s).words.offset",
         ],
@@ -1919,9 +1927,14 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
+            "(s.words)[",
+            "s.word_index",
+        ],
+        &[
+            "pub words: Option<&'a u32>",
+            "*(*s).words.offset",
             ".offset_by((s.word_index",
         ],
-        &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
 }
 
