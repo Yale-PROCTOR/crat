@@ -1001,14 +1001,14 @@ fn pointer_origin_map<'tcx>(
         let Some(dst) = destination.as_local() else {
             continue;
         };
-        if let Some((_, name)) = call_name(tcx, func)
-            && (is_pointer_arithmetic(&name) || is_as_ptr(&name))
+        if let Some((def_id, name)) = call_name(tcx, func)
+            && (is_pointer_arithmetic(tcx, def_id, &name) || is_as_ptr(tcx, def_id, &name))
             && let Some(arg) = args.first()
             && let Some(place) = operand_place(&arg.node)
         {
             origins.entry(dst).or_default().push(PointerOrigin {
                 source: place.local,
-                uses_pointer_arithmetic: is_pointer_arithmetic(&name),
+                uses_pointer_arithmetic: is_pointer_arithmetic(tcx, def_id, &name),
                 uses_pointer_cast: false,
             });
         }
@@ -1903,8 +1903,8 @@ fn build_rhs_map<'tcx>(
         let Some(dest_local) = destination.as_local() else {
             continue;
         };
-        if let Some((_, name)) = call_name(tcx, func)
-            && (is_pointer_arithmetic(&name) || is_as_ptr(&name))
+        if let Some((def_id, name)) = call_name(tcx, func)
+            && (is_pointer_arithmetic(tcx, def_id, &name) || is_as_ptr(tcx, def_id, &name))
             && let Some(arg) = args.first()
             && let Some(place) = operand_place(&arg.node)
         {
@@ -2377,7 +2377,7 @@ impl<'tcx> Collector<'_, 'tcx> {
         }
 
         if let Some((def_id, name)) = call {
-            if is_pointer_arithmetic(&name) {
+            if is_pointer_arithmetic(self.tcx, def_id, &name) {
                 let Some(dst) = self.destination_node(*destination, location) else {
                     return;
                 };
@@ -2413,7 +2413,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                 return;
             }
 
-            if is_as_ptr(&name)
+            if is_as_ptr(self.tcx, def_id, &name)
                 && let Some(arg) = args.first()
                 && let Some(place) = operand_place(&arg.node)
             {
@@ -2430,7 +2430,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                 return;
             }
 
-            if is_heap_alloc_call(self.tcx, def_id, &name, self.alloc_fns) {
+            if is_heap_alloc_call(self.tcx, def_id, self.alloc_fns) {
                 let Some(dst) = self.destination_node(*destination, location) else {
                     return;
                 };
@@ -3065,24 +3065,36 @@ fn call_name(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<(DefId, String)> {
     Some((*def_id, tcx.def_path_str(*def_id)))
 }
 
-fn is_pointer_arithmetic(name: &str) -> bool {
-    matches!(
-        name.rsplit("::").next(),
-        Some(
-            "offset"
-                | "wrapping_offset"
-                | "byte_offset"
-                | "wrapping_byte_offset"
-                | "add"
-                | "wrapping_add"
-                | "sub"
-                | "wrapping_sub"
+/// Returns true only for the core/std inherent raw-pointer arithmetic
+/// methods. The crate and `::ptr::` path checks keep user-defined functions
+/// that merely share these names (common in translated C code, e.g. a free
+/// function `add`) from being granted base-preserving semantics.
+fn is_pointer_arithmetic(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    let crate_name = tcx.crate_name(def_id.krate);
+    matches!(crate_name.as_str(), "core" | "std")
+        && name.contains("::ptr::")
+        && matches!(
+            name.rsplit("::").next(),
+            Some(
+                "offset"
+                    | "wrapping_offset"
+                    | "byte_offset"
+                    | "wrapping_byte_offset"
+                    | "add"
+                    | "wrapping_add"
+                    | "sub"
+                    | "wrapping_sub"
+            )
         )
-    )
 }
 
-fn is_as_ptr(name: &str) -> bool {
-    matches!(name.rsplit("::").next(), Some("as_ptr" | "as_mut_ptr"))
+/// Returns true only for the core/std slice/array `as_ptr`/`as_mut_ptr`
+/// methods, not for arbitrary functions sharing those names.
+fn is_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+    let crate_name = tcx.crate_name(def_id.krate);
+    matches!(crate_name.as_str(), "core" | "std")
+        && (name.contains("::slice::") || name.contains("::array::"))
+        && matches!(name.rsplit("::").next(), Some("as_ptr" | "as_mut_ptr"))
 }
 
 fn call_no_writes(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
@@ -3209,18 +3221,10 @@ fn is_empty_array_ref_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     len.try_to_target_usize(tcx) == Some(0)
 }
 
-fn is_heap_alloc_call(
-    tcx: TyCtxt<'_>,
-    def_id: DefId,
-    name: &str,
-    alloc_fns: &FxHashSet<LocalDefId>,
-) -> bool {
-    if matches!(
-        name.rsplit("::").next(),
-        Some("malloc" | "calloc" | "realloc")
-    ) {
-        return true;
-    }
+/// Returns true for allocator shims found by Andersen pre-analysis and for
+/// the foreign libc allocators. A local Rust function that merely shares an
+/// allocator name gets no heap-alloc provenance.
+fn is_heap_alloc_call(tcx: TyCtxt<'_>, def_id: DefId, alloc_fns: &FxHashSet<LocalDefId>) -> bool {
     def_id
         .as_local()
         .is_some_and(|local_def_id| alloc_fns.contains(&local_def_id))

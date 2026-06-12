@@ -2589,3 +2589,80 @@ fn index_tracked_top_level_param_group_is_not_flagged_store_suppressing() {
     );
 }
 
+#[test]
+fn user_defined_add_function_is_not_pointer_arithmetic() {
+    // a free function named `add` (common in translated C) must not be
+    // granted the base-preserving semantics of <*mut T>::add; the genuine
+    // inherent method keeps them.
+    let map = run_analysis(
+        r#"
+        pub unsafe fn add(p: *mut i32, _n: i32) -> *mut i32 {
+            p
+        }
+
+        pub unsafe fn f(p: *mut i32) {
+            let q = add(p, 1);
+            let r = p.add(1);
+            let _ = (*q, *r);
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    assert!(
+        matches!(q.unique, Some(BaseId::OpaqueReturn { .. })),
+        "user-defined add must yield an opaque return, got {q:#?}"
+    );
+    let r = facts(&map, "f", "r");
+    assert_unique_param(r);
+}
+
+#[test]
+fn local_function_named_malloc_is_not_heap_alloc() {
+    let map = run_analysis(
+        r#"
+        pub unsafe fn malloc(_size: usize) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+
+        pub unsafe fn f() {
+            let q = malloc(8);
+            let _ = *q;
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    assert!(
+        !q.bases
+            .iter()
+            .any(|base| matches!(base, BaseId::HeapAlloc { .. })),
+        "local fn named malloc must not get heap-alloc provenance: {q:#?}"
+    );
+    assert!(
+        matches!(q.unique, Some(BaseId::OpaqueReturn { .. })),
+        "local fn named malloc must yield an opaque return, got {q:#?}"
+    );
+}
+
+#[test]
+fn foreign_malloc_is_heap_alloc() {
+    let map = run_analysis(
+        r#"
+        unsafe extern "C" {
+            fn malloc(size: usize) -> *mut u8;
+        }
+
+        pub unsafe fn f() {
+            let q = malloc(8);
+            let _ = *q;
+        }
+        "#,
+    );
+
+    let q = facts(&map, "f", "q");
+    assert!(
+        matches!(q.unique, Some(BaseId::HeapAlloc { .. })),
+        "foreign malloc must keep heap-alloc provenance, got {q:#?}"
+    );
+}
