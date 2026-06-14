@@ -249,8 +249,7 @@ fn run_rewrite_groups_with_points_to(
                     };
                     let has_rewritable_binding =
                         group_has_rewritable_binding(tcx, did, &body, result, &group);
-                    let needs_live_base_rewrite =
-                        group_needs_live_base_rewrite(result, &group);
+                    let needs_live_base_rewrite = group_needs_live_base_rewrite(result, &group);
                     let member_names = group
                         .members
                         .iter()

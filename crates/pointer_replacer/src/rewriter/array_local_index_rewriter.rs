@@ -2887,12 +2887,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             }
             if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = &stmt.kind
                 && let ExprKind::Assign(lhs, rhs, _) = &expr.kind
-                && let Some(base_key) = direct_base_cursor_key(
-                    self.ast_to_hir,
-                    self.tcx,
-                    &self.plan.base_by_key,
-                    lhs,
-                )
+                && let Some(base_key) =
+                    direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
                 && let Some(base_rewrite) = self.plan.base_by_key.get(&base_key)
                 && base_rewrite.base_live
             {
@@ -3282,7 +3278,10 @@ mod member_offset_tests {
 
     #[test]
     fn non_live_base_is_unchanged() {
-        assert_eq!(member_offset_expr(false, Some("out_idx"), "src_idx"), "src_idx");
+        assert_eq!(
+            member_offset_expr(false, Some("out_idx"), "src_idx"),
+            "src_idx"
+        );
     }
 
     #[test]
