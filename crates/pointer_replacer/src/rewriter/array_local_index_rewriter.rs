@@ -64,6 +64,9 @@ struct BindingRewrite {
     field_base: bool,
     base_proxy_hir_ids: FxHashSet<HirId>,
     group_member_hir_ids: FxHashSet<HirId>,
+    /// caller-visible index-tracked field base: the field write is kept live and
+    /// member materializations subtract `base_index_name` (approach D).
+    base_live: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +78,8 @@ struct BaseCursorRewrite {
     base_is_raw_ptr: bool,
     ptr_ty: String,
     field_base: bool,
+    /// caller-visible field base whose write stays live (approach D).
+    base_live: bool,
 }
 
 type BaseCursorKey = (HirId, String);
@@ -969,6 +974,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                     base_is_raw_ptr,
                     ptr_ty,
                     field_base: group.base_slot_offset != 0,
+                    base_live: false,
                 },
             );
             Some(index_name)
@@ -1037,6 +1043,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 field_base,
                 base_proxy_hir_ids: proxy_hir_ids.clone(),
                 group_member_hir_ids: group_member_hir_ids.clone(),
+                base_live: false,
             },
         );
     }
@@ -1405,6 +1412,7 @@ fn collect_binding_use_summaries_for_names_for_test(
                     field_base: false,
                     base_proxy_hir_ids: FxHashSet::default(),
                     group_member_hir_ids: FxHashSet::default(),
+                    base_live: false,
                 },
             )
         })
