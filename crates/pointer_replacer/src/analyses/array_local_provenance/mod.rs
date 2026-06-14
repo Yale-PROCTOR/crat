@@ -885,16 +885,36 @@ fn member_pointer_elements_match_base_element<'tcx>(
                     return local_origin_uses_pointer_arithmetic(body, tcx, info.root);
                 }
                 local_origin_uses_pointer_arithmetic(body, tcx, info.root)
-                    || local_origin_uses_pointer_cast(body, tcx, info.root)
+                    || element_tys_same_size_align(body, tcx, base_element_ty, member_element_ty)
             })
     })
+}
+
+/// true when two element types have the same size, so an index counted in one
+/// unit advances the same number of bytes in the other; alignment is also
+/// required to match as extra conservatism for the rare same-size/different-align
+/// case. both must be sized with a computable layout; otherwise returns false
+/// (fail closed).
+fn element_tys_same_size_align<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    base_element_ty: Ty<'tcx>,
+    member_element_ty: Ty<'tcx>,
+) -> bool {
+    let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
+    let (Ok(base_layout), Ok(member_layout)) = (
+        tcx.layout_of(typing_env.as_query_input(base_element_ty)),
+        tcx.layout_of(typing_env.as_query_input(member_element_ty)),
+    ) else {
+        return false;
+    };
+    base_layout.size == member_layout.size && base_layout.align.abi == member_layout.align.abi
 }
 
 #[derive(Clone, Copy)]
 struct PointerOrigin {
     source: Local,
     uses_pointer_arithmetic: bool,
-    uses_pointer_cast: bool,
 }
 
 fn local_origin_uses_pointer_arithmetic<'tcx>(
@@ -923,32 +943,6 @@ fn local_origin_uses_pointer_arithmetic_inner(
     })
 }
 
-fn local_origin_uses_pointer_cast<'tcx>(
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    local: Local,
-) -> bool {
-    let origins = pointer_origin_map(body, tcx);
-    let mut visited = FxHashSet::default();
-    local_origin_uses_pointer_cast_inner(local, &origins, &mut visited)
-}
-
-fn local_origin_uses_pointer_cast_inner(
-    local: Local,
-    origins: &FxHashMap<Local, Vec<PointerOrigin>>,
-    visited: &mut FxHashSet<Local>,
-) -> bool {
-    if !visited.insert(local) {
-        return false;
-    }
-    origins.get(&local).is_some_and(|edges| {
-        edges.iter().any(|edge| {
-            edge.uses_pointer_cast
-                || local_origin_uses_pointer_cast_inner(edge.source, origins, visited)
-        })
-    })
-}
-
 fn pointer_origin_map<'tcx>(
     body: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -964,19 +958,17 @@ fn pointer_origin_map<'tcx>(
                 Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => Some(PointerOrigin {
                     source: place.local,
                     uses_pointer_arithmetic: false,
-                    uses_pointer_cast: false,
                 }),
                 Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
                 | Rvalue::CopyForDeref(place) => Some(PointerOrigin {
                     source: place.local,
                     uses_pointer_arithmetic: false,
-                    uses_pointer_cast: false,
                 }),
+                // casts still create a source edge so arithmetic is found through a cast chain
                 Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                     Some(PointerOrigin {
                         source: place.local,
                         uses_pointer_arithmetic: false,
-                        uses_pointer_cast: true,
                     })
                 }
                 _ => None,
@@ -1009,7 +1001,6 @@ fn pointer_origin_map<'tcx>(
             origins.entry(dst).or_default().push(PointerOrigin {
                 source: place.local,
                 uses_pointer_arithmetic: is_pointer_arithmetic(tcx, def_id, &name),
-                uses_pointer_cast: false,
             });
         }
     }

@@ -2665,3 +2665,38 @@ fn foreign_malloc_is_heap_alloc() {
         "foreign malloc must keep heap-alloc provenance, got {q:#?}"
     );
 }
+
+#[test]
+fn select_rewrite_groups_rejects_size_mismatched_cast_cursor() {
+    // `small` is `seq as *mut i8` over an `*mut i32` base: the cast changes the
+    // pointee size (4 -> 1), so an index recorded in `small`'s i8 units would be
+    // wrong in `seq`'s i32 units. selection must reject the cast cursor.
+    let groups = run_rewrite_groups_with_points_to(
+        RewriteGroupFactMode::ReadyOnly,
+        r#"
+        pub unsafe fn f(seq: *mut i32, len: usize) -> i32 {
+            let small = seq as *mut i8;
+            let mut i: usize = 0;
+            while i < len {
+                let v = *seq.offset(i as isize);
+                *small.offset(i as isize) = v as i8;
+                i = i.wrapping_add(1);
+            }
+            if *small.offset(0) != 0 {
+                return -10;
+            }
+            0
+        }
+        "#,
+    );
+
+    let f_groups = groups.get("f").unwrap();
+    assert!(
+        !f_groups.iter().any(|group| {
+            matches!(group.base, BaseId::Param { .. })
+                && group.base_name.as_deref() == Some("seq")
+                && group.member_names.contains("small")
+        }),
+        "size-mismatched cast cursor must not be selected into the base group: {f_groups:#?}"
+    );
+}
