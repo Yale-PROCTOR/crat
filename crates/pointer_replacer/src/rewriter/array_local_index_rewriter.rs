@@ -2159,6 +2159,53 @@ fn is_null_expr(expr: &Expr) -> bool {
     }
 }
 
+/// returns whether unwrapping a cast on an `offset`/`add`/`offset_from`
+/// receiver preserves the pointee size, so the derived index stays in base
+/// element units; alignment is also required to match as extra conservatism for
+/// the rare same-size/different-align case. a receiver with no enclosing cast is
+/// trivially layout-preserving. for multi-level casts the outermost cast type is
+/// compared against the fully-unwrapped (all casts stripped) inner type, so any
+/// size change anywhere in the chain causes rejection. fails closed: if either
+/// side's type is unresolvable, is not a raw pointer, or has no computable
+/// layout, returns false.
+fn receiver_cast_preserves_pointee_layout(
+    receiver: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let outer = unwrap_paren(receiver);
+    // no cast applied directly to the receiver: the unwrap cannot change units.
+    if !matches!(outer.kind, ExprKind::Cast(..)) {
+        return true;
+    }
+    let inner = unwrap_cast_and_paren(outer);
+    let (Some(outer_layout), Some(inner_layout)) = (
+        ast_expr_pointee_size_align(outer, ast_to_hir, tcx),
+        ast_expr_pointee_size_align(inner, ast_to_hir, tcx),
+    ) else {
+        return false;
+    };
+    outer_layout == inner_layout
+}
+
+/// resolves the `(size, align)` in bytes of the pointee of an AST expression
+/// whose type is a raw pointer. returns `None` if the type is unresolvable, not
+/// a raw pointer, or has no computable layout.
+fn ast_expr_pointee_size_align(
+    expr: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<(u64, u64)> {
+    let hir_expr = ast_to_hir.get_expr(expr.id, tcx)?;
+    let typeck = tcx.typeck(hir_expr.hir_id.owner);
+    let ty::TyKind::RawPtr(pointee, _) = typeck.expr_ty(hir_expr).kind() else {
+        return None;
+    };
+    let typing_env = ty::TypingEnv::post_analysis(tcx, hir_expr.hir_id.owner.to_def_id());
+    let layout = tcx.layout_of(typing_env.as_query_input(*pointee)).ok()?;
+    Some((layout.size.bytes(), layout.align.abi.bytes()))
+}
+
 fn unwrap_pointer_producing_expr(expr: &Expr) -> &Expr {
     let expr = unwrap_cast_and_paren(expr);
     match &expr.kind {
@@ -2303,6 +2350,9 @@ fn projected_as_ptr_receiver_base_name(
     if !matches!(name, "offset" | "add") || offset_call.args.len() != 1 {
         return None;
     }
+    if !receiver_cast_preserves_pointee_layout(&offset_call.receiver, ast_to_hir, tcx) {
+        return None;
+    }
     let receiver = unwrap_cast_and_paren(&offset_call.receiver);
     let ExprKind::MethodCall(as_ptr_call) = &receiver.kind else {
         return None;
@@ -2371,6 +2421,9 @@ fn pointer_index_from_base_expr(
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
         return IndexExpr::Unsupported;
     }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
+        return IndexExpr::Unsupported;
+    }
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
     let receiver_is_base = (!field_base && receiver_hir_id == Some(base_hir_id))
@@ -2408,6 +2461,9 @@ fn group_member_pointer_assignment_index_expr(
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
         return IndexExpr::Unsupported;
     }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
+        return IndexExpr::Unsupported;
+    }
     let receiver = unwrap_pointer_producing_expr(&call.receiver);
     let Some(receiver_hir_id) = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) else {
         return IndexExpr::Unsupported;
@@ -2440,6 +2496,9 @@ fn introduced_group_member_assignment_index_expr(
     };
     let name = call.seg.ident.name.as_str();
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return IndexExpr::Unsupported;
+    }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
         return IndexExpr::Unsupported;
     }
     let receiver = unwrap_pointer_producing_expr(&call.receiver);
@@ -2485,6 +2544,9 @@ fn assignment_index_expr(
     };
     let name = call.seg.ident.name.as_str();
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return IndexExpr::Unsupported;
+    }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
         return IndexExpr::Unsupported;
     }
     let receiver = unwrap_pointer_producing_expr(&call.receiver);
@@ -2538,6 +2600,9 @@ fn base_assignment_index_expr(
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
         return IndexExpr::Unsupported;
     }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
+        return IndexExpr::Unsupported;
+    }
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
     let receiver_is_base = (!base_rewrite.field_base
@@ -2583,6 +2648,9 @@ fn live_base_self_advance_counter(
     };
     let name = call.seg.ident.name.as_str();
     if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return None;
+    }
+    if !receiver_cast_preserves_pointee_layout(&call.receiver, ast_to_hir, tcx) {
         return None;
     }
     let receiver = unwrap_cast_and_paren(&call.receiver);

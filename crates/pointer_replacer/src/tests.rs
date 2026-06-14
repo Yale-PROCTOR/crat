@@ -9616,3 +9616,96 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "{s}"
     );
 }
+
+#[test]
+fn test_array_local_rewriter_rejects_size_changing_receiver_cast() {
+    // `(p as *mut i8).offset(12)` advances 12 *bytes* past an *mut i32 base;
+    // recording index 12 and re-materializing in i32 units would be 48 bytes.
+    // the rewriter must leave q untouched.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = (p as *mut i8).offset(12) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !changed,
+        "size-changing receiver cast must not be rewritten:\n{s}"
+    );
+    assert!(
+        s.contains("let mut q: *mut i32"),
+        "q must stay a raw pointer:\n{s}"
+    );
+    assert!(!s.contains("q_idx"), "no index must be derived for q:\n{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_offset_then_cast() {
+    // offset-then-cast: the index is computed in base (i32) units, the cast is
+    // applied to the result, so this stays rewritten (control).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_equal_size_receiver_cast() {
+    // `(p as *const u8).offset(3)` over an *mut i8 base: pointee size is
+    // unchanged (1 == 1), so the index unit is correct and the rewrite stands.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i8) -> i8 {
+    let mut q: *mut i8 = (p as *const u8).offset(3) as *mut i8;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i8"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_offset_from_not_folded_across_size_cast() {
+    // q is a size-changing cast cursor; its offset_from(r) must NOT be folded
+    // into an index subtraction, because q has no valid base-unit index.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> isize {
+    let mut q: *mut i32 = (base as *mut i8).offset(12) as *mut i32;
+    let mut r: *mut i32 = base.offset(1);
+    *base = 0;
+    *q = 0;
+    *r = 0;
+    q.offset_from(r)
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // r may be independently rewritten to r_idx (no size-changing cast on r's
+    // receiver), so we check only that q is the (unrewritten) receiver of
+    // offset_from, not that r specifically appears as the argument.
+    assert!(
+        s.contains("q.offset_from("),
+        "offset_from must be preserved:\n{s}"
+    );
+    assert!(
+        !s.contains("q_idx"),
+        "no index must be derived for the cast cursor q:\n{s}"
+    );
+}
