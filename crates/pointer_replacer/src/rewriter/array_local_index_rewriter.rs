@@ -3022,6 +3022,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 if let Some(base_key) =
                     direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
                     && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
+                    && !rewrite.base_live
                 {
                     let index = base_assignment_index_expr(
                         rhs,
@@ -3176,6 +3177,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             && let Some(base_key) =
                 direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, inner)
             && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
+            && !rewrite.base_live
         {
             let ptr = base_cursor_pointer_expr(rewrite);
             *expr = utils::expr!("*({})", pprust::expr_to_string(&ptr));
@@ -3228,6 +3230,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         if let Some(base_key) =
             direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, expr)
             && let Some(rewrite) = self.plan.base_by_key.get(&base_key)
+            && !rewrite.base_live
         {
             *expr = base_cursor_pointer_expr(rewrite);
             self.changed = true;
