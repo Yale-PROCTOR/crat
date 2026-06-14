@@ -11,7 +11,7 @@ use super::{
 use crate::{
     analyses::type_qualifier::foster::mutability::mutability_analysis,
     rewriter::array_local_index_rewriter::{
-        group_has_rewritable_binding, group_suppresses_caller_visible_store,
+        group_has_rewritable_binding, group_needs_live_base_rewrite,
     },
     utils::rustc::RustProgram,
 };
@@ -172,7 +172,7 @@ struct RewriteGroupFacts {
     member_root_names: FxHashSet<String>,
     index_tracked: bool,
     has_rewritable_binding: bool,
-    suppresses_caller_visible_store: bool,
+    needs_live_base_rewrite: bool,
     kind: &'static str,
     writes_base_binding: bool,
     preserved_call_count: usize,
@@ -249,8 +249,8 @@ fn run_rewrite_groups_with_points_to(
                     };
                     let has_rewritable_binding =
                         group_has_rewritable_binding(tcx, did, &body, result, &group);
-                    let suppresses_caller_visible_store =
-                        group_suppresses_caller_visible_store(result, &group);
+                    let needs_live_base_rewrite =
+                        group_needs_live_base_rewrite(result, &group);
                     let member_names = group
                         .members
                         .iter()
@@ -280,7 +280,7 @@ fn run_rewrite_groups_with_points_to(
                         kind,
                         index_tracked: group.index_tracked,
                         has_rewritable_binding,
-                        suppresses_caller_visible_store,
+                        needs_live_base_rewrite,
                         writes_base_binding,
                         preserved_call_count,
                     }
@@ -2493,11 +2493,11 @@ fn group_has_rewritable_binding_for_field_base_group() {
 }
 
 #[test]
-fn index_tracked_pointee_field_base_group_is_flagged_store_suppressing() {
+fn index_tracked_pointee_field_base_group_is_flagged_live_base() {
     // cp_block shape: the base slot (*state).out lives behind a parameter
     // pointer; turning its direct store into an index update would hide the
-    // advanced pointer from the caller, so the rewriter must skip the group
-    // even though selection still classifies it as index_tracked.
+    // advanced pointer from the caller, so the rewriter uses the live-field /
+    // shadow-counter scheme (approach D) and flags the group accordingly.
     let groups = run_rewrite_groups_with_points_to(
         RewriteGroupFactMode::ReadyOnly,
         r#"
@@ -2524,15 +2524,15 @@ fn index_tracked_pointee_field_base_group_is_flagged_store_suppressing() {
         .find(|group| group.index_tracked && group.member_names.contains("state.out"))
         .unwrap_or_else(|| panic!("expected index_tracked state.out group: {f_groups:#?}"));
     assert!(
-        group.suppresses_caller_visible_store,
-        "index-tracked pointee field base must be flagged store-suppressing: {group:#?}"
+        group.needs_live_base_rewrite,
+        "index-tracked pointee field base must be flagged needs_live_base_rewrite: {group:#?}"
     );
 }
 
 #[test]
-fn index_tracked_by_value_field_base_group_is_not_flagged_store_suppressing() {
+fn index_tracked_by_value_field_base_group_is_not_flagged_live_base() {
     // pair.a lives in the by-value parameter copy; suppressing its store is
-    // invisible to the caller, so the group stays plannable.
+    // invisible to the caller, so the group stays plannable without live-base.
     let groups = run_rewrite_groups_with_points_to(
         RewriteGroupFactMode::ReadyOnly,
         r#"
@@ -2558,13 +2558,13 @@ fn index_tracked_by_value_field_base_group_is_not_flagged_store_suppressing() {
         .find(|group| group.index_tracked && group.member_names.contains("qa"))
         .unwrap_or_else(|| panic!("expected index_tracked pair.a group: {f_groups:#?}"));
     assert!(
-        !group.suppresses_caller_visible_store,
+        !group.needs_live_base_rewrite,
         "by-value field base writes a local copy and must stay plannable: {group:#?}"
     );
 }
 
 #[test]
-fn index_tracked_top_level_param_group_is_not_flagged_store_suppressing() {
+fn index_tracked_top_level_param_group_is_not_flagged_live_base() {
     // p is a by-value parameter binding; reassigning it is caller-invisible.
     let groups = run_rewrite_groups_with_points_to(
         RewriteGroupFactMode::ReadyOnly,
@@ -2584,7 +2584,7 @@ fn index_tracked_top_level_param_group_is_not_flagged_store_suppressing() {
         .find(|group| group.index_tracked && group.member_names.contains("q"))
         .unwrap_or_else(|| panic!("expected index_tracked param group: {f_groups:#?}"));
     assert!(
-        !group.suppresses_caller_visible_store,
+        !group.needs_live_base_rewrite,
         "top-level param cursor must stay plannable: {group:#?}"
     );
 }

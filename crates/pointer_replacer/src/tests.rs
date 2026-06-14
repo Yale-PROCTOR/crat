@@ -9436,11 +9436,10 @@ pub unsafe fn expose(mut h: *mut Holder, mut i: isize) {
 }
 
 #[test]
-fn test_array_local_rewriter_preserves_reassigned_pointee_field_base_store() {
-    // (*s).out lives behind the parameter pointer, so the caller observes it
-    // after return; index-tracking the reassignment would suppress that store.
-    // the group stays classified but must not be rewritten (see
-    // group_suppresses_caller_visible_store).
+fn test_array_local_rewriter_rewrites_reassigned_pointee_field_base_live() {
+    // (*s).out is caller-visible: the field write is KEPT live, a shadow
+    // counter tracks the advance, and members materialize off the live field
+    // with the counter subtracted (approach D).
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9459,22 +9458,23 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        !changed,
-        "caller-visible field base reassignment must not be index-tracked:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("(*s).out ="), "{s}");
-    assert!(!s.contains("out_idx"), "{s}");
-    assert!(!s.contains("src_idx"), "{s}");
-    assert!(!s.contains("dst_idx"), "{s}");
+    // field write kept live
+    assert!(s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    // shadow counter declared and advanced
+    assert!(s.contains("let mut out_idx: isize = 0isize"), "{s}");
+    assert!(s.contains("out_idx = (out_idx) + (length)"), "{s}");
+    // members are indexes, materialized with - out_idx
+    assert!(s.contains("src_idx"), "{s}");
+    assert!(s.contains("dst_idx"), "{s}");
+    assert!(s.contains("- (out_idx)"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_skips_memory_copy_cursors_of_reassigned_pointee_field_base() {
-    // same caller-visibility constraint as
-    // test_array_local_rewriter_preserves_reassigned_pointee_field_base_store:
-    // (*s).out is reassigned, so the whole group must stay unrewritten.
+fn test_array_local_rewriter_rewrites_memory_copy_cursors_of_reassigned_pointee_field_base() {
+    // (*s).out is caller-visible: the field write is KEPT live (approach D),
+    // a shadow counter tracks the advance, and members are index-rewritten.
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9503,22 +9503,20 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: i32, mut distance: i
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        !changed,
-        "cursors of a reassigned caller-visible field base must not be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // field write kept live
     assert!(s.contains("(*s).out ="), "{s}");
-    assert!(!s.contains("src_idx"), "{s}");
-    assert!(!s.contains("dst_idx"), "{s}");
-    assert!(s.contains("let mut src: *mut i8"), "{s}");
-    assert!(s.contains("let mut dst: *mut i8"), "{s}");
+    // member index vars present
+    assert!(s.contains("src_idx") || s.contains("dst_idx"), "{s}");
+    // shadow counter for out declared
+    assert!(s.contains("out_idx"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_skips_two_reassigned_pointee_field_bases() {
-    // both (*p).a and (*p).b are reassigned caller-visible field bases, so
-    // neither group may be index-tracked.
+fn test_array_local_rewriter_rewrites_two_reassigned_pointee_field_bases() {
+    // both (*p).a and (*p).b are caller-visible field bases; both are rewritten
+    // with the live-field / shadow-counter scheme (approach D).
     let code = r#"
 #[repr(C)]
 pub struct Pair {
@@ -9537,15 +9535,37 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        !changed,
-        "reassigned caller-visible field bases must not be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // field writes kept live
     assert!(s.contains("(*p).a ="), "{s}");
     assert!(s.contains("(*p).b ="), "{s}");
-    assert!(!s.contains("a_idx"), "{s}");
-    assert!(!s.contains("b_idx"), "{s}");
+    // member index vars present
+    assert!(s.contains("ax_idx") || s.contains("a_idx"), "{s}");
+    assert!(s.contains("bx_idx") || s.contains("b_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_live_field_base_with_non_self_advance() {
+    // the base field is reassigned from a member, not a self-advance, so D
+    // cannot track the counter; the group is dropped and left unrewritten.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+}
+
+pub unsafe fn f(mut s: *mut State, mut n: isize) -> i32 {
+    let mut cur: *mut i8 = (*s).out.offset(n);
+    (*s).out = cur;
+    cur = cur.offset(1);
+    *cur as i32
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("(*s).out = cur"), "{s}");
+    assert!(!s.contains("out_idx"), "{s}");
 }
 
 #[test]

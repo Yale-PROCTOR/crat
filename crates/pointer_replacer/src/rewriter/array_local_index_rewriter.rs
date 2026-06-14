@@ -492,13 +492,11 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     visitor.changed
 }
 
-/// Returns true when rewriting this group would suppress a store the caller
-/// can observe: the base is index-tracked (its direct stores become index
-/// updates that are never written back) and the base slot lives behind a
-/// `Pointee` path, i.e. in memory reachable through a parameter. Such groups
-/// stay classified by selection (future write-back support may restore them)
-/// but must not be planned for rewriting.
-pub(crate) fn group_suppresses_caller_visible_store(
+/// Returns true for an index-tracked base whose base slot lives behind a
+/// `Pointee` path — a caller-visible field base. These are rewritten with the
+/// live-field / shadow-counter scheme (approach D): the field write is kept and
+/// member materializations subtract the base counter.
+pub(crate) fn group_needs_live_base_rewrite(
     provenance: &ArrayLocalProvenance,
     group: &RewriteGroup,
 ) -> bool {
@@ -806,12 +804,7 @@ struct GroupPlanContext<'a, 'tcx> {
 }
 
 fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGroup) {
-    // rewriting an index-tracked base behind a pointee path would turn its
-    // direct stores into local index updates and never write the advanced
-    // pointer back to caller-visible memory; keep such groups out of the plan.
-    if group_suppresses_caller_visible_store(context.provenance, group) {
-        return;
-    }
+    let base_live = group_needs_live_base_rewrite(context.provenance, group);
     let Some(&base_hir_id) = context.local_to_hir.get(&group.base_local) else {
         return;
     };
@@ -974,7 +967,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                     base_is_raw_ptr,
                     ptr_ty,
                     field_base: group.base_slot_offset != 0,
-                    base_live: false,
+                    base_live,
                 },
             );
             Some(index_name)
@@ -1043,7 +1036,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 field_base,
                 base_proxy_hir_ids: proxy_hir_ids.clone(),
                 group_member_hir_ids: group_member_hir_ids.clone(),
-                base_live: false,
+                base_live,
             },
         );
     }
