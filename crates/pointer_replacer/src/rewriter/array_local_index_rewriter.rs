@@ -2560,6 +2560,43 @@ fn base_assignment_index_expr(
     IndexExpr::Unsupported
 }
 
+/// For a live (caller-visible) field base, recognizes a base self-advance
+/// `(*s).out = (*s).out.offset(n)` / `.add(n)` and returns the counter update
+/// expression `out_idx + n`. Returns `None` for any other RHS (e.g. assignment
+/// from a member), which approach D does not support.
+fn live_base_self_advance_counter(
+    rhs: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base_rewrite: &BaseCursorRewrite,
+) -> Option<Expr> {
+    let rhs = unwrap_cast_and_paren(rhs);
+    let ExprKind::MethodCall(call) = &rhs.kind else {
+        return None;
+    };
+    let name = call.seg.ident.name.as_str();
+    if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+        return None;
+    }
+    let receiver = unwrap_cast_and_paren(&call.receiver);
+    let receiver_is_base = (!base_rewrite.field_base
+        && hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id) == Some(base_rewrite.base_hir_id))
+        || receiver_is_base_as_ptr_for_context(
+            receiver,
+            ast_to_hir,
+            tcx,
+            base_rewrite.base_hir_id,
+            &base_rewrite.base_name,
+            base_rewrite.field_base,
+        )
+        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
+    if !receiver_is_base {
+        return None;
+    }
+    let offset = offset_index_arg_expr(name, &call.args[0]);
+    Some(add_index_expr(&base_rewrite.index_name, &offset))
+}
+
 fn index_init_expr(index: IndexExpr, nullable: bool) -> Option<Expr> {
     match (index, nullable) {
         (IndexExpr::Plain(expr), false) => Some(expr),
@@ -2838,6 +2875,38 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 && let Some(index_stmt) = self.rewrite_materialized_local_stmt(local)
             {
                 new_stmts.push(index_stmt);
+                new_stmts.push(stmt);
+                continue;
+            }
+            if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = &stmt.kind
+                && let ExprKind::Assign(lhs, rhs, _) = &expr.kind
+                && let Some(base_key) = direct_base_cursor_key(
+                    self.ast_to_hir,
+                    self.tcx,
+                    &self.plan.base_by_key,
+                    lhs,
+                )
+                && let Some(base_rewrite) = self.plan.base_by_key.get(&base_key)
+                && base_rewrite.base_live
+            {
+                if let Some(counter_rhs) =
+                    live_base_self_advance_counter(rhs, self.ast_to_hir, self.tcx, base_rewrite)
+                {
+                    let counter_stmt = utils::stmt!(
+                        "{} = {};",
+                        base_rewrite.index_name,
+                        pprust::expr_to_string(&counter_rhs)
+                    );
+                    // keep the field write verbatim (field stays caller-correct),
+                    // then advance the shadow counter.
+                    new_stmts.push(stmt);
+                    new_stmts.push(counter_stmt);
+                    self.changed = true;
+                    continue;
+                }
+                // not a recognized self-advance: leave the statement untouched.
+                // prune drops such groups, so members are not index-rewritten and
+                // the live field read stays correct.
                 new_stmts.push(stmt);
                 continue;
             }
