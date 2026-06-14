@@ -2583,6 +2583,16 @@ fn idx_read_expr(rewrite: &BindingRewrite) -> String {
     }
 }
 
+/// computes the offset expression for a member materialization. for a live
+/// (caller-visible) field base the member index is corrected by the base
+/// counter (`index - base_index`); otherwise the member index is used as-is.
+fn member_offset_expr(base_live: bool, base_index_name: Option<&str>, index_expr: &str) -> String {
+    match (base_live, base_index_name) {
+        (true, Some(base_idx)) => format!("({index_expr}) - ({base_idx})"),
+        _ => index_expr.to_string(),
+    }
+}
+
 fn base_offset_expr_for_parts(base_name: &str, base_is_raw_ptr: bool, index_expr: &str) -> String {
     if base_is_raw_ptr {
         format!("({base_name}).offset({index_expr})")
@@ -2592,7 +2602,12 @@ fn base_offset_expr_for_parts(base_name: &str, base_is_raw_ptr: bool, index_expr
 }
 
 fn base_offset_expr_for_index(rewrite: &BindingRewrite, index_expr: &str) -> String {
-    base_offset_expr_for_parts(&rewrite.base_name, rewrite.base_is_raw_ptr, index_expr)
+    let offset = member_offset_expr(
+        rewrite.base_live,
+        rewrite.base_index_name.as_deref(),
+        index_expr,
+    );
+    base_offset_expr_for_parts(&rewrite.base_name, rewrite.base_is_raw_ptr, &offset)
 }
 
 fn pointer_expr_for_index(rewrite: &BindingRewrite) -> Expr {
@@ -3171,5 +3186,28 @@ impl LocalKindInitMut for LocalKind {
             LocalKind::Init(init) | LocalKind::InitElse(init, _) => Some(init),
             LocalKind::Decl => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod member_offset_tests {
+    use super::member_offset_expr;
+
+    #[test]
+    fn live_base_subtracts_base_index() {
+        assert_eq!(
+            member_offset_expr(true, Some("out_idx"), "src_idx"),
+            "(src_idx) - (out_idx)"
+        );
+    }
+
+    #[test]
+    fn non_live_base_is_unchanged() {
+        assert_eq!(member_offset_expr(false, Some("out_idx"), "src_idx"), "src_idx");
+    }
+
+    #[test]
+    fn live_base_without_index_is_unchanged() {
+        assert_eq!(member_offset_expr(true, None, "src_idx"), "src_idx");
     }
 }
