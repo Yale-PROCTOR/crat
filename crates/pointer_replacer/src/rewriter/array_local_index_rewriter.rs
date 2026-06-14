@@ -1853,6 +1853,24 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
             direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.base_rewrites, lhs)
         {
             if let Some(base_rewrite) = self.base_rewrites.get(&base_key) {
+                if base_rewrite.base_live {
+                    // approach D only supports base self-advance; any other base
+                    // mutation (or an offset arg referencing a planned member)
+                    // drops the group so the field is left untouched.
+                    if live_base_self_advance_counter(rhs, self.ast_to_hir, self.tcx, base_rewrite)
+                        .is_none()
+                        || base_assignment_index_arg_contains_planned_local(
+                            rhs,
+                            self.ast_to_hir,
+                            self.tcx,
+                            &self.planned_rewrites,
+                            base_rewrite,
+                        )
+                    {
+                        self.mark_rewrites_for_base_unsupported(&base_key);
+                    }
+                    return;
+                }
                 let index = base_assignment_index_expr(
                     rhs,
                     self.ast_to_hir,
