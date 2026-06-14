@@ -513,10 +513,6 @@ pub(crate) fn group_has_rewritable_binding<'tcx>(
     provenance: &ArrayLocalProvenance,
     group: &RewriteGroup,
 ) -> bool {
-    // index_tracked with a field base is unsupported.
-    if group.base_slot_offset != 0 && group.index_tracked {
-        return false;
-    }
     let hir_to_mir = utils::ir::map_thir_to_mir(def_id, false, tcx);
     let local_to_hir: FxHashMap<Local, HirId> = hir_to_mir
         .binding_to_local
