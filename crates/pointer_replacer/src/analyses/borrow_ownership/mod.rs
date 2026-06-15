@@ -7,6 +7,7 @@
 mod domain;
 pub mod crate_slots;
 pub mod resolve;
+pub mod solver;
 pub mod slots;
 mod assoc;
 mod call_graph;

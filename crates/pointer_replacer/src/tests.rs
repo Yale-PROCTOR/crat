@@ -9513,6 +9513,157 @@ pub unsafe fn h(w: *mut Wrap<i32>) {
     }
 }
 
+mod borrow_ownership_solver {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::{mir::Local, ty::TyCtxt};
+    use rustc_span::def_id::LocalDefId;
+    use z3::SatResult;
+
+    use crate::{
+        analyses::borrow_ownership::{
+            SlotKind,
+            crate_slots::CrateSlots,
+            slots::SlotId,
+            solver::{KindSolver, SlotRef},
+        },
+        utils::rustc::RustProgram,
+    };
+
+    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
+        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    }
+
+    fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn function_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    fn with_g_slots<F>(f: F)
+    where
+        F: for<'tcx> FnOnce(&RustProgram<'tcx>, &CrateSlots, LocalDefId, SlotId, SlotId) + Send,
+    {
+        run_compiler(
+            r#"
+pub unsafe fn g(pp: *mut *mut i32) -> i32 {
+    **pp
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let g = function_by_name(&program, "g");
+                let fn_slots = slots.fn_local_slots.get(&g).expect("slots for g");
+                let pp = Local::from_u32(1);
+                let d0 = fn_slots
+                    .slot_for_local_depth(pp, 0)
+                    .expect("pp depth 0 slot");
+                let d1 = fn_slots
+                    .slot_for_local_depth(pp, 1)
+                    .expect("pp depth 1 slot");
+
+                f(&program, &slots, g, d0, d1);
+            },
+        );
+    }
+
+    #[test]
+    fn baseline_slot_encoding_is_satisfiable() {
+        with_g_slots(|_, slots, _, _, _| {
+            let ks = KindSolver::new(slots);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+        });
+    }
+
+    #[test]
+    fn monotonicity_rejects_raw_over_owning() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+
+            ks.assume(SlotRef::Local(g, d0), SlotKind::Raw);
+            ks.assume(SlotRef::Local(g, d1), SlotKind::Owning);
+
+            assert_eq!(ks.check(), SatResult::Unsat);
+        });
+    }
+
+    #[test]
+    fn owning_chain_is_satisfiable() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+
+            ks.assume(SlotRef::Local(g, d0), SlotKind::Owning);
+            ks.assume(SlotRef::Local(g, d1), SlotKind::Owning);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+        });
+    }
+
+    #[test]
+    fn ref_separates_raw_from_deeper_owning() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+
+            ks.assume(SlotRef::Local(g, d0), SlotKind::Ref);
+            ks.assume(SlotRef::Local(g, d1), SlotKind::Owning);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+        });
+    }
+
+    #[test]
+    fn model_reports_assumed_raw_slots() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+            let s0 = SlotRef::Local(g, d0);
+            let s1 = SlotRef::Local(g, d1);
+
+            ks.assume(s0, SlotKind::Raw);
+            ks.assume(s1, SlotKind::Raw);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+            let model = ks.model_kinds().expect("satisfiable model");
+            assert_eq!(model.get(&s0), Some(&SlotKind::Raw));
+            assert_eq!(model.get(&s1), Some(&SlotKind::Raw));
+        });
+    }
+}
+
 mod borrow_ownership_resolve {
     use rustc_abi::FieldIdx;
     use rustc_hir::{ItemKind, OwnerNode};
