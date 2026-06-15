@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 mod domain;
+pub mod crate_slots;
 pub mod slots;
 
 #[allow(unused_imports)]
