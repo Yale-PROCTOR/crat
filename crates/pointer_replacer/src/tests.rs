@@ -9513,6 +9513,395 @@ pub unsafe fn h(w: *mut Wrap<i32>) {
     }
 }
 
+mod borrow_ownership_resolve {
+    use rustc_abi::FieldIdx;
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::{
+        mir::{Local, Place, ProjectionElem},
+        ty::{Ty, TyCtxt, TyKind},
+    };
+    use rustc_span::def_id::LocalDefId;
+
+    use crate::{
+        analyses::borrow_ownership::{
+            crate_slots::{CrateSlots, ptr_chain_depth},
+            ptr::decompose_ty,
+            resolve::{ResolvedSlot, resolve_place},
+            slots::StructFieldSlot,
+        },
+        utils::rustc::RustProgram,
+    };
+
+    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
+        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    }
+
+    fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn struct_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .structs
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("struct `{name}` not found"))
+    }
+
+    fn function_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    fn struct_field_ty<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        struct_did: LocalDefId,
+        field_index: usize,
+    ) -> Ty<'tcx> {
+        let ty = tcx.type_of(struct_did).skip_binder();
+        let TyKind::Adt(adt, substs) = ty.kind() else {
+            panic!("expected struct ADT type");
+        };
+
+        adt.all_fields()
+            .nth(field_index)
+            .unwrap_or_else(|| panic!("field index {field_index} not found"))
+            .ty(tcx, substs)
+    }
+
+    #[test]
+    fn resolve_local_chain_depths() {
+        run_compiler(
+            r#"
+pub unsafe fn g(pp: *mut *mut i32) -> i32 {
+    **pp
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let g = function_by_name(&program, "g");
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                let body = &*body;
+                let pp = Local::from_u32(1);
+                let base = Place::from(pp);
+                let fn_locals = slots.fn_local_slots.get(&g).expect("slots for g");
+
+                assert_eq!(
+                    resolve_place(&slots, g, body, base, 0),
+                    fn_locals
+                        .slot_for_local_depth(pp, 0)
+                        .map(ResolvedSlot::Local)
+                );
+                assert_eq!(
+                    resolve_place(&slots, g, body, base, 1),
+                    fn_locals
+                        .slot_for_local_depth(pp, 1)
+                        .map(ResolvedSlot::Local)
+                );
+                assert_eq!(resolve_place(&slots, g, body, base, 2), None);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_struct_field() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub a: *mut i32,
+    pub b: *mut i32,
+}
+
+pub unsafe fn f(s: *mut S) {
+    let _x = (*s).a;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let f = function_by_name(&program, "f");
+                let s = struct_by_name(&program, "S");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let body = &*body;
+                let s_local = Local::from_u32(1);
+                let field_a_ty = struct_field_ty(tcx, s, 0);
+                let field_a = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 0,
+                };
+                let place = Place::from(s_local).project_deeper(
+                    &[
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIdx::from_u32(0), field_a_ty),
+                    ],
+                    tcx,
+                );
+
+                assert_eq!(
+                    resolve_place(&slots, f, body, place, 0),
+                    slots
+                        .field_slots
+                        .slot_for_field_depth(field_a, 0)
+                        .map(ResolvedSlot::Field)
+                );
+                assert_eq!(
+                    resolve_place(&slots, f, body, Place::from(s_local), 0),
+                    slots
+                        .fn_local_slots
+                        .get(&f)
+                        .expect("slots for f")
+                        .slot_for_local_depth(s_local, 0)
+                        .map(ResolvedSlot::Local)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_capped_deref_then_field_is_conservative() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub a: *mut i32,
+}
+
+pub unsafe fn ok_field(q: *mut *mut *mut S) -> *mut i32 {
+    (***q).a
+}
+
+pub unsafe fn deep_field(p: *mut *mut *mut *mut S) -> *mut i32 {
+    (****p).a
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let s = struct_by_name(&program, "S");
+                let ok_field = function_by_name(&program, "ok_field");
+                let deep_field = function_by_name(&program, "deep_field");
+                let field_a_ty = struct_field_ty(tcx, s, 0);
+                let field_a = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 0,
+                };
+                let expected_field = slots
+                    .field_slots
+                    .slot_for_field_depth(field_a, 0)
+                    .map(ResolvedSlot::Field);
+
+                let ok_body = tcx
+                    .mir_drops_elaborated_and_const_checked(ok_field)
+                    .borrow();
+                let ok_body = &*ok_body;
+                let q = Local::from_u32(1);
+                let ok_place = Place::from(q).project_deeper(
+                    &[
+                        ProjectionElem::Deref,
+                        ProjectionElem::Deref,
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIdx::from_u32(0), field_a_ty),
+                    ],
+                    tcx,
+                );
+                assert_eq!(
+                    resolve_place(&slots, ok_field, ok_body, ok_place, 0),
+                    expected_field
+                );
+
+                let deep_body = tcx
+                    .mir_drops_elaborated_and_const_checked(deep_field)
+                    .borrow();
+                let deep_body = &*deep_body;
+                let p = Local::from_u32(1);
+                let deep_place = Place::from(p).project_deeper(
+                    &[
+                        ProjectionElem::Deref,
+                        ProjectionElem::Deref,
+                        ProjectionElem::Deref,
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIdx::from_u32(0), field_a_ty),
+                    ],
+                    tcx,
+                );
+                assert_eq!(
+                    resolve_place(&slots, deep_field, deep_body, deep_place, 0),
+                    None
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_depth_cap_conservative() {
+        run_compiler(
+            r#"
+pub unsafe fn deep(p: *mut *mut *mut *mut i32) -> i32 {
+    ****p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let deep = function_by_name(&program, "deep");
+                let body = tcx.mir_drops_elaborated_and_const_checked(deep).borrow();
+                let body = &*body;
+                let p = Local::from_u32(1);
+                let base = Place::from(p);
+                let fn_locals = slots.fn_local_slots.get(&deep).expect("slots for deep");
+
+                for depth in 0..3 {
+                    assert_eq!(
+                        resolve_place(&slots, deep, body, base, depth),
+                        fn_locals
+                            .slot_for_local_depth(p, depth)
+                            .map(ResolvedSlot::Local)
+                    );
+                }
+                assert_eq!(resolve_place(&slots, deep, body, base, 3), None);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_array_conservative() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub arr: [*mut i32; 4],
+    pub scalar: *mut i32,
+}
+
+pub unsafe fn h(s: *mut S, a: [*mut i32; 4]) {
+    let _x = (*s).arr;
+    let _y = a;
+    let _z = (*s).scalar;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let h = function_by_name(&program, "h");
+                let s = struct_by_name(&program, "S");
+                let body = tcx.mir_drops_elaborated_and_const_checked(h).borrow();
+                let body = &*body;
+                let s_local = Local::from_u32(1);
+                let array_param = Local::from_u32(2);
+                let arr_ty = struct_field_ty(tcx, s, 0);
+                let scalar_ty = struct_field_ty(tcx, s, 1);
+                let arr_place = Place::from(s_local).project_deeper(
+                    &[
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIdx::from_u32(0), arr_ty),
+                    ],
+                    tcx,
+                );
+                let scalar_place = Place::from(s_local).project_deeper(
+                    &[
+                        ProjectionElem::Deref,
+                        ProjectionElem::Field(FieldIdx::from_u32(1), scalar_ty),
+                    ],
+                    tcx,
+                );
+                let scalar_field = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 1,
+                };
+
+                assert_eq!(resolve_place(&slots, h, body, arr_place, 0), None);
+                assert_eq!(
+                    resolve_place(&slots, h, body, Place::from(array_param), 0),
+                    None
+                );
+                assert_eq!(
+                    resolve_place(&slots, h, body, scalar_place, 0),
+                    slots
+                        .field_slots
+                        .slot_for_field_depth(scalar_field, 0)
+                        .map(ResolvedSlot::Field)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn reconciliation_depth_models() {
+        run_compiler(
+            r#"
+pub unsafe fn recon(
+    chain2: *mut *mut i32,
+    arr: [*mut i32; 4],
+    deep: *mut *mut *mut *mut i32,
+) {
+    let _ = chain2;
+    let _ = arr;
+    let _ = deep;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let recon = function_by_name(&program, "recon");
+                let body = tcx.mir_drops_elaborated_and_const_checked(recon).borrow();
+                let body = &*body;
+                let chain2_ty = body.local_decls[Local::from_u32(1)].ty;
+                let arr_ty = body.local_decls[Local::from_u32(2)].ty;
+                let deep_ty = body.local_decls[Local::from_u32(3)].ty;
+
+                assert_eq!(ptr_chain_depth(chain2_ty), 2);
+                assert_eq!(decompose_ty(chain2_ty).0, 2);
+
+                assert_eq!(ptr_chain_depth(arr_ty), 0);
+                assert_eq!(decompose_ty(arr_ty).0, 1);
+
+                assert_eq!(ptr_chain_depth(deep_ty), 3);
+                assert_eq!(decompose_ty(deep_ty).0, 4);
+            },
+        );
+    }
+}
+
 #[test]
 fn test_array_local_rewriter_field_base_group_rewrites_loop_pointers() {
     let code = r#"
