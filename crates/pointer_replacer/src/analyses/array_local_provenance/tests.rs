@@ -60,6 +60,7 @@ fn collect_bindings(body: &hir::Body<'_>) -> FxHashMap<hir::HirId, String> {
 struct LocalFacts {
     bases: FxHashSet<BaseId>,
     unique: Option<BaseId>,
+    unique_non_null: Option<BaseId>,
     admissibility: Option<BaseAdmissibility>,
 }
 
@@ -93,6 +94,10 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
                     })
                     .unwrap_or_default();
                 let unique = result.unique_base_of_local(*local);
+                let unique_non_null = result
+                    .slot_table
+                    .local_head_slot(*local)
+                    .and_then(|slot| result.provenance.unique_non_null_base(&PfgNode::Slot(slot)));
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
@@ -101,6 +106,7 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
                     LocalFacts {
                         bases,
                         unique,
+                        unique_non_null,
                         admissibility,
                     },
                 );
@@ -145,6 +151,10 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
                     })
                     .unwrap_or_default();
                 let unique = result.unique_base_of_local(*local);
+                let unique_non_null = result
+                    .slot_table
+                    .local_head_slot(*local)
+                    .and_then(|slot| result.provenance.unique_non_null_base(&PfgNode::Slot(slot)));
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
@@ -153,6 +163,7 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
                     LocalFacts {
                         bases,
                         unique,
+                        unique_non_null,
                         admissibility,
                     },
                 );
@@ -2698,5 +2709,110 @@ fn select_rewrite_groups_rejects_size_mismatched_cast_cursor() {
                 && group.member_names.contains("small")
         }),
         "size-mismatched cast cursor must not be selected into the base group: {f_groups:#?}"
+    );
+}
+
+#[test]
+fn constant_pointer_string_literal_is_not_nulllike() {
+    // a cursor reassigned to a byte-string literal must get a ConstantPointer
+    // base (opaque), not a transparent NullLike base.
+    let map = run_analysis(
+        r#"
+        pub unsafe fn f(p: *const i8, cond: bool) {
+            let mut q: *const i8 = p.offset(1);
+            if cond {
+                q = b"x\0" as *const u8 as *const i8;
+            }
+            let _ = *q;
+            let _ = *p;
+        }
+        "#,
+    );
+    let q = facts(&map, "f", "q");
+    assert!(
+        q.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::ConstantPointer,
+                ..
+            }
+        )),
+        "string-literal reassignment must produce a ConstantPointer base: {q:#?}"
+    );
+    assert!(
+        !q.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
+        "string-literal reassignment must not be classified NullLike: {q:#?}"
+    );
+}
+
+#[test]
+fn constant_pointer_string_literal_breaks_unique_non_null_base() {
+    // because ConstantPointer is opaque, the cursor no longer has a unique
+    // non-null base, so it is excluded at selection time.
+    let map = run_analysis(
+        r#"
+        pub unsafe fn f(p: *const i8, cond: bool) {
+            let mut q: *const i8 = p.offset(1);
+            if cond {
+                q = b"x\0" as *const u8 as *const i8;
+            }
+            let _ = *q;
+            let _ = *p;
+        }
+        "#,
+    );
+    let q = facts(&map, "f", "q");
+    assert_eq!(
+        q.unique_non_null, None,
+        "string-literal reassignment must remove the unique non-null base: {q:#?}"
+    );
+}
+
+#[test]
+fn null_sentinel_reassignment_stays_transparent() {
+    // regression: the 0-as-pointer null sentinel must remain a transparent
+    // NullLike base so null-initialized cursors keep a unique non-null base.
+    let map = run_analysis(
+        r#"
+        pub unsafe fn f(p: *const i8, cond: bool) {
+            let mut q: *const i8 = p.offset(1);
+            if cond {
+                q = 0 as *const i8;
+            }
+            let _ = *q;
+            let _ = *p;
+        }
+        "#,
+    );
+    let q = facts(&map, "f", "q");
+    assert!(
+        q.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
+        "null sentinel must stay NullLike: {q:#?}"
+    );
+    assert!(
+        !q.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::ConstantPointer,
+                ..
+            }
+        )),
+        "null sentinel must not become ConstantPointer: {q:#?}"
+    );
+    assert!(
+        matches!(q.unique_non_null, Some(BaseId::Param { .. })),
+        "null sentinel must keep a unique non-null Param base: {q:#?}"
     );
 }

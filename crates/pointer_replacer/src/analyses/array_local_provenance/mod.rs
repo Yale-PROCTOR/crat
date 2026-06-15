@@ -2539,7 +2539,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                 self.graph.add_base_edge(
                     BaseId::Unknown {
                         location,
-                        reason: UnknownReason::NullLike,
+                        reason: constant_pointer_reason(operand, self.tcx),
                     },
                     dst,
                 );
@@ -2564,7 +2564,7 @@ impl<'tcx> Collector<'_, 'tcx> {
                 self.graph.add_base_edge(
                     BaseId::Unknown {
                         location,
-                        reason: UnknownReason::NullLike,
+                        reason: constant_pointer_reason(operand, self.tcx),
                     },
                     dst,
                 );
@@ -3105,7 +3105,8 @@ fn is_null_ptr_call(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
 }
 
 /// Returns true when `operand` is the integer constant zero, i.e. `0 as *mut T`.
-/// Used to classify `PointerWithExposedProvenance` casts of zero as NullLike.
+/// Used to classify the zero sentinel as NullLike, both for
+/// `PointerWithExposedProvenance` casts and in `constant_pointer_reason`.
 fn is_zero_int_operand<'tcx>(operand: &Operand<'tcx>, _tcx: TyCtxt<'tcx>) -> bool {
     let Some(const_op) = operand.constant() else {
         return false;
@@ -3117,6 +3118,20 @@ fn is_zero_int_operand<'tcx>(operand: &Operand<'tcx>, _tcx: TyCtxt<'tcx>) -> boo
         return false;
     };
     int_val.to_bits(int_val.size()) == 0
+}
+
+/// classifies a constant pointer operand for the operand collectors: the
+/// integer-zero sentinel stays `NullLike` (transparent in unique-base
+/// computation), while any other constant pointer (string/byte literal,
+/// static) is `ConstantPointer` (opaque), so a cursor reassigned to it loses
+/// base uniqueness and is excluded at selection rather than rescued by the
+/// rewriter's prune pass.
+fn constant_pointer_reason<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> UnknownReason {
+    if is_zero_int_operand(operand, tcx) {
+        UnknownReason::NullLike
+    } else {
+        UnknownReason::ConstantPointer
+    }
 }
 
 fn call_propagates_first_arg<'tcx>(
