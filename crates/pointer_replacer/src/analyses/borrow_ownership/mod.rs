@@ -6,10 +6,14 @@
 
 mod domain;
 pub mod crate_slots;
+pub mod resolve;
 pub mod slots;
 mod assoc;
 mod call_graph;
+#[cfg(not(test))]
 mod ptr;
+#[cfg(test)]
+pub(crate) mod ptr;
 mod struct_ctxt;
 mod vec_vec;
 pub mod ssa;
