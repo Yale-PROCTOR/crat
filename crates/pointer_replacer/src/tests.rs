@@ -17,6 +17,13 @@ fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (S
     .unwrap()
 }
 
+fn array_local_trace_events(code: &str) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true).1
+    })
+    .unwrap()
+}
+
 fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
@@ -9707,5 +9714,82 @@ pub unsafe fn foo(mut base: *mut i32) -> isize {
     assert!(
         !s.contains("q_idx"),
         "no index must be derived for the cast cursor q:\n{s}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_selection_and_apply_for_rewritten_group() {
+    use crate::rewriter::array_local_trace::{TraceStage, TraceSubject};
+    // a simple selectable + rewritten group (mirrors
+    // test_array_local_rewriter_rewrites_simple_non_null_derived_local).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Selection),
+        "expected at least one Selection event: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Apply
+            && matches!(&e.subject, TraceSubject::Member(name) if name == "q")),
+        "expected an Apply event for member q: {events:#?}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_disabled_is_neutral() {
+    // enabling the trace must not change the rewritten output, and the disabled
+    // trace must record nothing.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (src_enabled, _events) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
+    })
+    .unwrap();
+    let (src_disabled, events_disabled) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
+    })
+    .unwrap();
+    assert!(
+        events_disabled.is_empty(),
+        "disabled trace must record nothing: {events_disabled:#?}"
+    );
+    assert_eq!(
+        src_enabled, src_disabled,
+        "enabling the trace must not change pass output"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_prune_drop_with_assignment_text() {
+    use crate::rewriter::array_local_trace::{TraceDecision, TraceStage};
+    // q is reassigned via an expression the index rewrite cannot handle, so the
+    // prune pass drops it; the trace records a Prune/Dropped event whose reason
+    // includes the offending assignment text.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p.offset(if q.is_null() { 0 } else { 1 });
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Prune
+            && e.decision == TraceDecision::Dropped
+            && e.reason.contains("q.is_null()")),
+        "expected a Prune/Dropped event mentioning the offending assignment: {events:#?}"
     );
 }

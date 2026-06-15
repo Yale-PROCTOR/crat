@@ -19,7 +19,6 @@ pub(crate) enum TraceSubject {
 pub(crate) enum TraceStage {
     Selection,
     Plan,
-    AstRefine,
     Prune,
     Representation,
     Apply,
@@ -103,6 +102,7 @@ impl RewriteTrace {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn events(&self) -> &[TraceEvent] {
         &self.events
     }

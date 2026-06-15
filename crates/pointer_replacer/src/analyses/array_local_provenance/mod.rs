@@ -675,6 +675,9 @@ pub struct RewriteSelectionContext<'a, 'tcx> {
     pub points_to: &'a andersen::AnalysisResult,
 }
 
+// only used by the analysis test harness now; the rewriter pass calls
+// `classify_rewrite_groups` directly so it can also trace discarded statuses.
+#[cfg(test)]
 pub fn select_rewrite_groups<'a, 'tcx>(
     provenance: &ArrayLocalProvenance,
     body: &Body<'tcx>,

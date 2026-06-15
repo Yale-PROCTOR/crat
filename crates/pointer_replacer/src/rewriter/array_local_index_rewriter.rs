@@ -27,11 +27,12 @@ use crate::{
     analyses::{
         self,
         array_local_provenance::{
-            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteSelectionContext, SlotInfo,
-            SlotPathElem, named_struct_field,
+            ArrayLocalProvenance, PfgNode, RewriteGroup, RewriteGroupStatus,
+            RewriteSelectionContext, SlotInfo, SlotPathElem, named_struct_field,
         },
         type_qualifier::foster::mutability::MutabilityResult,
     },
+    rewriter::array_local_trace::{RewriteTrace, TraceDecision, TraceStage, TraceSubject},
     utils::rustc::RustProgram,
 };
 
@@ -467,16 +468,43 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
 ) -> bool {
+    let mut trace = RewriteTrace::from_env();
+    let changed = apply_array_local_index_rewrite_inner(
+        krate,
+        input,
+        provenances,
+        mutability_result,
+        nullity_result,
+        points_to,
+        ast_to_hir,
+        &mut trace,
+    );
+    trace.emit(input.tcx);
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_array_local_index_rewrite_inner<'tcx>(
+    krate: &mut Crate,
+    input: &RustProgram<'tcx>,
+    provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
+    mutability_result: &MutabilityResult,
+    nullity_result: &analyses::nullity::NullityResult,
+    points_to: &andersen::AnalysisResult,
+    ast_to_hir: &AstToHir,
+    trace: &mut RewriteTrace,
+) -> bool {
     let mut plan = build_rewrite_plan(
         input,
         provenances,
         mutability_result,
         nullity_result,
         points_to,
+        trace,
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
-    prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan);
-    choose_binding_representations(krate, ast_to_hir, input.tcx, &mut plan);
+    prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan, trace);
+    choose_binding_representations(krate, ast_to_hir, input.tcx, &mut plan, trace);
     if plan.by_hir_id.is_empty() {
         return false;
     }
@@ -487,9 +515,36 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
         plan,
         introduced_hir_ids: FxHashSet::default(),
         changed: false,
+        trace,
     };
     visitor.visit_crate(krate);
     visitor.changed
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
+    krate: &mut Crate,
+    input: &RustProgram<'tcx>,
+    provenances: &FxHashMap<LocalDefId, ArrayLocalProvenance>,
+    mutability_result: &MutabilityResult,
+    nullity_result: &analyses::nullity::NullityResult,
+    points_to: &andersen::AnalysisResult,
+    ast_to_hir: &AstToHir,
+    enabled: bool,
+) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
+    let mut trace = RewriteTrace::for_test(enabled);
+    let _ = apply_array_local_index_rewrite_inner(
+        krate,
+        input,
+        provenances,
+        mutability_result,
+        nullity_result,
+        points_to,
+        ast_to_hir,
+        &mut trace,
+    );
+    trace.into_events()
 }
 
 /// Returns true for an index-tracked base whose base slot lives behind a
@@ -562,6 +617,7 @@ fn build_rewrite_plan<'tcx>(
     mutability_result: &MutabilityResult,
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
+    trace: &mut RewriteTrace,
 ) -> RewritePlan {
     let mut plan = RewritePlan::default();
     for &def_id in &input.functions {
@@ -572,7 +628,7 @@ fn build_rewrite_plan<'tcx>(
             .tcx
             .mir_drops_elaborated_and_const_checked(def_id)
             .borrow();
-        let groups = analyses::array_local_provenance::select_rewrite_groups(
+        let all_statuses = analyses::array_local_provenance::classify_rewrite_groups(
             provenance,
             &body,
             mutability_result,
@@ -582,6 +638,43 @@ fn build_rewrite_plan<'tcx>(
                 points_to,
             },
         );
+        // record one Selection event per produced status before filtering
+        // (gated so no labels are built on the default, disabled path).
+        if trace.is_enabled() {
+            for status in &all_statuses {
+                let (base_local, decision, reason): (
+                    rustc_middle::mir::Local,
+                    TraceDecision,
+                    &str,
+                ) = match status {
+                    RewriteGroupStatus::Ready(group) => {
+                        (group.base_local, TraceDecision::Kept, "selected (ready)")
+                    }
+                    // preserved-across-calls statuses are produced by selection but
+                    // discarded by the rewriter (not planned), so trace them as skipped.
+                    RewriteGroupStatus::PreservedAcrossCalls { group, .. } => (
+                        group.base_local,
+                        TraceDecision::Skipped,
+                        "selection produced a preserved-across-calls status (discarded, not planned)",
+                    ),
+                };
+                let label = format!("{base_local:?}");
+                trace.record(
+                    def_id,
+                    TraceSubject::Group(label),
+                    TraceStage::Selection,
+                    decision,
+                    || reason.to_string(),
+                );
+            }
+        }
+        let groups: Vec<RewriteGroup> = all_statuses
+            .into_iter()
+            .filter_map(|status| match status {
+                RewriteGroupStatus::Ready(group) => Some(group),
+                RewriteGroupStatus::PreservedAcrossCalls { .. } => None,
+            })
+            .collect();
         if groups.is_empty() {
             continue;
         }
@@ -604,6 +697,7 @@ fn build_rewrite_plan<'tcx>(
                 local_to_hir: &local_to_hir,
                 existing_names: &mut existing_names,
                 plan: &mut plan,
+                trace: &mut *trace,
             };
             add_group_to_plan(&mut context, &group);
         }
@@ -797,11 +891,21 @@ struct GroupPlanContext<'a, 'tcx> {
     local_to_hir: &'a FxHashMap<Local, HirId>,
     existing_names: &'a mut FxHashSet<String>,
     plan: &'a mut RewritePlan,
+    trace: &'a mut RewriteTrace,
 }
 
 fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGroup) {
+    // cheap label for early-return sites where base_name is not yet computed
+    let base_local_label = || format!("{:?}", group.base_local);
     let base_live = group_needs_live_base_rewrite(context.provenance, group);
     let Some(&base_hir_id) = context.local_to_hir.get(&group.base_local) else {
+        context.trace.record(
+            context.def_id,
+            TraceSubject::Group(base_local_label()),
+            TraceStage::Plan,
+            TraceDecision::Dropped,
+            || "plan: base local has no HIR binding".to_string(),
+        );
         return;
     };
 
@@ -819,6 +923,13 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             let Some(base_slot_info) =
                 analyses::array_local_provenance::base_slot_info(context.provenance, group)
             else {
+                context.trace.record(
+                    context.def_id,
+                    TraceSubject::Group(base_local_label()),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: missing base slot info".to_string(),
+                );
                 return;
             };
             let local_name = context.tcx.hir_name(base_hir_id).to_string();
@@ -826,6 +937,13 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             let Some(field_path_name) =
                 slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
             else {
+                context.trace.record(
+                    context.def_id,
+                    TraceSubject::Group(base_local_label()),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: base field path not expressible".to_string(),
+                );
                 return;
             };
             // collect raw-pointer members that can serve as proxies for the field base
@@ -921,12 +1039,33 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             let Some(base_info) =
                 analyses::array_local_provenance::base_slot_info(context.provenance, group)
             else {
+                context.trace.record(
+                    context.def_id,
+                    TraceSubject::Group(base_name.clone()),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: index-tracked base slot info missing".to_string(),
+                );
                 return;
             };
             let Some(base_ptr_ty) = slot_ty(context.body, context.tcx, base_info) else {
+                context.trace.record(
+                    context.def_id,
+                    TraceSubject::Group(base_name.clone()),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: base slot has no raw-pointer type".to_string(),
+                );
                 return;
             };
             let ty::TyKind::RawPtr(pointee, mutability) = base_ptr_ty.kind() else {
+                context.trace.record(
+                    context.def_id,
+                    TraceSubject::Group(base_name.clone()),
+                    TraceStage::Plan,
+                    TraceDecision::Dropped,
+                    || "plan: base slot has no raw-pointer type".to_string(),
+                );
                 return;
             };
             let index_stem = if group.base_slot_offset == 0 {
@@ -973,6 +1112,15 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
     };
     let non_null = context.nullity_result.non_null_locals.get(&context.def_id);
 
+    // record group kept (group made it past all early-returns and has members to process)
+    context.trace.record(
+        context.def_id,
+        TraceSubject::Group(base_name.clone()),
+        TraceStage::Plan,
+        TraceDecision::Kept,
+        || "plan: group will be planned".to_string(),
+    );
+
     for &slot_idx in &group.members {
         let Some(info) = context.provenance.slot_table.slot_infos.get(slot_idx) else {
             continue;
@@ -981,6 +1129,14 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             continue;
         }
         let Some(&source_hir_id) = context.local_to_hir.get(&info.root) else {
+            // member not in HIR: skipped by the group_member_hir_ids filter
+            context.trace.record(
+                context.def_id,
+                TraceSubject::Member(format!("{:?}", info.root)),
+                TraceStage::Plan,
+                TraceDecision::Skipped,
+                || "plan: member is not a raw-pointer local with a HIR binding".to_string(),
+            );
             continue;
         };
         // skip proxy locals — they hold the base at offset 0 and stay as-is.
@@ -993,6 +1149,14 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         let source_name = context.tcx.hir_name(source_hir_id).to_string();
         let ptr_ty = context.body.local_decls[info.root].ty;
         let ty::TyKind::RawPtr(pointee, mutability) = ptr_ty.kind() else {
+            // member not a raw-pointer type: skipped
+            context.trace.record(
+                context.def_id,
+                TraceSubject::Member(source_name.clone()),
+                TraceStage::Plan,
+                TraceDecision::Skipped,
+                || "plan: member is not a raw-pointer local with a HIR binding".to_string(),
+            );
             continue;
         };
         let index_name = fresh_index_name(&source_name, context.existing_names);
@@ -1034,6 +1198,14 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 group_member_hir_ids: group_member_hir_ids.clone(),
                 base_live,
             },
+        );
+        // record member kept
+        context.trace.record(
+            context.def_id,
+            TraceSubject::Member(source_name.clone()),
+            TraceStage::Plan,
+            TraceDecision::Kept,
+            || "plan: member added to rewrite plan".to_string(),
         );
     }
 }
@@ -1280,6 +1452,7 @@ fn prune_unsupported_direct_place_uses(
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
     plan: &mut RewritePlan,
+    trace: &mut RewriteTrace,
 ) {
     if plan.by_hir_id.is_empty() {
         return;
@@ -1291,13 +1464,54 @@ fn prune_unsupported_direct_place_uses(
         planned_rewrites: plan.by_hir_id.clone(),
         base_rewrites: plan.base_by_key.clone(),
         unsupported_hir_ids: FxHashSet::default(),
+        trace_enabled: trace.is_enabled(),
+        dropped_reasons: Vec::new(),
     };
     visitor.visit_crate(krate);
+    // record one prune drop per member still in the plan (a member can be flagged
+    // by more than one site; only the first reason is traced).
+    let mut traced_drops: FxHashSet<HirId> = FxHashSet::default();
+    for (hir_id, reason) in &visitor.dropped_reasons {
+        if !traced_drops.insert(*hir_id) {
+            continue;
+        }
+        if let Some(rewrite) = plan.by_hir_id.get(hir_id) {
+            let source_name = rewrite.source_name.clone();
+            let reason = reason.clone();
+            trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(source_name),
+                TraceStage::Prune,
+                TraceDecision::Dropped,
+                || reason,
+            );
+        }
+    }
     if !visitor.unsupported_hir_ids.is_empty() {
         plan.by_hir_id
             .retain(|hir_id, _| !visitor.unsupported_hir_ids.contains(hir_id));
     }
+    // snapshot base cursors before orphan pruning so removed ones can be traced.
+    let base_cursors_before: Vec<(BaseCursorKey, String, LocalDefId)> = if trace.is_enabled() {
+        plan.base_by_key
+            .iter()
+            .map(|(key, rewrite)| (key.clone(), rewrite.base_name.clone(), rewrite.fn_def_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
     prune_orphan_base_cursors(plan);
+    for (key, base_name, fn_def_id) in base_cursors_before {
+        if !plan.base_by_key.contains_key(&key) {
+            trace.record(
+                fn_def_id,
+                TraceSubject::Base(base_name),
+                TraceStage::Prune,
+                TraceDecision::Dropped,
+                || "prune: orphan base cursor (no live members)".to_string(),
+            );
+        }
+    }
 }
 
 fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
@@ -1316,6 +1530,7 @@ fn choose_binding_representations(
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
     plan: &mut RewritePlan,
+    trace: &mut RewriteTrace,
 ) {
     if plan.by_hir_id.is_empty() {
         return;
@@ -1359,6 +1574,20 @@ fn choose_binding_representations(
             rewrite.representation = BindingRepresentation::Materialized(kind);
         } else if !summary.has_index_benefit() {
             rewrite.representation = BindingRepresentation::IndexOnly;
+        }
+    }
+    // record the chosen representation per member (only when tracing).
+    if trace.is_enabled() {
+        for (hir_id, rewrite) in &plan.by_hir_id {
+            let representation = rewrite.representation.clone();
+            let index_benefit = rewrite.has_index_benefit;
+            trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(rewrite.source_name.clone()),
+                TraceStage::Representation,
+                TraceDecision::Kept,
+                || format!("representation={representation:?} index_benefit={index_benefit}"),
+            );
         }
     }
 }
@@ -1807,6 +2036,10 @@ struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
     planned_rewrites: FxHashMap<HirId, BindingRewrite>,
     base_rewrites: FxHashMap<BaseCursorKey, BaseCursorRewrite>,
     unsupported_hir_ids: FxHashSet<HirId>,
+    // reasons for each prune drop, collected only when the trace is enabled
+    // (so the offending assignment text is not pretty-printed otherwise).
+    trace_enabled: bool,
+    dropped_reasons: Vec<(HirId, String)>,
 }
 
 impl AstVisitor<'_> for UnsupportedDirectPlaceUseVisitor<'_, '_> {
@@ -1910,15 +2143,34 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                 rewrite,
             )
         {
+            if self.trace_enabled {
+                self.dropped_reasons.push((
+                    hir_id,
+                    format!(
+                        "prune: unsupported assignment `{}`",
+                        pprust::expr_to_string(rhs)
+                    ),
+                ));
+            }
             self.unsupported_hir_ids.insert(hir_id);
         }
     }
 
     fn mark_rewrites_for_base_unsupported(&mut self, base_key: &BaseCursorKey) {
-        for rewrite in self.planned_rewrites.values() {
-            if base_cursor_key(rewrite.base_hir_id, &rewrite.base_name) == *base_key {
-                self.unsupported_hir_ids.insert(rewrite.source_hir_id);
+        let matched: Vec<HirId> = self
+            .planned_rewrites
+            .values()
+            .filter(|rewrite| base_cursor_key(rewrite.base_hir_id, &rewrite.base_name) == *base_key)
+            .map(|rewrite| rewrite.source_hir_id)
+            .collect();
+        for source_hir_id in matched {
+            if self.trace_enabled {
+                self.dropped_reasons.push((
+                    source_hir_id,
+                    "prune: base cursor used in an unsupported place".to_string(),
+                ));
             }
+            self.unsupported_hir_ids.insert(source_hir_id);
         }
     }
 
@@ -1937,6 +2189,15 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
         let hir_id =
             direct_planned_local_hir_id(self.ast_to_hir, self.tcx, &self.planned_rewrites, expr)?;
         if self.planned_rewrites.contains_key(&hir_id) {
+            if self.trace_enabled {
+                self.dropped_reasons.push((
+                    hir_id,
+                    format!(
+                        "prune: direct unsupported place use `{}`",
+                        pprust::expr_to_string(expr)
+                    ),
+                ));
+            }
             self.unsupported_hir_ids.insert(hir_id);
             Some(hir_id)
         } else {
@@ -2838,6 +3099,7 @@ struct ArrayLocalIndexRewriteVisitor<'a, 'tcx> {
     plan: RewritePlan,
     introduced_hir_ids: FxHashSet<HirId>,
     changed: bool,
+    trace: &'a mut RewriteTrace,
 }
 
 impl ArrayLocalIndexRewriteVisitor<'_, '_> {
@@ -2896,7 +3158,19 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
                 &rewrite,
             );
         }
-        let new_index_init = index_init_expr(index, rewrite.nullable)?;
+        let Some(new_index_init) = index_init_expr(index, rewrite.nullable) else {
+            self.trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(rewrite.source_name.clone()),
+                TraceStage::Apply,
+                TraceDecision::Skipped,
+                || {
+                    "apply: index derivation failed at visit time (prune/visitor divergence)"
+                        .to_string()
+                },
+            );
+            return None;
+        };
         let index_name = rewrite.index_name.clone();
         let index_stmt = utils::stmt!(
             "let mut {}: isize = {};",
@@ -2911,6 +3185,13 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         local.ty = Some(materialized_ty(&rewrite));
         *init = P(materialized_init);
         self.introduced_hir_ids.insert(hir_id);
+        self.trace.record(
+            hir_id.owner.def_id,
+            TraceSubject::Member(rewrite.source_name.clone()),
+            TraceStage::Apply,
+            TraceDecision::Rewritten,
+            || "apply: materialized binding introduced".to_string(),
+        );
         self.changed = true;
         Some(index_stmt)
     }
@@ -3074,6 +3355,16 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             );
         }
         let Some(new_init) = index_init_expr(index, rewrite.nullable) else {
+            self.trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(rewrite.source_name.clone()),
+                TraceStage::Apply,
+                TraceDecision::Skipped,
+                || {
+                    "apply: index derivation failed at visit time (prune/visitor divergence)"
+                        .to_string()
+                },
+            );
             mut_visit::walk_local(self, local);
             return;
         };
@@ -3084,6 +3375,13 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         local.ty = Some(index_ty(rewrite.nullable));
         *init = P(new_init);
         self.introduced_hir_ids.insert(hir_id);
+        self.trace.record(
+            hir_id.owner.def_id,
+            TraceSubject::Member(rewrite.source_name.clone()),
+            TraceStage::Apply,
+            TraceDecision::Rewritten,
+            || "apply: index-only binding introduced".to_string(),
+        );
         self.changed = true;
     }
 
