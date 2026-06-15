@@ -9229,6 +9229,290 @@ pub unsafe fn make_holder() -> Holder {
     }
 }
 
+mod borrow_ownership_slots {
+    use std::ops::Range;
+
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::{mir::Local, ty::TyCtxt};
+    use rustc_span::def_id::LocalDefId;
+
+    use crate::{
+        analyses::borrow_ownership::{
+            crate_slots::CrateSlots,
+            slots::{SlotId, SlotOwner, StructFieldSlot},
+        },
+        utils::rustc::RustProgram,
+    };
+
+    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
+        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    }
+
+    fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn struct_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .structs
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("struct `{name}` not found"))
+    }
+
+    fn function_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    fn slot_range_len(range: Range<SlotId>) -> usize {
+        range.end.index() - range.start.index()
+    }
+
+    #[test]
+    fn crate_slots_registers_struct_pointer_fields() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub a: *mut i32,
+    pub b: *mut *mut i32,
+}
+
+pub unsafe fn use_s(s: *mut S) {
+    let _x = (*s).a;
+    let _y = (*s).b;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let s = struct_by_name(&program, "S");
+                let a = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 0,
+                };
+                let b = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 1,
+                };
+
+                assert_eq!(
+                    slot_range_len(slots.field_slots.slots_for_field(a).expect("field S::a")),
+                    1
+                );
+                assert_eq!(
+                    slot_range_len(slots.field_slots.slots_for_field(b).expect("field S::b")),
+                    2
+                );
+
+                let a_slot = slots
+                    .field_slots
+                    .slot_for_field_depth(a, 0)
+                    .expect("slot for field S::a depth 0");
+                assert_eq!(slots.field_slots.slot(a_slot).owner, SlotOwner::Field(a));
+                assert_eq!(slots.field_slots.slot(a_slot).depth, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn crate_slots_local_chain_stops_at_struct() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub a: *mut i32,
+}
+
+pub unsafe fn f(s: *mut S) {
+    let _x = (*s).a;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let s = struct_by_name(&program, "S");
+                let f = function_by_name(&program, "f");
+                let local_s = Local::from_u32(1);
+                let field = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 0,
+                };
+
+                let local_slots = slots.fn_local_slots.get(&f).expect("slots for f");
+                assert_eq!(
+                    slot_range_len(local_slots.slots_for_local(local_s).expect("local _1")),
+                    1
+                );
+                assert!(slots.field_slots.slots_for_field(field).is_some());
+            },
+        );
+    }
+
+    // Arrays of pointers are a deferred shape per the §2 boundary contract in
+    // docs/agents/plan/2026-06-13-borrow-ownership-unified-plan-concrete.md;
+    // Phase 2's resolver must treat the absent slot as conservative Raw.
+    // TODO: descend arrays or mark owners unsupported in a later phase.
+    #[test]
+    fn crate_slots_defers_array_of_pointer_shapes() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub arr: [*mut i32; 4],
+    pub scalar: *mut i32,
+}
+
+pub unsafe fn takes_array(arr: [*mut i32; 4]) -> *mut i32 {
+    arr[0]
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let s = struct_by_name(&program, "S");
+                let arr = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 0,
+                };
+                let scalar = StructFieldSlot {
+                    struct_did: s,
+                    field_index: 1,
+                };
+
+                assert!(slots.field_slots.slots_for_field(arr).is_none());
+                assert_eq!(
+                    slot_range_len(
+                        slots
+                            .field_slots
+                            .slots_for_field(scalar)
+                            .expect("field S::scalar"),
+                    ),
+                    1
+                );
+
+                let f = function_by_name(&program, "takes_array");
+                assert!(
+                    slots
+                        .fn_local_slots
+                        .get(&f)
+                        .expect("slots for takes_array")
+                        .slots_for_local(Local::from_u32(1))
+                        .is_none()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn crate_slots_tracks_nested_local_pointers() {
+        run_compiler(
+            r#"
+pub unsafe fn g(pp: *mut *mut i32) -> i32 {
+    **pp
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let g = function_by_name(&program, "g");
+                let pp = Local::from_u32(1);
+
+                let local_slots = slots.fn_local_slots.get(&g).expect("slots for g");
+                assert_eq!(
+                    slot_range_len(local_slots.slots_for_local(pp).expect("local _1")),
+                    2
+                );
+
+                let depth_0 = local_slots
+                    .slot_for_local_depth(pp, 0)
+                    .expect("slot for pp depth 0");
+                let depth_1 = local_slots
+                    .slot_for_local_depth(pp, 1)
+                    .expect("slot for pp depth 1");
+
+                assert_eq!(local_slots.slot(depth_0).depth, 0);
+                assert_eq!(local_slots.slot(depth_1).depth, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn crate_slots_generic_struct_field_depth() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct Wrap<T> {
+    pub p: *mut T,
+}
+
+pub unsafe fn h(w: *mut Wrap<i32>) {
+    let _z = (*w).p;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let wrap = struct_by_name(&program, "Wrap");
+                let field = StructFieldSlot {
+                    struct_did: wrap,
+                    field_index: 0,
+                };
+
+                assert_eq!(
+                    slot_range_len(
+                        slots
+                            .field_slots
+                            .slots_for_field(field)
+                            .expect("field Wrap::p"),
+                    ),
+                    1
+                );
+            },
+        );
+    }
+}
+
 #[test]
 fn test_array_local_rewriter_field_base_group_rewrites_loop_pointers() {
     let code = r#"
