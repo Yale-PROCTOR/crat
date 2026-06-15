@@ -9554,3 +9554,89 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "{s}"
     );
 }
+
+#[test]
+fn borrow_ownership_slot_universe_tracks_local_pointer_depths() {
+    use rustc_middle::mir::Local;
+    use rustc_span::def_id::{DefIndex, LocalDefId};
+
+    use crate::analyses::borrow_ownership::{
+        SlotKind,
+        slots::{SlotId, SlotOwner, SlotUniverse, StructFieldSlot},
+    };
+
+    assert_eq!(SlotKind::ALL, [SlotKind::Raw, SlotKind::Ref, SlotKind::Owning]);
+
+    let pointer = Local::from_u32(1);
+    let nested_pointer = Local::from_u32(2);
+    let unregistered = Local::from_u32(3);
+    let field = StructFieldSlot {
+        struct_did: LocalDefId {
+            local_def_index: DefIndex::from_u32(42),
+        },
+        field_index: 1,
+    };
+    let mut universe = SlotUniverse::from_local_depths([(pointer, 1), (nested_pointer, 2)]);
+    universe.register_field(field, 2);
+
+    assert_eq!(universe.len(), 5);
+    assert_eq!(
+        universe.slots_for_local(pointer),
+        Some(SlotId::from_usize(0)..SlotId::from_usize(1))
+    );
+    assert_eq!(
+        universe.slots_for_local(nested_pointer),
+        Some(SlotId::from_usize(1)..SlotId::from_usize(3))
+    );
+    assert_eq!(
+        universe.slots_for_field(field),
+        Some(SlotId::from_usize(3)..SlotId::from_usize(5))
+    );
+
+    let pointer_slot = universe
+        .slot_for_local_depth(pointer, 0)
+        .expect("slot for local pointer");
+    assert_eq!(pointer_slot, SlotId::from_usize(0));
+    assert_eq!(universe.slot(pointer_slot).owner, SlotOwner::Local(pointer));
+    assert_eq!(universe.slot(pointer_slot).depth, 0);
+
+    assert!(universe.slot_for_local_depth(pointer, 1).is_none());
+    assert!(universe.slots_for_local(unregistered).is_none());
+    assert!(universe.slot_for_local_depth(unregistered, 0).is_none());
+
+    let nested_outer = universe
+        .slot_for_local_depth(nested_pointer, 0)
+        .expect("outer slot for nested pointer");
+    let nested_inner = universe
+        .slot_for_local_depth(nested_pointer, 1)
+        .expect("inner slot for nested pointer");
+
+    assert_eq!(nested_outer, SlotId::from_usize(1));
+    assert_eq!(nested_inner, SlotId::from_usize(2));
+    assert_eq!(
+        universe.slot(nested_outer).owner,
+        SlotOwner::Local(nested_pointer)
+    );
+    assert_eq!(
+        universe.slot(nested_inner).owner,
+        SlotOwner::Local(nested_pointer)
+    );
+    assert_eq!(universe.slot(nested_outer).depth, 0);
+    assert_eq!(universe.slot(nested_inner).depth, 1);
+    assert!(universe.slot_for_local_depth(nested_pointer, 2).is_none());
+
+    let field_outer = universe
+        .slot_for_field_depth(field, 0)
+        .expect("outer field slot");
+    let field_inner = universe
+        .slot_for_field_depth(field, 1)
+        .expect("inner field slot");
+
+    assert_eq!(field_outer, SlotId::from_usize(3));
+    assert_eq!(field_inner, SlotId::from_usize(4));
+    assert_eq!(universe.slot(field_outer).owner, SlotOwner::Field(field));
+    assert_eq!(universe.slot(field_inner).owner, SlotOwner::Field(field));
+    assert_eq!(universe.slot(field_outer).depth, 0);
+    assert_eq!(universe.slot(field_inner).depth, 1);
+    assert!(universe.slot_for_field_depth(field, 2).is_none());
+}
