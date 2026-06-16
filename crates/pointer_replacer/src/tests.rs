@@ -9611,6 +9611,48 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
     }
 
     #[test]
+    fn max_ref_promotes_free_chain() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+            let s0 = SlotRef::Local(g, d0);
+            let s1 = SlotRef::Local(g, d1);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+            let model = ks.model_kinds().expect("satisfiable model");
+            assert_eq!(model.get(&s0), Some(&SlotKind::Ref));
+            assert_eq!(model.get(&s1), Some(&SlotKind::Ref));
+        });
+    }
+
+    #[test]
+    fn max_ref_under_assumption() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let ks = KindSolver::new(slots);
+            let s0 = SlotRef::Local(g, d0);
+            let s1 = SlotRef::Local(g, d1);
+
+            ks.assume(s0, SlotKind::Owning);
+
+            assert_eq!(ks.check(), SatResult::Sat);
+            let model = ks.model_kinds().expect("satisfiable model");
+            assert_eq!(model.get(&s0), Some(&SlotKind::Owning));
+            assert_eq!(model.get(&s1), Some(&SlotKind::Ref));
+        });
+    }
+
+    #[test]
+    fn optimal_model_is_repeatable() {
+        with_g_slots(|_, slots, _, _, _| {
+            let ks = KindSolver::new(slots);
+
+            let first = ks.model_kinds().expect("first satisfiable model");
+            let second = ks.model_kinds().expect("second satisfiable model");
+
+            assert_eq!(first, second);
+        });
+    }
+
+    #[test]
     fn monotonicity_rejects_raw_over_owning() {
         with_g_slots(|_, slots, g, d0, d1| {
             let ks = KindSolver::new(slots);
