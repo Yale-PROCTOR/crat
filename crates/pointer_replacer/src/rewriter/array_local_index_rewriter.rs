@@ -638,8 +638,7 @@ fn build_rewrite_plan<'tcx>(
                 points_to,
             },
         );
-        // record one Selection event per produced status before filtering
-        // (gated so no labels are built on the default, disabled path).
+        // gated so no labels are built on the default, disabled path.
         if trace.is_enabled() {
             for status in &all_statuses {
                 let (base_local, decision, reason): (
@@ -650,12 +649,11 @@ fn build_rewrite_plan<'tcx>(
                     RewriteGroupStatus::Ready(group) => {
                         (group.base_local, TraceDecision::Kept, "selected (ready)")
                     }
-                    // preserved-across-calls statuses are produced by selection but
-                    // discarded by the rewriter (not planned), so trace them as skipped.
+                    // preserved-across-calls statuses are discarded by the rewriter.
                     RewriteGroupStatus::PreservedAcrossCalls { group, .. } => (
                         group.base_local,
                         TraceDecision::Skipped,
-                        "selection produced a preserved-across-calls status (discarded, not planned)",
+                        "preserved across calls (discarded)",
                     ),
                 };
                 let label = format!("{base_local:?}");
@@ -1112,7 +1110,6 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
     };
     let non_null = context.nullity_result.non_null_locals.get(&context.def_id);
 
-    // record group kept (group made it past all early-returns and has members to process)
     context.trace.record(
         context.def_id,
         TraceSubject::Group(base_name.clone()),
@@ -1129,13 +1126,12 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             continue;
         }
         let Some(&source_hir_id) = context.local_to_hir.get(&info.root) else {
-            // member not in HIR: skipped by the group_member_hir_ids filter
             context.trace.record(
                 context.def_id,
                 TraceSubject::Member(format!("{:?}", info.root)),
                 TraceStage::Plan,
                 TraceDecision::Skipped,
-                || "plan: member is not a raw-pointer local with a HIR binding".to_string(),
+                || "plan: member has no HIR binding".to_string(),
             );
             continue;
         };
@@ -1149,13 +1145,12 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         let source_name = context.tcx.hir_name(source_hir_id).to_string();
         let ptr_ty = context.body.local_decls[info.root].ty;
         let ty::TyKind::RawPtr(pointee, mutability) = ptr_ty.kind() else {
-            // member not a raw-pointer type: skipped
             context.trace.record(
                 context.def_id,
                 TraceSubject::Member(source_name.clone()),
                 TraceStage::Plan,
                 TraceDecision::Skipped,
-                || "plan: member is not a raw-pointer local with a HIR binding".to_string(),
+                || "plan: member is not a raw-pointer local".to_string(),
             );
             continue;
         };
@@ -1199,7 +1194,6 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 base_live,
             },
         );
-        // record member kept
         context.trace.record(
             context.def_id,
             TraceSubject::Member(source_name.clone()),
@@ -1576,7 +1570,7 @@ fn choose_binding_representations(
             rewrite.representation = BindingRepresentation::IndexOnly;
         }
     }
-    // record the chosen representation per member (only when tracing).
+    // gated: avoid building labels on the disabled path.
     if trace.is_enabled() {
         for (hir_id, rewrite) in &plan.by_hir_id {
             let representation = rewrite.representation.clone();
