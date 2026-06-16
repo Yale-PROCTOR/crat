@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 use rustc_span::def_id::LocalDefId;
-use z3::{ast::Bool, Model, SatResult, Solver};
+use z3::{ast::Bool, Model, Optimize, SatResult};
 
 use super::{
     crate_slots::CrateSlots,
@@ -22,13 +22,13 @@ struct KindVars {
 }
 
 pub struct KindSolver {
-    solver: Solver,
+    solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
 }
 
 impl KindSolver {
     pub fn new(slots: &CrateSlots) -> Self {
-        let solver = Solver::new();
+        let solver = Optimize::new();
         let mut vars = FxHashMap::default();
 
         add_universe(&solver, &mut vars, &slots.field_slots, SlotRef::Field);
@@ -36,6 +36,13 @@ impl KindSolver {
             add_universe(&solver, &mut vars, universe, |slot| {
                 SlotRef::Local(fn_did, slot)
             });
+        }
+
+        // Prefer Ref where hard constraints allow it, then Raw over unnecessary Owning.
+        let big = vars.len() as u64 + 1;
+        for kind_vars in vars.values() {
+            solver.assert_soft(&kind_vars.ref_, big, None);
+            solver.assert_soft(&kind_vars.raw, 1u64, None);
         }
 
         KindSolver { solver, vars }
@@ -54,7 +61,7 @@ impl KindSolver {
     }
 
     pub fn check(&self) -> SatResult {
-        self.solver.check()
+        self.solver.check(&[])
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
@@ -82,7 +89,7 @@ impl KindSolver {
 }
 
 fn add_universe<F>(
-    solver: &Solver,
+    solver: &Optimize,
     vars: &mut FxHashMap<SlotRef, KindVars>,
     universe: &SlotUniverse,
     mut slot_ref: F,
@@ -116,15 +123,15 @@ fn add_universe<F>(
     }
 }
 
-fn assert_exactly_one(solver: &Solver, vars: &KindVars) {
-    solver.assert(Bool::or(&[&vars.raw, &vars.ref_, &vars.own]));
+fn assert_exactly_one(solver: &Optimize, vars: &KindVars) {
+    solver.assert(&Bool::or(&[&vars.raw, &vars.ref_, &vars.own]));
     assert_not_both(solver, &vars.raw, &vars.ref_);
     assert_not_both(solver, &vars.raw, &vars.own);
     assert_not_both(solver, &vars.ref_, &vars.own);
 }
 
-fn assert_not_both(solver: &Solver, a: &Bool, b: &Bool) {
-    solver.assert(Bool::or(&[&!a, &!b]));
+fn assert_not_both(solver: &Optimize, a: &Bool, b: &Bool) {
+    solver.assert(&Bool::or(&[&!a, &!b]));
 }
 
 fn is_true(model: &Model, b: &Bool) -> bool {
