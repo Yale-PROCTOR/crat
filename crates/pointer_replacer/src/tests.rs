@@ -9706,6 +9706,254 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
     }
 }
 
+mod borrow_ownership_coherence {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::{mir::Local, ty::TyCtxt};
+    use rustc_span::def_id::LocalDefId;
+    use z3::SatResult;
+
+    use crate::{
+        analyses::borrow_ownership::{
+            SlotKind,
+            coherence::add_coherence,
+            crate_slots::CrateSlots,
+            solver::{KindSolver, SlotRef},
+            slots::StructFieldSlot,
+        },
+        utils::rustc::RustProgram,
+    };
+
+    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
+        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    }
+
+    fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn function_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("function `{name}` not found"))
+    }
+
+    fn struct_by_name(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .structs
+            .iter()
+            .copied()
+            .find(|did| {
+                program
+                    .tcx
+                    .def_path_str(did.to_def_id())
+                    .rsplit("::")
+                    .next()
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("struct `{name}` not found"))
+    }
+
+    fn local_slot(slots: &CrateSlots, fn_did: LocalDefId, local: Local, depth: u8) -> SlotRef {
+        let slot = slots
+            .fn_local_slots
+            .get(&fn_did)
+            .unwrap_or_else(|| panic!("slots for function {fn_did:?}"))
+            .slot_for_local_depth(local, depth)
+            .unwrap_or_else(|| panic!("slot for local {local:?} depth {depth}"));
+
+        SlotRef::Local(fn_did, slot)
+    }
+
+    #[test]
+    fn copy_propagates_kind() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_fn(p: *mut i32) -> *mut i32 {
+    p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_fn = function_by_name(&program, "copy_fn");
+                let body = tcx.mir_drops_elaborated_and_const_checked(copy_fn).borrow();
+                let solver = KindSolver::new(&slots);
+
+                add_coherence(&solver, &slots, copy_fn, &body);
+
+                let ret = local_slot(&slots, copy_fn, Local::from_u32(0), 0);
+                let p = local_slot(&slots, copy_fn, Local::from_u32(1), 0);
+                solver.assume(p, SlotKind::Owning);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&ret), Some(&SlotKind::Owning));
+            },
+        );
+    }
+
+    #[test]
+    fn address_of_depth_shift() {
+        run_compiler(
+            r#"
+pub unsafe fn addr_fn(mut p: *mut i32) -> *mut *mut i32 {
+    let q: *mut *mut i32 = &raw mut p;
+    q
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let addr_fn = function_by_name(&program, "addr_fn");
+                let body = tcx.mir_drops_elaborated_and_const_checked(addr_fn).borrow();
+                let solver = KindSolver::new(&slots);
+
+                add_coherence(&solver, &slots, addr_fn, &body);
+
+                let ret_depth_1 = local_slot(&slots, addr_fn, Local::from_u32(0), 1);
+                let p = local_slot(&slots, addr_fn, Local::from_u32(1), 0);
+                solver.assume(p, SlotKind::Owning);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&ret_depth_1), Some(&SlotKind::Owning));
+            },
+        );
+    }
+
+    #[test]
+    fn all_raw_sat_with_coherence() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_fn(p: *mut i32) -> *mut i32 {
+    p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_fn = function_by_name(&program, "copy_fn");
+                let body = tcx.mir_drops_elaborated_and_const_checked(copy_fn).borrow();
+                let solver = KindSolver::new(&slots);
+
+                add_coherence(&solver, &slots, copy_fn, &body);
+
+                solver.assume(
+                    local_slot(&slots, copy_fn, Local::from_u32(0), 0),
+                    SlotKind::Raw,
+                );
+                solver.assume(
+                    local_slot(&slots, copy_fn, Local::from_u32(1), 0),
+                    SlotKind::Raw,
+                );
+
+                assert_eq!(solver.check(), SatResult::Sat);
+            },
+        );
+    }
+
+    #[test]
+    fn cast_does_not_propagate_kind() {
+        run_compiler(
+            r#"
+pub unsafe fn cast_fn(p: *mut i32) -> *mut u8 {
+    p as *mut u8
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let cast_fn = function_by_name(&program, "cast_fn");
+                let body = tcx.mir_drops_elaborated_and_const_checked(cast_fn).borrow();
+                let solver = KindSolver::new(&slots);
+
+                add_coherence(&solver, &slots, cast_fn, &body);
+
+                let ret = local_slot(&slots, cast_fn, Local::from_u32(0), 0);
+                let p = local_slot(&slots, cast_fn, Local::from_u32(1), 0);
+                solver.assume(p, SlotKind::Owning);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&ret), Some(&SlotKind::Ref));
+            },
+        );
+    }
+
+    #[test]
+    fn aggregate_initializes_field_slot() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub p: *mut i32,
+}
+
+pub unsafe fn agg_fn(ptr: *mut i32) -> S {
+    S { p: ptr }
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let s = struct_by_name(&program, "S");
+                let agg_fn = function_by_name(&program, "agg_fn");
+                let body = tcx.mir_drops_elaborated_and_const_checked(agg_fn).borrow();
+                let solver = KindSolver::new(&slots);
+
+                add_coherence(&solver, &slots, agg_fn, &body);
+
+                let ptr = local_slot(&slots, agg_fn, Local::from_u32(1), 0);
+                solver.assume(ptr, SlotKind::Owning);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let field_slot = slots
+                    .field_slots
+                    .slot_for_field_depth(
+                        StructFieldSlot {
+                            struct_did: s,
+                            field_index: 0,
+                        },
+                        0,
+                    )
+                    .expect("slot for S::p");
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&SlotRef::Field(field_slot)), Some(&SlotKind::Owning));
+            },
+        );
+    }
+}
+
 mod borrow_ownership_resolve {
     use rustc_abi::FieldIdx;
     use rustc_hir::{ItemKind, OwnerNode};

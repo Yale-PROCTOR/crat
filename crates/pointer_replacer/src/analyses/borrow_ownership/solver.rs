@@ -60,6 +60,20 @@ impl KindSolver {
         }
     }
 
+    pub fn equate(&self, a: SlotRef, b: SlotRef) {
+        let va = self
+            .vars
+            .get(&a)
+            .unwrap_or_else(|| panic!("unknown slot: {a:?}"));
+        let vb = self
+            .vars
+            .get(&b)
+            .unwrap_or_else(|| panic!("unknown slot: {b:?}"));
+        self.solver.assert(&!va.raw.xor(&vb.raw));
+        self.solver.assert(&!va.ref_.xor(&vb.ref_));
+        self.solver.assert(&!va.own.xor(&vb.own));
+    }
+
     pub fn check(&self) -> SatResult {
         self.solver.check(&[])
     }

@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 mod domain;
+pub mod coherence;
 pub mod crate_slots;
 pub mod resolve;
 pub mod solver;
