@@ -693,6 +693,59 @@ fn transform_rewrites_enum_required_integer_literals() {
 }
 
 #[test]
+fn transform_rewrites_casted_if_assigned_through_enum_pointer() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const C: E = 2;
+            pub const B: E = 1;
+            pub const A: E = 0;
+
+            pub unsafe extern "C" fn foo(mut x: core::ffi::c_int) {
+                let mut e: E = A;
+                let mut p: *mut E = &mut e;
+                *p = (if x != 0 {
+                    A as core::ffi::c_int
+                } else {
+                    B as core::ffi::c_int
+                }) as E;
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub enum E"));
+    assert!(code.contains("*p = if x != 0 { A } else { B };"));
+    assert!(!code.contains("as core::ffi::c_int"));
+    assert!(!code.contains("as u32;"));
+}
+
+#[test]
+fn reject_unknown_if_value_assigned_through_enum_pointer() {
+    analyze_with_tcx(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const B: E = 1;
+            pub const A: E = 0;
+
+            pub unsafe extern "C" fn foo(mut x: core::ffi::c_int) {
+                let mut e: E = A;
+                let mut p: *mut E = &mut e;
+                *p = (if x != 0 {
+                    A as core::ffi::c_int
+                } else {
+                    2 as core::ffi::c_int
+                }) as E;
+            }
+            "#,
+        |tcx, analysis| {
+            let info = enum_by_name(&analysis, tcx, "E");
+            assert!(!info.transformable);
+            assert!(has_reject(info, RejectReasonKind::CastAssignedToEnum));
+        },
+    );
+}
+
+#[test]
 fn transform_rewrites_outparam_default_enum_literal() {
     let code = transform_and_compile(
         r#"

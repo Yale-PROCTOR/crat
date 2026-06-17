@@ -41,6 +41,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
         ast_to_hir,
         replacements: plan.replacements,
         variant_consts: plan.variant_consts,
+        cast_strips: plan.cast_strips,
         cast_sites: plan.cast_sites,
         match_rewrites: plan.match_rewrites,
         comparison_rewrites: plan.comparison_rewrites,
@@ -55,6 +56,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
 #[derive(Debug, Default)]
 pub struct EnumAnalysis {
     pub enums: FxHashMap<LocalDefId, EnumInfo>,
+    cast_strips: Vec<CastStripSite>,
     match_rewrites: Vec<MatchRewriteSite>,
     comparison_rewrites: Vec<ComparisonRewriteSite>,
     literal_rewrites: Vec<LiteralRewriteSite>,
@@ -128,6 +130,12 @@ pub enum CastSiteKind {
 }
 
 #[derive(Clone, Debug)]
+struct CastStripSite {
+    enum_alias: LocalDefId,
+    expr_hir_id: HirId,
+}
+
+#[derive(Clone, Debug)]
 struct MatchRewriteSite {
     enum_alias: LocalDefId,
     match_hir_id: HirId,
@@ -195,6 +203,7 @@ struct VariantReplacement {
 struct EnumTransformPlan {
     replacements: FxHashMap<LocalDefId, EnumReplacement>,
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
+    cast_strips: FxHashSet<HirId>,
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
     comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
@@ -235,6 +244,18 @@ impl EnumTransformPlan {
                 let entry = plan.cast_sites.entry(site.hir_id).or_insert(repr.clone());
                 debug_assert_eq!(entry, &repr);
             }
+        }
+
+        for site in &analysis.cast_strips {
+            if !analysis
+                .enums
+                .get(&site.enum_alias)
+                .is_some_and(|info| info.transformable)
+            {
+                continue;
+            }
+
+            plan.cast_strips.insert(site.expr_hir_id);
         }
 
         for site in &analysis.match_rewrites {
@@ -298,6 +319,7 @@ struct AstVisitor<'tcx> {
     ast_to_hir: AstToHir,
     replacements: FxHashMap<LocalDefId, EnumReplacement>,
     variant_consts: FxHashMap<LocalDefId, LocalDefId>,
+    cast_strips: FxHashSet<HirId>,
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
     comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
@@ -454,19 +476,25 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             return;
         }
 
-        if let ast::ExprKind::Cast(_, ty) = &mut expr.kind
-            && let Some(repr) = self.replacement_for_ty(ty)
-        {
-            **ty = utils::ty!("{}", repr.repr);
-        }
-
         let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) else {
             return;
         };
         let hir_id = hir_expr.hir_id;
+        if self.cast_strips.contains(&hir_id) {
+            let base = pprust::expr_to_string(utils::ast::unwrap_cast_and_paren(expr));
+            *expr = utils::expr!("{base}");
+            return;
+        }
+
         if let Some(variant_path) = self.literal_rewrites.get(&hir_id) {
             *expr = utils::expr!("{variant_path}");
             return;
+        }
+
+        if let ast::ExprKind::Cast(_, ty) = &mut expr.kind
+            && let Some(repr) = self.replacement_for_ty(ty)
+        {
+            **ty = utils::ty!("{}", repr.repr);
         }
 
         let Some(repr) = self.cast_sites.get(&hir_id) else {
@@ -857,6 +885,7 @@ struct BodyVisitor<'a, 'tcx> {
     current_ret_ty: Option<HirEnumTy>,
     enum_required_exprs: FxHashSet<HirId>,
     cast_sites: FxHashSet<(LocalDefId, HirId, CastSiteKind)>,
+    cast_strips: FxHashSet<(LocalDefId, HirId)>,
 }
 
 impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
@@ -868,6 +897,7 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             current_ret_ty: None,
             enum_required_exprs: FxHashSet::default(),
             cast_sites: FxHashSet::default(),
+            cast_strips: FxHashSet::default(),
         }
     }
 
@@ -919,27 +949,58 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
         expected: LocalDefId,
         context: RequiredContext,
     ) {
+        self.require_enum_after_casts(expr, expected, context, &[]);
+    }
+
+    fn require_enum_after_casts(
+        &mut self,
+        expr: &'tcx hir::Expr<'tcx>,
+        expected: LocalDefId,
+        context: RequiredContext,
+        cast_chain: &[IntegerRepr],
+    ) {
         let expr = utils::hir::unwrap_drop_temps(expr);
         if let hir::ExprKind::Block(block, _) = expr.kind
             && let Some(tail) = block.expr
         {
-            self.require_enum(tail, expected, context);
+            self.require_enum_after_casts(tail, expected, context, cast_chain);
             return;
         }
 
         self.enum_required_exprs.insert(expr.hir_id);
+        if let hir::ExprKind::Cast(inner, _) = expr.kind
+            && let Some(target_repr) = expr_integer_repr(expr, self.tcx)
+        {
+            self.record_cast_strip(expected, expr);
+            let mut inner_cast_chain = Vec::with_capacity(cast_chain.len() + 1);
+            inner_cast_chain.push(target_repr);
+            inner_cast_chain.extend_from_slice(cast_chain);
+            self.require_enum_after_casts(inner, expected, context, &inner_cast_chain);
+            return;
+        }
+
+        if let hir::ExprKind::If(_, then_expr, Some(else_expr)) = expr.kind {
+            self.require_enum_after_casts(then_expr, expected, context, cast_chain);
+            self.require_enum_after_casts(else_expr, expected, context, cast_chain);
+            return;
+        }
+
         match self.classify_expr(expr) {
-            ExprEnumClass::Enum(alias) if alias == expected => {}
+            ExprEnumClass::Enum(alias) if alias == expected => {
+                if !self.cast_chain_preserves_enum(expected, cast_chain) {
+                    self.add_reject(expected, RejectReasonKind::CastAssignedToEnum, expr.span);
+                }
+            }
             ExprEnumClass::Enum(_) => self.add_reject(
                 expected,
                 RejectReasonKind::WrongEnumAssignedToEnum,
                 expr.span,
             ),
             _ => {
-                if self.try_record_enum_literal_rewrite(expr, expected) {
+                if self.try_record_enum_literal_rewrite(expr, expected, cast_chain) {
                     return;
                 }
-                let kind = self.reject_kind_for_expr(expr, context);
+                let kind = self.reject_kind_for_expr_after_casts(expr, context, cast_chain);
                 self.add_reject(expected, kind, expr.span);
                 match context {
                     RequiredContext::FunctionArgument
@@ -960,16 +1021,42 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
         }
     }
 
+    fn record_cast_strip(&mut self, enum_alias: LocalDefId, expr: &'tcx hir::Expr<'tcx>) {
+        if !self.cast_strips.insert((enum_alias, expr.hir_id)) {
+            return;
+        }
+        self.analysis.cast_strips.push(CastStripSite {
+            enum_alias,
+            expr_hir_id: expr.hir_id,
+        });
+    }
+
+    fn cast_chain_preserves_enum(
+        &self,
+        enum_alias: LocalDefId,
+        cast_chain: &[IntegerRepr],
+    ) -> bool {
+        if cast_chain.is_empty() {
+            return true;
+        }
+        let Some(info) = self.analysis.enums.get(&enum_alias) else {
+            return false;
+        };
+        self.comparison_casts_compatible(info, cast_chain, &[]) == Some(true)
+    }
+
     fn try_record_enum_literal_rewrite(
         &mut self,
         expr: &'tcx hir::Expr<'tcx>,
         enum_alias: LocalDefId,
+        cast_chain: &[IntegerRepr],
     ) -> bool {
         let variant_path = {
             let Some(info) = self.analysis.enums.get(&enum_alias) else {
                 return false;
             };
-            let Some(value) = numeric_expr_value(expr, info.repr, self.tcx) else {
+            let Some(value) = numeric_expr_value_after_casts(expr, info.repr, cast_chain, self.tcx)
+            else {
                 return false;
             };
             let Some(variants) = self.casted_variants_for_operand(info, &[]) else {
@@ -987,6 +1074,19 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             variant_path,
         });
         true
+    }
+
+    fn reject_kind_for_expr_after_casts(
+        &self,
+        expr: &'tcx hir::Expr<'tcx>,
+        context: RequiredContext,
+        cast_chain: &[IntegerRepr],
+    ) -> RejectReasonKind {
+        if !cast_chain.is_empty() {
+            RejectReasonKind::CastAssignedToEnum
+        } else {
+            self.reject_kind_for_expr(expr, context)
+        }
     }
 
     fn reject_kind_for_expr(
@@ -1490,6 +1590,9 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
                 _ => None,
             },
             hir::ExprKind::Field(base, field) => self.field_type(base, field.name),
+            hir::ExprKind::Unary(hir::UnOp::Deref, expr) => {
+                self.expr_decl_ty(expr).and_then(HirEnumTy::pointee)
+            }
             _ => None,
         }
     }
@@ -1832,6 +1935,23 @@ fn numeric_expr_value(
     } else {
         cast_integer_value(value, target_repr, tcx)
     }
+}
+
+fn numeric_expr_value_after_casts(
+    expr: &hir::Expr<'_>,
+    target_repr: IntegerRepr,
+    cast_chain: &[IntegerRepr],
+    tcx: TyCtxt<'_>,
+) -> Option<CastedIntegerValue> {
+    if cast_chain.is_empty() {
+        return numeric_expr_value(expr, target_repr, tcx);
+    }
+
+    let mut value = numeric_expr_value_in_expr_type(expr, tcx)?;
+    for target_repr in cast_chain {
+        value = cast_integer_value(value, *target_repr, tcx)?;
+    }
+    Some(value)
 }
 
 fn numeric_expr_value_in_expr_type(
