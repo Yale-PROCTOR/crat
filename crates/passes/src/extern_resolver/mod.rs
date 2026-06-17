@@ -272,6 +272,21 @@ fn tys_equal_after_resolution<'tcx>(
         (Foreign(def_id1), Foreign(def_id2)) => {
             resolve_def_id(*def_id1, resolve_map) == resolve_def_id(*def_id2, resolve_map)
         }
+        (FnPtr(sig1, header1), FnPtr(sig2, header2)) => {
+            if header1 != header2 {
+                return false;
+            }
+            let sig1 = sig1.skip_binder();
+            let sig2 = sig2.skip_binder();
+            let inputs1 = sig1.inputs();
+            let inputs2 = sig2.inputs();
+            inputs1.len() == inputs2.len()
+                && tys_equal_after_resolution(sig1.output(), sig2.output(), resolve_map)
+                && inputs1
+                    .iter()
+                    .zip(inputs2)
+                    .all(|(ty1, ty2)| tys_equal_after_resolution(*ty1, *ty2, resolve_map))
+        }
         _ => ty1 == ty2,
     }
 }
@@ -365,6 +380,29 @@ fn ty_to_string_after_resolution<'tcx>(
             )
         }
         Slice(ty) => format!("[{}]", ty_to_string_after_resolution(*ty, resolve_map, tcx)),
+        FnPtr(sig, header) => {
+            let sig = sig.skip_binder();
+            let mut inputs: Vec<_> = sig
+                .inputs()
+                .iter()
+                .map(|ty| ty_to_string_after_resolution(*ty, resolve_map, tcx))
+                .collect();
+            if header.c_variadic {
+                inputs.push("...".to_string());
+            }
+            let safety = if header.safety.is_unsafe() {
+                "unsafe "
+            } else {
+                ""
+            };
+            let abi = if header.abi.is_rustic_abi() {
+                String::new()
+            } else {
+                format!("extern \"{}\" ", header.abi.name())
+            };
+            let output = ty_to_string_after_resolution(sig.output(), resolve_map, tcx);
+            format!("{safety}{abi}fn({}) -> {output}", inputs.join(", "))
+        }
         _ => utils::ir::mir_ty_to_string(ty, tcx),
     }
 }

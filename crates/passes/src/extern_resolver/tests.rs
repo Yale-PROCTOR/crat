@@ -534,6 +534,77 @@ fn test_ignore_param_type_resolved_foreign_type() {
 }
 
 #[test]
+fn test_ignore_param_type_resolved_fn_ptr_type() {
+    let code = "
+    #![feature(extern_types)]
+    mod a {
+        #[repr(C)]
+        pub struct item {
+            pub x: core::ffi::c_int,
+        }
+        pub type cb = Option<unsafe extern \"C\" fn(*mut item) -> core::ffi::c_int>;
+        pub type const_cb = Option<unsafe extern \"C\" fn(*const item) -> core::ffi::c_int>;
+        #[no_mangle]
+        pub unsafe extern \"C\" fn same(_: cb) -> core::ffi::c_int {
+            1
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn needs_cast(_: const_cb) -> core::ffi::c_int {
+            2
+        }
+    }
+    mod b {
+        #[repr(C)]
+        pub struct item {
+            pub x: core::ffi::c_int,
+        }
+        pub type cb = Option<unsafe extern \"C\" fn(*mut item) -> core::ffi::c_int>;
+        extern \"C\" {
+            pub fn same(_: cb) -> core::ffi::c_int;
+            pub fn needs_cast(_: cb) -> core::ffi::c_int;
+        }
+    }
+";
+    utils::compilation::run_compiler_on_str(code, |tcx| {
+        let config = super::Config {
+            ignore_param_type: true,
+            ..Default::default()
+        };
+        let result = super::resolve(config.ignore_return_type, config.ignore_param_type, tcx);
+        let resolve_map = super::make_resolve_map(&result, &None, &config, tcx);
+
+        let mut visitor = super::HirVisitor::new(tcx);
+        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+        let foreign_fn = |name: &str| {
+            visitor
+                .data
+                .foreign_fns
+                .iter()
+                .copied()
+                .find(|def_id| utils::ir::def_id_to_symbol(*def_id, tcx).unwrap().as_str() == name)
+                .unwrap()
+        };
+        let fn_input = |def_id| tcx.fn_sig(def_id).skip_binder().skip_binder().inputs()[0];
+
+        let same = foreign_fn("same");
+        let resolved_same = resolve_map[&same];
+        assert!(super::tys_equal_after_resolution(
+            fn_input(same),
+            fn_input(resolved_same),
+            &resolve_map
+        ));
+
+        let needs_cast = foreign_fn("needs_cast");
+        let resolved_needs_cast = resolve_map[&needs_cast];
+        let target_ty =
+            super::ty_to_string_after_resolution(fn_input(resolved_needs_cast), &resolve_map, tcx);
+        assert!(target_ty.contains("unsafe extern \"C\" fn(*const crate::a::item) -> i32"));
+        assert!(!target_ty.contains("crate::b::item"));
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_ignore_param_type_resolved_adt() {
     run_extern_test(
         "
