@@ -8642,6 +8642,58 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_direct_union_field_pointer_stays_raw() {
+    let code = r#"
+#[repr(C)]
+pub union U {
+    pub p: *mut i32,
+    pub n: usize,
+}
+pub unsafe fn foo(u: U) -> *mut i32 {
+    u.p
+}
+"#;
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("pub union U"), "{s}");
+    assert!(s.contains("-> *mut i32"), "{s}");
+}
+
+#[test]
+fn test_nested_union_field_pointer_stays_raw() {
+    let code = r#"
+#[repr(C)]
+pub struct S {
+    pub x: i32,
+    pub y: U,
+}
+#[repr(C)]
+pub union U {
+    pub x: i32,
+    pub y: Inner,
+}
+#[repr(C)]
+pub struct Inner {
+    pub x: i32,
+    pub y: *mut i32,
+}
+impl Copy for Inner {}
+impl Clone for Inner {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+pub unsafe extern "C" fn foo(mut sp: *mut S) -> *mut i32 {
+    return (*sp).y.y.y;
+}
+"#;
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("pub union U"), "{s}");
+    assert!(s.contains("-> *mut i32"), "{s}");
+}
+
 /// Raw pointer mutability cast: `p` is *mut (writes through it), `q` is *const
 /// (only compared). The comparison `p == q` requires matching types, so a cast
 /// is inserted.

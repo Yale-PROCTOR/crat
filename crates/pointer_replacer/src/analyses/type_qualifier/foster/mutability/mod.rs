@@ -144,21 +144,32 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             struct_fields,
             tcx,
         } = self.ctxt;
-        let database = &mut self.database;
+        let database = &mut *self.database;
 
         match rhs {
             Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs) => {
-                let lhs =
-                    place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, tcx, database);
+                let Some(lhs) = try_place_vars::<MutCtxt>(
+                    lhs,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                ) else {
+                    return;
+                };
                 let mut rhs_deref = None;
-                let rhs = place_vars::<UnknownCtxt>(
+                let Some(rhs) = try_place_vars::<UnknownCtxt>(
                     rhs,
                     local_decls,
                     locals,
                     struct_fields,
                     tcx,
                     &mut rhs_deref,
-                );
+                ) else {
+                    make_mut(lhs, database);
+                    return;
+                };
 
                 // type safety
                 assert_eq!(
@@ -184,17 +195,28 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             }
             Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => {
                 // for cast, we process the head ptr only
-                let lhs =
-                    place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, tcx, database);
+                let Some(lhs) = try_place_vars::<MutCtxt>(
+                    lhs,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                ) else {
+                    return;
+                };
                 let mut rhs_deref = None;
-                let rhs = place_vars::<UnknownCtxt>(
+                let Some(rhs) = try_place_vars::<UnknownCtxt>(
                     rhs,
                     local_decls,
                     locals,
                     struct_fields,
                     tcx,
                     &mut rhs_deref,
-                );
+                ) else {
+                    make_mut(lhs, database);
+                    return;
+                };
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
@@ -215,17 +237,28 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             //     }
             // }
             Rvalue::BinaryOp(BinOp::Offset, box (ptr, _)) => {
-                let dest_vars =
-                    place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, tcx, database);
+                let Some(dest_vars) = try_place_vars::<MutCtxt>(
+                    lhs,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                ) else {
+                    return;
+                };
                 if let Some(arg) = ptr.place() {
-                    let arg_vars = place_vars::<EnsureNoDeref>(
+                    let Some(arg_vars) = try_place_vars::<EnsureNoDeref>(
                         &arg,
                         local_decls,
                         locals,
                         struct_fields,
                         tcx,
                         &mut (),
-                    );
+                    ) else {
+                        make_mut(dest_vars, database);
+                        return;
+                    };
                     let mut dest_arg = dest_vars.zip(arg_vars);
 
                     if let Some((dest, arg)) = dest_arg.next() {
@@ -238,24 +271,29 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 }
             }
             Rvalue::Ref(_, _, rhs) | Rvalue::RawPtr(_, rhs) => {
-                let mut lhs = place_vars::<EnsureNoDeref>(
+                let Some(mut lhs) = try_place_vars::<EnsureNoDeref>(
                     lhs,
                     local_decls,
                     locals,
                     struct_fields,
                     tcx,
                     &mut (),
-                );
+                ) else {
+                    return;
+                };
                 let mut rhs_deref = None;
-                let rhs = place_vars::<UnknownCtxt>(
+                let lhs_ref = lhs.next().unwrap();
+                let Some(rhs) = try_place_vars::<UnknownCtxt>(
                     rhs,
                     local_decls,
                     locals,
                     struct_fields,
                     tcx,
                     &mut rhs_deref,
-                );
-                let lhs_ref = lhs.next().unwrap();
+                ) else {
+                    database.bottom(lhs_ref);
+                    return;
+                };
                 if let Some(rhs_deref) = rhs_deref {
                     database.guard(lhs_ref, rhs_deref);
                 }
@@ -265,8 +303,16 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(_, variant_idx, _, _, _), fields) => {
-                let lhs_vars =
-                    place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, tcx, database);
+                let Some(lhs_vars) = try_place_vars::<MutCtxt>(
+                    lhs,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                ) else {
+                    return;
+                };
                 let lhs_ty = lhs.ty(local_decls.local_decls(), tcx).ty;
                 let TyKind::Adt(adt_def, generic_args) = lhs_ty.kind() else {
                     unreachable!("{lhs_ty:?}")
@@ -288,22 +334,22 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                         continue;
                     };
                     let mut rhs_deref = None;
-                    let rhs = place_vars::<UnknownCtxt>(
+                    let Some(rhs) = try_place_vars::<UnknownCtxt>(
                         &rhs,
                         local_decls,
                         locals,
                         struct_fields,
                         tcx,
                         &mut rhs_deref,
-                    );
+                    ) else {
+                        make_mut(lhs, database);
+                        continue;
+                    };
 
                     assert_eq!(
                         lhs.end.index() - lhs.start.index(),
                         rhs.end.index() - rhs.start.index(),
-                        "{:?}: {} = {:?}",
-                        lhs,
-                        lhs_ty,
-                        field
+                        "{lhs:?}: {lhs_ty} = {field:?}",
                     );
 
                     let mut lhs_rhs = lhs.zip(rhs);
@@ -320,8 +366,14 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 }
             }
             _ => {
-                let _ =
-                    place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, tcx, database);
+                let _ = try_place_vars::<MutCtxt>(
+                    lhs,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                );
             }
         }
     }
@@ -334,7 +386,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             struct_fields,
             tcx,
         } = self.ctxt;
-        let database = &mut self.database;
+        let database = &mut *self.database;
 
         if let Some(mir::MirFunctionCall {
             func,
@@ -350,7 +402,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                         .contents_iter(callee)
                         .take(callee_body.arg_count + 1);
 
-                    let dest = place_vars::<MutCtxt>(
+                    let dest = try_place_vars::<MutCtxt>(
                         destination,
                         local_decls,
                         locals,
@@ -360,34 +412,39 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     );
                     let ret = callee_vars.next().unwrap();
 
-                    // type safety
-                    assert_eq!(
-                        dest.end.index() - dest.start.index(),
-                        ret.end.index() - ret.start.index()
-                    );
+                    if let Some(dest) = dest {
+                        // type safety
+                        assert_eq!(
+                            dest.end.index() - dest.start.index(),
+                            ret.end.index() - ret.start.index()
+                        );
 
-                    let mut dest_ret = dest.zip(ret);
+                        let mut dest_ret = dest.zip(ret);
 
-                    if let Some((dest, ret)) = dest_ret.next() {
-                        database.guard(dest, ret)
-                    }
-                    for (dest, ret) in dest_ret {
-                        database.guard(ret, dest);
-                        database.guard(dest, ret);
+                        if let Some((dest, ret)) = dest_ret.next() {
+                            database.guard(dest, ret)
+                        }
+                        for (dest, ret) in dest_ret {
+                            database.guard(ret, dest);
+                            database.guard(dest, ret);
+                        }
                     }
 
                     for (arg, param_vars) in args.iter().zip(callee_vars) {
                         let Some(arg) = arg.node.place() else {
                             continue;
                         };
-                        let arg_vars = place_vars::<EnsureNoDeref>(
+                        let Some(arg_vars) = try_place_vars::<EnsureNoDeref>(
                             &arg,
                             local_decls,
                             locals,
                             struct_fields,
                             tcx,
                             &mut (),
-                        );
+                        ) else {
+                            make_mut(param_vars, database);
+                            continue;
+                        };
 
                         let mut param_arg = param_vars.zip(arg_vars);
                         if let Some((param, arg)) = param_arg.next() {
@@ -475,6 +532,12 @@ impl PlaceContext for EnsureNoDeref {
     }
 }
 
+fn make_mut(vars: Range<Var>, database: &mut BooleanSystem<Mutability>) {
+    for var in vars {
+        database.bottom(var);
+    }
+}
+
 fn place_vars<'tcx, Ctxt: PlaceContext>(
     place: &Place<'tcx>,
     local_decls: &impl HasLocalDecls<'tcx>,
@@ -483,6 +546,18 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     deref_store: &mut Ctxt::DerefStore,
 ) -> Range<Var> {
+    try_place_vars::<Ctxt>(place, local_decls, locals, struct_fields, tcx, deref_store)
+        .unwrap_or_else(|| locals[place.local.index()]..locals[place.local.index()])
+}
+
+fn try_place_vars<'tcx, Ctxt: PlaceContext>(
+    place: &Place<'tcx>,
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    deref_store: &mut Ctxt::DerefStore,
+) -> Option<Range<Var>> {
     let mut place_vars = Range {
         start: locals[place.local.index()],
         end: locals[place.local.index() + 1],
@@ -498,58 +573,55 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 base_ty = base_ty.builtin_deref(true).unwrap();
                 variant = None;
             }
-            ProjectionElem::Field(field, ty) => {
-                match base_ty.kind() {
-                    TyKind::Adt(adt_def, _) => {
-                        let generic_args = match base_ty.kind() {
-                            TyKind::Adt(_, generic_args) => *generic_args,
-                            _ => unreachable!(),
-                        };
-                        if let Some(variant_idx) = variant {
-                            place_vars = super::enum_variant_field_range(
-                                tcx,
-                                *adt_def,
-                                generic_args,
-                                variant_idx,
-                                place_vars,
-                                field,
-                            );
-                            base_ty = ty;
-                            variant = None;
-                            continue;
-                        }
-                        assert!(place_vars.is_empty());
-                        // FIXME correctness?
-                        if adt_def.is_union() {
-                            return place_vars;
-                        }
-                        let field_vars = struct_fields
-                            .fields(adt_def.did().expect_local())
-                            .nth(field.index())
-                            .unwrap();
-
-                        place_vars = field_vars;
-
+            ProjectionElem::Field(field, ty) => match base_ty.kind() {
+                TyKind::Adt(adt_def, _) => {
+                    let generic_args = match base_ty.kind() {
+                        TyKind::Adt(_, generic_args) => *generic_args,
+                        _ => unreachable!(),
+                    };
+                    if let Some(variant_idx) = variant {
+                        place_vars = super::enum_variant_field_range(
+                            tcx,
+                            *adt_def,
+                            generic_args,
+                            variant_idx,
+                            place_vars,
+                            field,
+                        );
                         base_ty = ty;
                         variant = None;
+                        continue;
                     }
-                    TyKind::Tuple(tys) => {
-                        let offset: usize = tys
-                            .iter()
-                            .take(field.index())
-                            .map(|t| super::count_ptr(tcx, t))
-                            .sum();
-                        let field_count = super::count_ptr(tcx, ty);
-                        place_vars = Range {
-                            start: place_vars.start + offset,
-                            end: place_vars.start + offset + field_count,
-                        };
-                        base_ty = ty;
-                        variant = None;
+                    assert!(place_vars.is_empty());
+                    if adt_def.is_union() {
+                        return None;
                     }
-                    _ => unreachable!(),
+                    let field_vars = struct_fields
+                        .fields(adt_def.did().expect_local())
+                        .nth(field.index())
+                        .unwrap();
+
+                    place_vars = field_vars;
+
+                    base_ty = ty;
+                    variant = None;
                 }
-            }
+                TyKind::Tuple(tys) => {
+                    let offset: usize = tys
+                        .iter()
+                        .take(field.index())
+                        .map(|t| super::count_ptr(tcx, t))
+                        .sum();
+                    let field_count = super::count_ptr(tcx, ty);
+                    place_vars = Range {
+                        start: place_vars.start + offset,
+                        end: place_vars.start + offset + field_count,
+                    };
+                    base_ty = ty;
+                    variant = None;
+                }
+                _ => unreachable!(),
+            },
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 base_ty = base_ty.builtin_index().unwrap();
                 variant = None;
@@ -563,7 +635,7 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 if !adt_def.is_enum() {
                     // happens when asserting nonnullness of fn ptrs
                     assert!(place_vars.is_empty());
-                    return place_vars;
+                    return Some(place_vars);
                 }
                 place_vars =
                     super::enum_variant_range(tcx, *adt_def, generic_args, place_vars, variant_idx);
@@ -574,7 +646,7 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
         }
     }
 
-    place_vars
+    Some(place_vars)
 }
 
 pub(crate) fn conservative_call<'tcx>(
@@ -586,25 +658,28 @@ pub(crate) fn conservative_call<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_var = place_vars::<MutCtxt>(
+    if let Some(dest_var) = try_place_vars::<MutCtxt>(
         destination,
         local_decls,
         locals,
         struct_fields,
         tcx,
         database,
-    );
-
-    for var in dest_var {
-        database.bottom(var);
+    ) {
+        for var in dest_var {
+            database.bottom(var);
+        }
     }
 
     for arg in args {
         let Some(arg) = arg.node.place() else {
             continue;
         };
-        let arg_vars =
-            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
+        let Some(arg_vars) =
+            try_place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ())
+        else {
+            continue;
+        };
         for var in arg_vars {
             database.bottom(var);
         }
