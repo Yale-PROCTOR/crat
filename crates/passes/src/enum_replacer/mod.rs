@@ -44,6 +44,7 @@ pub fn replace_enums(tcx: TyCtxt<'_>) -> String {
         cast_sites: plan.cast_sites,
         match_rewrites: plan.match_rewrites,
         comparison_rewrites: plan.comparison_rewrites,
+        literal_rewrites: plan.literal_rewrites,
         inserted_casts: FxHashSet::default(),
     };
     visitor.visit_crate(&mut krate);
@@ -56,6 +57,7 @@ pub struct EnumAnalysis {
     pub enums: FxHashMap<LocalDefId, EnumInfo>,
     match_rewrites: Vec<MatchRewriteSite>,
     comparison_rewrites: Vec<ComparisonRewriteSite>,
+    literal_rewrites: Vec<LiteralRewriteSite>,
 }
 
 #[derive(Debug)]
@@ -152,6 +154,13 @@ struct ComparisonRewrite {
 }
 
 #[derive(Clone, Debug)]
+struct LiteralRewriteSite {
+    enum_alias: LocalDefId,
+    expr_hir_id: HirId,
+    variant_path: String,
+}
+
+#[derive(Clone, Debug)]
 enum ComparisonOperandRewrite {
     StripCasts,
     ReplaceWithVariantPath(String),
@@ -189,6 +198,7 @@ struct EnumTransformPlan {
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
     comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
+    literal_rewrites: FxHashMap<HirId, String>,
 }
 
 impl EnumTransformPlan {
@@ -266,6 +276,19 @@ impl EnumTransformPlan {
             );
         }
 
+        for site in &analysis.literal_rewrites {
+            if !analysis
+                .enums
+                .get(&site.enum_alias)
+                .is_some_and(|info| info.transformable)
+            {
+                continue;
+            }
+
+            plan.literal_rewrites
+                .insert(site.expr_hir_id, site.variant_path.clone());
+        }
+
         plan
     }
 }
@@ -278,6 +301,7 @@ struct AstVisitor<'tcx> {
     cast_sites: FxHashMap<HirId, String>,
     match_rewrites: FxHashMap<HirId, MatchRewrite>,
     comparison_rewrites: FxHashMap<HirId, ComparisonRewrite>,
+    literal_rewrites: FxHashMap<HirId, String>,
     inserted_casts: FxHashSet<HirId>,
 }
 
@@ -440,6 +464,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             return;
         };
         let hir_id = hir_expr.hir_id;
+        if let Some(variant_path) = self.literal_rewrites.get(&hir_id) {
+            *expr = utils::expr!("{variant_path}");
+            return;
+        }
+
         let Some(repr) = self.cast_sites.get(&hir_id) else {
             return;
         };
@@ -907,6 +936,9 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
                 expr.span,
             ),
             _ => {
+                if self.try_record_enum_literal_rewrite(expr, expected) {
+                    return;
+                }
                 let kind = self.reject_kind_for_expr(expr, context);
                 self.add_reject(expected, kind, expr.span);
                 match context {
@@ -926,6 +958,35 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
                 }
             }
         }
+    }
+
+    fn try_record_enum_literal_rewrite(
+        &mut self,
+        expr: &'tcx hir::Expr<'tcx>,
+        enum_alias: LocalDefId,
+    ) -> bool {
+        let variant_path = {
+            let Some(info) = self.analysis.enums.get(&enum_alias) else {
+                return false;
+            };
+            let Some(value) = numeric_expr_value(expr, info.repr, self.tcx) else {
+                return false;
+            };
+            let Some(variants) = self.casted_variants_for_operand(info, &[]) else {
+                return false;
+            };
+            let Some(variant) = variants.get(&value) else {
+                return false;
+            };
+            variant.path.clone()
+        };
+
+        self.analysis.literal_rewrites.push(LiteralRewriteSite {
+            enum_alias,
+            expr_hir_id: expr.hir_id,
+            variant_path,
+        });
+        true
     }
 
     fn reject_kind_for_expr(

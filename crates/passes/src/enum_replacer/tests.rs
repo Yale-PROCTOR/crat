@@ -147,7 +147,7 @@ fn reject_duplicate_discriminants() {
 }
 
 #[test]
-fn reject_integer_literal_assigned_to_enum() {
+fn accept_integer_literal_assigned_to_enum_variant_value() {
     analyze_with_tcx(
         r#"
             pub type E = core::ffi::c_uint;
@@ -162,11 +162,30 @@ fn reject_integer_literal_assigned_to_enum() {
             "#,
         |tcx, analysis| {
             let info = enum_by_name(&analysis, tcx, "E");
+            assert!(info.transformable);
+            assert!(info.reject_reasons.is_empty());
+        },
+    );
+}
+
+#[test]
+fn reject_integer_literal_assigned_to_enum_unknown_value() {
+    analyze_with_tcx(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn f() -> E {
+                let mut e: E = 2 as core::ffi::c_uint;
+                e = B;
+                e
+            }
+            "#,
+        |tcx, analysis| {
+            let info = enum_by_name(&analysis, tcx, "E");
             assert!(!info.transformable);
-            assert!(
-                has_reject(info, RejectReasonKind::CastAssignedToEnum)
-                    || has_reject(info, RejectReasonKind::IntegerLiteralAssignedToEnum)
-            );
+            assert!(has_reject(info, RejectReasonKind::CastAssignedToEnum));
         },
     );
 }
@@ -261,7 +280,7 @@ fn reject_wrong_argument_for_enum_parameter() {
             }
 
             pub unsafe extern "C" fn f() -> E {
-                takes_e(1 as core::ffi::c_uint)
+                takes_e(2 as core::ffi::c_uint)
             }
             "#,
         |tcx, analysis| {
@@ -284,7 +303,7 @@ fn reject_wrong_return_expression() {
             pub const B: E = 1;
 
             pub unsafe extern "C" fn f() -> E {
-                return 1 as core::ffi::c_uint;
+                return 2 as core::ffi::c_uint;
             }
             "#,
         |tcx, analysis| {
@@ -644,6 +663,63 @@ fn transform_simple_c_enum() {
     assert!(!code.contains("pub const A"));
     assert!(!code.contains("pub const B"));
     assert!(!code.contains("pub const C"));
+}
+
+#[test]
+fn transform_rewrites_enum_required_integer_literals() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const A: E = 0;
+            pub const B: E = 1;
+
+            pub unsafe extern "C" fn takes_e(x: E) -> E {
+                x
+            }
+
+            pub unsafe extern "C" fn f() -> E {
+                let mut e: E = 0 as core::ffi::c_uint;
+                e = takes_e(1 as core::ffi::c_uint);
+                return 0;
+            }
+            "#,
+    );
+
+    assert!(code.contains("let mut e: E = crate::E::A;"));
+    assert!(code.contains("e = takes_e(crate::E::B);"));
+    assert!(code.contains("return crate::E::A;"));
+    assert!(!code.contains("0 as core::ffi::c_uint"));
+    assert!(!code.contains("1 as core::ffi::c_uint"));
+}
+
+#[test]
+fn transform_rewrites_outparam_default_enum_literal() {
+    let code = transform_and_compile(
+        r#"
+            pub type E = core::ffi::c_uint;
+            pub const C: E = 2;
+            pub const B: E = 1;
+            pub const A: E = 0;
+
+            pub unsafe extern "C" fn foo(mut x: core::ffi::c_int) -> E {
+                let mut e___v: E = 0;
+                let mut e: *mut E = &mut e___v;
+                if x == 0 as core::ffi::c_int {
+                    *e = A;
+                } else if x == 1 as core::ffi::c_int {
+                    *e = B;
+                } else {
+                    *e = C;
+                };
+                return e___v;
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub enum E"));
+    assert!(code.contains("let mut e___v: E = crate::E::A;"));
+    assert!(!code.contains("type E ="));
+    assert!(!code.contains("let mut e___v: E = 0;"));
 }
 
 #[test]
