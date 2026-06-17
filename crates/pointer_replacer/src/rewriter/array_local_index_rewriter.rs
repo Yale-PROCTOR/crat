@@ -632,23 +632,35 @@ fn refine_base_pointer_kinds_from_ast(
     };
     visitor.visit_crate(krate);
     for rewrite in plan.by_hir_id.values_mut() {
-        if let Some(&base_is_raw_ptr) = visitor.base_is_raw_ptr_by_hir_id.get(&rewrite.base_hir_id)
+        if visitor
+            .base_is_raw_ptr_by_hir_id
+            .get(&rewrite.base_hir_id)
+            .copied()
+            .unwrap_or(false)
+            || visitor
+                .base_is_raw_ptr_by_name
+                .get(&rewrite.base_name)
+                .copied()
+                .flatten()
+                .unwrap_or(false)
         {
-            rewrite.base_is_raw_ptr = base_is_raw_ptr;
-        } else if let Some(Some(base_is_raw_ptr)) =
-            visitor.base_is_raw_ptr_by_name.get(&rewrite.base_name)
-        {
-            rewrite.base_is_raw_ptr = *base_is_raw_ptr;
+            rewrite.base_is_raw_ptr = true;
         }
     }
     for rewrite in plan.base_by_key.values_mut() {
-        if let Some(&base_is_raw_ptr) = visitor.base_is_raw_ptr_by_hir_id.get(&rewrite.base_hir_id)
+        if visitor
+            .base_is_raw_ptr_by_hir_id
+            .get(&rewrite.base_hir_id)
+            .copied()
+            .unwrap_or(false)
+            || visitor
+                .base_is_raw_ptr_by_name
+                .get(&rewrite.base_name)
+                .copied()
+                .flatten()
+                .unwrap_or(false)
         {
-            rewrite.base_is_raw_ptr = base_is_raw_ptr;
-        } else if let Some(Some(base_is_raw_ptr)) =
-            visitor.base_is_raw_ptr_by_name.get(&rewrite.base_name)
-        {
-            rewrite.base_is_raw_ptr = *base_is_raw_ptr;
+            rewrite.base_is_raw_ptr = true;
         }
     }
 }
@@ -877,10 +889,10 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
             }
         };
 
-    let base_is_raw_ptr = matches!(
-        context.body.local_decls[group.base_local].ty.kind(),
-        ty::TyKind::RawPtr(..)
-    );
+    let base_is_raw_ptr =
+        analyses::array_local_provenance::base_slot_info(context.provenance, group)
+            .and_then(|info| slot_ty(context.body, context.tcx, info))
+            .is_some_and(|ty| matches!(ty.kind(), ty::TyKind::RawPtr(..)));
     let base_cursor_key = base_cursor_key(base_hir_id, &base_name);
     let group_member_hir_ids = group
         .members
@@ -2383,7 +2395,14 @@ fn group_member_pointer_assignment_index_expr(
     let rhs_ptr = pprust::expr_to_string(rhs);
     let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
     let base_ptr = base_offset_expr_for_index(rewrite, base_index);
-    let relative = utils::expr!("({}).offset_from({})", rhs_ptr, base_ptr);
+    let common_ptr_ty = const_ptr_ty(&rewrite.ptr_ty);
+    let relative = utils::expr!(
+        "({} as {}).offset_from({} as {})",
+        rhs_ptr,
+        common_ptr_ty,
+        base_ptr,
+        common_ptr_ty
+    );
     match base_current_index_expr(rewrite) {
         Some(index_name) => IndexExpr::Plain(add_index_expr(index_name, &relative)),
         None => IndexExpr::Plain(relative),
@@ -2580,6 +2599,13 @@ fn materialized_ty(rewrite: &BindingRewrite) -> P<Ty> {
     P(utils::ty!("{}", rewrite.ptr_ty))
 }
 
+fn const_ptr_ty(ptr_ty: &str) -> String {
+    ptr_ty
+        .strip_prefix("*mut ")
+        .map(|pointee| format!("*const {pointee}"))
+        .unwrap_or_else(|| ptr_ty.to_string())
+}
+
 fn pointer_value_expr(rewrite: &BindingRewrite) -> Expr {
     if rewrite.nullable {
         let null_fn = if rewrite.ptr_mut {
@@ -2588,11 +2614,11 @@ fn pointer_value_expr(rewrite: &BindingRewrite) -> Expr {
             "std::ptr::null()"
         };
         utils::expr!(
-            "{}.map_or({} as {}, |idx| ({}) as {})",
+            "{}.map_or({} as {}, |___idx| ({}) as {})",
             rewrite.index_name,
             null_fn,
             rewrite.ptr_ty,
-            base_offset_expr_for_index(rewrite, "idx"),
+            base_offset_expr_for_index(rewrite, "___idx"),
             rewrite.ptr_ty
         )
     } else {

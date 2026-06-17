@@ -7947,7 +7947,10 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
         s.contains("q_idx.map_or(std::ptr::null_mut() as *mut i32"),
         "{s}"
     );
-    assert!(s.contains("|idx| ((p).offset(idx)) as *mut i32"), "{s}");
+    assert!(
+        s.contains("|___idx| ((p).offset(___idx)) as *mut i32"),
+        "{s}"
+    );
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
 }
 
@@ -8037,7 +8040,7 @@ pub unsafe fn foo(mut raw: *mut i32, mut take: bool, mut k: isize) -> *mut i32 {
     let compact = s.split_whitespace().collect::<String>();
     assert!(
         compact.contains(
-            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|idx|((raw)[(idx)asusize..]).as_mut_ptr())"
+            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|___idx|((raw)[(___idx)asusize..]).as_mut_ptr())"
         ),
         "{s}"
     );
@@ -8271,6 +8274,66 @@ pub unsafe fn foo(p: &[i32], n: isize) -> i32 {
     assert!(s.contains("q_idx"), "{s}");
     assert!(s.contains("(p).as_ptr().offset"), "{s}");
     assert!(!s.contains("p.offset"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_alias_typed_field_base_as_raw_pointer() {
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut u8,
+}
+
+pub type StatePtr = *mut State;
+
+pub unsafe fn copy_from_back(mut s: StatePtr, mut length: isize, mut distance: isize) -> u8 {
+    let mut src: *mut u8 = (*s).out.offset(-distance);
+    let mut dst: *mut u8 = (*s).out;
+    (*s).out = (*s).out.offset(length);
+    *dst = *src;
+    dst = dst.offset(1);
+    src = src.offset(1);
+    *dst
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(
+        changed,
+        "expected aliased field-base pointer to be rewritten:\n{s}"
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !s.contains("((*s).out).as_ptr()"),
+        "raw pointer field base must not be reconstructed with as_ptr:\n{s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_casts_c_void_base_for_relative_offset_from() {
+    let code = r#"
+pub unsafe fn search(mut array_ptr: *mut core::ffi::c_void, mut item_size: usize, mut lim: usize) -> usize {
+    let mut part: *mut u8 = 0 as *mut u8;
+    let mut array: *mut u8 = array_ptr as *mut u8;
+    let mut base: *mut u8 = array_ptr as *mut u8;
+    while lim != 0 {
+        part = base.offset((lim / 2).wrapping_mul(item_size) as isize);
+        if *part == 0 {
+            base = part;
+            break;
+        }
+        base = part.offset(item_size as isize);
+        lim >>= 1;
+    }
+    base.offset_from(array) as usize
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "expected c_void base cursor to be rewritten:\n{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !s.contains(".offset_from((array_ptr).offset(0isize))"),
+        "relative offset_from must not compare u8 and c_void pointers:\n{s}"
+    );
 }
 
 #[test]
