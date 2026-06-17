@@ -175,6 +175,16 @@ enum ReturnTyItem {
     Option(Param),
 }
 
+fn ast_mut_ptr_pointee_ty_str(ty: &Ty) -> Option<String> {
+    match &ty.kind {
+        TyKind::Ptr(mut_ty) if mut_ty.mutbl == Mutability::Mut => {
+            Some(pprust::ty_to_string(&mut_ty.ty))
+        }
+        TyKind::Paren(ty) => ast_mut_ptr_pointee_ty_str(ty),
+        _ => None,
+    }
+}
+
 pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
@@ -725,6 +735,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             && let Some(func) = self.funcs.get(&local_def_id)
             && !func.index_map.is_empty()
         {
+            let ast_param_ty_strs = fn_item
+                .sig
+                .decl
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, param)| {
+                    ast_mut_ptr_pointee_ty_str(&param.ty).map(|ty| (ParamIdx::from_usize(i), ty))
+                })
+                .collect::<FxHashMap<_, _>>();
+            let param_ty_str = |param: &Param| {
+                ast_param_ty_strs
+                    .get(&param.index)
+                    .unwrap_or(&param.ty_str)
+                    .clone()
+            };
+
             // remove output parameters from input types
             fn_item.sig.decl.inputs = fn_item
                 .sig
@@ -752,13 +779,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             for ret_ty in &func.return_tys {
                 let ret_ty_str = match ret_ty {
                     ReturnTyItem::Orig => pprust::ty_to_string(orig_return_ty.unwrap()),
-                    ReturnTyItem::Type(param) => param.ty_str.clone(),
+                    ReturnTyItem::Type(param) => param_ty_str(param),
                     ReturnTyItem::Result(param) => format!(
                         "Result<{}, {}>",
-                        param.ty_str,
+                        param_ty_str(param),
                         pprust::ty_to_string(orig_return_ty.unwrap())
                     ),
-                    ReturnTyItem::Option(param) => format!("Option<{}>", param.ty_str),
+                    ReturnTyItem::Option(param) => format!("Option<{}>", param_ty_str(param)),
                 };
                 ret_tys.push(ret_ty_str);
             }
@@ -774,17 +801,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             // add value, ref, flag local declarations
             for param in func.index_map.values() {
                 let default_init = &param.default_init;
+                let ty_str = param_ty_str(param);
                 let value_decl = stmt!(
                     "let mut {0}___v: {1} = {2};",
                     param.name,
-                    param.ty_str,
+                    ty_str,
                     default_init
                 );
-                let ref_decl = stmt!(
-                    "let mut {0}: *mut {1} = &mut {0}___v;",
-                    param.name,
-                    param.ty_str
-                );
+                let ref_decl = stmt!("let mut {0}: *mut {1} = &mut {0}___v;", param.name, ty_str);
                 let flag_decl = stmt!("let mut {}___s: bool = false;", param.name);
 
                 let stmts = &mut fn_item.body.as_mut().unwrap().stmts;
