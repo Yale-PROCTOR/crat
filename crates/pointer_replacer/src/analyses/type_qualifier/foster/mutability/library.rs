@@ -74,6 +74,7 @@ pub fn library_call<'tcx>(
             local_decls,
             locals,
             struct_fields,
+            tcx,
             database,
         );
     }
@@ -87,6 +88,7 @@ pub fn library_call<'tcx>(
             local_decls,
             locals,
             struct_fields,
+            tcx,
             database,
         );
     }
@@ -110,6 +112,7 @@ pub fn library_call<'tcx>(
                         local_decls,
                         locals,
                         struct_fields,
+                        tcx,
                         database,
                     );
                 }
@@ -120,6 +123,7 @@ pub fn library_call<'tcx>(
                         local_decls,
                         locals,
                         struct_fields,
+                        tcx,
                         database,
                     );
                 }
@@ -130,6 +134,7 @@ pub fn library_call<'tcx>(
                         local_decls,
                         locals,
                         struct_fields,
+                        tcx,
                         database,
                     );
                 }
@@ -147,6 +152,7 @@ pub fn library_call<'tcx>(
             local_decls,
             locals,
             struct_fields,
+            tcx,
             database,
         );
     }
@@ -158,10 +164,17 @@ fn call_is_null<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     assert!(dest_vars.is_empty());
     // no constraint on args
     let _ = args;
@@ -173,13 +186,20 @@ fn call_offset<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     if let Some(arg) = args[0].node.place() {
         let arg_vars =
-            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, &mut ());
+            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
         let mut dest_arg = dest_vars.zip(arg_vars);
 
         if let Some((dest, arg)) = dest_arg.next() {
@@ -198,10 +218,17 @@ fn call_offset_from<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     assert!(dest_vars.is_empty());
     // no constraint on args
     let _ = args;
@@ -213,13 +240,20 @@ fn call_as_mut_ptr<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     if let Some(arg) = args[0].node.place() {
         let arg_vars =
-            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, &mut ());
+            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
         let mut dest_arg = dest_vars.zip(arg_vars);
 
         if let Some((dest, arg)) = dest_arg.next() {

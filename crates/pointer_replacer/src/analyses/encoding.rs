@@ -14,15 +14,15 @@ pub struct Encoding<Idx> {
     pub contents: VecVec<Idx>,
 }
 
-pub fn encode_structs<Idx, F>(
+pub fn encode_structs<'tcx, Idx, F>(
     initial: Idx,
     structs: &[LocalDefId],
-    tcx: TyCtxt,
+    tcx: TyCtxt<'tcx>,
     mut count_vars: F,
 ) -> (StructFields<Idx>, Idx)
 where
     Idx: Add<usize, Output = Idx> + Clone,
-    F: FnMut(Ty) -> usize,
+    F: FnMut(Ty<'tcx>) -> usize,
 {
     let mut did_idx = FxHashMap::default();
     did_idx.reserve(structs.len());
@@ -56,15 +56,15 @@ where
     )
 }
 
-pub fn encode_fns<Idx, F>(
+pub fn encode_fns<'tcx, Idx, F>(
     initial: Idx,
     fns: &[LocalDefId],
-    tcx: TyCtxt,
+    tcx: TyCtxt<'tcx>,
     mut count_vars: F,
 ) -> (FnLocals<Idx>, Idx)
 where
     Idx: Add<usize, Output = Idx> + Clone,
-    F: FnMut(Ty) -> usize,
+    F: FnMut(Ty<'tcx>) -> usize,
 {
     let mut did_idx = FxHashMap::default();
     did_idx.reserve(fns.len());

@@ -1,8 +1,11 @@
 //! Foster style flow-insensitive type qualifier inference algorithm
 
+use std::ops::Range;
+
 use constraint_system::{BooleanLattice, Var};
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_index::IndexVec;
-use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use rustc_type_ir::TyKind;
 
@@ -27,7 +30,7 @@ pub struct TypeQualifiers<Qualifier> {
     model: IndexVec<Var, Qualifier>,
 }
 
-fn count_ptr(mut ty: Ty) -> usize {
+fn count_ptr<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> usize {
     let mut cnt = 0;
     loop {
         if let Some(inner_ty) = ty.builtin_deref(true) {
@@ -39,11 +42,70 @@ fn count_ptr(mut ty: Ty) -> usize {
             ty = inner_ty;
             continue;
         }
-        if let TyKind::Tuple(tys) = ty.kind() {
-            return cnt + tys.iter().map(|t| count_ptr(t)).sum::<usize>();
+        match ty.kind() {
+            TyKind::Tuple(tys) => {
+                return cnt + tys.iter().map(|t| count_ptr(tcx, t)).sum::<usize>();
+            }
+            TyKind::Adt(adt_def, generic_args) if adt_def.is_enum() => {
+                return cnt
+                    + adt_def
+                        .variants()
+                        .iter()
+                        .map(|variant| variant_ptr_count(tcx, variant, generic_args))
+                        .sum::<usize>();
+            }
+            _ => {}
         }
         break cnt;
     }
+}
+
+fn enum_variant_range<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def: ty::AdtDef<'tcx>,
+    generic_args: ty::GenericArgsRef<'tcx>,
+    base: Range<Var>,
+    variant_idx: VariantIdx,
+) -> Range<Var> {
+    let offset = adt_def
+        .variants()
+        .iter()
+        .take(variant_idx.index())
+        .map(|variant| variant_ptr_count(tcx, variant, generic_args))
+        .sum::<usize>();
+    let count = variant_ptr_count(tcx, adt_def.variant(variant_idx), generic_args);
+    base.start + offset..base.start + offset + count
+}
+
+fn enum_variant_field_range<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def: ty::AdtDef<'tcx>,
+    generic_args: ty::GenericArgsRef<'tcx>,
+    variant_idx: VariantIdx,
+    base: Range<Var>,
+    field_idx: FieldIdx,
+) -> Range<Var> {
+    let variant = adt_def.variant(variant_idx);
+    let offset = variant
+        .fields
+        .iter()
+        .take(field_idx.index())
+        .map(|field| count_ptr(tcx, field.ty(tcx, generic_args)))
+        .sum::<usize>();
+    let count = count_ptr(tcx, variant.fields[field_idx].ty(tcx, generic_args));
+    base.start + offset..base.start + offset + count
+}
+
+fn variant_ptr_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    variant: &ty::VariantDef,
+    generic_args: ty::GenericArgsRef<'tcx>,
+) -> usize {
+    variant
+        .fields
+        .iter()
+        .map(|field| count_ptr(tcx, field.ty(tcx, generic_args)))
+        .sum()
 }
 
 impl<Domain> TypeQualifiers<Domain>
@@ -62,12 +124,12 @@ where Domain: BooleanLattice
         let next: Var = model.next_index();
 
         let (struct_fields, next) = encode_structs(next, structs, tcx, |field_ty| {
-            let num_ptrs = count_ptr(field_ty);
+            let num_ptrs = count_ptr(tcx, field_ty);
             model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });
         let (fn_locals, _) = encode_fns(next, fns, tcx, |local_ty| {
-            let num_ptrs = count_ptr(local_ty);
+            let num_ptrs = count_ptr(tcx, local_ty);
             model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });

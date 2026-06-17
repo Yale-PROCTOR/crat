@@ -4,8 +4,8 @@ use rustc_abi::Size;
 use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
 use rustc_hash::FxHashMap;
 use rustc_middle::mir::{
-    Const, ConstValue, HasLocalDecls, Local, Location, Operand, Place, ProjectionElem, Rvalue,
-    Terminator, visit::Visitor,
+    AggregateKind, Const, ConstValue, HasLocalDecls, Local, Location, Operand, Place,
+    ProjectionElem, Rvalue, Terminator, visit::Visitor,
 };
 use rustc_span::source_map::Spanned;
 use rustc_type_ir::{TyKind, UintTy};
@@ -141,6 +141,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
         let local_decls = self.ctxt.local_decls;
         let locals = self.ctxt.locals;
         let struct_fields = self.ctxt.struct_fields;
+        let tcx = self.ctxt.tcx;
 
         let database = &mut *self.database;
 
@@ -150,8 +151,8 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                     self.string_literals.insert(lhs.local, lit);
                 }
 
-                let lhs = place_vars(lhs, local_decls, locals, struct_fields);
-                let rhs = place_vars(rhs, local_decls, locals, struct_fields);
+                let lhs = place_vars(lhs, local_decls, locals, struct_fields, tcx);
+                let rhs = place_vars(rhs, local_decls, locals, struct_fields, tcx);
 
                 // type safety
                 assert_eq!(
@@ -180,8 +181,8 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 }
 
                 // for cast, we process the head ptr only
-                let lhs = place_vars(lhs, local_decls, locals, struct_fields);
-                let rhs = place_vars(rhs, local_decls, locals, struct_fields);
+                let lhs = place_vars(lhs, local_decls, locals, struct_fields, tcx);
+                let rhs = place_vars(rhs, local_decls, locals, struct_fields, tcx);
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
@@ -199,11 +200,50 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                     self.string_literals.insert(lhs.local, lit);
                 }
 
-                let lhs = place_vars(lhs, local_decls, locals, struct_fields);
-                let rhs = place_vars(rhs, local_decls, locals, struct_fields);
+                let lhs = place_vars(lhs, local_decls, locals, struct_fields, tcx);
+                let rhs = place_vars(rhs, local_decls, locals, struct_fields, tcx);
                 for (lhs, rhs) in lhs.skip(1).zip(rhs) {
                     database.guard(lhs, rhs);
                     database.guard(rhs, lhs);
+                }
+            }
+            Rvalue::Aggregate(box AggregateKind::Adt(_, variant_idx, _, _, _), fields) => {
+                let lhs_vars = place_vars(lhs, local_decls, locals, struct_fields, tcx);
+                let lhs_ty = lhs.ty(local_decls.local_decls(), tcx).ty;
+                let TyKind::Adt(adt_def, generic_args) = lhs_ty.kind() else {
+                    unreachable!("{lhs_ty:?}")
+                };
+                if !adt_def.is_enum() {
+                    return;
+                }
+                let variant = adt_def.variant(*variant_idx);
+                for ((field_idx, _), field) in variant.fields.iter_enumerated().zip(fields) {
+                    let lhs = super::enum_variant_field_range(
+                        tcx,
+                        *adt_def,
+                        generic_args,
+                        *variant_idx,
+                        lhs_vars.clone(),
+                        field_idx,
+                    );
+                    let Some(rhs) = field.place() else {
+                        continue;
+                    };
+                    let rhs = place_vars(&rhs, local_decls, locals, struct_fields, tcx);
+
+                    assert_eq!(
+                        lhs.end.index() - lhs.start.index(),
+                        rhs.end.index() - rhs.start.index()
+                    );
+
+                    let mut lhs_rhs = lhs.zip(rhs);
+                    if let Some((lhs, rhs)) = lhs_rhs.next() {
+                        database.guard(lhs, rhs);
+                    }
+                    for (lhs, rhs) in lhs_rhs {
+                        database.guard(lhs, rhs);
+                        database.guard(rhs, lhs)
+                    }
                 }
             }
             Rvalue::Use(Operand::Constant(c)) => {
@@ -258,7 +298,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                         .contents_iter(callee)
                         .take(callee_body.arg_count + 1);
 
-                    let dest = place_vars(destination, local_decls, locals, struct_fields);
+                    let dest = place_vars(destination, local_decls, locals, struct_fields, tcx);
                     let ret = callee_vars.next().unwrap();
 
                     let mut dest_ret = dest.zip(ret);
@@ -275,7 +315,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                         let Some(arg) = arg.node.place() else {
                             continue;
                         };
-                        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields);
+                        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields, tcx);
 
                         let mut param_arg = param_vars.zip(arg_vars);
                         if let Some((param, arg)) = param_arg.next() {
@@ -296,6 +336,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                         locals,
                         struct_fields,
                         &self.string_literals,
+                        tcx,
                         database,
                     );
                 }
@@ -317,6 +358,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                     local_decls,
                     locals,
                     struct_fields,
+                    tcx,
                     database,
                 ),
             }
@@ -329,22 +371,42 @@ fn place_vars<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
 ) -> Range<Var> {
     let mut place_vars = Range {
         start: locals[place.local.index()],
         end: locals[place.local.index() + 1],
     };
     let mut base_ty = local_decls.local_decls()[place.local].ty;
+    let mut variant = None;
 
     for projection_elem in place.projection {
         match projection_elem {
             ProjectionElem::Deref => {
                 place_vars.start += 1;
                 base_ty = base_ty.builtin_deref(true).unwrap();
+                variant = None;
             }
             ProjectionElem::Field(field, ty) => {
                 match base_ty.kind() {
                     TyKind::Adt(adt_def, _) => {
+                        let generic_args = match base_ty.kind() {
+                            TyKind::Adt(_, generic_args) => *generic_args,
+                            _ => unreachable!(),
+                        };
+                        if let Some(variant_idx) = variant {
+                            place_vars = super::enum_variant_field_range(
+                                tcx,
+                                *adt_def,
+                                generic_args,
+                                variant_idx,
+                                place_vars,
+                                field,
+                            );
+                            base_ty = ty;
+                            variant = None;
+                            continue;
+                        }
                         assert!(place_vars.is_empty());
                         // FIXME correctness?
                         if adt_def.is_union() {
@@ -358,33 +420,44 @@ fn place_vars<'tcx>(
                         place_vars = field_vars;
 
                         base_ty = ty;
+                        variant = None;
                     }
                     TyKind::Tuple(tys) => {
                         let offset: usize = tys
                             .iter()
                             .take(field.index())
-                            .map(|t| super::count_ptr(t))
+                            .map(|t| super::count_ptr(tcx, t))
                             .sum();
-                        let field_count = super::count_ptr(ty);
+                        let field_count = super::count_ptr(tcx, ty);
                         place_vars = Range {
                             start: place_vars.start + offset,
                             end: place_vars.start + offset + field_count,
                         };
                         base_ty = ty;
+                        variant = None;
                     }
                     _ => unreachable!(),
                 }
             }
             ProjectionElem::Index(_) => {
                 base_ty = base_ty.builtin_index().unwrap();
+                variant = None;
             }
             ProjectionElem::ConstantIndex { .. } => unreachable!("unexpected constant index"),
             ProjectionElem::Subslice { .. } => unreachable!("unexpected subslicing"),
             ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
-            ProjectionElem::Downcast(..) => {
-                // happens when asserting nonnullness of fn ptrs
-                assert!(place_vars.is_empty());
-                return place_vars;
+            ProjectionElem::Downcast(_, variant_idx) => {
+                let TyKind::Adt(adt_def, generic_args) = base_ty.kind() else {
+                    unreachable!("{base_ty:?}")
+                };
+                if !adt_def.is_enum() {
+                    // happens when asserting nonnullness of fn ptrs
+                    assert!(place_vars.is_empty());
+                    return place_vars;
+                }
+                place_vars =
+                    super::enum_variant_range(tcx, *adt_def, generic_args, place_vars, variant_idx);
+                variant = Some(variant_idx);
             }
             ProjectionElem::UnwrapUnsafeBinder(_) => unreachable!("unexpected UnwrapUnsafeBinder"),
             ProjectionElem::Subtype(_) => unreachable!("unexpected Subtype"),
@@ -400,9 +473,10 @@ pub(crate) fn conservative_call<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
-    let dest_var = place_vars(destination, local_decls, locals, struct_fields);
+    let dest_var = place_vars(destination, local_decls, locals, struct_fields, tcx);
 
     for var in dest_var {
         database.bottom(var);
@@ -412,7 +486,7 @@ pub(crate) fn conservative_call<'tcx>(
         let Some(arg) = arg.node.place() else {
             continue;
         };
-        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields);
+        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields, tcx);
         for var in arg_vars {
             database.bottom(var);
         }

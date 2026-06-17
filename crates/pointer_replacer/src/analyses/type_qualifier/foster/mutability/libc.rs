@@ -1,4 +1,7 @@
-use rustc_middle::mir::{HasLocalDecls, Operand, Place};
+use rustc_middle::{
+    mir::{HasLocalDecls, Operand, Place},
+    ty::TyCtxt,
+};
 use rustc_span::{Symbol, source_map::Spanned};
 
 use super::{EnsureNoDeref, MutCtxt, Mutability, conservative_call, place_vars};
@@ -14,6 +17,7 @@ pub fn libc_call<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
     match callee.as_str() {
@@ -25,6 +29,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -36,6 +41,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -48,6 +54,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -59,6 +66,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -70,6 +78,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -83,6 +92,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -95,13 +105,26 @@ fn call_memcpy<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     if let Some(memcpy_dest) = args[0].node.place() {
-        let memcpy_dest =
-            place_vars::<EnsureNoDeref>(&memcpy_dest, local_decls, locals, struct_fields, &mut ());
+        let memcpy_dest = place_vars::<EnsureNoDeref>(
+            &memcpy_dest,
+            local_decls,
+            locals,
+            struct_fields,
+            tcx,
+            &mut (),
+        );
 
         assert!(memcpy_dest.end > memcpy_dest.start);
         database.bottom(memcpy_dest.start);
@@ -123,14 +146,21 @@ fn call_strchr<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
 
     if let Some(arg) = args[0].node.place() {
         let arg_vars =
-            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, &mut ());
+            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
         let mut dest_arg = dest_vars.zip(arg_vars);
 
         if let Some((dest, arg)) = dest_arg.next() {
@@ -149,10 +179,12 @@ fn call_sprintf<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
     if let Some(arg) = args[0].node.place() {
-        let arg = place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, &mut ());
+        let arg =
+            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
 
         assert!(arg.end > arg.start);
         database.bottom(arg.start);
@@ -165,15 +197,22 @@ fn call_scanf<'tcx, const MUT_START: usize>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Mutability>,
 ) {
-    let dest_vars =
-        place_vars::<MutCtxt>(destination, local_decls, locals, struct_fields, database);
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
     assert!(dest_vars.is_empty());
     for arg in &args[MUT_START..] {
         if let Some(arg) = arg.node.place() {
             let arg =
-                place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, &mut ());
+                place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
 
             assert!(arg.end > arg.start);
             database.bottom(arg.start);

@@ -5,7 +5,7 @@ use rustc_hir::{
     intravisit::{Visitor, walk_expr, walk_stmt},
 };
 use rustc_middle::{
-    mir::{Local, Operand, Rvalue, StatementKind},
+    mir::{AggregateKind, Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind},
     ty::{self, TyCtxt},
 };
 use rustc_span::def_id::LocalDefId;
@@ -56,6 +56,10 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
             .tcx
             .mir_drops_elaborated_and_const_checked(did)
             .borrow();
+        let unsupported_enum_payload_raw_locals =
+            collect_unsupported_enum_payload_raw_locals(body, rust_program.tcx);
+        let unsupported_enum_payload_raw_bindings =
+            collect_unsupported_enum_payload_raw_bindings(rust_program.tcx, *did);
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
         let input_len = rust_program
@@ -77,6 +81,10 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
 
         for (local, decl) in body.local_decls.iter_enumerated().skip(1) {
             let is_input = local.index() <= input_len;
+            let hir_id = local_to_binding.get(&local).copied();
+            let unsupported_enum_payload_raw = unsupported_enum_payload_raw_locals.contains(&local)
+                || hir_id
+                    .is_some_and(|hir_id| unsupported_enum_payload_raw_bindings.contains(&hir_id));
             let sig_input_dec = local
                 .index()
                 .checked_sub(1)
@@ -133,6 +141,22 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                     }],
                 });
                 Some(returned_kind)
+            } else if unsupported_enum_payload_raw {
+                let Some((_, mutability)) = super::transform::unwrap_ptr_from_mir_ty(decl.ty)
+                else {
+                    unreachable!("{:?}", decl.ty)
+                };
+                let kind = PtrKind::Raw(mutability.is_mut());
+                decision_info = Some(DecisionInfo {
+                    kind: Some(kind),
+                    events: vec![super::decision::DecisionInfoEvent {
+                        before: None,
+                        after: Some(kind),
+                        reason: DecisionReason::UnsupportedEnumPayload,
+                        detail: None,
+                    }],
+                });
+                Some(kind)
             } else {
                 let info = decision_maker.decide_with_info(local, decl, aliases);
                 let decision = info.kind;
@@ -141,7 +165,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
             };
 
             if let Some(mut ptr_kind) = decision {
-                let Some(hir_id) = local_to_binding.get(&local) else {
+                let Some(hir_id) = hir_id else {
                     continue;
                 };
                 if !is_input
@@ -152,14 +176,14 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         diagnostics,
                         DecisionSubject::Local {
                             did: *did,
-                            hir_id: *hir_id,
+                            hir_id,
                             local,
                         },
                         DecisionStage::Initial,
                         info,
                     );
                 }
-                if !is_input && let Some(init) = binding_inits.get(hir_id).copied() {
+                if !is_input && let Some(init) = binding_inits.get(&hir_id).copied() {
                     if let Some(alias_kind) = cursor_field_offset_alias_kind(
                         rust_program.tcx,
                         analysis,
@@ -170,7 +194,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         record_local_collection_event(
                             diagnostics.as_deref_mut(),
                             *did,
-                            *hir_id,
+                            hir_id,
                             local,
                             ptr_kind,
                             alias_kind,
@@ -189,7 +213,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                             record_local_collection_event(
                                 diagnostics.as_deref_mut(),
                                 *did,
-                                *hir_id,
+                                hir_id,
                                 local,
                                 ptr_kind,
                                 alias_kind,
@@ -206,7 +230,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                             record_local_collection_event(
                                 diagnostics.as_deref_mut(),
                                 *did,
-                                *hir_id,
+                                hir_id,
                                 local,
                                 ptr_kind,
                                 alias_kind,
@@ -216,11 +240,11 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         }
                     }
                 }
-                if non_outermost_owning_locals.contains(hir_id) && ptr_kind.is_owning_box_like() {
+                if non_outermost_owning_locals.contains(&hir_id) && ptr_kind.is_owning_box_like() {
                     record_local_collection_event(
                         diagnostics.as_deref_mut(),
                         *did,
-                        *hir_id,
+                        hir_id,
                         local,
                         ptr_kind,
                         PtrKind::Raw(ptr_kind.is_mut()),
@@ -228,12 +252,120 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                     );
                     ptr_kind = PtrKind::Raw(ptr_kind.is_mut());
                 }
-                ptr_kinds.insert(*hir_id, ptr_kind);
+                ptr_kinds.insert(hir_id, ptr_kind);
             }
         }
     }
 
     ptr_kinds
+}
+
+fn collect_unsupported_enum_payload_raw_locals<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> FxHashSet<Local> {
+    let mut locals = FxHashSet::default();
+    for stmt in body
+        .basic_blocks
+        .iter()
+        .flat_map(|block| block.statements.iter())
+    {
+        let StatementKind::Assign(box (destination, rvalue)) = &stmt.kind else {
+            continue;
+        };
+        match rvalue {
+            Rvalue::Aggregate(box AggregateKind::Adt(..), operands) if matches!(destination.ty(body, tcx).ty.kind(), ty::TyKind::Adt(adt_def, _) if adt_def.is_enum()) => {
+                for operand in operands {
+                    if let Some(place) = operand.place() {
+                        insert_direct_raw_pointer_local(body, tcx, &place, &mut locals);
+                    }
+                }
+            }
+            Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs)
+                if place_has_downcast(rhs) =>
+            {
+                insert_direct_raw_pointer_local(body, tcx, destination, &mut locals);
+            }
+            _ => {}
+        }
+    }
+    locals
+}
+
+fn insert_direct_raw_pointer_local<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    place: &Place<'tcx>,
+    locals: &mut FxHashSet<Local>,
+) {
+    if place.projection.is_empty()
+        && body.local_decls[place.local].ty.is_raw_ptr()
+        && place.ty(body, tcx).ty.is_raw_ptr()
+    {
+        locals.insert(place.local);
+    }
+}
+
+fn place_has_downcast(place: &Place<'_>) -> bool {
+    place
+        .projection
+        .iter()
+        .any(|elem| matches!(elem, ProjectionElem::Downcast(..)))
+}
+
+fn collect_unsupported_enum_payload_raw_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: LocalDefId,
+) -> FxHashSet<HirId> {
+    struct EnumPayloadVisitor<'a, 'tcx> {
+        typeck: &'a ty::TypeckResults<'tcx>,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for EnumPayloadVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && is_enum_variant_ctor(callee)
+            {
+                for arg in args {
+                    if self.typeck.expr_ty_adjusted(arg).is_raw_ptr()
+                        && let Some(hir_id) = local_path_hir_id(arg)
+                    {
+                        self.bindings.insert(hir_id);
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let typeck = tcx.typeck(did);
+    let mut visitor = EnumPayloadVisitor {
+        typeck,
+        bindings: FxHashSet::default(),
+    };
+    visitor.visit_body(tcx.hir_body_owned_by(did));
+    visitor.bindings
+}
+
+fn is_enum_variant_ctor(expr: &hir::Expr<'_>) -> bool {
+    let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else {
+        return false;
+    };
+    matches!(
+        path.res,
+        Res::Def(DefKind::Ctor(hir::def::CtorOf::Variant, _), _)
+    )
+}
+
+fn local_path_hir_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else {
+        return None;
+    };
+    let Res::Local(hir_id) = path.res else {
+        return None;
+    };
+    Some(hir_id)
 }
 
 fn record_decision_info(

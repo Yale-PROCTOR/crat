@@ -9603,3 +9603,69 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "{s}"
     );
 }
+
+#[test]
+fn test_array_local_rewriter_handles_result_pointer_payload() {
+    let code = r#"
+pub static mut GLOBAL: i32 = 0;
+
+pub unsafe fn foo(mut x: i32) -> Result<*mut i32, i32> {
+    let mut p___s: bool = false;
+    let mut p___v: *mut i32 = core::ptr::null_mut();
+    let mut p: *mut *mut i32 = &mut p___v;
+    if x != 0 {
+        let mut q: *mut i32 = &raw mut GLOBAL;
+        { p___s = true; *p = q };
+        return if p___s { Ok(p___v) } else { Err(0) };
+    } else {
+        return if p___s { Ok(p___v) } else { Err(1) };
+    };
+}
+
+pub unsafe fn bar() {
+    let mut p: *mut i32 = core::ptr::null_mut();
+    let mut x: i32 =
+        match { let rv___ = foo(1); rv___ } {
+            Ok(v___) => { *(&mut p) = v___; 0 }
+            Err(v___) => v___,
+        };
+    let _ = x;
+    let _ = p;
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn test_replace_local_borrows_handles_result_pointer_payload() {
+    let code = r#"
+pub static mut GLOBAL: i32 = 0;
+
+pub unsafe fn foo(mut x: i32) -> Result<*mut i32, i32> {
+    let mut p___s: bool = false;
+    let mut p___v: *mut i32 = core::ptr::null_mut();
+    let mut p: *mut *mut i32 = &mut p___v;
+    if x != 0 {
+        let mut q: *mut i32 = &raw mut GLOBAL;
+        { p___s = true; *p = q };
+        return if p___s { Ok(p___v) } else { Err(0) };
+    } else {
+        return if p___s { Ok(p___v) } else { Err(1) };
+    };
+}
+
+pub unsafe fn bar() {
+    let mut p: *mut i32 = core::ptr::null_mut();
+    let mut x: i32 =
+        match { let rv___ = foo(1); rv___ } {
+            Ok(v___) => { *(&mut p) = v___; 0 }
+            Err(v___) => v___,
+        };
+    let _ = x;
+    let _ = p;
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}

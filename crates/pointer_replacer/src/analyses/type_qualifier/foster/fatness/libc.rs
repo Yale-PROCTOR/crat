@@ -1,5 +1,8 @@
 use rustc_hash::FxHashMap;
-use rustc_middle::mir::{HasLocalDecls, Local, Operand, Place};
+use rustc_middle::{
+    mir::{HasLocalDecls, Local, Operand, Place},
+    ty::TyCtxt,
+};
 use rustc_span::{Symbol, source_map::Spanned};
 use utils::file::{fprintf, fscanf};
 
@@ -18,6 +21,7 @@ pub fn libc_call<'tcx>(
     locals: &[Var],
     struct_fields: &StructFields,
     string_literals: &FxHashMap<Local, &[u8]>,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
     match callee.as_str() {
@@ -29,6 +33,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -40,6 +45,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -51,12 +57,13 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
         // all ptr args are fat, no dest effect
         "strcmp" | "strcasecmp" | "strcspn" | "fopen" => {
-            mark_args_bottom(args, local_decls, locals, struct_fields, database);
+            mark_args_bottom(args, local_decls, locals, struct_fields, tcx, database);
         }
         // first 2 ptr args are fat, no dest effect
         "strncmp" | "strncasecmp" | "memcmp" | "setenv" | "rename" => {
@@ -65,6 +72,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
@@ -76,12 +84,13 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
         }
         // TODO generate constraints when the first argument is not 1
         "calloc" => {
-            let dest_vars = place_vars(destination, local_decls, locals, struct_fields);
+            let dest_vars = place_vars(destination, local_decls, locals, struct_fields, tcx);
             assert!(!dest_vars.is_empty());
         }
         // first arg is a fat buffer, rest are printf-like
@@ -91,6 +100,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
             call_printf(
@@ -99,6 +109,7 @@ pub fn libc_call<'tcx>(
                 locals,
                 struct_fields,
                 string_literals,
+                tcx,
                 database,
             );
         }
@@ -109,6 +120,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
             call_printf(
@@ -117,6 +129,7 @@ pub fn libc_call<'tcx>(
                 locals,
                 struct_fields,
                 string_literals,
+                tcx,
                 database,
             );
         }
@@ -126,6 +139,7 @@ pub fn libc_call<'tcx>(
             locals,
             struct_fields,
             string_literals,
+            tcx,
             database,
         ),
         "fprintf" => call_printf(
@@ -134,6 +148,7 @@ pub fn libc_call<'tcx>(
             locals,
             struct_fields,
             string_literals,
+            tcx,
             database,
         ),
         "scanf" => call_scanf(
@@ -142,6 +157,7 @@ pub fn libc_call<'tcx>(
             locals,
             struct_fields,
             string_literals,
+            tcx,
             database,
         ),
         "fscanf" => call_scanf(
@@ -150,6 +166,7 @@ pub fn libc_call<'tcx>(
             locals,
             struct_fields,
             string_literals,
+            tcx,
             database,
         ),
         "sscanf" => {
@@ -158,6 +175,7 @@ pub fn libc_call<'tcx>(
                 local_decls,
                 locals,
                 struct_fields,
+                tcx,
                 database,
             );
             call_scanf(
@@ -166,6 +184,7 @@ pub fn libc_call<'tcx>(
                 locals,
                 struct_fields,
                 string_literals,
+                tcx,
                 database,
             );
         }
@@ -179,13 +198,14 @@ fn mark_dest_and_args_bottom<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
-    let dest_vars = place_vars(destination, local_decls, locals, struct_fields);
+    let dest_vars = place_vars(destination, local_decls, locals, struct_fields, tcx);
     assert!(!dest_vars.is_empty());
     database.bottom(dest_vars.start);
 
-    mark_args_bottom(args, local_decls, locals, struct_fields, database);
+    mark_args_bottom(args, local_decls, locals, struct_fields, tcx, database);
 }
 
 fn mark_args_bottom<'tcx>(
@@ -193,10 +213,11 @@ fn mark_args_bottom<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
     for ptr in args.iter().filter_map(|arg| arg.node.place()) {
-        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields, tcx);
         assert!(!ptr_vars.is_empty());
         database.bottom(ptr_vars.start);
     }
@@ -208,6 +229,7 @@ fn call_printf<'tcx>(
     locals: &[Var],
     struct_fields: &StructFields,
     string_literals: &FxHashMap<Local, &[u8]>,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
     let [fmt, args @ ..] = args else { panic!() };
@@ -221,7 +243,7 @@ fn call_printf<'tcx>(
             if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
                 continue;
             }
-            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields, tcx);
             assert!(!ptr_vars.is_empty());
             database.bottom(ptr_vars.start);
         }
@@ -234,6 +256,7 @@ fn call_scanf<'tcx>(
     locals: &[Var],
     struct_fields: &StructFields,
     string_literals: &FxHashMap<Local, &[u8]>,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
     let [fmt, args @ ..] = args else { panic!() };
@@ -250,7 +273,7 @@ fn call_scanf<'tcx>(
             if !local_decls.local_decls()[ptr.local].ty.is_raw_ptr() {
                 continue;
             }
-            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+            let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields, tcx);
             assert!(!ptr_vars.is_empty());
             database.bottom(ptr_vars.start);
         }

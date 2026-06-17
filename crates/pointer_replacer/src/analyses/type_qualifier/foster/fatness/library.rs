@@ -40,6 +40,7 @@ pub fn library_call<'tcx>(
                             local_decls,
                             locals,
                             struct_fields,
+                            tcx,
                             database,
                         )
                     }
@@ -50,6 +51,7 @@ pub fn library_call<'tcx>(
                             local_decls,
                             locals,
                             struct_fields,
+                            tcx,
                             database,
                         )
                     }
@@ -68,11 +70,12 @@ fn call_offset<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
-    let dest_vars = place_vars(destination, local_decls, locals, struct_fields);
+    let dest_vars = place_vars(destination, local_decls, locals, struct_fields, tcx);
     if let Some(arg) = args[0].node.place() {
-        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields);
+        let arg_vars = place_vars(&arg, local_decls, locals, struct_fields, tcx);
         let mut dest_arg = dest_vars.zip(arg_vars);
 
         if let Some((_, arg)) = dest_arg.next() {
@@ -91,13 +94,14 @@ fn call_offset_from<'tcx>(
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
     database: &mut BooleanSystem<Fatness>,
 ) {
-    let dest_vars = place_vars(destination, local_decls, locals, struct_fields);
+    let dest_vars = place_vars(destination, local_decls, locals, struct_fields, tcx);
     assert!(dest_vars.is_empty());
     // no constraint on args
     for ptr in args.iter().filter_map(|arg| arg.node.place()) {
-        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields);
+        let ptr_vars = place_vars(&ptr, local_decls, locals, struct_fields, tcx);
         assert!(!ptr_vars.is_empty());
         database.bottom(ptr_vars.start);
     }
