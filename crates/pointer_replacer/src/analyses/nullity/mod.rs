@@ -796,56 +796,104 @@ struct SingleParamAnalyzer<'a, 'tcx> {
 
 impl<'a, 'tcx> SingleParamAnalyzer<'a, 'tcx> {
     fn proves_non_null(mut self, param: Local) -> bool {
-        self.prove_from(
-            Location::START,
-            Aliases::new(param),
-            &mut FxHashSet::default(),
-        )
+        self.prove_from(Location::START, Aliases::new(param))
     }
 
-    fn prove_from(
-        &mut self,
-        location: Location,
-        aliases: Aliases,
-        path: &mut FxHashSet<TraversalKey>,
-    ) -> bool {
-        let key = TraversalKey::new(location, &aliases);
-        if self.positive_memo.contains(&key) {
-            return true;
-        }
-        if !path.insert(key.clone()) {
-            return false;
+    fn prove_from(&mut self, location: Location, aliases: Aliases) -> bool {
+        let mut path = FxHashSet::default();
+        let mut stack = vec![ProofFrame::new(location, aliases)];
+        let mut child_result = None;
+
+        while let Some(frame) = stack.last() {
+            if let Some(result) = child_result.take() {
+                let action = stack.last_mut().unwrap().handle_child_result(result);
+                self.apply_frame_action(action, &mut stack, &mut path, &mut child_result);
+                continue;
+            }
+
+            let ProofFrameState::Enter(location) = &frame.state else {
+                break;
+            };
+            let location = *location;
+
+            if self.positive_memo.contains(&frame.key) {
+                stack.pop();
+                child_result = Some(true);
+                continue;
+            }
+
+            if !path.insert(frame.key.clone()) {
+                stack.pop();
+                child_result = Some(false);
+                continue;
+            }
+
+            stack.last_mut().unwrap().in_path = true;
+            let aliases = stack.last().unwrap().aliases.clone();
+            let action = match self.proof_step(location, aliases) {
+                ProofStep::Proof => FrameAction::Complete(true),
+                ProofStep::Barrier => FrameAction::Complete(false),
+                ProofStep::Continue(location, aliases) => {
+                    stack.last_mut().unwrap().state = ProofFrameState::AwaitSingle;
+                    FrameAction::Push(location, aliases)
+                }
+                ProofStep::Successors(successors, aliases) => {
+                    let location = Location {
+                        block: successors[0],
+                        statement_index: 0,
+                    };
+                    stack.last_mut().unwrap().state = ProofFrameState::AwaitSuccessors {
+                        successors,
+                        next: 1,
+                    };
+                    FrameAction::Push(location, aliases)
+                }
+            };
+            self.apply_frame_action(action, &mut stack, &mut path, &mut child_result);
         }
 
-        let proved = self.prove_from_uncached(location, aliases, path);
-
-        path.remove(&key);
-        if proved {
-            self.positive_memo.insert(key);
-        }
-        proved
+        child_result.unwrap_or(false)
     }
 
-    fn prove_from_uncached(
+    fn apply_frame_action(
         &mut self,
-        location: Location,
-        aliases: Aliases,
+        action: FrameAction,
+        stack: &mut Vec<ProofFrame>,
         path: &mut FxHashSet<TraversalKey>,
-    ) -> bool {
+        child_result: &mut Option<bool>,
+    ) {
+        match action {
+            FrameAction::Complete(proved) => {
+                let frame = stack.pop().unwrap();
+                if frame.in_path {
+                    path.remove(&frame.key);
+                    if proved {
+                        self.positive_memo.insert(frame.key);
+                    }
+                }
+                *child_result = Some(proved);
+            }
+            FrameAction::Push(location, aliases) => {
+                stack.push(ProofFrame::new(location, aliases));
+            }
+        }
+    }
+
+    fn proof_step(&mut self, location: Location, aliases: Aliases) -> ProofStep {
         let block = &self.body.basic_blocks[location.block];
         if location.statement_index < block.statements.len() {
             return match self
                 .transfer_statement(&block.statements[location.statement_index], aliases)
             {
-                Step::Proof => true,
-                Step::Barrier => false,
+                Step::Proof => ProofStep::Proof,
+                Step::Barrier => ProofStep::Barrier,
                 Step::Continue(aliases) => {
-                    self.prove_from(location.successor_within_block(), aliases, path)
+                    ProofStep::Continue(location.successor_within_block(), aliases)
                 }
             };
         }
 
-        self.transfer_terminator(block.terminator(), aliases, path)
+        self.transfer_terminator(block.terminator(), aliases)
     }
 
     fn transfer_statement(&self, statement: &Statement<'tcx>, mut aliases: Aliases) -> Step {
@@ -881,35 +929,29 @@ impl<'a, 'tcx> SingleParamAnalyzer<'a, 'tcx> {
         Step::Continue(aliases)
     }
 
-    fn transfer_terminator(
-        &mut self,
-        terminator: &Terminator<'tcx>,
-        aliases: Aliases,
-        path: &mut FxHashSet<TraversalKey>,
-    ) -> bool {
+    fn transfer_terminator(&self, terminator: &Terminator<'tcx>, aliases: Aliases) -> ProofStep {
         if let Some(call) = terminator.as_call(self.tcx) {
-            return self.transfer_call(terminator, call, aliases, path);
+            return self.transfer_call(terminator, call, aliases);
         }
 
         if terminator_derefs_alias(terminator, &aliases) {
-            return true;
+            return ProofStep::Proof;
         }
 
-        self.prove_successors(terminator.successors(), aliases, path)
+        self.successor_step(terminator.successors(), aliases)
     }
 
     fn transfer_call(
-        &mut self,
+        &self,
         terminator: &Terminator<'tcx>,
         call: MirFunctionCall<'_, 'tcx>,
         aliases: Aliases,
-        path: &mut FxHashSet<TraversalKey>,
-    ) -> bool {
+    ) -> ProofStep {
         let mut alias_arg_indices = vec![];
 
         for (idx, arg) in call.args.iter().enumerate() {
             if operand_derefs_alias(&arg.node, &aliases) {
-                return true;
+                return ProofStep::Proof;
             }
             if operand_contains_alias_value(&arg.node, &aliases) {
                 alias_arg_indices.push(idx);
@@ -917,18 +959,22 @@ impl<'a, 'tcx> SingleParamAnalyzer<'a, 'tcx> {
         }
 
         if place_derefs_alias(&call.destination, &aliases) {
-            return true;
+            return ProofStep::Proof;
         }
 
         if !alias_arg_indices.is_empty() {
-            return self.call_requires_non_null(&call.func, &alias_arg_indices);
+            return if self.call_requires_non_null(&call.func, &alias_arg_indices) {
+                ProofStep::Proof
+            } else {
+                ProofStep::Barrier
+            };
         }
 
         if call.destination.projection.is_empty() && aliases.contains(call.destination.local) {
-            return false;
+            return ProofStep::Barrier;
         }
 
-        self.prove_successors(terminator.successors(), aliases, path)
+        self.successor_step(terminator.successors(), aliases)
     }
 
     fn call_requires_non_null(&self, func: &CallKind, alias_arg_indices: &[usize]) -> bool {
@@ -951,27 +997,17 @@ impl<'a, 'tcx> SingleParamAnalyzer<'a, 'tcx> {
         }
     }
 
-    fn prove_successors(
-        &mut self,
+    fn successor_step(
+        &self,
         successors: impl Iterator<Item = BasicBlock>,
         aliases: Aliases,
-        path: &mut FxHashSet<TraversalKey>,
-    ) -> bool {
+    ) -> ProofStep {
         let successors = successors.collect::<Vec<_>>();
         if successors.is_empty() {
-            return false;
+            return ProofStep::Barrier;
         }
 
-        successors.into_iter().all(|block| {
-            self.prove_from(
-                Location {
-                    block,
-                    statement_index: 0,
-                },
-                aliases.clone(),
-                path,
-            )
-        })
+        ProofStep::Successors(successors, aliases)
     }
 }
 
@@ -979,6 +1015,66 @@ enum Step {
     Proof,
     Barrier,
     Continue(Aliases),
+}
+
+enum ProofStep {
+    Proof,
+    Barrier,
+    Continue(Location, Aliases),
+    Successors(Vec<BasicBlock>, Aliases),
+}
+
+enum FrameAction {
+    Complete(bool),
+    Push(Location, Aliases),
+}
+
+struct ProofFrame {
+    key: TraversalKey,
+    aliases: Aliases,
+    state: ProofFrameState,
+    in_path: bool,
+}
+
+impl ProofFrame {
+    fn new(location: Location, aliases: Aliases) -> Self {
+        Self {
+            key: TraversalKey::new(location, &aliases),
+            aliases,
+            state: ProofFrameState::Enter(location),
+            in_path: false,
+        }
+    }
+
+    fn handle_child_result(&mut self, result: bool) -> FrameAction {
+        match &mut self.state {
+            ProofFrameState::Enter(_) => unreachable!(),
+            ProofFrameState::AwaitSingle => FrameAction::Complete(result),
+            ProofFrameState::AwaitSuccessors { successors, next } => {
+                if !result {
+                    return FrameAction::Complete(false);
+                }
+                if *next == successors.len() {
+                    return FrameAction::Complete(true);
+                }
+                let location = Location {
+                    block: successors[*next],
+                    statement_index: 0,
+                };
+                *next += 1;
+                FrameAction::Push(location, self.aliases.clone())
+            }
+        }
+    }
+}
+
+enum ProofFrameState {
+    Enter(Location),
+    AwaitSingle,
+    AwaitSuccessors {
+        successors: Vec<BasicBlock>,
+        next: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
