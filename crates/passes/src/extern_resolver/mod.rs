@@ -237,7 +237,7 @@ struct Cast<'tcx> {
     target_ty: ty::Ty<'tcx>,
 }
 
-/// Compare two types for equality, considering that ADT def_ids in `resolve_map`
+/// Compare two types for equality, considering that def_ids in `resolve_map`
 /// that map to the same representative should be treated as equal.
 fn tys_equal_after_resolution<'tcx>(
     ty1: ty::Ty<'tcx>,
@@ -269,6 +269,9 @@ fn tys_equal_after_resolution<'tcx>(
             c1 == c2 && tys_equal_after_resolution(*t1, *t2, resolve_map)
         }
         (Slice(t1), Slice(t2)) => tys_equal_after_resolution(*t1, *t2, resolve_map),
+        (Foreign(def_id1), Foreign(def_id2)) => {
+            resolve_def_id(*def_id1, resolve_map) == resolve_def_id(*def_id2, resolve_map)
+        }
         _ => ty1 == ty2,
     }
 }
@@ -331,6 +334,14 @@ fn ty_to_string_after_resolution<'tcx>(
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{path_str}<{args}>")
+            }
+        }
+        Foreign(def_id) => {
+            let def_id = resolve_def_id(*def_id, resolve_map);
+            if def_id.is_local() {
+                format!("crate::{}", tcx.def_path_str(def_id))
+            } else {
+                tcx.def_path_str(def_id)
             }
         }
         RawPtr(ty, mutability) => {

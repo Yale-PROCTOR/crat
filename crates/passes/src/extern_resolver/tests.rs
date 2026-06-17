@@ -484,6 +484,56 @@ fn test_ignore_param_type_ref_arg_casts_via_resolved_extern_type() {
 }
 
 #[test]
+fn test_ignore_param_type_resolved_foreign_type() {
+    run_extern_test(
+        "
+    #![feature(extern_types)]
+    mod a {
+        extern \"C\" {
+            pub type o;
+        }
+        pub type o_alias = o;
+        pub type opaque_ptr = *mut o_alias;
+        #[no_mangle]
+        pub unsafe extern \"C\" fn same(_: *mut opaque_ptr) -> core::ffi::c_int {
+            1
+        }
+        #[no_mangle]
+        pub unsafe extern \"C\" fn needs_cast(_: *const opaque_ptr) -> core::ffi::c_int {
+            2
+        }
+    }
+    mod b {
+        extern \"C\" {
+            pub type o;
+            pub fn same(_: *mut opaque_ptr) -> core::ffi::c_int;
+            pub fn needs_cast(_: *mut opaque_ptr) -> core::ffi::c_int;
+        }
+        pub type o_alias = o;
+        pub type opaque_ptr = *mut o_alias;
+        #[no_mangle]
+        pub unsafe extern \"C\" fn foo() -> core::ffi::c_int {
+            let mut x: opaque_ptr = 0 as *mut o_alias;
+            same(&mut x) + needs_cast(&mut x)
+        }
+    }
+",
+        super::Config {
+            ignore_param_type: true,
+            ..Default::default()
+        },
+        &[
+            "same(&mut x)",
+            "needs_cast((&mut x) as *mut *mut crate::a::o",
+            "*const *mut crate::a::o)",
+            "use crate::a::needs_cast",
+            "use crate::a::same",
+        ],
+        &["crate::b::o", "pub fn same", "pub fn needs_cast"],
+    );
+}
+
+#[test]
 fn test_ignore_param_type_resolved_adt() {
     run_extern_test(
         "
