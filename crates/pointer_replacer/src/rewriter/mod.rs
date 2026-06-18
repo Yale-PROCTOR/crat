@@ -64,6 +64,8 @@ pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
+    pub test_serialization: bool,
     #[cfg(test)]
     pub force_ownership_analysis_failure: bool,
 }
@@ -152,6 +154,12 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         offset_sign_result,
         nullity_result,
         struct_copy_result,
+    };
+    let analysis_results = if config.test_serialization {
+        let serialized = serializer::serialize_analysis(&analysis_results);
+        serializer::deserialize_analysis(serialized)
+    } else {
+        analysis_results
     };
 
     let fn_ptr_groups = FnPtrGroups::build(

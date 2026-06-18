@@ -119,6 +119,11 @@ struct Args {
         help = "Enable verbose ownership solver output for the pointer pass"
     )]
     pointer_verbose: bool,
+    #[arg(
+        long,
+        help = "Round-trip pointer analysis through the serializable mirror format"
+    )]
+    pointer_test_serialization: bool,
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -234,6 +239,7 @@ fn main() {
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
     config.pointer.verbose |= args.pointer_verbose;
+    config.pointer.test_serialization |= args.pointer_test_serialization;
     config.passes.extend(args.pass);
     if args.analysis.is_some() {
         config.analysis = args.analysis;
