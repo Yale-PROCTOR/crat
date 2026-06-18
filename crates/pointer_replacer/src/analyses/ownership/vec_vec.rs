@@ -3,8 +3,8 @@ use std::alloc::{Allocator, Global};
 /// A vector of non-growable-after-construction vecs: `Vec<Vec<I>>`
 #[derive(Clone, Debug)]
 pub struct VecVec<I, A: Allocator = Global> {
-    indices: Vec<usize, A>,
-    data: Vec<I, A>,
+    pub(crate) indices: Vec<usize, A>,
+    pub(crate) data: Vec<I, A>,
 }
 
 impl<I, A: Allocator> std::ops::Index<usize> for VecVec<I, A> {

@@ -58,21 +58,21 @@ pub struct LifetimeFlowSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct FieldPlace {
-    base: Local,
-    deref_depth: u8,
-    field: StructFieldSlot,
+pub(crate) struct FieldPlace {
+    pub(crate) base: Local,
+    pub(crate) deref_depth: u8,
+    pub(crate) field: StructFieldSlot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum LifetimeOwner {
+pub(crate) enum LifetimeOwner {
     Local(Local),
     Field(FieldPlace),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalSlot {
-    owner: LifetimeOwner,
+    pub(crate) owner: LifetimeOwner,
     pub depth: u8,
 }
 
@@ -90,7 +90,7 @@ enum DerivedPlaceElem {
 #[derive(Clone, Debug)]
 pub struct BodyLifetimeFlow {
     pub slots: IndexVec<LifetimeSlot, LocalSlot>,
-    slot_map: FxHashMap<(LifetimeOwner, u8), LifetimeSlot>,
+    pub(crate) slot_map: FxHashMap<(LifetimeOwner, u8), LifetimeSlot>,
     pub value_flows: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub storage_aliases: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub unknown_targets: DenseBitSet<LifetimeSlot>,

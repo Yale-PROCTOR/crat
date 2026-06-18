@@ -4,11 +4,11 @@ pub mod whole_program;
 
 mod assoc;
 mod call_graph;
-mod discretization;
+pub(crate) mod discretization;
 mod ptr;
 pub mod ssa;
 mod struct_ctxt;
-mod vec_vec;
+pub(crate) mod vec_vec;
 
 use rustc_middle::mir::Body;
 use serde::{Deserialize, Serialize};

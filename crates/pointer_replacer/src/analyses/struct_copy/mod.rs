@@ -13,8 +13,8 @@ use crate::{analyses::borrow::StructFieldSlot, utils::rustc::RustProgram};
 
 #[derive(Debug, Default)]
 pub struct StructCopyAnalysisResult {
-    copy_impl_structs: FxHashSet<LocalDefId>,
-    copy_removable_structs: FxHashSet<LocalDefId>,
+    pub(crate) copy_impl_structs: FxHashSet<LocalDefId>,
+    pub(crate) copy_removable_structs: FxHashSet<LocalDefId>,
 }
 
 impl StructCopyAnalysisResult {

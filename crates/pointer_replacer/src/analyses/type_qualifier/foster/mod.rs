@@ -25,9 +25,9 @@ pub type StructFields = encoding::StructFields<Var>;
 pub type FnLocals = encoding::FnLocals<Var>;
 
 pub struct TypeQualifiers<Qualifier> {
-    struct_fields: StructFields,
-    fn_locals: FnLocals,
-    model: IndexVec<Var, Qualifier>,
+    pub(crate) struct_fields: StructFields,
+    pub(crate) fn_locals: FnLocals,
+    pub(crate) model: IndexVec<Var, Qualifier>,
 }
 
 fn count_ptr<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> usize {

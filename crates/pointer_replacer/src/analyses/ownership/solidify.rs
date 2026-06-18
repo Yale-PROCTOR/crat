@@ -31,9 +31,9 @@ rustc_index::newtype_index! {
 pub type SolidifiedOwnershipSchemes = TypeQualifiers<Ownership>;
 
 pub struct TypeQualifiers<Qualifier> {
-    struct_fields: discretization::StructFields<Var>,
-    fn_locals: discretization::FnLocals<Var>,
-    model: IndexVec<Var, Qualifier>,
+    pub(crate) struct_fields: discretization::StructFields<Var>,
+    pub(crate) fn_locals: discretization::FnLocals<Var>,
+    pub(crate) model: IndexVec<Var, Qualifier>,
 }
 
 impl<Qualifier> TypeQualifiers<Qualifier> {

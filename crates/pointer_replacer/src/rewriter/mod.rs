@@ -38,6 +38,7 @@ pub(crate) mod collector;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod lifetimes;
+pub(crate) mod serializer;
 mod struct_array_field_pre;
 mod transform;
 
