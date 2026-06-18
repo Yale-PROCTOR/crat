@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use anyhow::Context;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     Idx, IndexVec,
@@ -235,6 +238,20 @@ pub fn serialize_analysis(analysis: &Analysis) -> SerializableAnalysis {
         nullity_result: serialize_nullity_result(&analysis.nullity_result),
         struct_copy_result: serialize_struct_copy_analysis_result(&analysis.struct_copy_result),
     }
+}
+
+pub fn dump_analysis_to_file(analysis: &Analysis, path: &Path) -> anyhow::Result<()> {
+    let serialized = serialize_analysis(analysis);
+    let bytes = postcard::to_stdvec(&serialized).context("serialize pointer analysis")?;
+    std::fs::write(path, bytes)
+        .with_context(|| format!("write pointer analysis to {}", path.display()))
+}
+
+pub fn load_analysis_from_file(path: &Path) -> anyhow::Result<Analysis> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read pointer analysis from {}", path.display()))?;
+    let serialized = postcard::from_bytes(&bytes).context("deserialize pointer analysis")?;
+    Ok(deserialize_analysis(serialized))
 }
 
 pub fn deserialize_analysis(serialized: SerializableAnalysis) -> Analysis {

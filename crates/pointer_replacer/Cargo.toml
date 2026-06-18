@@ -17,6 +17,7 @@ tracing.workspace = true
 etrace.workspace = true
 typed-arena.workspace = true
 serde.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 similar = "2.7.0"

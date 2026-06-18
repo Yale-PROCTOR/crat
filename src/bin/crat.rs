@@ -124,6 +124,10 @@ struct Args {
         help = "Round-trip pointer analysis through the serializable mirror format"
     )]
     pointer_test_serialization: bool,
+    #[arg(long, help = "Dump pointer analysis to a postcard-encoded file")]
+    pointer_dump_analysis_to: Option<PathBuf>,
+    #[arg(long, help = "Load pointer analysis from a postcard-encoded file")]
+    pointer_load_analysis_from: Option<PathBuf>,
     #[arg(short, long, help = "Enable verbose output")]
     verbose: bool,
     #[arg(long, value_delimiter = ',', help = "Transformation passes to run")]
@@ -240,6 +244,12 @@ fn main() {
     config.inplace |= args.inplace;
     config.pointer.verbose |= args.pointer_verbose;
     config.pointer.test_serialization |= args.pointer_test_serialization;
+    if args.pointer_dump_analysis_to.is_some() {
+        config.pointer.dump_analysis_to = args.pointer_dump_analysis_to;
+    }
+    if args.pointer_load_analysis_from.is_some() {
+        config.pointer.load_analysis_from = args.pointer_load_analysis_from;
+    }
     config.passes.extend(args.pass);
     if args.analysis.is_some() {
         config.analysis = args.analysis;

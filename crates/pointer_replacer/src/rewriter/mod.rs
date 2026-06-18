@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use etrace::some_or;
 use points_to::andersen;
 use rustc_ast::mut_visit::MutVisitor;
@@ -66,6 +68,10 @@ pub struct Config {
     pub verbose: bool,
     #[serde(default)]
     pub test_serialization: bool,
+    #[serde(default)]
+    pub dump_analysis_to: Option<PathBuf>,
+    #[serde(default)]
+    pub load_analysis_from: Option<PathBuf>,
     #[cfg(test)]
     pub force_ownership_analysis_failure: bool,
 }
@@ -109,51 +115,61 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     };
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-    let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
-    let points_to = andersen::post_analyze(
-        &andersen_config,
-        pre_points_to.clone(),
-        points_to_solutions.clone(),
-        &tss,
-        tcx,
-    );
 
-    let mutability_result =
-        analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
-    let output_params =
-        analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
-    let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
-    let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
-    let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-    let borrow_promotion_result =
-        analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
-    let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
-    let struct_copy_result =
-        analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
-    let promoted_mut_ref_result = source_var_groups
-        .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
-    let promoted_shared_ref_result = source_var_groups
-        .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
-    let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
-    let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
-    offset_sign_result.access_signs =
-        source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
-    let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
-    nullity_result.non_null_locals =
-        source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
-    let analysis_results = Analysis {
-        borrow_promotion_result,
-        borrow_lifetime_flows,
-        promoted_mut_ref_result,
-        promoted_shared_ref_result,
-        mutability_result,
-        fatness_result,
-        aliases,
-        output_params,
-        ownership_schemes,
-        offset_sign_result,
-        nullity_result,
-        struct_copy_result,
+    let analysis_results = if let Some(path) = &config.load_analysis_from {
+        serializer::load_analysis_from_file(path).unwrap_or_else(|err| {
+            panic!(
+                "failed to load pointer analysis from {}: {err:#}",
+                path.display()
+            )
+        })
+    } else {
+        let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+        let points_to = andersen::post_analyze(
+            &andersen_config,
+            pre_points_to.clone(),
+            points_to_solutions.clone(),
+            &tss,
+            tcx,
+        );
+
+        let mutability_result =
+            analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
+        let output_params =
+            analyses::output_params::compute_output_params(&input, &mutability_result, &aliases);
+        let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
+        let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
+        let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
+        let borrow_promotion_result =
+            analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
+        let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
+        let struct_copy_result =
+            analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
+        let promoted_mut_ref_result = source_var_groups
+            .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
+        let promoted_shared_ref_result = source_var_groups
+            .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
+        let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
+        let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
+        offset_sign_result.access_signs =
+            source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+        let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
+        nullity_result.non_null_locals =
+            source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+        Analysis {
+            borrow_promotion_result,
+            borrow_lifetime_flows,
+            promoted_mut_ref_result,
+            promoted_shared_ref_result,
+            mutability_result,
+            fatness_result,
+            aliases,
+            output_params,
+            ownership_schemes,
+            offset_sign_result,
+            nullity_result,
+            struct_copy_result,
+        }
     };
     let analysis_results = if config.test_serialization {
         let serialized = serializer::serialize_analysis(&analysis_results);
@@ -161,6 +177,14 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     } else {
         analysis_results
     };
+    if let Some(path) = &config.dump_analysis_to {
+        serializer::dump_analysis_to_file(&analysis_results, path).unwrap_or_else(|err| {
+            panic!(
+                "failed to dump pointer analysis to {}: {err:#}",
+                path.display()
+            )
+        });
+    }
 
     let fn_ptr_groups = FnPtrGroups::build(
         &pre_points_to,
