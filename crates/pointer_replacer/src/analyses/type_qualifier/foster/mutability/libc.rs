@@ -10,6 +10,7 @@ use crate::analyses::type_qualifier::foster::{
     constraint_system::{BooleanSystem, ConstraintSystem},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn libc_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],

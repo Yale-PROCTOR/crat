@@ -1078,8 +1078,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(true)));
                 let [arg] = &mut args[..] else { panic!() };
-                let [hir_arg] = &hir_args[..] else { panic!() };
-                self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
+                let [hir_arg] = hir_args[..] else { panic!() };
+                self.transform_ptr(arg, &hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
             }
             ExprKind::Ret(Some(ret)) => {
                 let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
