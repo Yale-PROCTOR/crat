@@ -6326,6 +6326,34 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_deref_if_slice_else_null() {
+    run_test(
+        r#"
+use ::libc;
+
+pub const NULL: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+
+pub unsafe extern "C" fn foo(take_slot: bool) -> libc::c_int {
+    let mut buf: [libc::c_int; 4] = [0; 4];
+    let mut p: *mut libc::c_int = buf.as_mut_ptr();
+    let mut size: usize = 0;
+    *p.offset(1 as isize) = 11 as libc::c_int;
+    *((if take_slot {
+        let fresh = size;
+        size = size.wrapping_add(1);
+        &mut *p.offset(fresh as isize) as *mut libc::c_int as *mut core::ffi::c_void
+    } else {
+        NULL
+    }) as *mut libc::c_int) = 7 as libc::c_int;
+    return buf[0];
+}
+"#,
+        &["panic!()", "[0]", "&mut [i32]"],
+        &[],
+    );
+}
+
 // ===== transform_ptr code path tests: null literal, if-else, block, cast_int =====
 
 /// Null literal (`0 as *mut T`) assigned to OptRef pointer → `None`.

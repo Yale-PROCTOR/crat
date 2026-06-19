@@ -3751,6 +3751,35 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         visitor.found
     }
 
+    fn finish_transformed_if_ptr(
+        &self,
+        ptr: &mut Expr,
+        transformed_if: Expr,
+        hir_ptr: &hir::Expr<'tcx>,
+        ctx: PtrCtx,
+        kind: PtrKind,
+    ) {
+        if let (PtrCtx::Deref(_), PtrKind::Slice(m)) = (ctx, kind) {
+            let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
+            let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
+            let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
+            if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+                && let Some(rhs_inner_ty) = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
+                && lhs_inner_ty != rhs_inner_ty
+            {
+                *ptr = utils::expr!(
+                    "std::slice::from_raw_parts{0}(({1}).as{0}_ptr() as *{2} {3}, 1_000_000)",
+                    if m { "_mut" } else { "" },
+                    pprust::expr_to_string(&transformed_if),
+                    if m { "mut" } else { "const" },
+                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                );
+                return;
+            }
+        }
+        *ptr = transformed_if;
+    }
+
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
         let allocator_root_expr = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr)).clone();
         let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
@@ -3766,7 +3795,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             let hir::ExprKind::Block(hir_t, _) = hir_t.kind else {
                 panic!("{}", pprust::expr_to_string(e));
             };
-            let kind1 = self.transform_ptr(t, hir_t.expr.unwrap(), ctx);
+            let hir_t_expr = hir_t.expr.unwrap();
+            let t_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_t_expr);
+            let kind1 = self.transform_ptr(t, hir_t_expr, ctx);
             let kind2 = if let ExprKind::Block(f, _) = &mut f.kind {
                 let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else {
                     panic!("{}", pprust::expr_to_string(e));
@@ -3774,12 +3805,53 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 let hir::ExprKind::Block(hir_f, _) = hir_f.kind else {
                     panic!("{}", pprust::expr_to_string(e));
                 };
-                self.transform_ptr(f, hir_f.expr.unwrap(), ctx)
+                let hir_f_expr = hir_f.expr.unwrap();
+                let f_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_f_expr);
+                let kind2 = self.transform_ptr(f, hir_f_expr, ctx);
+                if kind1 != kind2
+                    && let PtrCtx::Deref(m) = ctx
+                    && !t_is_null
+                    && f_is_null
+                    && kind2 == PtrKind::Raw(m)
+                {
+                    **f = utils::expr!("panic!()");
+                    let transformed_if = e.clone();
+                    self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+                    return kind1;
+                }
+                kind2
             } else {
+                let f_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_f);
                 // if-else chain
-                self.transform_ptr(f, hir_f, ctx)
+                let kind2 = self.transform_ptr(f, hir_f, ctx);
+                if kind1 != kind2
+                    && let PtrCtx::Deref(m) = ctx
+                    && !t_is_null
+                    && f_is_null
+                    && kind2 == PtrKind::Raw(m)
+                {
+                    **f = utils::expr!("panic!()");
+                    let transformed_if = e.clone();
+                    self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+                    return kind1;
+                }
+                kind2
             };
+            if kind1 != kind2
+                && let PtrCtx::Deref(m) = ctx
+                && t_is_null
+                && kind1 == PtrKind::Raw(m)
+            {
+                **t = utils::expr!("panic!()");
+                let transformed_if = e.clone();
+                self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind2);
+                return kind2;
+            }
             assert_eq!(kind1, kind2);
+            if !matches!(kind1, PtrKind::Raw(_)) {
+                let transformed_if = e.clone();
+                self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+            }
             return kind1;
         }
 
