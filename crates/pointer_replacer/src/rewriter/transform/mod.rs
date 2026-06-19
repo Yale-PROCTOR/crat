@@ -14800,6 +14800,7 @@ fn collect_raw_field_source_bindings(
 enum OwnershipFieldBlockReason {
     NonRawFieldType,
     NonScalarPointee,
+    ArrayLikeOwningField,
     CVoidOrFilePointee,
     UnsupportedStructLiteralRhs,
     UnsupportedAssignmentRhs,
@@ -14811,9 +14812,10 @@ enum OwnershipFieldBlockReason {
 }
 
 impl OwnershipFieldBlockReason {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::NonRawFieldType,
         Self::NonScalarPointee,
+        Self::ArrayLikeOwningField,
         Self::CVoidOrFilePointee,
         Self::UnsupportedStructLiteralRhs,
         Self::UnsupportedAssignmentRhs,
@@ -14829,6 +14831,7 @@ impl OwnershipFieldBlockReason {
         match self {
             Self::NonRawFieldType => "non_raw_field_type",
             Self::NonScalarPointee => "non_scalar_pointee",
+            Self::ArrayLikeOwningField => "array_like_owning_field",
             Self::CVoidOrFilePointee => "c_void_or_file_pointee",
             Self::UnsupportedStructLiteralRhs => "unsupported_struct_literal_rhs",
             Self::UnsupportedAssignmentRhs => "unsupported_assignment_rhs",
@@ -14897,6 +14900,9 @@ fn owning_struct_field_scalar_inner_ty<'tcx>(
 ) -> Option<Result<ty::Ty<'tcx>, OwnershipFieldBlockReason>> {
     if !struct_field_is_exactly_owning(analysis, field) {
         return None;
+    }
+    if analysis_field_is_array_like(analysis, field) {
+        return Some(Err(OwnershipFieldBlockReason::ArrayLikeOwningField));
     }
 
     let struct_ty = tcx.type_of(field.struct_did).skip_binder();
@@ -15554,6 +15560,7 @@ fn ownership_reason_to_decision_reason(reason: OwnershipFieldBlockReason) -> Dec
     match reason {
         OwnershipFieldBlockReason::NonRawFieldType => DecisionReason::NonRawFieldType,
         OwnershipFieldBlockReason::NonScalarPointee => DecisionReason::NonScalarPointee,
+        OwnershipFieldBlockReason::ArrayLikeOwningField => DecisionReason::ArrayLikeOwningField,
         OwnershipFieldBlockReason::CVoidOrFilePointee => DecisionReason::CVoidOrFilePointee,
         OwnershipFieldBlockReason::UnsupportedStructLiteralRhs => {
             DecisionReason::UnsupportedStructLiteralRhs

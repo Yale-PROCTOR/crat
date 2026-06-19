@@ -186,6 +186,7 @@ pub enum DecisionReason {
     BorrowFieldConflictDemotion,
     NonRawFieldType,
     NonScalarPointee,
+    ArrayLikeOwningField,
     UnsupportedStructLiteralRhs,
     UnsupportedAssignmentRhs,
     UnsupportedCallRhs,
@@ -286,6 +287,7 @@ impl DecisionReason {
             Self::BorrowFieldConflictDemotion => "borrow_field_conflict_demotion",
             Self::NonRawFieldType => "non_raw_field_type",
             Self::NonScalarPointee => "non_scalar_pointee",
+            Self::ArrayLikeOwningField => "array_like_owning_field",
             Self::UnsupportedStructLiteralRhs => "unsupported_struct_literal_rhs",
             Self::UnsupportedAssignmentRhs => "unsupported_assignment_rhs",
             Self::UnsupportedCallRhs => "unsupported_call_rhs",
@@ -464,6 +466,7 @@ impl DecisionDiagnostics {
                     DecisionReason::OwnershipFieldSelectedOptBox => ownership_selected += 1,
                     DecisionReason::NonRawFieldType
                     | DecisionReason::NonScalarPointee
+                    | DecisionReason::ArrayLikeOwningField
                     | DecisionReason::UnsupportedStructLiteralRhs
                     | DecisionReason::UnsupportedAssignmentRhs
                     | DecisionReason::UnsupportedCallRhs

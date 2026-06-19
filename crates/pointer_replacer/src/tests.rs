@@ -1854,6 +1854,46 @@ pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
 }
 
 #[test]
+fn test_rewriter_keeps_array_like_owning_struct_field_raw_for_slice_call_arg() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).p = malloc(std::mem::size_of::<i32>());
+}
+
+pub unsafe fn read(p: *mut i32) -> i32 {
+    *p.offset(1)
+}
+
+pub unsafe fn drive(owner: *mut Holder) -> i32 {
+    read((*owner).p)
+}
+
+pub unsafe fn release(owner: *mut Holder) {
+    free((*owner).p as *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub p: *mut i32",
+            "pub unsafe fn read(p: &[i32]) -> i32",
+            "std::slice::from_raw_parts",
+            "free(owner.p as *mut core::ffi::c_void);",
+        ],
+        &["pub p: Option<Box<i32>>"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_negative_offset_struct_field_to_slice_cursor() {
     run_test(
         r#"
