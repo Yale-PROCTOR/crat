@@ -1072,10 +1072,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 args,
                 ..
             }) if seg.ident.name.as_str() == "offset_from" => {
-                let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx).unwrap();
+                let hir_expr = self.ast_to_hir.get_expr(expr.id, self.tcx).unwrap();
+                let hir::ExprKind::MethodCall(_, hir_receiver, hir_args, _) = hir_expr.kind else {
+                    panic!("{hir_expr:?}")
+                };
                 self.transform_ptr(receiver, hir_receiver, PtrCtx::Rhs(PtrKind::Raw(true)));
                 let [arg] = &mut args[..] else { panic!() };
-                let hir_arg = self.ast_to_hir.get_expr(arg.id, self.tcx).unwrap();
+                let [hir_arg] = &hir_args[..] else { panic!() };
                 self.transform_ptr(arg, hir_arg, PtrCtx::Rhs(PtrKind::Raw(true)));
             }
             ExprKind::Ret(Some(ret)) => {

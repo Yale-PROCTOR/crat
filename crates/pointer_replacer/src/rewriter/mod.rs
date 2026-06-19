@@ -45,9 +45,7 @@ mod struct_array_field_pre;
 mod transform;
 
 pub struct Analysis {
-    #[allow(dead_code)]
     pub(crate) borrow_promotion_result: BorrowPromotionResults,
-    #[allow(dead_code)]
     pub(crate) borrow_lifetime_flows: LifetimeFlowResults,
     pub(crate) promoted_mut_ref_result: PromotedMutRefResult,
     pub(crate) promoted_shared_ref_result: PromotedMutRefResult,
