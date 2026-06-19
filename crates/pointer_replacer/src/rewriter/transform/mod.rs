@@ -3551,6 +3551,31 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
     }
 
+    fn transform_integer_to_pointer_cast(
+        &self,
+        ptr: &mut Expr,
+        uncast_expr: &str,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        ctx: PtrCtx,
+    ) -> PtrKind {
+        // Integer-derived pointers have no Rust provenance to promote.
+        match ctx {
+            PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
+                *ptr = utils::expr!(
+                    "{} as *{} {}",
+                    uncast_expr,
+                    if m { "mut" } else { "const" },
+                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                );
+                PtrKind::Raw(m)
+            }
+            PtrCtx::Rhs(_) => panic!(
+                "cannot rewrite integer-to-pointer cast as non-raw pointer: {}",
+                pprust::expr_to_string(ptr)
+            ),
+        }
+    }
+
     fn transform_promoted_field_rhs(
         &self,
         rhs: &mut Expr,
@@ -4029,6 +4054,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     );
                 }
             }
+        } else if unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx).is_none()
+            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+        {
+            let uncast_expr = pprust::expr_to_string(e);
+            return self.transform_integer_to_pointer_cast(ptr, &uncast_expr, lhs_inner_ty, ctx);
         } else {
             panic!("{}", pprust::expr_to_string(ptr));
         };
@@ -4102,6 +4132,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 _ => panic!("{}", pprust::expr_to_string(ptr)),
             }
+        }
+
+        if unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx).is_none()
+            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+        {
+            let uncast_expr = pprust::expr_to_string(e);
+            return self.transform_integer_to_pointer_cast(ptr, &uncast_expr, lhs_inner_ty, ctx);
         }
 
         let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or_else(|| {

@@ -6549,6 +6549,38 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_intptr_to_raw_c_void_arg_stays_raw() {
+    run_test(
+        r#"
+pub type intptr_t = isize;
+
+unsafe extern "C" fn compare_and_swap(
+    ptr: *mut *mut core::ffi::c_void,
+    oldval: *mut core::ffi::c_void,
+    newval: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    let foundval: *mut core::ffi::c_void = *ptr;
+    if foundval == oldval {
+        *ptr = newval;
+    }
+    foundval
+}
+
+pub unsafe extern "C" fn foo(slot: *mut intptr_t, value: intptr_t) {
+    let oldval: intptr_t = *slot;
+    compare_and_swap(
+        slot as *mut *mut core::ffi::c_void,
+        oldval as *mut core::ffi::c_void,
+        value as *mut core::ffi::c_void,
+    );
+}
+"#,
+        &["oldval as *mut", "value as *mut"],
+        &[],
+    );
+}
+
 // ===== as_ptr + Raw context tests (lines 549-565) =====
 
 /// as_ptr + Raw, no cast: overlapping borrows from `.as_mut_ptr()` demote both
