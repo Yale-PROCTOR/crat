@@ -7175,6 +7175,20 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_bytestr_direct_deref_numeric_cast() {
+    run_test(
+        r#"
+use ::libc;
+pub unsafe extern "C" fn foo() -> libc::c_int {
+    return *(b"alnum\x00" as *const u8 as *const libc::c_char) as libc::c_int;
+}
+"#,
+        &["bytemuck::cast_slice::<_, i8>", ".first().unwrap()"],
+        &["*const libc::c_char"],
+    );
+}
+
 /// ByteStr + Slice, u8: byte string with offset → Slice. `lhs_inner_ty == u8`
 /// → expression cloned.
 #[test]

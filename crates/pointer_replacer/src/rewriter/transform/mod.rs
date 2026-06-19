@@ -5224,7 +5224,21 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                     return PtrKind::Slice(m);
                 }
-                PtrCtx::Deref(_) => panic!(),
+                PtrCtx::Deref(m) => {
+                    assert!(!m, "{}", pprust::expr_to_string(ptr));
+                    if lhs_inner_ty == self.tcx.types.u8 {
+                        *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
+                    } else {
+                        assert!(lhs_inner_ty.is_numeric());
+                        self.bytemuck.set(true);
+                        *ptr = utils::expr!(
+                            "bytemuck::cast_slice::<_, {}>({}).first()",
+                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            pprust::expr_to_string(e),
+                        );
+                    }
+                    return PtrKind::OptRef(m);
+                }
             }
         }
 
