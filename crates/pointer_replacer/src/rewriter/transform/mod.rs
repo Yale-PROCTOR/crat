@@ -30,7 +30,7 @@ use utils::{
 use super::{
     Analysis, BytemuckDependency, Config,
     collector::{collect_diffs, collect_diffs_with_diagnostics},
-    decision::{PtrKind, SigDecision, SigDecisions},
+    decision::{PtrKind, SigDecision, SigDecisions, pointee_forces_raw},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
@@ -2027,6 +2027,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if struct_field_pointee_forces_raw(self.tcx, field) {
+            return None;
+        }
         let kind = if struct_field_is_exactly_owning(self.analysis, field) {
             self.ownership_field_kind(field)
         } else {
@@ -2079,6 +2082,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         } else {
             return None;
         };
+        if struct_field_pointee_forces_raw(self.tcx, field) {
+            return None;
+        }
         if self.field_is_array_like(field) {
             if self.field_cursor_fields.contains(&field) {
                 Some(PtrKind::SliceCursor(mutability))
@@ -2270,6 +2276,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     Some(DecisionReason::CExposedThinAbiField)
                 } else if self.c_exposed_cursor_abi_fields.contains(&field) {
                     Some(DecisionReason::CExposedCursorAbiField)
+                } else if struct_field_pointee_forces_raw(self.tcx, field) {
+                    Some(DecisionReason::OpaqueOrUnsizedPointee)
                 } else {
                     None
                 };
@@ -14934,6 +14942,7 @@ enum OwnershipFieldBlockReason {
     NonScalarPointee,
     ArrayLikeOwningField,
     CVoidOrFilePointee,
+    OpaqueOrUnsizedPointee,
     UnsupportedStructLiteralRhs,
     UnsupportedAssignmentRhs,
     UnsupportedCallRhs,
@@ -14944,11 +14953,12 @@ enum OwnershipFieldBlockReason {
 }
 
 impl OwnershipFieldBlockReason {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::NonRawFieldType,
         Self::NonScalarPointee,
         Self::ArrayLikeOwningField,
         Self::CVoidOrFilePointee,
+        Self::OpaqueOrUnsizedPointee,
         Self::UnsupportedStructLiteralRhs,
         Self::UnsupportedAssignmentRhs,
         Self::UnsupportedCallRhs,
@@ -14965,6 +14975,7 @@ impl OwnershipFieldBlockReason {
             Self::NonScalarPointee => "non_scalar_pointee",
             Self::ArrayLikeOwningField => "array_like_owning_field",
             Self::CVoidOrFilePointee => "c_void_or_file_pointee",
+            Self::OpaqueOrUnsizedPointee => "opaque_or_unsized_pointee",
             Self::UnsupportedStructLiteralRhs => "unsupported_struct_literal_rhs",
             Self::UnsupportedAssignmentRhs => "unsupported_assignment_rhs",
             Self::UnsupportedCallRhs => "unsupported_call_rhs",
@@ -15053,6 +15064,13 @@ fn owning_struct_field_scalar_inner_ty<'tcx>(
     };
     if inner_ty.is_c_void(tcx) || utils::file::contains_file_ty(*inner_ty, tcx) {
         return Some(Err(OwnershipFieldBlockReason::CVoidOrFilePointee));
+    }
+    if pointee_forces_raw(
+        tcx,
+        ty::TypingEnv::post_analysis(tcx, field.struct_did),
+        *inner_ty,
+    ) {
+        return Some(Err(OwnershipFieldBlockReason::OpaqueOrUnsizedPointee));
     }
     if matches!(
         inner_ty.kind(),
@@ -15694,6 +15712,9 @@ fn ownership_reason_to_decision_reason(reason: OwnershipFieldBlockReason) -> Dec
         OwnershipFieldBlockReason::NonScalarPointee => DecisionReason::NonScalarPointee,
         OwnershipFieldBlockReason::ArrayLikeOwningField => DecisionReason::ArrayLikeOwningField,
         OwnershipFieldBlockReason::CVoidOrFilePointee => DecisionReason::CVoidOrFilePointee,
+        OwnershipFieldBlockReason::OpaqueOrUnsizedPointee => {
+            DecisionReason::OpaqueOrUnsizedPointee
+        }
         OwnershipFieldBlockReason::UnsupportedStructLiteralRhs => {
             DecisionReason::UnsupportedStructLiteralRhs
         }
@@ -15901,6 +15922,7 @@ fn apply_field_storage_input_lifetimes(
         fn record_storage(&mut self, field: StructFieldSlot, rhs: &hir::Expr<'_>) {
             if !matches!(
                 borrow_promoted_array_field_kind(
+                    self.tcx,
                     self.analysis,
                     self.demoted_fields,
                     self.field_cursor_fields,
@@ -15981,12 +16003,16 @@ fn apply_field_storage_input_lifetimes(
 }
 
 fn borrow_promoted_array_field_kind(
+    tcx: TyCtxt<'_>,
     analysis: &Analysis,
     demoted_fields: &FxHashSet<StructFieldSlot>,
     field_cursor_fields: &FxHashSet<StructFieldSlot>,
     field: StructFieldSlot,
 ) -> Option<PtrKind> {
-    if demoted_fields.contains(&field) || struct_field_is_exactly_owning(analysis, field) {
+    if demoted_fields.contains(&field)
+        || struct_field_is_exactly_owning(analysis, field)
+        || struct_field_pointee_forces_raw(tcx, field)
+    {
         return None;
     }
     let mutability = if analysis
@@ -16020,6 +16046,30 @@ fn analysis_field_is_array_like(analysis: &Analysis, field: StructFieldSlot) -> 
         .struct_facts(field.struct_did)
         .nth(field.field_index)
         .is_some_and(|fatnesses| fatnesses.iter().any(|fatness| fatness.is_arr()))
+}
+
+fn struct_field_raw_pointee_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    field: StructFieldSlot,
+) -> Option<ty::Ty<'tcx>> {
+    let struct_ty = tcx.type_of(field.struct_did).skip_binder();
+    let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+        return None;
+    };
+    let field_ty = adt_def
+        .all_fields()
+        .nth(field.field_index)
+        .map(|field| field.ty(tcx, args))?;
+    let ty::TyKind::RawPtr(inner_ty, _) = field_ty.kind() else {
+        return None;
+    };
+    Some(*inner_ty)
+}
+
+fn struct_field_pointee_forces_raw(tcx: TyCtxt<'_>, field: StructFieldSlot) -> bool {
+    struct_field_raw_pointee_ty(tcx, field).is_some_and(|pointee| {
+        pointee_forces_raw(tcx, ty::TypingEnv::post_analysis(tcx, field.struct_did), pointee)
+    })
 }
 
 fn hir_field_base_local_id(hir_expr: &hir::Expr<'_>) -> Option<HirId> {

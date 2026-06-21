@@ -109,6 +109,7 @@ impl DecisionStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecisionReason {
     CVoidOrFilePointee,
+    OpaqueOrUnsizedPointee,
     MutableAliasCluster,
     OwningArrayOutputParam,
     OwningArrayLocalStruct,
@@ -206,6 +207,7 @@ impl DecisionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CVoidOrFilePointee => "c_void_or_file_pointee",
+            Self::OpaqueOrUnsizedPointee => "opaque_or_unsized_pointee",
             Self::MutableAliasCluster => "mutable_alias_cluster",
             Self::OwningArrayOutputParam => "owning_array_output_param",
             Self::OwningArrayLocalStruct => "owning_array_local_struct",
@@ -467,6 +469,7 @@ impl DecisionDiagnostics {
                     DecisionReason::NonRawFieldType
                     | DecisionReason::NonScalarPointee
                     | DecisionReason::ArrayLikeOwningField
+                    | DecisionReason::OpaqueOrUnsizedPointee
                     | DecisionReason::UnsupportedStructLiteralRhs
                     | DecisionReason::UnsupportedAssignmentRhs
                     | DecisionReason::UnsupportedCallRhs

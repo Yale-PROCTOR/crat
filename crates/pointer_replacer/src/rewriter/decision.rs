@@ -88,6 +88,7 @@ impl PtrKind {
 
 pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     mutable_pointers: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
     _owning_pointers: IndexVec<Local, bool>,
@@ -184,6 +185,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             .unwrap_or_else(|| DenseBitSet::new_empty(mutable_pointers.len()));
         DecisionMaker {
             tcx,
+            typing_env: ty::TypingEnv::post_analysis(tcx, did),
             array_pointers,
             mutable_pointers,
             _owning_pointers,
@@ -223,6 +225,11 @@ impl<'tcx> DecisionMaker<'tcx> {
                 (
                     Some(PtrKind::Raw(m.is_mut())),
                     DecisionReason::CVoidOrFilePointee,
+                )
+            } else if pointee_forces_raw(self.tcx, self.typing_env, ty) {
+                (
+                    Some(PtrKind::Raw(m.is_mut())),
+                    DecisionReason::OpaqueOrUnsizedPointee,
                 )
             } else if aliases.is_some_and(|aliases| {
                 std::iter::once(local)
@@ -367,6 +374,14 @@ impl<'tcx> DecisionMaker<'tcx> {
             events,
         }
     }
+}
+
+pub(crate) fn pointee_forces_raw<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    pointee: ty::Ty<'tcx>,
+) -> bool {
+    matches!(pointee.kind(), ty::TyKind::Foreign(_)) || !pointee.is_sized(tcx, typing_env)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1113,6 +1128,7 @@ mod tests {
 
         DecisionMaker {
             tcx,
+            typing_env: ty::TypingEnv::fully_monomorphized(),
             mutable_pointers,
             array_pointers,
             _owning_pointers: owning_pointers,

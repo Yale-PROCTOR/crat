@@ -9991,6 +9991,123 @@ pub const COMMAND: Command = Command {
 }
 
 #[test]
+fn test_section4_keeps_opaque_out_param_local_raw() {
+    run_test(
+        r#"
+#![feature(extern_types)]
+
+extern "C" {
+    pub type git_branch_iterator;
+    pub fn memset(dst: *mut core::ffi::c_void, value: i32, len: usize) -> *mut core::ffi::c_void;
+    pub fn git_branch_iterator_new(out: *mut *mut git_branch_iterator) -> i32;
+    pub fn git_branch_iterator_free(iter: *mut git_branch_iterator);
+}
+
+pub unsafe extern "C" fn list_branches() -> i32 {
+    let mut iter: *mut git_branch_iterator = 0 as *mut git_branch_iterator;
+    if git_branch_iterator_new(&mut iter) < 0 {
+        return -1;
+    }
+    memset(iter as *mut core::ffi::c_void, 0, 1);
+    git_branch_iterator_free(iter);
+    return 0;
+}
+"#,
+        &[
+            "let mut iter: *mut crate::git_branch_iterator",
+            "memset(iter as *mut core::ffi::c_void, 0, 1);",
+            "git_branch_iterator_free(iter);",
+        ],
+        &[
+            "&mut [crate::git_branch_iterator]",
+            "&mut [git_branch_iterator]",
+        ],
+    );
+}
+
+#[test]
+fn test_section4_keeps_opaque_foreign_api_handle_raw() {
+    run_test(
+        r#"
+#![feature(extern_types)]
+
+extern "C" {
+    pub type __dirstream;
+    pub fn memset(dst: *mut core::ffi::c_void, value: i32, len: usize) -> *mut core::ffi::c_void;
+    pub fn open_dir() -> *mut DIR;
+    pub fn read_dir(dir: *mut DIR) -> i32;
+    pub fn close_dir(dir: *mut DIR) -> i32;
+}
+
+pub type DIR = __dirstream;
+
+pub unsafe extern "C" fn scan_dir() -> i32 {
+    let mut dir: *mut DIR = open_dir();
+    if dir.is_null() {
+        return -1;
+    }
+    memset(dir as *mut core::ffi::c_void, 0, 1);
+    if read_dir(dir) < 0 {
+        close_dir(dir);
+        return -1;
+    }
+    return close_dir(dir);
+}
+"#,
+        &[
+            "let mut dir: *mut crate::__dirstream",
+            "memset(dir as *mut core::ffi::c_void, 0, 1);",
+            "read_dir(dir)",
+            "close_dir(dir)",
+        ],
+        &["&mut [crate::__dirstream]", "&mut [__dirstream]"],
+    );
+}
+
+#[test]
+fn test_section4_keeps_opaque_pcre_match_data_raw() {
+    run_test(
+        r#"
+#![feature(extern_types)]
+
+extern "C" {
+    pub type pcre2_real_match_data_8;
+    pub fn memset(dst: *mut core::ffi::c_void, value: i32, len: usize) -> *mut core::ffi::c_void;
+    pub fn pcre2_match_data_create_8(count: u32) -> *mut pcre2_match_data_8;
+    pub fn pcre2_match_8(data: *mut pcre2_match_data_8) -> i32;
+    pub fn pcre2_match_data_free_8(data: *mut pcre2_match_data_8);
+}
+
+pub type pcre2_match_data_8 = pcre2_real_match_data_8;
+
+pub unsafe extern "C" fn git_regexp_match(mut count: u32) -> i32 {
+    let mut data: *mut pcre2_match_data_8 = 0 as *mut pcre2_match_data_8;
+    data = pcre2_match_data_create_8(count);
+    if data.is_null() {
+        return -1;
+    }
+    memset(data as *mut core::ffi::c_void, 0, 1);
+    let mut error = pcre2_match_8(data);
+    pcre2_match_data_free_8(data);
+    return error;
+}
+"#,
+        &[
+            "let mut data: *mut crate::pcre2_real_match_data_8",
+            "memset(data as *mut core::ffi::c_void, 0, 1);",
+            "pcre2_match_8(data)",
+            "pcre2_match_data_free_8(data)",
+        ],
+        &[
+            "&mut [crate::pcre2_match_data_8]",
+            "&mut [pcre2_match_data_8]",
+            "&mut [crate::pcre2_real_match_data_8]",
+            "&mut [pcre2_real_match_data_8]",
+        ],
+    );
+}
+
+#[test]
 fn test_ordinary_call_in_anon_const_does_not_enter_fn_ptr_callee_fallback() {
     run_test(
         r#"
