@@ -35,6 +35,10 @@ impl FnPtrGroups {
         let fn_set: FxHashMap<LocalDefId, ()> =
             rust_program.functions.iter().map(|&d| (d, ())).collect();
         let true_fn_ptr_set = crate::rewriter::collector::collect_fn_ptrs(rust_program);
+        let enum_payload_raw_inputs =
+            crate::rewriter::collector::collect_unsupported_enum_payload_fn_ptr_raw_inputs(
+                rust_program,
+            );
         let mut participants: Vec<LocalDefId> = true_fn_ptr_set
             .iter()
             .copied()
@@ -95,13 +99,18 @@ impl FnPtrGroups {
                 let decision_maker = DecisionMaker::new(analysis, did, tcx);
                 let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
                 let aliases = analysis.aliases.get(&did);
+                let raw_inputs = enum_payload_raw_inputs.get(&did);
 
                 let member_input_decs: Vec<Option<PtrKind>> = body
                     .local_decls
                     .iter_enumerated()
                     .skip(1)
                     .take(input_len)
-                    .map(|(param, param_decl)| {
+                    .enumerate()
+                    .map(|(idx, (param, param_decl))| {
+                        if raw_inputs.is_some_and(|inputs| inputs.contains(&idx)) {
+                            return None;
+                        }
                         let param_aliases = aliases.and_then(|a| a.get(&param));
                         decision_maker.decide(param, param_decl, param_aliases)
                     })

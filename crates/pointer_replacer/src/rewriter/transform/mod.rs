@@ -7545,18 +7545,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             PtrExprBaseKind::Other => match self.behind_subscripts(pe.hir_base) {
                 PathOrDeref::Path => true,
                 PathOrDeref::Deref(hir_id) => {
-                    matches!(
-                        self.effective_ptr_kind(hir_id)
-                            .unwrap_or(self.ptr_kinds[&hir_id]),
-                        PtrKind::Ref(_)
-                            | PtrKind::OptRef(_)
-                            | PtrKind::Box
-                            | PtrKind::OptBox
-                            | PtrKind::BoxedSlice
-                            | PtrKind::OptBoxedSlice
-                            | PtrKind::Slice(_)
-                            | PtrKind::SliceCursor(_)
-                    )
+                    if let Some(kind) = self
+                        .effective_ptr_kind(hir_id)
+                        .or_else(|| self.ptr_kinds.get(&hir_id).copied())
+                    {
+                        matches!(
+                            kind,
+                            PtrKind::Ref(_)
+                                | PtrKind::OptRef(_)
+                                | PtrKind::Box
+                                | PtrKind::OptBox
+                                | PtrKind::BoxedSlice
+                                | PtrKind::OptBoxedSlice
+                                | PtrKind::Slice(_)
+                                | PtrKind::SliceCursor(_)
+                        )
+                    } else {
+                        slice_like_container_inner_ty(pe.base_ty, self.tcx).is_some()
+                    }
                 }
                 PathOrDeref::Other => pe.base_ty.is_array(),
             },

@@ -57,19 +57,28 @@ impl FnPtrRewriteDecision {
         // --- Step 1: compute individual decisions per fn-ptr function ---
         let mut individual_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>> =
             FxHashMap::default();
+        let enum_payload_raw_inputs =
+            crate::rewriter::collector::collect_unsupported_enum_payload_fn_ptr_raw_inputs(
+                rust_program,
+            );
 
         for &did in fn_ptr_groups.fn_to_group.keys() {
             let input_len = tcx.fn_sig(did).skip_binder().inputs().skip_binder().len();
             let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
             let aliases = analysis.aliases.get(&did);
             let decision_maker = DecisionMaker::new(analysis, did, tcx);
+            let raw_inputs = enum_payload_raw_inputs.get(&did);
 
             let decs: Vec<Option<PtrKind>> = body
                 .local_decls
                 .iter_enumerated()
                 .skip(1)
                 .take(input_len)
-                .map(|(param, param_decl)| {
+                .enumerate()
+                .map(|(idx, (param, param_decl))| {
+                    if raw_inputs.is_some_and(|inputs| inputs.contains(&idx)) {
+                        return None;
+                    }
                     let param_aliases = aliases.and_then(|a| a.get(&param));
                     decision_maker.decide(param, param_decl, param_aliases)
                 })

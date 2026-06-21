@@ -9991,6 +9991,134 @@ pub const COMMAND: Command = Command {
 }
 
 #[test]
+fn test_section15_option_fn_payload_cast_in_extern_call_keeps_raw_until_supported() {
+    let code = r#"
+#[repr(C)]
+pub struct GitFilter {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct GitStr {
+    pub ptr: *mut i8,
+}
+
+#[repr(C)]
+pub struct GitFilterSource {
+    pub mode: i32,
+}
+
+#[repr(C)]
+pub struct GitWritestream {
+    pub id: i32,
+}
+
+unsafe extern "C" {
+    pub fn git_filter_buffered_stream_new(
+        out: *mut *mut GitWritestream,
+        filter: *mut GitFilter,
+        apply: Option<unsafe extern "C" fn(
+            *mut GitFilter,
+            *mut *mut core::ffi::c_void,
+            *mut GitStr,
+            *const GitStr,
+            *const GitFilterSource,
+        ) -> i32>,
+        empty: *mut GitStr,
+        payload: *mut *mut core::ffi::c_void,
+        source: *const GitFilterSource,
+        next: *mut GitWritestream,
+    ) -> i32;
+}
+
+pub unsafe extern "C" fn crlf_apply(
+    mut filter: *mut GitFilter,
+    mut payload: *mut *mut core::ffi::c_void,
+    mut out: *mut GitStr,
+    mut src: *const GitStr,
+    mut source: *const GitFilterSource,
+) -> i32 {
+    (*out).ptr = (*src).ptr;
+    *payload = core::ptr::null_mut();
+    return (*filter).id + (*source).mode;
+}
+
+pub unsafe extern "C" fn crlf_stream(
+    mut out: *mut *mut GitWritestream,
+    mut filter: *mut GitFilter,
+    mut payload: *mut *mut core::ffi::c_void,
+    mut source: *const GitFilterSource,
+    mut next: *mut GitWritestream,
+) -> i32 {
+    return git_filter_buffered_stream_new(
+        out,
+        filter,
+        (Some(crlf_apply as unsafe extern "C" fn(
+            *mut GitFilter,
+            *mut *mut core::ffi::c_void,
+            *mut GitStr,
+            *const GitStr,
+            *const GitFilterSource,
+        ) -> i32)) as Option<unsafe extern "C" fn(
+            *mut GitFilter,
+            *mut *mut core::ffi::c_void,
+            *mut GitStr,
+            *const GitStr,
+            *const GitFilterSource,
+        ) -> i32>,
+        core::ptr::null_mut(),
+        payload,
+        source,
+        next,
+    );
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
+#[test]
+fn test_deref_array_pointer_as_mut_ptr_offset_without_rewrite_decision() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Hunk {
+    pub header_len: usize,
+    pub header: [i8; 128],
+}
+
+#[repr(C)]
+pub struct Line {
+    pub content: *const i8,
+    pub content_len: usize,
+}
+
+unsafe extern "C" {
+    pub fn install(
+        cb: Option<unsafe extern "C" fn(*const Hunk, *mut Line) -> i32>,
+    ) -> i32;
+}
+
+pub unsafe extern "C" fn print_hunk(mut h: *const Hunk, mut line: *mut Line) -> i32 {
+    let mut content: *const i8 = ((*h).header).as_ptr();
+    (*line).content = content;
+    (*line).content_len = (*h).header_len;
+    return *content as i32;
+}
+
+pub unsafe extern "C" fn register() -> i32 {
+    return install(
+        (Some(print_hunk as unsafe extern "C" fn(*const Hunk, *mut Line) -> i32))
+            as Option<unsafe extern "C" fn(*const Hunk, *mut Line) -> i32>,
+    );
+}
+"#,
+        &["content: Option<&i8>", "(&((*h).header)).first()"],
+        &["((*h).header).as_ptr()"],
+    );
+}
+
+#[test]
 fn test_section4_keeps_opaque_out_param_local_raw() {
     run_test(
         r#"

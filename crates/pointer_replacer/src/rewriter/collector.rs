@@ -772,29 +772,8 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
 
     impl<'tcx> Visitor<'tcx> for FnPtrCollector<'tcx> {
         fn visit_expr(&mut self, ex: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
-            let mut maybe_local_fn = None;
-            if let ExprKind::Path(ref qpath) = ex.kind
-                && let QPath::Resolved(_, path) = qpath
-                && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
-            {
-                maybe_local_fn = def_id.as_local();
-            } else if let ExprKind::Cast(inner, ty) = ex.kind
-                && let TyKind::BareFn(_) = ty.kind
-                && let ExprKind::Path(ref qpath) = inner.kind
-                && let QPath::Resolved(_, path) = qpath
-                && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
-            {
-                maybe_local_fn = def_id.as_local();
-            }
-
-            if let Some(def_id) = maybe_local_fn {
-                let typeck = self.tcx.typeck(ex.hir_id.owner);
-                if matches!(
-                    typeck.expr_ty_adjusted(ex).kind(),
-                    rustc_middle::ty::TyKind::FnPtr(..)
-                ) {
-                    self.fn_ptrs.insert(def_id);
-                }
+            if let Some(def_id) = local_fn_item_coerced_to_fn_ptr(self.tcx, ex) {
+                self.fn_ptrs.insert(def_id);
             }
             walk_expr(self, ex);
         }
@@ -811,4 +790,145 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
     }
 
     collector.fn_ptrs
+}
+
+pub fn collect_unsupported_enum_payload_fn_ptr_raw_inputs(
+    rust_program: &RustProgram,
+) -> FxHashMap<LocalDefId, FxHashSet<usize>> {
+    struct EnumPayloadFnPtrCollector<'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        raw_inputs: FxHashMap<LocalDefId, FxHashSet<usize>>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for EnumPayloadFnPtrCollector<'tcx> {
+        fn visit_expr(&mut self, ex: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+            if let ExprKind::Cast(inner, _) = ex.kind {
+                let typeck = self.tcx.typeck(ex.hir_id.owner);
+                if ty_is_enum_with_fn_ptr_payload(typeck.expr_ty_adjusted(ex)) {
+                    for did in fn_ptr_items_in_enum_payload(self.tcx, inner) {
+                        let input_len = self
+                            .tcx
+                            .fn_sig(did)
+                            .skip_binder()
+                            .inputs()
+                            .skip_binder()
+                            .len();
+                        self.raw_inputs.entry(did).or_default().extend(0..input_len);
+                    }
+                }
+            }
+            walk_expr(self, ex);
+        }
+    }
+
+    let mut collector = EnumPayloadFnPtrCollector {
+        tcx: rust_program.tcx,
+        raw_inputs: FxHashMap::default(),
+    };
+
+    for def_id in rust_program.tcx.hir_body_owners() {
+        let body = rust_program.tcx.hir_body_owned_by(def_id);
+        collector.visit_body(body);
+    }
+
+    collector.raw_inputs
+}
+
+fn fn_ptr_items_in_enum_payload<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx rustc_hir::Expr<'tcx>,
+) -> FxHashSet<LocalDefId> {
+    struct PayloadVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fns: FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for PayloadVisitor<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+            if let ExprKind::Call(callee, args) = expr.kind
+                && is_enum_variant_ctor(callee)
+            {
+                for arg in args {
+                    collect_fn_ptr_items_in_expr(self.tcx, arg, &mut self.fns);
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = PayloadVisitor {
+        tcx,
+        fns: FxHashSet::default(),
+    };
+    visitor.visit_expr(expr);
+    visitor.fns
+}
+
+fn collect_fn_ptr_items_in_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx rustc_hir::Expr<'tcx>,
+    fns: &mut FxHashSet<LocalDefId>,
+) {
+    struct FnPtrItemVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fns: &'a mut FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FnPtrItemVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) -> Self::Result {
+            if let Some(did) = local_fn_item_coerced_to_fn_ptr(self.tcx, expr) {
+                self.fns.insert(did);
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    FnPtrItemVisitor { tcx, fns }.visit_expr(expr);
+}
+
+fn local_fn_item_coerced_to_fn_ptr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx rustc_hir::Expr<'tcx>,
+) -> Option<LocalDefId> {
+    let mut maybe_local_fn = None;
+    if let ExprKind::Path(ref qpath) = expr.kind
+        && let QPath::Resolved(_, path) = qpath
+        && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
+    {
+        maybe_local_fn = def_id.as_local();
+    } else if let ExprKind::Cast(inner, ty) = expr.kind
+        && let TyKind::BareFn(_) = ty.kind
+        && let ExprKind::Path(ref qpath) = inner.kind
+        && let QPath::Resolved(_, path) = qpath
+        && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
+    {
+        maybe_local_fn = def_id.as_local();
+    }
+
+    let def_id = maybe_local_fn?;
+    let typeck = tcx.typeck(expr.hir_id.owner);
+    matches!(typeck.expr_ty_adjusted(expr).kind(), ty::TyKind::FnPtr(..)).then_some(def_id)
+}
+
+fn ty_is_enum_with_fn_ptr_payload(ty: ty::Ty<'_>) -> bool {
+    let ty::TyKind::Adt(adt_def, args) = ty.kind() else {
+        return false;
+    };
+    adt_def.is_enum()
+        && args
+            .iter()
+            .any(|arg| arg.as_type().is_some_and(ty_contains_fn_ptr))
+}
+
+fn ty_contains_fn_ptr(ty: ty::Ty<'_>) -> bool {
+    match ty.kind() {
+        ty::TyKind::FnPtr(..) => true,
+        ty::TyKind::Adt(_, args) => args
+            .iter()
+            .any(|arg| arg.as_type().is_some_and(ty_contains_fn_ptr)),
+        ty::TyKind::Tuple(tys) => tys.iter().any(ty_contains_fn_ptr),
+        ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _) => ty_contains_fn_ptr(*inner),
+        ty::TyKind::Array(inner, _) | ty::TyKind::Slice(inner) => ty_contains_fn_ptr(*inner),
+        _ => false,
+    }
 }
