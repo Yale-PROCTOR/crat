@@ -173,7 +173,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.rewrite_struct_definition(struct_did, generics, fields);
                     for (field_idx, field) in fields.iter_mut().enumerate() {
                         let fi = FieldIdx::from_usize(field_idx);
-                        if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                        if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
                             && let Some(decs) =
                                 self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
                         {
@@ -341,7 +341,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
                         }
                         None => {
-                            if let TyKind::BareFn(bare_fn) = &mut param.ty.kind
+                            if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut param.ty)
                                 && let Some(hir_id) =
                                     self.ast_to_hir.local_map.get(&param.pat.id).copied()
                                 && let Some(decs) =
@@ -451,7 +451,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 for (field_idx, field) in fields.iter_mut().enumerate() {
                     let fi = FieldIdx::from_usize(field_idx);
-                    if let TyKind::BareFn(bare_fn) = &mut field.ty.kind
+                    if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
                         && let Some(decs) = self
                             .fn_ptr_rewrite
                             .field_decisions
@@ -478,12 +478,22 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ItemKind::Static(box static_item) => {
-                // only bare fn-ptr statics (fn(...)) are covered; Option<fn(...)> statics
-                // are not in annotation_decisions and their BareFn match fails here
                 let static_def_id = self.ast_to_hir.global_map[&node_id];
                 let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
-                if let TyKind::BareFn(bare_fn) = &mut static_item.ty.kind
+                if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut static_item.ty)
                     && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id)
+                {
+                    let decs = decs.clone();
+                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                        self.slice_cursor.set(true);
+                    }
+                }
+            }
+            ItemKind::Const(box const_item) => {
+                let const_def_id = self.ast_to_hir.global_map[&node_id];
+                let const_hir_id = self.tcx.local_def_id_to_hir_id(const_def_id);
+                if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut const_item.ty)
+                    && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&const_hir_id)
                 {
                     let decs = decs.clone();
                     if rewrite_bare_fn_inputs(bare_fn, &decs) {
@@ -667,7 +677,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         // Handle fn-ptr typed locals: rewrite BareFn type annotations
         if let Some(ty) = &mut local.ty
-            && let TyKind::BareFn(bare_fn) = &mut ty.kind
+            && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
             && let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
             && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
@@ -896,6 +906,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let hir::ExprKind::Call(func, hargs) = hir_expr.kind else {
                     panic!("{hir_expr:?}")
                 };
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
                 let sig_dec = if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
                     && let Res::Def(_, def_id) = path.res
                     && let Some(def_id) = def_id.as_local()
@@ -927,8 +938,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     } else {
                         None
                     };
-
-                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
                     *expr = free_rewrite;

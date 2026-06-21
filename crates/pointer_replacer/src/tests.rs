@@ -9898,3 +9898,108 @@ pub unsafe fn bar() {
     let (s, _) = rewrite_with_config(code, &Config::default());
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
 }
+
+#[test]
+fn test_fn_ptr_static_struct_array_option_cast_rewrites_storage_and_call_site() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Command {
+    pub run: Option<unsafe extern "C" fn(i32, *mut *mut i8) -> i32>,
+}
+
+pub unsafe extern "C" fn add(mut argc: i32, mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return argc;
+}
+
+pub static COMMANDS: [Command; 1] = [Command {
+    run: Some(add as unsafe extern "C" fn(i32, *mut *mut i8) -> i32),
+}];
+
+pub unsafe fn dispatch(mut argc: i32, mut argv: *mut *mut i8) -> i32 {
+    let handler = COMMANDS[0].run.expect("command");
+    return handler(argc, argv);
+}
+"#,
+        &[
+            "fn add(mut argc: i32, mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(i32, &mut [*mut i8]) -> i32>",
+            "return handler(argc, (argv));",
+        ],
+        &[
+            "Option<unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32>",
+            "add as unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32",
+            "return handler(argc, (argv).as_mut_ptr());",
+        ],
+    );
+}
+
+#[test]
+fn test_fn_ptr_static_option_alias_cast_rewrites_alias_and_initializer() {
+    run_test(
+        r#"
+pub type CommandFn = Option<unsafe extern "C" fn(i32, *mut *mut i8) -> i32>;
+
+pub unsafe extern "C" fn add(mut argc: i32, mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return argc;
+}
+
+pub static COMMAND: CommandFn =
+    Some(add as unsafe extern "C" fn(i32, *mut *mut i8) -> i32);
+"#,
+        &[
+            "type CommandFn = Option<unsafe extern \"C\" fn(i32, &mut [*mut i8]) -> i32>",
+            "Some(add as unsafe extern \"C\" fn(i32, &mut [*mut i8]) -> i32)",
+        ],
+        &[
+            "type CommandFn = Option<unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32>",
+            "add as unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_fn_ptr_const_aggregate_option_cast_rewrites_nested_field_type() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Command {
+    pub run: Option<unsafe extern "C" fn(i32, *mut *mut i8) -> i32>,
+}
+
+pub unsafe extern "C" fn add(mut argc: i32, mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return argc;
+}
+
+pub const COMMAND: Command = Command {
+    run: Some(add as unsafe extern "C" fn(i32, *mut *mut i8) -> i32),
+};
+"#,
+        &[
+            "fn add(mut argc: i32, mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(i32, &mut [*mut i8]) -> i32>",
+            "Some(add as unsafe extern \"C\" fn(i32, &mut [*mut i8]) -> i32)",
+        ],
+        &[
+            "Option<unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32>",
+            "add as unsafe extern \"C\" fn(i32, *mut *mut i8) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_ordinary_call_in_anon_const_does_not_enter_fn_ptr_callee_fallback() {
+    run_test(
+        r#"
+pub unsafe fn foo() -> i32 {
+    let values: [i32; core::mem::size_of::<i32>()] = [1; core::mem::size_of::<i32>()];
+    return values[0];
+}
+"#,
+        &["core::mem::size_of::<i32>()"],
+        &[],
+    );
+}

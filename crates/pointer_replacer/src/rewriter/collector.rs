@@ -805,8 +805,8 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
         fn_ptrs: FxHashSet::default(),
     };
 
-    for def_id in rust_program.functions.iter() {
-        let body = rust_program.tcx.hir_body_owned_by(*def_id);
+    for def_id in rust_program.tcx.hir_body_owners() {
+        let body = rust_program.tcx.hir_body_owned_by(def_id);
         collector.visit_body(body);
     }
 
