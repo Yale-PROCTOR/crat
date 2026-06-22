@@ -10230,6 +10230,167 @@ pub unsafe extern "C" fn compact(mut str: *mut core::ffi::c_char) -> usize {
 }
 
 #[test]
+fn test_section7_call_argument_c_void_cast_materializes_promoted_param() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct GitRepository {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct GitIndex {
+    pub owner: *mut core::ffi::c_void,
+    pub id: i32,
+}
+
+unsafe extern "C" fn git_ptr__swap(
+    mut ptr: *mut *mut core::ffi::c_void,
+    mut newval: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    let mut old: *mut core::ffi::c_void = *ptr;
+    *ptr = newval;
+    return old;
+}
+
+pub unsafe extern "C" fn set_odb(
+    mut repo: *mut GitRepository,
+    mut index: *mut GitIndex,
+    mut slot: usize,
+) {
+    (*repo.offset(slot as isize)).id = 1;
+    (*index.offset(slot as isize)).id = 2;
+    git_ptr__swap(
+        &mut (*index).owner as *mut *mut core::ffi::c_void,
+        repo as *mut core::ffi::c_void,
+    );
+}
+"#,
+        &[
+            "mut repo: &mut [crate::GitRepository]",
+            "(repo).as_mut_ptr() as *mut",
+        ],
+        &["repo as *mut core::ffi::c_void"],
+    );
+}
+
+#[test]
+fn test_section7_nested_c_void_address_cast_materializes_promoted_param() {
+    run_test(
+        r#"
+extern "C" {
+    fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
+}
+
+pub unsafe extern "C" fn getseed(mut seed: *mut u64) -> u64 {
+    if seed.is_null() {
+        return 0;
+    }
+
+    read(
+        0,
+        seed as *mut core::ffi::c_void,
+        core::mem::size_of::<u64>(),
+    );
+    *seed.offset(0) = (*seed.offset(0) as u64) ^
+        ((seed as *mut core::ffi::c_void as usize as u64) << 32);
+    return *seed.offset(0);
+}
+"#,
+        &[
+            "mut seed: &mut [u64]",
+            "(seed).as_mut_ptr() as *mut core::ffi::c_void as usize as u64",
+        ],
+        &["seed as *mut core::ffi::c_void as usize as u64"],
+    );
+}
+
+#[test]
+fn test_forced_raw_param_call_result_keeps_signature_and_body_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Repo {
+    pub odb: *mut Odb,
+}
+
+#[repr(C)]
+pub struct Odb {
+    pub owner: *mut core::ffi::c_void,
+    pub refcount: i32,
+}
+
+unsafe extern "C" fn git_ptr__swap(
+    mut ptr: *mut *mut core::ffi::c_void,
+    mut newval: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    let mut old: *mut core::ffi::c_void = *ptr;
+    *ptr = newval;
+    return old;
+}
+
+unsafe extern "C" fn git_odb_free(mut odb: *mut Odb) {
+    if !odb.is_null() {
+        (*odb).refcount = 0;
+    }
+}
+
+pub unsafe extern "C" fn set_odb(mut repo: *mut Repo, mut odb: *mut Odb) {
+    if !odb.is_null() {
+        (*odb).refcount += 1;
+    }
+    odb = git_ptr__swap(
+        &mut (*repo).odb as *mut *mut Odb as *mut *mut core::ffi::c_void,
+        odb as *mut core::ffi::c_void,
+    ) as *mut Odb;
+    if !odb.is_null() {
+        git_odb_free(odb);
+    }
+}
+"#,
+        &[
+            "mut odb: *mut crate::Odb",
+            "odb as *mut core::ffi::c_void",
+            "if !odb.is_null()",
+        ],
+        &["mut odb: &mut [crate::Odb]", "mut odb: &mut crate::Odb"],
+    );
+}
+
+#[test]
+fn test_forced_raw_slice_param_call_result_keeps_signature_and_body_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: i32,
+}
+
+unsafe extern "C" fn raw_identity(mut ptr: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    return ptr;
+}
+
+pub unsafe extern "C" fn replace_entry(mut entry: *mut Entry, mut slot: usize) {
+    if entry.is_null() {
+        return;
+    }
+    (*entry.offset(slot as isize)).value += 1;
+    entry = raw_identity(entry as *mut core::ffi::c_void) as *mut Entry;
+    if !entry.is_null() {
+        (*entry).value += 1;
+    }
+}
+"#,
+        &[
+            "mut entry: *mut crate::Entry",
+            "entry as *mut core::ffi::c_void",
+            "if !entry.is_null()",
+        ],
+        &["mut entry: &mut [crate::Entry]", "mut entry: &mut crate::Entry"],
+    );
+}
+
+#[test]
 fn test_section12_keeps_hashmap_link_fields_raw() {
     run_test(
         r#"

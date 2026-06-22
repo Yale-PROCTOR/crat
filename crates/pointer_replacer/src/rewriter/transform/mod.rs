@@ -1259,6 +1259,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
                     if let Some((_, inner_mutability)) = unwrap_ptr_from_mir_ty(inner_ty)
                         && (cast_raw_mut.is_some() || cast_ty.is_integral())
+                        && self.cast_inner_has_promoted_source(inner, hir_inner)
                         && !self.cast_has_pointer_destination_context(hir_expr, cast_ty)
                     {
                         self.transform_ptr(
@@ -1595,6 +1596,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             collect_local_raw_param_summaries(rust_program.tcx, &sig_decs, &free_like_wrappers);
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
+        let initial_forced_raw_input_changed = force_signature_inputs_raw_for_bindings(
+            rust_program.tcx,
+            &mut sig_decs,
+            &forced_raw_bindings,
+            Some(&mut diagnostics),
+            DecisionReason::UnsupportedAllocatorRoot,
+        );
+        if initial_forced_raw_input_changed {
+            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+        }
         record_binding_events(
             &mut diagnostics,
             rust_program.tcx,
@@ -1883,6 +1894,57 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
             }
             let old_len = forced_raw_bindings.len();
+            for (bindings, reason) in [
+                (
+                    &local_struct_downgrades.call_conflict,
+                    DecisionReason::LocalStructCallConflict,
+                ),
+                (
+                    &local_struct_downgrades.call_binding_conflict,
+                    DecisionReason::LocalStructCallBindingConflict,
+                ),
+                (
+                    &local_struct_downgrades.field_borrow_conflict,
+                    DecisionReason::LocalStructFieldBorrowConflict,
+                ),
+                (
+                    &local_struct_downgrades.reborrow_assignment,
+                    DecisionReason::LocalStructReborrowAssignment,
+                ),
+                (
+                    &local_struct_downgrades.field_mut_ptr,
+                    DecisionReason::LocalStructFieldMutPtr,
+                ),
+                (
+                    &local_struct_downgrades.static_projection,
+                    DecisionReason::LocalStructStaticProjection,
+                ),
+                (
+                    &local_struct_downgrades.foreign_mut_call,
+                    DecisionReason::LocalStructForeignMutCall,
+                ),
+                (
+                    &unsupported_box_input_bindings,
+                    DecisionReason::UnsupportedBoxInput,
+                ),
+                (&raw_call_result_bindings, DecisionReason::RawCallResult),
+                (
+                    &unsupported_box_target_bindings,
+                    DecisionReason::UnsupportedBoxTarget,
+                ),
+                (
+                    &unsupported_box_usage_bindings,
+                    DecisionReason::UnsupportedBoxUsage,
+                ),
+            ] {
+                changed |= force_signature_inputs_raw_for_bindings(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    bindings,
+                    Some(&mut diagnostics),
+                    reason,
+                );
+            }
             local_struct_downgrades.extend_forced_raw_bindings(&mut forced_raw_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
@@ -3644,6 +3706,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         cast_ty: ty::Ty<'tcx>,
     ) -> bool {
         let cast_is_integral = cast_ty.is_integral();
+        let cast_is_raw_ptr = matches!(cast_ty.kind(), ty::TyKind::RawPtr(..));
         let mut child_hir_id = hir_expr.hir_id;
         let Some(parent_node) = self
             .tcx
@@ -3664,7 +3727,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         };
         match parent_node {
             hir::Node::Expr(parent) => match parent.kind {
-                hir::ExprKind::Cast(..) => true,
+                hir::ExprKind::Cast(..) => {
+                    let parent_ty = self.tcx.typeck(parent.hir_id.owner).expr_ty(parent);
+                    !(cast_is_raw_ptr && parent_ty.is_integral())
+                }
                 hir::ExprKind::Call(_, args) => {
                     !cast_is_integral && args.iter().any(|arg| arg.hir_id == child_hir_id)
                 }
@@ -3735,6 +3801,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             _ => false,
         }
+    }
+
+    fn cast_inner_has_promoted_source(
+        &self,
+        inner: &Expr,
+        hir_inner: &hir::Expr<'tcx>,
+    ) -> bool {
+        let inner = unwrap_addr_of_deref(unwrap_cast_and_paren(inner));
+        let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_inner));
+        self.ptr_expr(inner, hir_inner)
+            .and_then(|pe| self.ptr_source_kind(&pe))
+            .is_some_and(|kind| !matches!(kind, PtrKind::Raw(_)))
     }
 
     fn transform_integer_to_pointer_cast(
@@ -10298,6 +10376,28 @@ fn force_signature_input_raw_for_binding(
     }
     sig_dec.set_input_dec(idx, decision);
     true
+}
+
+fn force_signature_inputs_raw_for_bindings(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    bindings: &FxHashSet<HirId>,
+    mut diagnostics: Option<&mut DecisionDiagnostics>,
+    reason: DecisionReason,
+) -> bool {
+    let mut changed = false;
+    for &hir_id in bindings {
+        let Some((did, idx)) = param_index_for_binding(tcx, hir_id) else {
+            continue;
+        };
+        if force_signature_input_raw_for_binding(tcx, sig_decs, hir_id) {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                record_signature_input_event(diagnostics, tcx, sig_decs, did, idx, reason);
+            }
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn force_signature_input_mut_for_binding(
@@ -18459,6 +18559,15 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                 .or_default()
                 .push("unsupported_allocator_root");
         }
+        if force_signature_inputs_raw_for_bindings(
+            tcx,
+            &mut sig_decs,
+            &forced_raw_bindings,
+            None,
+            DecisionReason::UnsupportedAllocatorRoot,
+        ) {
+            ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups);
+        }
         normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
         normalize_owning_call_result_bindings(tcx, &sig_decs, &mut ptr_kinds, &forced_raw_bindings);
 
@@ -18578,6 +18687,61 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
             }
 
             let old_len = forced_raw_bindings.len();
+            for (bindings, reason) in [
+                (
+                    &local_struct_downgrades.call_conflict,
+                    DecisionReason::LocalStructCallConflict,
+                ),
+                (
+                    &local_struct_downgrades.call_binding_conflict,
+                    DecisionReason::LocalStructCallBindingConflict,
+                ),
+                (
+                    &local_struct_downgrades.field_borrow_conflict,
+                    DecisionReason::LocalStructFieldBorrowConflict,
+                ),
+                (
+                    &local_struct_downgrades.reborrow_assignment,
+                    DecisionReason::LocalStructReborrowAssignment,
+                ),
+                (
+                    &local_struct_downgrades.field_mut_ptr,
+                    DecisionReason::LocalStructFieldMutPtr,
+                ),
+                (
+                    &local_struct_downgrades.static_projection,
+                    DecisionReason::LocalStructStaticProjection,
+                ),
+                (
+                    &local_struct_downgrades.foreign_mut_call,
+                    DecisionReason::LocalStructForeignMutCall,
+                ),
+                (
+                    &unsupported_box_input_bindings,
+                    DecisionReason::UnsupportedBoxInput,
+                ),
+                (&raw_call_result_bindings, DecisionReason::RawCallResult),
+                (
+                    &raw_local_assignment_bindings,
+                    DecisionReason::RawLocalAssignment,
+                ),
+                (
+                    &unsupported_box_target_bindings,
+                    DecisionReason::UnsupportedBoxTarget,
+                ),
+                (
+                    &unsupported_box_usage_bindings,
+                    DecisionReason::UnsupportedBoxUsage,
+                ),
+            ] {
+                changed |= force_signature_inputs_raw_for_bindings(
+                    tcx,
+                    &mut sig_decs,
+                    bindings,
+                    None,
+                    reason,
+                );
+            }
             local_struct_downgrades.extend_forced_raw_bindings(&mut forced_raw_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
