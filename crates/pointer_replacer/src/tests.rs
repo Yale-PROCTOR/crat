@@ -9554,7 +9554,7 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
 
 #[test]
 fn test_array_local_rewriter_skips_live_field_base_with_non_self_advance() {
-    // the base field is reassigned from a member, not a self-advance, so D
+    // the base field is reassigned from a member, not a self-advance,
     // cannot track the counter; the group is dropped and left unrewritten.
     let code = r#"
 #[repr(C)]

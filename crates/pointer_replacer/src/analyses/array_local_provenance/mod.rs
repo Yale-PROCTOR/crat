@@ -483,15 +483,6 @@ pub fn array_local_provenance_analysis(
     results
 }
 
-pub fn analyze_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    body: &Body<'tcx>,
-    alloc_fns: &FxHashSet<LocalDefId>,
-) -> ArrayLocalProvenance {
-    analyze_body_with_summaries(tcx, def_id, body, alloc_fns, None)
-}
-
 fn analyze_body_with_summaries<'tcx>(
     tcx: TyCtxt<'tcx>,
     _def_id: LocalDefId,
@@ -774,7 +765,7 @@ pub(crate) fn classify_rewrite_groups<'a, 'tcx>(
         // simultaneous-liveness gate: require at least one MIR location where the
         // mutability condition holds for the subset of member locals that are live there.
         // `live_after` tracks MIR locals (not slots), so a struct root being live means
-        // all its fields are considered potentially live — a sound over-approximation.
+        // all its fields are considered potentially live
         let has_conflict = live_after.values().any(|live| {
             let live_mut_count = local_mut_roots
                 .iter()
@@ -893,11 +884,6 @@ fn member_pointer_elements_match_base_element<'tcx>(
     })
 }
 
-/// true when two element types have the same size, so an index counted in one
-/// unit advances the same number of bytes in the other; alignment is also
-/// required to match as extra conservatism for the rare same-size/different-align
-/// case. both must be sized with a computable layout; otherwise returns false
-/// (fail closed).
 fn element_tys_same_size_align<'tcx>(
     body: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -2598,38 +2584,20 @@ impl<'tcx> Collector<'_, 'tcx> {
         }
     }
 
-    /// Range-based helper for source places.
-    ///
-    /// Returns the full `Range<SlotIdx>` covering all pointer slots in `place`.
-    /// Returns `None` when the projection is unsupported or the place has no
-    /// pointer slots (i.e. the slot range would be empty).
     fn source_slots(&self, place: Place<'tcx>) -> Option<Range<SlotIdx>> {
         let slots = self.slot_table.place_slots(place, self.body, self.tcx)?;
         if slots.is_empty() { None } else { Some(slots) }
     }
 
-    /// Range-based helper for destination places.
-    ///
-    /// Returns the full `Range<SlotIdx>` covering all pointer slots in `place`.
-    /// Returns `None` when the projection is unsupported or the place has no
-    /// pointer slots (i.e. the slot range would be empty).
     fn destination_slots(&self, place: Place<'tcx>) -> Option<Range<SlotIdx>> {
         let slots = self.slot_table.place_slots(place, self.body, self.tcx)?;
         if slots.is_empty() { None } else { Some(slots) }
     }
 
-    /// Returns the head `PfgNode` for `place` by looking up the first slot via
-    /// `source_slots`.  Unlike `place_head_slot`, this is not restricted to
-    /// places whose top-level type is a raw pointer: it works for any place
-    /// whose slot range is non-empty (e.g. a struct that contains pointer fields).
     fn source_node(&self, place: Place<'tcx>) -> Option<PfgNode> {
         self.source_slots(place)?.next().map(PfgNode::Slot)
     }
 
-    /// Returns the head `PfgNode` (first slot in the slot range) for `place`
-    /// by delegating to `destination_slots`.
-    /// When the slot range is empty or the projection is unsupported,
-    /// inserts an `Unknown` base into the graph and returns `None`.
     fn destination_node(&mut self, place: Place<'tcx>, location: Location) -> Option<PfgNode> {
         if let Some(mut slots) = self.destination_slots(place) {
             slots.next().map(PfgNode::Slot)
@@ -2648,7 +2616,7 @@ impl<'tcx> Collector<'_, 'tcx> {
         };
         // Only mark true pointee slots (depth > 0) as unknown; sibling field
         // slots in a struct destination (depth = 0) are NOT pointees and must
-        // not be polluted here — their provenance comes from the call itself.
+        // not be polluted here.
         for slot in slots.skip(1) {
             if self.slot_table.slot_infos[slot].depth == 0 {
                 continue;
@@ -2694,9 +2662,7 @@ impl<'tcx> Collector<'_, 'tcx> {
     ///
     /// When the borrowed place is a simple `*local_ptr` (deref of a raw pointer),
     /// propagate provenance from `local_ptr`'s slot rather than minting a fresh
-    /// `RawBorrow` base.  This lets bases established by pointer-arithmetic call
-    /// handlers (`is_pointer_arithmetic`, `is_as_ptr`) flow through re-borrow
-    /// patterns like `&mut *offset_result as *mut T`.
+    /// `RawBorrow` base.
     fn collect_raw_borrow_flow(
         &mut self,
         lhs: Place<'tcx>,
@@ -2705,10 +2671,8 @@ impl<'tcx> Collector<'_, 'tcx> {
         dst_slots: &std::ops::Range<SlotIdx>,
         location: Location,
     ) {
-        // for `*local_ptr` (raw pointer or reference), inherit its existing
-        // provenance instead of minting a fresh RawBorrow base.  The reborrow
-        // pattern `&mut *(_5: *mut T)` gives `_4: &mut T`, and `&raw mut *(_4:
-        // &mut T)` gives `_3: *mut T`.  Both steps must propagate through.
+        // The reborrow pattern `&mut *(_5: *mut T)` gives `_4: &mut T`,
+        // and `&raw mut *(_4: &mut T)` gives `_3: *mut T`.
         let propagated = if let [ProjectionElem::Deref] = place.projection.as_ref()
             && (self.local_ty(place.local).is_raw_ptr() || self.local_ty(place.local).is_ref())
             && let Some(slot) = self.slot_table.local_head_slot(place.local)
@@ -3082,8 +3046,6 @@ fn is_pointer_arithmetic(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
         )
 }
 
-/// Returns true only for the core/std slice/array `as_ptr`/`as_mut_ptr`
-/// methods, not for arbitrary functions sharing those names.
 fn is_as_ptr(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
     let crate_name = tcx.crate_name(def_id.krate);
     matches!(crate_name.as_str(), "core" | "std")
@@ -3098,9 +3060,6 @@ fn call_no_writes(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
         && matches!(name.rsplit("::").next(), Some("is_null"))
 }
 
-/// Returns `true` for `core::ptr::null()` / `core::ptr::null_mut()` and
-/// the inherent `<*mut T>::null()` / `<*const T>::null()` methods, which
-/// always produce a null (zero) pointer and carry no real provenance.
 fn is_null_ptr_call(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
     let crate_name = tcx.crate_name(def_id.krate);
     matches!(crate_name.as_str(), "core" | "std")
@@ -3108,8 +3067,6 @@ fn is_null_ptr_call(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
 }
 
 /// Returns true when `operand` is the integer constant zero, i.e. `0 as *mut T`.
-/// Used to classify the zero sentinel as NullLike, both for
-/// `PointerWithExposedProvenance` casts and in `constant_pointer_reason`.
 fn is_zero_int_operand<'tcx>(operand: &Operand<'tcx>, _tcx: TyCtxt<'tcx>) -> bool {
     let Some(const_op) = operand.constant() else {
         return false;
@@ -3123,12 +3080,6 @@ fn is_zero_int_operand<'tcx>(operand: &Operand<'tcx>, _tcx: TyCtxt<'tcx>) -> boo
     int_val.to_bits(int_val.size()) == 0
 }
 
-/// classifies a constant pointer operand for the operand collectors: the
-/// integer-zero sentinel stays `NullLike` (transparent in unique-base
-/// computation), while any other constant pointer (string/byte literal,
-/// static) is `ConstantPointer` (opaque), so a cursor reassigned to it loses
-/// base uniqueness and is excluded at selection rather than rescued by the
-/// rewriter's prune pass.
 fn constant_pointer_reason<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> UnknownReason {
     if is_zero_int_operand(operand, tcx) {
         UnknownReason::NullLike

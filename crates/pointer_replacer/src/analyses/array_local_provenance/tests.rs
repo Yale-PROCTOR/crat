@@ -2507,7 +2507,7 @@ fn index_tracked_pointee_field_base_group_is_flagged_live_base() {
     // cp_block shape: the base slot (*state).out lives behind a parameter
     // pointer; turning its direct store into an index update would hide the
     // advanced pointer from the caller, so the rewriter uses the live-field /
-    // shadow-counter scheme (approach D) and flags the group accordingly.
+    // shadow-counter scheme and flags the group accordingly.
     let groups = run_rewrite_groups_with_points_to(
         RewriteGroupFactMode::ReadyOnly,
         r#"

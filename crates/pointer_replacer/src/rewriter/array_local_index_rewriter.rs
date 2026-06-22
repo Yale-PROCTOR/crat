@@ -2417,12 +2417,7 @@ fn is_null_expr(expr: &Expr) -> bool {
 /// returns whether unwrapping a cast on an `offset`/`add`/`offset_from`
 /// receiver preserves the pointee size, so the derived index stays in base
 /// element units; alignment is also required to match as extra conservatism for
-/// the rare same-size/different-align case. a receiver with no enclosing cast is
-/// trivially layout-preserving. for multi-level casts the outermost cast type is
-/// compared against the fully-unwrapped (all casts stripped) inner type, so any
-/// size change anywhere in the chain causes rejection. fails closed: if either
-/// side's type is unresolvable, is not a raw pointer, or has no computable
-/// layout, returns false.
+/// the rare same-size/different-align case.
 fn receiver_cast_preserves_pointee_layout(
     receiver: &Expr,
     ast_to_hir: &AstToHir,
