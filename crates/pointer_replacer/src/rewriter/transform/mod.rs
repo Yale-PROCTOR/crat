@@ -64,6 +64,8 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     c_exposed_abi_fields: FxHashSet<StructFieldSlot>,
     c_exposed_thin_abi_fields: FxHashSet<StructFieldSlot>,
     c_exposed_cursor_abi_fields: FxHashSet<StructFieldSlot>,
+    item_lifetime_plans: ItemLifetimePlans,
+    item_ty_context: Vec<LocalDefId>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
@@ -101,6 +103,25 @@ enum AllocWrapperInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BorrowedRawParamInfo {
     alias: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ItemLifetimePlans {
+    plans: FxHashMap<LocalDefId, ItemLifetimePlan>,
+    ty_lifetimes: FxHashMap<HirId, Vec<Symbol>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ItemLifetimePlan {
+    lifetimes: Vec<Symbol>,
+    direct_field_lifetimes: FxHashMap<usize, Symbol>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemLifetimeUse {
+    owner_did: LocalDefId,
+    hir_id: HirId,
+    target_did: LocalDefId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,23 +173,29 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         let node_id = item.id;
         let mut fn_def_id: Option<LocalDefId> = None;
         let mut fn_output_transform: Option<(LocalDefId, PtrKind)> = None;
+        let mut item_ty_context: Option<LocalDefId> = None;
         match &mut item.kind {
             ItemKind::Impl(box impl_item) => {
-                let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
+                let Some(item_did) = self.local_lifetime_item_did_for_ast_ty(&impl_item.self_ty)
+                else {
                     return;
                 };
-                if !self.struct_has_field_rewrite_candidate(struct_did) {
+                let lifetimes = self.ordered_item_lifetimes(item_did);
+                let has_field_rewrite_candidate = self
+                    .local_struct_did_for_ast_ty(&impl_item.self_ty)
+                    .is_some_and(|struct_did| self.struct_has_field_rewrite_candidate(struct_did));
+                if lifetimes.is_empty() && !has_field_rewrite_candidate {
                     return;
                 }
-                let lifetimes = self.ordered_struct_lifetimes(struct_did);
                 if !lifetimes.is_empty() {
                     super::lifetimes::ensure_lifetime_params(&mut impl_item.generics, &lifetimes);
-                    self.add_struct_lifetime_args_to_ty_with_lifetimes(
+                    self.add_lifetime_args_to_ty_with_lifetimes_for_item(
                         &mut impl_item.self_ty,
+                        item_did,
                         &lifetimes,
                     );
                 }
-                self.impl_self_lifetimes.push((struct_did, lifetimes));
+                self.impl_self_lifetimes.push((item_did, lifetimes));
                 mut_visit::walk_item(self, item);
                 self.impl_self_lifetimes.pop();
                 return;
@@ -187,6 +214,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                         }
                     }
+                    item_ty_context = Some(struct_did);
                 }
             }
             ItemKind::Fn(box fn_item) => {
@@ -468,6 +496,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ItemKind::TyAlias(box ty_alias) => {
                 let alias_def_id = self.ast_to_hir.global_map[&node_id];
+                let lifetimes = self.ordered_item_lifetimes(alias_def_id);
+                if !lifetimes.is_empty() {
+                    super::lifetimes::ensure_lifetime_params(&mut ty_alias.generics, &lifetimes);
+                }
+                item_ty_context = Some(alias_def_id);
                 let alias_hir_id = self.tcx.local_def_id_to_hir_id(alias_def_id);
                 if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&alias_hir_id) {
                     let decs = decs.clone();
@@ -505,7 +538,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         if in_item_initializer {
             self.item_initializer_depth += 1;
         }
+        if let Some(item_did) = item_ty_context {
+            self.item_ty_context.push(item_did);
+        }
         mut_visit::walk_item(self, item);
+        if item_ty_context.is_some() {
+            self.item_ty_context.pop();
+        }
         if in_item_initializer {
             self.item_initializer_depth -= 1;
         }
@@ -655,19 +694,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     local.ty = Some(P(self.mk_local_opt_box_ty(lhs_inner_ty)));
                 }
                 PtrKind::BoxedSlice => {
-                    local.ty = Some(P(self.mk_boxed_slice_ty(lhs_inner_ty)));
+                    local.ty = Some(P(self.mk_local_boxed_slice_ty(lhs_inner_ty)));
                 }
                 PtrKind::OptBoxedSlice => {
-                    local.ty = Some(P(self.mk_opt_boxed_slice_ty(lhs_inner_ty)));
+                    local.ty = Some(P(self.mk_local_opt_boxed_slice_ty(lhs_inner_ty)));
                 }
                 PtrKind::Slice(m) => {
-                    local.ty = Some(P(self.mk_slice_ty(lhs_inner_ty, m)));
+                    local.ty = Some(P(self.mk_local_slice_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::Raw(m) => {
-                    local.ty = Some(P(self.mk_raw_ptr_ty(lhs_inner_ty, m)));
+                    local.ty = Some(P(self.mk_local_raw_ptr_ty(lhs_inner_ty, m)));
                 }
                 PtrKind::SliceCursor(m) => {
-                    local.ty = Some(P(self.mk_cursor_ty(lhs_inner_ty, m)));
+                    local.ty = Some(P(self.mk_local_cursor_ty(lhs_inner_ty, m)));
                     self.slice_cursor.set(true);
                 }
             }
@@ -1313,7 +1352,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn visit_ty(&mut self, ty: &mut Ty) {
         mut_visit::walk_ty(self, ty);
-        self.add_struct_lifetime_args_to_ty(ty);
+        self.add_lifetime_args_to_ty(ty);
     }
 }
 
@@ -2216,6 +2255,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             c_exposed_abi_fields,
             c_exposed_thin_abi_fields,
             c_exposed_cursor_abi_fields,
+            item_lifetime_plans: ItemLifetimePlans::default(),
+            item_ty_context: Vec::new(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
             fn_ptr_rewrite,
@@ -2227,8 +2268,184 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             item_initializer_depth: 0,
             diagnostics,
         };
+        visitor.item_lifetime_plans = visitor.build_item_lifetime_plans();
         visitor.record_field_decisions();
         visitor
+    }
+
+    fn build_item_lifetime_plans(&self) -> ItemLifetimePlans {
+        let item_dids = local_lifetime_item_dids(self.tcx);
+        let mut uses = Vec::new();
+        let mut direct_fields = Vec::new();
+
+        for item_did in &item_dids {
+            let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*item_did) else {
+                continue;
+            };
+            match item.kind {
+                hir::ItemKind::Struct(_, _, hir::VariantData::Struct { fields, .. }) => {
+                    for (field_index, field_def) in fields.iter().enumerate() {
+                        let field = StructFieldSlot {
+                            struct_did: *item_did,
+                            field_index,
+                        };
+                        if self
+                            .field_ptr_kind(field)
+                            .is_some_and(field_kind_carries_lifetime)
+                        {
+                            direct_fields.push(field);
+                        }
+                        self.collect_item_lifetime_uses_for_ty(*item_did, field_def.ty, &mut uses);
+                    }
+                }
+                hir::ItemKind::TyAlias(_, _, ty) => {
+                    self.collect_item_lifetime_uses_for_ty(*item_did, ty, &mut uses);
+                }
+                _ => {}
+            }
+        }
+
+        let (components, item_components) = lifetime_item_components(&item_dids, &uses);
+        let mut component_slot_counts = vec![0usize; components.len()];
+        let mut direct_field_slots = FxHashMap::default();
+        for field in direct_fields {
+            let Some(&component) = item_components.get(&field.struct_did) else {
+                continue;
+            };
+            let slot = component_slot_counts[component];
+            component_slot_counts[component] += 1;
+            direct_field_slots.insert(field, slot);
+        }
+
+        let mut use_slot_indices: FxHashMap<HirId, Vec<usize>> = FxHashMap::default();
+        loop {
+            let mut changed = false;
+            for item_use in &uses {
+                let Some(&owner_component) = item_components.get(&item_use.owner_did) else {
+                    continue;
+                };
+                let Some(&target_component) = item_components.get(&item_use.target_did) else {
+                    continue;
+                };
+                let target_slot_count = component_slot_counts[target_component];
+                if target_slot_count == 0 {
+                    continue;
+                };
+                if owner_component == target_component {
+                    let slots = (0..target_slot_count).collect::<Vec<_>>();
+                    if use_slot_indices.get(&item_use.hir_id) != Some(&slots) {
+                        use_slot_indices.insert(item_use.hir_id, slots);
+                    }
+                } else {
+                    let slots = use_slot_indices.entry(item_use.hir_id).or_default();
+                    while slots.len() < target_slot_count {
+                        slots.push(component_slot_counts[owner_component]);
+                        component_slot_counts[owner_component] += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let component_lifetimes = components
+            .iter()
+            .enumerate()
+            .map(|(component, items)| {
+                let mut used = items
+                    .iter()
+                    .flat_map(|item_did| existing_item_lifetime_params(self.tcx, *item_did))
+                    .collect::<FxHashSet<_>>();
+                (0..component_slot_counts[component])
+                    .map(|_| next_lifetime_symbol(&mut used))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut plans = ItemLifetimePlans::default();
+        for item_did in &item_dids {
+            let Some(&component) = item_components.get(item_did) else {
+                continue;
+            };
+            plans.plans.insert(
+                *item_did,
+                ItemLifetimePlan {
+                    lifetimes: component_lifetimes[component].clone(),
+                    direct_field_lifetimes: FxHashMap::default(),
+                },
+            );
+        }
+        for (field, slot) in direct_field_slots {
+            let Some(&component) = item_components.get(&field.struct_did) else {
+                continue;
+            };
+            let Some(lifetime) = component_lifetimes[component].get(slot).copied() else {
+                continue;
+            };
+            plans
+                .plans
+                .entry(field.struct_did)
+                .or_default()
+                .direct_field_lifetimes
+                .insert(field.field_index, lifetime);
+        }
+        for item_use in &uses {
+            let Some(slot_indices) = use_slot_indices.get(&item_use.hir_id) else {
+                continue;
+            };
+            let Some(&owner_component) = item_components.get(&item_use.owner_did) else {
+                continue;
+            };
+            let lifetimes = slot_indices
+                .iter()
+                .filter_map(|slot| component_lifetimes[owner_component].get(*slot).copied())
+                .collect::<Vec<_>>();
+            if !lifetimes.is_empty() {
+                plans.ty_lifetimes.insert(item_use.hir_id, lifetimes);
+            }
+        }
+
+        plans
+    }
+
+    fn collect_item_lifetime_uses_for_ty(
+        &self,
+        owner_did: LocalDefId,
+        ty: &'tcx hir::Ty<'tcx>,
+        uses: &mut Vec<ItemLifetimeUse>,
+    ) {
+        struct ItemTyUseVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            owner_did: LocalDefId,
+            uses: &'a mut Vec<ItemLifetimeUse>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for ItemTyUseVisitor<'_, '_, 'tcx> {
+            fn visit_qpath(
+                &mut self,
+                qpath: &'tcx hir::QPath<'tcx>,
+                hir_id: HirId,
+                _span: rustc_span::Span,
+            ) {
+                if let Some(target_did) = self.transform.local_lifetime_item_did_from_qpath(qpath) {
+                    self.uses.push(ItemLifetimeUse {
+                        owner_did: self.owner_did,
+                        hir_id,
+                        target_did,
+                    });
+                }
+                intravisit::walk_qpath(self, qpath, hir_id);
+            }
+        }
+
+        let mut visitor = ItemTyUseVisitor {
+            transform: self,
+            owner_did,
+            uses,
+        };
+        intravisit::walk_unambig_ty(&mut visitor, ty);
     }
 
     pub(crate) fn bytemuck_dependency(&self) -> BytemuckDependency {
@@ -2249,13 +2466,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if self.item_initializer_depth > 0 && target_ty == self.tcx.types.i8 {
             format!(
                 "bytemuck::must_cast_slice::<_, {}>({})",
-                mir_ty_to_string(target_ty, self.tcx),
+                self.body_ty_name(target_ty),
                 byte_str
             )
         } else if explicit_runtime_target {
             format!(
                 "bytemuck::cast_slice::<_, {}>({})",
-                mir_ty_to_string(target_ty, self.tcx),
+                self.body_ty_name(target_ty),
                 byte_str
             )
         } else {
@@ -2685,6 +2902,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn field_lifetime(&self, field: StructFieldSlot) -> Option<Symbol> {
+        if let Some(lifetime) = self
+            .item_lifetime_plans
+            .plans
+            .get(&field.struct_did)
+            .and_then(|plan| plan.direct_field_lifetimes.get(&field.field_index).copied())
+        {
+            return Some(lifetime);
+        }
         self.lifetime_plans
             .structs
             .get(&field.struct_did)
@@ -2748,6 +2973,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn ordered_struct_lifetimes(&self, struct_did: LocalDefId) -> Vec<Symbol> {
+        if let Some(plan) = self.item_lifetime_plans.plans.get(&struct_did) {
+            return plan.lifetimes.clone();
+        }
         let Some(plan) = self.lifetime_plans.structs.get(&struct_did) else {
             return vec![];
         };
@@ -2771,6 +2999,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             })
             .map(|(_, lifetime)| *lifetime)
             .collect()
+    }
+
+    fn ordered_item_lifetimes(&self, item_did: LocalDefId) -> Vec<Symbol> {
+        if let Some(plan) = self.item_lifetime_plans.plans.get(&item_did) {
+            return plan.lifetimes.clone();
+        }
+        if local_item_is_struct(self.tcx, item_did) {
+            self.ordered_struct_lifetimes(item_did)
+        } else {
+            vec![]
+        }
     }
 
     fn rewrite_struct_definition(
@@ -2844,8 +3083,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         impl MutVisitor for FieldPointeeTyVisitor<'_, '_, '_> {
             fn visit_ty(&mut self, ty: &mut Ty) {
                 mut_visit::walk_ty(self, ty);
-                self.transform
-                    .add_promoted_lifetime_args_to_ast_ty_shallow(ty);
+                self.transform.add_item_position_lifetime_args_to_ty(ty);
             }
         }
 
@@ -2853,57 +3091,52 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         visitor.visit_ty(ty);
     }
 
-    fn add_promoted_lifetime_args_to_ast_ty_shallow(&self, ty: &mut Ty) {
-        let ty_str = pprust::ty_to_string(ty);
-        let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx) else {
-            return;
-        };
-        let hir::TyKind::Path(qpath) = &hir_ty.kind else {
-            return;
-        };
-        let Some(struct_did) = self.local_struct_did_from_qpath(qpath) else {
-            return;
-        };
-        let lifetimes = self.ordered_struct_lifetimes(struct_did);
-        if lifetimes.is_empty() {
+    fn add_lifetime_args_to_ty(&self, ty: &mut Ty) {
+        if !self.item_ty_context.is_empty() && self.add_item_position_lifetime_args_to_ty(ty) {
             return;
         }
-        let promoted_lifetime_args = lifetimes
-            .iter()
-            .map(|lifetime| format!("'{}", lifetime.as_str()))
-            .collect::<Vec<_>>();
-        *ty = utils::ty!(
-            "{}",
-            add_lifetime_args_to_type_path_string(
-                ty_str,
-                self.existing_lifetime_param_count(struct_did),
-                &promoted_lifetime_args,
-            )
-        );
+        self.add_anonymous_lifetime_args_to_ty(ty);
     }
 
-    fn add_struct_lifetime_args_to_ty(&self, ty: &mut Ty) {
-        let Some((struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
+    fn add_item_position_lifetime_args_to_ty(&self, ty: &mut Ty) -> bool {
+        let Some(hir_ty) = self.ast_to_hir.get_ty(ty.id, self.tcx) else {
+            return false;
+        };
+        let Some(item_did) = self.local_lifetime_item_did_from_hir_ty(hir_ty) else {
+            return false;
+        };
+        let Some(lifetimes) = self.item_lifetime_plans.ty_lifetimes.get(&hir_ty.hir_id) else {
+            return false;
+        };
+        if lifetimes.is_empty() {
+            return false;
+        }
+        self.add_lifetime_args_to_ty_with_lifetimes_for_item(ty, item_did, lifetimes);
+        true
+    }
+
+    fn add_anonymous_lifetime_args_to_ty(&self, ty: &mut Ty) {
+        let Some((item_did, lifetimes)) = self.lifetime_item_lifetimes_for_ty(ty) else {
             return;
         };
         if self
             .impl_self_lifetimes
             .last()
-            .is_some_and(|(impl_struct_did, _)| *impl_struct_did == struct_did)
+            .is_some_and(|(impl_item_did, _)| *impl_item_did == item_did)
         {
-            self.add_struct_lifetime_args_to_ty_with_lifetimes(ty, &lifetimes);
+            self.add_lifetime_args_to_ty_with_lifetimes_for_item(ty, item_did, &lifetimes);
         } else {
-            self.add_struct_lifetime_args_to_ty_with_lifetime_count(ty, lifetimes.len());
+            self.add_lifetime_args_to_ty_with_lifetime_count(ty, item_did, &lifetimes);
         }
     }
 
-    fn struct_lifetimes_for_ty(&self, ty: &Ty) -> Option<(LocalDefId, Vec<Symbol>)> {
-        let struct_did = self.local_struct_did_for_ast_ty(ty)?;
-        let lifetimes = self.ordered_struct_lifetimes(struct_did);
+    fn lifetime_item_lifetimes_for_ty(&self, ty: &Ty) -> Option<(LocalDefId, Vec<Symbol>)> {
+        let item_did = self.local_lifetime_item_did_for_ast_ty(ty)?;
+        let lifetimes = self.ordered_item_lifetimes(item_did);
         if lifetimes.is_empty() {
             return None;
         }
-        Some((struct_did, lifetimes))
+        Some((item_did, lifetimes))
     }
 
     fn local_struct_did_for_ast_ty(&self, ty: &Ty) -> Option<LocalDefId> {
@@ -2914,45 +3147,52 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         self.local_struct_did_from_qpath(&hir_qpath)
     }
 
-    fn add_struct_lifetime_args_to_ty_with_lifetimes(&self, ty: &mut Ty, lifetimes: &[Symbol]) {
-        let Some((struct_did, _)) = self.struct_lifetimes_for_ty(ty) else {
-            return;
+    fn local_lifetime_item_did_for_ast_ty(&self, ty: &Ty) -> Option<LocalDefId> {
+        let hir_ty = self.ast_to_hir.get_ty(ty.id, self.tcx)?;
+        self.local_lifetime_item_did_from_hir_ty(hir_ty)
+    }
+
+    fn local_lifetime_item_did_from_hir_ty(&self, hir_ty: &hir::Ty<'tcx>) -> Option<LocalDefId> {
+        let hir::TyKind::Path(hir_qpath) = hir_ty.kind else {
+            return None;
         };
+        self.local_lifetime_item_did_from_qpath(&hir_qpath)
+    }
+
+    fn add_lifetime_args_to_ty_with_lifetimes_for_item(
+        &self,
+        ty: &mut Ty,
+        item_did: LocalDefId,
+        lifetimes: &[Symbol],
+    ) {
         let promoted_lifetime_args = lifetimes
             .iter()
             .map(|lifetime| format!("'{}", lifetime.as_str()))
             .collect::<Vec<_>>();
-        self.add_struct_lifetime_args_to_ty_with_args(
-            ty,
-            struct_did,
-            lifetimes,
-            &promoted_lifetime_args,
-        );
+        self.add_lifetime_args_to_ty_with_args(ty, item_did, lifetimes, &promoted_lifetime_args);
     }
 
-    fn add_struct_lifetime_args_to_ty_with_lifetime_count(
+    fn add_lifetime_args_to_ty_with_lifetime_count(
         &self,
         ty: &mut Ty,
-        lifetime_count: usize,
+        item_did: LocalDefId,
+        expected_lifetimes: &[Symbol],
     ) {
-        let Some((struct_did, lifetimes)) = self.struct_lifetimes_for_ty(ty) else {
-            return;
-        };
-        let promoted_lifetime_args = std::iter::repeat_n("'_", lifetime_count)
+        let promoted_lifetime_args = std::iter::repeat_n("'_", expected_lifetimes.len())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        self.add_struct_lifetime_args_to_ty_with_args(
+        self.add_lifetime_args_to_ty_with_args(
             ty,
-            struct_did,
-            &lifetimes,
+            item_did,
+            expected_lifetimes,
             &promoted_lifetime_args,
         );
     }
 
-    fn add_struct_lifetime_args_to_ty_with_args(
+    fn add_lifetime_args_to_ty_with_args(
         &self,
         ty: &mut Ty,
-        struct_did: LocalDefId,
+        item_did: LocalDefId,
         expected_lifetimes: &[Symbol],
         promoted_lifetime_args: &[String],
     ) {
@@ -2962,7 +3202,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if path.segments.last().is_some_and(|seg| {
             path_segment_has_expected_lifetimes(
                 seg,
-                self.existing_lifetime_param_count(struct_did),
+                self.existing_lifetime_param_count(item_did),
                 expected_lifetimes,
             )
         }) {
@@ -2973,7 +3213,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             "{}",
             add_lifetime_args_to_type_path_string(
                 ty_str,
-                self.existing_lifetime_param_count(struct_did),
+                self.existing_lifetime_param_count(item_did),
                 promoted_lifetime_args,
             )
         );
@@ -3004,7 +3244,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let hir::ExprKind::Struct(qpath, _, _) = parent.kind else {
             return None;
         };
-        let struct_did = self.local_struct_did_from_qpath(qpath)?;
+        let struct_did = self.local_struct_did_from_struct_literal_qpath(qpath)?;
         let field_index = self.field_index_by_name(struct_did, hir_field.ident.name)?;
         let field = StructFieldSlot {
             struct_did,
@@ -3042,6 +3282,57 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         };
         let Res::Def(DefKind::Struct, def_id) = path.res else {
+            return None;
+        };
+        def_id.as_local()
+    }
+
+    fn local_struct_did_from_struct_literal_qpath(
+        &self,
+        qpath: &hir::QPath<'tcx>,
+    ) -> Option<LocalDefId> {
+        let hir::QPath::Resolved(_, path) = qpath else {
+            return None;
+        };
+        match path.res {
+            Res::Def(DefKind::Struct, def_id) => def_id.as_local(),
+            Res::Def(DefKind::TyAlias, def_id) => {
+                self.local_struct_did_from_ty_alias(def_id.as_local()?)
+            }
+            _ => None,
+        }
+    }
+
+    fn local_struct_did_from_ty_alias(&self, alias_did: LocalDefId) -> Option<LocalDefId> {
+        let mut alias_did = alias_did;
+        let mut seen = FxHashSet::default();
+        while seen.insert(alias_did) {
+            let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(alias_did) else {
+                return None;
+            };
+            let hir::ItemKind::TyAlias(_, _, ty) = item.kind else {
+                return None;
+            };
+            let hir::TyKind::Path(qpath) = ty.kind else {
+                return None;
+            };
+            let hir::QPath::Resolved(_, path) = qpath else {
+                return None;
+            };
+            match path.res {
+                Res::Def(DefKind::Struct, def_id) => return def_id.as_local(),
+                Res::Def(DefKind::TyAlias, def_id) => alias_did = def_id.as_local()?,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn local_lifetime_item_did_from_qpath(&self, qpath: &hir::QPath<'tcx>) -> Option<LocalDefId> {
+        let hir::QPath::Resolved(_, path) = qpath else {
+            return None;
+        };
+        let Res::Def(DefKind::Struct | DefKind::TyAlias, def_id) = path.res else {
             return None;
         };
         def_id.as_local()
@@ -3106,6 +3397,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn anonymous_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
         self.promoted_mir_ty_name(ty, false)
+    }
+
+    fn body_ty_name(&self, ty: ty::Ty<'tcx>) -> String {
+        self.anonymous_ty_name(ty)
     }
 
     fn promoted_mir_ty_name(&self, ty: ty::Ty<'tcx>, use_named_struct_lifetimes: bool) -> String {
@@ -3247,7 +3542,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_local_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
-        let ty = self.anonymous_ty_name(ty);
+        let ty = self.body_ty_name(ty);
         utils::ty!("Box<{ty}>")
     }
 
@@ -3257,7 +3552,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn mk_local_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
-        let ty = self.anonymous_ty_name(ty);
+        let ty = self.body_ty_name(ty);
         utils::ty!("Option<Box<{ty}>>")
     }
 
@@ -3266,8 +3561,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("Box<[{ty}]>")
     }
 
+    fn mk_local_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.body_ty_name(ty);
+        utils::ty!("Box<[{ty}]>")
+    }
+
     fn mk_opt_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.ty_name(ty);
+        utils::ty!("Option<Box<[{ty}]>>")
+    }
+
+    fn mk_local_opt_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
+        let ty = self.body_ty_name(ty);
         utils::ty!("Option<Box<[{ty}]>>")
     }
 
@@ -3298,6 +3603,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("crate::slice_cursor::{cursor}<{lifetime}, {ty}>")
     }
 
+    fn mk_local_cursor_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.body_ty_name(ty);
+        if mutability {
+            utils::ty!("crate::slice_cursor::SliceCursorMut<'_, {ty}>")
+        } else {
+            utils::ty!("crate::slice_cursor::SliceCursor<'_, {ty}>")
+        }
+    }
+
     fn mk_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.ty_name(ty);
         if mutability {
@@ -3321,8 +3635,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("&{lifetime}{m}[{ty}]")
     }
 
+    fn mk_local_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.body_ty_name(ty);
+        if mutability {
+            utils::ty!("&mut [{ty}]")
+        } else {
+            utils::ty!("&[{ty}]")
+        }
+    }
+
     fn mk_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.ty_name(ty);
+        let m = if mutability { "mut" } else { "const" };
+        utils::ty!("*{m} {ty}")
+    }
+
+    fn mk_local_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
+        let ty = self.body_ty_name(ty);
         let m = if mutability { "mut" } else { "const" };
         utils::ty!("*{m} {ty}")
     }
@@ -3335,7 +3664,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         field_kind: PtrKind,
     ) -> Expr {
         let field_expr = pprust::expr_to_string(field_expr);
-        let inner_ty = self.ty_name(inner_ty);
+        let inner_ty = self.body_ty_name(inner_ty);
         match field_kind {
             PtrKind::OptRef(_) | PtrKind::OptBox => {
                 if mutability {
@@ -3443,7 +3772,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn raw_bridge_expr(&self, lhs_inner_ty: ty::Ty<'tcx>, m: bool, info: &RawBridgeInfo) -> Expr {
-        let ty = self.ty_name(lhs_inner_ty);
+        let ty = self.body_ty_name(lhs_inner_ty);
         let default_expr = self.default_value_expr(lhs_inner_ty);
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match info {
@@ -3454,6 +3783,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 ty,
             ),
             RawBridgeInfo::Array { len_expr } => {
+                let len_expr = self.body_raw_bridge_len_expr(lhs_inner_ty, len_expr);
                 let ptr_expr = if m {
                     format!(
                         "Box::leak(std::iter::repeat_with(|| {{ {default_expr_str} }}).take(({len_expr}) as usize).collect::<Vec<{ty}>>().into_boxed_slice()).as_mut_ptr()"
@@ -3466,6 +3796,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 utils::expr!("{ptr_expr}")
             }
         }
+    }
+
+    fn body_raw_bridge_len_expr(&self, inner_ty: ty::Ty<'tcx>, len_expr: &str) -> String {
+        let source_ty = mir_ty_to_string(inner_ty, self.tcx);
+        let body_ty = self.body_ty_name(inner_ty);
+        if source_ty == body_ty {
+            return len_expr.to_owned();
+        }
+
+        let mut len_expr = len_expr.to_owned();
+        for candidate_ty in size_of_type_name_candidates(&source_ty) {
+            for prefix in ["::core::mem", "core::mem", "::std::mem", "std::mem"] {
+                len_expr = len_expr.replace(
+                    &format!("{prefix}::size_of::<{candidate_ty}>()"),
+                    &format!("{prefix}::size_of::<{body_ty}>()"),
+                );
+            }
+        }
+        len_expr
     }
 
     fn transform_return_rhs(
@@ -3564,11 +3913,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 let arg_ty = self.tcx.typeck(hir_expr.hir_id.owner).node_type(hir_id);
                 let (inner_ty, _) = unwrap_ptr_from_mir_ty(arg_ty)?;
                 let arg_str = pprust::expr_to_string(arg);
-                let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
+                let inner_ty_str = self.body_ty_name(inner_ty);
                 return Some(match info {
                     RawBridgeInfo::Scalar => scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str),
                     RawBridgeInfo::Array { len_expr } => {
-                        array_box_from_raw_free_expr(&arg_str, &inner_ty_str, len_expr)
+                        let len_expr = self.body_raw_bridge_len_expr(inner_ty, len_expr);
+                        array_box_from_raw_free_expr(&arg_str, &inner_ty_str, &len_expr)
                     }
                 });
             }
@@ -3630,7 +3980,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             Some(inner_ty),
         );
         let arg_str = pprust::expr_to_string(&raw_arg);
-        let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
+        let inner_ty_str = self.body_ty_name(inner_ty);
         Some(scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str))
     }
 
@@ -4372,7 +4722,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     "{} as *{} {}",
                     uncast_expr,
                     if m { "mut" } else { "const" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                    self.body_ty_name(lhs_inner_ty),
                 );
                 PtrKind::Raw(m)
             }
@@ -4493,7 +4843,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(pe.base),
                 ptr_method,
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 ref_method,
             )
         };
@@ -4606,7 +4956,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(&transformed_if),
                     if m { "mut" } else { "const" },
-                    mir_ty_to_string(lhs_inner_ty, self.tcx),
+                    self.body_ty_name(lhs_inner_ty),
                 );
                 return;
             }
@@ -4876,13 +5226,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             "{} as *{} {}",
                             pprust::expr_to_string(ptr),
                             if m { "mut" } else { "const" },
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                         );
                     } else if m && !rhs_mut.is_mut() {
                         *ptr = utils::expr!(
                             "{} as *mut {}",
                             pprust::expr_to_string(ptr),
-                            mir_ty_to_string(rhs_inner_ty, self.tcx),
+                            self.body_ty_name(rhs_inner_ty),
                         );
                     }
                     return PtrKind::Raw(m);
@@ -5237,7 +5587,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             "&raw {0} ({1}) as *{0} {2}",
                             if m { "mut" } else { "const" },
                             pprust::expr_to_string(e),
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                         );
                     }
                     return PtrKind::Raw(m);
@@ -5256,7 +5606,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *ptr = utils::expr!(
                             "Some(bytemuck::cast_{}::<_, {}>(&{}({})))",
                             if m { "mut" } else { "ref" },
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                             if m { "mut " } else { "" },
                             pprust::expr_to_string(e),
                         );
@@ -5267,7 +5617,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             if m { "mut " } else { "" },
                             if m { "mut" } else { "const" },
                             pprust::expr_to_string(e),
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                         );
                     }
                     return PtrKind::OptRef(m);
@@ -5305,8 +5655,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             )
                         };
                     } else {
-                        let rhs_ty_str = mir_ty_to_string(rhs_inner_ty, self.tcx);
-                        let lhs_ty_str = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        let rhs_ty_str = self.body_ty_name(rhs_inner_ty);
+                        let lhs_ty_str = self.body_ty_name(lhs_inner_ty);
                         *ptr = if m {
                             utils::expr!(
                                 "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(&raw mut ({0}) as *mut {1}, std::mem::size_of::<{2}>() / std::mem::size_of::<{1}>())",
@@ -5542,7 +5892,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *ptr = utils::expr!(
                             "Some(bytemuck::cast_{}::<_, {}>(&{}({})[0]))",
                             if m { "mut" } else { "ref" },
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                             if m { "mut " } else { "" },
                             pprust::expr_to_string(&base),
                         );
@@ -5553,7 +5903,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             pprust::expr_to_string(&base),
                             if m { "mut_" } else { "" },
                             if m { "mut" } else { "const" },
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
+                            self.body_ty_name(lhs_inner_ty),
                         );
                     }
                     return PtrKind::OptRef(m);
@@ -5581,7 +5931,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             match (ctx, rhs_kind) {
                 (PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m), PtrKind::Raw(m1)) => {
                     if m && !m1 {
-                        let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                        let inner_ty = self.body_ty_name(lhs_inner_ty);
                         *ptr = utils::expr!("{} as *mut {}", pprust::expr_to_string(ptr), inner_ty);
                     }
                     return PtrKind::Raw(m);
@@ -6183,7 +6533,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
                 if m && !m1 {
-                    let inner_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+                    let inner_ty = self.body_ty_name(lhs_inner_ty);
                     *ptr = utils::expr!("{} as *mut {}", pprust::expr_to_string(e), inner_ty);
                 }
                 PtrKind::Raw(m)
@@ -6293,7 +6643,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ty::TyKind::RawPtr(pointee, mutability) => utils::expr!(
                 "std::ptr::null{}::<{}>()",
                 if mutability.is_mut() { "_mut" } else { "" },
-                self.ty_name(*pointee),
+                self.body_ty_name(*pointee),
             ),
             ty::TyKind::Array(elem, _) => {
                 let elem_expr = self.default_value_expr(*elem);
@@ -6303,7 +6653,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 )
             }
             ty::TyKind::Adt(adt_def, args) if adt_def.did().is_local() && adt_def.is_struct() => {
-                let ty_name = strip_top_level_generic_args_from_type_path(self.ty_name(ty));
+                let ty_name = strip_top_level_generic_args_from_type_path(self.body_ty_name(ty));
                 let struct_did = adt_def.did().expect_local();
                 let fields = adt_def
                     .all_fields()
@@ -6334,16 +6684,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 utils::expr!("{} {{ {} }}", ty_name, fields)
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_enum() => {
-                let ty_name = self.ty_name(ty);
+                let ty_name = self.body_ty_name(ty);
                 let variant_name = fieldless_enum_zero_variant(self.tcx, *adt_def).unwrap();
                 utils::expr!("{}::{}", ty_name, variant_name)
             }
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_union() => {
-                let ty_name = self.ty_name(ty);
+                let ty_name = self.body_ty_name(ty);
                 utils::expr!("std::mem::MaybeUninit::<{ty_name}>::zeroed().assume_init()")
             }
             _ => {
-                let ty = self.ty_name(ty);
+                let ty = self.body_ty_name(ty);
                 utils::expr!("<{ty} as Default>::default()")
             }
         }
@@ -6391,7 +6741,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
     ) -> Option<PtrKind> {
         let alloc_root = self.allocator_root(expr)?;
-        let ty = self.ty_name(lhs_inner_ty);
+        let ty = self.body_ty_name(lhs_inner_ty);
         let default_expr = self.default_value_expr(lhs_inner_ty);
         let default_expr_str = pprust::expr_to_string(&default_expr);
         match (target_kind, alloc_root) {
@@ -6469,8 +6819,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         if !need_cast {
             if matches!(e.kind, ExprKind::Index(..)) {
                 utils::expr!(
@@ -6563,11 +6913,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
 
-        let Some(mut source_inner_ty) = slice_like_container_inner_ty(pe.base_ty, self.tcx)
-            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))
-        else {
-            return None;
-        };
+        let mut source_inner_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))?;
         let mut is_slice_ref = ty_is_slice_ref(pe.base_ty)
             || ty_is_borrowed_slice_like_container(pe.base_ty, self.tcx)
             || matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
@@ -6629,7 +6976,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "({}) as *{} {}",
                 pprust::expr_to_string(&raw),
                 if mutability.is_mut() { "mut" } else { "const" },
-                mir_ty_to_string(to_ty, self.tcx),
+                self.body_ty_name(to_ty),
             );
         }
         Some(raw)
@@ -6780,7 +7127,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
         let pointee_str = pprust::expr_to_string(pointee);
-        let target_ty = mir_ty_to_string(target_inner_ty, self.tcx);
+        let target_ty = self.body_ty_name(target_inner_ty);
         match pointee_ty.kind() {
             ty::TyKind::Array(elem_ty, _) if ty_is_byte_sized_raw_inner(*elem_ty) => {
                 if *elem_ty == target_inner_ty {
@@ -6878,7 +7225,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         Some(utils::expr!(
             "bytemuck::cast_slice{}::<_, {}>(&{}({}))",
             if mutable { "_mut" } else { "" },
-            mir_ty_to_string(target_inner_ty, self.tcx),
+            self.body_ty_name(target_inner_ty),
             if mutable { "mut " } else { "" },
             pprust::expr_to_string(pointee),
         ))
@@ -6987,7 +7334,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let deref = if m { "as_deref_mut" } else { "as_deref" };
         let null = if m { "null_mut" } else { "null" };
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
         if !need_cast {
             utils::expr!(
                 "({}).{}().map_or(std::ptr::{}::<{}>(), |_x| _x)",
@@ -6997,7 +7344,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 lhs_ty,
             )
         } else {
-            let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+            let rhs_ty = self.body_ty_name(rhs_inner_ty);
             utils::expr!(
                 "({}).{}().map_or(std::ptr::{}::<{}>(), |_x| _x as *{} {} as *{} {})",
                 pprust::expr_to_string(e),
@@ -7019,8 +7366,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         let null = if m { "null_mut" } else { "null" };
         if lhs_inner_ty == rhs_inner_ty {
             if m {
@@ -7059,8 +7406,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
         let ptr_mut = if m { "mut" } else { "const" };
         let null = if m { "null_mut" } else { "null" };
@@ -7095,8 +7442,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         let source_mut = if m1 { "mut" } else { "const" };
         let target_mut = if m { "mut" } else { "const" };
         if lhs_inner_ty == rhs_inner_ty && m == m1 {
@@ -7140,8 +7487,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         if lhs_inner_ty == rhs_inner_ty {
             utils::expr!(
                 "Box::into_raw({}) as *{} {}",
@@ -7168,8 +7515,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
-        let rhs_ty = mir_ty_to_string(rhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
+        let rhs_ty = self.body_ty_name(rhs_inner_ty);
         let ptr_method = if m { "as_mut_ptr" } else { "as_ptr" };
         let ptr_mut = if m { "mut" } else { "const" };
         if lhs_inner_ty == rhs_inner_ty {
@@ -7229,7 +7576,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             utils::expr!(
                 "Some(bytemuck::cast_{}::<_, {}>(&{}*({})))",
                 if m && m1 { "mut" } else { "ref" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 if m && m1 { "mut " } else { "" },
                 e_str,
             )
@@ -7302,7 +7649,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 if m { "_mut" } else { "" },
                 if m { "mut" } else { "ref" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         } else {
             panic!("unsupported M4A casted OptBox -> OptRef reinterpretation")
@@ -7332,7 +7679,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             lhs_inner_ty, rhs_inner_ty,
             "M4B raw-to-box fallback requires matching pointee types"
         );
-        let lhs_ty = mir_ty_to_string(lhs_inner_ty, self.tcx);
+        let lhs_ty = self.body_ty_name(lhs_inner_ty);
         if !utils::ast::has_side_effects(e) {
             utils::expr!(
                 "if ({0}).is_null() {{
@@ -7392,7 +7739,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 if m && m1 { "mut " } else { "" },
                 pprust::expr_to_string(e),
                 if m && m1 { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 if m && m1 { "_mut" } else { "" },
             )
         } else if !need_cast {
@@ -7400,7 +7747,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "({}).as_deref{1}().map_or(std::ptr::null{1}::<{2}>(), |_x| _x){3}",
                 pprust::expr_to_string(e),
                 if m && m1 { "_mut" } else { "" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 cast_mut,
             )
         } else {
@@ -7408,7 +7755,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "({}).as_deref{1}().map_or(std::ptr::null{1}::<{2}>(), |_x| _x as *{3} _ as *{3} _){4}",
                 pprust::expr_to_string(e),
                 if m && m1 { "_mut" } else { "" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 if m && m1 { "mut" } else { "const" },
                 cast_mut,
             )
@@ -7445,7 +7792,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         "({}) as *{} {}",
                         pprust::expr_to_string(&raw),
                         if m { "mut" } else { "const" },
-                        mir_ty_to_string(to_ty, self.tcx),
+                        self.body_ty_name(to_ty),
                     );
                     from_ty = to_ty;
                 }
@@ -7481,7 +7828,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "({}) as *{} {}",
                 pprust::expr_to_string(&raw),
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         } else {
             raw
@@ -7579,7 +7926,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 if m { "mut" } else { "ref" },
             )
         }
@@ -7608,7 +7955,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 cast_mut,
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 if m { "mut" } else { "ref" },
             )
         }
@@ -7641,7 +7988,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 if m && m1 { "_mut" } else { "" },
                 if m && m1 { "mut" } else { "ref" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         } else {
             // can be used for deref, so type must be specified
@@ -7651,7 +7998,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 if m && m1 { "_mut" } else { "" },
                 if m && m1 { "mut " } else { "" },
                 if m && m1 { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         }
     }
@@ -8039,7 +8386,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             utils::expr!(
                 "bytemuck::cast_slice{}::<_, {}>({}({}))",
                 if m { "_mut" } else { "" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 reference,
                 pprust::expr_to_string(e),
             )
@@ -8050,7 +8397,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         }
     }
@@ -8159,7 +8506,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 "{}::new(bytemuck::cast_slice{}::<_, {}>({}({})))",
                 cursor_ty,
                 if m { "_mut" } else { "" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 reference,
                 pprust::expr_to_string(e),
             )
@@ -8171,7 +8518,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 if m { "mut_" } else { "" },
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         }
     }
@@ -8200,7 +8547,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             utils::expr!(
                 "{}::new(bytemuck::cast_slice::<_, {}>(({}).as_slice()))",
                 cursor_ty,
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
                 pprust::expr_to_string(e),
             )
         } else {
@@ -8210,7 +8557,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
                 if m { "mut" } else { "const" },
-                mir_ty_to_string(lhs_inner_ty, self.tcx),
+                self.body_ty_name(lhs_inner_ty),
             )
         }
     }
@@ -8633,7 +8980,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             "({}) as *{} {}",
                             pprust::expr_to_string(&e),
                             if m { "mut" } else { "const" },
-                            mir_ty_to_string(to_ty, self.tcx),
+                            self.body_ty_name(to_ty),
                         );
                         from_ty = to_ty;
                     } else {
@@ -16866,6 +17213,165 @@ fn local_struct_fields(tcx: TyCtxt<'_>) -> Vec<StructFieldSlot> {
     fields
 }
 
+fn local_lifetime_item_dids(tcx: TyCtxt<'_>) -> Vec<LocalDefId> {
+    let mut items = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        if matches!(
+            item.kind,
+            hir::ItemKind::Struct(..) | hir::ItemKind::TyAlias(..)
+        ) {
+            items.push(item.owner_id.def_id);
+        }
+    }
+    items
+}
+
+fn local_item_is_struct(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {
+    matches!(
+        tcx.hir_node_by_def_id(did),
+        hir::Node::Item(item) if matches!(item.kind, hir::ItemKind::Struct(..))
+    )
+}
+
+fn existing_item_lifetime_params(tcx: TyCtxt<'_>, did: LocalDefId) -> Vec<Symbol> {
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+        return vec![];
+    };
+    let Some(generics) = item.kind.generics() else {
+        return vec![];
+    };
+    generics
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, hir::GenericParamKind::Lifetime { .. }))
+        .map(|param| Symbol::intern(param.name.ident().name.as_str().trim_start_matches('\'')))
+        .collect()
+}
+
+fn next_lifetime_symbol(used: &mut FxHashSet<Symbol>) -> Symbol {
+    for ch in b'a'..=b'z' {
+        let name = Symbol::intern(std::str::from_utf8(&[ch]).unwrap());
+        if used.insert(name) {
+            return name;
+        }
+    }
+
+    let mut index = 0usize;
+    loop {
+        let name = Symbol::intern(&format!("lt{index}"));
+        if used.insert(name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn lifetime_item_components(
+    item_dids: &[LocalDefId],
+    uses: &[ItemLifetimeUse],
+) -> (Vec<Vec<LocalDefId>>, FxHashMap<LocalDefId, usize>) {
+    let item_indices = item_dids
+        .iter()
+        .enumerate()
+        .map(|(index, did)| (*did, index))
+        .collect::<FxHashMap<_, _>>();
+    let mut edges = vec![Vec::new(); item_dids.len()];
+    for item_use in uses {
+        let Some(&owner_index) = item_indices.get(&item_use.owner_did) else {
+            continue;
+        };
+        let Some(&target_index) = item_indices.get(&item_use.target_did) else {
+            continue;
+        };
+        if !edges[owner_index].contains(&target_index) {
+            edges[owner_index].push(target_index);
+        }
+    }
+
+    struct Tarjan<'a> {
+        item_dids: &'a [LocalDefId],
+        edges: &'a [Vec<usize>],
+        next_index: usize,
+        stack: Vec<usize>,
+        on_stack: Vec<bool>,
+        indexes: Vec<Option<usize>>,
+        lowlinks: Vec<usize>,
+        components: Vec<Vec<LocalDefId>>,
+    }
+
+    impl Tarjan<'_> {
+        fn visit(&mut self, node: usize) {
+            let index = self.next_index;
+            self.next_index += 1;
+            self.indexes[node] = Some(index);
+            self.lowlinks[node] = index;
+            self.stack.push(node);
+            self.on_stack[node] = true;
+
+            for &target in &self.edges[node] {
+                if self.indexes[target].is_none() {
+                    self.visit(target);
+                    self.lowlinks[node] = self.lowlinks[node].min(self.lowlinks[target]);
+                } else if self.on_stack[target] {
+                    self.lowlinks[node] = self.lowlinks[node].min(self.indexes[target].unwrap());
+                }
+            }
+
+            if self.lowlinks[node] != index {
+                return;
+            }
+
+            let mut component = Vec::new();
+            while let Some(member) = self.stack.pop() {
+                self.on_stack[member] = false;
+                component.push(self.item_dids[member]);
+                if member == node {
+                    break;
+                }
+            }
+            self.components.push(component);
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        item_dids,
+        edges: &edges,
+        next_index: 0,
+        stack: Vec::new(),
+        on_stack: vec![false; item_dids.len()],
+        indexes: vec![None; item_dids.len()],
+        lowlinks: vec![0; item_dids.len()],
+        components: Vec::new(),
+    };
+    for index in 0..item_dids.len() {
+        if tarjan.indexes[index].is_none() {
+            tarjan.visit(index);
+        }
+    }
+
+    let mut item_components = FxHashMap::default();
+    for (component_index, component) in tarjan.components.iter().enumerate() {
+        for item_did in component {
+            item_components.insert(*item_did, component_index);
+        }
+    }
+
+    (tarjan.components, item_components)
+}
+
+fn field_kind_carries_lifetime(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
+    )
+}
+
 fn conflict_reason_to_decision_reason(reason: ConflictDemotionReason) -> DecisionReason {
     match reason {
         ConflictDemotionReason::ActiveBorrowOverlap => DecisionReason::ActiveBorrowOverlap,
@@ -19314,6 +19820,247 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
         after.bridge_calls = bridge_call_counts_from_source(&rewritten);
         (result, after)
+    }
+
+    fn assert_pointer_lifetime_rewrite_typechecks(code: &str, expected: &[&str]) {
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&Config::default(), tcx)
+        })
+        .unwrap();
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        for item in expected {
+            assert!(
+                rewritten.contains(item),
+                "Expected to find `{item}` in:\n{rewritten}",
+            );
+        }
+        assert_no_anonymous_lifetimes_in_item_definitions(&rewritten);
+    }
+
+    fn assert_no_anonymous_lifetimes_in_item_definitions(rewritten: &str) {
+        let mut in_struct = false;
+        for line in rewritten.lines() {
+            let trimmed = line.trim_start();
+            if in_struct || trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") {
+                assert!(
+                    !trimmed.contains("'_"),
+                    "rewritten item/type positions should use declared lifetimes:\n{rewritten}",
+                );
+            }
+            if trimmed.starts_with("pub type ") || trimmed.starts_with("type ") {
+                assert!(
+                    !trimmed.contains("'_"),
+                    "rewritten item/type positions should use declared lifetimes:\n{rewritten}",
+                );
+            }
+            if trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") {
+                in_struct = trimmed.ends_with('{');
+            } else if in_struct && trimmed.starts_with('}') {
+                in_struct = false;
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_lifetime_propagates_through_containing_struct_field() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub unsafe fn read(x: i32) -> i32 {
+    let promoted = Inner {
+        value: &raw const x,
+    };
+    let first = *promoted.value;
+    let outer = Outer {
+        inner: Inner {
+            value: &raw const x,
+        },
+    };
+    first + *outer.inner.value
+}
+"#,
+            &[
+                "pub struct Inner<'a>",
+                "pub value: Option<&'a i32>",
+                "pub struct Outer<'a>",
+                "pub inner: Inner<'a>",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_lifetime_propagates_through_type_alias() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+pub type Alias = Inner;
+
+pub unsafe fn read(x: i32) -> i32 {
+    let alias = Alias {
+        value: &raw const x,
+    };
+    *alias.value
+}
+"#,
+            &[
+                "pub struct Inner<'a>",
+                "pub value: Option<&'a i32>",
+                "pub type Alias<'a> = Inner<'a>",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_lifetime_uses_declared_lifetime_in_self_recursive_field() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+pub type NodeAlias = Node;
+
+#[repr(C)]
+pub struct Node {
+    pub next: *mut NodeAlias,
+    pub value: i32,
+}
+
+pub unsafe fn mark(node: *mut Node) {
+    if !((*node).next).is_null() {
+        (*(*node).next).value = 1;
+    }
+}
+"#,
+            &[
+                "pub type NodeAlias<'a> = Node<'a>",
+                "pub struct Node<'a>",
+                "pub next: Option<&'a mut NodeAlias<'a>>",
+                "pub unsafe fn mark<'a>(mut node: &mut crate::Node<'a>)",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_lifetime_propagates_through_raw_pointer_field_to_promoted_struct() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: *const Inner,
+}
+
+pub unsafe fn read(outer: Outer) -> i32 {
+    *(*outer.inner).value
+}
+
+pub unsafe fn make(inner: *const Inner) -> Outer {
+    Outer { inner }
+}
+"#,
+            &[
+                "pub struct Inner<'a>",
+                "pub value: Option<&'a i32>",
+                "pub struct Outer<'a>",
+                "pub inner: *const Inner<'a>",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_lifetime_keeps_multi_lifetime_pointee_slots_separate() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct Pair {
+    pub left: *const i32,
+    pub right: *const i32,
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub pair: *const Pair,
+}
+
+pub unsafe fn read(left: i32, right: i32) -> i32 {
+    let pair = Pair {
+        left: &raw const left,
+        right: &raw const right,
+    };
+    let holder = Holder {
+        pair: &raw const pair,
+    };
+    *(*holder.pair).left + *(*holder.pair).right
+}
+"#,
+            &[
+                "pub struct Pair<'a, 'b>",
+                "pub left: Option<&'a i32>",
+                "pub right: Option<&'b i32>",
+                "pub struct Holder<'a, 'b, 'c>",
+                "pub pair: Option<&'a Pair<'b, 'c>>",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_lifetime_propagates_through_nested_struct_chain() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Middle {
+    pub inner: Inner,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub middle: Middle,
+}
+
+pub unsafe fn read(x: i32) -> i32 {
+    let promoted = Inner {
+        value: &raw const x,
+    };
+    let first = *promoted.value;
+    let outer = Outer {
+        middle: Middle {
+            inner: Inner {
+                value: &raw const x,
+            },
+        },
+    };
+    first + *outer.middle.inner.value
+}
+"#,
+            &[
+                "pub struct Inner<'a>",
+                "pub value: Option<&'a i32>",
+                "pub struct Middle<'a>",
+                "pub inner: Inner<'a>",
+                "pub struct Outer<'a>",
+                "pub middle: Middle<'a>",
+            ],
+        );
     }
 
     fn classify_initial_raw_reason<'tcx>(

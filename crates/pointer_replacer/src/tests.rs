@@ -1316,8 +1316,8 @@ pub unsafe fn clear_list(head: *mut Node) {
 }
         "#,
         &[
-            "let mut x: *mut crate::Node<'a> =",
-            "let mut y: *mut crate::Node<'a> = std::ptr::null_mut();",
+            "let mut x: *mut crate::Node<'_> =",
+            "let mut y: *mut crate::Node<'_> = std::ptr::null_mut();",
         ],
         &["Option<&crate::Node>"],
     );
@@ -3229,8 +3229,8 @@ pub unsafe fn hold(nodes: &Vec<Node>) -> usize {
         &[
             "pub struct Node<'a>",
             "pub value: Option<&'a mut i32>",
-            "pub struct Holder<'a>",
-            "pub nodes: Option<&'a Vec<Node<'a>>>",
+            "pub struct Holder<'a, 'b>",
+            "pub nodes: Option<&'a Vec<Node<'b>>>",
         ],
         &["Vec<Node>>", "Vec<Node>"],
     );
@@ -3410,6 +3410,220 @@ pub unsafe fn sum(mut x: i32, y: i32) -> i32 {
             "Pair { a: Some(&mut x), b: Some(&y) }",
         ],
         &["pub a: *mut i32", "pub b: *const i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_slice_annotation_uses_in_scope_lifetime_for_promoted_adt() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub value: *const i32,
+}
+
+pub unsafe fn promote_node(x: i32) -> i32 {
+    let node = Node { value: &raw const x };
+    *node.value
+}
+
+pub unsafe fn read_second(x: i32, y: i32) -> i32 {
+    let nodes = [
+        Node { value: &raw const x },
+        Node { value: &raw const y },
+    ];
+    let mut p: *const Node = nodes.as_ptr();
+    *(*p.offset(1)).value
+}
+"#,
+        &["pub struct Node<'a>", "let mut p: &[crate::Node<'_>]"],
+        &["let mut p: *const crate::Node"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_raw_ptr_annotation_uses_in_scope_lifetime_for_promoted_adt() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub next: *mut Node,
+    pub value: i32,
+}
+
+pub unsafe fn clear_local_list() {
+    let mut x: *mut Node = malloc(std::mem::size_of::<Node>()) as *mut Node;
+    (*x).next = std::ptr::null_mut();
+    let mut y: *mut Node = std::ptr::null_mut();
+    while !x.is_null() {
+        y = (*x).next;
+        free(x as *mut core::ffi::c_void);
+        x = y;
+    }
+}
+"#,
+        &["pub struct Node<'a>", "let mut x: *mut crate::Node<'_>"],
+        &["let mut x: &mut crate::Node"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_raw_alloc_annotation_uses_in_scope_lifetime_for_nested_adt() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Wrapper {
+    pub node: Node,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_node(x: i32) -> i32 {
+    let node = Node {
+        value: &raw const x,
+    };
+    *node.value
+}
+
+pub unsafe fn owned_nodes(x: i32) {
+    let mut p: *mut Wrapper = malloc(2 * std::mem::size_of::<Wrapper>()) as *mut Wrapper;
+    (*p.offset(1)).tag = x;
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &["pub struct Node<'a>", "let mut p: *mut crate::Wrapper<'_>"],
+        &["let mut p: &mut crate::Wrapper"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_nullable_raw_alloc_annotation_uses_in_scope_lifetime_for_nested_adt() {
+    run_test(
+        r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Node {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Wrapper {
+    pub node: Node,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_node(x: i32) -> i32 {
+    let node = Node {
+        value: &raw const x,
+    };
+    *node.value
+}
+
+pub unsafe fn maybe_owned_nodes(flag: bool, x: i32) {
+    let mut p: *mut Wrapper = std::ptr::null_mut();
+    if flag {
+        p = malloc(2 * std::mem::size_of::<Wrapper>()) as *mut Wrapper;
+        (*p.offset(1)).tag = x;
+    }
+    if !p.is_null() {
+        free(p as *mut core::ffi::c_void);
+    }
+}
+"#,
+        &["pub struct Node<'a>", "let mut p: *mut crate::Wrapper<'_>"],
+        &["let mut p: &mut crate::Wrapper"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_cursor_annotation_uses_in_scope_lifetime_for_promoted_adt() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Node {
+    pub value: *const i32,
+}
+
+pub unsafe fn promote_node(x: i32) -> i32 {
+    let node = Node { value: &raw const x };
+    *node.value
+}
+
+pub unsafe fn read_around_cursor(x: i32, y: i32) -> i32 {
+    let nodes = [
+        Node { value: &raw const x },
+        Node { value: &raw const y },
+    ];
+    let mut p: *const Node = nodes.as_ptr().offset(1);
+    let first = *(*p.offset(-1)).value;
+    p = p.offset(1);
+    first + *(*p.offset(-1)).value
+}
+"#,
+        &[
+            "pub struct Node<'a>",
+            "let mut p: crate::slice_cursor::SliceCursor<'_, crate::Node<'_>>",
+        ],
+        &["let mut p: *const crate::Node"],
+    );
+}
+
+#[test]
+fn test_rewriter_local_slice_annotation_uses_in_scope_lifetimes_for_multi_lifetime_adt() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub left: *const i32,
+    pub right: *const i32,
+}
+
+pub unsafe fn promote_pair(x: i32, y: i32) -> i32 {
+    let pair = Pair {
+        left: &raw const x,
+        right: &raw const y,
+    };
+    *pair.left + *pair.right
+}
+
+pub unsafe fn read_second_pair(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    let pairs = [
+        Pair {
+            left: &raw const a,
+            right: &raw const b,
+        },
+        Pair {
+            left: &raw const c,
+            right: &raw const d,
+        },
+    ];
+    let mut p: *const Pair = pairs.as_ptr();
+    *(*p.offset(1)).left + *(*p.offset(1)).right
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "let mut p: &[crate::Pair<'_, '_>]",
+        ],
+        &["let mut p: *const crate::Pair"],
     );
 }
 
