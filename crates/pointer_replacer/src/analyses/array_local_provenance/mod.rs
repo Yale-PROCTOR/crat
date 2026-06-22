@@ -483,6 +483,7 @@ pub fn array_local_provenance_analysis(
     results
 }
 
+#[cfg(test)]
 pub fn analyze_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
