@@ -150,7 +150,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         }],
                     });
                 }
-                decision
+                decision.filter(|kind| !matches!(kind, PtrKind::Raw(_)))
             } else if let Some(sig_input_dec) = sig_input_dec {
                 Some(sig_input_dec)
             } else if let Some(returned_kind) = returned_output_locals.get(&local).copied() {

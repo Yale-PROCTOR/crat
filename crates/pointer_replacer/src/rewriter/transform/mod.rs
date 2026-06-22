@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 
+use points_to::andersen;
 use rustc_abi::FieldIdx;
 use rustc_ast::{
     mut_visit::{self, FnKind, MutVisitor},
@@ -24,6 +25,7 @@ use utils::{
         BytemuckDerivePlan, BytemuckDeriveVisitor, BytemuckRequirement, BytemuckTypeClassifier,
     },
     ir::{AstToHir, is_option, mir_ty_to_string},
+    ty_shape::TyShapes,
 };
 
 #[cfg(test)]
@@ -176,12 +178,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.rewrite_struct_definition(struct_did, generics, fields);
                     for (field_idx, field) in fields.iter_mut().enumerate() {
                         let fi = FieldIdx::from_usize(field_idx);
-                        if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
-                            && let Some(decs) =
-                                self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
+                        if let Some(decs) =
+                            self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
                         {
                             let decs = decs.clone();
-                            if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                            if rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
                                 self.slice_cursor.set(true);
                             }
                         }
@@ -344,14 +345,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
                         }
                         None => {
-                            if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut param.ty)
-                                && let Some(hir_id) =
-                                    self.ast_to_hir.local_map.get(&param.pat.id).copied()
+                            if let Some(hir_id) =
+                                self.ast_to_hir.local_map.get(&param.pat.id).copied()
                                 && let Some(decs) =
                                     self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
                             {
                                 let decs = decs.clone();
-                                if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                                if rewrite_bare_fn_inputs_in_ty(&mut param.ty, &decs) {
                                     self.slice_cursor.set(true);
                                 }
                             }
@@ -454,14 +454,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 for (field_idx, field) in fields.iter_mut().enumerate() {
                     let fi = FieldIdx::from_usize(field_idx);
-                    if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut field.ty)
-                        && let Some(decs) = self
-                            .fn_ptr_rewrite
-                            .field_decisions
-                            .get(&(struct_def_id, fi))
+                    if let Some(decs) = self
+                        .fn_ptr_rewrite
+                        .field_decisions
+                        .get(&(struct_def_id, fi))
                     {
                         let decs = decs.clone();
-                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                        if rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
                             self.slice_cursor.set(true);
                         }
                     }
@@ -473,8 +472,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&alias_hir_id) {
                     let decs = decs.clone();
                     if let Some(ty) = &mut ty_alias.ty
-                        && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
-                        && rewrite_bare_fn_inputs(bare_fn, &decs)
+                        && rewrite_bare_fn_inputs_in_ty(ty, &decs)
                     {
                         self.slice_cursor.set(true);
                     }
@@ -483,11 +481,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ItemKind::Static(box static_item) => {
                 let static_def_id = self.ast_to_hir.global_map[&node_id];
                 let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
-                if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut static_item.ty)
-                    && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id)
-                {
+                if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id) {
                     let decs = decs.clone();
-                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                    if rewrite_bare_fn_inputs_in_ty(&mut static_item.ty, &decs) {
                         self.slice_cursor.set(true);
                     }
                 }
@@ -495,11 +491,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ItemKind::Const(box const_item) => {
                 let const_def_id = self.ast_to_hir.global_map[&node_id];
                 let const_hir_id = self.tcx.local_def_id_to_hir_id(const_def_id);
-                if let Some(bare_fn) = find_bare_fn_in_ty_mut(&mut const_item.ty)
-                    && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&const_hir_id)
-                {
+                if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&const_hir_id) {
                     let decs = decs.clone();
-                    if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                    if rewrite_bare_fn_inputs_in_ty(&mut const_item.ty, &decs) {
                         self.slice_cursor.set(true);
                     }
                 }
@@ -542,6 +536,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             .ty;
             let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl) else { return };
             self.transform_return_rhs(expr, hir_tail, output_kind, lhs_inner_ty);
+            if ty_contains_raw_ptr_leaf(self.tcx, return_decl) {
+                self.transform_raw_aggregate_context_after_pointer_conversion(
+                    expr,
+                    hir_tail,
+                    return_decl,
+                );
+            }
         }
     }
 
@@ -687,6 +688,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         Some(lhs_inner_ty),
                     );
                 }
+                if ty_contains_raw_ptr_leaf(self.tcx, lhs_ty) {
+                    self.transform_raw_aggregate_context_after_pointer_conversion(
+                        rhs, hir_rhs, lhs_ty,
+                    );
+                }
             }
         }
 
@@ -705,13 +711,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         // Handle fn-ptr typed locals: rewrite BareFn type annotations
         if let Some(ty) = &mut local.ty
-            && let Some(bare_fn) = find_bare_fn_in_ty_mut(ty)
             && let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
             && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
         {
             let decs = decs.clone();
-            if rewrite_bare_fn_inputs(bare_fn, &decs) {
+            if rewrite_bare_fn_inputs_in_ty(ty, &decs) {
                 self.slice_cursor.set(true);
             }
         }
@@ -930,6 +935,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                     }
                 }
+                if ty_contains_raw_ptr_leaf(self.tcx, lhs_ty) {
+                    self.transform_raw_aggregate_context_after_pointer_conversion(
+                        rhs, hir_rhs, lhs_ty,
+                    );
+                }
             }
             ExprKind::Binary(bin_op, l, r)
                 if matches!(
@@ -1012,6 +1022,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             "({}).as_deref_mut()",
                             pprust::expr_to_string(arg)
                         ));
+                    }
+                    if ty_contains_raw_ptr_leaf(self.tcx, ty) {
+                        self.transform_raw_aggregate_context_after_pointer_conversion(
+                            arg, harg, ty,
+                        );
                     }
                 }
 
@@ -1149,6 +1164,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .and_then(|sd| sd.output_dec)
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_return_rhs(ret, hir_ret, kind, lhs_inner_ty);
+                    self.transform_raw_aggregate_context_after_pointer_conversion(
+                        ret,
+                        hir_ret,
+                        sig.output(),
+                    );
                 } else if ty_contains_raw_ptr_leaf(self.tcx, sig.output()) {
                     self.transform_raw_aggregate_context(ret, hir_ret, sig.output());
                 }
@@ -1577,17 +1597,44 @@ enum AllocatorRoot<'a> {
     },
 }
 
+fn sync_fn_ptr_contracts<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    pre_points_to: &andersen::PreAnalysisData<'tcx>,
+    points_to_solutions: &andersen::Solutions,
+    tss: &TyShapes<'_, 'tcx>,
+    fn_ptr_groups: &FnPtrGroups,
+    fn_ptr_rewrite: &mut FnPtrRewriteDecision,
+    sig_decs: &mut SigDecisions,
+    c_exposed_fns: &FxHashSet<String>,
+) -> bool {
+    let changed =
+        fn_ptr_rewrite.sync_from_sig_decs(rust_program, fn_ptr_groups, sig_decs, c_exposed_fns);
+    fn_ptr_rewrite.rebuild_site_decisions(
+        pre_points_to,
+        points_to_solutions,
+        rust_program,
+        tss,
+        fn_ptr_groups,
+        c_exposed_fns,
+    );
+    changed
+}
+
 impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     pub fn new(
         config: &Config,
         rust_program: &RustProgram<'tcx>,
         analysis: &'analysis Analysis,
+        pre_points_to: &andersen::PreAnalysisData<'tcx>,
+        points_to_solutions: &andersen::Solutions,
+        tss: &TyShapes<'_, 'tcx>,
         ast_to_hir: AstToHir,
         fn_ptr_groups: FnPtrGroups,
         fn_ptr_rewrite: FnPtrRewriteDecision,
         diagnostics: DecisionDiagnostics,
     ) -> TransformVisitor<'analysis, 'tcx> {
         let mut diagnostics = diagnostics;
+        let mut fn_ptr_rewrite = fn_ptr_rewrite;
         let lifetime_plans = super::lifetimes::LifetimePlans::new(rust_program, analysis);
         let mut sig_decs = SigDecisions::new_with_diagnostics(
             rust_program,
@@ -1596,6 +1643,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &fn_ptr_groups,
             Some(&fn_ptr_rewrite.group_decisions),
             Some(&mut diagnostics),
+        );
+        sync_fn_ptr_contracts(
+            rust_program,
+            pre_points_to,
+            points_to_solutions,
+            tss,
+            &fn_ptr_groups,
+            &mut fn_ptr_rewrite,
+            &mut sig_decs,
+            &config.c_exposed_fns,
         );
         let initial_sig_decs = sig_decs.clone();
         let mut ptr_kinds = collect_diffs_with_diagnostics(
@@ -1621,6 +1678,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             DecisionReason::UnsupportedAllocatorRoot,
         );
         if initial_forced_raw_input_changed {
+            sync_fn_ptr_contracts(
+                rust_program,
+                pre_points_to,
+                points_to_solutions,
+                tss,
+                &fn_ptr_groups,
+                &mut fn_ptr_rewrite,
+                &mut sig_decs,
+                &config.c_exposed_fns,
+            );
             ptr_kinds = collect_diffs_with_fn_ptr_decisions(
                 rust_program,
                 analysis,
@@ -1991,6 +2058,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !changed {
                 break;
             }
+            sync_fn_ptr_contracts(
+                rust_program,
+                pre_points_to,
+                points_to_solutions,
+                tss,
+                &fn_ptr_groups,
+                &mut fn_ptr_rewrite,
+                &mut sig_decs,
+                &config.c_exposed_fns,
+            );
             ptr_kinds = collect_diffs_with_fn_ptr_decisions(
                 rust_program,
                 analysis,
@@ -2061,6 +2138,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
         if sig_changed {
+            sync_fn_ptr_contracts(
+                rust_program,
+                pre_points_to,
+                points_to_solutions,
+                tss,
+                &fn_ptr_groups,
+                &mut fn_ptr_rewrite,
+                &mut sig_decs,
+                &config.c_exposed_fns,
+            );
             ptr_kinds = collect_diffs_with_fn_ptr_decisions(
                 rust_program,
                 analysis,
@@ -2084,6 +2171,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &field_cursor_fields,
             &mut sig_decs,
         );
+        if sync_fn_ptr_contracts(
+            rust_program,
+            pre_points_to,
+            points_to_solutions,
+            tss,
+            &fn_ptr_groups,
+            &mut fn_ptr_rewrite,
+            &mut sig_decs,
+            &config.c_exposed_fns,
+        ) {
+            ptr_kinds = collect_diffs_with_fn_ptr_decisions(
+                rust_program,
+                analysis,
+                &sig_decs,
+                &fn_ptr_groups,
+                &fn_ptr_rewrite.group_decisions,
+            );
+        }
         let raw_bridge_bindings = collect_raw_bridge_bindings(
             rust_program.tcx,
             &ptr_kinds,
@@ -3582,9 +3687,17 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     .and_then(|did| self.fn_ptr_group_decisions_for_fn(did)),
                 _ => None,
             },
-            hir::ExprKind::Field(struct_expr, field_ident) => {
-                self.fn_ptr_field_decisions(struct_expr, field_ident.name)
-            }
+            hir::ExprKind::Field(struct_expr, field_ident) => self
+                .fn_ptr_field_decisions(struct_expr, field_ident.name)
+                .or_else(|| {
+                    self.expr_ty_is_fn_ptr_or_option_fn_ptr(func)
+                        .then(|| self.fn_ptr_input_decisions_for_callee(struct_expr))
+                        .flatten()
+                }),
+            hir::ExprKind::Index(base, _, _) => self
+                .expr_ty_is_fn_ptr_or_option_fn_ptr(func)
+                .then(|| self.fn_ptr_input_decisions_for_callee(base))
+                .flatten(),
             hir::ExprKind::MethodCall(method_seg, receiver, _, _)
                 if matches!(method_seg.ident.name.as_str(), "expect" | "unwrap")
                     && self.expr_ty_is_option_fn_ptr(receiver) =>
@@ -3634,6 +3747,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     fn expr_ty_is_option_fn_ptr(&self, expr: &hir::Expr<'tcx>) -> bool {
         let typeck = self.tcx.typeck(expr.hir_id.owner);
         ty_is_option_fn_ptr(self.tcx, typeck.expr_ty_adjusted(expr))
+    }
+
+    fn expr_ty_is_fn_ptr_or_option_fn_ptr(&self, expr: &hir::Expr<'tcx>) -> bool {
+        let typeck = self.tcx.typeck(expr.hir_id.owner);
+        let ty = typeck.expr_ty_adjusted(expr);
+        matches!(ty.kind(), ty::TyKind::FnPtr(..)) || ty_is_option_fn_ptr(self.tcx, ty)
     }
 
     fn hir_expr_has_fn_ptr_group_cast(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
@@ -3804,16 +3923,68 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         hir_expr: &'tcx hir::Expr<'tcx>,
         expected_ty: ty::Ty<'tcx>,
     ) -> bool {
+        self.transform_raw_aggregate_context_inner(expr, hir_expr, expected_ty, true)
+    }
+
+    fn transform_raw_aggregate_context_after_pointer_conversion(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        expected_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        self.transform_raw_aggregate_context_inner(expr, hir_expr, expected_ty, false)
+    }
+
+    fn transform_raw_aggregate_context_inner(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        expected_ty: ty::Ty<'tcx>,
+        allow_raw_leaf: bool,
+    ) -> bool {
         if !ty_contains_raw_ptr_leaf(self.tcx, expected_ty) {
             return false;
         }
 
         if let ExprKind::Paren(inner) = &mut expr.kind {
-            return self.transform_raw_aggregate_context(inner, hir_expr, expected_ty);
+            return self.transform_raw_aggregate_context_inner(
+                inner,
+                hir_expr,
+                expected_ty,
+                allow_raw_leaf,
+            );
+        }
+        if let Some(inner) = ast_some_call_arg_mut(expr) {
+            return self.transform_raw_aggregate_context_inner(
+                inner,
+                hir_expr,
+                expected_ty,
+                allow_raw_leaf,
+            );
         }
         let hir_expr = utils::hir::unwrap_drop_temps(hir_expr);
         match expected_ty.kind() {
+            ty::TyKind::Ref(_, inner_ty, _) => {
+                let Some((inner, hir_inner)) = self.transparent_ref_aggregate_inner(expr, hir_expr)
+                else {
+                    return false;
+                };
+                self.transform_raw_aggregate_context_inner(
+                    inner,
+                    hir_inner,
+                    *inner_ty,
+                    allow_raw_leaf,
+                )
+            }
             ty::TyKind::RawPtr(inner_ty, mutability) => {
+                if let Some(changed) =
+                    self.transform_raw_pointer_aggregate_payload(expr, hir_expr, *inner_ty)
+                {
+                    return changed;
+                }
+                if !allow_raw_leaf {
+                    return false;
+                }
                 if self.raw_address_expr_matches_expected(
                     expr,
                     hir_expr,
@@ -3837,6 +4008,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 true
             }
+            ty::TyKind::Slice(elem_ty) => {
+                self.transform_raw_slice_aggregate_payload(expr, hir_expr, *elem_ty)
+            }
             ty::TyKind::Array(elem_ty, _) => {
                 if !ty_contains_raw_ptr_leaf(self.tcx, *elem_ty) {
                     return false;
@@ -3854,7 +4028,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     .iter_mut()
                     .zip(hir_elems)
                     .fold(false, |changed, (elem, hir_elem)| {
-                        self.transform_raw_aggregate_context(elem, hir_elem, *elem_ty) || changed
+                        self.transform_raw_aggregate_context_inner(elem, hir_elem, *elem_ty, true)
+                            || changed
                     })
             }
             ty::TyKind::Tuple(elem_tys) => {
@@ -3870,7 +4045,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 elems.iter_mut().zip(hir_elems).zip(elem_tys.iter()).fold(
                     false,
                     |changed, ((elem, hir_elem), elem_ty)| {
-                        self.transform_raw_aggregate_context(elem, hir_elem, elem_ty) || changed
+                        self.transform_raw_aggregate_context_inner(elem, hir_elem, elem_ty, true)
+                            || changed
                     },
                 )
             }
@@ -3918,6 +4094,89 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     );
                 }
                 changed
+            }
+            _ => false,
+        }
+    }
+
+    fn transparent_ref_aggregate_inner<'e>(
+        &self,
+        expr: &'e mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+    ) -> Option<(&'e mut Expr, &'tcx hir::Expr<'tcx>)> {
+        let ExprKind::AddrOf(BorrowKind::Ref, _, inner) = &mut expr.kind else {
+            return None;
+        };
+        Some((inner, hir_ref_or_as_ptr_inner(hir_expr)))
+    }
+
+    fn transform_raw_pointer_aggregate_payload(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        elem_ty: ty::Ty<'tcx>,
+    ) -> Option<bool> {
+        if let Some((inner, hir_inner)) = self.transparent_ref_aggregate_inner(expr, hir_expr) {
+            return Some(self.transform_raw_slice_aggregate_payload(inner, hir_inner, elem_ty));
+        }
+        if let ExprKind::MethodCall(call) = &mut expr.kind
+            && is_as_ptr_method(call.seg.ident.name)
+        {
+            let hir::ExprKind::MethodCall(_, hir_receiver, _, _) =
+                utils::hir::unwrap_drop_temps(hir_expr).kind
+            else {
+                return None;
+            };
+            return Some(self.transform_raw_slice_aggregate_payload(
+                &mut call.receiver,
+                hir_receiver,
+                elem_ty,
+            ));
+        }
+        None
+    }
+
+    fn transform_raw_slice_aggregate_payload(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        elem_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        if !ty_contains_raw_ptr_leaf(self.tcx, elem_ty) {
+            return false;
+        }
+        if let ExprKind::Paren(inner) = &mut expr.kind {
+            return self.transform_raw_slice_aggregate_payload(inner, hir_expr, elem_ty);
+        }
+        if let Some(inner) = ast_some_call_arg_mut(expr) {
+            return self.transform_raw_slice_aggregate_payload(inner, hir_expr, elem_ty);
+        }
+        if let Some((inner, hir_inner)) = self.transparent_ref_aggregate_inner(expr, hir_expr) {
+            return self.transform_raw_slice_aggregate_payload(inner, hir_inner, elem_ty);
+        }
+        let hir_expr = utils::hir::unwrap_drop_temps(hir_expr);
+        if let ExprKind::Array(elems) = &mut expr.kind {
+            let hir::ExprKind::Array(hir_elems) = hir_expr.kind else {
+                return false;
+            };
+            if elems.len() != hir_elems.len() {
+                return false;
+            }
+            return elems
+                .iter_mut()
+                .zip(hir_elems)
+                .fold(false, |changed, (elem, hir_elem)| {
+                    self.transform_raw_aggregate_context_inner(elem, hir_elem, elem_ty, true)
+                        || changed
+                });
+        }
+        match (&expr.kind, elem_ty.kind()) {
+            (ExprKind::Tup(_), ty::TyKind::Tuple(_))
+            | (ExprKind::Array(_), ty::TyKind::Array(_, _)) => {
+                self.transform_raw_aggregate_context_inner(expr, hir_expr, elem_ty, true)
+            }
+            (ExprKind::Struct(_), ty::TyKind::Adt(adt_def, _)) if adt_def.is_struct() => {
+                self.transform_raw_aggregate_context_inner(expr, hir_expr, elem_ty, true)
             }
             _ => false,
         }
@@ -4760,7 +5019,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return PtrKind::OptRef(m);
         }
 
-        if pe.addr_of {
+        if pe.addr_of && !pe.as_ptr {
             let addr_source_mut = addr_of_mutability(e).unwrap_or(false);
             let e = unwrap_addr_of(e);
             // if rhs is `&mut x` and `x`'s type has been updated, we need a cast
@@ -5105,7 +5364,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
 
-        if pe.as_ptr && self.is_base_not_a_raw_ptr(&pe) {
+        if pe.as_ptr
+            && self.is_base_not_a_raw_ptr(&pe)
+            && !matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
+        {
             match ctx {
                 PtrCtx::Rhs(PtrKind::OptRef(m)) => {
                     if let Some((base, source_inner_ty, is_slice_ref)) =
@@ -6270,6 +6532,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         if !self.is_base_not_a_raw_ptr(pe) {
             return None;
         }
+        if matches!(self.ptr_source_kind(pe), Some(PtrKind::OptRef(_))) {
+            return None;
+        }
         if want_mut {
             let source_mut = if pe.as_ptr {
                 pe.as_mut_ptr
@@ -6298,8 +6563,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
 
-        let mut source_inner_ty = slice_like_container_inner_ty(pe.base_ty, self.tcx)
-            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))?;
+        let Some(mut source_inner_ty) = slice_like_container_inner_ty(pe.base_ty, self.tcx)
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx))
+        else {
+            return None;
+        };
         let mut is_slice_ref = ty_is_slice_ref(pe.base_ty)
             || ty_is_borrowed_slice_like_container(pe.base_ty, self.tcx)
             || matches!(self.ptr_source_kind(pe), Some(PtrKind::Slice(_)));
@@ -7542,10 +7810,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         };
         let typeck = self.tcx.typeck(hir_receiver.hir_id.owner);
-        let source_inner_ty =
-            slice_like_container_inner_ty(typeck.expr_ty(hir_receiver), self.tcx)?;
+        let receiver_ty = typeck.expr_ty(hir_receiver);
+        let source_inner_ty = slice_like_container_inner_ty(receiver_ty, self.tcx)?;
         if source_inner_ty != target_inner_ty {
             return None;
+        }
+        if ty_is_borrowed_slice_like_container(receiver_ty, self.tcx) {
+            return Some((*call.receiver).clone());
         }
 
         if target_mut {
@@ -7572,6 +7843,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     ) -> Expr {
         let need_cast = lhs_inner_ty != rhs_inner_ty;
         let e_str = pprust::expr_to_string(e);
+        if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {
+            return slice;
+        }
         if !need_cast {
             utils::expr!(
                 "std::slice::from_{}(&{}*({}))",
@@ -8237,7 +8511,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         slice_like_container_inner_ty(pe.base_ty, self.tcx).is_some()
                     }
                 }
-                PathOrDeref::Other => pe.base_ty.is_array(),
+                PathOrDeref::Other => {
+                    pe.base_ty.is_array()
+                        || ty_is_borrowed_slice_like_container(pe.base_ty, self.tcx)
+                }
             },
             _ => false,
         }
@@ -8515,7 +8792,41 @@ fn mk_cursor_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: 
     utils::ty!("crate::slice_cursor::{cursor}<'{lifetime}, {inner_ty}>")
 }
 
+fn rewrite_bare_fn_inputs_in_ty(ty: &mut Ty, decisions: &[Option<PtrKind>]) -> bool {
+    match &mut ty.kind {
+        TyKind::BareFn(bare_fn) => rewrite_bare_fn_inputs(bare_fn, decisions),
+        TyKind::Path(_, path) => {
+            let mut changed = false;
+            for seg in &mut path.segments {
+                let Some(gen_args) = seg.args.as_mut() else {
+                    continue;
+                };
+                let GenericArgs::AngleBracketed(angle_args) = &mut **gen_args else {
+                    continue;
+                };
+                for arg in &mut angle_args.args {
+                    if let AngleBracketedArg::Arg(GenericArg::Type(inner_ty)) = arg {
+                        changed |= rewrite_bare_fn_inputs_in_ty(inner_ty, decisions);
+                    }
+                }
+            }
+            changed
+        }
+        TyKind::Tup(tys) => tys
+            .iter_mut()
+            .any(|ty| rewrite_bare_fn_inputs_in_ty(ty, decisions)),
+        TyKind::Slice(inner) | TyKind::Array(inner, _) | TyKind::Paren(inner) => {
+            rewrite_bare_fn_inputs_in_ty(inner, decisions)
+        }
+        TyKind::Ptr(mut_ty) | TyKind::Ref(_, mut_ty) => {
+            rewrite_bare_fn_inputs_in_ty(&mut mut_ty.ty, decisions)
+        }
+        _ => false,
+    }
+}
+
 /// Finds a `BareFn` type nested inside wrappers like `Option<fn(...)>`.
+#[allow(dead_code)]
 fn find_bare_fn_in_ty_mut(ty: &mut Ty) -> Option<&mut rustc_ast::BareFnTy> {
     match &mut ty.kind {
         TyKind::BareFn(bare_fn) => Some(bare_fn),
@@ -9522,6 +9833,7 @@ fn ty_contains_param(ty: ty::Ty<'_>) -> bool {
 fn ty_contains_raw_ptr_leaf<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
     match ty.kind() {
         ty::TyKind::RawPtr(..) => true,
+        ty::TyKind::Ref(_, inner, _) => ty_contains_raw_ptr_leaf(tcx, *inner),
         ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
             ty_contains_raw_ptr_leaf(tcx, *elem)
         }
@@ -9532,6 +9844,42 @@ fn ty_contains_raw_ptr_leaf<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
             .iter()
             .any(|field| ty_contains_raw_ptr_leaf(tcx, field.ty(tcx, args))),
         _ => false,
+    }
+}
+
+fn ast_some_call_arg_mut(expr: &mut Expr) -> Option<&mut Expr> {
+    let ExprKind::Call(callee, args) = &mut expr.kind else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let ExprKind::Path(_, path) = &callee.kind else {
+        return None;
+    };
+    if path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident.name.as_str() == "Some")
+    {
+        args.get_mut(0).map(|arg| &mut **arg)
+    } else {
+        None
+    }
+}
+
+fn is_as_ptr_method(name: Symbol) -> bool {
+    matches!(name.as_str(), "as_ptr" | "as_mut_ptr")
+}
+
+fn hir_ref_or_as_ptr_inner<'tcx>(hir_expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+    let hir_expr = utils::hir::unwrap_drop_temps(hir_expr);
+    match hir_expr.kind {
+        hir::ExprKind::AddrOf(_, _, inner) => utils::hir::unwrap_drop_temps(inner),
+        hir::ExprKind::MethodCall(seg, receiver, _, _) if is_as_ptr_method(seg.ident.name) => {
+            utils::hir::unwrap_drop_temps(receiver)
+        }
+        _ => hir_expr,
     }
 }
 
@@ -11997,7 +12345,6 @@ fn raw_pointer_map_or_closure_body<'a, 'tcx>(
 
     let hir_expr = ast_to_hir.get_expr(expr_id, tcx)?;
     let typeck = tcx.typeck(hir_expr.hir_id.owner);
-    let (_, raw_mutability) = unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_expr))?;
 
     let hir::ExprKind::MethodCall(_, hir_receiver, hir_args, _) = hir_expr.kind else {
         return None;
@@ -12013,9 +12360,19 @@ fn raw_pointer_map_or_closure_body<'a, 'tcx>(
         return None;
     };
     let hir_body = tcx.hir_body(*body);
-    let ty::TyKind::RawPtr(_, _) = typeck.expr_ty(hir_body.value).kind() else {
+    let ty::TyKind::RawPtr(_, closure_raw_mutability) = typeck.expr_ty(hir_body.value).kind()
+    else {
         return None;
     };
+    let raw_mutability = hir_args
+        .first()
+        .and_then(
+            |hir_fallback_arg| match typeck.expr_ty(hir_fallback_arg).kind() {
+                ty::TyKind::RawPtr(_, fallback_raw_mutability) => Some(*fallback_raw_mutability),
+                _ => None,
+            },
+        )
+        .unwrap_or(*closure_raw_mutability);
 
     Some((
         raw_mutability.is_mut(),
@@ -18167,10 +18524,22 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
             let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
             utils::ast::remove_unnecessary_items_from_ast(&mut krate);
             let (input, analysis) = build_analysis(tcx);
+            let arena = typed_arena::Arena::new();
+            let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+            let andersen_config = points_to::andersen::Config {
+                use_optimized_mir: false,
+                c_exposed_fns: FxHashSet::default(),
+            };
+            let pre_points_to = points_to::andersen::pre_analyze(&andersen_config, &tss, tcx);
+            let points_to_solutions =
+                points_to::andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
             let visitor = TransformVisitor::new(
                 &Config::default(),
                 &input,
                 &analysis,
+                &pre_points_to,
+                &points_to_solutions,
+                &tss,
                 ast_to_hir,
                 FnPtrGroups::default(),
                 FnPtrRewriteDecision::default(),

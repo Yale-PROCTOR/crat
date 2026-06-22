@@ -203,6 +203,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         &analysis_results,
         &tss,
         &fn_ptr_groups,
+        &config.c_exposed_fns,
     );
 
     let diagnostics = diagnostics::DecisionDiagnostics::from_env();
@@ -210,6 +211,9 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         config,
         &input,
         &analysis_results,
+        &pre_points_to,
+        &points_to_solutions,
+        &tss,
         ast_to_hir,
         fn_ptr_groups,
         fn_ptr_rewrite,

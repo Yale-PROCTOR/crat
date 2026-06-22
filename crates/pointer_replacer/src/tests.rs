@@ -8458,6 +8458,165 @@ pub unsafe fn foo(wrapper: Wrapper) -> *mut i32 {
 }
 
 #[test]
+fn test_map_or_raw_pointer_constness_mut_i8_offset_from_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn distance_from_candidate(
+    mut ptr: *mut i8,
+    idx: Option<isize>,
+    pos: usize,
+) -> isize {
+    if ptr.is_null() {
+        return 0;
+    }
+    *ptr.offset(0) = 1;
+    let current: *mut i8 = ptr.add(pos);
+    return current.offset_from(idx.map_or(
+        std::ptr::null_mut() as *mut i8,
+        |___idx| ((ptr).offset(___idx)) as *mut i8,
+    ));
+}
+"#,
+        &[".as_mut_ptr()"],
+        &[".as_ptr()"],
+    );
+}
+
+#[test]
+fn test_map_or_raw_pointer_constness_mut_u8_add_offset_from_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn byte_delta(
+    mut hdr: *mut u8,
+    idx: Option<isize>,
+    pos: usize,
+) -> isize {
+    if hdr.is_null() {
+        return 0;
+    }
+    *hdr.add(0usize) = 1;
+    *hdr.offset(pos as isize) = (*hdr.add(0usize)).wrapping_add(1);
+    let current: *mut u8 = hdr.offset(pos as isize);
+    return current.offset_from(idx.map_or(
+        std::ptr::null_mut() as *mut u8,
+        |___idx| ((hdr).add(___idx as usize)) as *mut u8,
+    ));
+}
+"#,
+        &[".as_mut_ptr()"],
+        &[],
+    );
+}
+
+#[test]
+fn test_map_or_raw_pointer_constness_mut_u8_offset_from_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn byte_distance(
+    mut hdr: *mut u8,
+    idx: Option<isize>,
+    pos: usize,
+) -> isize {
+    if hdr.is_null() {
+        return 0;
+    }
+    *hdr.offset(0) = 1;
+    let current: *mut u8 = hdr.add(pos);
+    return current.offset_from(idx.map_or(
+        std::ptr::null_mut() as *mut u8,
+        |___idx| ((hdr).offset(___idx)) as *mut u8,
+    ));
+}
+"#,
+        &[".as_mut_ptr()"],
+        &[".as_ptr()"],
+    );
+}
+
+#[test]
+fn test_map_or_raw_pointer_constness_mut_struct_offset_from_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: i32,
+}
+
+pub unsafe extern "C" fn entry_delta(
+    mut entries: *mut Entry,
+    idx: Option<isize>,
+    pos: usize,
+) -> isize {
+    if entries.is_null() {
+        return 0;
+    }
+    (*entries.offset(0)).value = 1;
+    let current: *mut Entry = entries.add(pos);
+    return current.offset_from(idx.map_or(
+        std::ptr::null_mut() as *mut Entry,
+        |___idx| ((entries).offset(___idx)) as *mut Entry,
+    ));
+}
+"#,
+        &[".as_mut_ptr()"],
+        &[".as_ptr()"],
+    );
+}
+
+#[test]
+fn test_map_or_raw_pointer_constness_mut_function_argument_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn consume_mut_byte(ptr: *mut u8) -> i32;
+}
+
+pub unsafe extern "C" fn call_consume(
+    mut ptr: *mut u8,
+    idx: Option<isize>,
+) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+    *ptr.offset(0) = 1;
+    return consume_mut_byte(idx.map_or(
+        std::ptr::null_mut() as *mut u8,
+        |___idx| ((ptr).offset(___idx)) as *mut u8,
+    ));
+}
+"#,
+        &[".as_mut_ptr()"],
+        &[".as_ptr()"],
+    );
+}
+
+#[test]
+fn test_map_or_raw_pointer_constness_const_i8_offset_from_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn const_distance_from_candidate(
+    mut ptr: *const i8,
+    idx: Option<isize>,
+    pos: usize,
+) -> isize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let first = *ptr.offset(0) as isize;
+    let current: *const i8 = ptr.add(pos);
+    return first
+        + current.offset_from(idx.map_or(
+            std::ptr::null() as *const i8,
+            |___idx| ((ptr).offset(___idx)) as *const i8,
+        ));
+}
+"#,
+        &[".as_ptr()"],
+        &[".as_mut_ptr()"],
+    );
+}
+
+#[test]
 fn test_array_local_rewriter_skips_assignment_with_planned_local_in_rhs() {
     let code = r#"
 pub unsafe fn foo(mut p: *mut i32) -> i32 {
@@ -10496,6 +10655,395 @@ pub unsafe extern "C" fn call_table(mut data: *const i8) -> i32 {
 }
 
 #[test]
+fn test_raw_aggregate_element_contract_direct_const_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_table(mut table: *const *const i8) -> i32 {
+    return *(*table.offset(0)) as i32 + *(*table.offset(1)) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32 + read_table([data, data.add(1usize)].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_mut_array_arg_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn read_items(mut items: *const *mut Item) -> i32 {
+    (*(*items.offset(0))).value += 1;
+    return (*(*items.offset(1))).value;
+}
+
+pub unsafe extern "C" fn dispatch(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value = 1;
+    (*item.offset(1)).value = 2;
+    return read_items([item, item.add(1usize)].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_mut_outer_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn advance_first(mut table: *mut *const i8) -> i32 {
+    *table.offset(0) = (*table.offset(0)).add(1usize);
+    return *(*table.offset(0)) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32 + advance_first([data, data.add(1usize)].as_mut_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_nested_const_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_rows(mut rows: *const [*const i8; 2]) -> i32 {
+    return *(*rows.offset(0))[0usize] as i32 + *(*rows.offset(0))[1usize] as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32 + read_rows([[data, data.add(1usize)]].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_mut_tuple_array_arg_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+pub unsafe fn read_pairs(mut pairs: *const (*mut Item, *mut Item)) -> i32 {
+    let next = pairs.offset(1isize);
+    return (next as usize != pairs as usize) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value = 1;
+    (*item.offset(1)).value = 2;
+    return read_pairs([(item, item.add(1usize))].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_local_tuple_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_pairs(mut pairs: *const (*const i8, *const i8)) -> i32 {
+    let next = pairs.offset(1isize);
+    return (next as usize != pairs as usize) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    let pairs = &[(data, data.add(1usize))];
+    return first as i32 + read_pairs(pairs.as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_local_struct_array_arg_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Bundle {
+    pub tag: i32,
+    pub first: *const i8,
+    pub second: *const i8,
+}
+
+impl Copy for Bundle {}
+
+impl Clone for Bundle {
+    fn clone(&self) -> Bundle {
+        *self
+    }
+}
+
+extern "C" {
+    fn accept_bundle(bundle: Bundle);
+}
+
+pub unsafe fn read_bundles(mut bundles: *const Bundle) -> i32 {
+    let bundle = *bundles.offset(0);
+    accept_bundle(bundle);
+    return bundle.tag;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    let bundles = &[Bundle {
+        tag: first as i32,
+        first: data,
+        second: data.add(1usize),
+    }];
+    return read_bundles(bundles.as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_tuple_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_pairs(mut pairs: *const (*const i8, *const i8)) -> i32 {
+    let next = pairs.offset(1isize);
+    return (next as usize != pairs as usize) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32 + read_pairs([(data, data.add(1usize))].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_nested_tuple_array_arg_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_nested(mut pairs: *const ((*const i8, [*const i8; 2]), i32)) -> i32 {
+    let next = pairs.offset(1isize);
+    return (next as usize != pairs as usize) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32 + read_nested([((data, [data, data.add(1usize)]), 4)].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_struct_array_arg_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Bundle {
+    pub tag: i32,
+    pub first: *const i8,
+    pub second: *const i8,
+}
+
+impl Copy for Bundle {}
+
+impl Clone for Bundle {
+    fn clone(&self) -> Bundle {
+        *self
+    }
+}
+
+extern "C" {
+    fn accept_bundle(bundle: Bundle);
+}
+
+pub unsafe fn read_bundles(mut bundles: *const Bundle) -> i32 {
+    let bundle = *bundles.offset(0);
+    accept_bundle(bundle);
+    return bundle.tag;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32
+        + read_bundles((&[Bundle {
+            tag: first as i32,
+            first: data,
+            second: data.add(1usize),
+        }]).as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_direct_nested_struct_array_arg_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub ptrs: [*const i8; 2],
+}
+
+impl Copy for Inner {}
+
+impl Clone for Inner {
+    fn clone(&self) -> Inner {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+    pub tag: i32,
+    pub tail: *const i8,
+}
+
+impl Copy for Outer {}
+
+impl Clone for Outer {
+    fn clone(&self) -> Outer {
+        *self
+    }
+}
+
+extern "C" {
+    fn accept_outer(outer: Outer);
+}
+
+pub unsafe fn read_outers(mut outers: *const Outer) -> i32 {
+    let outer = *outers.offset(0);
+    accept_outer(outer);
+    return outer.tag;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    return first as i32
+        + read_outers([Outer {
+            inner: Inner {
+                ptrs: [data, data.add(1usize)],
+            },
+            tag: first as i32,
+            tail: data.add(2usize),
+        }].as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_local_nested_struct_array_then_passed_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub ptrs: [*const i8; 2],
+}
+
+impl Copy for Inner {}
+
+impl Clone for Inner {
+    fn clone(&self) -> Inner {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+    pub tag: i32,
+    pub tail: *const i8,
+}
+
+impl Copy for Outer {}
+
+impl Clone for Outer {
+    fn clone(&self) -> Outer {
+        *self
+    }
+}
+
+extern "C" {
+    fn accept_outer(outer: Outer);
+}
+
+pub unsafe fn read_outers(mut outers: *const Outer) -> i32 {
+    let outer = *outers.offset(0);
+    accept_outer(outer);
+    return outer.tag;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    let outers = &[Outer {
+        inner: Inner {
+            ptrs: [data, data.add(1usize)],
+        },
+        tag: first as i32,
+        tail: data.add(2usize),
+    }];
+    return first as i32 + read_outers(outers.as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_element_contract_local_nested_tuple_array_then_passed_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn read_nested(mut pairs: *const ((*const i8, [*const i8; 2]), i32)) -> i32 {
+    let next = pairs.offset(1isize);
+    return (next as usize != pairs as usize) as i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
+    let first = *data.offset(0);
+    let pairs = &[((data, [data, data.add(1usize)]), 9)];
+    return first as i32 + read_nested(pairs.as_ptr());
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
 fn test_section7_cursor_offset_raw_cast_is_not_revisited_as_offset_call() {
     run_test(
         r#"
@@ -11168,6 +11716,419 @@ pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
             "Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
         ],
         &["expect(\"command\")((argv).as_mut_ptr())"],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_tuple_local_scalar_callback_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn set_one(mut value: *mut i32) -> i32 {
+    *value = 1;
+    return *value;
+}
+
+pub unsafe extern "C" fn dispatch(mut value: *mut i32) -> i32 {
+    *value = 0;
+    let handlers: (unsafe extern "C" fn(*mut i32) -> i32, i32) =
+        (set_one as unsafe extern "C" fn(*mut i32) -> i32, 5);
+    return (handlers.0)(value) + handlers.1;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_nested_alias_field_slice_callback_typechecks() {
+    run_test(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+pub type MaybeCommandFn = Option<CommandFn>;
+
+#[repr(C)]
+pub struct Command {
+    pub run: MaybeCommandFn,
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static COMMANDS: [Command; 1] = [Command {
+    run: Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+}];
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler: MaybeCommandFn = COMMANDS[0].run;
+    return handler.expect("command")(argv);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_alias_param_callback_typechecks() {
+    run_test(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn invoke(
+    cb: CommandFn,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return cb(argv);
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    return invoke(
+        add as unsafe extern "C" fn(*mut *mut i8) -> i32,
+        argv,
+    );
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_tuple_param_callback_typechecks() {
+    run_test(
+        r#"
+pub type CommandFn = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn invoke(
+    pair: (CommandFn, i32),
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return pair.0.expect("command")(argv) + pair.1;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    return invoke(
+        (Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32), 7),
+        argv,
+    );
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_tuple_local_callback_slot_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handlers: (unsafe extern "C" fn(*mut *mut i8) -> i32, i32) =
+        (add as unsafe extern "C" fn(*mut *mut i8) -> i32, 9);
+    return (handlers.0)(argv) + handlers.1;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_array_local_callback_slot_typechecks() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handlers: [unsafe extern "C" fn(*mut *mut i8) -> i32; 1] =
+        [add as unsafe extern "C" fn(*mut *mut i8) -> i32];
+    return handlers[0](argv);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_struct_field_alias_local_typechecks() {
+    run_test(
+        r#"
+pub type CommandFn = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct Inner {
+    pub run: (CommandFn, i32),
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub inner: Inner,
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static OUTER: Outer = Outer {
+    inner: Inner {
+        run: (Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32), 3),
+    },
+};
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler = OUTER.inner.run.0;
+    return handler.expect("command")(argv) + OUTER.inner.run.1;
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_raw_c_exposed_param_slot_typechecks() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("invoke".to_string());
+    run_test_with_config(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn invoke(
+    cb: CommandFn,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    return cb(argv);
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return invoke(
+        add as unsafe extern "C" fn(*mut *mut i8) -> i32,
+        argv,
+    );
+}
+"#,
+        &config,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_raw_c_exposed_field_slot_typechecks() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("invoke".to_string());
+    run_test_with_config(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+#[repr(C)]
+pub struct Command {
+    pub run: (CommandFn, i32),
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn invoke(command: *mut Command, mut argv: *mut *mut i8) -> i32 {
+    return ((*command).run.0)(argv) + (*command).run.1;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let mut command = Command {
+        run: (add as unsafe extern "C" fn(*mut *mut i8) -> i32, 11),
+    };
+    return invoke(&mut command as *mut Command, argv);
+}
+"#,
+        &config,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_mixed_local_and_foreign_callbacks_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn raw_add(argv: *mut *mut i8) -> i32;
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn dispatch(
+    use_local: bool,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler: unsafe extern "C" fn(*mut *mut i8) -> i32 =
+        if use_local {
+            add as unsafe extern "C" fn(*mut *mut i8) -> i32
+        } else {
+            raw_add as unsafe extern "C" fn(*mut *mut i8) -> i32
+        };
+    return handler(argv);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_rewritten_callback_with_raw_argument_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn raw_touch(argv: *mut *mut i8);
+}
+
+pub type CommandFn = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn dispatch(
+    cb: CommandFn,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    raw_touch(argv);
+    return cb.expect("command")(argv);
+}
+
+pub unsafe extern "C" fn call(mut argv: *mut *mut i8) -> i32 {
+    return dispatch(
+        Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+        argv,
+    );
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_explicit_cast_destination_typechecks() {
+    run_test(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn choose(use_add: bool) -> CommandFn {
+    if use_add {
+        return add as unsafe extern "C" fn(*mut *mut i8) -> i32;
+    }
+    return add as unsafe extern "C" fn(*mut *mut i8) -> i32;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler = choose(true);
+    return handler(argv);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_c_exposed_scalar_input_raw_output_field_typechecks() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("init_allocator".to_string());
+    run_test_with_config(
+        r#"
+pub type size_t = usize;
+
+#[repr(C)]
+pub struct Allocator {
+    pub gmalloc: Option<unsafe extern "C" fn(size_t) -> *mut core::ffi::c_void>,
+    pub gfree: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> ()>,
+}
+
+unsafe extern "C" fn fail_malloc(len: size_t) -> *mut core::ffi::c_void {
+    if len == 0 {
+        return core::ptr::null_mut();
+    }
+    return core::ptr::null_mut();
+}
+
+unsafe extern "C" fn fail_free(_ptr: *mut core::ffi::c_void) {}
+
+pub static mut ALLOCATOR: Allocator = Allocator {
+    gmalloc: Some(fail_malloc as unsafe extern "C" fn(size_t) -> *mut core::ffi::c_void),
+    gfree: Some(fail_free as unsafe extern "C" fn(*mut core::ffi::c_void) -> ()),
+};
+
+#[no_mangle]
+pub unsafe extern "C" fn init_allocator(allocator: *mut Allocator) {
+    (*allocator).gmalloc =
+        Some(fail_malloc as unsafe extern "C" fn(size_t) -> *mut core::ffi::c_void);
+    (*allocator).gfree = Some(fail_free as unsafe extern "C" fn(*mut core::ffi::c_void) -> ());
+}
+
+pub unsafe extern "C" fn allocate(len: size_t) -> *mut core::ffi::c_void {
+    let p: *mut core::ffi::c_void =
+        (ALLOCATOR.gmalloc).expect("non-null function pointer")(len);
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    return p;
+}
+"#,
+        &config,
+        &["expect(\"non-null function pointer\")(len)"],
+        &["len as *mut", "(len)."],
     );
 }
 
