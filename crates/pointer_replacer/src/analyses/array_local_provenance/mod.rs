@@ -483,6 +483,15 @@ pub fn array_local_provenance_analysis(
     results
 }
 
+pub fn analyze_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    body: &Body<'tcx>,
+    alloc_fns: &FxHashSet<LocalDefId>,
+) -> ArrayLocalProvenance {
+    analyze_body_with_summaries(tcx, def_id, body, alloc_fns, None)
+}
+
 fn analyze_body_with_summaries<'tcx>(
     tcx: TyCtxt<'tcx>,
     _def_id: LocalDefId,
