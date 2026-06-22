@@ -1226,7 +1226,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
-            ExprKind::Cast(_, cast_ty) => {
+            ExprKind::Cast(inner, cast_ty) => {
                 if let TyKind::BareFn(bare_fn) = &mut cast_ty.kind
                     && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
                     && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
@@ -1242,6 +1242,32 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if rewrite_bare_fn_inputs(bare_fn, &decs) {
                             self.slice_cursor.set(true);
                         }
+                    }
+                }
+
+                if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+                    && let hir::ExprKind::Cast(hir_inner, _) = hir_expr.kind
+                {
+                    let hir_inner = utils::hir::unwrap_drop_temps(hir_inner);
+                    let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                    let cast_ty = typeck.expr_ty(hir_expr);
+                    let inner_ty = typeck.expr_ty_adjusted(hir_inner);
+                    let cast_raw_mut = if let ty::TyKind::RawPtr(_, mutability) = cast_ty.kind() {
+                        Some(mutability.is_mut())
+                    } else {
+                        None
+                    };
+                    if let Some((_, inner_mutability)) = unwrap_ptr_from_mir_ty(inner_ty)
+                        && (cast_raw_mut.is_some() || cast_ty.is_integral())
+                        && !self.cast_has_pointer_destination_context(hir_expr, cast_ty)
+                    {
+                        self.transform_ptr(
+                            inner,
+                            hir_inner,
+                            PtrCtx::Rhs(PtrKind::Raw(
+                                cast_raw_mut.unwrap_or_else(|| inner_mutability.is_mut()),
+                            )),
+                        );
                     }
                 }
             }
@@ -3610,6 +3636,105 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_kind: PtrKind,
     ) -> PtrKind {
         self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
+    }
+
+    fn cast_has_pointer_destination_context(
+        &self,
+        hir_expr: &hir::Expr<'tcx>,
+        cast_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        let cast_is_integral = cast_ty.is_integral();
+        let mut child_hir_id = hir_expr.hir_id;
+        let Some(parent_node) = self
+            .tcx
+            .hir_parent_iter(hir_expr.hir_id)
+            .find_map(|(_, parent_node)| {
+                if let hir::Node::Expr(parent) = parent_node
+                    && let hir::ExprKind::DropTemps(inner) = parent.kind
+                    && inner.hir_id == child_hir_id
+                {
+                    child_hir_id = parent.hir_id;
+                    None
+                } else {
+                    Some(parent_node)
+                }
+            })
+        else {
+            return false;
+        };
+        match parent_node {
+            hir::Node::Expr(parent) => match parent.kind {
+                hir::ExprKind::Cast(..) => true,
+                hir::ExprKind::Call(_, args) => {
+                    !cast_is_integral && args.iter().any(|arg| arg.hir_id == child_hir_id)
+                }
+                hir::ExprKind::MethodCall(seg, receiver, _, _)
+                    if receiver.hir_id == child_hir_id =>
+                {
+                    matches!(
+                        seg.ident.name.as_str(),
+                        "offset"
+                            | "add"
+                            | "wrapping_add"
+                            | "wrapping_sub"
+                            | "as_ptr"
+                            | "as_mut_ptr"
+                            | "offset_from"
+                    )
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == child_hir_id => {
+                    unwrap_ptr_from_mir_ty(self.tcx.typeck(parent.hir_id.owner).expr_ty(lhs))
+                        .is_some()
+                }
+                hir::ExprKind::Unary(hir::UnOp::Deref, operand)
+                    if operand.hir_id == child_hir_id =>
+                {
+                    true
+                }
+                hir::ExprKind::Ret(Some(ret)) if ret.hir_id == child_hir_id => {
+                    unwrap_ptr_from_mir_ty(
+                        self.tcx
+                            .fn_sig(hir_expr.hir_id.owner)
+                            .skip_binder()
+                            .skip_binder()
+                            .output(),
+                    )
+                    .is_some()
+                }
+                hir::ExprKind::Closure(_) => !cast_is_integral,
+                _ => false,
+            },
+            hir::Node::LetStmt(let_stmt) => {
+                let Some(init) = let_stmt.init else {
+                    return false;
+                };
+                if init.hir_id != child_hir_id {
+                    return false;
+                }
+                if cast_is_integral {
+                    return false;
+                }
+                let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind else {
+                    return false;
+                };
+                unwrap_ptr_from_mir_ty(self.tcx.typeck(binding_hir_id.owner).node_type(binding_hir_id))
+                    .is_some()
+            }
+            hir::Node::Block(block)
+                if block.expr.is_some_and(|expr| expr.hir_id == child_hir_id) =>
+            {
+                !cast_is_integral
+                    || unwrap_ptr_from_mir_ty(
+                        self.tcx
+                            .fn_sig(hir_expr.hir_id.owner)
+                            .skip_binder()
+                            .skip_binder()
+                            .output(),
+                    )
+                    .is_some()
+            }
+            _ => false,
+        }
     }
 
     fn transform_integer_to_pointer_cast(
@@ -7443,10 +7568,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         PtrExprBaseKind::Other,
                     ));
                 };
-                let name = seg.ident.name.as_str();
+                let name = call.seg.ident.name.as_str();
+                if name != seg.ident.name.as_str() {
+                    return Some(PtrExpr::new(
+                        expr,
+                        hir_expr,
+                        base_ty,
+                        PtrExprBaseKind::Other,
+                    ));
+                }
                 if name == "offset" || name == "add" {
+                    let Some(offset) = call.args.first() else {
+                        return Some(PtrExpr::new(
+                            expr,
+                            hir_expr,
+                            base_ty,
+                            PtrExprBaseKind::Other,
+                        ));
+                    };
                     let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;
-                    ptr_expr.push_offset(&call.args[0]);
+                    ptr_expr.push_offset(offset);
                     Some(ptr_expr)
                 } else if name == "as_mut_ptr" || name == "as_ptr" {
                     let mut ptr_expr = self.ptr_expr(&call.receiver, hreceiver)?;

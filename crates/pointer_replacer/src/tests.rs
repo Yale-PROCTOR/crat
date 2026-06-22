@@ -10088,6 +10088,148 @@ pub const COMMAND: Command = Command {
 }
 
 #[test]
+fn test_section7_address_cast_materializes_slice_pointer() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn crc32_align(mut buf: *const u8, mut len: usize) -> u64 {
+    if buf.is_null() {
+        return 0;
+    }
+
+    let mut sum: u64 = 0;
+    while len != 0 && (buf as core::ffi::c_ulong & 7 as core::ffi::c_ulong) != 0 {
+        sum = sum.wrapping_add(*buf as u64);
+        buf = buf.offset(1);
+        len = len.wrapping_sub(1);
+    }
+    return sum;
+}
+"#,
+        &["mut buf: &[u8]", "(buf).as_ptr() as core::ffi::c_ulong"],
+        &["buf as core::ffi::c_ulong"],
+    );
+}
+
+#[test]
+fn test_section7_typed_raw_cast_materializes_mut_slice_pointer() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct GitCommit {
+    pub id: i32,
+}
+
+pub unsafe extern "C" fn collect_parent(
+    mut parent: *mut GitCommit,
+    mut n: usize,
+) -> *const GitCommit {
+    (*parent.offset(n as isize)).id = 1;
+    let mut parents: [*const GitCommit; 1] = [parent as *const GitCommit];
+    return parents[0];
+}
+"#,
+        &[
+            "mut parent: &mut [crate::GitCommit]",
+            "(parent).as_ptr() as *const",
+        ],
+        &[
+            "parent as *const crate::GitCommit",
+            "parent as *const GitCommit",
+        ],
+    );
+}
+
+#[test]
+fn test_section7_c_void_cast_materializes_mut_slice_pointer() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct GitRepository {
+    pub id: i32,
+}
+
+pub unsafe extern "C" fn checkout_repo(mut repo: *mut GitRepository, mut slot: usize) -> i32 {
+    (*repo.offset(slot as isize)).id = 7;
+    if (repo as *mut core::ffi::c_void).is_null() {
+        return 0;
+    }
+    return 1;
+}
+"#,
+        &[
+            "mut repo: &mut [crate::GitRepository]",
+            "(repo).as_mut_ptr() as *mut",
+        ],
+        &["repo as *mut core::ffi::c_void"],
+    );
+}
+
+#[test]
+fn test_section7_c_char_cast_materializes_shared_slice_pointer() {
+    run_test(
+        r#"
+extern "C" {
+    fn use_strings(count: usize, strings: *const *const core::ffi::c_char);
+}
+
+pub unsafe extern "C" fn check_ref(mut ref_0: *const core::ffi::c_char) -> i32 {
+    if *ref_0.offset(0) != 0 {
+        let strings: [*const core::ffi::c_char; 3] = [
+            b"bad\0".as_ptr() as *const core::ffi::c_char,
+            ref_0 as *const core::ffi::c_char,
+            b"\0".as_ptr() as *const core::ffi::c_char,
+        ];
+        use_strings(3, strings.as_ptr());
+    }
+    return *ref_0.offset(0) as i32;
+}
+"#,
+        &["mut ref_0: &[i8]", "(ref_0).as_ptr() as *const"],
+        &["ref_0 as *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_section7_cursor_offset_raw_cast_is_not_revisited_as_offset_call() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn compact(mut str: *mut core::ffi::c_char) -> usize {
+    let mut scan_idx: Option<isize> = None;
+    let mut pos_idx: isize = 0isize;
+    if str.is_null() {
+        return 0;
+    }
+
+    scan_idx = Some(0isize);
+    while *((str).offset(scan_idx.unwrap()) as *mut i8) != 0 {
+        *((str).offset(pos_idx) as *mut i8) =
+            *((str).offset(scan_idx.unwrap()) as *mut i8);
+        pos_idx = (pos_idx) + ((1) as isize);
+        scan_idx = Some((scan_idx.unwrap()) + ((1) as isize));
+    }
+
+    if (str).offset(pos_idx) as *mut i8 !=
+        scan_idx.map_or(std::ptr::null_mut() as *mut i8,
+            |___idx| ((str).offset(___idx)) as *mut i8)
+    {
+        *((str).offset(pos_idx) as *mut i8) = 0;
+    }
+
+    return pos_idx as usize;
+}
+"#,
+        &[
+            "mut str:",
+            "crate::slice_cursor::SliceCursorMut<'_, i8>",
+            "as_deref_mut().offset_by((pos_idx) as",
+            ")).as_mut_ptr() as",
+            "*mut i8",
+        ],
+        &["(str).offset(pos_idx) as *mut i8"],
+    );
+}
+
+#[test]
 fn test_section12_keeps_hashmap_link_fields_raw() {
     run_test(
         r#"
