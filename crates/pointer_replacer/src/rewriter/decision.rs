@@ -442,7 +442,14 @@ impl SigDecisions {
         lifetime_plans: &super::lifetimes::LifetimePlans,
         fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
     ) -> Self {
-        Self::new_with_diagnostics(rust_program, analysis, lifetime_plans, fn_ptr_groups, None)
+        Self::new_with_diagnostics(
+            rust_program,
+            analysis,
+            lifetime_plans,
+            fn_ptr_groups,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_diagnostics(
@@ -450,6 +457,7 @@ impl SigDecisions {
         analysis: &Analysis,
         lifetime_plans: &super::lifetimes::LifetimePlans,
         fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+        fn_ptr_group_decisions: Option<&FxHashMap<LocalDefId, Vec<Option<PtrKind>>>>,
         mut diagnostics: Option<&mut DecisionDiagnostics>,
     ) -> Self {
         let mut data = FxHashMap::default();
@@ -469,7 +477,12 @@ impl SigDecisions {
                 let input_decs = fn_ptr_groups
                     .fn_to_group
                     .get(did)
-                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep).cloned())
+                    .and_then(|rep| {
+                        fn_ptr_group_decisions
+                            .unwrap_or(&fn_ptr_groups.group_decisions)
+                            .get(rep)
+                            .cloned()
+                    })
                     .unwrap_or_else(|| vec![None; input_len]);
                 if let Some(diagnostics) = diagnostics.as_deref_mut() {
                     record_param_decisions(

@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 
-use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_ast::{
     mut_visit::{self, FnKind, MutVisitor},
@@ -27,9 +26,11 @@ use utils::{
     ir::{AstToHir, is_option, mir_ty_to_string},
 };
 
+#[cfg(test)]
+use super::collector::collect_diffs;
 use super::{
     Analysis, BytemuckDependency, Config,
-    collector::{collect_diffs, collect_diffs_with_diagnostics},
+    collector::{collect_diffs_with_diagnostics, collect_diffs_with_fn_ptr_decisions},
     decision::{PtrKind, SigDecision, SigDecisions, pointee_forces_raw},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
@@ -679,8 +680,26 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             if let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind {
                 let hir_rhs = let_stmt.init.unwrap();
                 if !self.try_bridge_raw_root(rhs, hir_rhs, lhs_kind, lhs_inner_ty, Some(hir_id)) {
-                    self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                    self.transform_rhs_with_expected_inner(
+                        rhs,
+                        hir_rhs,
+                        lhs_kind,
+                        Some(lhs_inner_ty),
+                    );
                 }
+            }
+        }
+
+        if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, _ident, _) = let_stmt.pat.kind
+            && let Some(hir_rhs) = let_stmt.init
+            && let LocalKind::Init(box rhs) | LocalKind::InitElse(box rhs, _) = &mut local.kind
+        {
+            let lhs_ty = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+            if unwrap_ptr_from_mir_ty(lhs_ty).is_none()
+                && ty_contains_raw_ptr_leaf(self.tcx, lhs_ty)
+            {
+                self.transform_raw_aggregate_context(rhs, hir_rhs, lhs_ty);
             }
         }
 
@@ -748,7 +767,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     return;
                 }
                 let lhs_ty = typeck.expr_ty(hir_lhs);
-                let (_, m) = some_or!(unwrap_ptr_from_mir_ty(lhs_ty), return);
+                let Some((_, m)) = unwrap_ptr_from_mir_ty(lhs_ty) else {
+                    if ty_contains_raw_ptr_leaf(self.tcx, lhs_ty) {
+                        self.transform_raw_aggregate_context(rhs, hir_rhs, lhs_ty);
+                    }
+                    return;
+                };
                 let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(lhs_ty).unwrap();
                 let lhs_hir_id = if let ExprKind::Path(_, _) = lhs.kind
                     && let Some(hir_id) = self.hir_id_of_path(lhs.id)
@@ -850,9 +874,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 Some(lhs_hir_id),
                             )
                         {
-                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                            self.transform_rhs_with_expected_inner(
+                                rhs,
+                                hir_rhs,
+                                lhs_kind,
+                                Some(lhs_inner_ty),
+                            );
                         } else if lhs_hir_id.is_none() {
-                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                            self.transform_rhs_with_expected_inner(
+                                rhs,
+                                hir_rhs,
+                                lhs_kind,
+                                Some(lhs_inner_ty),
+                            );
                         }
                     }
                     PtrKind::Slice(_)
@@ -872,7 +906,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 Some(lhs_hir_id),
                             )
                         {
-                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                            self.transform_rhs_with_expected_inner(
+                                rhs,
+                                hir_rhs,
+                                lhs_kind,
+                                Some(lhs_inner_ty),
+                            );
                         } else if lhs_hir_id.is_none()
                             && !self.try_bridge_raw_projection_root(
                                 rhs,
@@ -882,7 +921,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 lhs_inner_ty,
                             )
                         {
-                            self.transform_rhs(rhs, hir_rhs, lhs_kind);
+                            self.transform_rhs_with_expected_inner(
+                                rhs,
+                                hir_rhs,
+                                lhs_kind,
+                                Some(lhs_inner_ty),
+                            );
                         }
                     }
                 }
@@ -925,28 +969,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     None
                 };
 
-                // for indirect calls via a fn-ptr binding, look up joint decisions
                 let fn_ptr_decisions: Option<&Vec<Option<PtrKind>>> = if sig_dec.is_none() {
-                    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = func.kind
-                        && let Res::Local(binding_hir_id) = path.res
-                    {
-                        self.fn_ptr_rewrite
-                            .annotation_decisions
-                            .get(&binding_hir_id)
-                    } else {
-                        None
-                    }
+                    self.fn_ptr_input_decisions_for_callee(func)
                 } else {
                     None
                 };
-
-                // for calls via struct-field fn-ptrs (e.g., `(s.field).expect(...)(args)`)
-                let field_fn_ptr_decisions: Option<&Vec<Option<PtrKind>>> =
-                    if sig_dec.is_none() && fn_ptr_decisions.is_none() {
-                        self.field_fn_ptr_decisions_for_call(func)
-                    } else {
-                        None
-                    };
 
                 if let Some(free_rewrite) = self.rewrite_direct_free_call(hir_expr, &args[..]) {
                     *expr = free_rewrite;
@@ -960,11 +987,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .flatten()
                         .or_else(|| {
                             fn_ptr_decisions
-                                .and_then(|decs| decs.get(i).copied())
-                                .flatten()
-                        })
-                        .or_else(|| {
-                            field_fn_ptr_decisions
                                 .and_then(|decs| decs.get(i).copied())
                                 .flatten()
                         })
@@ -990,6 +1012,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             "({}).as_deref_mut()",
                             pprust::expr_to_string(arg)
                         ));
+                    }
+                }
+
+                for (arg, harg) in args.iter_mut().zip(hargs) {
+                    let expected_ty = typeck.expr_ty_adjusted(harg);
+                    if unwrap_ptr_from_mir_ty(expected_ty).is_none()
+                        && ty_contains_raw_ptr_leaf(self.tcx, expected_ty)
+                    {
+                        self.transform_raw_aggregate_context(arg, harg, expected_ty);
                     }
                 }
 
@@ -1118,24 +1149,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .and_then(|sd| sd.output_dec)
                         .unwrap_or(PtrKind::Raw(m.is_mut()));
                     self.transform_return_rhs(ret, hir_ret, kind, lhs_inner_ty);
-                } else if let ty::TyKind::Tuple(tys) = sig.output().kind() {
-                    let ExprKind::Tup(elems) = &mut ret.kind else {
-                        panic!("expected tuple expr for tuple return type")
-                    };
-                    let hir::ExprKind::Tup(hir_elems) = hir_ret.kind else {
-                        panic!("expected HIR tuple expr for tuple return type")
-                    };
-                    for (i, elem_ty) in tys.iter().enumerate() {
-                        if let ty::TyKind::RawPtr(_, m) = elem_ty.kind() {
-                            let (lhs_inner_ty, _) = unwrap_ptr_from_mir_ty(elem_ty).unwrap();
-                            self.transform_return_rhs(
-                                &mut elems[i],
-                                &hir_elems[i],
-                                PtrKind::Raw(m.is_mut()),
-                                lhs_inner_ty,
-                            );
-                        }
-                    }
+                } else if ty_contains_raw_ptr_leaf(self.tcx, sig.output()) {
+                    self.transform_raw_aggregate_context(ret, hir_ret, sig.output());
                 }
             }
             ExprKind::Unary(UnOp::Deref, e) => {
@@ -1236,7 +1251,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && let hir::def::Res::Def(_, def_id) = path.res
                         && let Some(local_did) = def_id.as_local()
                         && self.fn_ptr_rewrite.direct_rewrite.contains(&local_did)
-                        && let Some(decs) = self.fn_ptr_rewrite.individual_decisions.get(&local_did)
+                        && let Some(decs) = self.fn_ptr_group_decisions_for_fn(local_did)
                     {
                         let decs = decs.clone();
                         if rewrite_bare_fn_inputs(bare_fn, &decs) {
@@ -1579,6 +1594,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             analysis,
             &lifetime_plans,
             &fn_ptr_groups,
+            Some(&fn_ptr_rewrite.group_decisions),
             Some(&mut diagnostics),
         );
         let initial_sig_decs = sig_decs.clone();
@@ -1587,6 +1603,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             analysis,
             &sig_decs,
             &fn_ptr_groups,
+            Some(&fn_ptr_rewrite.group_decisions),
             Some(&mut diagnostics),
         );
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
@@ -1604,7 +1621,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             DecisionReason::UnsupportedAllocatorRoot,
         );
         if initial_forced_raw_input_changed {
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            ptr_kinds = collect_diffs_with_fn_ptr_decisions(
+                rust_program,
+                analysis,
+                &sig_decs,
+                &fn_ptr_groups,
+                &fn_ptr_rewrite.group_decisions,
+            );
         }
         record_binding_events(
             &mut diagnostics,
@@ -1968,7 +1991,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !changed {
                 break;
             }
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            ptr_kinds = collect_diffs_with_fn_ptr_decisions(
+                rust_program,
+                analysis,
+                &sig_decs,
+                &fn_ptr_groups,
+                &fn_ptr_rewrite.group_decisions,
+            );
             normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
             normalize_owning_call_result_bindings(
                 rust_program.tcx,
@@ -2032,7 +2061,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
         if sig_changed {
-            ptr_kinds = collect_diffs(rust_program, analysis, &sig_decs, &fn_ptr_groups);
+            ptr_kinds = collect_diffs_with_fn_ptr_decisions(
+                rust_program,
+                analysis,
+                &sig_decs,
+                &fn_ptr_groups,
+                &fn_ptr_rewrite.group_decisions,
+            );
         }
         normalize_forced_raw_bindings(rust_program.tcx, &mut ptr_kinds, &forced_raw_bindings);
         normalize_owning_call_result_bindings(
@@ -3336,7 +3371,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
     ) {
         let PtrKind::Raw(m) = output_kind else {
-            self.transform_rhs(rhs, hir_rhs, output_kind);
+            self.transform_rhs_with_expected_inner(rhs, hir_rhs, output_kind, Some(lhs_inner_ty));
             if matches!(output_kind, PtrKind::Ref(_)) {
                 use_moving_opt_ref_unwraps_for_return(rhs);
             }
@@ -3347,7 +3382,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 .typeck(hir_rhs.hir_id.owner)
                 .expr_ty_adjusted(hir_rhs),
         ) else {
-            self.transform_rhs(rhs, hir_rhs, output_kind);
+            self.transform_rhs_with_expected_inner(rhs, hir_rhs, output_kind, Some(lhs_inner_ty));
             return;
         };
         let rhs_expr = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
@@ -3380,7 +3415,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 _ => {}
             }
         }
-        self.transform_rhs(rhs, hir_rhs, output_kind);
+        self.transform_rhs_with_expected_inner(rhs, hir_rhs, output_kind, Some(lhs_inner_ty));
     }
 
     fn rewrite_direct_free_call(
@@ -3483,7 +3518,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return None;
         }
         let mut raw_arg = (**arg).clone();
-        self.transform_rhs(&mut raw_arg, hir_arg, PtrKind::Raw(true));
+        self.transform_rhs_with_expected_inner(
+            &mut raw_arg,
+            hir_arg,
+            PtrKind::Raw(true),
+            Some(inner_ty),
+        );
         let arg_str = pprust::expr_to_string(&raw_arg);
         let inner_ty_str = mir_ty_to_string(inner_ty, self.tcx);
         Some(scalar_box_from_raw_free_expr(&arg_str, &inner_ty_str))
@@ -3522,22 +3562,60 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         Some(hir_id)
     }
 
-    /// Returns fn-ptr group decisions for calls via struct-field fn-ptrs like
-    /// `(struct.field).expect("...")(args)`. Checks for the `expect`/`unwrap` unwrap pattern.
-    fn field_fn_ptr_decisions_for_call<'a>(
+    fn fn_ptr_input_decisions_for_callee<'a>(
         &'a self,
         func: &hir::Expr<'tcx>,
     ) -> Option<&'a Vec<Option<PtrKind>>> {
         let func = utils::hir::unwrap_drop_temps(func);
-        let hir::ExprKind::MethodCall(method_seg, receiver, _, _) = func.kind else {
-            return None;
-        };
-        if !matches!(method_seg.ident.name.as_str(), "expect" | "unwrap") {
-            return None;
+        match func.kind {
+            hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+                Res::Local(hir_id) => self.fn_ptr_rewrite.annotation_decisions.get(&hir_id),
+                Res::Def(DefKind::Static { .. } | DefKind::Const, def_id) => {
+                    def_id.as_local().and_then(|did| {
+                        self.fn_ptr_rewrite
+                            .annotation_decisions
+                            .get(&self.tcx.local_def_id_to_hir_id(did))
+                    })
+                }
+                Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) => def_id
+                    .as_local()
+                    .and_then(|did| self.fn_ptr_group_decisions_for_fn(did)),
+                _ => None,
+            },
+            hir::ExprKind::Field(struct_expr, field_ident) => {
+                self.fn_ptr_field_decisions(struct_expr, field_ident.name)
+            }
+            hir::ExprKind::MethodCall(method_seg, receiver, _, _)
+                if matches!(method_seg.ident.name.as_str(), "expect" | "unwrap")
+                    && self.expr_ty_is_option_fn_ptr(receiver) =>
+            {
+                self.fn_ptr_input_decisions_for_callee(receiver)
+            }
+            hir::ExprKind::Call(callee, args)
+                if args.len() == 1
+                    && self.expr_ty_is_option_fn_ptr(func)
+                    && hir_call_is_some_constructor(callee) =>
+            {
+                self.fn_ptr_input_decisions_for_callee(&args[0])
+            }
+            hir::ExprKind::Cast(inner, _) => self.fn_ptr_input_decisions_for_callee(inner),
+            _ => None,
         }
-        let receiver = utils::hir::unwrap_drop_temps(receiver);
-        let hir::ExprKind::Field(struct_expr, field_ident) = receiver.kind else { return None };
-        let typeck = self.tcx.typeck(func.hir_id.owner);
+    }
+
+    fn fn_ptr_group_decisions_for_fn(&self, did: LocalDefId) -> Option<&Vec<Option<PtrKind>>> {
+        self.fn_ptr_rewrite
+            .fn_to_group
+            .get(&did)
+            .and_then(|rep| self.fn_ptr_rewrite.group_decisions.get(rep))
+    }
+
+    fn fn_ptr_field_decisions(
+        &self,
+        struct_expr: &hir::Expr<'tcx>,
+        field_name: Symbol,
+    ) -> Option<&Vec<Option<PtrKind>>> {
+        let typeck = self.tcx.typeck(struct_expr.hir_id.owner);
         let struct_ty = typeck.expr_ty_adjusted(struct_expr);
         let ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else { return None };
         if !adt_def.is_struct() {
@@ -3546,11 +3624,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let struct_did = adt_def.did().as_local()?;
         let field_idx = adt_def
             .all_fields()
-            .position(|f| f.name == field_ident.name)
+            .position(|f| f.name == field_name)
             .map(FieldIdx::from_usize)?;
         self.fn_ptr_rewrite
             .field_decisions
             .get(&(struct_did, field_idx))
+    }
+
+    fn expr_ty_is_option_fn_ptr(&self, expr: &hir::Expr<'tcx>) -> bool {
+        let typeck = self.tcx.typeck(expr.hir_id.owner);
+        ty_is_option_fn_ptr(self.tcx, typeck.expr_ty_adjusted(expr))
     }
 
     fn hir_expr_has_fn_ptr_group_cast(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
@@ -3697,7 +3780,208 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         hir_rhs: &hir::Expr<'tcx>,
         lhs_kind: PtrKind,
     ) -> PtrKind {
-        self.transform_ptr(rhs, hir_rhs, PtrCtx::Rhs(lhs_kind))
+        self.transform_rhs_with_expected_inner(rhs, hir_rhs, lhs_kind, None)
+    }
+
+    fn transform_rhs_with_expected_inner(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        lhs_kind: PtrKind,
+        expected_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
+        self.transform_ptr_with_expected_inner(
+            rhs,
+            hir_rhs,
+            PtrCtx::Rhs(lhs_kind),
+            expected_inner_ty,
+        )
+    }
+
+    fn transform_raw_aggregate_context(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        expected_ty: ty::Ty<'tcx>,
+    ) -> bool {
+        if !ty_contains_raw_ptr_leaf(self.tcx, expected_ty) {
+            return false;
+        }
+
+        if let ExprKind::Paren(inner) = &mut expr.kind {
+            return self.transform_raw_aggregate_context(inner, hir_expr, expected_ty);
+        }
+        let hir_expr = utils::hir::unwrap_drop_temps(hir_expr);
+        match expected_ty.kind() {
+            ty::TyKind::RawPtr(inner_ty, mutability) => {
+                if self.raw_address_expr_matches_expected(
+                    expr,
+                    hir_expr,
+                    *inner_ty,
+                    mutability.is_mut(),
+                ) {
+                    return true;
+                }
+                if !self.try_transform_raw_pointer_method_receiver(
+                    expr,
+                    hir_expr,
+                    *inner_ty,
+                    mutability.is_mut(),
+                ) {
+                    self.transform_rhs_with_expected_inner(
+                        expr,
+                        hir_expr,
+                        PtrKind::Raw(mutability.is_mut()),
+                        Some(*inner_ty),
+                    );
+                }
+                true
+            }
+            ty::TyKind::Array(elem_ty, _) => {
+                if !ty_contains_raw_ptr_leaf(self.tcx, *elem_ty) {
+                    return false;
+                }
+                let ExprKind::Array(elems) = &mut expr.kind else {
+                    return false;
+                };
+                let hir::ExprKind::Array(hir_elems) = hir_expr.kind else {
+                    return false;
+                };
+                if elems.len() != hir_elems.len() {
+                    return false;
+                }
+                elems
+                    .iter_mut()
+                    .zip(hir_elems)
+                    .fold(false, |changed, (elem, hir_elem)| {
+                        self.transform_raw_aggregate_context(elem, hir_elem, *elem_ty) || changed
+                    })
+            }
+            ty::TyKind::Tuple(elem_tys) => {
+                let ExprKind::Tup(elems) = &mut expr.kind else {
+                    return false;
+                };
+                let hir::ExprKind::Tup(hir_elems) = hir_expr.kind else {
+                    return false;
+                };
+                if elems.len() != hir_elems.len() || elems.len() != elem_tys.len() {
+                    return false;
+                }
+                elems.iter_mut().zip(hir_elems).zip(elem_tys.iter()).fold(
+                    false,
+                    |changed, ((elem, hir_elem), elem_ty)| {
+                        self.transform_raw_aggregate_context(elem, hir_elem, elem_ty) || changed
+                    },
+                )
+            }
+            ty::TyKind::Adt(adt_def, args) if adt_def.is_struct() => {
+                let ExprKind::Struct(se) = &mut expr.kind else {
+                    return false;
+                };
+                let hir::ExprKind::Struct(_, hir_fields, _) = hir_expr.kind else {
+                    return false;
+                };
+                let variant = adt_def.non_enum_variant();
+                let struct_did = adt_def.did().as_local();
+                let mut changed = false;
+                for ast_field in &mut se.fields {
+                    let Some((field_idx, field_def)) = variant
+                        .fields
+                        .iter_enumerated()
+                        .find(|(_, field_def)| field_def.name == ast_field.ident.name)
+                    else {
+                        continue;
+                    };
+                    if struct_did.is_some_and(|struct_did| {
+                        self.field_ptr_kind(StructFieldSlot {
+                            struct_did,
+                            field_index: field_idx.index(),
+                        })
+                        .is_some()
+                    }) {
+                        continue;
+                    }
+                    let field_ty = field_def.ty(self.tcx, args);
+                    if !ty_contains_raw_ptr_leaf(self.tcx, field_ty) {
+                        continue;
+                    }
+                    let Some(hir_field) = hir_fields
+                        .iter()
+                        .find(|hir_field| hir_field.ident.name == ast_field.ident.name)
+                    else {
+                        continue;
+                    };
+                    changed |= self.transform_raw_aggregate_context(
+                        &mut ast_field.expr,
+                        hir_field.expr,
+                        field_ty,
+                    );
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    fn raw_address_expr_matches_expected(
+        &self,
+        expr: &Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        expected_inner_ty: ty::Ty<'tcx>,
+        expected_mutability: bool,
+    ) -> bool {
+        if !expr_has_raw_address_root(expr) {
+            return false;
+        }
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let Some((actual_inner_ty, actual_mutability)) =
+            unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_expr))
+        else {
+            return false;
+        };
+        actual_inner_ty == expected_inner_ty && actual_mutability.is_mut() == expected_mutability
+    }
+
+    fn try_transform_raw_pointer_method_receiver(
+        &self,
+        expr: &mut Expr,
+        hir_expr: &'tcx hir::Expr<'tcx>,
+        expected_inner_ty: ty::Ty<'tcx>,
+        expected_mutability: bool,
+    ) -> bool {
+        let ExprKind::MethodCall(call) = &mut expr.kind else {
+            return false;
+        };
+        if !matches!(
+            call.seg.ident.name.as_str(),
+            "offset" | "add" | "wrapping_add" | "wrapping_sub"
+        ) {
+            return false;
+        }
+        let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = hir_expr.kind else {
+            return false;
+        };
+        let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+        let Some((actual_inner_ty, actual_mutability)) =
+            unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_expr))
+        else {
+            return false;
+        };
+        if actual_inner_ty != expected_inner_ty || actual_mutability.is_mut() != expected_mutability
+        {
+            return false;
+        }
+        let Some((_, receiver_mutability)) =
+            unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_receiver))
+        else {
+            return false;
+        };
+        self.transform_ptr(
+            &mut call.receiver,
+            hir_receiver,
+            PtrCtx::Rhs(PtrKind::Raw(receiver_mutability.is_mut())),
+        );
+        true
     }
 
     fn cast_has_pointer_destination_context(
@@ -3708,20 +3992,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let cast_is_integral = cast_ty.is_integral();
         let cast_is_raw_ptr = matches!(cast_ty.kind(), ty::TyKind::RawPtr(..));
         let mut child_hir_id = hir_expr.hir_id;
-        let Some(parent_node) = self
-            .tcx
-            .hir_parent_iter(hir_expr.hir_id)
-            .find_map(|(_, parent_node)| {
-                if let hir::Node::Expr(parent) = parent_node
-                    && let hir::ExprKind::DropTemps(inner) = parent.kind
-                    && inner.hir_id == child_hir_id
-                {
-                    child_hir_id = parent.hir_id;
-                    None
-                } else {
-                    Some(parent_node)
-                }
-            })
+        let Some(parent_node) =
+            self.tcx
+                .hir_parent_iter(hir_expr.hir_id)
+                .find_map(|(_, parent_node)| {
+                    if let hir::Node::Expr(parent) = parent_node
+                        && let hir::ExprKind::DropTemps(inner) = parent.kind
+                        && inner.hir_id == child_hir_id
+                    {
+                        child_hir_id = parent.hir_id;
+                        None
+                    } else {
+                        Some(parent_node)
+                    }
+                })
         else {
             return false;
         };
@@ -3783,8 +4067,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind else {
                     return false;
                 };
-                unwrap_ptr_from_mir_ty(self.tcx.typeck(binding_hir_id.owner).node_type(binding_hir_id))
-                    .is_some()
+                unwrap_ptr_from_mir_ty(
+                    self.tcx
+                        .typeck(binding_hir_id.owner)
+                        .node_type(binding_hir_id),
+                )
+                .is_some()
             }
             hir::Node::Block(block)
                 if block.expr.is_some_and(|expr| expr.hir_id == child_hir_id) =>
@@ -3803,11 +4091,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
-    fn cast_inner_has_promoted_source(
-        &self,
-        inner: &Expr,
-        hir_inner: &hir::Expr<'tcx>,
-    ) -> bool {
+    fn cast_inner_has_promoted_source(&self, inner: &Expr, hir_inner: &hir::Expr<'tcx>) -> bool {
         let inner = unwrap_addr_of_deref(unwrap_cast_and_paren(inner));
         let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_inner));
         self.ptr_expr(inner, hir_inner)
@@ -3860,7 +4144,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         ) {
             field_kind
         } else {
-            self.transform_rhs(rhs, hir_rhs, field_kind)
+            self.transform_rhs_with_expected_inner(rhs, hir_rhs, field_kind, target_inner_ty)
         }
     }
 
@@ -4047,12 +4331,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         hir_ptr: &hir::Expr<'tcx>,
         ctx: PtrCtx,
         kind: PtrKind,
+        expected_inner_ty: Option<ty::Ty<'tcx>>,
     ) {
         if let (PtrCtx::Deref(_), PtrKind::Slice(m)) = (ctx, kind) {
             let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
             let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
             let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
-            if let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+            if let Some(lhs_inner_ty) =
+                expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
                 && let Some(rhs_inner_ty) = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
                 && lhs_inner_ty != rhs_inner_ty
             {
@@ -4070,6 +4356,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn transform_ptr(&self, ptr: &mut Expr, hir_ptr: &hir::Expr<'tcx>, ctx: PtrCtx) -> PtrKind {
+        self.transform_ptr_with_expected_inner(ptr, hir_ptr, ctx, None)
+    }
+
+    fn transform_ptr_with_expected_inner(
+        &self,
+        ptr: &mut Expr,
+        hir_ptr: &hir::Expr<'tcx>,
+        ctx: PtrCtx,
+        expected_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> PtrKind {
+        let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
+        let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
+        let expected_inner_ty =
+            expected_inner_ty.or_else(|| unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx));
         let allocator_root_expr = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr)).clone();
         let e = unwrap_addr_of_deref_mut(unwrap_cast_and_paren_mut(ptr));
         let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_ptr));
@@ -4086,7 +4386,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             };
             let hir_t_expr = hir_t.expr.unwrap();
             let t_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_t_expr);
-            let kind1 = self.transform_ptr(t, hir_t_expr, ctx);
+            let kind1 =
+                self.transform_ptr_with_expected_inner(t, hir_t_expr, ctx, expected_inner_ty);
             let kind2 = if let ExprKind::Block(f, _) = &mut f.kind {
                 let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else {
                     panic!("{}", pprust::expr_to_string(e));
@@ -4096,7 +4397,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 };
                 let hir_f_expr = hir_f.expr.unwrap();
                 let f_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_f_expr);
-                let kind2 = self.transform_ptr(f, hir_f_expr, ctx);
+                let kind2 =
+                    self.transform_ptr_with_expected_inner(f, hir_f_expr, ctx, expected_inner_ty);
                 if kind1 != kind2
                     && let PtrCtx::Deref(m) = ctx
                     && !t_is_null
@@ -4105,14 +4407,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 {
                     **f = utils::expr!("panic!()");
                     let transformed_if = e.clone();
-                    self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+                    self.finish_transformed_if_ptr(
+                        ptr,
+                        transformed_if,
+                        hir_ptr,
+                        ctx,
+                        kind1,
+                        expected_inner_ty,
+                    );
                     return kind1;
                 }
                 kind2
             } else {
                 let f_is_null = hir_is_null_like_ptr_arg(self.tcx, hir_f);
                 // if-else chain
-                let kind2 = self.transform_ptr(f, hir_f, ctx);
+                let kind2 =
+                    self.transform_ptr_with_expected_inner(f, hir_f, ctx, expected_inner_ty);
                 if kind1 != kind2
                     && let PtrCtx::Deref(m) = ctx
                     && !t_is_null
@@ -4121,7 +4431,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 {
                     **f = utils::expr!("panic!()");
                     let transformed_if = e.clone();
-                    self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+                    self.finish_transformed_if_ptr(
+                        ptr,
+                        transformed_if,
+                        hir_ptr,
+                        ctx,
+                        kind1,
+                        expected_inner_ty,
+                    );
                     return kind1;
                 }
                 kind2
@@ -4133,13 +4450,27 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             {
                 **t = utils::expr!("panic!()");
                 let transformed_if = e.clone();
-                self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind2);
+                self.finish_transformed_if_ptr(
+                    ptr,
+                    transformed_if,
+                    hir_ptr,
+                    ctx,
+                    kind2,
+                    expected_inner_ty,
+                );
                 return kind2;
             }
             assert_eq!(kind1, kind2);
             if !matches!(kind1, PtrKind::Raw(_)) {
                 let transformed_if = e.clone();
-                self.finish_transformed_if_ptr(ptr, transformed_if, hir_ptr, ctx, kind1);
+                self.finish_transformed_if_ptr(
+                    ptr,
+                    transformed_if,
+                    hir_ptr,
+                    ctx,
+                    kind1,
+                    expected_inner_ty,
+                );
             }
             return kind1;
         }
@@ -4151,7 +4482,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             let StmtKind::Expr(inner) = &mut block.stmts.last_mut().unwrap().kind else {
                 panic!("{}", pprust::expr_to_string(e));
             };
-            return self.transform_ptr(inner, hir_block.expr.unwrap(), ctx);
+            return self.transform_ptr_with_expected_inner(
+                inner,
+                hir_block.expr.unwrap(),
+                ctx,
+                expected_inner_ty,
+            );
         }
 
         if is_null_ptr_constructor(&allocator_root_expr) {
@@ -4211,7 +4547,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         if let PtrCtx::Rhs(kind @ (PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice)) = ctx {
             debug_assert!(!kind.is_optional());
-            self.transform_ptr(ptr, hir_ptr, PtrCtx::Rhs(kind.optional_variant()));
+            self.transform_ptr_with_expected_inner(
+                ptr,
+                hir_ptr,
+                PtrCtx::Rhs(kind.optional_variant()),
+                expected_inner_ty,
+            );
             *ptr = match kind {
                 PtrKind::Ref(m) if opt_ref_receiver_should_borrow(ptr) => {
                     utils::expr!(
@@ -4226,11 +4567,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if let PtrCtx::Rhs(kind @ (PtrKind::OptBox | PtrKind::OptBoxedSlice)) = ctx {
-            let lhs_ty = self
-                .tcx
-                .typeck(hir_ptr.hir_id.owner)
-                .expr_ty_adjusted(hir_ptr);
-            let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx)
+            let lhs_inner_ty = expected_inner_ty
                 .unwrap_or_else(|| panic!("{} {}", lhs_ty, pprust::expr_to_string(ptr)));
             if let Some(kind) = self.try_materialize_box_allocator_root(
                 ptr,
@@ -4244,8 +4581,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         let e = unwrap_addr_of_deref(unwrap_cast_and_paren(ptr));
-        let typeck = self.tcx.typeck(hir_ptr.hir_id.owner);
-        let lhs_ty = typeck.expr_ty_adjusted(hir_ptr);
         let rhs_ty = typeck.expr_ty(hir_unwrap_cast(hir_ptr));
         if let PtrCtx::Rhs(
             kind @ (PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_)),
@@ -4262,7 +4597,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 field_kind,
                 PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::Slice(_) | PtrKind::SliceCursor(_)
             )
-            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+            && let Some(lhs_inner_ty) =
+                expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
         {
             *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty, field_kind);
             return PtrKind::Raw(m);
@@ -4270,14 +4606,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let mut pe = if let Some(pe) = self.ptr_expr(e, hir_e) {
             pe
         } else if let Some((rhs_inner_ty, rhs_mut)) = unwrap_ptr_from_mir_ty(rhs_ty) {
-            let lhs_inner_ty =
-                unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or(rhs_inner_ty);
+            let lhs_inner_ty = expected_inner_ty.unwrap_or(rhs_inner_ty);
             match ctx {
                 PtrCtx::Rhs(PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice) => {
                     unreachable!("non-optional pointer targets are handled before raw fallback")
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) => {
-                    if lhs_ty != rhs_ty {
+                    if lhs_ty != rhs_ty || lhs_inner_ty != rhs_inner_ty {
                         *ptr = utils::expr!(
                             "{} as *{} {}",
                             pprust::expr_to_string(ptr),
@@ -4319,7 +4654,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
             }
         } else if unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx).is_none()
-            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+            && let Some(lhs_inner_ty) =
+                expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
         {
             let uncast_expr = pprust::expr_to_string(e);
             return self.transform_integer_to_pointer_cast(ptr, &uncast_expr, lhs_inner_ty, ctx);
@@ -4399,15 +4735,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx).is_none()
-            && let Some((lhs_inner_ty, _)) = unwrap_ptr_from_mir_ty(lhs_ty)
+            && let Some(lhs_inner_ty) =
+                expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
         {
             let uncast_expr = pprust::expr_to_string(e);
             return self.transform_integer_to_pointer_cast(ptr, &uncast_expr, lhs_inner_ty, ctx);
         }
 
-        let lhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx).unwrap_or_else(|| {
-            panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr));
-        });
+        let lhs_inner_ty = expected_inner_ty
+            .or_else(|| unwrap_ptr_or_arr_from_mir_ty(lhs_ty, self.tcx))
+            .unwrap_or_else(|| {
+                panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr));
+            });
         let rhs_inner_ty = unwrap_ptr_or_arr_from_mir_ty(rhs_ty, self.tcx)
             .unwrap_or_else(|| panic!("{} {} {}", lhs_ty, rhs_ty, pprust::expr_to_string(ptr)));
         let need_cast = lhs_inner_ty != rhs_inner_ty;
@@ -4858,7 +5197,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
                     if !need_cast {
-                        *ptr = raw_expr;
+                        *ptr = if m && !pe.as_mut_ptr {
+                            utils::expr!("({}).cast_mut()", pprust::expr_to_string(&raw_expr))
+                        } else {
+                            raw_expr
+                        };
                     } else {
                         *ptr = utils::expr!(
                             "({}) as *{} _",
@@ -5234,7 +5577,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, source_inner_ty);
                     return PtrKind::Slice(m);
                 }
-                (PtrCtx::Rhs(PtrKind::Slice(m)) | PtrCtx::Deref(m), PtrKind::Slice(_)) => {
+                (PtrCtx::Rhs(PtrKind::Slice(m)) | PtrCtx::Deref(m), PtrKind::Slice(source_m)) => {
+                    if m && !source_m {
+                        *ptr = self.mut_target_from_shared_slice_or_cursor(
+                            &pe,
+                            PtrKind::Slice(true),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::Slice(m);
+                    }
                     let base = self.projected_expr(&pe, m, false);
                     // can be used for deref, so type must be specified
                     *ptr = self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
@@ -5254,13 +5606,31 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     *ptr = self.plain_slice_from_expr(&base, m, lhs_inner_ty, source_inner_ty);
                     return PtrKind::Slice(m);
                 }
-                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::SliceCursor(_)) => {
+                (PtrCtx::Rhs(PtrKind::Slice(m)), PtrKind::SliceCursor(source_m)) => {
+                    if m && !source_m {
+                        *ptr = self.mut_target_from_shared_slice_or_cursor(
+                            &pe,
+                            PtrKind::Slice(true),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::Slice(m);
+                    }
                     let base = self.projected_expr(&pe, m, false);
                     *ptr = self.cursor_or_slice_to_slice_expr(&base, m);
                     return PtrKind::Slice(m);
                 }
-                (PtrCtx::Deref(m), PtrKind::SliceCursor(_)) => {
+                (PtrCtx::Deref(m), PtrKind::SliceCursor(source_m)) => {
                     self.slice_cursor.set(true);
+                    if m && !source_m {
+                        *ptr = self.mut_target_from_shared_slice_or_cursor(
+                            &pe,
+                            PtrKind::SliceCursor(true),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::SliceCursor(m);
+                    }
                     let base = self.projected_expr(&pe, m, false);
                     *ptr = self.cursor_from_cursor(&base, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::SliceCursor(m);
@@ -5298,9 +5668,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     );
                     return PtrKind::SliceCursor(m);
                 }
-                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Slice(_)) => {
+                (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Slice(source_m)) => {
                     // Plain slice → cursor
                     self.slice_cursor.set(true);
+                    if m && !source_m {
+                        *ptr = self.mut_target_from_shared_slice_or_cursor(
+                            &pe,
+                            PtrKind::SliceCursor(true),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::SliceCursor(m);
+                    }
                     let base = self.projected_expr(&pe, m, false);
                     *ptr = self.cursor_from_plain_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
                     return PtrKind::SliceCursor(m);
@@ -5308,6 +5687,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::SliceCursor(m1)) => {
                     // Cursor → cursor
                     self.slice_cursor.set(true);
+                    if m && !m1 {
+                        *ptr = self.mut_target_from_shared_slice_or_cursor(
+                            &pe,
+                            PtrKind::SliceCursor(true),
+                            lhs_inner_ty,
+                            rhs_inner_ty,
+                        );
+                        return PtrKind::SliceCursor(m);
+                    }
                     let base = self.projected_expr(&pe, m, false);
                     let mut result =
                         self.cursor_from_slice_or_cursor(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
@@ -6842,6 +7230,34 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     ) -> Expr {
         let raw = self.raw_from_projected_opt_ref(pe, m, m1, lhs_inner_ty, rhs_inner_ty);
         self.opt_ref_from_raw(&raw, m, m, lhs_inner_ty, lhs_inner_ty)
+    }
+
+    fn mut_target_from_shared_slice_or_cursor(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        target_kind: PtrKind,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        debug_assert!(matches!(
+            target_kind,
+            PtrKind::Slice(true) | PtrKind::SliceCursor(true)
+        ));
+        let base = self.projected_expr(pe, false, false);
+        let raw = self.raw_from_slice_or_cursor(&base, true, false, lhs_inner_ty, rhs_inner_ty);
+        let raw = pprust::expr_to_string(&raw);
+        match target_kind {
+            PtrKind::Slice(true) => {
+                utils::expr!("std::slice::from_raw_parts_mut({raw}, 1_000_000)")
+            }
+            PtrKind::SliceCursor(true) => {
+                self.slice_cursor.set(true);
+                utils::expr!(
+                    "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut({raw}, 1_000_000)"
+                )
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn raw_from_slice_or_cursor(
@@ -8585,6 +9001,14 @@ fn addr_of_mutability(expr: &Expr) -> Option<bool> {
     }
 }
 
+fn expr_has_raw_address_root(expr: &Expr) -> bool {
+    match &unwrap_paren(expr).kind {
+        ExprKind::AddrOf(BorrowKind::Raw, ..) => true,
+        ExprKind::Cast(inner, _) => expr_has_raw_address_root(inner),
+        _ => false,
+    }
+}
+
 fn place_expr_contains_deref(expr: &Expr) -> bool {
     match &unwrap_paren(expr).kind {
         ExprKind::Unary(UnOp::Deref, _) => true,
@@ -9093,6 +9517,45 @@ fn ty_contains_param(ty: ty::Ty<'_>) -> bool {
         ty::TyKind::Tuple(elems) => elems.iter().any(ty_contains_param),
         _ => false,
     }
+}
+
+fn ty_contains_raw_ptr_leaf<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::TyKind::RawPtr(..) => true,
+        ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+            ty_contains_raw_ptr_leaf(tcx, *elem)
+        }
+        ty::TyKind::Tuple(elems) => elems.iter().any(|elem| ty_contains_raw_ptr_leaf(tcx, elem)),
+        ty::TyKind::Adt(adt_def, args) if adt_def.is_struct() => adt_def
+            .non_enum_variant()
+            .fields
+            .iter()
+            .any(|field| ty_contains_raw_ptr_leaf(tcx, field.ty(tcx, args))),
+        _ => false,
+    }
+}
+
+fn ty_is_option_fn_ptr<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let ty::TyKind::Adt(adt_def, args) = ty.kind() else {
+        return false;
+    };
+    if !is_option(adt_def.did(), tcx) {
+        return false;
+    }
+    let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+        return false;
+    };
+    matches!(inner.kind(), ty::TyKind::FnPtr(..))
+}
+
+fn hir_call_is_some_constructor(callee: &hir::Expr<'_>) -> bool {
+    let callee = utils::hir::unwrap_drop_temps(callee);
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|seg| seg.ident.name.as_str() == "Some")
 }
 
 fn hir_is_null_ptr_constructor(expr: &hir::Expr<'_>) -> bool {
@@ -11435,7 +11898,9 @@ fn hir_expr_is_unanchored_raw_pointer_arg(
     raw_origin_locals: &FxHashSet<HirId>,
     expr: &hir::Expr<'_>,
 ) -> bool {
-    if hir_expr_uses_non_pointer_local(tcx, expr) {
+    if hir_expr_uses_non_pointer_local(tcx, expr)
+        || hir_expr_has_borrowed_slice_pointer_anchor(tcx, expr)
+    {
         return false;
     }
     if let Some(hir_id) = hir_unwrapped_local_id(expr)
@@ -11485,6 +11950,24 @@ fn hir_expr_is_unanchored_raw_pointer_source(
         },
         hir::ExprKind::AddrOf(_, _, pointee) => !hir_expr_ty_is_slice_or_array(tcx, pointee),
         _ => true,
+    }
+}
+
+fn hir_expr_has_borrowed_slice_pointer_anchor(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    match expr.kind {
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
+            "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" => {
+                hir_expr_has_borrowed_slice_pointer_anchor(tcx, receiver)
+            }
+            "as_ptr" | "as_mut_ptr" => {
+                let receiver_ty = tcx.typeck(receiver.hir_id.owner).expr_ty_adjusted(receiver);
+                !matches!(receiver_ty.kind(), ty::TyKind::RawPtr(..))
+                    && slice_like_container_inner_ty(receiver_ty, tcx).is_some()
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -16055,9 +16538,7 @@ fn ownership_reason_to_decision_reason(reason: OwnershipFieldBlockReason) -> Dec
         OwnershipFieldBlockReason::NonScalarPointee => DecisionReason::NonScalarPointee,
         OwnershipFieldBlockReason::ArrayLikeOwningField => DecisionReason::ArrayLikeOwningField,
         OwnershipFieldBlockReason::CVoidOrFilePointee => DecisionReason::CVoidOrFilePointee,
-        OwnershipFieldBlockReason::OpaqueOrUnsizedPointee => {
-            DecisionReason::OpaqueOrUnsizedPointee
-        }
+        OwnershipFieldBlockReason::OpaqueOrUnsizedPointee => DecisionReason::OpaqueOrUnsizedPointee,
         OwnershipFieldBlockReason::UnsupportedStructLiteralRhs => {
             DecisionReason::UnsupportedStructLiteralRhs
         }
@@ -16411,7 +16892,11 @@ fn struct_field_raw_pointee_ty<'tcx>(
 
 fn struct_field_pointee_forces_raw(tcx: TyCtxt<'_>, field: StructFieldSlot) -> bool {
     struct_field_raw_pointee_ty(tcx, field).is_some_and(|pointee| {
-        pointee_forces_raw(tcx, ty::TypingEnv::post_analysis(tcx, field.struct_did), pointee)
+        pointee_forces_raw(
+            tcx,
+            ty::TypingEnv::post_analysis(tcx, field.struct_did),
+            pointee,
+        )
     })
 }
 

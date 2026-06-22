@@ -7469,6 +7469,163 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_raw_constructor_type_anchor_mut_slice_if_c_void_null_const_branch() {
+    run_test(
+        r#"
+pub const NULL: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+
+pub unsafe extern "C" fn write_slot(use_data: bool, idx: usize) -> i64 {
+    let mut data: [i64; 4] = [0; 4];
+    let ptr: *mut i64 = (if use_data {
+        data.as_mut_ptr() as *mut core::ffi::c_void
+    } else {
+        NULL
+    }) as *mut i64;
+    *ptr.offset(idx as isize) = 13;
+    return data[idx];
+}
+"#,
+        &["from_raw_parts_mut", "as *mut", "&mut [i64]"],
+        &["from_raw_parts_mut((NULL),"],
+    );
+}
+
+#[test]
+fn test_raw_constructor_type_anchor_shared_slice_if_c_void_null_const_branch() {
+    run_test(
+        r#"
+pub const NULL: *const core::ffi::c_void = 0 as *const core::ffi::c_void;
+
+pub unsafe extern "C" fn read_slot(use_data: bool, idx: usize) -> i32 {
+    let data: [i32; 4] = [1, 2, 3, 4];
+    let ptr: *const i32 = (if use_data {
+        data.as_ptr() as *const core::ffi::c_void
+    } else {
+        NULL
+    }) as *const i32;
+    return *ptr.offset(idx as isize);
+}
+"#,
+        &["from_raw_parts", "as *const", "&[i32]"],
+        &["from_raw_parts((NULL),"],
+    );
+}
+
+#[test]
+fn test_raw_constructor_type_anchor_mut_cursor_if_git_malloc_null_const_branch() {
+    run_test(
+        r#"
+extern "C" {
+    fn git__malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub const NULL: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+
+pub unsafe extern "C" fn write_before(use_alloc: bool) -> i64 {
+    let ptr: *mut i64 = (if use_alloc {
+        git__malloc(64)
+    } else {
+        NULL
+    }) as *mut i64;
+    *ptr.offset(-1) = 7;
+    *ptr.offset(0) = 11;
+    return *ptr.offset(0);
+}
+"#,
+        &[
+            "SliceCursorMut::from_raw_parts_mut",
+            "as *mut",
+            "crate::slice_cursor::SliceCursorMut<'_, i64>",
+        ],
+        &["from_raw_parts_mut(_x,"],
+    );
+}
+
+#[test]
+fn test_raw_constructor_type_anchor_shared_cursor_if_callback_null_const_branch() {
+    run_test(
+        r#"
+extern "C" {
+    fn object_data(id: i32) -> *const core::ffi::c_void;
+}
+
+pub const NULL: *const core::ffi::c_void = 0 as *const core::ffi::c_void;
+
+pub unsafe extern "C" fn read_before(use_callback: bool) -> i64 {
+    let ptr: *const i64 = (if use_callback {
+        object_data(1)
+    } else {
+        NULL
+    }) as *const i64;
+    return *ptr.offset(-1) + *ptr.offset(0);
+}
+"#,
+        &[
+            "SliceCursor::from_raw_parts",
+            "as *const",
+            "crate::slice_cursor::SliceCursor<'_, i64>",
+        ],
+        &["from_raw_parts(_x,"],
+    );
+}
+
+#[test]
+fn test_raw_constructor_type_anchor_mut_slice_if_null_0_const_branch() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct GitDiffLine {
+    pub origin: i32,
+}
+
+pub const NULL_0: *mut core::ffi::c_void = 0 as *mut core::ffi::c_void;
+
+pub unsafe extern "C" fn line_origin(use_lines: bool, idx: usize) -> i32 {
+    let mut lines: [GitDiffLine; 2] = [
+        GitDiffLine { origin: 1 },
+        GitDiffLine { origin: 2 },
+    ];
+    let ptr: *mut GitDiffLine = (if use_lines {
+        lines.as_mut_ptr() as *mut core::ffi::c_void
+    } else {
+        NULL_0
+    }) as *mut GitDiffLine;
+    (*ptr.offset(idx as isize)).origin = 9;
+    return lines[idx].origin;
+}
+"#,
+        &["from_raw_parts_mut", "as *mut", "&mut [crate::GitDiffLine]"],
+        &["from_raw_parts_mut((NULL_0),"],
+    );
+}
+
+#[test]
+fn test_raw_constructor_type_anchor_mut_slice_if_direct_null_mut_branch() {
+    run_test(
+        r#"
+extern "C" {
+    fn raw_words() -> *mut core::ffi::c_void;
+}
+
+pub unsafe extern "C" fn write_direct_null(use_data: bool, idx: usize) -> i16 {
+    let ptr: *mut i16 = (if use_data {
+        raw_words()
+    } else {
+        std::ptr::null_mut::<core::ffi::c_void>()
+    }) as *mut i16;
+    *ptr.offset(idx as isize) = 5;
+    return *ptr.offset(0);
+}
+"#,
+        &["let _x", "from_raw_parts_mut", "as *mut", "&mut [i16]"],
+        &[
+            "from_raw_parts_mut(_x,",
+            "from_raw_parts_mut((std::ptr::null_mut",
+        ],
+    );
+}
+
 // ===== addr_of + pointer arithmetic tests =====
 
 /// addr_of with cast + offset: `*(&mut x as *mut c_int as *mut c_char).offset(1) = 0`.
@@ -10190,6 +10347,155 @@ pub unsafe extern "C" fn check_ref(mut ref_0: *const core::ffi::c_char) -> i32 {
 }
 
 #[test]
+fn test_raw_aggregate_context_rewrites_const_array_elements() {
+    run_test(
+        r#"
+extern "C" {
+    fn use_strings(count: usize, strings: *const *const core::ffi::c_char);
+}
+
+pub unsafe extern "C" fn collect(mut text: *const core::ffi::c_char) -> i32 {
+    if *text.offset(0) != 0 {
+        let table: [*const core::ffi::c_char; 2] = [text, text.add(1usize)];
+        use_strings(2, table.as_ptr());
+    }
+    return *text.offset(0) as i32;
+}
+"#,
+        &[
+            "mut text: &[i8]",
+            "let table: [*const core::ffi::c_char; 2]",
+            "(text).as_ptr()",
+            ".add(1usize)",
+        ],
+        &["[text, text.add(1usize)]", "text.add(1usize)"],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_context_rewrites_mut_array_elements() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub id: i32,
+}
+
+extern "C" {
+    fn use_items(ptrs: *const *mut Item);
+}
+
+pub unsafe extern "C" fn collect(mut items: *mut Item, slot: usize) -> i32 {
+    (*items.offset(slot as isize)).id = 5;
+    let table: [*mut Item; 2] = [items, items.add(1usize)];
+    use_items(table.as_ptr());
+    return (*items.offset(slot as isize)).id;
+}
+"#,
+        &[
+            "mut items: &mut [crate::Item]",
+            "let table: [*mut Item; 2]",
+            "(items).as_mut_ptr()",
+            ".add(1usize)",
+        ],
+        &["[items, items.add(1usize)]", "items.add(1usize)"],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_context_rewrites_nested_struct_tuple_fields() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct RawBundle {
+    pub first: *const i8,
+    pub nested: (*const i8, [*const i8; 2]),
+}
+
+extern "C" {
+    fn accept_bundle(bundle: RawBundle);
+}
+
+pub unsafe extern "C" fn publish(mut data: *const i8) -> i32 {
+    if data.is_null() {
+        return 0;
+    }
+    accept_bundle(RawBundle {
+        first: data.offset(0),
+        nested: (data.add(1usize), [data, data.add(2usize)]),
+    });
+    return *data.add(2usize) as i32;
+}
+"#,
+        &[
+            "mut data: &[i8]",
+            "pub struct RawBundle {",
+            "first: (data).as_ptr().offset(0)",
+            "nested: ((data).as_ptr().add(1usize),",
+            "[(data).as_ptr(), (data).as_ptr().add(2usize)]",
+        ],
+        &[
+            "RawBundle<'",
+            "first: data.offset(0)",
+            "data.add(1usize)",
+            "[data, data.add(2usize)]",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_context_rewrites_tuple_local_elements() {
+    run_test(
+        r#"
+extern "C" {
+    fn use_pair(first: *const i8, second: *const i8);
+}
+
+pub unsafe extern "C" fn collect(mut data: *const i8) -> i32 {
+    if *data.offset(0) == 0 {
+        return 0;
+    }
+    let pair: (*const i8, *const i8) = (data, data.add(1usize));
+    use_pair(pair.0, pair.1);
+    return *data.offset(0) as i32;
+}
+"#,
+        &[
+            "mut data: &[i8]",
+            "let pair: (*const i8, *const i8)",
+            "(data).as_ptr()",
+            "(data).as_ptr().add(1usize)",
+        ],
+        &["(data, data.add(1usize))", "data.add(1usize)"],
+    );
+}
+
+#[test]
+fn test_raw_aggregate_context_rewrites_call_argument_array() {
+    run_test(
+        r#"
+pub unsafe fn take_table(table: [*const i8; 2]) -> i32 {
+    return *table[1usize] as i32;
+}
+
+pub unsafe extern "C" fn call_table(mut data: *const i8) -> i32 {
+    if *data.offset(0) == 0 {
+        return 0;
+    }
+    return take_table([data, data.add(1usize)]);
+}
+"#,
+        &[
+            "mut data: &[i8]",
+            "pub unsafe fn take_table(table: [*const i8; 2])",
+            "(data).as_ptr()",
+            "(data).as_ptr().add(1usize)",
+        ],
+        &["take_table([data, data.add(1usize)])", "data.add(1usize)"],
+    );
+}
+
+#[test]
 fn test_section7_cursor_offset_raw_cast_is_not_revisited_as_offset_call() {
     run_test(
         r#"
@@ -10386,7 +10692,10 @@ pub unsafe extern "C" fn replace_entry(mut entry: *mut Entry, mut slot: usize) {
             "entry as *mut core::ffi::c_void",
             "if !entry.is_null()",
         ],
-        &["mut entry: &mut [crate::Entry]", "mut entry: &mut crate::Entry"],
+        &[
+            "mut entry: &mut [crate::Entry]",
+            "mut entry: &mut crate::Entry",
+        ],
     );
 }
 
@@ -10674,5 +10983,321 @@ pub unsafe fn foo() -> i32 {
 "#,
         &["core::mem::size_of::<i32>()"],
         &[],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_option_param_expect_callee_uses_rewritten_arg_contract() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn call_cb(
+    cb: Option<unsafe extern "C" fn(*mut *mut i8) -> i32>,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return cb.expect("cb")(argv);
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    return call_cb(
+        Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+        argv,
+    );
+}
+"#,
+        &[
+            "fn add(mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+        ],
+        &["cb.expect(\"cb\")((argv).as_mut_ptr())"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_wrapped_option_expect_callee_uses_rewritten_arg_contract() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn call_cb(
+    cb: Option<unsafe extern "C" fn(*mut *mut i8) -> i32>,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return Some(cb.expect("inner")).expect("outer")(argv);
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    return call_cb(
+        Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+        argv,
+    );
+}
+"#,
+        &[
+            "fn add(mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+        ],
+        &["expect(\"outer\")((argv).as_mut_ptr())"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_static_field_wrapped_expect_callee_uses_field_contract() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Command {
+    pub run: Option<unsafe extern "C" fn(*mut *mut i8) -> i32>,
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static COMMANDS: [Command; 1] = [Command {
+    run: Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+}];
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return Some(COMMANDS[0].run.expect("inner")).expect("outer")(argv);
+}
+"#,
+        &[
+            "fn add(mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+        ],
+        &["expect(\"outer\")((argv).as_mut_ptr())"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_alias_static_and_cast_share_signature_decisions() {
+    run_test(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static COMMAND: CommandFn = add as unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return COMMAND(argv);
+}
+"#,
+        &[
+            "type CommandFn = unsafe extern \"C\" fn(&mut [*mut i8]) -> i32",
+            "add as unsafe extern \"C\" fn(&mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type CommandFn = unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "COMMAND((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_alias_local_call_uses_alias_decisions() {
+    run_test(
+        r#"
+pub type CommandFn = unsafe extern "C" fn(*mut *mut i8) -> i32;
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler: CommandFn = add as unsafe extern "C" fn(*mut *mut i8) -> i32;
+    return handler(argv);
+}
+"#,
+        &[
+            "type CommandFn = unsafe extern \"C\" fn(&mut [*mut i8]) -> i32",
+            "let handler: CommandFn =",
+            "add as unsafe extern \"C\" fn(&mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type CommandFn = unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "handler((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_fn_ptr_contract_field_option_local_temporary_uses_field_contract() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Command {
+    pub run: Option<unsafe extern "C" fn(*mut *mut i8) -> i32>,
+}
+
+pub unsafe extern "C" fn add(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static COMMANDS: [Command; 1] = [Command {
+    run: Some(add as unsafe extern "C" fn(*mut *mut i8) -> i32),
+}];
+
+pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let handler = COMMANDS[0].run;
+    return handler.expect("command")(argv);
+}
+"#,
+        &[
+            "fn add(mut argv: &mut [*mut i8]) -> i32",
+            "Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+        ],
+        &["expect(\"command\")((argv).as_mut_ptr())"],
+    );
+}
+
+#[test]
+fn test_direct_call_mutability_contract_const_arg_to_mut_slice() {
+    run_test(
+        r#"
+pub unsafe fn write_word(mut words: *mut i32, idx: usize) {
+    *words.offset(idx as isize) = 99;
+}
+
+pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
+    let before = *words.offset(idx as isize);
+    write_word((words as *mut i32), idx);
+    return before;
+}
+"#,
+        &[
+            "fn write_word(mut words: &mut [i32], idx: usize)",
+            "fn dispatch(mut words: &[i32], idx: usize) -> i32",
+            "write_word(std::slice::from_raw_parts_mut((words).as_ptr().cast_mut()",
+        ],
+        &["write_word((words), idx)"],
+    );
+}
+
+#[test]
+fn test_direct_call_mutability_contract_local_cast_arg_to_mut_slice() {
+    run_test(
+        r#"
+pub unsafe fn write_slot(mut slots: *mut i16, idx: usize) {
+    *slots.offset(idx as isize) = 7;
+}
+
+pub unsafe extern "C" fn dispatch(mut slots: *const i16, idx: usize) -> i16 {
+    let local: *const i16 = slots;
+    let before = *local.offset(idx as isize);
+    write_slot(((local as *const i16) as *mut i16), idx);
+    return before;
+}
+"#,
+        &[
+            "fn write_slot(mut slots: &mut [i16], idx: usize)",
+            "let local: &[i16]",
+            "write_slot(std::slice::from_raw_parts_mut((local).as_ptr().cast_mut()",
+        ],
+        &["write_slot((local), idx)", "write_slot(((local"],
+    );
+}
+
+#[test]
+fn test_direct_call_mutability_contract_local_arg_to_mut_cursor() {
+    run_test(
+        r#"
+pub unsafe fn write_previous(mut words: *mut i32) {
+    *words.offset(-1) = 5;
+}
+
+pub unsafe extern "C" fn dispatch(mut words: *const i32) -> i32 {
+    let cursor: *const i32 = words;
+    let before = *cursor.offset(-1);
+    write_previous((cursor as *mut i32));
+    return before;
+}
+"#,
+        &[
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
+            "write_previous(crate::slice_cursor::SliceCursorMut::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
+        ],
+        &["write_previous(cursor)", "write_previous((cursor as"],
+    );
+}
+
+#[test]
+fn test_direct_call_mutability_contract_cursor_arg_to_mut_slice() {
+    run_test(
+        r#"
+pub unsafe fn write_window(mut words: *mut i32, idx: usize) {
+    *words.offset(idx as isize) = 11;
+}
+
+pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
+    let cursor: *const i32 = words;
+    let before = *cursor.offset(-1);
+    write_window((cursor as *mut i32), idx);
+    return before;
+}
+"#,
+        &[
+            "fn write_window(mut words: &mut [i32], idx: usize)",
+            "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
+            "write_window(std::slice::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
+        ],
+        &[
+            "write_window((cursor).as_slice_mut(), idx)",
+            "write_window((cursor as",
+        ],
+    );
+}
+
+#[test]
+fn test_direct_call_mutability_contract_slice_arg_to_mut_cursor() {
+    run_test(
+        r#"
+pub unsafe fn write_previous(mut words: *mut i32) {
+    *words.offset(-1) = 5;
+}
+
+pub unsafe extern "C" fn anchor(mut words: *const i32) -> i32 {
+    let cursor: *const i32 = words;
+    let before = *cursor.offset(-1);
+    write_previous((cursor as *mut i32));
+    return before;
+}
+
+pub unsafe extern "C" fn dispatch(words: &[i32]) -> i32 {
+    let before = words[0];
+    write_previous(words.as_ptr() as *mut i32);
+    return before;
+}
+"#,
+        &[
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "fn dispatch(words: &[i32]) -> i32",
+            "write_previous(crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(((words).as_ptr())",
+        ],
+        &[
+            "write_previous(crate::slice_cursor::SliceCursorMut::new(words))",
+            "write_previous((words).as_ptr() as",
+        ],
     );
 }

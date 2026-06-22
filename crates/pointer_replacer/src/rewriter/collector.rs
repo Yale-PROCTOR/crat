@@ -19,13 +19,31 @@ use crate::{
     analyses::borrow::StructFieldSlot, rewriter::decision::DecisionMaker, utils::rustc::RustProgram,
 };
 
+#[allow(dead_code)]
 pub fn collect_diffs<'tcx>(
     rust_program: &RustProgram<'tcx>,
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
 ) -> FxHashMap<HirId, PtrKind> {
-    collect_diffs_with_diagnostics(rust_program, analysis, sig_decs, fn_ptr_groups, None)
+    collect_diffs_with_diagnostics(rust_program, analysis, sig_decs, fn_ptr_groups, None, None)
+}
+
+pub fn collect_diffs_with_fn_ptr_decisions<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    analysis: &Analysis,
+    sig_decs: &SigDecisions,
+    fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+    fn_ptr_group_decisions: &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+) -> FxHashMap<HirId, PtrKind> {
+    collect_diffs_with_diagnostics(
+        rust_program,
+        analysis,
+        sig_decs,
+        fn_ptr_groups,
+        Some(fn_ptr_group_decisions),
+        None,
+    )
 }
 
 pub fn collect_diffs_with_diagnostics<'tcx>(
@@ -33,6 +51,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
     analysis: &Analysis,
     sig_decs: &SigDecisions,
     fn_ptr_groups: &crate::analyses::fn_ptr_groups::FnPtrGroups,
+    fn_ptr_group_decisions: Option<&FxHashMap<LocalDefId, Vec<Option<PtrKind>>>>,
     mut diagnostics: Option<&mut DecisionDiagnostics>,
 ) -> FxHashMap<HirId, PtrKind> {
     let mut ptr_kinds = FxHashMap::default();
@@ -104,7 +123,11 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                 fn_ptr_groups
                     .fn_to_group
                     .get(did)
-                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep))
+                    .and_then(|rep| {
+                        fn_ptr_group_decisions
+                            .unwrap_or(&fn_ptr_groups.group_decisions)
+                            .get(rep)
+                    })
                     .and_then(|decs| decs.get(local.index() - 1).copied())
                     .flatten()
             } else {

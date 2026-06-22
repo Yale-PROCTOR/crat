@@ -25,7 +25,12 @@ pub struct FnPtrRewriteDecision {
     pub direct_rewrite: FxHashSet<LocalDefId>,
     #[allow(dead_code)] // used in Phase 2 wrapper generation
     pub needs_wrapper: FxHashSet<LocalDefId>,
+    /// maps each rewritten fn-ptr-participating function to its group representative
+    pub fn_to_group: FxHashMap<LocalDefId, LocalDefId>,
+    /// Canonical final per-parameter input decisions per fn-ptr group.
+    pub group_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
     /// Per-parameter individual decisions per fn-ptr function (ignoring group consensus).
+    #[allow(dead_code)]
     pub individual_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
     /// Annotation-site decisions for direct_rewrite functions only.
     pub annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>>,
@@ -48,6 +53,8 @@ impl FnPtrRewriteDecision {
             return FnPtrRewriteDecision {
                 direct_rewrite: FxHashSet::default(),
                 needs_wrapper: FxHashSet::default(),
+                fn_to_group: FxHashMap::default(),
+                group_decisions: FxHashMap::default(),
                 individual_decisions: FxHashMap::default(),
                 annotation_decisions: FxHashMap::default(),
                 field_decisions: FxHashMap::default(),
@@ -288,22 +295,10 @@ impl FnPtrRewriteDecision {
             if candidates.is_empty() {
                 continue;
             }
-            let n = candidates[0].len();
-            let joint: Vec<Option<PtrKind>> = (0..n)
-                .map(|i| {
-                    candidates
-                        .iter()
-                        .try_fold(Option::<PtrKind>::None, |acc, cand| {
-                            match (acc, cand.get(i).copied().flatten()) {
-                                (None, x) => Ok(x),
-                                (x, None) => Ok(x),
-                                (Some(a), Some(b)) if a == b => Ok(Some(a)),
-                                _ => Err(()),
-                            }
-                        })
-                        .unwrap_or(None)
-                })
-                .collect();
+            let mut joint = candidates[0].clone();
+            for candidate in &candidates[1..] {
+                merge_decisions_conservatively(&mut joint, candidate);
+            }
             field_decisions.insert((struct_did, fi), joint);
         }
 
@@ -328,28 +323,48 @@ impl FnPtrRewriteDecision {
                 };
                 let Some(local_alias_id) = def_id.as_local() else { continue };
                 let alias_hir_id = rust_program.tcx.local_def_id_to_hir_id(local_alias_id);
-                annotation_decisions
-                    .entry(alias_hir_id)
-                    .or_insert_with(|| decs.clone());
+                insert_annotation_decision(&mut annotation_decisions, alias_hir_id, decs);
             }
         }
 
         struct BindingInitVisitor<'a, 'tcx> {
             tcx: ty::TyCtxt<'tcx>,
+            fn_ptr_groups: &'a FnPtrGroups,
+            final_group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
             annotation_decisions: &'a mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
         }
 
         impl<'tcx> Visitor<'tcx> for BindingInitVisitor<'_, 'tcx> {
             fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) -> Self::Result {
-                if let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind
-                    && let Some(init) = let_stmt.init
-                    && let Some(decs) =
+                if let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind {
+                    let init_decs = let_stmt.init.and_then(|init| {
                         field_fn_ptr_decisions_for_expr(self.tcx, init, self.field_decisions)
-                {
-                    self.annotation_decisions
-                        .entry(binding_hir_id)
-                        .or_insert(decs);
+                            .or_else(|| {
+                                fn_ptr_decisions_for_expr(
+                                    self.tcx,
+                                    init,
+                                    self.fn_ptr_groups,
+                                    self.final_group_decisions,
+                                )
+                            })
+                    });
+                    if let Some(decs) = init_decs {
+                        insert_annotation_decision(
+                            self.annotation_decisions,
+                            binding_hir_id,
+                            &decs,
+                        );
+                        if let Some(ty) = let_stmt.ty
+                            && let Some(alias_did) = hir_ty_alias_def_id(ty)
+                        {
+                            insert_annotation_decision(
+                                self.annotation_decisions,
+                                self.tcx.local_def_id_to_hir_id(alias_did),
+                                &decs,
+                            );
+                        }
+                    }
                 }
                 intravisit::walk_local(self, let_stmt);
             }
@@ -358,6 +373,8 @@ impl FnPtrRewriteDecision {
         {
             let mut visitor = BindingInitVisitor {
                 tcx,
+                fn_ptr_groups,
+                final_group_decisions: &final_group_decisions,
                 field_decisions: &field_decisions,
                 annotation_decisions: &mut annotation_decisions,
             };
@@ -375,7 +392,7 @@ impl FnPtrRewriteDecision {
                 if let Some(&loc) = pre.vars.get(&var)
                     && let Some(decs) = loc_decisions.get(&loc)
                 {
-                    annotation_decisions.insert(*hir_id, decs.clone());
+                    insert_annotation_decision(&mut annotation_decisions, *hir_id, decs);
                 }
             }
         }
@@ -393,7 +410,7 @@ impl FnPtrRewriteDecision {
                 continue;
             };
             let hir_id = rust_program.tcx.local_def_id_to_hir_id(static_did);
-            annotation_decisions.insert(hir_id, decs.clone());
+            insert_annotation_decision(&mut annotation_decisions, hir_id, decs);
         }
 
         // 3f: static/const item annotations whose initializer contains the function item.
@@ -416,20 +433,51 @@ impl FnPtrRewriteDecision {
             else {
                 continue;
             };
-            annotation_decisions.insert(item.hir_id(), decs.clone());
+            insert_annotation_decision(&mut annotation_decisions, item.hir_id(), &decs);
             if let Some(alias_did) = hir_ty_alias_def_id(ty) {
-                annotation_decisions
-                    .entry(tcx.local_def_id_to_hir_id(alias_did))
-                    .or_insert(decs);
+                insert_annotation_decision(
+                    &mut annotation_decisions,
+                    tcx.local_def_id_to_hir_id(alias_did),
+                    &decs,
+                );
             }
         }
 
         FnPtrRewriteDecision {
             direct_rewrite,
             needs_wrapper,
+            fn_to_group: fn_ptr_groups.fn_to_group.clone(),
+            group_decisions: final_group_decisions,
             individual_decisions,
             annotation_decisions,
             field_decisions,
+        }
+    }
+}
+
+fn insert_annotation_decision(
+    annotation_decisions: &mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
+    hir_id: HirId,
+    decs: &[Option<PtrKind>],
+) {
+    annotation_decisions
+        .entry(hir_id)
+        .and_modify(|existing| merge_decisions_conservatively(existing, decs))
+        .or_insert_with(|| decs.to_vec());
+}
+
+fn merge_decisions_conservatively(
+    existing: &mut Vec<Option<PtrKind>>,
+    incoming: &[Option<PtrKind>],
+) {
+    if existing.len() != incoming.len() {
+        let len = existing.len().max(incoming.len());
+        *existing = vec![None; len];
+        return;
+    }
+    for (existing, incoming) in existing.iter_mut().zip(incoming) {
+        if *existing != *incoming {
+            *existing = None;
         }
     }
 }
@@ -534,23 +582,20 @@ fn field_fn_ptr_decisions_for_expr<'tcx>(
                 return;
             }
 
-            if let hir::ExprKind::MethodCall(method_seg, receiver, _, _) = expr.kind
-                && matches!(method_seg.ident.name.as_str(), "expect" | "unwrap")
+            if let hir::ExprKind::Field(struct_expr, field_ident) =
+                utils::hir::unwrap_drop_temps(expr).kind
             {
-                let receiver = utils::hir::unwrap_drop_temps(receiver);
-                if let hir::ExprKind::Field(struct_expr, field_ident) = receiver.kind {
-                    let typeck = self.tcx.typeck(expr.hir_id.owner);
-                    let struct_ty = typeck.expr_ty_adjusted(struct_expr);
-                    if let ty::TyKind::Adt(adt_def, _) = struct_ty.kind()
-                        && adt_def.is_struct()
-                        && let Some(struct_did) = adt_def.did().as_local()
-                        && let Some(field_idx) =
-                            hir_field_index_by_name(self.tcx, struct_did, field_ident.name)
-                        && let Some(decs) = self.field_decisions.get(&(struct_did, field_idx))
-                    {
-                        self.found = Some(decs.clone());
-                        return;
-                    }
+                let typeck = self.tcx.typeck(expr.hir_id.owner);
+                let struct_ty = typeck.expr_ty_adjusted(struct_expr);
+                if let ty::TyKind::Adt(adt_def, _) = struct_ty.kind()
+                    && adt_def.is_struct()
+                    && let Some(struct_did) = adt_def.did().as_local()
+                    && let Some(field_idx) =
+                        hir_field_index_by_name(self.tcx, struct_did, field_ident.name)
+                    && let Some(decs) = self.field_decisions.get(&(struct_did, field_idx))
+                {
+                    self.found = Some(decs.clone());
+                    return;
                 }
             }
 
