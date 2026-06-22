@@ -588,6 +588,8 @@ fn main() {
                 std::fs::write(&file, s).unwrap();
                 if bytemuck.needs_derive() {
                     utils::bytemuck::ensure_bytemuck_with_derive(&dir);
+                } else if bytemuck.needs_must_cast() {
+                    utils::bytemuck::ensure_bytemuck_with_must_cast(&dir);
                 } else if bytemuck.needs_runtime() && !utils::has_dependency(&dir, "bytemuck") {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }

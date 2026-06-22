@@ -7227,6 +7227,103 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+// ===== Section 5: static byte-string initializers =====
+
+#[test]
+fn test_static_bytestr_slice_field_initializer_type_checks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct InfoName {
+    pub key: core::ffi::c_int,
+    pub name: *const core::ffi::c_char,
+}
+
+static mut BUILDINFO_NAMES: [InfoName; 3] = [
+    InfoName {
+        key: 1 as core::ffi::c_int,
+        name: b"cpu\x00" as *const u8 as *const core::ffi::c_char,
+    },
+    InfoName {
+        key: 2 as core::ffi::c_int,
+        name: b"built from commit\x00" as *const u8 as *const core::ffi::c_char,
+    },
+    InfoName {
+        key: 0 as core::ffi::c_int,
+        name: 0 as *const core::ffi::c_char,
+    },
+];
+
+pub unsafe fn first_name_byte<'a>() -> core::ffi::c_int {
+    let entry = BUILDINFO_NAMES.as_ptr();
+    let name = (*entry).name;
+    return *name.offset(0 as isize) as core::ffi::c_int;
+}
+"#,
+        &[
+            "name: bytemuck::must_cast_slice::<_, i8>(b\"cpu\\x00\")",
+            "name: bytemuck::must_cast_slice::<_",
+            "i8>(b\"built from commit\\x00\")",
+        ],
+        &[
+            "name: bytemuck::cast_slice(b\"cpu\\x00\")",
+            "name: bytemuck::cast_slice(b\"built from commit\\x00\")",
+        ],
+    );
+}
+
+#[test]
+fn test_static_bytestr_multiple_slice_fields_type_check() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct DriverDefinition {
+    pub name: *const core::ffi::c_char,
+    pub fns: *const core::ffi::c_char,
+    pub words: *const core::ffi::c_char,
+    pub flags: core::ffi::c_int,
+}
+
+static mut BUILTIN_DEFS: [DriverDefinition; 2] = [
+    DriverDefinition {
+        name: b"ada\x00" as *const u8 as *const core::ffi::c_char,
+        fns: b"!^(.*[ \t])?(is[ \t]+new|renames|is[ \t]+separate)([ \t].*)?$\x00"
+            as *const u8 as *const core::ffi::c_char,
+        words: b"[a-zA-Z][a-zA-Z0-9_]*|=>|\\.\\.|\\*\\*|:=|/=|>=|<=|[^[:space:]]\x00"
+            as *const u8 as *const core::ffi::c_char,
+        flags: 1 as core::ffi::c_int,
+    },
+    DriverDefinition {
+        name: 0 as *const core::ffi::c_char,
+        fns: 0 as *const core::ffi::c_char,
+        words: 0 as *const core::ffi::c_char,
+        flags: 0 as core::ffi::c_int,
+    },
+];
+
+pub unsafe fn builtin_first_bytes<'a, 'b, 'c>() -> core::ffi::c_int {
+    let def = BUILTIN_DEFS.as_ptr();
+    let name = (*def).name;
+    let fns = (*def).fns;
+    let words = (*def).words;
+    return *name.offset(0 as isize) as core::ffi::c_int
+        + *fns.offset(0 as isize) as core::ffi::c_int
+        + *words.offset(0 as isize) as core::ffi::c_int;
+}
+"#,
+        &[
+            "name: bytemuck::must_cast_slice::<_, i8>(b\"ada\\x00\")",
+            "fns: bytemuck::must_cast_slice",
+            "words: bytemuck::must_cast_slice",
+        ],
+        &[
+            "name: bytemuck::cast_slice(b\"ada\\x00\")",
+            "fns: bytemuck::cast_slice(",
+            "words: bytemuck::cast_slice(",
+        ],
+    );
+}
+
 // ===== Fallthrough tests (lines 734-755): struct field pointer access =====
 
 /// Fallthrough + OptRef: struct field `s.data` is a `*mut c_int` → `PtrExprBaseKind::Other`.

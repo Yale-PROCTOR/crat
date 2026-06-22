@@ -65,9 +65,11 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     ast_to_hir: AstToHir,
     fn_ptr_rewrite: FnPtrRewriteDecision,
     pub bytemuck: Cell<bool>,
+    bytemuck_must_cast: Cell<bool>,
     bytemuck_derives: RefCell<BytemuckDerivePlan>,
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
+    item_initializer_depth: usize,
     diagnostics: DecisionDiagnostics,
 }
 
@@ -504,7 +506,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             _ => {}
         }
 
+        let in_item_initializer = matches!(&item.kind, ItemKind::Static(_) | ItemKind::Const(_));
+        if in_item_initializer {
+            self.item_initializer_depth += 1;
+        }
         mut_visit::walk_item(self, item);
+        if in_item_initializer {
+            self.item_initializer_depth -= 1;
+        }
 
         if let Some(def_id) = fn_def_id
             && let ItemKind::Fn(box fn_item) = &mut item.kind
@@ -1983,9 +1992,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ast_to_hir,
             fn_ptr_rewrite,
             bytemuck: Cell::new(false),
+            bytemuck_must_cast: Cell::new(false),
             bytemuck_derives: RefCell::new(BytemuckDerivePlan::default()),
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
+            item_initializer_depth: 0,
             diagnostics,
         };
         visitor.record_field_decisions();
@@ -1995,8 +2006,41 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     pub(crate) fn bytemuck_dependency(&self) -> BytemuckDependency {
         BytemuckDependency::from_flags(
             self.bytemuck.get(),
+            self.bytemuck_must_cast.get(),
             !self.bytemuck_derives.borrow().is_empty(),
         )
+    }
+
+    fn byte_str_slice_cast(
+        &self,
+        byte_str: &Expr,
+        target_ty: ty::Ty<'tcx>,
+        explicit_runtime_target: bool,
+    ) -> String {
+        let byte_str = pprust::expr_to_string(byte_str);
+        if self.item_initializer_depth > 0 && target_ty == self.tcx.types.i8 {
+            format!(
+                "bytemuck::must_cast_slice::<_, {}>({})",
+                mir_ty_to_string(target_ty, self.tcx),
+                byte_str
+            )
+        } else if explicit_runtime_target {
+            format!(
+                "bytemuck::cast_slice::<_, {}>({})",
+                mir_ty_to_string(target_ty, self.tcx),
+                byte_str
+            )
+        } else {
+            format!("bytemuck::cast_slice({byte_str})")
+        }
+    }
+
+    fn note_byte_str_slice_cast_dependency(&self, target_ty: ty::Ty<'tcx>) {
+        if self.item_initializer_depth > 0 && target_ty == self.tcx.types.i8 {
+            self.bytemuck_must_cast.set(true);
+        } else {
+            self.bytemuck.set(true);
+        }
     }
 
     pub(crate) fn emit_diagnostics(&self) {
@@ -5201,11 +5245,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
-                        self.bytemuck.set(true);
-                        *ptr = utils::expr!(
-                            "bytemuck::cast_slice({}).first()",
-                            pprust::expr_to_string(e)
-                        );
+                        self.note_byte_str_slice_cast_dependency(lhs_inner_ty);
+                        let cast = self.byte_str_slice_cast(e, lhs_inner_ty, false);
+                        *ptr = utils::expr!("({cast}).first()");
                     }
                     return PtrKind::OptRef(m);
                 }
@@ -5222,11 +5264,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         );
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
-                        self.bytemuck.set(true);
-                        *ptr = utils::expr!(
-                            "crate::slice_cursor::SliceCursor::new(bytemuck::cast_slice({}))",
-                            pprust::expr_to_string(e),
-                        );
+                        self.note_byte_str_slice_cast_dependency(lhs_inner_ty);
+                        let cast = self.byte_str_slice_cast(e, lhs_inner_ty, false);
+                        *ptr = utils::expr!("crate::slice_cursor::SliceCursor::new({cast})");
                     }
                     return PtrKind::SliceCursor(m);
                 }
@@ -5236,8 +5276,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *ptr = e.clone();
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
-                        self.bytemuck.set(true);
-                        *ptr = utils::expr!("bytemuck::cast_slice({})", pprust::expr_to_string(e),);
+                        self.note_byte_str_slice_cast_dependency(lhs_inner_ty);
+                        let cast = self.byte_str_slice_cast(e, lhs_inner_ty, false);
+                        *ptr = utils::expr!("{cast}");
                     }
                     return PtrKind::Slice(m);
                 }
@@ -5247,12 +5288,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
-                        self.bytemuck.set(true);
-                        *ptr = utils::expr!(
-                            "bytemuck::cast_slice::<_, {}>({}).first()",
-                            mir_ty_to_string(lhs_inner_ty, self.tcx),
-                            pprust::expr_to_string(e),
-                        );
+                        self.note_byte_str_slice_cast_dependency(lhs_inner_ty);
+                        let cast = self.byte_str_slice_cast(e, lhs_inner_ty, true);
+                        *ptr = utils::expr!("({cast}).first()");
                     }
                     return PtrKind::OptRef(m);
                 }

@@ -1,4 +1,4 @@
-use std::{fs, path::Path, str::FromStr};
+use std::{collections::BTreeSet, fs, path::Path, str::FromStr};
 
 use rustc_abi::Size;
 use rustc_ast::{
@@ -458,9 +458,39 @@ impl BytemuckDerive {
     }
 }
 
-pub fn ensure_bytemuck_with_derive(dir: &Path) {
+fn ensure_bytemuck_features(dir: &Path, required_features: &[&str]) {
     let path = dir.join("Cargo.toml");
     let content = fs::read_to_string(&path).unwrap();
+    let table = content.parse::<toml::Table>().unwrap();
+    let existing = table
+        .get("dependencies")
+        .and_then(|deps| deps.get("bytemuck"));
+    let version = match existing {
+        Some(toml::Value::String(version)) => version.as_str(),
+        Some(toml::Value::Table(table)) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("1.24.0"),
+        _ => "1.24.0",
+    };
+    let mut features = BTreeSet::new();
+    if let Some(toml::Value::Table(table)) = existing
+        && let Some(toml::Value::Array(existing_features)) = table.get("features")
+    {
+        features.extend(
+            existing_features
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    features.extend(required_features.iter().map(|feature| feature.to_string()));
+    let features = features
+        .into_iter()
+        .map(|feature| format!(r#""{feature}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let mut doc = content.parse::<DocumentMut>().unwrap();
 
     if !doc.as_table().contains_key("dependencies") {
@@ -468,10 +498,18 @@ pub fn ensure_bytemuck_with_derive(dir: &Path) {
     }
 
     let deps = doc["dependencies"].as_table_mut().unwrap();
-    deps["bytemuck"] = TomlItem::from_str(
-        r#"{ version = "1.24.0", features = ["derive", "min_const_generics", "must_cast"] }"#,
-    )
+    deps["bytemuck"] = TomlItem::from_str(&format!(
+        r#"{{ version = "{version}", features = [{features}] }}"#
+    ))
     .unwrap();
 
     fs::write(path, doc.to_string()).unwrap();
+}
+
+pub fn ensure_bytemuck_with_must_cast(dir: &Path) {
+    ensure_bytemuck_features(dir, &["must_cast"]);
+}
+
+pub fn ensure_bytemuck_with_derive(dir: &Path) {
+    ensure_bytemuck_features(dir, &["derive", "min_const_generics", "must_cast"]);
 }

@@ -78,20 +78,26 @@ pub struct Config {
 pub enum BytemuckDependency {
     None,
     Runtime,
+    MustCast,
     Derive,
 }
 
 impl BytemuckDependency {
-    pub fn from_flags(runtime: bool, derive: bool) -> Self {
-        match (runtime, derive) {
-            (_, true) => Self::Derive,
-            (true, false) => Self::Runtime,
-            (false, false) => Self::None,
+    pub fn from_flags(runtime: bool, must_cast: bool, derive: bool) -> Self {
+        match (runtime, must_cast, derive) {
+            (_, _, true) => Self::Derive,
+            (_, true, false) => Self::MustCast,
+            (true, false, false) => Self::Runtime,
+            (false, false, false) => Self::None,
         }
     }
 
     pub fn needs_runtime(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    pub fn needs_must_cast(self) -> bool {
+        matches!(self, Self::MustCast | Self::Derive)
     }
 
     pub fn needs_derive(self) -> bool {
