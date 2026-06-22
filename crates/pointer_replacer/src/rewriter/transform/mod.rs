@@ -14269,11 +14269,12 @@ enum ConflictDemotionReason {
     RawBindingFromField,
     RawLocalCallArg,
     RawUnknownCallArg,
+    SelfReferentialFieldStorage,
 }
 
 impl ConflictDemotionReason {
     #[allow(dead_code)]
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::ActiveBorrowOverlap,
         Self::LocalAssignmentWhileBorrowed,
         Self::ConflictingReborrow,
@@ -14285,6 +14286,7 @@ impl ConflictDemotionReason {
         Self::RawBindingFromField,
         Self::RawLocalCallArg,
         Self::RawUnknownCallArg,
+        Self::SelfReferentialFieldStorage,
     ];
 
     #[allow(dead_code)]
@@ -14301,6 +14303,7 @@ impl ConflictDemotionReason {
             Self::RawBindingFromField => "raw_binding_from_field",
             Self::RawLocalCallArg => "raw_local_call_arg",
             Self::RawUnknownCallArg => "raw_unknown_call_arg",
+            Self::SelfReferentialFieldStorage => "self_referential_field_storage",
         }
     }
 }
@@ -14591,10 +14594,14 @@ fn collect_field_conflict_demotion_reasons(
         fn raw_field_storage_reason(
             &self,
             field: StructFieldSlot,
+            lhs: Option<&'tcx hir::Expr<'tcx>>,
             expr: &'tcx hir::Expr<'tcx>,
         ) -> Option<ConflictDemotionReason> {
             if self.expr_is_null_constructor(expr) || hir_raw_addr_local(expr).is_some() {
                 return None;
+            }
+            if lhs.is_some_and(|lhs| self.expr_uses_same_object_field(field, lhs, expr)) {
+                return Some(ConflictDemotionReason::SelfReferentialFieldStorage);
             }
             if self.expr_is_allocator_root_source(expr) {
                 return Some(ConflictDemotionReason::RawStorageAllocator);
@@ -14603,6 +14610,49 @@ fn collect_field_conflict_demotion_reasons(
                 return Some(ConflictDemotionReason::RawStoragePointer);
             }
             None
+        }
+
+        fn expr_uses_same_object_field(
+            &self,
+            field: StructFieldSlot,
+            lhs: &'tcx hir::Expr<'tcx>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) -> bool {
+            let Some(lhs_root) = hir_projection_root_local_id(lhs) else {
+                return false;
+            };
+
+            struct SameObjectFieldVisitor<'tcx> {
+                tcx: TyCtxt<'tcx>,
+                target_struct: LocalDefId,
+                target_root: HirId,
+                found: bool,
+            }
+
+            impl<'tcx> Visitor<'tcx> for SameObjectFieldVisitor<'tcx> {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    if self.found {
+                        return;
+                    }
+                    if let Some(rhs_field) = hir_struct_field_slot(self.tcx, expr)
+                        && rhs_field.struct_did == self.target_struct
+                        && hir_projection_root_local_id(expr) == Some(self.target_root)
+                    {
+                        self.found = true;
+                        return;
+                    }
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut visitor = SameObjectFieldVisitor {
+                tcx: self.tcx,
+                target_struct: field.struct_did,
+                target_root: lhs_root,
+                found: false,
+            };
+            visitor.visit_expr(rhs);
+            visitor.found
         }
 
         fn raw_storage_source_loses_mutability(
@@ -14651,8 +14701,13 @@ fn collect_field_conflict_demotion_reasons(
             }
         }
 
-        fn record_raw_field_storage(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
-            if let Some(reason) = self.raw_field_storage_reason(field, rhs) {
+        fn record_raw_field_storage(
+            &mut self,
+            field: StructFieldSlot,
+            lhs: Option<&'tcx hir::Expr<'tcx>>,
+            rhs: &'tcx hir::Expr<'tcx>,
+        ) {
+            if let Some(reason) = self.raw_field_storage_reason(field, lhs, rhs) {
                 self.record_conflict(field, reason);
             }
         }
@@ -14737,7 +14792,7 @@ fn collect_field_conflict_demotion_reasons(
                                 };
                                 self.record_mutable_field_copy_to_slot(field_slot, field.expr);
                                 self.record_field_borrow(field_slot, field.expr);
-                                self.record_raw_field_storage(field_slot, field.expr);
+                                self.record_raw_field_storage(field_slot, None, field.expr);
                             }
                         }
                     }
@@ -14751,7 +14806,7 @@ fn collect_field_conflict_demotion_reasons(
                     if let Some(field) = hir_struct_field_slot(self.tcx, lhs) {
                         self.clear_field_borrow(field);
                         self.record_field_borrow(field, rhs);
-                        self.record_raw_field_storage(field, rhs);
+                        self.record_raw_field_storage(field, Some(lhs), rhs);
                     }
                 }
                 hir::ExprKind::AssignOp(_, lhs, _) => {
@@ -15709,6 +15764,9 @@ fn conflict_reason_to_decision_reason(reason: ConflictDemotionReason) -> Decisio
         ConflictDemotionReason::RawBindingFromField => DecisionReason::RawBindingFromField,
         ConflictDemotionReason::RawLocalCallArg => DecisionReason::RawLocalCallArg,
         ConflictDemotionReason::RawUnknownCallArg => DecisionReason::RawUnknownCallArg,
+        ConflictDemotionReason::SelfReferentialFieldStorage => {
+            DecisionReason::SelfReferentialFieldStorage
+        }
     }
 }
 

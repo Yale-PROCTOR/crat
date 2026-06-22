@@ -9991,6 +9991,34 @@ pub const COMMAND: Command = Command {
 }
 
 #[test]
+fn test_section12_keeps_hashmap_link_fields_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Map {
+    pub entries: *mut Entry,
+    pub last: *mut Entry,
+}
+
+pub unsafe extern "C" fn select_entry(mut map: *mut Map, mut index: usize) {
+    (*map).last = ((*map).entries).offset(index as isize);
+}
+"#,
+        &[
+            "pub entries: &'a mut [Entry]",
+            "pub last: *mut Entry",
+            "map.last = ((map.entries)[(index as isize) as usize..]).as_mut_ptr();",
+        ],
+        &["pub last: &", "pub last: Option<&"],
+    );
+}
+
+#[test]
 fn test_section15_option_fn_payload_cast_in_extern_call_keeps_raw_until_supported() {
     let code = r#"
 #[repr(C)]
