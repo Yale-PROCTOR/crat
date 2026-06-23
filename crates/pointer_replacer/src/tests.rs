@@ -1214,6 +1214,345 @@ pub unsafe fn caller(s: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_e0499_callback_payload_promoted_field_reuse_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Repo {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct ParentData {
+    pub repo: *mut Repo,
+    pub count: i32,
+}
+
+pub unsafe fn bump_repo(repo: *mut Repo) -> i32 {
+    (*repo.offset(0)).value += 1;
+    (*repo.offset(0)).value
+}
+
+pub unsafe fn visit(payload: *mut core::ffi::c_void) {
+    let data = payload as *mut ParentData;
+    (*data).count += 1;
+}
+
+pub unsafe fn create(repo: *mut Repo) -> i32 {
+    let mut data = ParentData { repo: repo, count: 0 };
+    let before = bump_repo(repo);
+    visit(&raw mut data as *mut core::ffi::c_void);
+    (*data.repo.offset(0)).value += data.count;
+    before + (*data.repo.offset(0)).value
+}
+"#,
+        &[
+            "pub struct ParentData {",
+            "pub repo: *mut Repo",
+            "pub unsafe fn bump_repo(mut repo: &mut [crate::Repo]) -> i32",
+            "pub unsafe fn create(mut repo: &mut [crate::Repo]) -> i32",
+            ".as_mut_ptr()",
+        ],
+        &[
+            "pub struct ParentData<'a>",
+            "pub repo: &'a mut [crate::Repo]",
+            "pub unsafe fn bump_repo(mut repo: *mut crate::Repo)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_callback_payload_field_reuse_with_pointer_comparison_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Repo {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct ParentData {
+    pub repo: *mut Repo,
+}
+
+pub unsafe fn touch(repo: *mut Repo) {
+    (*repo.offset(0)).value = (*repo.offset(0)).value.wrapping_add(1);
+}
+
+pub unsafe fn enqueue(payload: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    payload
+}
+
+pub unsafe fn create(repo: *mut Repo) -> i32 {
+    let mut data = ParentData { repo: repo };
+    let same = data.repo == repo;
+    touch(repo);
+    enqueue(&raw mut data as *mut core::ffi::c_void);
+    if same { (*data.repo.offset(0)).value } else { 0 }
+}
+"#,
+        &[
+            "pub struct ParentData {",
+            "pub repo: *mut Repo",
+            "pub unsafe fn touch(mut repo: &mut [crate::Repo])",
+            "pub unsafe fn create(mut repo: &mut [crate::Repo]) -> i32",
+            ".as_mut_ptr()",
+        ],
+        &[
+            "pub struct ParentData<'a>",
+            "pub repo: &'a mut [crate::Repo]",
+            "pub unsafe fn touch(mut repo: *mut crate::Repo)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_callback_payload_scalar_ref_source_stays_promoted() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Repo {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct ParentData {
+    pub repo: *mut Repo,
+}
+
+pub unsafe fn touch(repo: *mut Repo) {
+    (*repo).value += 1;
+}
+
+pub unsafe fn visit(payload: *mut core::ffi::c_void) {
+    let data = payload as *mut ParentData;
+    (*(*data).repo).value += 1;
+}
+
+pub unsafe fn create(repo: *mut Repo) -> i32 {
+    let mut data = ParentData { repo: repo };
+    touch(repo);
+    visit(&raw mut data as *mut core::ffi::c_void);
+    (*data.repo).value
+}
+"#,
+        &[
+            "pub struct ParentData {",
+            "pub repo: *mut Repo",
+            "pub unsafe fn touch(mut repo: &mut crate::Repo)",
+            "pub unsafe fn create(mut repo: Option<&mut crate::Repo>) -> i32",
+        ],
+        &[
+            "pub struct ParentData<'a>",
+            "pub repo: &'a mut crate::Repo",
+            "pub unsafe fn touch(mut repo: *mut crate::Repo)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_same_call_field_and_raw_parent_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct HashCtx {
+    pub value: u8,
+}
+
+#[repr(C)]
+pub struct Oid {
+    pub id: [u8; 4],
+}
+
+impl Copy for Oid {}
+
+impl Clone for Oid {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct PatchArgs {
+    pub ctx: HashCtx,
+    pub result: Oid,
+    pub len: usize,
+}
+
+pub unsafe fn hash_final(out: *mut u8, ctx: *mut HashCtx) -> i32 {
+    *out.offset(0) = (*ctx).value;
+    0
+}
+
+pub unsafe fn hash_init(ctx: *mut HashCtx) -> i32 {
+    (*ctx).value = 0;
+    0
+}
+
+pub unsafe fn flush(result: *mut Oid, args: *mut PatchArgs) {
+    let ctx: *mut HashCtx = &mut (*args).ctx;
+    let mut hash = Oid { id: [0; 4] };
+    hash_final(hash.id.as_mut_ptr(), ctx);
+    hash_init(ctx);
+    let mut i = 0usize;
+    while i < (*args).len {
+        (*result.offset(0)).id[i] = hash.id[i];
+        i += 1;
+    }
+}
+
+pub unsafe fn caller() -> u8 {
+    let mut args = PatchArgs {
+        ctx: HashCtx { value: 7 },
+        result: Oid { id: [0; 4] },
+        len: 1,
+    };
+    flush(&mut args.result, &mut args);
+    args.result.id[0] + args.ctx.value
+}
+"#,
+        &[
+            "pub unsafe fn flush(mut result: &mut [crate::Oid],",
+            "mut args: *mut crate::PatchArgs)",
+            "std::slice::from_mut(&mut (args.result))",
+            "&raw mut (args)",
+        ],
+        &["pub unsafe fn flush(mut result: *mut crate::Oid"],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_same_call_array_field_and_raw_parent_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct HashCtx {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Work {
+    pub ctx: HashCtx,
+    pub values: [i32; 4],
+    pub len: usize,
+}
+
+pub unsafe fn reset(ctx: *mut HashCtx) {
+    (*ctx).value += 1;
+}
+
+pub unsafe fn fill(values: *mut i32, work: *mut Work) {
+    let ctx: *mut HashCtx = &mut (*work).ctx;
+    reset(ctx);
+    let mut i = 0usize;
+    while i < (*work).len {
+        *values.offset(i as isize) = (*work).ctx.value;
+        i += 1;
+    }
+}
+
+pub unsafe fn caller() -> i32 {
+    let mut work = Work {
+        ctx: HashCtx { value: 3 },
+        values: [0; 4],
+        len: 1,
+    };
+    fill(work.values.as_mut_ptr(), &mut work);
+    work.values[0] + work.ctx.value
+}
+"#,
+        &[
+            "pub unsafe fn fill(mut values: &mut [i32], mut work: *mut crate::Work)",
+            "&mut (work.values)",
+            "&raw mut (work)",
+        ],
+        &["pub unsafe fn fill(mut values: *mut i32"],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_nested_same_local_mut_borrow_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn pop(stack: *mut *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let current = *stack.offset(0);
+    *stack.offset(0) = core::ptr::null_mut();
+    current
+}
+
+pub unsafe fn push(stack: *mut *mut core::ffi::c_void, item: *mut core::ffi::c_void) {
+    *stack.offset(0) = item;
+}
+
+pub unsafe fn caller(item: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let mut list: *mut core::ffi::c_void = item;
+    push(&mut list, pop(&mut list));
+    list
+}
+"#,
+        &[
+            "pub unsafe fn pop(mut stack: &mut [*mut std::ffi::c_void])",
+            "-> *mut std::ffi::c_void",
+            "pub unsafe fn push(mut stack: &mut [*mut std::ffi::c_void],",
+            "mut item: *mut std::ffi::c_void)",
+            "std::slice::from_mut(&mut (list))",
+        ],
+        &[
+            "pub unsafe fn pop(mut stack: *mut *mut core::ffi::c_void",
+            "pub unsafe fn push(mut stack: *mut *mut core::ffi::c_void",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_e0499_nested_same_local_mut_borrow_in_later_argument_typechecks() {
+    run_test(
+        r#"
+pub unsafe fn pop(stack: *mut *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let current = *stack.offset(0);
+    *stack.offset(0) = core::ptr::null_mut();
+    current
+}
+
+pub unsafe fn choose(
+    item: *mut core::ffi::c_void,
+    fallback: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    if item.is_null() { fallback } else { item }
+}
+
+pub unsafe fn store(
+    stack: *mut *mut core::ffi::c_void,
+    item: *mut core::ffi::c_void,
+    flag: i32,
+) -> i32 {
+    *stack.offset(0) = item;
+    flag
+}
+
+pub unsafe fn caller(
+    item: *mut core::ffi::c_void,
+    fallback: *mut core::ffi::c_void,
+) -> i32 {
+    let mut list: *mut core::ffi::c_void = item;
+    store(&mut list, choose(pop(&mut list), fallback), 1)
+}
+"#,
+        &[
+            "pub unsafe fn pop(mut stack: &mut [*mut std::ffi::c_void])",
+            "-> *mut std::ffi::c_void",
+            "pub unsafe fn store(mut stack: &mut [*mut std::ffi::c_void],",
+            "mut item: *mut std::ffi::c_void, flag: i32) -> i32",
+            "std::slice::from_mut(&mut (list))",
+        ],
+        &[
+            "pub unsafe fn pop(mut stack: *mut *mut core::ffi::c_void",
+            "pub unsafe fn store(mut stack: *mut *mut core::ffi::c_void",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_same_call_scalar_output_and_copy_read_uses_temporary() {
     run_test(
         r#"

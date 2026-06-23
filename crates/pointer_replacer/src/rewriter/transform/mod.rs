@@ -1272,7 +1272,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     .enumerate()
                     .map(|(i, harg)| self.call_arg_param_kind(harg, i, sig_dec, fn_ptr_decisions))
                     .collect::<Vec<_>>();
-                let same_call_temp_plan =
+                let mut same_call_temp_plan =
                     self.same_call_temp_plan(hir_expr, hargs, &arg_param_kinds);
                 self.rewrite_same_call_temp_args(args, &same_call_temp_plan);
 
@@ -1310,6 +1310,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.transform_raw_aggregate_context(arg, harg, expected_ty);
                     }
                 }
+                self.rewrite_same_call_hoisted_arg_temps(args, &mut same_call_temp_plan);
 
                 // when this is a transmute call and an argument casts a fn-ptr group function,
                 // replace the first explicit type arg with `_` to match the rewritten cast type
@@ -1610,8 +1611,16 @@ struct SameCallTemp {
 }
 
 #[derive(Clone, Debug)]
+struct SameCallArgTemp {
+    arg_index: usize,
+    temp_name: String,
+    expr: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 struct SameCallTempPlan {
     temps: Vec<SameCallTemp>,
+    arg_temps: Vec<SameCallArgTemp>,
     arg_replacements: Vec<FxHashMap<HirId, String>>,
 }
 
@@ -1619,6 +1628,7 @@ impl SameCallTempPlan {
     fn new(arg_count: usize) -> Self {
         Self {
             temps: Vec::new(),
+            arg_temps: Vec::new(),
             arg_replacements: std::iter::repeat_with(FxHashMap::default)
                 .take(arg_count)
                 .collect(),
@@ -1627,6 +1637,16 @@ impl SameCallTempPlan {
 
     fn push_temp(&mut self, temp: SameCallTemp) {
         self.temps.push(temp);
+    }
+
+    fn push_arg_temp(&mut self, temp: SameCallArgTemp) {
+        self.arg_temps.push(temp);
+    }
+
+    fn has_arg_temp(&self, arg_index: usize) -> bool {
+        self.arg_temps
+            .iter()
+            .any(|temp| temp.arg_index == arg_index)
     }
 
     fn temp_for_local(&self, local_hir_id: HirId) -> Option<String> {
@@ -10376,7 +10396,52 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 plan.arg_replacements[later_index].insert(local_hir_id, temp_name);
             }
         }
+        self.add_same_call_hoisted_arg_temps(&mut plan, hargs, arg_param_kinds);
         plan
+    }
+
+    fn add_same_call_hoisted_arg_temps(
+        &self,
+        plan: &mut SameCallTempPlan,
+        hargs: &'tcx [hir::Expr<'tcx>],
+        arg_param_kinds: &[Option<PtrKind>],
+    ) {
+        for (source_index, (harg, param_kind)) in hargs.iter().zip(arg_param_kinds).enumerate() {
+            if !param_kind.is_some_and(is_mutable_borrow_like_decision) {
+                continue;
+            }
+            for root in hir_mutable_borrow_like_local_roots(harg) {
+                for later_index in source_index + 1..hargs.len() {
+                    if plan.has_arg_temp(later_index) {
+                        continue;
+                    }
+                    let later_arg = &hargs[later_index];
+                    let later_kind = arg_param_kinds.get(later_index).copied().flatten();
+                    let hoist_raw_parent = later_kind == Some(PtrKind::Raw(true))
+                        && hir_addr_local(later_arg) == Some((root, true))
+                        && hir_arg_mutable_field_borrow_roots(harg).contains(&root);
+                    let hoist_nested_mut_borrow =
+                        hir_arg_contains_nested_mut_borrow_of_local(later_arg, root);
+                    if !hoist_raw_parent && !hoist_nested_mut_borrow {
+                        continue;
+                    }
+                    if !hargs[..later_index]
+                        .iter()
+                        .all(hir_arg_is_simple_same_call_reorderable)
+                    {
+                        continue;
+                    }
+                    let local_name = self.tcx.hir_name(root);
+                    let counter = self.same_call_temp_counter.get();
+                    self.same_call_temp_counter.set(counter + 1);
+                    plan.push_arg_temp(SameCallArgTemp {
+                        arg_index: later_index,
+                        temp_name: same_call_temp_name(counter, local_name.as_str()),
+                        expr: None,
+                    });
+                }
+            }
+        }
     }
 
     fn same_call_temp_local_is_copy(
@@ -10407,14 +10472,36 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn rewrite_same_call_hoisted_arg_temps(
+        &self,
+        args: &mut [P<Expr>],
+        plan: &mut SameCallTempPlan,
+    ) {
+        plan.arg_temps.sort_by_key(|temp| temp.arg_index);
+        for temp in &mut plan.arg_temps {
+            let Some(arg) = args.get_mut(temp.arg_index) else {
+                continue;
+            };
+            temp.expr = Some(pprust::expr_to_string(arg));
+            *arg = P(utils::expr!("{}", temp.temp_name));
+        }
+    }
+
     fn wrap_same_call_temp_call(&self, expr: &mut Expr, plan: &SameCallTempPlan) {
-        if plan.temps.is_empty() {
+        if plan.temps.is_empty() && plan.arg_temps.is_empty() {
             return;
         }
         let mut lets = String::new();
         for temp in &plan.temps {
             use std::fmt::Write as _;
             write!(&mut lets, "let {} = {};", temp.temp_name, temp.local_name).unwrap();
+        }
+        for temp in &plan.arg_temps {
+            let Some(temp_expr) = &temp.expr else {
+                continue;
+            };
+            use std::fmt::Write as _;
+            write!(&mut lets, "let {} = {};", temp.temp_name, temp_expr).unwrap();
         }
         *expr = utils::expr!("{{ {lets} {} }}", pprust::expr_to_string(expr));
     }
@@ -15202,6 +15289,89 @@ fn same_call_has_other_mutable_borrow_of_local(
         })
 }
 
+fn hir_mutable_borrow_like_local_roots(expr: &hir::Expr<'_>) -> FxHashSet<HirId> {
+    let mut roots = FxHashSet::default();
+    if let Some((local, true)) = hir_addr_local(expr) {
+        roots.insert(local);
+    }
+    roots.extend(
+        hir_top_level_field_projection_uses_in_expr(expr)
+            .into_iter()
+            .map(|(root, _)| root),
+    );
+    roots
+}
+
+fn hir_arg_mutable_field_borrow_roots(expr: &hir::Expr<'_>) -> FxHashSet<HirId> {
+    hir_top_level_field_projection_uses_in_expr(expr)
+        .into_iter()
+        .map(|(root, _)| root)
+        .collect()
+}
+
+fn hir_expr_mutably_borrows_local_root(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = hir_unwrap_casts(utils::hir::unwrap_drop_temps(expr));
+    match expr.kind {
+        hir::ExprKind::AddrOf(_, mutability, pointee) if mutability.is_mut() => {
+            hir_local_place_root_without_deref(pointee)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.is_empty() && seg.ident.name.as_str() == "as_mut_ptr" =>
+        {
+            hir_local_place_root_without_deref(receiver)
+        }
+        _ => None,
+    }
+}
+
+fn hir_arg_contains_nested_mut_borrow_of_local(expr: &hir::Expr<'_>, target: HirId) -> bool {
+    struct NestedMutBorrowVisitor {
+        root: HirId,
+        target: HirId,
+        found: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for NestedMutBorrowVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.found {
+                return;
+            }
+            if expr.hir_id != self.root
+                && hir_expr_mutably_borrows_local_root(expr) == Some(self.target)
+            {
+                self.found = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = NestedMutBorrowVisitor {
+        root: expr.hir_id,
+        target,
+        found: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
+fn hir_arg_is_simple_same_call_reorderable(expr: &hir::Expr<'_>) -> bool {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    match hir_unwrap_casts(expr).kind {
+        hir::ExprKind::Path(_) => true,
+        hir::ExprKind::Field(base, _) => hir_arg_is_simple_same_call_reorderable(base),
+        hir::ExprKind::AddrOf(_, _, inner) | hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
+            hir_arg_is_simple_same_call_reorderable(inner)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.is_empty() && is_as_ptr_method(seg.ident.name) =>
+        {
+            hir_arg_is_simple_same_call_reorderable(receiver)
+        }
+        _ => false,
+    }
+}
+
 fn hir_arg_blocks_same_call_temp_snapshot(expr: &hir::Expr<'_>, target: HirId) -> bool {
     struct BlockingUseVisitor {
         target: HirId,
@@ -18066,6 +18236,7 @@ fn collect_field_conflict_demotion_reasons(
         mutable_fields: &'a FxHashSet<StructFieldSlot>,
         allocator_locals: FxHashSet<HirId>,
         active_borrows: FxHashMap<HirId, FxHashMap<StructFieldSlot, bool>>,
+        active_borrow_source_uses: FxHashMap<HirId, FxHashSet<StructFieldSlot>>,
         ignored_borrow_exprs: FxHashSet<HirId>,
         conflict_reasons: FxHashMap<StructFieldSlot, FxHashSet<ConflictDemotionReason>>,
     }
@@ -18090,14 +18261,42 @@ fn collect_field_conflict_demotion_reasons(
             }
         }
 
+        fn ignore_borrow_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            struct ExprIdVisitor {
+                ids: FxHashSet<HirId>,
+            }
+
+            impl<'tcx> Visitor<'tcx> for ExprIdVisitor {
+                fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                    self.ids.insert(expr.hir_id);
+                    intravisit::walk_expr(self, expr);
+                }
+            }
+
+            let mut visitor = ExprIdVisitor {
+                ids: FxHashSet::default(),
+            };
+            visitor.visit_expr(expr);
+            self.ignored_borrow_exprs.extend(visitor.ids);
+        }
+
+        fn field_borrow_source(&self, rhs: &'tcx hir::Expr<'tcx>) -> Option<(HirId, bool, bool)> {
+            if let Some(source) = hir_raw_addr_local(rhs) {
+                return Some((source.0, source.1, false));
+            }
+            let local = field_storage_rhs_source_local_id(rhs)?;
+            let kind = self.ptr_kinds.get(&local).copied()?;
+            is_borrow_like_decision(kind).then_some((local, kind.is_mut(), true))
+        }
+
         fn record_field_borrow(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
             if !self.promoted_fields.contains(&field) {
                 return;
             }
-            let Some((local, new_mut)) = hir_raw_addr_local(rhs) else {
+            let Some((local, new_mut, track_source_use)) = self.field_borrow_source(rhs) else {
                 return;
             };
-            self.ignored_borrow_exprs.insert(rhs.hir_id);
+            self.ignore_borrow_expr(rhs);
             let conflicting_fields = {
                 let fields = self.active_borrows.entry(local).or_default();
                 let has_conflict = !fields.is_empty()
@@ -18110,12 +18309,33 @@ fn collect_field_conflict_demotion_reasons(
                 fields.insert(field, new_mut);
                 conflicting_fields
             };
+            if track_source_use && new_mut {
+                self.active_borrow_source_uses
+                    .entry(local)
+                    .or_default()
+                    .insert(field);
+            }
             if !conflicting_fields.is_empty() {
                 self.record_conflicts(
                     conflicting_fields,
                     ConflictDemotionReason::ActiveBorrowOverlap,
                 );
                 self.record_conflict(field, ConflictDemotionReason::ActiveBorrowOverlap);
+            }
+        }
+
+        fn record_active_borrow_source_use(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            if self.ignored_borrow_exprs.contains(&expr.hir_id) {
+                return;
+            }
+            let Some(local) = hir_unwrapped_local_id(expr) else {
+                return;
+            };
+            if let Some(fields) = self.active_borrow_source_uses.get(&local) {
+                self.record_conflicts(
+                    fields.iter().copied().collect::<Vec<_>>(),
+                    ConflictDemotionReason::ActiveBorrowOverlap,
+                );
             }
         }
 
@@ -18150,6 +18370,9 @@ fn collect_field_conflict_demotion_reasons(
 
         fn clear_field_borrow(&mut self, field: StructFieldSlot) {
             for fields in self.active_borrows.values_mut() {
+                fields.remove(&field);
+            }
+            for fields in self.active_borrow_source_uses.values_mut() {
                 fields.remove(&field);
             }
         }
@@ -18552,6 +18775,7 @@ fn collect_field_conflict_demotion_reasons(
         }
 
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            self.record_active_borrow_source_use(expr);
             self.record_conflicting_reborrow(expr);
             self.record_raw_field_pointer_projection(expr);
             match expr.kind {
@@ -18607,6 +18831,7 @@ fn collect_field_conflict_demotion_reasons(
             mutable_fields: &analysis.borrow_promotion_result.mutable_fields,
             allocator_locals: FxHashSet::default(),
             active_borrows: FxHashMap::default(),
+            active_borrow_source_uses: FxHashMap::default(),
             ignored_borrow_exprs: FxHashSet::default(),
             conflict_reasons: FxHashMap::default(),
         };
@@ -18703,7 +18928,25 @@ fn collect_raw_field_source_bindings(
             hir_field_is_raw_ptr(self.tcx, field)
         }
 
-        fn record_rhs(&mut self, rhs: &'tcx hir::Expr<'tcx>) {
+        fn rhs_promoted_source_can_bridge_to_raw(&self, rhs: &'tcx hir::Expr<'tcx>) -> bool {
+            if let Some(hir_id) = hir_unwrapped_local_id(rhs)
+                && self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .copied()
+                    .is_some_and(|kind| kind.is_mut() && is_borrow_like_decision(kind))
+            {
+                return true;
+            }
+            false
+        }
+
+        fn record_rhs(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
+            if self.demoted_fields.contains(&field)
+                && self.rhs_promoted_source_can_bridge_to_raw(rhs)
+            {
+                return;
+            }
             if let Some(callee_did) = hir_called_local_fn(self.tcx, rhs)
                 && self.typeck.expr_ty_adjusted(rhs).is_raw_ptr()
             {
@@ -18733,7 +18976,7 @@ fn collect_raw_field_source_bindings(
                                     field_index,
                                 };
                                 if self.field_stays_raw(slot) {
-                                    self.record_rhs(field.expr);
+                                    self.record_rhs(slot, field.expr);
                                 }
                             }
                         }
@@ -18743,7 +18986,7 @@ fn collect_raw_field_source_bindings(
                     if let Some(slot) = hir_struct_field_slot(self.tcx, lhs)
                         && self.field_stays_raw(slot)
                     {
-                        self.record_rhs(rhs);
+                        self.record_rhs(slot, rhs);
                     }
                 }
                 _ => {}
