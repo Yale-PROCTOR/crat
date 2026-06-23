@@ -39,13 +39,12 @@ use crate::{
             solver::{BoOwnDatabase, KindSolver, SlotRef},
             ssa::{
                 FnResults,
-                constraint::{Database, Debug, Gen, GlobalAssumptions, Var, initialize_local},
+                constraint::{Database, Gen, GlobalAssumptions, Var, initialize_local},
                 consume::{Consume, initial_definitions},
                 dom::compute_dominance_frontier,
                 state::SSAState,
             },
         },
-        output_params::OutputParams,
     },
     utils::rustc::RustProgram,
 };
@@ -118,10 +117,7 @@ pub(crate) trait AnalysisKind<'analysis, 'db, 'tcx> {
     /// Interprocedural context
     type InterCtxt;
     type DB: Database;
-    fn analyze(
-        crate_ctxt: CrateCtxt<'tcx>,
-        output_params: &OutputParams,
-    ) -> anyhow::Result<Self::Results>;
+    fn analyze(crate_ctxt: CrateCtxt<'tcx>) -> anyhow::Result<Self::Results>;
 }
 
 type InterCtxt = FxHashMap<DefId, FnSig<Option<Param<Range<Var>>>>>;
@@ -133,10 +129,7 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for BoOwnershipPro
     type InterCtxt = &'analysis InterCtxt;
     type Results = ();
 
-    fn analyze(
-        _crate_ctxt: CrateCtxt<'tcx>,
-        _output_params: &OutputParams,
-    ) -> anyhow::Result<Self::Results> {
+    fn analyze(_crate_ctxt: CrateCtxt<'tcx>) -> anyhow::Result<Self::Results> {
         unimplemented!("B0 only forks ownership emission; B1 wires a real BO analysis")
     }
 }
@@ -156,30 +149,16 @@ pub(crate) struct BoOwnEmissionStats {
 /// functions.
 pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
-    output_params: &OutputParams,
     slots: &CrateSlots,
     kind_solver: &KindSolver,
 ) -> anyhow::Result<(BoOwnEmissionStats, Vec<Bool>)> {
-    // Full output-param coverage is a hard precondition: a missing entry would
-    // silently reclassify an output param as `Normal` and drop its write-back
-    // ownership flow. Production populates every function; fail loud instead.
-    for &did in crate_ctxt.fns() {
-        if !output_params.contains_key(&did.expect_local()) {
-            anyhow::bail!(
-                "output_params is missing an entry for {}",
-                crate_ctxt.tcx.def_path_str(did)
-            );
-        }
-    }
-
     let mut var_gen = Gen::new();
     let mut database = BoOwnDatabase::new(kind_solver.optimize());
     let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
 
     // The full InterCtxt must be built (all signature vars allocated) before any
     // body is emitted, so a local call's `inter_ctxt[&callee]` resolves.
-    let inter_ctxt =
-        initial_crate_inter_ctxt(crate_ctxt, output_params, &mut var_gen, &mut database);
+    let inter_ctxt = initial_crate_inter_ctxt(crate_ctxt, &mut var_gen, &mut database);
 
     // Emission order is irrelevant: bodies share the InterCtxt signature vars, so
     // z3 resolves cross-function (and recursive) flow when the joint system is
@@ -302,16 +281,15 @@ fn link_versions_to_slots<'tcx>(
     }
 }
 
-/// B3b: build a signature (ret + args) for *every* crate function into the
-/// shared database, keyed by `DefId`. Mirrors production `initial_inter_ctxt`.
-/// Full `output_params` coverage is enforced by the caller
-/// (`emit_crate_ownership_constraints`), so the `.get()` here is always `Some`
-/// in practice; it stays a tolerant lookup only as a local defensive default.
-/// These signature vars are the interprocedural linkage consulted by
+/// B3b/B4: build a signature (ret + args) for *every* crate function into the
+/// shared database, keyed by `DefId`. B4 retired the `output_params` input:
+/// every pointer ARG is uniformly two-slot `Consume(use+def)` so the solver
+/// decides escape natively (relaxed monotonicity), rather than a precomputed
+/// output-param flag. The RETURN stays `Param::Normal` (single slot). These
+/// signature vars are the interprocedural linkage consulted by
 /// `Boundary::{call,entry,exit}`.
 fn initial_crate_inter_ctxt<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
-    output_params: &OutputParams,
     var_gen: &mut Gen,
     database: &mut impl Database,
 ) -> InterCtxt {
@@ -325,7 +303,6 @@ fn initial_crate_inter_ctxt<'tcx>(
             .mir_drops_elaborated_and_const_checked(did.expect_local())
             .borrow();
         let body = &*body_ref;
-        let output_params = output_params.get(&did.expect_local());
 
         let mut local_decls = body.local_decls.iter_enumerated();
         let (_, return_local_decl) = local_decls.next().unwrap();
@@ -339,34 +316,25 @@ fn initial_crate_inter_ctxt<'tcx>(
 
         let args = local_decls
             .take(body.arg_count)
-            .map(|(local, local_decl)| {
-                if output_params.is_some_and(|params| params.contains(local)) {
-                    let r#use = initialize_local(
-                        local_decl,
-                        var_gen,
-                        database,
-                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                    );
-                    let def = initialize_local(
-                        local_decl,
-                        var_gen,
-                        database,
-                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                    );
-                    r#use.zip(def).map(|(r#use, def)| {
-                        database.push_assume::<Debug>((), r#use.start, true);
-                        database.push_assume::<Debug>((), def.start, true);
-                        Param::Output(Consume { r#use, def })
-                    })
-                } else {
-                    initialize_local(
-                        local_decl,
-                        var_gen,
-                        database,
-                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                    )
-                    .map(Param::Normal)
-                }
+            .map(|(_local, local_decl)| {
+                let r#use = initialize_local(
+                    local_decl,
+                    var_gen,
+                    database,
+                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                );
+                let def = initialize_local(
+                    local_decl,
+                    var_gen,
+                    database,
+                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                );
+                // B4: no owning seed — escape is solved natively. A read-only
+                // param settles to Ref via the soft objective; `*out = malloc`
+                // settles to Ref-over-Owning. Hard-seeding here would force every
+                // param Owning (regressing read-only/borrowed caller storage).
+                r#use.zip(def)
+                    .map(|(r#use, def)| Param::Output(Consume { r#use, def }))
             })
             .collect();
 

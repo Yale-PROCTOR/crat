@@ -9708,7 +9708,6 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
 
 mod borrow_ownership_coherence {
     use rustc_hir::{ItemKind, OwnerNode};
-    use rustc_index::bit_set::MixedBitSet;
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
     use z3::SatResult;
@@ -9723,7 +9722,6 @@ mod borrow_ownership_coherence {
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
             },
-            output_params::OutputParams,
         },
         utils::rustc::RustProgram,
     };
@@ -9815,24 +9813,13 @@ pub unsafe fn alloc_free() {
 "#,
             |tcx| {
                 let program = collect_program(tcx);
-                let alloc_free = function_by_name(&program, "alloc_free");
-                let body = tcx
-                    .mir_drops_elaborated_and_const_checked(alloc_free)
-                    .borrow();
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
-
-                let (stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
-                .expect("B1 ownership emission should run");
+                let (stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("B1 ownership emission should run");
 
                 assert!(
                     stats.z3_ast_len > 1,
@@ -9911,15 +9898,8 @@ pub unsafe fn alloc_free() {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
-
-                let (_stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
                 .expect("B2 ownership emission should run");
 
                 let p_local = call_destination(tcx, &body, "malloc");
@@ -9960,15 +9940,8 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                output_params.insert(fill, MixedBitSet::new_empty(body.local_decls.len()));
-
-                let (_stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
                 .expect("B2 ownership emission should run");
                 add_coherence(&kind_solver, &slots, fill, &body);
 
@@ -10022,15 +9995,8 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                output_params.insert(leak, MixedBitSet::new_empty(body.local_decls.len()));
-
-                let (_stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
                 .expect("B3a ownership emission should run");
 
                 // Prove the relax path is genuinely exercised: exactly one source
@@ -10089,15 +10055,8 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                output_params.insert(two, MixedBitSet::new_empty(body.local_decls.len()));
-
-                let (_stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
                 .expect("B3a ownership emission should run");
 
                 // Two sources; assuming both is UNSAT (b conflicts with finalize).
@@ -10165,19 +10124,9 @@ pub unsafe fn forward() -> *mut core::ffi::c_void {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
 
-                let mut output_params = OutputParams::default();
-                for did in [make, forward] {
-                    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-                    output_params.insert(did, MixedBitSet::new_empty(body.local_decls.len()));
-                }
-
-                let (_stats, selectors) = emit_crate_ownership_constraints(
-                    &crate_ctxt,
-                    &output_params,
-                    &slots,
-                    &kind_solver,
-                )
-                .expect("B3b crate emission should run");
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("B3b crate emission should run");
 
                 // The only malloc is in `make`; a selector here proves `make`'s
                 // body was emitted by the crate driver (emitting `forward` alone
@@ -10203,6 +10152,45 @@ pub unsafe fn forward() -> *mut core::ffi::c_void {
                     model.get(&forward_ret),
                     Some(&SlotKind::Owning),
                     "ownership from `make` must flow across the call into `forward`'s return"
+                );
+            },
+        );
+    }
+
+    /// B4 (escape-half retirement): with `output_params` retired, a pointer param
+    /// the body only *reads* through must NOT be promoted to `Owning`. Escape is
+    /// decided natively now — nothing forces `p` owning, so the soft objective
+    /// (prefers Ref) settles its depth-0 slot to `Ref`. This is the anti-regression
+    /// guard for the uniform two-slot change: it is RED if the input owning seeds
+    /// are kept (they would hard-force `p` `Owning`), GREEN once they are dropped.
+    #[test]
+    fn read_only_input_arg_is_ref() {
+        run_compiler(
+            r#"
+pub unsafe fn reader(p: *mut i32) -> i32 {
+    *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let reader = function_by_name(&program, "reader");
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("B4 crate emission should run");
+
+                // `p` is param Local 1; read-only, so its depth-0 slot must be Ref.
+                let p = local_slot(&slots, reader, Local::from_u32(1), 0);
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
+                assert_eq!(
+                    model.get(&p),
+                    Some(&SlotKind::Ref),
+                    "a read-only input pointer param must stay Ref, not be promoted to Owning"
                 );
             },
         );
