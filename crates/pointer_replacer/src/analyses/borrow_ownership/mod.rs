@@ -147,20 +147,78 @@ pub(crate) struct BoOwnEmissionStats {
     pub source_sink_emissions: usize,
 }
 
-pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
+/// B3b: crate-level interprocedural emission. Builds the full `InterCtxt` (a
+/// signature for every crate function) into one shared `BoOwnDatabase`, then
+/// emits every function body's constraints into that shared `KindSolver`. The
+/// shared signature vars are the interprocedural linkage — z3 resolves
+/// cross-function (and recursive) ownership flow when the joint system is solved
+/// via `model_kinds_relaxing`. Stats and source selectors aggregate across all
+/// functions.
+pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     output_params: &OutputParams,
     slots: &CrateSlots,
     kind_solver: &KindSolver,
-    fn_did: LocalDefId,
 ) -> anyhow::Result<(BoOwnEmissionStats, Vec<Bool>)> {
-    if !crate_ctxt.fns().contains(&fn_did.to_def_id()) {
-        anyhow::bail!(
-            "function {} is not in borrow_ownership CrateCtxt",
-            crate_ctxt.tcx.def_path_str(fn_did.to_def_id())
+    // Full output-param coverage is a hard precondition: a missing entry would
+    // silently reclassify an output param as `Normal` and drop its write-back
+    // ownership flow. Production populates every function; fail loud instead.
+    for &did in crate_ctxt.fns() {
+        if !output_params.contains_key(&did.expect_local()) {
+            anyhow::bail!(
+                "output_params is missing an entry for {}",
+                crate_ctxt.tcx.def_path_str(did)
+            );
+        }
+    }
+
+    let mut var_gen = Gen::new();
+    let mut database = BoOwnDatabase::new(kind_solver.optimize());
+    let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
+
+    // The full InterCtxt must be built (all signature vars allocated) before any
+    // body is emitted, so a local call's `inter_ctxt[&callee]` resolves.
+    let inter_ctxt =
+        initial_crate_inter_ctxt(crate_ctxt, output_params, &mut var_gen, &mut database);
+
+    // Emission order is irrelevant: bodies share the InterCtxt signature vars, so
+    // z3 resolves cross-function (and recursive) flow when the joint system is
+    // solved. No SCC iteration is needed at fixed precision 1.
+    for &did in crate_ctxt.fns() {
+        emit_fn_body_into(
+            crate_ctxt,
+            slots,
+            kind_solver,
+            &mut database,
+            &mut var_gen,
+            &global_assumptions,
+            &inter_ctxt,
+            did.expect_local(),
         );
     }
 
+    let source_selectors = database.source_selectors().to_vec();
+    let stats = BoOwnEmissionStats {
+        z3_ast_len: database.z3_ast_len(),
+        source_sink_emissions: database.source_sink_emissions(),
+    };
+    Ok((stats, source_selectors))
+}
+
+/// Emit one function body's BO constraints into the shared `database`/`KindSolver`
+/// and solidify its per-version ownership onto slots. Shared by the single-fn
+/// (B1–B3a) and crate-level (B3b) drivers; `inter_ctxt` must already contain a
+/// signature for every callee this body can reach.
+fn emit_fn_body_into<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    slots: &CrateSlots,
+    kind_solver: &KindSolver,
+    database: &mut BoOwnDatabase<'_>,
+    var_gen: &mut Gen,
+    global_assumptions: &GlobalAssumptions,
+    inter_ctxt: &InterCtxt,
+    fn_did: LocalDefId,
+) {
     const B1_PRECISION: Precision = 1;
 
     let body_ref = crate_ctxt
@@ -168,11 +226,6 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
         .mir_drops_elaborated_and_const_checked(fn_did)
         .borrow();
     let body = &*body_ref;
-    let mut var_gen = Gen::new();
-    let mut database = BoOwnDatabase::new(kind_solver.optimize());
-    let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
-    let inter_ctxt =
-        initial_single_fn_inter_ctxt(crate_ctxt, output_params, body, &mut var_gen, &mut database);
     let ssa_state = initial_ssa_state(crate_ctxt, body);
 
     let summary = {
@@ -181,10 +234,10 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
             crate_ctxt,
             B1_PRECISION,
             body,
-            &mut database,
-            &mut var_gen,
-            &inter_ctxt,
-            &global_assumptions,
+            database,
+            var_gen,
+            inter_ctxt,
+            global_assumptions,
         );
 
         rn.go::<BoOwnershipProbe>(&mut infer_cx);
@@ -192,16 +245,7 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
     };
 
     // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
-    link_versions_to_slots(slots, fn_did, body, &summary, &database, kind_solver);
-
-    // B3a: the relax loop assumes these source selectors; dropping one leaks
-    // that allocation (classifies it non-Owning) to resolve an UNSAT.
-    let source_selectors = database.source_selectors().to_vec();
-    let stats = BoOwnEmissionStats {
-        z3_ast_len: database.z3_ast_len(),
-        source_sink_emissions: database.source_sink_emissions(),
-    };
-    Ok((stats, source_selectors))
+    link_versions_to_slots(slots, fn_did, body, &summary, database, kind_solver);
 }
 
 /// B2 solidification linking: tie each local pointer slot's `own` bit to the
@@ -258,62 +302,78 @@ fn link_versions_to_slots<'tcx>(
     }
 }
 
-fn initial_single_fn_inter_ctxt<'tcx>(
+/// B3b: build a signature (ret + args) for *every* crate function into the
+/// shared database, keyed by `DefId`. Mirrors production `initial_inter_ctxt`.
+/// Full `output_params` coverage is enforced by the caller
+/// (`emit_crate_ownership_constraints`), so the `.get()` here is always `Some`
+/// in practice; it stays a tolerant lookup only as a local defensive default.
+/// These signature vars are the interprocedural linkage consulted by
+/// `Boundary::{call,entry,exit}`.
+fn initial_crate_inter_ctxt<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     output_params: &OutputParams,
-    body: &Body<'tcx>,
     var_gen: &mut Gen,
     database: &mut impl Database,
 ) -> InterCtxt {
     const INIT_PRECISION: Precision = 1;
 
-    let mut local_decls = body.local_decls.iter_enumerated();
-    let (_, return_local_decl) = local_decls.next().unwrap();
-    let ret = initialize_local(
-        return_local_decl,
-        var_gen,
-        database,
-        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-    )
-    .map(Param::Normal);
+    let mut fn_sigs = FxHashMap::default();
+    fn_sigs.reserve(crate_ctxt.fns().len());
+    for &did in crate_ctxt.fns() {
+        let body_ref = crate_ctxt
+            .tcx
+            .mir_drops_elaborated_and_const_checked(did.expect_local())
+            .borrow();
+        let body = &*body_ref;
+        let output_params = output_params.get(&did.expect_local());
 
-    let output_params = output_params.get(&body.source.def_id().expect_local());
-    let args = local_decls
-        .take(body.arg_count)
-        .map(|(local, local_decl)| {
-            if output_params.is_some_and(|params| params.contains(local)) {
-                let r#use = initialize_local(
-                    local_decl,
-                    var_gen,
-                    database,
-                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                );
-                let def = initialize_local(
-                    local_decl,
-                    var_gen,
-                    database,
-                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                );
-                r#use.zip(def).map(|(r#use, def)| {
-                    database.push_assume::<Debug>((), r#use.start, true);
-                    database.push_assume::<Debug>((), def.start, true);
-                    Param::Output(Consume { r#use, def })
-                })
-            } else {
-                initialize_local(
-                    local_decl,
-                    var_gen,
-                    database,
-                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
-                )
-                .map(Param::Normal)
-            }
-        })
-        .collect();
+        let mut local_decls = body.local_decls.iter_enumerated();
+        let (_, return_local_decl) = local_decls.next().unwrap();
+        let ret = initialize_local(
+            return_local_decl,
+            var_gen,
+            database,
+            crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+        )
+        .map(Param::Normal);
 
-    let mut inter_ctxt = FxHashMap::default();
-    inter_ctxt.insert(body.source.def_id(), FnSig { ret, args });
-    inter_ctxt
+        let args = local_decls
+            .take(body.arg_count)
+            .map(|(local, local_decl)| {
+                if output_params.is_some_and(|params| params.contains(local)) {
+                    let r#use = initialize_local(
+                        local_decl,
+                        var_gen,
+                        database,
+                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                    );
+                    let def = initialize_local(
+                        local_decl,
+                        var_gen,
+                        database,
+                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                    );
+                    r#use.zip(def).map(|(r#use, def)| {
+                        database.push_assume::<Debug>((), r#use.start, true);
+                        database.push_assume::<Debug>((), def.start, true);
+                        Param::Output(Consume { r#use, def })
+                    })
+                } else {
+                    initialize_local(
+                        local_decl,
+                        var_gen,
+                        database,
+                        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                    )
+                    .map(Param::Normal)
+                }
+            })
+            .collect();
+
+        fn_sigs.insert(did, FnSig { ret, args });
+    }
+
+    fn_sigs
 }
 
 fn initial_ssa_state<'tcx>(crate_ctxt: &CrateCtxt<'tcx>, body: &Body<'tcx>) -> SSAState {
