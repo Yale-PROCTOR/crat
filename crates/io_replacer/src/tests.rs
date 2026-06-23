@@ -17,15 +17,10 @@ fn run_test_with_config(s: &str, config: super::Config, includes: &[&str], exclu
         .to_string();
     compilation::run_compiler_on_str(&res.code, utils::type_check).expect(&stripped);
     for s in includes {
-        assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
+        assert!(stripped.contains(s), "{stripped}\nmust contain {s}");
     }
     for s in excludes {
-        assert!(
-            !stripped.contains(s),
-            "{}\nmust not contain {}",
-            stripped,
-            s
-        );
+        assert!(!stripped.contains(s), "{stripped}\nmust not contain {s}");
     }
 }
 

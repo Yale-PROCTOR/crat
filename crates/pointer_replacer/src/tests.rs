@@ -12129,6 +12129,650 @@ pub unsafe extern "C" fn dispatch(mut argv: *mut *mut i8) -> i32 {
 }
 
 #[test]
+fn test_fn_pointer_lifetime_args_bare_alias_pointee_adt_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+pub type PayloadVisitor = unsafe extern "C" fn(*mut Payload) -> i32;
+
+pub unsafe extern "C" fn visit_payload(mut payload: *mut Payload) -> i32 {
+    *(*payload).value = 13;
+    return *(*payload).value;
+}
+
+pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 5;
+    let visitor: PayloadVisitor =
+        visit_payload as unsafe extern "C" fn(*mut Payload) -> i32;
+    return visitor(&raw mut payload);
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub value: Option<&'a mut i32>",
+            "type PayloadVisitor<'a> = unsafe extern \"C\" fn(&mut Payload<'a>) -> i32",
+        ],
+        &["fn(&mut Payload) -> i32"],
+    );
+}
+
+#[test]
+fn test_fn_pointer_lifetime_args_option_alias_pointee_adt_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+pub type MaybePayloadVisitor = Option<unsafe extern "C" fn(*mut Payload) -> i32>;
+
+pub unsafe extern "C" fn visit_payload(mut payload: *mut Payload) -> i32 {
+    *(*payload).value = 21;
+    return *(*payload).value;
+}
+
+pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 8;
+    let visitor: MaybePayloadVisitor =
+        Some(visit_payload as unsafe extern "C" fn(*mut Payload) -> i32);
+    return visitor.expect("payload visitor")(&raw mut payload);
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub value: Option<&'a mut i32>",
+            "type MaybePayloadVisitor<'a> =",
+            "Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+        ],
+        &["fn(&mut Payload) -> i32"],
+    );
+}
+
+#[test]
+fn test_fn_pointer_lifetime_args_struct_field_callback_pointee_adt_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct CallbackTable {
+    pub visit: Option<unsafe extern "C" fn(*mut Payload) -> i32>,
+}
+
+pub unsafe extern "C" fn visit_payload(mut payload: *mut Payload) -> i32 {
+    *(*payload).value = 34;
+    return *(*payload).value;
+}
+
+pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 11;
+    let table = CallbackTable {
+        visit: Some(visit_payload as unsafe extern "C" fn(*mut Payload) -> i32),
+    };
+    return table.visit.expect("payload visitor")(&raw mut payload);
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub value: Option<&'a mut i32>",
+            "pub struct CallbackTable<'a>",
+            "pub visit: Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+        ],
+        &["fn(&mut Payload) -> i32"],
+    );
+}
+
+#[test]
+fn test_fn_pointer_lifetime_args_nested_callback_table_chain_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+pub type PayloadVisitor = Option<unsafe extern "C" fn(*mut Payload) -> i32>;
+
+#[repr(C)]
+pub struct RemoteCallbacks {
+    pub visit: PayloadVisitor,
+}
+
+#[repr(C)]
+pub struct FetchOptions {
+    pub callbacks: RemoteCallbacks,
+}
+
+#[repr(C)]
+pub struct CloneOptions {
+    pub fetch: FetchOptions,
+    pub checkout: PayloadVisitor,
+}
+
+pub unsafe extern "C" fn visit_payload(mut payload: *mut Payload) -> i32 {
+    *(*payload).value += 1;
+    return *(*payload).value;
+}
+
+pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 55;
+    let options = CloneOptions {
+        fetch: FetchOptions {
+            callbacks: RemoteCallbacks {
+                visit: Some(visit_payload as unsafe extern "C" fn(*mut Payload) -> i32),
+            },
+        },
+        checkout: Some(visit_payload as unsafe extern "C" fn(*mut Payload) -> i32),
+    };
+    let first = options
+        .fetch
+        .callbacks
+        .visit
+        .expect("remote callback")(&raw mut payload);
+    return first + options.checkout.expect("checkout callback")(&raw mut payload);
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub value: Option<&'a mut i32>",
+            "type PayloadVisitor<'a> =",
+            "Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+            "pub struct RemoteCallbacks<'a>",
+            "pub visit: PayloadVisitor<'a>",
+            "pub struct FetchOptions<'a>",
+            "pub callbacks: RemoteCallbacks<'a>",
+            "pub struct CloneOptions<'a, 'b>",
+            "pub fetch: FetchOptions<'a>",
+            "pub checkout: PayloadVisitor<'b>",
+        ],
+        &[
+            "fn(&mut Payload) -> i32",
+            "pub visit: PayloadVisitor,",
+            "pub callbacks: RemoteCallbacks,",
+            "pub fetch: FetchOptions,",
+            "pub checkout: PayloadVisitor,",
+        ],
+    );
+}
+
+#[test]
+fn test_fn_signature_declares_nested_adt_lifetimes_raw_nested_parameter_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn raw_touch(slot: *mut *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+pub unsafe fn promote_payload(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 101;
+    return *payload.value;
+}
+
+pub unsafe fn raw_nested_slot(mut slot: *mut *mut Payload) {
+    raw_touch(slot as *mut *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub unsafe fn raw_nested_slot<'a>(mut slot:",
+            "Option<&mut *mut crate::Payload<'a>>",
+        ],
+        &["pub unsafe fn raw_nested_slot(mut slot:"],
+    );
+}
+
+#[test]
+fn test_fn_signature_declares_nested_adt_lifetimes_out_slice_parameter_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+pub unsafe fn promote_payload(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    *payload.value = 202;
+    return *payload.value;
+}
+
+pub unsafe fn clear_payload_slot(mut out: *mut *mut Payload) {
+    *out.offset(0) = core::ptr::null_mut();
+}
+"#,
+        &[
+            "pub struct Payload<'a>",
+            "pub unsafe fn clear_payload_slot<'a>(mut out:",
+            "&mut [*mut crate::Payload<'a>])",
+        ],
+        &["pub unsafe fn clear_payload_slot(mut out: &mut [*mut crate::Payload<'a>])"],
+    );
+}
+
+#[test]
+fn test_fn_signature_declares_nested_adt_lifetimes_multi_lifetime_out_slice_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub left: *mut i32,
+    pub right: *const i32,
+}
+
+pub unsafe fn promote_pair(mut left: i32, right: i32) -> i32 {
+    let mut pair = Pair {
+        left: &raw mut left,
+        right: &raw const right,
+    };
+    *pair.left = 303;
+    return *pair.left + *pair.right;
+}
+
+pub unsafe fn clear_pair_slot(mut out: *mut *mut Pair) {
+    *out.offset(0) = core::ptr::null_mut();
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "pub unsafe fn clear_pair_slot<'a,",
+            "'b>(mut out: &mut [*mut crate::Pair<'a, 'b>])",
+        ],
+        &["pub unsafe fn clear_pair_slot(mut out: &mut [*mut crate::Pair<'a, 'b>])"],
+    );
+}
+
+#[test]
+fn test_fn_signature_declares_nested_adt_lifetimes_multi_lifetime_raw_parameter_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn raw_touch(slot: *mut *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Pair {
+    pub left: *mut i32,
+    pub right: *const i32,
+}
+
+pub unsafe fn promote_pair(mut left: i32, right: i32) -> i32 {
+    let mut pair = Pair {
+        left: &raw mut left,
+        right: &raw const right,
+    };
+    *pair.left = 404;
+    return *pair.left + *pair.right;
+}
+
+pub unsafe fn raw_pair_slot(mut slot: *mut *mut Pair) {
+    raw_touch(slot as *mut *mut core::ffi::c_void);
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "pub unsafe fn raw_pair_slot<'a,",
+            "'b>(mut slot:",
+            "Option<&mut *mut crate::Pair<'a, 'b>>",
+        ],
+        &["pub unsafe fn raw_pair_slot(mut slot:"],
+    );
+}
+
+#[test]
+fn test_fn_signature_declares_nested_adt_lifetimes_merges_existing_input_lifetime_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub left: *mut i32,
+    pub right: *const i32,
+}
+
+pub unsafe fn promote_pair(mut left: i32, right: i32) -> i32 {
+    let mut pair = Pair {
+        left: &raw mut left,
+        right: &raw const right,
+    };
+    *pair.left = 505;
+    return *pair.left + *pair.right;
+}
+
+pub unsafe fn pair_slot_and_identity(
+    flag: bool,
+    value: *mut i32,
+    out: *mut *mut Pair,
+) -> *mut i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    if flag {
+        return value;
+    }
+    return core::ptr::null_mut();
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "pub unsafe fn pair_slot_and_identity<'a,",
+            "'b>(flag: bool",
+            "mut value: Option<&'a mut i32>",
+            "mut out: &mut [*mut crate::Pair<'a, 'b>]",
+            "-> Option<&'a mut i32>",
+        ],
+        &["pub unsafe fn pair_slot_and_identity<'a>("],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_option_raw_payload_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_second_inner(first: i32, second: i32) -> i32 {
+    let inners = [
+        Inner { value: &raw const first },
+        Inner { value: &raw const second },
+    ];
+    let mut p: *const Inner = inners.as_ptr();
+    return *(*p.offset(1)).value;
+}
+
+pub unsafe fn maybe_payload(flag: bool) -> Option<*mut Payload> {
+    if flag {
+        return Some(core::ptr::null_mut());
+    }
+    return None;
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Payload<'a>",
+            "pub inner: Inner<'a>",
+            "pub unsafe fn maybe_payload<'a>(flag: bool) -> Option<*mut Payload<'a>>",
+        ],
+        &["Option<*mut Payload<'_>>"],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_result_raw_payload_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_second_inner(first: i32, second: i32) -> i32 {
+    let inners = [
+        Inner { value: &raw const first },
+        Inner { value: &raw const second },
+    ];
+    let mut p: *const Inner = inners.as_ptr();
+    return *(*p.offset(1)).value;
+}
+
+pub unsafe fn payload_result(flag: bool) -> Result<*mut Payload, i32> {
+    if flag {
+        return Ok(core::ptr::null_mut());
+    }
+    return Err(-1);
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Payload<'a>",
+            "pub inner: Inner<'a>",
+            "pub unsafe fn payload_result<'a>(flag: bool)",
+            "-> Result<*mut Payload<'a>, i32>",
+        ],
+        &["Result<*mut Payload<'_>, i32>"],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_tuple_raw_payload_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_second_inner(first: i32, second: i32) -> i32 {
+    let inners = [
+        Inner { value: &raw const first },
+        Inner { value: &raw const second },
+    ];
+    let mut p: *const Inner = inners.as_ptr();
+    return *(*p.offset(1)).value;
+}
+
+pub unsafe fn payload_tuple() -> (*mut Payload, i32) {
+    return (core::ptr::null_mut(), 8);
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Payload<'a>",
+            "pub inner: Inner<'a>",
+            "pub unsafe fn payload_tuple<'a>() -> (*mut Payload<'a>, i32)",
+        ],
+        &["(*mut Payload<'_>, i32)"],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_direct_raw_payload_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_second_inner(first: i32, second: i32) -> i32 {
+    let inners = [
+        Inner { value: &raw const first },
+        Inner { value: &raw const second },
+    ];
+    let mut p: *const Inner = inners.as_ptr();
+    return *(*p.offset(1)).value;
+}
+
+pub unsafe fn raw_payload() -> *mut Payload {
+    return core::ptr::null_mut();
+}
+
+pub unsafe fn call_raw_payload() {
+    let factory: unsafe fn() -> *mut Payload = raw_payload;
+    let _ = factory();
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Payload<'a>",
+            "pub inner: Inner<'a>",
+            "pub unsafe fn raw_payload<'a>()",
+            "Payload<'a>",
+        ],
+        &["-> *mut Payload<'_>"],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_reuses_input_lifetime_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Payload {
+    pub inner: Inner,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_second_inner(first: i32, second: i32) -> i32 {
+    let inners = [
+        Inner { value: &raw const first },
+        Inner { value: &raw const second },
+    ];
+    let mut p: *const Inner = inners.as_ptr();
+    return *(*p.offset(1)).value;
+}
+
+pub unsafe fn maybe_payload_for_value<'a>(
+    _value: &'a i32,
+    flag: bool,
+) -> Option<*mut Payload> {
+    if flag {
+        return Some(core::ptr::null_mut());
+    }
+    return None;
+}
+"#,
+        &[
+            "pub struct Inner<'a>",
+            "pub struct Payload<'a>",
+            "pub inner: Inner<'a>",
+            "pub unsafe fn maybe_payload_for_value<'a>(",
+            "_value: &'a i32",
+            "-> Option<*mut Payload<'a>>",
+        ],
+        &["Option<*mut Payload<'_>>"],
+    );
+}
+
+#[test]
+fn test_fn_return_declares_nested_adt_lifetimes_option_multi_lifetime_payload_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Pair {
+    pub left: *const i32,
+    pub right: *const i32,
+}
+
+#[repr(C)]
+pub struct PairPayload {
+    pub pair: Pair,
+    pub tag: i32,
+}
+
+pub unsafe fn promote_pair(left: i32, right: i32) -> i32 {
+    let pair = Pair {
+        left: &raw const left,
+        right: &raw const right,
+    };
+    return *pair.left + *pair.right;
+}
+
+pub unsafe fn read_second_pair(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    let pairs = [
+        Pair {
+            left: &raw const a,
+            right: &raw const b,
+        },
+        Pair {
+            left: &raw const c,
+            right: &raw const d,
+        },
+    ];
+    let mut p: *const Pair = pairs.as_ptr();
+    return *(*p.offset(1)).left + *(*p.offset(1)).right;
+}
+
+pub unsafe fn maybe_pair_payload(flag: bool) -> Option<*mut PairPayload> {
+    if flag {
+        return Some(core::ptr::null_mut());
+    }
+    return None;
+}
+"#,
+        &[
+            "pub struct Pair<'a, 'b>",
+            "pub struct PairPayload<'a, 'b>",
+            "pub pair: Pair<'a, 'b>",
+            "pub unsafe fn maybe_pair_payload<'a, 'b>(flag: bool)",
+            "-> Option<*mut PairPayload<'a, 'b>>",
+        ],
+        &["Option<*mut PairPayload<'_"],
+    );
+}
+
+#[test]
 fn test_fn_pointer_contract_raw_c_exposed_param_slot_typechecks() {
     let mut config = Config::default();
     config.c_exposed_fns.insert("invoke".to_string());

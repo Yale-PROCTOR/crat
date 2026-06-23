@@ -200,7 +200,7 @@ impl FnPtrRewriteDecision {
         for (&rep, members) in &group_members {
             let input_len = tcx.fn_sig(rep).skip_binder().inputs().skip_binder().len();
             let mut group_decs = vec![None; input_len];
-            for idx in 0..input_len {
+            for (idx, group_dec) in group_decs.iter_mut().enumerate() {
                 let mut dec = self
                     .group_decisions
                     .get(&rep)
@@ -219,7 +219,7 @@ impl FnPtrRewriteDecision {
                         Some(raw_group_input_decision(tcx, fn_ptr_groups, rep, idx)),
                     );
                 }
-                group_decs[idx] = dec;
+                *group_dec = dec;
             }
             synced_group_decisions.insert(rep, group_decs);
         }

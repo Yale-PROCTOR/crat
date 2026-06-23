@@ -209,7 +209,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.fn_ptr_rewrite.field_decisions.get(&(struct_did, fi))
                         {
                             let decs = decs.clone();
-                            if rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
+                            if self.rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
                                 self.slice_cursor.set(true);
                             }
                         }
@@ -225,6 +225,34 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     .mir_drops_elaborated_and_const_checked(def_id)
                     .borrow();
                 let sig_dec = self.sig_decs.data.get(&def_id).unwrap();
+                let output_dec_before = sig_dec.output_dec;
+                let output_lifetime = sig_dec.output_lifetime;
+                let adjusted_output_dec = output_dec_before.map(|output_dec| {
+                    let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
+                    let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) else {
+                        return output_dec;
+                    };
+                    if output_dec.is_owning_box_like()
+                        && fn_tail_returns_unsupported_box_binding(
+                            self.tcx,
+                            &self.sig_decs,
+                            &self.ptr_kinds,
+                            def_id,
+                            output_dec,
+                            inner_ty,
+                        )
+                    {
+                        PtrKind::Raw(true)
+                    } else {
+                        output_dec
+                    }
+                });
+                let output_ty_will_be_replaced = adjusted_output_dec.is_some()
+                    && matches!(fn_item.sig.decl.output, FnRetTy::Ty(_))
+                    && unwrap_ptr_from_mir_ty(
+                        mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)].ty,
+                    )
+                    .is_some();
 
                 if !sig_dec.signature_locked {
                     let mut planned_lifetimes = Vec::new();
@@ -245,20 +273,48 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if input_dec.is_some()
                             && let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty)
                         {
-                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
+                            self.extend_signature_lifetimes_for_ty(
+                                &mut planned_lifetimes,
+                                inner_ty,
+                            );
                         }
                     }
-                    if sig_dec.output_dec.is_some() {
+                    if output_ty_will_be_replaced {
                         let return_decl =
                             &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
                         if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
-                            self.extend_lifetimes_for_ty(&mut planned_lifetimes, inner_ty);
+                            self.extend_signature_lifetimes_for_ty(
+                                &mut planned_lifetimes,
+                                inner_ty,
+                            );
                         }
+                    } else if let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output {
+                        self.extend_signature_lifetimes_for_ast_ty(&mut planned_lifetimes, ret_ty);
+                    }
+                    for param in &mut fn_item.sig.decl.inputs {
+                        self.extend_bare_fn_return_lifetimes_in_ty(
+                            &mut planned_lifetimes,
+                            &mut param.ty,
+                        );
+                    }
+                    if let Some(body) = &mut fn_item.body {
+                        self.extend_bare_fn_return_lifetimes_in_block(&mut planned_lifetimes, body);
                     }
                     super::lifetimes::ensure_lifetime_params(
                         &mut fn_item.generics,
                         &planned_lifetimes,
                     );
+                    if !output_ty_will_be_replaced
+                        && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
+                    {
+                        self.add_signature_lifetime_args_to_ast_ty(ret_ty);
+                    }
+                    for param in &mut fn_item.sig.decl.inputs {
+                        self.add_signature_lifetime_args_to_bare_fn_returns_in_ty(&mut param.ty);
+                    }
+                    if let Some(body) = &mut fn_item.body {
+                        self.add_signature_lifetime_args_to_bare_fn_returns_in_block(body);
+                    }
                 }
 
                 for (param_index, ((local_decl, input_dec), param)) in mir_body
@@ -379,7 +435,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                     self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
                             {
                                 let decs = decs.clone();
-                                if rewrite_bare_fn_inputs_in_ty(&mut param.ty, &decs) {
+                                if self.rewrite_bare_fn_inputs_in_ty(&mut param.ty, &decs) {
                                     self.slice_cursor.set(true);
                                 }
                             }
@@ -402,29 +458,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         binding_mode.1 = Mutability::Mut;
                     }
                 }
-
-                let output_dec_before = sig_dec.output_dec;
-                let output_lifetime = sig_dec.output_lifetime;
-                let adjusted_output_dec = output_dec_before.map(|output_dec| {
-                    let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
-                    let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) else {
-                        return output_dec;
-                    };
-                    if output_dec.is_owning_box_like()
-                        && fn_tail_returns_unsupported_box_binding(
-                            self.tcx,
-                            &self.sig_decs,
-                            &self.ptr_kinds,
-                            def_id,
-                            output_dec,
-                            inner_ty,
-                        )
-                    {
-                        PtrKind::Raw(true)
-                    } else {
-                        output_dec
-                    }
-                });
 
                 if let Some(output_dec) = adjusted_output_dec {
                     let return_decl = &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
@@ -488,7 +521,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .get(&(struct_def_id, fi))
                     {
                         let decs = decs.clone();
-                        if rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
+                        if self.rewrite_bare_fn_inputs_in_ty(&mut field.ty, &decs) {
                             self.slice_cursor.set(true);
                         }
                     }
@@ -505,7 +538,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&alias_hir_id) {
                     let decs = decs.clone();
                     if let Some(ty) = &mut ty_alias.ty
-                        && rewrite_bare_fn_inputs_in_ty(ty, &decs)
+                        && self.rewrite_bare_fn_inputs_in_ty(ty, &decs)
                     {
                         self.slice_cursor.set(true);
                     }
@@ -516,7 +549,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let static_hir_id = self.tcx.local_def_id_to_hir_id(static_def_id);
                 if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&static_hir_id) {
                     let decs = decs.clone();
-                    if rewrite_bare_fn_inputs_in_ty(&mut static_item.ty, &decs) {
+                    if self.rewrite_bare_fn_inputs_in_ty(&mut static_item.ty, &decs) {
                         self.slice_cursor.set(true);
                     }
                 }
@@ -526,7 +559,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let const_hir_id = self.tcx.local_def_id_to_hir_id(const_def_id);
                 if let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&const_hir_id) {
                     let decs = decs.clone();
-                    if rewrite_bare_fn_inputs_in_ty(&mut const_item.ty, &decs) {
+                    if self.rewrite_bare_fn_inputs_in_ty(&mut const_item.ty, &decs) {
                         self.slice_cursor.set(true);
                     }
                 }
@@ -755,7 +788,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             && let Some(decs) = self.fn_ptr_rewrite.annotation_decisions.get(&hir_id)
         {
             let decs = decs.clone();
-            if rewrite_bare_fn_inputs_in_ty(ty, &decs) {
+            if self.rewrite_bare_fn_inputs_in_ty(ty, &decs) {
                 self.slice_cursor.set(true);
             }
         }
@@ -1313,7 +1346,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && let Some(decs) = self.fn_ptr_group_decisions_for_fn(local_did)
                     {
                         let decs = decs.clone();
-                        if rewrite_bare_fn_inputs(bare_fn, &decs) {
+                        if self.rewrite_bare_fn_inputs(bare_fn, &decs) {
                             self.slice_cursor.set(true);
                         }
                     }
@@ -3075,6 +3108,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         pprust::ty_to_string(&ty)
     }
 
+    fn ast_ty_string_for_rewritten_bare_fn_input(&self, ty: &Ty) -> String {
+        let mut ty = ty.clone();
+        self.add_lifetime_args_to_rewritten_bare_fn_input_ty(&mut ty);
+        pprust::ty_to_string(&ty)
+    }
+
     fn add_promoted_lifetime_args_to_ast_ty(&self, ty: &mut Ty) {
         struct FieldPointeeTyVisitor<'a, 'analysis, 'tcx> {
             transform: &'a TransformVisitor<'analysis, 'tcx>,
@@ -3089,6 +3128,193 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         let mut visitor = FieldPointeeTyVisitor { transform: self };
         visitor.visit_ty(ty);
+    }
+
+    fn add_lifetime_args_to_rewritten_bare_fn_input_ty(&self, ty: &mut Ty) {
+        struct BareFnInputTyVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl MutVisitor for BareFnInputTyVisitor<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                mut_visit::walk_ty(self, ty);
+                if !self.transform.add_item_position_lifetime_args_to_ty(ty) {
+                    self.transform.add_anonymous_lifetime_args_to_ty(ty);
+                }
+            }
+        }
+
+        let mut visitor = BareFnInputTyVisitor { transform: self };
+        visitor.visit_ty(ty);
+    }
+
+    fn extend_signature_lifetimes_for_ast_ty(&self, lifetimes: &mut Vec<Symbol>, ty: &mut Ty) {
+        struct SignatureLifetimeCollector<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            lifetimes: &'a mut Vec<Symbol>,
+        }
+
+        impl MutVisitor for SignatureLifetimeCollector<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                mut_visit::walk_ty(self, ty);
+                if let Some((_, ty_lifetimes)) = self.transform.lifetime_item_lifetimes_for_ty(ty) {
+                    for lifetime in ty_lifetimes {
+                        if !self.lifetimes.contains(&lifetime) {
+                            self.lifetimes.push(lifetime);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut visitor = SignatureLifetimeCollector {
+            transform: self,
+            lifetimes,
+        };
+        visitor.visit_ty(ty);
+    }
+
+    fn extend_bare_fn_return_lifetimes_in_ty(&self, lifetimes: &mut Vec<Symbol>, ty: &mut Ty) {
+        struct BareFnReturnLifetimeCollector<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            lifetimes: &'a mut Vec<Symbol>,
+        }
+
+        impl MutVisitor for BareFnReturnLifetimeCollector<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                match &mut ty.kind {
+                    TyKind::BareFn(bare_fn) => {
+                        for param in &mut bare_fn.decl.inputs {
+                            self.visit_ty(&mut param.ty);
+                        }
+                        if let FnRetTy::Ty(ret_ty) = &mut bare_fn.decl.output {
+                            self.transform
+                                .extend_signature_lifetimes_for_ast_ty(self.lifetimes, ret_ty);
+                        }
+                    }
+                    _ => mut_visit::walk_ty(self, ty),
+                }
+            }
+        }
+
+        let mut visitor = BareFnReturnLifetimeCollector {
+            transform: self,
+            lifetimes,
+        };
+        visitor.visit_ty(ty);
+    }
+
+    fn extend_bare_fn_return_lifetimes_in_block(
+        &self,
+        lifetimes: &mut Vec<Symbol>,
+        block: &mut Block,
+    ) {
+        struct BareFnReturnBlockCollector<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+            lifetimes: &'a mut Vec<Symbol>,
+        }
+
+        impl MutVisitor for BareFnReturnBlockCollector<'_, '_, '_> {
+            fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+                smallvec![item]
+            }
+
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                self.transform
+                    .extend_bare_fn_return_lifetimes_in_ty(self.lifetimes, ty);
+            }
+        }
+
+        let mut visitor = BareFnReturnBlockCollector {
+            transform: self,
+            lifetimes,
+        };
+        visitor.visit_block(block);
+    }
+
+    fn add_named_lifetime_args_to_ty(&self, ty: &mut Ty) -> bool {
+        let Some((item_did, lifetimes)) = self.lifetime_item_lifetimes_for_ty(ty) else {
+            return false;
+        };
+        self.add_lifetime_args_to_ty_with_lifetimes_for_item(ty, item_did, &lifetimes);
+        true
+    }
+
+    fn add_signature_lifetime_args_to_ast_ty(&self, ty: &mut Ty) {
+        struct SignatureTyVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl MutVisitor for SignatureTyVisitor<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                mut_visit::walk_ty(self, ty);
+                self.transform.add_named_lifetime_args_to_ty(ty);
+            }
+        }
+
+        let mut visitor = SignatureTyVisitor { transform: self };
+        visitor.visit_ty(ty);
+    }
+
+    fn add_signature_lifetime_args_to_bare_fn_returns_in_ty(&self, ty: &mut Ty) {
+        struct BareFnReturnTyVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl MutVisitor for BareFnReturnTyVisitor<'_, '_, '_> {
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                match &mut ty.kind {
+                    TyKind::BareFn(bare_fn) => {
+                        for param in &mut bare_fn.decl.inputs {
+                            self.visit_ty(&mut param.ty);
+                        }
+                        if let FnRetTy::Ty(ret_ty) = &mut bare_fn.decl.output {
+                            self.transform.add_signature_lifetime_args_to_ast_ty(ret_ty);
+                        }
+                    }
+                    _ => mut_visit::walk_ty(self, ty),
+                }
+            }
+        }
+
+        let mut visitor = BareFnReturnTyVisitor { transform: self };
+        visitor.visit_ty(ty);
+    }
+
+    fn add_signature_lifetime_args_to_bare_fn_returns_in_block(&self, block: &mut Block) {
+        struct BareFnReturnBlockVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl MutVisitor for BareFnReturnBlockVisitor<'_, '_, '_> {
+            fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+                smallvec![item]
+            }
+
+            fn visit_ty(&mut self, ty: &mut Ty) {
+                self.transform
+                    .add_signature_lifetime_args_to_bare_fn_returns_in_ty(ty);
+            }
+        }
+
+        let mut visitor = BareFnReturnBlockVisitor { transform: self };
+        visitor.visit_block(block);
+    }
+
+    fn rewrite_bare_fn_inputs_in_ty(&self, ty: &mut Ty, decisions: &[Option<PtrKind>]) -> bool {
+        rewrite_bare_fn_inputs_in_ty(ty, decisions, &|inner_ty| {
+            self.ast_ty_string_for_rewritten_bare_fn_input(inner_ty)
+        })
+    }
+
+    fn rewrite_bare_fn_inputs(
+        &self,
+        bare_fn: &mut rustc_ast::BareFnTy,
+        decisions: &[Option<PtrKind>],
+    ) -> bool {
+        rewrite_bare_fn_inputs(bare_fn, decisions, &|inner_ty| {
+            self.ast_ty_string_for_rewritten_bare_fn_input(inner_ty)
+        })
     }
 
     fn add_lifetime_args_to_ty(&self, ty: &mut Ty) {
@@ -3354,6 +3580,34 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !lifetimes.contains(&lifetime) {
                 lifetimes.push(lifetime);
             }
+        }
+    }
+
+    fn extend_signature_lifetimes_for_ty(&self, lifetimes: &mut Vec<Symbol>, ty: ty::Ty<'tcx>) {
+        self.extend_lifetimes_for_ty(lifetimes, ty);
+        match ty.kind() {
+            ty::TyKind::Adt(_, args) => {
+                for arg in args.iter() {
+                    if let ty::GenericArgKind::Type(ty) = arg.kind() {
+                        self.extend_signature_lifetimes_for_ty(lifetimes, ty);
+                    }
+                }
+            }
+            ty::TyKind::RawPtr(pointee, _) => {
+                self.extend_signature_lifetimes_for_ty(lifetimes, *pointee);
+            }
+            ty::TyKind::Ref(_, inner, _) => {
+                self.extend_signature_lifetimes_for_ty(lifetimes, *inner);
+            }
+            ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
+                self.extend_signature_lifetimes_for_ty(lifetimes, *elem);
+            }
+            ty::TyKind::Tuple(elems) => {
+                for elem in elems.iter() {
+                    self.extend_signature_lifetimes_for_ty(lifetimes, elem);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9139,9 +9393,13 @@ fn mk_cursor_ast_ty_with_lifetime(inner_ty: String, mutability: bool, lifetime: 
     utils::ty!("crate::slice_cursor::{cursor}<'{lifetime}, {inner_ty}>")
 }
 
-fn rewrite_bare_fn_inputs_in_ty(ty: &mut Ty, decisions: &[Option<PtrKind>]) -> bool {
+fn rewrite_bare_fn_inputs_in_ty(
+    ty: &mut Ty,
+    decisions: &[Option<PtrKind>],
+    inner_ty_to_string: &impl std::ops::Fn(&Ty) -> String,
+) -> bool {
     match &mut ty.kind {
-        TyKind::BareFn(bare_fn) => rewrite_bare_fn_inputs(bare_fn, decisions),
+        TyKind::BareFn(bare_fn) => rewrite_bare_fn_inputs(bare_fn, decisions, inner_ty_to_string),
         TyKind::Path(_, path) => {
             let mut changed = false;
             for seg in &mut path.segments {
@@ -9153,7 +9411,8 @@ fn rewrite_bare_fn_inputs_in_ty(ty: &mut Ty, decisions: &[Option<PtrKind>]) -> b
                 };
                 for arg in &mut angle_args.args {
                     if let AngleBracketedArg::Arg(GenericArg::Type(inner_ty)) = arg {
-                        changed |= rewrite_bare_fn_inputs_in_ty(inner_ty, decisions);
+                        changed |=
+                            rewrite_bare_fn_inputs_in_ty(inner_ty, decisions, inner_ty_to_string);
                     }
                 }
             }
@@ -9161,12 +9420,12 @@ fn rewrite_bare_fn_inputs_in_ty(ty: &mut Ty, decisions: &[Option<PtrKind>]) -> b
         }
         TyKind::Tup(tys) => tys
             .iter_mut()
-            .any(|ty| rewrite_bare_fn_inputs_in_ty(ty, decisions)),
+            .any(|ty| rewrite_bare_fn_inputs_in_ty(ty, decisions, inner_ty_to_string)),
         TyKind::Slice(inner) | TyKind::Array(inner, _) | TyKind::Paren(inner) => {
-            rewrite_bare_fn_inputs_in_ty(inner, decisions)
+            rewrite_bare_fn_inputs_in_ty(inner, decisions, inner_ty_to_string)
         }
         TyKind::Ptr(mut_ty) | TyKind::Ref(_, mut_ty) => {
-            rewrite_bare_fn_inputs_in_ty(&mut mut_ty.ty, decisions)
+            rewrite_bare_fn_inputs_in_ty(&mut mut_ty.ty, decisions, inner_ty_to_string)
         }
         _ => false,
     }
@@ -9198,12 +9457,13 @@ fn find_bare_fn_in_ty_mut(ty: &mut Ty) -> Option<&mut rustc_ast::BareFnTy> {
 fn rewrite_bare_fn_inputs(
     bare_fn: &mut rustc_ast::BareFnTy,
     decisions: &[Option<PtrKind>],
+    inner_ty_to_string: &impl std::ops::Fn(&Ty) -> String,
 ) -> bool {
     let mut used_slice_cursor = false;
     for (param, decision) in bare_fn.decl.inputs.iter_mut().zip(decisions) {
         let Some(kind) = decision else { continue };
         let TyKind::Ptr(MutTy { ty: inner_ty, .. }) = &param.ty.kind else { continue };
-        let inner_str = pprust::ty_to_string(inner_ty);
+        let inner_str = inner_ty_to_string(inner_ty);
         let new_ty = match kind {
             PtrKind::Ref(m) => {
                 let m = if *m { "mut " } else { "" };
@@ -20133,16 +20393,18 @@ pub unsafe fn read(x: i32) -> i32 {
         "other_initial_raw"
     }
 
-    fn simulate_transform_reasons<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        input: &RustProgram<'tcx>,
-        analysis: &super::super::Analysis,
-    ) -> (
+    type SimulatedTransformReasons = (
         SigDecisions,
         FxHashMap<HirId, PtrKind>,
         FxHashMap<HirId, Vec<&'static str>>,
         FxHashMap<HirId, Vec<&'static str>>,
-    ) {
+    );
+
+    fn simulate_transform_reasons<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        input: &RustProgram<'tcx>,
+        analysis: &super::super::Analysis,
+    ) -> SimulatedTransformReasons {
         let lifetime_plans = super::super::lifetimes::LifetimePlans::new(input, analysis);
         let fn_ptr_groups = FnPtrGroups::default();
         let mut sig_decs = SigDecisions::new(input, analysis, &lifetime_plans, &fn_ptr_groups);
