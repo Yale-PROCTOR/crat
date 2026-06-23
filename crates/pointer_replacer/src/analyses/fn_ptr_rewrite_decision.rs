@@ -39,6 +39,8 @@ pub struct FnPtrRewriteDecision {
     pub annotation_decisions: FxHashMap<HirId, Vec<Option<PtrKind>>>,
     /// Struct-field fn-ptr decisions for direct_rewrite functions only.
     pub field_decisions: FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+    /// Function return-value fn-ptr decisions established from annotated return types.
+    pub return_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
 }
 
 impl FnPtrRewriteDecision {
@@ -62,6 +64,7 @@ impl FnPtrRewriteDecision {
                 individual_decisions: FxHashMap::default(),
                 annotation_decisions: FxHashMap::default(),
                 field_decisions: FxHashMap::default(),
+                return_decisions: FxHashMap::default(),
             };
         }
 
@@ -169,6 +172,7 @@ impl FnPtrRewriteDecision {
             individual_decisions,
             annotation_decisions: FxHashMap::default(),
             field_decisions: FxHashMap::default(),
+            return_decisions: FxHashMap::default(),
         };
         decision.force_raw_boundary_contracts(rust_program, fn_ptr_groups, c_exposed_fns);
         decision.rebuild_site_decisions(
@@ -309,6 +313,12 @@ impl FnPtrRewriteDecision {
         for (field, decs) in collect_c_exposed_fn_ptr_fields(rust_program, c_exposed_fns) {
             field_dec_candidates.entry(field).or_default().push(decs);
         }
+        for (field, decs) in collect_foreign_abi_fn_ptr_fields(rust_program) {
+            field_dec_candidates.entry(field).or_default().push(decs);
+        }
+        for (field, decs) in collect_boundary_fn_ptr_arg_fields(rust_program, c_exposed_fns) {
+            field_dec_candidates.entry(field).or_default().push(decs);
+        }
 
         for &fn_did in rust_program.functions.iter() {
             let body = &*rust_program
@@ -353,7 +363,7 @@ impl FnPtrRewriteDecision {
         impl<'tcx> Visitor<'tcx> for FieldInitVisitor<'_, 'tcx> {
             fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
                 if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
-                    && let Some(struct_did) = hir_local_struct_did_from_qpath(qpath)
+                    && let Some(struct_did) = hir_local_struct_did_from_qpath(self.tcx, qpath)
                 {
                     for field in fields {
                         let Some(field_idx) =
@@ -402,6 +412,7 @@ impl FnPtrRewriteDecision {
             for candidate in &candidates[1..] {
                 merge_decisions_conservatively(&mut joint, candidate);
             }
+            complete_field_storage_contract(tcx, struct_did, fi, &mut joint);
             field_decisions.insert((struct_did, fi), joint);
         }
 
@@ -424,6 +435,7 @@ impl FnPtrRewriteDecision {
             fn_ptr_groups: &'a FnPtrGroups,
             group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+            return_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             annotation_decisions: &'a mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
         }
 
@@ -431,15 +443,13 @@ impl FnPtrRewriteDecision {
             fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) -> Self::Result {
                 if let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind {
                     let init_decs = let_stmt.init.and_then(|init| {
-                        field_fn_ptr_decisions_for_expr(self.tcx, init, self.field_decisions)
-                            .or_else(|| {
-                                fn_ptr_decisions_for_expr(
-                                    self.tcx,
-                                    init,
-                                    self.fn_ptr_groups,
-                                    self.group_decisions,
-                                )
-                            })
+                        produced_fn_ptr_decisions_for_expr(
+                            self.tcx,
+                            init,
+                            Some((self.fn_ptr_groups, self.group_decisions)),
+                            Some(self.field_decisions),
+                            Some(self.return_decisions),
+                        )
                     });
                     if let Some(decs) = init_decs {
                         insert_annotation_decision(
@@ -461,25 +471,12 @@ impl FnPtrRewriteDecision {
             }
         }
 
-        {
-            let mut visitor = BindingInitVisitor {
-                tcx,
-                fn_ptr_groups,
-                group_decisions: &self.group_decisions,
-                field_decisions: &field_decisions,
-                annotation_decisions: &mut annotation_decisions,
-            };
-            for def_id in tcx.hir_body_owners() {
-                let body = tcx.hir_body_owned_by(def_id);
-                visitor.visit_body(body);
-            }
-        }
-
         struct CallParamVisitor<'a, 'tcx> {
             tcx: ty::TyCtxt<'tcx>,
             fn_ptr_groups: &'a FnPtrGroups,
             group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+            return_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
             annotation_decisions: &'a mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
         }
 
@@ -499,16 +496,13 @@ impl FnPtrRewriteDecision {
                         {
                             continue;
                         }
-                        let arg_decs =
-                            field_fn_ptr_decisions_for_expr(self.tcx, arg, self.field_decisions)
-                                .or_else(|| {
-                                    fn_ptr_decisions_for_expr(
-                                        self.tcx,
-                                        arg,
-                                        self.fn_ptr_groups,
-                                        self.group_decisions,
-                                    )
-                                });
+                        let arg_decs = produced_fn_ptr_decisions_for_expr(
+                            self.tcx,
+                            arg,
+                            Some((self.fn_ptr_groups, self.group_decisions)),
+                            Some(self.field_decisions),
+                            Some(self.return_decisions),
+                        );
                         let Some(decs) = arg_decs else { continue };
                         insert_annotation_decision(self.annotation_decisions, param_hir_id, &decs);
                         insert_alias_decisions_for_ty(
@@ -523,83 +517,361 @@ impl FnPtrRewriteDecision {
             }
         }
 
-        {
-            let mut visitor = CallParamVisitor {
+        let mut return_decisions = FxHashMap::default();
+        loop {
+            let before_annotation_decisions = annotation_decisions.clone();
+            let before_return_decisions = return_decisions.clone();
+
+            propagate_return_alias_decisions(
                 tcx,
                 fn_ptr_groups,
-                group_decisions: &self.group_decisions,
-                field_decisions: &field_decisions,
-                annotation_decisions: &mut annotation_decisions,
-            };
-            for def_id in tcx.hir_body_owners() {
-                let body = tcx.hir_body_owned_by(def_id);
-                visitor.visit_body(body);
+                &self.group_decisions,
+                &field_decisions,
+                &return_decisions,
+                &mut annotation_decisions,
+            );
+            propagate_alias_decisions(tcx, &mut annotation_decisions);
+            seed_explicit_hir_ty_contracts(tcx, &mut annotation_decisions);
+            seed_field_decisions_from_established_tys(
+                tcx,
+                rust_program,
+                &annotation_decisions,
+                &mut field_decisions,
+            );
+            return_decisions = collect_return_decisions(tcx, &annotation_decisions);
+
+            {
+                let mut visitor = BindingInitVisitor {
+                    tcx,
+                    fn_ptr_groups,
+                    group_decisions: &self.group_decisions,
+                    field_decisions: &field_decisions,
+                    return_decisions: &return_decisions,
+                    annotation_decisions: &mut annotation_decisions,
+                };
+                for def_id in tcx.hir_body_owners() {
+                    let body = tcx.hir_body_owned_by(def_id);
+                    visitor.visit_body(body);
+                }
+            }
+
+            {
+                let mut visitor = CallParamVisitor {
+                    tcx,
+                    fn_ptr_groups,
+                    group_decisions: &self.group_decisions,
+                    field_decisions: &field_decisions,
+                    return_decisions: &return_decisions,
+                    annotation_decisions: &mut annotation_decisions,
+                };
+                for def_id in tcx.hir_body_owners() {
+                    let body = tcx.hir_body_owned_by(def_id);
+                    visitor.visit_body(body);
+                }
+            }
+
+            // 3d: local/param bindings
+            for &fn_did in rust_program.functions.iter() {
+                let hir_to_mir = utils::ir::map_thir_to_mir(fn_did, false, rust_program.tcx);
+                for (hir_id, local) in &hir_to_mir.binding_to_local {
+                    let var = Var::Local(fn_did, *local);
+                    if let Some(&loc) = pre.vars.get(&var)
+                        && let Some(decs) = loc_decisions.get(&loc)
+                    {
+                        insert_annotation_decision(&mut annotation_decisions, *hir_id, decs);
+                    }
+                }
+            }
+
+            // 3e: static item annotation decisions
+            for (&static_did, &base_loc) in &pre.globals {
+                if pre.inv_fns.contains_key(&base_loc) {
+                    continue;
+                }
+                let ty = rust_program.tcx.type_of(static_did).skip_binder();
+                if !ty_contains_fn_ptr(ty) {
+                    continue;
+                }
+                let Some(decs) = loc_decisions.get(&base_loc) else {
+                    continue;
+                };
+                let hir_id = rust_program.tcx.local_def_id_to_hir_id(static_did);
+                insert_annotation_decision(&mut annotation_decisions, hir_id, decs);
+            }
+
+            // 3f: static/const item annotations whose initializer contains the function item.
+            for item_id in tcx.hir_free_items() {
+                let item = tcx.hir_item(item_id);
+                let (ty, body_id) = match item.kind {
+                    hir::ItemKind::Static(_, _, ty, body_id)
+                    | hir::ItemKind::Const(_, _, ty, body_id) => (ty, body_id),
+                    _ => continue,
+                };
+                if !hir_ty_contains_fn_ptr(ty)
+                    && hir_ty_alias_def_id(ty).is_none()
+                    && !ty_contains_fn_ptr(tcx.type_of(item.owner_id.def_id).skip_binder())
+                {
+                    continue;
+                }
+                let body = tcx.hir_body(body_id);
+                let Some(decs) = produced_fn_ptr_decisions_for_expr(
+                    tcx,
+                    body.value,
+                    Some((fn_ptr_groups, &self.group_decisions)),
+                    Some(&field_decisions),
+                    Some(&return_decisions),
+                ) else {
+                    continue;
+                };
+                insert_annotation_decision(&mut annotation_decisions, item.hir_id(), &decs);
+                insert_alias_decisions_for_ty(tcx, &mut annotation_decisions, ty, &decs);
+            }
+
+            if annotation_decisions == before_annotation_decisions
+                && return_decisions == before_return_decisions
+            {
+                break;
             }
         }
 
-        // 3d: local/param bindings
-        for &fn_did in rust_program.functions.iter() {
-            let hir_to_mir = utils::ir::map_thir_to_mir(fn_did, false, rust_program.tcx);
-            for (hir_id, local) in &hir_to_mir.binding_to_local {
-                let var = Var::Local(fn_did, *local);
-                if let Some(&loc) = pre.vars.get(&var)
-                    && let Some(decs) = loc_decisions.get(&loc)
+        self.annotation_decisions = annotation_decisions;
+        self.field_decisions = field_decisions;
+        self.return_decisions = return_decisions;
+    }
+
+    pub fn push_field_storage_contracts_to_groups<'tcx>(
+        &mut self,
+        rust_program: &RustProgram<'tcx>,
+        fn_ptr_groups: &FnPtrGroups,
+    ) -> bool {
+        struct FieldStorageVisitor<'a, 'tcx> {
+            tcx: ty::TyCtxt<'tcx>,
+            fn_ptr_groups: &'a FnPtrGroups,
+            field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+            sources: &'a BodyFnPtrSources,
+            stored_contracts: Vec<(FxHashSet<LocalDefId>, Vec<Option<PtrKind>>)>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for FieldStorageVisitor<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                    && let Some(struct_did) = hir_local_struct_did_from_qpath(self.tcx, qpath)
                 {
-                    insert_annotation_decision(&mut annotation_decisions, *hir_id, decs);
+                    for field in fields {
+                        let Some(field_idx) =
+                            hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                        else {
+                            continue;
+                        };
+                        let Some(decs) = self.field_decisions.get(&(struct_did, field_idx)) else {
+                            continue;
+                        };
+                        let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                            self.tcx,
+                            field.expr,
+                            self.fn_ptr_groups,
+                            self.sources,
+                        );
+                        if !local_fns.is_empty() {
+                            self.stored_contracts.push((local_fns, decs.clone()));
+                        }
+                    }
+                }
+
+                if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let Some(field) = field_decision_key_for_expr(self.tcx, lhs)
+                    && let Some(decs) = self.field_decisions.get(&field)
+                {
+                    let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                        self.tcx,
+                        rhs,
+                        self.fn_ptr_groups,
+                        self.sources,
+                    );
+                    if !local_fns.is_empty() {
+                        self.stored_contracts.push((local_fns, decs.clone()));
+                    }
+                }
+
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let tcx = rust_program.tcx;
+        let mut stored_contracts = Vec::new();
+        for def_id in tcx.hir_body_owners() {
+            let body = tcx.hir_body_owned_by(def_id);
+            let sources =
+                collect_body_fn_ptr_sources(tcx, body, fn_ptr_groups, &self.field_decisions);
+            let mut visitor = FieldStorageVisitor {
+                tcx,
+                fn_ptr_groups,
+                field_decisions: &self.field_decisions,
+                sources: &sources,
+                stored_contracts: Vec::new(),
+            };
+            visitor.visit_body(body);
+            stored_contracts.extend(visitor.stored_contracts);
+        }
+
+        let mut changed = false;
+        for (local_fns, field_decs) in stored_contracts {
+            for did in local_fns {
+                let Some(&rep) = fn_ptr_groups.fn_to_group.get(&did) else { continue };
+                let input_len = tcx.fn_sig(rep).skip_binder().inputs().skip_binder().len();
+                let group_decs = self
+                    .group_decisions
+                    .entry(rep)
+                    .or_insert_with(|| vec![None; input_len]);
+                for (idx, &field_dec) in field_decs.iter().enumerate() {
+                    let Some(group_dec) = group_decs.get_mut(idx) else {
+                        continue;
+                    };
+                    let old_dec = *group_dec;
+                    merge_contract_decision(
+                        group_dec,
+                        field_dec,
+                        Some(raw_group_input_decision(tcx, fn_ptr_groups, rep, idx)),
+                    );
+                    if *group_dec != old_dec {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn push_callback_param_contracts_to_groups<'tcx>(
+        &mut self,
+        rust_program: &RustProgram<'tcx>,
+        fn_ptr_groups: &FnPtrGroups,
+    ) -> bool {
+        struct CallArgContractVisitor<'a, 'tcx> {
+            tcx: ty::TyCtxt<'tcx>,
+            fn_ptr_groups: &'a FnPtrGroups,
+            annotation_decisions: &'a FxHashMap<HirId, Vec<Option<PtrKind>>>,
+            sources: &'a BodyFnPtrSources,
+            arg_contracts: Vec<(FxHashSet<LocalDefId>, Vec<Option<PtrKind>>)>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for CallArgContractVisitor<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let hir::ExprKind::Call(callee, args) = expr.kind
+                    && let Some(callee_did) = hir_callee_local_def_id(callee)
+                {
+                    for (idx, arg) in args.iter().enumerate() {
+                        let Some((param_hir_id, _)) = local_fn_param_hir(self.tcx, callee_did, idx)
+                        else {
+                            continue;
+                        };
+                        let Some(decs) = self.annotation_decisions.get(&param_hir_id) else {
+                            continue;
+                        };
+                        let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                            self.tcx,
+                            arg,
+                            self.fn_ptr_groups,
+                            self.sources,
+                        );
+                        if !local_fns.is_empty() {
+                            self.arg_contracts.push((local_fns, decs.clone()));
+                        }
+                    }
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let tcx = rust_program.tcx;
+        let mut arg_contracts = Vec::new();
+        for def_id in tcx.hir_body_owners() {
+            let body = tcx.hir_body_owned_by(def_id);
+            let sources =
+                collect_body_fn_ptr_sources(tcx, body, fn_ptr_groups, &self.field_decisions);
+            let mut visitor = CallArgContractVisitor {
+                tcx,
+                fn_ptr_groups,
+                annotation_decisions: &self.annotation_decisions,
+                sources: &sources,
+                arg_contracts: Vec::new(),
+            };
+            visitor.visit_body(body);
+            arg_contracts.extend(visitor.arg_contracts);
+        }
+
+        merge_source_contracts_to_groups(
+            tcx,
+            fn_ptr_groups,
+            &mut self.group_decisions,
+            arg_contracts,
+        )
+    }
+
+    pub fn push_callback_return_contracts_to_groups<'tcx>(
+        &mut self,
+        rust_program: &RustProgram<'tcx>,
+        fn_ptr_groups: &FnPtrGroups,
+    ) -> bool {
+        struct ReturnContractVisitor<'a, 'tcx> {
+            tcx: ty::TyCtxt<'tcx>,
+            fn_ptr_groups: &'a FnPtrGroups,
+            sources: &'a BodyFnPtrSources,
+            return_decs: &'a Vec<Option<PtrKind>>,
+            return_contracts: Vec<(FxHashSet<LocalDefId>, Vec<Option<PtrKind>>)>,
+        }
+
+        impl<'tcx> ReturnContractVisitor<'_, 'tcx> {
+            fn collect_from_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+                let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                    self.tcx,
+                    expr,
+                    self.fn_ptr_groups,
+                    self.sources,
+                );
+                if !local_fns.is_empty() {
+                    self.return_contracts
+                        .push((local_fns, self.return_decs.clone()));
                 }
             }
         }
 
-        // 3e: static item annotation decisions
-        for (&static_did, &base_loc) in &pre.globals {
-            if pre.inv_fns.contains_key(&base_loc) {
-                continue;
+        impl<'tcx> Visitor<'tcx> for ReturnContractVisitor<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                if let hir::ExprKind::Ret(Some(value)) = expr.kind {
+                    self.collect_from_expr(value);
+                }
+                intravisit::walk_expr(self, expr);
             }
-            let ty = rust_program.tcx.type_of(static_did).skip_binder();
-            if !ty_contains_fn_ptr(ty) {
-                continue;
-            }
-            let Some(decs) = loc_decisions.get(&base_loc) else {
-                continue;
-            };
-            let hir_id = rust_program.tcx.local_def_id_to_hir_id(static_did);
-            insert_annotation_decision(&mut annotation_decisions, hir_id, decs);
         }
 
-        // 3f: static/const item annotations whose initializer contains the function item.
-        for item_id in tcx.hir_free_items() {
-            let item = tcx.hir_item(item_id);
-            let (ty, body_id) = match item.kind {
-                hir::ItemKind::Static(_, _, ty, body_id)
-                | hir::ItemKind::Const(_, _, ty, body_id) => (ty, body_id),
-                _ => continue,
-            };
-            if !hir_ty_contains_fn_ptr(ty)
-                && hir_ty_alias_def_id(ty).is_none()
-                && !ty_contains_fn_ptr(tcx.type_of(item.owner_id.def_id).skip_binder())
-            {
-                continue;
-            }
-            let body = tcx.hir_body(body_id);
-            let Some(decs) =
-                fn_ptr_decisions_for_expr(tcx, body.value, fn_ptr_groups, &self.group_decisions)
-            else {
+        let tcx = rust_program.tcx;
+        let mut return_contracts = Vec::new();
+        for def_id in tcx.hir_body_owners() {
+            let Some(return_decs) = self.return_decisions.get(&def_id) else {
                 continue;
             };
-            insert_annotation_decision(&mut annotation_decisions, item.hir_id(), &decs);
-            insert_alias_decisions_for_ty(tcx, &mut annotation_decisions, ty, &decs);
+            let body = tcx.hir_body_owned_by(def_id);
+            let sources =
+                collect_body_fn_ptr_sources(tcx, body, fn_ptr_groups, &self.field_decisions);
+            let mut visitor = ReturnContractVisitor {
+                tcx,
+                fn_ptr_groups,
+                sources: &sources,
+                return_decs,
+                return_contracts: Vec::new(),
+            };
+            visitor.visit_body(body);
+            visitor.collect_from_expr(body.value);
+            return_contracts.extend(visitor.return_contracts);
         }
 
-        propagate_return_alias_decisions(
+        merge_source_contracts_to_groups(
             tcx,
             fn_ptr_groups,
-            &self.group_decisions,
-            &mut annotation_decisions,
-        );
-        propagate_alias_decisions(tcx, &mut annotation_decisions);
-
-        self.annotation_decisions = annotation_decisions;
-        self.field_decisions = field_decisions;
+            &mut self.group_decisions,
+            return_contracts,
+        )
     }
 
     fn force_raw_boundary_contracts<'tcx>(
@@ -615,6 +887,7 @@ impl FnPtrRewriteDecision {
             c_exposed_fns,
             &mut self.group_decisions,
         );
+        force_foreign_abi_contracts_raw(rust_program, fn_ptr_groups, &mut self.group_decisions);
     }
 }
 
@@ -663,6 +936,39 @@ fn merge_contract_decision(
         (Some(_), Some(raw @ PtrKind::Raw(_))) => *existing = Some(raw),
         (Some(_), Some(_)) => *existing = raw_fallback,
     }
+}
+
+fn merge_source_contracts_to_groups(
+    tcx: ty::TyCtxt<'_>,
+    fn_ptr_groups: &FnPtrGroups,
+    group_decisions: &mut FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+    source_contracts: Vec<(FxHashSet<LocalDefId>, Vec<Option<PtrKind>>)>,
+) -> bool {
+    let mut changed = false;
+    for (local_fns, contract_decs) in source_contracts {
+        for did in local_fns {
+            let Some(&rep) = fn_ptr_groups.fn_to_group.get(&did) else { continue };
+            let input_len = tcx.fn_sig(rep).skip_binder().inputs().skip_binder().len();
+            let group_decs = group_decisions
+                .entry(rep)
+                .or_insert_with(|| vec![None; input_len]);
+            for (idx, &contract_dec) in contract_decs.iter().enumerate() {
+                let Some(group_dec) = group_decs.get_mut(idx) else {
+                    continue;
+                };
+                let old_dec = *group_dec;
+                merge_contract_decision(
+                    group_dec,
+                    contract_dec,
+                    Some(raw_group_input_decision(tcx, fn_ptr_groups, rep, idx)),
+                );
+                if *group_dec != old_dec {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 fn raw_input_decision(tcx: ty::TyCtxt<'_>, did: LocalDefId, idx: usize) -> Option<PtrKind> {
@@ -748,6 +1054,35 @@ fn fn_ptr_input_decisions_from_ty<'tcx>(
     }
 }
 
+fn declared_field_fn_ptr_contract(
+    tcx: ty::TyCtxt<'_>,
+    struct_did: LocalDefId,
+    field_idx: FieldIdx,
+) -> Option<Vec<Option<PtrKind>>> {
+    let struct_ty = tcx.type_of(struct_did).skip_binder();
+    let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+        return None;
+    };
+    let field_ty = adt_def.all_fields().nth(field_idx.index())?.ty(tcx, args);
+    fn_ptr_input_decisions_from_ty(tcx, field_ty)
+}
+
+fn complete_field_storage_contract(
+    tcx: ty::TyCtxt<'_>,
+    struct_did: LocalDefId,
+    field_idx: FieldIdx,
+    decs: &mut [Option<PtrKind>],
+) {
+    let Some(declared_decs) = declared_field_fn_ptr_contract(tcx, struct_did, field_idx) else {
+        return;
+    };
+    for (slot, declared) in decs.iter_mut().zip(declared_decs) {
+        if slot.is_none() {
+            *slot = declared;
+        }
+    }
+}
+
 fn merge_decision_vec(existing: &mut Option<Vec<Option<PtrKind>>>, incoming: &[Option<PtrKind>]) {
     if let Some(existing) = existing {
         merge_decisions_conservatively(existing, incoming);
@@ -762,36 +1097,13 @@ fn fn_ptr_decisions_for_expr<'tcx>(
     fn_ptr_groups: &FnPtrGroups,
     final_group_decisions: &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
 ) -> Option<Vec<Option<PtrKind>>> {
-    struct FnPtrDecisionFinder<'a, 'tcx> {
-        tcx: ty::TyCtxt<'tcx>,
-        fn_ptr_groups: &'a FnPtrGroups,
-        final_group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
-        found: Option<Vec<Option<PtrKind>>>,
-    }
-
-    impl<'tcx> Visitor<'tcx> for FnPtrDecisionFinder<'_, 'tcx> {
-        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-            if let Some(decs) = fn_ptr_decisions_for_leaf(
-                self.tcx,
-                expr,
-                self.fn_ptr_groups,
-                self.final_group_decisions,
-            ) {
-                merge_decision_vec(&mut self.found, &decs);
-            }
-
-            intravisit::walk_expr(self, expr);
-        }
-    }
-
-    let mut visitor = FnPtrDecisionFinder {
+    produced_fn_ptr_decisions_for_expr(
         tcx,
-        fn_ptr_groups,
-        final_group_decisions,
-        found: None,
-    };
-    visitor.visit_expr(expr);
-    visitor.found
+        expr,
+        Some((fn_ptr_groups, final_group_decisions)),
+        None,
+        None,
+    )
 }
 
 fn fn_ptr_decisions_for_leaf<'tcx>(
@@ -835,14 +1147,44 @@ fn fn_ptr_def_id_from_expr(expr: &hir::Expr<'_>) -> Option<rustc_hir::def_id::De
     None
 }
 
-fn hir_local_struct_did_from_qpath(qpath: &hir::QPath<'_>) -> Option<LocalDefId> {
+fn hir_local_struct_did_from_qpath(
+    tcx: ty::TyCtxt<'_>,
+    qpath: &hir::QPath<'_>,
+) -> Option<LocalDefId> {
     let hir::QPath::Resolved(_, path) = qpath else {
         return None;
     };
-    let Res::Def(DefKind::Struct, def_id) = path.res else {
-        return None;
-    };
-    def_id.as_local()
+    match path.res {
+        Res::Def(DefKind::Struct, def_id) => def_id.as_local(),
+        Res::Def(DefKind::TyAlias, def_id) => {
+            local_struct_did_from_ty_alias(tcx, def_id.as_local()?)
+        }
+        _ => None,
+    }
+}
+
+fn local_struct_did_from_ty_alias(
+    tcx: ty::TyCtxt<'_>,
+    mut alias_did: LocalDefId,
+) -> Option<LocalDefId> {
+    let mut seen = FxHashSet::default();
+    while seen.insert(alias_did) {
+        let hir::Node::Item(item) = tcx.hir_node_by_def_id(alias_did) else {
+            return None;
+        };
+        let hir::ItemKind::TyAlias(_, _, ty) = item.kind else {
+            return None;
+        };
+        let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = ty.kind else {
+            return None;
+        };
+        match path.res {
+            Res::Def(DefKind::Struct, def_id) => return def_id.as_local(),
+            Res::Def(DefKind::TyAlias, def_id) => alias_did = def_id.as_local()?,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn hir_field_index_by_name(
@@ -859,51 +1201,271 @@ fn hir_field_index_by_name(
     Some(FieldIdx::from_usize(idx))
 }
 
-fn field_fn_ptr_decisions_for_expr<'tcx>(
+#[allow(clippy::type_complexity)]
+fn produced_fn_ptr_decisions_for_expr<'tcx>(
     tcx: ty::TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
-    field_decisions: &FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+    fn_ptr_decisions: Option<(&FnPtrGroups, &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>)>,
+    field_decisions: Option<&FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>>,
+    return_decisions: Option<&FxHashMap<LocalDefId, Vec<Option<PtrKind>>>>,
 ) -> Option<Vec<Option<PtrKind>>> {
-    struct FieldDecisionFinder<'a, 'tcx> {
-        tcx: ty::TyCtxt<'tcx>,
-        field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
-        found: Option<Vec<Option<PtrKind>>>,
+    let expr = utils::hir::unwrap_drop_temps(expr);
+
+    if let Some((fn_ptr_groups, group_decisions)) = fn_ptr_decisions
+        && let Some(decs) = fn_ptr_decisions_for_leaf(tcx, expr, fn_ptr_groups, group_decisions)
+    {
+        return Some(decs);
+    }
+    if let Some(return_decisions) = return_decisions
+        && let hir::ExprKind::Call(callee, _) = expr.kind
+        && let Some(callee_did) = hir_callee_local_def_id(callee)
+        && let Some(decs) = return_decisions.get(&callee_did)
+    {
+        return Some(decs.clone());
     }
 
-    impl<'tcx> Visitor<'tcx> for FieldDecisionFinder<'_, 'tcx> {
-        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-            if self.found.is_some() {
-                return;
-            }
-
-            if let hir::ExprKind::Field(struct_expr, field_ident) =
-                utils::hir::unwrap_drop_temps(expr).kind
-            {
-                let typeck = self.tcx.typeck(expr.hir_id.owner);
-                let struct_ty = typeck.expr_ty_adjusted(struct_expr);
-                if let ty::TyKind::Adt(adt_def, _) = struct_ty.kind()
-                    && adt_def.is_struct()
-                    && let Some(struct_did) = adt_def.did().as_local()
-                    && let Some(field_idx) =
-                        hir_field_index_by_name(self.tcx, struct_did, field_ident.name)
-                    && let Some(decs) = self.field_decisions.get(&(struct_did, field_idx))
-                {
-                    self.found = Some(decs.clone());
-                    return;
-                }
-            }
-
-            intravisit::walk_expr(self, expr);
+    match expr.kind {
+        hir::ExprKind::DropTemps(inner)
+        | hir::ExprKind::Cast(inner, _)
+        | hir::ExprKind::Type(inner, _)
+        | hir::ExprKind::Use(inner, _)
+        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => produced_fn_ptr_decisions_for_expr(
+            tcx,
+            inner,
+            fn_ptr_decisions,
+            field_decisions,
+            return_decisions,
+        ),
+        hir::ExprKind::If(_, then_expr, Some(else_expr)) => {
+            let mut found = None;
+            merge_decisions_from_value_expr(
+                tcx,
+                &mut found,
+                then_expr,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            );
+            merge_decisions_from_value_expr(
+                tcx,
+                &mut found,
+                else_expr,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            );
+            found
         }
+        hir::ExprKind::If(_, _, None) => None,
+        hir::ExprKind::Match(_, arms, _) => {
+            let mut found = None;
+            for arm in arms {
+                merge_decisions_from_value_expr(
+                    tcx,
+                    &mut found,
+                    arm.body,
+                    fn_ptr_decisions,
+                    field_decisions,
+                    return_decisions,
+                );
+            }
+            found
+        }
+        hir::ExprKind::Block(block, _) => block.expr.and_then(|tail| {
+            produced_fn_ptr_decisions_for_expr(
+                tcx,
+                tail,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            )
+        }),
+        hir::ExprKind::Call(callee, [arg]) if hir_call_is_fn_ptr_value_wrapper(callee) => {
+            produced_fn_ptr_decisions_for_expr(
+                tcx,
+                arg,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            )
+        }
+        hir::ExprKind::Call(callee, args)
+            if !args.is_empty()
+                && expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr)
+                && expr_ty_contains_fn_ptr(tcx, &args[0])
+                && hir_call_is_option_unwrap_or_expect(callee) =>
+        {
+            produced_fn_ptr_decisions_for_expr(
+                tcx,
+                &args[0],
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            )
+        }
+        hir::ExprKind::MethodCall(seg, receiver, _, _)
+            if matches!(seg.ident.name.as_str(), "unwrap" | "expect")
+                && expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr)
+                && expr_ty_contains_fn_ptr(tcx, receiver) =>
+        {
+            produced_fn_ptr_decisions_for_expr(
+                tcx,
+                receiver,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            )
+        }
+        hir::ExprKind::Field(..) => field_decisions.and_then(|field_decisions| {
+            field_decision_key_for_expr(tcx, expr)
+                .and_then(|field| field_decisions.get(&field).cloned())
+        }),
+        hir::ExprKind::Index(base, _, _) if expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr) => {
+            produced_fn_ptr_decisions_for_expr(
+                tcx,
+                base,
+                fn_ptr_decisions,
+                field_decisions,
+                return_decisions,
+            )
+        }
+        hir::ExprKind::Struct(_, fields, tail) => {
+            let mut found = None;
+            for field in fields {
+                merge_decisions_from_value_expr(
+                    tcx,
+                    &mut found,
+                    field.expr,
+                    fn_ptr_decisions,
+                    field_decisions,
+                    return_decisions,
+                );
+            }
+            if let hir::StructTailExpr::Base(base) = tail {
+                merge_decisions_from_value_expr(
+                    tcx,
+                    &mut found,
+                    base,
+                    fn_ptr_decisions,
+                    field_decisions,
+                    return_decisions,
+                );
+            }
+            found
+        }
+        hir::ExprKind::Tup(exprs) | hir::ExprKind::Array(exprs) => {
+            let mut found = None;
+            for expr in exprs {
+                merge_decisions_from_value_expr(
+                    tcx,
+                    &mut found,
+                    expr,
+                    fn_ptr_decisions,
+                    field_decisions,
+                    return_decisions,
+                );
+            }
+            found
+        }
+        hir::ExprKind::Repeat(value, _) => produced_fn_ptr_decisions_for_expr(
+            tcx,
+            value,
+            fn_ptr_decisions,
+            field_decisions,
+            return_decisions,
+        ),
+        _ => None,
     }
+}
 
-    let mut visitor = FieldDecisionFinder {
+#[allow(clippy::type_complexity)]
+fn merge_decisions_from_value_expr<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    found: &mut Option<Vec<Option<PtrKind>>>,
+    expr: &'tcx hir::Expr<'tcx>,
+    fn_ptr_decisions: Option<(&FnPtrGroups, &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>)>,
+    field_decisions: Option<&FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>>,
+    return_decisions: Option<&FxHashMap<LocalDefId, Vec<Option<PtrKind>>>>,
+) {
+    if let Some(decs) = produced_fn_ptr_decisions_for_expr(
         tcx,
+        expr,
+        fn_ptr_decisions,
         field_decisions,
-        found: None,
+        return_decisions,
+    ) {
+        merge_decision_vec(found, &decs);
+    }
+}
+
+fn expr_ty_is_fn_ptr_or_option_fn_ptr(tcx: ty::TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    let typeck = tcx.typeck(expr.hir_id.owner);
+    let ty = typeck.expr_ty_adjusted(expr);
+    matches!(ty.kind(), ty::TyKind::FnPtr(..)) || ty_is_option_fn_ptr(tcx, ty)
+}
+
+fn expr_ty_contains_fn_ptr(tcx: ty::TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
+    let typeck = tcx.typeck(expr.hir_id.owner);
+    ty_contains_fn_ptr(typeck.expr_ty_adjusted(expr))
+}
+
+fn ty_is_option_fn_ptr<'tcx>(tcx: ty::TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let ty::TyKind::Adt(adt_def, args) = ty.kind() else {
+        return false;
     };
-    visitor.visit_expr(expr);
-    visitor.found
+    if !is_option(adt_def.did(), tcx) {
+        return false;
+    }
+    let ty::GenericArgKind::Type(inner) = args[0].kind() else {
+        return false;
+    };
+    matches!(inner.kind(), ty::TyKind::FnPtr(..))
+}
+
+fn hir_call_is_fn_ptr_value_wrapper(callee: &hir::Expr<'_>) -> bool {
+    let callee = utils::hir::unwrap_drop_temps(callee);
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|seg| matches!(seg.ident.name.as_str(), "Some" | "Ok"))
+}
+
+fn hir_call_is_option_unwrap_or_expect(callee: &hir::Expr<'_>) -> bool {
+    let callee = utils::hir::unwrap_drop_temps(callee);
+    let hir::ExprKind::Path(qpath) = callee.kind else {
+        return false;
+    };
+    match qpath {
+        hir::QPath::Resolved(_, path) => path
+            .segments
+            .last()
+            .is_some_and(|seg| matches!(seg.ident.name.as_str(), "unwrap" | "expect")),
+        hir::QPath::TypeRelative(_, seg) => matches!(seg.ident.name.as_str(), "unwrap" | "expect"),
+        _ => false,
+    }
+}
+
+fn field_decision_key_for_expr<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<(LocalDefId, FieldIdx)> {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    let hir::ExprKind::Field(struct_expr, field_ident) = expr.kind else {
+        return None;
+    };
+    let typeck = tcx.typeck(expr.hir_id.owner);
+    let struct_ty = typeck.expr_ty_adjusted(struct_expr);
+    let ty::TyKind::Adt(adt_def, _) = struct_ty.kind() else {
+        return None;
+    };
+    if !adt_def.is_struct() {
+        return None;
+    }
+    let struct_did = adt_def.did().as_local()?;
+    let field_idx = hir_field_index_by_name(tcx, struct_did, field_ident.name)?;
+    Some((struct_did, field_idx))
 }
 
 fn force_mixed_foreign_contracts_raw<'tcx>(
@@ -989,6 +1551,7 @@ fn force_c_exposed_contracts_raw<'tcx>(
         group_decisions: &'a mut FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
         c_exposed_fn_ptr_params: &'a FxHashMap<LocalDefId, Vec<Option<Vec<Option<PtrKind>>>>>,
         c_exposed_fields: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+        sources: &'a BodyFnPtrSources,
     }
 
     impl<'tcx> Visitor<'tcx> for CExposedVisitor<'_, 'tcx> {
@@ -999,8 +1562,12 @@ fn force_c_exposed_contracts_raw<'tcx>(
             {
                 for (arg, maybe_decs) in args.iter().zip(param_decs) {
                     let Some(decs) = maybe_decs else { continue };
-                    let local_fns =
-                        local_fn_ptr_group_fns_in_expr(self.tcx, arg, self.fn_ptr_groups);
+                    let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                        self.tcx,
+                        arg,
+                        self.fn_ptr_groups,
+                        self.sources,
+                    );
                     force_fns_to_raw_contract(
                         self.tcx,
                         self.fn_ptr_groups,
@@ -1012,7 +1579,7 @@ fn force_c_exposed_contracts_raw<'tcx>(
             }
 
             if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
-                && let Some(struct_did) = hir_local_struct_did_from_qpath(qpath)
+                && let Some(struct_did) = hir_local_struct_did_from_qpath(self.tcx, qpath)
             {
                 for field in fields {
                     let Some(field_idx) =
@@ -1023,8 +1590,12 @@ fn force_c_exposed_contracts_raw<'tcx>(
                     let Some(decs) = self.c_exposed_fields.get(&(struct_did, field_idx)) else {
                         continue;
                     };
-                    let local_fns =
-                        local_fn_ptr_group_fns_in_expr(self.tcx, field.expr, self.fn_ptr_groups);
+                    let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                        self.tcx,
+                        field.expr,
+                        self.fn_ptr_groups,
+                        self.sources,
+                    );
                     force_fns_to_raw_contract(
                         self.tcx,
                         self.fn_ptr_groups,
@@ -1039,15 +1610,135 @@ fn force_c_exposed_contracts_raw<'tcx>(
         }
     }
 
-    let mut visitor = CExposedVisitor {
-        tcx,
-        fn_ptr_groups,
-        group_decisions,
-        c_exposed_fn_ptr_params: &c_exposed_fn_ptr_params,
-        c_exposed_fields: &c_exposed_fields,
-    };
     for def_id in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(def_id);
+        let sources = collect_body_fn_ptr_sources(tcx, body, fn_ptr_groups, &c_exposed_fields);
+        let mut visitor = CExposedVisitor {
+            tcx,
+            fn_ptr_groups,
+            group_decisions,
+            c_exposed_fn_ptr_params: &c_exposed_fn_ptr_params,
+            c_exposed_fields: &c_exposed_fields,
+            sources: &sources,
+        };
+        visitor.visit_body(body);
+    }
+}
+
+fn force_foreign_abi_contracts_raw<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    fn_ptr_groups: &FnPtrGroups,
+    group_decisions: &mut FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+) {
+    let tcx = rust_program.tcx;
+    let mut foreign_fn_ptr_params: FxHashMap<LocalDefId, Vec<Option<Vec<Option<PtrKind>>>>> =
+        FxHashMap::default();
+    for did in foreign_fn_def_ids(tcx) {
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        let param_decs = sig
+            .inputs()
+            .iter()
+            .map(|ty| fn_ptr_input_decisions_from_ty(tcx, *ty))
+            .collect();
+        foreign_fn_ptr_params.insert(did, param_decs);
+    }
+    let foreign_fields = collect_foreign_abi_fn_ptr_fields(rust_program);
+
+    struct ForeignAbiVisitor<'a, 'tcx> {
+        tcx: ty::TyCtxt<'tcx>,
+        fn_ptr_groups: &'a FnPtrGroups,
+        group_decisions: &'a mut FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+        foreign_fn_ptr_params: &'a FxHashMap<LocalDefId, Vec<Option<Vec<Option<PtrKind>>>>>,
+        foreign_fields: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+        sources: &'a BodyFnPtrSources,
+    }
+
+    impl<'tcx> Visitor<'tcx> for ForeignAbiVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Call(callee, args) = expr.kind
+                && let Some(callee_did) = hir_callee_local_def_id(callee)
+                && let Some(param_decs) = self.foreign_fn_ptr_params.get(&callee_did)
+            {
+                for (arg, maybe_decs) in args.iter().zip(param_decs) {
+                    let Some(decs) = maybe_decs else { continue };
+                    let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                        self.tcx,
+                        arg,
+                        self.fn_ptr_groups,
+                        self.sources,
+                    );
+                    force_fns_to_raw_contract(
+                        self.tcx,
+                        self.fn_ptr_groups,
+                        self.group_decisions,
+                        &local_fns,
+                        decs,
+                    );
+                }
+            }
+
+            if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                && let Some(struct_did) = hir_local_struct_did_from_qpath(self.tcx, qpath)
+            {
+                for field in fields {
+                    let Some(field_idx) =
+                        hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                    else {
+                        continue;
+                    };
+                    let Some(decs) = self.foreign_fields.get(&(struct_did, field_idx)) else {
+                        continue;
+                    };
+                    let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                        self.tcx,
+                        field.expr,
+                        self.fn_ptr_groups,
+                        self.sources,
+                    );
+                    force_fns_to_raw_contract(
+                        self.tcx,
+                        self.fn_ptr_groups,
+                        self.group_decisions,
+                        &local_fns,
+                        decs,
+                    );
+                }
+            }
+
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(field) = field_decision_key_for_expr(self.tcx, lhs)
+                && let Some(decs) = self.foreign_fields.get(&field)
+            {
+                let local_fns = produced_local_fn_ptr_group_fns_in_expr(
+                    self.tcx,
+                    rhs,
+                    self.fn_ptr_groups,
+                    self.sources,
+                );
+                force_fns_to_raw_contract(
+                    self.tcx,
+                    self.fn_ptr_groups,
+                    self.group_decisions,
+                    &local_fns,
+                    decs,
+                );
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        let sources = collect_body_fn_ptr_sources(tcx, body, fn_ptr_groups, &foreign_fields);
+        let mut visitor = ForeignAbiVisitor {
+            tcx,
+            fn_ptr_groups,
+            group_decisions,
+            foreign_fn_ptr_params: &foreign_fn_ptr_params,
+            foreign_fields: &foreign_fields,
+            sources: &sources,
+        };
         visitor.visit_body(body);
     }
 }
@@ -1074,6 +1765,260 @@ fn force_fns_to_raw_contract(
             }
         }
     }
+}
+
+#[derive(Default)]
+struct BodyFnPtrSources {
+    local_sources: FxHashMap<HirId, FxHashSet<LocalDefId>>,
+    field_sources: FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
+}
+
+fn collect_body_fn_ptr_sources<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    body: &'tcx hir::Body<'tcx>,
+    fn_ptr_groups: &FnPtrGroups,
+    field_contracts: &FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+) -> BodyFnPtrSources {
+    struct SourceConstraintVisitor<'a, 'tcx> {
+        tcx: ty::TyCtxt<'tcx>,
+        field_contracts: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+        local_constraints: Vec<(HirId, &'tcx hir::Expr<'tcx>)>,
+        field_constraints: Vec<((LocalDefId, FieldIdx), &'tcx hir::Expr<'tcx>)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for SourceConstraintVisitor<'_, 'tcx> {
+        fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) -> Self::Result {
+            if let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.local_constraints.push((binding_hir_id, init));
+            }
+            intravisit::walk_local(self, let_stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
+                if let Some(local_hir_id) = local_binding_target_for_expr(lhs) {
+                    self.local_constraints.push((local_hir_id, rhs));
+                }
+                if let Some(field) = field_decision_key_for_expr(self.tcx, lhs)
+                    && self.field_contracts.contains_key(&field)
+                {
+                    self.field_constraints.push((field, rhs));
+                }
+            }
+
+            if let hir::ExprKind::Struct(qpath, fields, _) = expr.kind
+                && let Some(struct_did) = hir_local_struct_did_from_qpath(self.tcx, qpath)
+            {
+                for field in fields {
+                    let Some(field_idx) =
+                        hir_field_index_by_name(self.tcx, struct_did, field.ident.name)
+                    else {
+                        continue;
+                    };
+                    let field_key = (struct_did, field_idx);
+                    if self.field_contracts.contains_key(&field_key) {
+                        self.field_constraints.push((field_key, field.expr));
+                    }
+                }
+            }
+
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = SourceConstraintVisitor {
+        tcx,
+        field_contracts,
+        local_constraints: Vec::new(),
+        field_constraints: Vec::new(),
+    };
+    visitor.visit_body(body);
+
+    let mut sources = BodyFnPtrSources::default();
+    loop {
+        let mut changed = false;
+        let mut local_updates = Vec::new();
+        for &(hir_id, expr) in &visitor.local_constraints {
+            let fns = produced_local_fn_ptr_group_fns_in_expr(tcx, expr, fn_ptr_groups, &sources);
+            if !fns.is_empty() {
+                local_updates.push((hir_id, fns));
+            }
+        }
+        let mut field_updates = Vec::new();
+        for &(field, expr) in &visitor.field_constraints {
+            let fns = produced_local_fn_ptr_group_fns_in_expr(tcx, expr, fn_ptr_groups, &sources);
+            if !fns.is_empty() {
+                field_updates.push((field, fns));
+            }
+        }
+        for (hir_id, fns) in local_updates {
+            changed |= merge_local_fn_sources(&mut sources.local_sources, hir_id, fns);
+        }
+        for (field, fns) in field_updates {
+            changed |= merge_field_fn_sources(&mut sources.field_sources, field, fns);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    sources
+}
+
+fn merge_local_fn_sources(
+    sources: &mut FxHashMap<HirId, FxHashSet<LocalDefId>>,
+    hir_id: HirId,
+    fns: FxHashSet<LocalDefId>,
+) -> bool {
+    let entry = sources.entry(hir_id).or_default();
+    let old_len = entry.len();
+    entry.extend(fns);
+    entry.len() != old_len
+}
+
+fn merge_field_fn_sources(
+    sources: &mut FxHashMap<(LocalDefId, FieldIdx), FxHashSet<LocalDefId>>,
+    field: (LocalDefId, FieldIdx),
+    fns: FxHashSet<LocalDefId>,
+) -> bool {
+    let entry = sources.entry(field).or_default();
+    let old_len = entry.len();
+    entry.extend(fns);
+    entry.len() != old_len
+}
+
+fn local_binding_target_for_expr(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind else {
+        return None;
+    };
+    let Res::Local(hir_id) = path.res else {
+        return None;
+    };
+    Some(hir_id)
+}
+
+fn produced_local_fn_ptr_group_fns_in_expr<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    fn_ptr_groups: &FnPtrGroups,
+    sources: &BodyFnPtrSources,
+) -> FxHashSet<LocalDefId> {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+
+    if let Some(def_id) = fn_ptr_def_id_from_expr(expr)
+        && let Some(did) = def_id.as_local()
+        && fn_ptr_groups.fn_to_group.contains_key(&did)
+    {
+        let typeck = tcx.typeck(expr.hir_id.owner);
+        if ty_contains_fn_ptr(typeck.expr_ty_adjusted(expr)) {
+            let mut fns = FxHashSet::default();
+            fns.insert(did);
+            return fns;
+        }
+    }
+
+    match expr.kind {
+        hir::ExprKind::DropTemps(inner)
+        | hir::ExprKind::Cast(inner, _)
+        | hir::ExprKind::Type(inner, _)
+        | hir::ExprKind::Use(inner, _)
+        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, inner, fn_ptr_groups, sources)
+        }
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            if let Res::Local(hir_id) = path.res
+                && expr_ty_contains_fn_ptr(tcx, expr)
+            {
+                return sources
+                    .local_sources
+                    .get(&hir_id)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            FxHashSet::default()
+        }
+        hir::ExprKind::If(_, then_expr, Some(else_expr)) => {
+            let mut fns =
+                produced_local_fn_ptr_group_fns_in_expr(tcx, then_expr, fn_ptr_groups, sources);
+            merge_local_fns_from_value_expr(&mut fns, tcx, else_expr, fn_ptr_groups, sources);
+            fns
+        }
+        hir::ExprKind::If(_, _, None) => FxHashSet::default(),
+        hir::ExprKind::Match(_, arms, _) => {
+            let mut fns = FxHashSet::default();
+            for arm in arms {
+                merge_local_fns_from_value_expr(&mut fns, tcx, arm.body, fn_ptr_groups, sources);
+            }
+            fns
+        }
+        hir::ExprKind::Block(block, _) => block
+            .expr
+            .map(|tail| produced_local_fn_ptr_group_fns_in_expr(tcx, tail, fn_ptr_groups, sources))
+            .unwrap_or_default(),
+        hir::ExprKind::Call(callee, [arg]) if hir_call_is_fn_ptr_value_wrapper(callee) => {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, arg, fn_ptr_groups, sources)
+        }
+        hir::ExprKind::Call(callee, args)
+            if !args.is_empty()
+                && expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr)
+                && expr_ty_contains_fn_ptr(tcx, &args[0])
+                && hir_call_is_option_unwrap_or_expect(callee) =>
+        {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, &args[0], fn_ptr_groups, sources)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, _, _)
+            if matches!(seg.ident.name.as_str(), "unwrap" | "expect")
+                && expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr)
+                && expr_ty_contains_fn_ptr(tcx, receiver) =>
+        {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, receiver, fn_ptr_groups, sources)
+        }
+        hir::ExprKind::Field(..) => field_decision_key_for_expr(tcx, expr)
+            .and_then(|field| sources.field_sources.get(&field).cloned())
+            .unwrap_or_default(),
+        hir::ExprKind::Index(base, _, _) if expr_ty_is_fn_ptr_or_option_fn_ptr(tcx, expr) => {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, base, fn_ptr_groups, sources)
+        }
+        hir::ExprKind::Struct(_, fields, tail) => {
+            let mut fns = FxHashSet::default();
+            for field in fields {
+                merge_local_fns_from_value_expr(&mut fns, tcx, field.expr, fn_ptr_groups, sources);
+            }
+            if let hir::StructTailExpr::Base(base) = tail {
+                merge_local_fns_from_value_expr(&mut fns, tcx, base, fn_ptr_groups, sources);
+            }
+            fns
+        }
+        hir::ExprKind::Tup(exprs) | hir::ExprKind::Array(exprs) => {
+            let mut fns = FxHashSet::default();
+            for expr in exprs {
+                merge_local_fns_from_value_expr(&mut fns, tcx, expr, fn_ptr_groups, sources);
+            }
+            fns
+        }
+        hir::ExprKind::Repeat(value, _) => {
+            produced_local_fn_ptr_group_fns_in_expr(tcx, value, fn_ptr_groups, sources)
+        }
+        _ => FxHashSet::default(),
+    }
+}
+
+fn merge_local_fns_from_value_expr<'tcx>(
+    fns: &mut FxHashSet<LocalDefId>,
+    tcx: ty::TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    fn_ptr_groups: &FnPtrGroups,
+    sources: &BodyFnPtrSources,
+) {
+    fns.extend(produced_local_fn_ptr_group_fns_in_expr(
+        tcx,
+        expr,
+        fn_ptr_groups,
+        sources,
+    ));
 }
 
 fn local_fn_ptr_group_fns_in_expr<'tcx>(
@@ -1169,21 +2114,118 @@ fn collect_c_exposed_fn_ptr_fields<'tcx>(
     fields
 }
 
+fn collect_foreign_abi_fn_ptr_fields<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+) -> FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>> {
+    let tcx = rust_program.tcx;
+    let mut fields = FxHashMap::default();
+    for did in foreign_fn_def_ids(tcx) {
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        for &input in sig.inputs() {
+            collect_c_exposed_fn_ptr_fields_from_ty(tcx, input, &mut fields);
+        }
+    }
+    fields
+}
+
+#[allow(clippy::type_complexity)]
+fn collect_boundary_fn_ptr_arg_fields<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+    c_exposed_fns: &FxHashSet<String>,
+) -> Vec<((LocalDefId, FieldIdx), Vec<Option<PtrKind>>)> {
+    let tcx = rust_program.tcx;
+    let mut boundary_fn_ptr_params: FxHashMap<LocalDefId, Vec<Option<Vec<Option<PtrKind>>>>> =
+        FxHashMap::default();
+    for did in foreign_fn_def_ids(tcx) {
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        let param_decs = sig
+            .inputs()
+            .iter()
+            .map(|ty| fn_ptr_input_decisions_from_ty(tcx, *ty))
+            .collect();
+        boundary_fn_ptr_params.insert(did, param_decs);
+    }
+    for &did in &rust_program.functions {
+        if !is_c_exposed_fn(tcx, did, c_exposed_fns) {
+            continue;
+        }
+        let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+        let param_decs = sig
+            .inputs()
+            .iter()
+            .map(|ty| fn_ptr_input_decisions_from_ty(tcx, *ty))
+            .collect();
+        boundary_fn_ptr_params.insert(did, param_decs);
+    }
+
+    #[allow(clippy::type_complexity)]
+    struct BoundaryFieldArgVisitor<'a, 'tcx> {
+        tcx: ty::TyCtxt<'tcx>,
+        boundary_fn_ptr_params: &'a FxHashMap<LocalDefId, Vec<Option<Vec<Option<PtrKind>>>>>,
+        fields: Vec<((LocalDefId, FieldIdx), Vec<Option<PtrKind>>)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for BoundaryFieldArgVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Call(callee, args) = expr.kind
+                && let Some(callee_did) = hir_callee_local_def_id(callee)
+                && let Some(param_decs) = self.boundary_fn_ptr_params.get(&callee_did)
+            {
+                for (arg, maybe_decs) in args.iter().zip(param_decs) {
+                    let Some(decs) = maybe_decs else { continue };
+                    let Some(field) = field_decision_key_for_expr(self.tcx, arg) else {
+                        continue;
+                    };
+                    self.fields.push((field, decs.clone()));
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = BoundaryFieldArgVisitor {
+        tcx,
+        boundary_fn_ptr_params: &boundary_fn_ptr_params,
+        fields: Vec::new(),
+    };
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        visitor.visit_body(body);
+    }
+    visitor.fields
+}
+
 fn collect_c_exposed_fn_ptr_fields_from_ty<'tcx>(
     tcx: ty::TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     fields: &mut FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
 ) {
-    let (ty::TyKind::RawPtr(pointee, _) | ty::TyKind::Ref(_, pointee, _)) = ty.kind() else {
-        return;
-    };
-    collect_fn_ptr_fields_from_struct_ty(tcx, *pointee, fields);
+    let mut seen = FxHashSet::default();
+    collect_c_exposed_fn_ptr_fields_from_ty_inner(tcx, ty, fields, &mut seen);
+}
+
+fn collect_c_exposed_fn_ptr_fields_from_ty_inner<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fields: &mut FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+    seen: &mut FxHashSet<LocalDefId>,
+) {
+    match ty.kind() {
+        ty::TyKind::RawPtr(pointee, _) | ty::TyKind::Ref(_, pointee, _) => {
+            collect_c_exposed_fn_ptr_fields_from_ty_inner(tcx, *pointee, fields, seen);
+        }
+        ty::TyKind::Adt(adt_def, _) if adt_def.is_struct() => {
+            collect_fn_ptr_fields_from_struct_ty(tcx, ty, fields, seen);
+        }
+        _ => {}
+    }
 }
 
 fn collect_fn_ptr_fields_from_struct_ty<'tcx>(
     tcx: ty::TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
     fields: &mut FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+    seen: &mut FxHashSet<LocalDefId>,
 ) {
     let ty::TyKind::Adt(adt_def, args) = ty.kind() else {
         return;
@@ -1194,13 +2236,30 @@ fn collect_fn_ptr_fields_from_struct_ty<'tcx>(
     let Some(struct_did) = adt_def.did().as_local() else {
         return;
     };
+    if !seen.insert(struct_did) {
+        return;
+    }
     for (field_idx, field) in adt_def.non_enum_variant().fields.iter_enumerated() {
         let field_ty = field.ty(tcx, args);
         if let Some(decs) = fn_ptr_input_decisions_from_ty(tcx, field_ty) {
             fields.insert((struct_did, field_idx), decs);
         }
-        collect_fn_ptr_fields_from_struct_ty(tcx, field_ty, fields);
+        collect_c_exposed_fn_ptr_fields_from_ty_inner(tcx, field_ty, fields, seen);
     }
+}
+
+fn foreign_fn_def_ids(tcx: ty::TyCtxt<'_>) -> Vec<LocalDefId> {
+    tcx.hir_crate(())
+        .owners
+        .iter()
+        .filter_map(|owner| {
+            let owner = owner.as_owner()?;
+            let hir::OwnerNode::ForeignItem(item) = owner.node() else {
+                return None;
+            };
+            matches!(item.kind, hir::ForeignItemKind::Fn(..)).then_some(item.owner_id.def_id)
+        })
+        .collect()
 }
 
 fn is_c_exposed_fn(
@@ -1296,6 +2355,127 @@ fn insert_alias_decisions_for_ty<I>(
     }
 }
 
+fn established_fn_ptr_contract_for_hir_ty<I>(
+    tcx: ty::TyCtxt<'_>,
+    annotation_decisions: &FxHashMap<HirId, Vec<Option<PtrKind>>>,
+    ty: &hir::Ty<'_, I>,
+) -> Option<Vec<Option<PtrKind>>> {
+    let mut found = None;
+    for alias_did in collect_hir_ty_alias_def_ids_for_ty(ty) {
+        if let Some(decs) = annotation_decisions.get(&tcx.local_def_id_to_hir_id(alias_did)) {
+            merge_decision_vec(&mut found, decs);
+        }
+    }
+    found
+}
+
+fn seed_explicit_hir_ty_contracts(
+    tcx: ty::TyCtxt<'_>,
+    annotation_decisions: &mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
+) {
+    struct ExplicitLocalTyVisitor<'a, 'tcx> {
+        tcx: ty::TyCtxt<'tcx>,
+        annotation_decisions: &'a FxHashMap<HirId, Vec<Option<PtrKind>>>,
+        pending: Vec<(HirId, Vec<Option<PtrKind>>)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for ExplicitLocalTyVisitor<'_, 'tcx> {
+        fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) -> Self::Result {
+            if let hir::PatKind::Binding(_, binding_hir_id, _, _) = let_stmt.pat.kind
+                && let Some(ty) = let_stmt.ty
+                && let Some(decs) =
+                    established_fn_ptr_contract_for_hir_ty(self.tcx, self.annotation_decisions, ty)
+            {
+                self.pending.push((binding_hir_id, decs));
+            }
+            intravisit::walk_local(self, let_stmt);
+        }
+    }
+
+    let mut pending = Vec::new();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let hir::ItemKind::Fn { sig, body, .. } = item.kind else {
+            continue;
+        };
+        let body = tcx.hir_body(body);
+        for (param, param_ty) in body.params.iter().zip(sig.decl.inputs) {
+            let hir::PatKind::Binding(_, param_hir_id, _, _) = param.pat.kind else {
+                continue;
+            };
+            let Some(decs) =
+                established_fn_ptr_contract_for_hir_ty(tcx, annotation_decisions, param_ty)
+            else {
+                continue;
+            };
+            pending.push((param_hir_id, decs));
+        }
+    }
+
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        let mut visitor = ExplicitLocalTyVisitor {
+            tcx,
+            annotation_decisions,
+            pending: Vec::new(),
+        };
+        visitor.visit_body(body);
+        pending.extend(visitor.pending);
+    }
+
+    for (hir_id, decs) in pending {
+        insert_annotation_decision(annotation_decisions, hir_id, &decs);
+    }
+}
+
+fn seed_field_decisions_from_established_tys<'tcx>(
+    tcx: ty::TyCtxt<'tcx>,
+    rust_program: &RustProgram<'tcx>,
+    annotation_decisions: &FxHashMap<HirId, Vec<Option<PtrKind>>>,
+    field_decisions: &mut FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+) {
+    for &struct_did in rust_program.structs.iter() {
+        let hir_item = tcx.hir_expect_item(struct_did);
+        let hir::ItemKind::Struct(_, _, variant_data) = &hir_item.kind else {
+            continue;
+        };
+        for (fi_idx, hir_field) in variant_data.fields().iter().enumerate() {
+            let Some(decs) =
+                established_fn_ptr_contract_for_hir_ty(tcx, annotation_decisions, hir_field.ty)
+            else {
+                continue;
+            };
+            let key = (struct_did, FieldIdx::from_usize(fi_idx));
+            field_decisions
+                .entry(key)
+                .and_modify(|existing| merge_decisions_conservatively(existing, &decs))
+                .or_insert(decs);
+        }
+    }
+}
+
+fn collect_return_decisions(
+    tcx: ty::TyCtxt<'_>,
+    annotation_decisions: &FxHashMap<HirId, Vec<Option<PtrKind>>>,
+) -> FxHashMap<LocalDefId, Vec<Option<PtrKind>>> {
+    let mut return_decisions = FxHashMap::default();
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let hir::ItemKind::Fn { sig, .. } = item.kind else {
+            continue;
+        };
+        let hir::FnRetTy::Return(return_ty) = sig.decl.output else {
+            continue;
+        };
+        if let Some(decs) =
+            established_fn_ptr_contract_for_hir_ty(tcx, annotation_decisions, return_ty)
+        {
+            return_decisions.insert(item.owner_id.def_id, decs);
+        }
+    }
+    return_decisions
+}
+
 fn local_fn_param_hir<'tcx>(
     tcx: ty::TyCtxt<'tcx>,
     did: LocalDefId,
@@ -1352,12 +2532,16 @@ fn propagate_return_alias_decisions(
     tcx: ty::TyCtxt<'_>,
     fn_ptr_groups: &FnPtrGroups,
     group_decisions: &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+    field_decisions: &FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+    return_decisions: &FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
     annotation_decisions: &mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
 ) {
     struct ReturnAliasVisitor<'a, 'tcx> {
         tcx: ty::TyCtxt<'tcx>,
         fn_ptr_groups: &'a FnPtrGroups,
         group_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
+        field_decisions: &'a FxHashMap<(LocalDefId, FieldIdx), Vec<Option<PtrKind>>>,
+        return_decisions: &'a FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
         annotation_decisions: &'a mut FxHashMap<HirId, Vec<Option<PtrKind>>>,
         aliases: Vec<LocalDefId>,
     }
@@ -1365,11 +2549,12 @@ fn propagate_return_alias_decisions(
     impl<'tcx> Visitor<'tcx> for ReturnAliasVisitor<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
             if let hir::ExprKind::Ret(Some(value)) = expr.kind
-                && let Some(decs) = fn_ptr_decisions_for_expr(
+                && let Some(decs) = produced_fn_ptr_decisions_for_expr(
                     self.tcx,
                     value,
-                    self.fn_ptr_groups,
-                    self.group_decisions,
+                    Some((self.fn_ptr_groups, self.group_decisions)),
+                    Some(self.field_decisions),
+                    Some(self.return_decisions),
                 )
             {
                 for &alias_did in &self.aliases {
@@ -1402,13 +2587,19 @@ fn propagate_return_alias_decisions(
             tcx,
             fn_ptr_groups,
             group_decisions,
+            field_decisions,
+            return_decisions,
             annotation_decisions,
             aliases,
         };
         visitor.visit_body(body);
-        if let Some(decs) =
-            fn_ptr_decisions_for_expr(tcx, body.value, fn_ptr_groups, group_decisions)
-        {
+        if let Some(decs) = produced_fn_ptr_decisions_for_expr(
+            tcx,
+            body.value,
+            Some((fn_ptr_groups, group_decisions)),
+            Some(field_decisions),
+            Some(return_decisions),
+        ) {
             for &alias_did in &visitor.aliases {
                 insert_annotation_decision(
                     visitor.annotation_decisions,

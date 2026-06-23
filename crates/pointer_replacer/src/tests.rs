@@ -11889,6 +11889,1313 @@ pub unsafe fn foo() -> i32 {
 }
 
 #[test]
+fn test_root1_fn_ptr_raw_boundary_field_storage_forces_callback_raw() {
+    run_test(
+        r#"
+pub type emit_func_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct Callbacks {
+    pub cb: emit_func_t,
+}
+
+unsafe extern "C" {
+    pub fn install_callbacks(callbacks: *const Callbacks) -> i32;
+}
+
+pub unsafe extern "C" fn emit_one(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 1;
+}
+
+pub unsafe fn register_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let callbacks = Callbacks {
+        cb: Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32),
+    };
+    return install_callbacks(&callbacks) + emit_one(argv);
+}
+"#,
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "fn emit_one(mut argv: *mut *mut i8) -> i32",
+            "emit_one as unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+        ],
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "fn emit_one(mut argv: &mut [*mut i8]) -> i32",
+            "emit_one as unsafe extern \"C\" fn(&mut [*mut i8]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_alias_option_associated_unwrap_uses_alias_contract() {
+    run_test(
+        r#"
+pub type emit_func_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+pub unsafe extern "C" fn emit_one(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static EMIT: emit_func_t =
+    Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32);
+
+pub unsafe fn dispatch_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return Option::unwrap(EMIT)(argv);
+}
+"#,
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "fn emit_one(mut argv: &mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit_one as unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "Option::unwrap(EMIT)((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_struct_fields_associated_expect_use_field_contract() {
+    run_test(
+        r#"
+pub type emit_func_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct Callbacks {
+    pub emit: emit_func_t,
+    pub fallback: Option<unsafe extern "C" fn(*mut *mut i8) -> i32>,
+}
+
+pub unsafe extern "C" fn emit_one(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static CALLBACKS: Callbacks = Callbacks {
+    emit: Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32),
+    fallback: Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32),
+};
+
+pub unsafe fn dispatch_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return Option::expect(CALLBACKS.emit, "emit")(argv)
+        + Option::unwrap(CALLBACKS.fallback)(argv);
+}
+"#,
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "pub emit: emit_func_t",
+            "pub fallback: Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+        ],
+        &[
+            "Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit_one as unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "Option::expect(CALLBACKS.emit, \"emit\")((argv).as_mut_ptr())",
+            "Option::unwrap(CALLBACKS.fallback)((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_typedef_option_local_param_associated_expect_uses_contract() {
+    run_test(
+        r#"
+pub type emit_func_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+pub unsafe extern "C" fn emit_one(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn invoke_emit(
+    cb: emit_func_t,
+    mut argv: *mut *mut i8,
+) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return Option::expect(cb, "emit")(argv);
+}
+
+pub unsafe fn dispatch_emit(mut argv: *mut *mut i8) -> i32 {
+    return invoke_emit(
+        Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32),
+        argv,
+    );
+}
+"#,
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "cb: emit_func_t",
+        ],
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit_one as unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "Option::expect(cb, \"emit\")((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_typedef_option_local_copy_associated_unwrap_uses_contract() {
+    run_test(
+        r#"
+pub type emit_func_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct Callbacks {
+    pub emit: emit_func_t,
+}
+
+pub unsafe extern "C" fn emit_one(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub static CALLBACKS: Callbacks = Callbacks {
+    emit: Some(emit_one as unsafe extern "C" fn(*mut *mut i8) -> i32),
+};
+
+pub unsafe fn dispatch_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let cb: emit_func_t = CALLBACKS.emit;
+    return Option::unwrap(cb)(argv);
+}
+"#,
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "pub emit: emit_func_t",
+        ],
+        &[
+            "type emit_func_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit_one as unsafe extern \"C\" fn(*mut *mut i8) -> i32",
+            "Option::unwrap(cb)((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_if_initializer_condition_raw_field_does_not_pollute_branch_contract() {
+    run_test(
+        r#"
+pub type raw_probe_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+pub type local_emit_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub probe: raw_probe_t,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub static RAW_CALLBACKS: RawCallbacks = RawCallbacks { probe: None };
+
+pub unsafe extern "C" fn local_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn choose_and_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let emit: local_emit_t = if RAW_CALLBACKS.probe.is_some() {
+        Some(local_emit as unsafe extern "C" fn(*mut *mut i8) -> i32)
+    } else {
+        Some(local_emit as unsafe extern "C" fn(*mut *mut i8) -> i32)
+    };
+    return install_raw_callbacks(&RAW_CALLBACKS) + emit.expect("emit")(argv);
+}
+"#,
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "fn local_emit(mut argv: &mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit.expect(\"emit\")((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_match_scrutinee_raw_field_does_not_pollute_arm_contract() {
+    run_test(
+        r#"
+pub type raw_probe_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+pub type local_emit_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub probe: raw_probe_t,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub static RAW_CALLBACKS: RawCallbacks = RawCallbacks { probe: None };
+
+pub unsafe extern "C" fn local_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn choose_and_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let emit: local_emit_t = match RAW_CALLBACKS.probe {
+        Some(_) => Some(local_emit as unsafe extern "C" fn(*mut *mut i8) -> i32),
+        None => Some(local_emit as unsafe extern "C" fn(*mut *mut i8) -> i32),
+    };
+    return install_raw_callbacks(&RAW_CALLBACKS) + emit.expect("emit")(argv);
+}
+"#,
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "fn local_emit(mut argv: &mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit.expect(\"emit\")((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_block_statement_raw_field_does_not_pollute_tail_contract() {
+    run_test(
+        r#"
+pub type raw_probe_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+pub type local_emit_t = Option<unsafe extern "C" fn(*mut *mut i8) -> i32>;
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub probe: raw_probe_t,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub static RAW_CALLBACKS: RawCallbacks = RawCallbacks { probe: None };
+
+pub unsafe extern "C" fn local_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn choose_and_emit(mut argv: *mut *mut i8) -> i32 {
+    *argv.offset(0) = core::ptr::null_mut();
+    let emit: local_emit_t = {
+        let _seen = RAW_CALLBACKS.probe.is_some();
+        Some(local_emit as unsafe extern "C" fn(*mut *mut i8) -> i32)
+    };
+    return install_raw_callbacks(&RAW_CALLBACKS) + emit.expect("emit")(argv);
+}
+"#,
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "fn local_emit(mut argv: &mut [*mut i8]) -> i32",
+        ],
+        &[
+            "type raw_probe_t = Option<unsafe extern \"C\" fn(&mut [*mut i8]) -> i32>",
+            "type local_emit_t = Option<unsafe extern \"C\" fn(*mut *mut i8) -> i32>",
+            "emit.expect(\"emit\")((argv).as_mut_ptr())",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_nested_raw_outer_definition_forces_inner_callback_table_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Iterator {
+    pub value: i32,
+}
+
+pub type each_cb = Option<unsafe extern "C" fn(*mut Iterator) -> i32>;
+
+#[repr(C)]
+pub struct InnerCallbacks {
+    pub each: each_cb,
+}
+
+#[repr(C)]
+pub struct OuterDefinition {
+    pub callbacks: InnerCallbacks,
+}
+
+unsafe extern "C" {
+    pub fn register_outer_definition(definition: *const OuterDefinition) -> i32;
+}
+
+pub unsafe extern "C" fn local_each(mut iter: *mut Iterator) -> i32 {
+    (*iter.offset(0)).value += 1;
+    return (*iter.offset(0)).value;
+}
+
+pub static mut OUTER_DEFINITION: OuterDefinition = OuterDefinition {
+    callbacks: InnerCallbacks {
+        each: Some(local_each as unsafe extern "C" fn(*mut Iterator) -> i32),
+    },
+};
+
+pub unsafe fn register_outer() -> i32 {
+    return register_outer_definition(&raw const OUTER_DEFINITION);
+}
+"#,
+        &[
+            "type each_cb = Option<unsafe extern \"C\" fn(*mut Iterator) -> i32>",
+            "pub each: each_cb",
+            "fn local_each(mut iter: *mut crate::Iterator) -> i32",
+            "local_each as",
+            "unsafe extern \"C\" fn(*mut Iterator) -> i32",
+        ],
+        &[
+            "type each_cb = Option<unsafe extern \"C\" fn(&mut [crate::Iterator]) -> i32>",
+            "fn local_each(mut iter: &mut [crate::Iterator]) -> i32",
+            "local_each as unsafe extern \"C\" fn(&mut [crate::Iterator]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_shared_callback_field_raw_merge_forces_slice_entry_cast_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Iterator {
+    pub current: *const Entry,
+    pub position: i32,
+}
+
+#[repr(C)]
+pub struct IteratorCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn keep_raw_iterator(iter: *mut Iterator) -> i32;
+}
+
+pub unsafe extern "C" fn slice_current(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    *out.offset(0) = (*iter.offset(0)).current;
+    return (*iter.offset(0)).position;
+}
+
+pub unsafe extern "C" fn raw_current(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    *out.offset(0) = core::ptr::null();
+    return keep_raw_iterator(iter);
+}
+
+pub static SLICE_CALLBACKS: IteratorCallbacks = IteratorCallbacks {
+    current: Some(
+        slice_current as unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32,
+    ),
+};
+
+pub static RAW_CALLBACKS: IteratorCallbacks = IteratorCallbacks {
+    current: Some(
+        raw_current as unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32,
+    ),
+};
+
+pub unsafe fn call_both(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    *out.offset(0) = core::ptr::null();
+    let first = SLICE_CALLBACKS.current.expect("slice")(out, iter);
+    let second = RAW_CALLBACKS.current.expect("raw")(out, iter);
+    return first + second;
+}
+"#,
+        &[
+            "*mut Iterator<'a>) -> i32>",
+            "mut iter: *mut crate::Iterator<'a>",
+        ],
+        &[
+            "slice_current as unsafe extern \"C\" fn(&mut [*const Entry], &[Iterator]) -> i32",
+            "slice_current as unsafe extern \"C\" fn(&mut [*const Entry], &mut [Iterator]) -> i32",
+            "slice_current as\n                unsafe extern \"C\" fn(&mut [*const Entry], &[Iterator<'_>])",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_local_static_callback_field_raw_merge_forces_slice_entry_cast_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Iterator {
+    pub current: *const Entry,
+    pub position: i32,
+}
+
+#[repr(C)]
+pub struct IteratorCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn keep_raw_iterator(iter: *mut Iterator) -> i32;
+}
+
+pub unsafe extern "C" fn slice_current(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    *out.offset(0) = (*iter.offset(0)).current;
+    return (*iter.offset(0)).position;
+}
+
+pub unsafe extern "C" fn raw_current(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    *out.offset(0) = core::ptr::null();
+    return keep_raw_iterator(iter);
+}
+
+pub unsafe fn call_local_tables(
+    mut out: *mut *const Entry,
+    mut iter: *mut Iterator,
+) -> i32 {
+    static mut SLICE_CALLBACKS: IteratorCallbacks = IteratorCallbacks {
+        current: Some(
+            slice_current as unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32,
+        ),
+    };
+    static mut RAW_CALLBACKS: IteratorCallbacks = IteratorCallbacks {
+        current: Some(
+            raw_current as unsafe extern "C" fn(*mut *const Entry, *mut Iterator) -> i32,
+        ),
+    };
+    *out.offset(0) = core::ptr::null();
+    let first = SLICE_CALLBACKS.current.expect("slice")(out, iter);
+    let second = RAW_CALLBACKS.current.expect("raw")(out, iter);
+    return first + second;
+}
+"#,
+        &[
+            "*mut Iterator<'a>) -> i32>",
+            "mut iter: *mut crate::Iterator<'a>",
+        ],
+        &[
+            "slice_current as unsafe extern \"C\" fn(&mut [*const Entry], &[Iterator]) -> i32",
+            "slice_current as unsafe extern \"C\" fn(&mut [*const Entry], &mut [Iterator]) -> i32",
+            "slice_current as\n                    unsafe extern \"C\" fn(&mut [*const Entry], &[Iterator<'_>])",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_global_raw_item_callback_table_forces_callback_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub reset: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn reset_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value = 0;
+    return (*item.offset(0)).value;
+}
+
+pub static RAW_CALLBACKS: RawCallbacks = RawCallbacks {
+    reset: Some(reset_item as unsafe extern "C" fn(*mut Item) -> i32),
+};
+
+pub unsafe fn register_raw_callbacks() -> i32 {
+    return install_raw_callbacks(&RAW_CALLBACKS);
+}
+"#,
+        &[
+            "pub reset: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn reset_item(mut item: *mut crate::Item) -> i32",
+            "reset_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub reset: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn reset_item(mut item: &mut [crate::Item]) -> i32",
+            "reset_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_local_static_raw_item_callback_table_forces_callback_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub reset: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn reset_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value = 0;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_local_raw_callbacks() -> i32 {
+    static mut RAW_CALLBACKS: RawCallbacks = RawCallbacks {
+        reset: Some(reset_item as unsafe extern "C" fn(*mut Item) -> i32),
+    };
+    return install_raw_callbacks(&raw const RAW_CALLBACKS);
+}
+"#,
+        &[
+            "pub reset: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn reset_item(mut item: *mut crate::Item) -> i32",
+            "reset_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub reset: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn reset_item(mut item: &mut [crate::Item]) -> i32",
+            "reset_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_multi_field_raw_reset_free_keeps_only_raw_default_callbacks_raw() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct IteratorCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut *const Entry, *mut Item) -> i32>,
+    pub reset: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+    pub free: Option<unsafe extern "C" fn(*mut Item)>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_reset(reset: Option<unsafe extern "C" fn(*mut Item) -> i32>) -> i32;
+    pub fn install_raw_free(free: Option<unsafe extern "C" fn(*mut Item)>);
+}
+
+pub unsafe extern "C" fn set_current(
+    mut out: *mut *const Entry,
+    mut item: *mut Item,
+) -> i32 {
+    *out.offset(0) = core::ptr::null();
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe extern "C" fn reset_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value = 0;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe extern "C" fn free_item(mut item: *mut Item) {
+    (*item.offset(0)).value = -1;
+}
+
+pub static CALLBACKS: IteratorCallbacks = IteratorCallbacks {
+    current: Some(
+        set_current as unsafe extern "C" fn(*mut *const Entry, *mut Item) -> i32,
+    ),
+    reset: Some(reset_item as unsafe extern "C" fn(*mut Item) -> i32),
+    free: Some(free_item as unsafe extern "C" fn(*mut Item)),
+};
+
+pub unsafe fn dispatch_callbacks(
+    mut out: *mut *const Entry,
+    mut item: *mut Item,
+) -> i32 {
+    *out.offset(0) = core::ptr::null();
+    let result = CALLBACKS.current.expect("current")(out, item);
+    install_raw_free(CALLBACKS.free);
+    return result + install_raw_reset(CALLBACKS.reset);
+}
+"#,
+        &[
+            "fn set_current(mut out: &mut [*const crate::Entry]",
+            "mut item: &mut [crate::Item]) -> i32",
+            "pub reset: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "pub free: Option<unsafe extern \"C\" fn(*mut Item)>",
+            "fn reset_item(mut item: *mut crate::Item) -> i32",
+            "fn free_item(mut item: *mut crate::Item)",
+            "reset_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+            "free_item as unsafe extern \"C\" fn(*mut Item)",
+        ],
+        &[
+            "fn reset_item(mut item: &mut [crate::Item]) -> i32",
+            "fn free_item(mut item: &mut [crate::Item])",
+            "reset_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+            "free_item as unsafe extern \"C\" fn(&mut [Item])",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_local_variable_initializer_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn visit_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_from_local() -> i32 {
+    let cb = Some(visit_item as unsafe extern "C" fn(*mut Item) -> i32);
+    let callbacks = RawCallbacks { current: cb };
+    return install_raw_callbacks(&callbacks);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn visit_item(mut item: *mut crate::Item) -> i32",
+            "visit_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn visit_item(mut item: &mut [crate::Item]) -> i32",
+            "visit_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_assignment_from_local_variable_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn visit_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_assigned_from_local() -> i32 {
+    let cb = Some(visit_item as unsafe extern "C" fn(*mut Item) -> i32);
+    let mut callbacks = RawCallbacks { current: None };
+    callbacks.current = cb;
+    return install_raw_callbacks(&callbacks);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn visit_item(mut item: *mut crate::Item) -> i32",
+            "visit_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn visit_item(mut item: &mut [crate::Item]) -> i32",
+            "visit_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_direct_assignment_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn visit_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_direct_assignment() -> i32 {
+    let mut callbacks = RawCallbacks { current: None };
+    callbacks.current = Some(visit_item as unsafe extern "C" fn(*mut Item) -> i32);
+    return install_raw_callbacks(&callbacks);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn visit_item(mut item: *mut crate::Item) -> i32",
+            "visit_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn visit_item(mut item: &mut [crate::Item]) -> i32",
+            "visit_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_rhs_block_does_not_force_unstored_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn stored_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe extern "C" fn local_only(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 2;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_with_rhs_block(mut item: *mut Item) -> i32 {
+    let callbacks = RawCallbacks {
+        current: {
+            let _seen = if Some(
+                local_only as unsafe extern "C" fn(*mut Item) -> i32,
+            )
+            .is_some()
+            {
+                1
+            } else {
+                0
+            };
+            Some(stored_item as unsafe extern "C" fn(*mut Item) -> i32)
+        },
+    };
+    return install_raw_callbacks(&callbacks) + local_only(item);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "fn stored_item(mut item: *mut crate::Item) -> i32",
+            "stored_item as unsafe extern \"C\" fn(*mut Item) -> i32",
+            "fn local_only(mut item: &mut [crate::Item]) -> i32",
+            "local_only as",
+            "unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+        &[
+            "fn stored_item(mut item: &mut [crate::Item]) -> i32",
+            "stored_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+            "fn local_only(mut item: *mut crate::Item) -> i32",
+            "local_only as unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_type_alias_constructor_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+pub type RawCallbacksAlias = RawCallbacks;
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: *const RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn visit_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_alias_constructor() -> i32 {
+    let callbacks = RawCallbacksAlias {
+        current: Some(visit_item as unsafe extern "C" fn(*mut Item) -> i32),
+    };
+    return install_raw_callbacks(&callbacks);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "type RawCallbacksAlias = RawCallbacks",
+            "fn visit_item(mut item: *mut crate::Item) -> i32",
+            "visit_item as",
+            "unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "type RawCallbacksAlias = RawCallbacks<'",
+            "fn visit_item(mut item: &mut [crate::Item]) -> i32",
+            "visit_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_foreign_by_value_boundary_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Item {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RawCallbacks {
+    pub current: Option<unsafe extern "C" fn(*mut Item) -> i32>,
+}
+
+unsafe extern "C" {
+    pub fn install_raw_callbacks(callbacks: RawCallbacks) -> i32;
+}
+
+pub unsafe extern "C" fn visit_item(mut item: *mut Item) -> i32 {
+    (*item.offset(0)).value += 1;
+    return (*item.offset(0)).value;
+}
+
+pub unsafe fn register_by_value() -> i32 {
+    let callbacks = RawCallbacks {
+        current: Some(visit_item as unsafe extern "C" fn(*mut Item) -> i32),
+    };
+    return install_raw_callbacks(callbacks);
+}
+"#,
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(*mut Item) -> i32>",
+            "pub fn install_raw_callbacks(callbacks: RawCallbacks)",
+            "fn visit_item(mut item: *mut crate::Item) -> i32",
+            "visit_item as",
+            "unsafe extern \"C\" fn(*mut Item) -> i32",
+        ],
+        &[
+            "pub current: Option<unsafe extern \"C\" fn(&mut [Item]) -> i32>",
+            "fn visit_item(mut item: &mut [crate::Item]) -> i32",
+            "visit_item as unsafe extern \"C\" fn(&mut [Item]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_helper_param_pushes_back_to_callback() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct DiffFile {
+    pub flags: i32,
+}
+
+pub type git_diff_file_cb =
+    Option<unsafe extern "C" fn(*mut DiffFile) -> i32>;
+
+#[repr(C)]
+pub struct DiffOutput {
+    pub file_cb: git_diff_file_cb,
+}
+
+unsafe extern "C" {
+    pub fn install_diff_output(out: *const DiffOutput) -> i32;
+}
+
+pub unsafe extern "C" fn patch_generated_file_cb(mut file: *mut DiffFile) -> i32 {
+    (*file.offset(0)).flags += 1;
+    return (*file.offset(0)).flags;
+}
+
+pub unsafe fn diff_output_init(
+    mut out: *mut DiffOutput,
+    file_cb: git_diff_file_cb,
+) {
+    (*out).file_cb = file_cb;
+}
+
+pub unsafe fn generate_patch_output() -> i32 {
+    let mut out = DiffOutput { file_cb: None };
+    diff_output_init(
+        &raw mut out,
+        Some(patch_generated_file_cb as unsafe extern "C" fn(*mut DiffFile) -> i32),
+    );
+    return install_diff_output(&raw const out);
+}
+"#,
+        &[
+            "type git_diff_file_cb =",
+            "Option<unsafe extern \"C\" fn(*mut DiffFile) -> i32>",
+            "pub file_cb: git_diff_file_cb",
+            "file_cb: git_diff_file_cb",
+            "fn patch_generated_file_cb",
+            "mut file:",
+            "*mut crate::DiffFile",
+            "patch_generated_file_cb as",
+            "unsafe extern \"C\" fn(*mut DiffFile) -> i32",
+        ],
+        &[
+            "type git_diff_file_cb = Option<unsafe extern \"C\" fn(&mut [DiffFile]) -> i32>",
+            "fn patch_generated_file_cb(mut file: &mut [crate::DiffFile]) -> i32",
+            "unsafe extern \"C\" fn(&mut [DiffFile]) -> i32",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_fn_ptr_raw_field_result_return_pushes_back_to_callback_call() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Transport {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub hits: i32,
+}
+
+pub type git_transport_cb =
+    Option<unsafe extern "C" fn(*mut *mut Transport, *mut Remote, *mut i32) -> i32>;
+
+#[repr(C)]
+pub struct TransportDefinition {
+    pub callback: git_transport_cb,
+}
+
+unsafe extern "C" {
+    pub fn register_transport_definition(definition: *const TransportDefinition) -> i32;
+}
+
+pub unsafe extern "C" fn local_transport_cb(
+    mut out: *mut *mut Transport,
+    mut owner: *mut Remote,
+    mut param: *mut i32,
+) -> i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    (*owner.offset(0)).hits += *param.offset(0);
+    return (*owner.offset(0)).hits;
+}
+
+pub static TRANSPORT_DEFINITION: TransportDefinition = TransportDefinition {
+    callback: Some(
+        local_transport_cb
+            as unsafe extern "C" fn(*mut *mut Transport, *mut Remote, *mut i32) -> i32,
+    ),
+};
+
+pub unsafe fn transport_find_fn() -> Result<git_transport_cb, i32> {
+    register_transport_definition(&raw const TRANSPORT_DEFINITION);
+    return Ok(TRANSPORT_DEFINITION.callback);
+}
+
+pub unsafe fn dispatch_transport(
+    mut owner: *mut Remote,
+    mut param: *mut i32,
+) -> i32 {
+    let mut out: *mut Transport = core::ptr::null_mut();
+    let fn_0 = transport_find_fn().unwrap();
+    return fn_0.expect("transport")(&mut out, owner, param);
+}
+"#,
+        &[
+            "type git_transport_cb =",
+            "Option<unsafe extern \"C\" fn(*mut *mut Transport, *mut Remote,",
+            "*mut i32)",
+            "-> i32>",
+            "pub callback: git_transport_cb",
+            "Result<git_transport_cb, i32>",
+            "fn local_transport_cb",
+            "mut out:",
+            "*mut *mut crate::Transport",
+            "mut owner: *mut crate::Remote",
+            "mut param: *mut i32",
+            "local_transport_cb as",
+            "unsafe extern \"C\" fn(*mut *mut Transport, *mut Remote,",
+            "*mut i32) -> i32",
+            "let mut out: *mut crate::Transport",
+            "fn_0.expect(\"transport\")",
+        ],
+        &[
+            "type git_transport_cb = Option<unsafe extern \"C\" fn(&mut [*mut Transport]",
+            "fn local_transport_cb(mut out: &mut [*mut crate::Transport]",
+            "mut owner: &mut [crate::Remote]",
+            "mut param: &mut [i32]",
+            "let mut out: &mut [crate::Transport]",
+            "as_mut_ptr()",
+            "&raw mut (out) as",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_const_offset_reads_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub version: u32,
+}
+
+pub unsafe fn read_header_fields(mut data: *const u8, idx: isize) -> u32 {
+    let signature = (*((data).offset(idx) as *const Header)).signature;
+    let version = (*((data).offset(idx) as *const Header)).version;
+    return signature.wrapping_add(version);
+}
+"#,
+        &["fn read_header_fields", "signature", "version"],
+        &[
+            "[(idx) as isize].signature",
+            "[(idx) as isize].version",
+            "[(idx) as usize].signature",
+            "[(idx) as usize].version",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_option_unwrap_reads_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub flags: u32,
+}
+
+pub unsafe fn read_optional_header(mut data: *const u8, hdr_idx: Option<isize>) -> u32 {
+    if hdr_idx.is_none() {
+        return 0;
+    }
+    let signature = (*((data).offset(hdr_idx.unwrap()) as *const Header)).signature;
+    let flags = (*((data).offset(hdr_idx.unwrap()) as *const Header)).flags;
+    return signature ^ flags;
+}
+"#,
+        &["fn read_optional_header", "signature", "flags"],
+        &[
+            "[(hdr_idx.unwrap()) as isize].signature",
+            "[(hdr_idx.unwrap()) as isize].flags",
+            "[(hdr_idx.unwrap()) as usize].signature",
+            "[(hdr_idx.unwrap()) as usize].flags",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_mut_offset_write_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub version: u32,
+}
+
+pub unsafe fn write_header_version(mut data: *mut u8, idx: isize) -> u32 {
+    (*((data).offset(idx) as *mut Header)).version = 2;
+    return (*((data).offset(idx) as *mut Header)).version;
+}
+"#,
+        &["fn write_header_version", "version"],
+        &[
+            "[(idx) as isize].version = 2",
+            "[(idx) as isize].version",
+            "[(idx) as usize].version = 2",
+            "[(idx) as usize].version",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_nonzero_repeated_offset_reads_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub length: u32,
+}
+
+pub unsafe fn read_later_header_twice(mut data: *const u8, idx: isize) -> u32 {
+    let hdr_off = idx + 8isize;
+    let signature = (*((data).offset(hdr_off) as *const Header)).signature;
+    let length = (*((data).offset(hdr_off) as *const Header)).length;
+    return signature.wrapping_add(length);
+}
+"#,
+        &["fn read_later_header_twice", "signature", "length"],
+        &[
+            "[(hdr_off) as isize].signature",
+            "[(hdr_off) as isize].length",
+            "[(hdr_off) as usize].signature",
+            "[(hdr_off) as usize].length",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_chained_offsets_before_cast_read_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub version: u32,
+}
+
+pub unsafe fn read_chained_header_signature(mut data: *const u8, a: isize, b: isize) -> u32 {
+    let signature = (*((data.offset(a).offset(b)) as *const Header)).signature;
+    return signature;
+}
+"#,
+        &["fn read_chained_header_signature", "signature"],
+        &[
+            "[(a) as isize].signature",
+            "[(a) as usize].signature",
+            "[(b) as isize].signature",
+            "[(b) as usize].signature",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_cast_before_offset_read_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub version: u32,
+}
+
+pub unsafe fn read_cast_before_offset_header_signature(mut data: *const u8, idx: isize) -> u32 {
+    let signature = (*((data as *const Header).offset(idx))).signature;
+    return signature;
+}
+"#,
+        &["fn read_cast_before_offset_header_signature", "signature"],
+        &[
+            "(data)[(idx) as isize].signature",
+            "(data)[(idx) as usize].signature",
+            "data[(idx) as isize].signature",
+            "data[(idx) as usize].signature",
+        ],
+    );
+}
+
+#[test]
+fn test_root2_cursor_cast_field_mut_cast_before_offset_write_typecheck() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub signature: u32,
+    pub version: u32,
+}
+
+pub unsafe fn write_cast_before_offset_header_version(mut data: *mut u8, idx: isize) {
+    (*((data as *mut Header).offset(idx))).version = 7;
+}
+"#,
+        &["fn write_cast_before_offset_header_version", "version"],
+        &[
+            "(data)[(idx) as isize].version",
+            "(data)[(idx) as usize].version",
+            "data[(idx) as isize].version",
+            "data[(idx) as usize].version",
+        ],
+    );
+}
+
+#[test]
 fn test_fn_ptr_contract_option_param_expect_callee_uses_rewritten_arg_contract() {
     run_test(
         r#"
