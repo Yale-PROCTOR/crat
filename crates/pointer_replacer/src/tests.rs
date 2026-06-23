@@ -1214,6 +1214,187 @@ pub unsafe fn caller(s: *mut State) -> i32 {
 }
 
 #[test]
+fn test_rewriter_same_call_scalar_output_and_copy_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn checked_add(mut out: *mut i32, old: i32, add: i32) -> i32 {
+    *out.offset(0) = old + add;
+    return 0;
+}
+
+pub unsafe fn caller() -> i32 {
+    let mut len: i32 = 4;
+    checked_add(&mut len, len, 1);
+    return len;
+}
+"#,
+        &[
+            "pub unsafe fn checked_add(mut out: &mut [i32], old: i32, add: i32) -> i32",
+            "let __crat_same_call_0_len = len;",
+            "std::slice::from_mut(&mut (len))",
+        ],
+        &[
+            "checked_add(std::slice::from_mut(&mut (len)), len, 1)",
+            "pub unsafe fn checked_add(mut out: *mut i32",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_same_call_scalar_output_and_expression_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn checked_add(mut out: *mut i32, old: i32, add: i32) -> i32 {
+    *out.offset(0) = old + add;
+    return 0;
+}
+
+pub unsafe fn caller(delta: i32) -> i32 {
+    let mut len: i32 = 4;
+    checked_add(&mut len, len + delta, 1);
+    return len;
+}
+"#,
+        &[
+            "pub unsafe fn checked_add(mut out: &mut [i32], old: i32, add: i32) -> i32",
+            "let __crat_same_call_0_len = len;",
+            "std::slice::from_mut(&mut (len))",
+        ],
+        &[
+            "checked_add(std::slice::from_mut(&mut (len)), len + delta, 1)",
+            "pub unsafe fn checked_add(mut out: *mut i32",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_same_call_pointer_output_and_copy_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn open_slot(
+    mut out: *mut *mut core::ffi::c_void,
+    current: *mut core::ffi::c_void,
+    level: i32,
+) -> i32 {
+    *out.offset(0) = current;
+    return level;
+}
+
+pub unsafe fn caller(mut config: *mut core::ffi::c_void, level: i32) -> i32 {
+    open_slot(&mut config, config, level);
+    return level;
+}
+"#,
+        &[
+            "pub unsafe fn open_slot(mut out: &mut [*mut std::ffi::c_void]",
+            "let __crat_same_call_0_config = config;",
+            "std::slice::from_mut(&mut (config))",
+        ],
+        &[
+            "open_slot(std::slice::from_mut(&mut (config)), config, level)",
+            "pub unsafe fn open_slot(mut out: *mut *mut core::ffi::c_void",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_same_call_pointer_output_and_slice_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn open_level(mut out: *mut *mut i32, values: *const i32, level: i32) -> i32 {
+    *out.offset(0) = values as *mut i32;
+    return *values.offset(level as isize);
+}
+
+pub unsafe fn caller(level: i32) -> i32 {
+    let mut config: *mut i32 = core::ptr::null_mut();
+    open_level(&mut config, config, level);
+    return level;
+}
+"#,
+        &[
+            "pub unsafe fn open_level(mut out: &mut [*mut i32]",
+            "values: crate::slice_cursor::SliceCursor<'_, i32>",
+            "let __crat_same_call_0_config = config;",
+            "std::slice::from_mut(&mut (config))",
+            "crate::slice_cursor::SliceCursor::from_raw_parts",
+        ],
+        &[
+            "open_level(std::slice::from_mut(&mut (config)), config, level)",
+            "std::slice::from_mut(&mut (config)),\n        if (config).is_null()",
+            "pub unsafe fn open_level(mut out: *mut *mut i32",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_same_call_multiple_outputs_and_later_copy_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn fill_offsets(
+    mut base_out: *mut i64,
+    mut aux_out: *mut i32,
+    mut curpos_out: *mut i64,
+    base: i64,
+) -> i32 {
+    *base_out.offset(0) = base + 1;
+    *aux_out.offset(0) = 7;
+    *curpos_out.offset(0) = base + 2;
+    return 0;
+}
+
+pub unsafe fn caller() -> i64 {
+    let mut base_offset: i64 = 10;
+    let mut aux: i32 = 0;
+    let mut curpos: i64 = 0;
+    fill_offsets(&mut base_offset, &mut aux, &mut curpos, base_offset);
+    return base_offset + curpos + aux as i64;
+}
+"#,
+        &[
+            "pub unsafe fn fill_offsets(mut base_out: &mut [i64]",
+            "mut aux_out: &mut [i32]",
+            "mut curpos_out: &mut [i64]",
+            "let __crat_same_call_0_base_offset = base_offset;",
+            "std::slice::from_mut(&mut (base_offset))",
+            "std::slice::from_mut(&mut (curpos))",
+        ],
+        &[
+            "std::slice::from_mut(&mut (curpos)),\n        base_offset)",
+            "std::slice::from_mut(&mut (curpos)), base_offset)",
+            "pub unsafe fn fill_offsets(mut base_out: *mut i64",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_same_call_signed_helper_output_and_copy_read_uses_temporary() {
+    run_test(
+        r#"
+pub unsafe fn sub_int_overflow(mut out: *mut i32, old: i32, sub: i32) -> i32 {
+    *out.offset(0) = old - sub;
+    return 0;
+}
+
+pub unsafe fn caller(oldlines: i32) -> i32 {
+    let mut old_lineno: i32 = 99;
+    sub_int_overflow(&mut old_lineno, old_lineno, oldlines);
+    return old_lineno;
+}
+"#,
+        &[
+            "pub unsafe fn sub_int_overflow(mut out: &mut [i32]",
+            "let __crat_same_call_0_old_lineno = old_lineno;",
+            "std::slice::from_mut(&mut (old_lineno))",
+        ],
+        &[
+            "sub_int_overflow(std::slice::from_mut(&mut (old_lineno)), old_lineno",
+            "pub unsafe fn sub_int_overflow(mut out: *mut i32",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_keeps_shared_local_struct_array_field_as_mut_ptr_views_safe() {
     run_test(
         r#"

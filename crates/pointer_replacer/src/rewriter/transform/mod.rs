@@ -78,6 +78,7 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     bytemuck_classifier: RefCell<BytemuckTypeClassifier<'tcx>>,
     pub slice_cursor: Cell<bool>,
     item_initializer_depth: usize,
+    same_call_temp_counter: Cell<usize>,
     diagnostics: DecisionDiagnostics,
 }
 
@@ -1255,23 +1256,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     return;
                 }
 
+                let arg_param_kinds = hargs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, harg)| self.call_arg_param_kind(harg, i, sig_dec, fn_ptr_decisions))
+                    .collect::<Vec<_>>();
+                let same_call_temp_plan =
+                    self.same_call_temp_plan(hir_expr, hargs, &arg_param_kinds);
+                self.rewrite_same_call_temp_args(args, &same_call_temp_plan);
+
                 for (i, (arg, harg)) in args.iter_mut().zip(hargs).enumerate() {
                     let ty = typeck.expr_ty_adjusted(harg);
-                    let param_kind = sig_dec
-                        .and_then(|sig| sig.input_decs.get(i).copied())
-                        .flatten()
-                        .or_else(|| {
-                            fn_ptr_decisions
-                                .and_then(|decs| decs.get(i).copied())
-                                .flatten()
-                        })
-                        .or_else(|| {
-                            unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
-                                PtrKind::Raw(
-                                    self.get_mutability_decision(harg).unwrap_or(m.is_mut()),
-                                )
-                            })
-                        });
+                    let param_kind = arg_param_kinds.get(i).copied().flatten();
                     let Some(param_kind) = param_kind else { continue };
 
                     self.transform_rhs(arg, harg, param_kind);
@@ -1325,6 +1321,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
                 hoist_opt_ref_borrow(expr);
+                self.wrap_same_call_temp_call(expr, &same_call_temp_plan);
             }
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "is_null" =>
@@ -1592,6 +1589,48 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 enum PtrCtx {
     Rhs(PtrKind),
     Deref(bool),
+}
+
+#[derive(Clone, Debug)]
+struct SameCallTemp {
+    local_hir_id: HirId,
+    local_name: Symbol,
+    temp_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct SameCallTempPlan {
+    temps: Vec<SameCallTemp>,
+    arg_replacements: Vec<FxHashMap<HirId, String>>,
+}
+
+impl SameCallTempPlan {
+    fn new(arg_count: usize) -> Self {
+        Self {
+            temps: Vec::new(),
+            arg_replacements: std::iter::repeat_with(FxHashMap::default)
+                .take(arg_count)
+                .collect(),
+        }
+    }
+
+    fn push_temp(&mut self, temp: SameCallTemp) {
+        self.temps.push(temp);
+    }
+
+    fn temp_for_local(&self, local_hir_id: HirId) -> Option<String> {
+        self.temps
+            .iter()
+            .find(|temp| temp.local_hir_id == local_hir_id)
+            .map(|temp| temp.temp_name.clone())
+    }
+
+    fn local_name(&self, local_hir_id: HirId) -> Option<Symbol> {
+        self.temps
+            .iter()
+            .find(|temp| temp.local_hir_id == local_hir_id)
+            .map(|temp| temp.local_name)
+    }
 }
 
 fn is_c_exposed_fn(tcx: TyCtxt<'_>, did: LocalDefId, c_exposed_fns: &FxHashSet<String>) -> bool {
@@ -2515,6 +2554,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             bytemuck_classifier: RefCell::new(BytemuckTypeClassifier::new(rust_program.tcx)),
             slice_cursor: Cell::new(false),
             item_initializer_depth: 0,
+            same_call_temp_counter: Cell::new(0),
             diagnostics,
         };
         visitor.item_lifetime_plans = visitor.build_item_lifetime_plans();
@@ -10251,6 +10291,123 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn call_arg_param_kind(
+        &self,
+        harg: &hir::Expr<'tcx>,
+        arg_index: usize,
+        sig_dec: Option<&SigDecision>,
+        fn_ptr_decisions: Option<&Vec<Option<PtrKind>>>,
+    ) -> Option<PtrKind> {
+        let ty = self.tcx.typeck(harg.hir_id.owner).expr_ty_adjusted(harg);
+        sig_dec
+            .and_then(|sig| sig.input_decs.get(arg_index).copied())
+            .flatten()
+            .or_else(|| {
+                fn_ptr_decisions
+                    .and_then(|decs| decs.get(arg_index).copied())
+                    .flatten()
+            })
+            .or_else(|| {
+                unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
+                    PtrKind::Raw(self.get_mutability_decision(harg).unwrap_or(m.is_mut()))
+                })
+            })
+    }
+
+    fn same_call_temp_plan(
+        &self,
+        hir_call: &hir::Expr<'tcx>,
+        hargs: &'tcx [hir::Expr<'tcx>],
+        arg_param_kinds: &[Option<PtrKind>],
+    ) -> SameCallTempPlan {
+        let mut plan = SameCallTempPlan::new(hargs.len());
+        for (source_index, (harg, param_kind)) in hargs.iter().zip(arg_param_kinds).enumerate() {
+            if !param_kind.is_some_and(is_mutable_borrow_like_decision) {
+                continue;
+            }
+            let Some((local_hir_id, true)) = hir_addr_local(harg) else {
+                continue;
+            };
+            if same_call_has_other_mutable_borrow_of_local(
+                hargs,
+                arg_param_kinds,
+                source_index,
+                local_hir_id,
+            ) {
+                continue;
+            }
+            if !self.same_call_temp_local_is_copy(hir_call, local_hir_id) {
+                continue;
+            }
+            for later_index in source_index + 1..hargs.len() {
+                let later_arg = &hargs[later_index];
+                if !hir_arg_has_tempable_same_call_local_read(later_arg, local_hir_id) {
+                    continue;
+                }
+                if hargs[source_index + 1..later_index]
+                    .iter()
+                    .any(|arg| hir_arg_blocks_same_call_temp_snapshot(arg, local_hir_id))
+                {
+                    continue;
+                }
+                let temp_name = plan.temp_for_local(local_hir_id).unwrap_or_else(|| {
+                    let local_name = self.tcx.hir_name(local_hir_id);
+                    let counter = self.same_call_temp_counter.get();
+                    self.same_call_temp_counter.set(counter + 1);
+                    let temp_name = same_call_temp_name(counter, local_name.as_str());
+                    plan.push_temp(SameCallTemp {
+                        local_hir_id,
+                        local_name,
+                        temp_name: temp_name.clone(),
+                    });
+                    temp_name
+                });
+                plan.arg_replacements[later_index].insert(local_hir_id, temp_name);
+            }
+        }
+        plan
+    }
+
+    fn same_call_temp_local_is_copy(
+        &self,
+        hir_call: &hir::Expr<'tcx>,
+        local_hir_id: HirId,
+    ) -> bool {
+        let typing_env = ty::TypingEnv::post_analysis(self.tcx, hir_call.hir_id.owner.def_id);
+        let local_ty = self.tcx.typeck(local_hir_id.owner).node_type(local_hir_id);
+        self.tcx.type_is_copy_modulo_regions(typing_env, local_ty)
+    }
+
+    fn rewrite_same_call_temp_args(&self, args: &mut [P<Expr>], plan: &SameCallTempPlan) {
+        for (arg, replacements) in args.iter_mut().zip(&plan.arg_replacements) {
+            if replacements.is_empty() {
+                continue;
+            }
+            let mut rewriter = SameCallTempPathRewriter {
+                tcx: self.tcx,
+                ast_to_hir: &self.ast_to_hir,
+                replacements,
+                target_names: replacements
+                    .keys()
+                    .filter_map(|hir_id| plan.local_name(*hir_id))
+                    .collect(),
+            };
+            rewriter.visit_expr(arg);
+        }
+    }
+
+    fn wrap_same_call_temp_call(&self, expr: &mut Expr, plan: &SameCallTempPlan) {
+        if plan.temps.is_empty() {
+            return;
+        }
+        let mut lets = String::new();
+        for temp in &plan.temps {
+            use std::fmt::Write as _;
+            write!(&mut lets, "let {} = {};", temp.temp_name, temp.local_name).unwrap();
+        }
+        *expr = utils::expr!("{{ {lets} {} }}", pprust::expr_to_string(expr));
+    }
+
     fn ptr_expr<'a>(
         &self,
         expr: &'a Expr,
@@ -15011,6 +15168,127 @@ fn hir_path_source_kind(
         unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
             .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
     })
+}
+
+fn hir_expr_contains_local(expr: &hir::Expr<'_>, target: HirId) -> bool {
+    hir_local_ids_in_expr(expr).contains(&target)
+}
+
+fn same_call_has_other_mutable_borrow_of_local(
+    hargs: &[hir::Expr<'_>],
+    arg_param_kinds: &[Option<PtrKind>],
+    source_index: usize,
+    target: HirId,
+) -> bool {
+    hargs
+        .iter()
+        .zip(arg_param_kinds)
+        .enumerate()
+        .any(|(idx, (harg, param_kind))| {
+            idx != source_index
+                && param_kind.is_some_and(is_mutable_borrow_like_decision)
+                && hir_addr_local(harg) == Some((target, true))
+        })
+}
+
+fn hir_arg_blocks_same_call_temp_snapshot(expr: &hir::Expr<'_>, target: HirId) -> bool {
+    struct BlockingUseVisitor {
+        target: HirId,
+        blocked: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for BlockingUseVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.blocked {
+                return;
+            }
+            match expr.kind {
+                hir::ExprKind::Closure(_) => {
+                    self.blocked = true;
+                }
+                hir::ExprKind::Assign(lhs, _, _) | hir::ExprKind::AssignOp(_, lhs, _) => {
+                    if hir_expr_contains_local(lhs, self.target) {
+                        self.blocked = true;
+                    }
+                }
+                hir::ExprKind::AddrOf(_, mutability, pointee)
+                    if mutability.is_mut() && hir_expr_contains_local(pointee, self.target) =>
+                {
+                    self.blocked = true;
+                }
+                _ => {}
+            }
+            if !self.blocked {
+                intravisit::walk_expr(self, expr);
+            }
+        }
+    }
+
+    let mut visitor = BlockingUseVisitor {
+        target,
+        blocked: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.blocked
+}
+
+fn hir_arg_has_tempable_same_call_local_read(expr: &hir::Expr<'_>, target: HirId) -> bool {
+    struct LocalReadVisitor {
+        target: HirId,
+        found_read: bool,
+        blocked: bool,
+    }
+
+    impl<'tcx> Visitor<'tcx> for LocalReadVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.blocked {
+                return;
+            }
+            match expr.kind {
+                hir::ExprKind::Closure(_) => {
+                    self.blocked = true;
+                    return;
+                }
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if hir_expr_contains_local(lhs, self.target) {
+                        self.blocked = true;
+                        return;
+                    }
+                    self.visit_expr(rhs);
+                    return;
+                }
+                hir::ExprKind::AssignOp(_, lhs, rhs) => {
+                    if hir_expr_contains_local(lhs, self.target) {
+                        self.blocked = true;
+                        return;
+                    }
+                    self.visit_expr(rhs);
+                    return;
+                }
+                hir::ExprKind::AddrOf(_, mutability, pointee)
+                    if mutability.is_mut() && hir_expr_contains_local(pointee, self.target) =>
+                {
+                    self.blocked = true;
+                    return;
+                }
+                _ => {}
+            }
+
+            if hir_unwrapped_local_id(expr) == Some(self.target) {
+                self.found_read = true;
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = LocalReadVisitor {
+        target,
+        found_read: false,
+        blocked: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.found_read && !visitor.blocked
 }
 
 fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
@@ -20260,6 +20538,91 @@ impl mut_visit::MutVisitor for CapturePathRewriter<'_> {
             *expr = utils::expr!("{}", self.to);
         }
     }
+}
+
+struct SameCallTempPathRewriter<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &'a AstToHir,
+    replacements: &'a FxHashMap<HirId, String>,
+    target_names: FxHashSet<Symbol>,
+}
+
+impl MutVisitor for SameCallTempPathRewriter<'_, '_> {
+    fn visit_block(&mut self, block: &mut Block) {
+        if block_binds_any_same_call_temp_target(block, &self.target_names) {
+            return;
+        }
+        mut_visit::walk_block(self, block);
+    }
+
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if matches!(expr.kind, ExprKind::Closure(_)) {
+            return;
+        }
+        if let ExprKind::Path(_, _) = &expr.kind
+            && let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx)
+            && let Some(hir_id) = hir_unwrapped_local_id(hir_expr)
+            && let Some(temp_name) = self.replacements.get(&hir_id)
+        {
+            *expr = utils::expr!("{temp_name}");
+            return;
+        }
+        mut_visit::walk_expr(self, expr);
+    }
+}
+
+fn block_binds_any_same_call_temp_target(
+    block: &mut Block,
+    target_names: &FxHashSet<Symbol>,
+) -> bool {
+    struct ShadowingBindingVisitor<'a> {
+        target_names: &'a FxHashSet<Symbol>,
+        found: bool,
+    }
+
+    impl MutVisitor for ShadowingBindingVisitor<'_> {
+        fn visit_pat(&mut self, pat: &mut Pat) {
+            if self.found {
+                return;
+            }
+            if let PatKind::Ident(_, ident, _) = &pat.kind
+                && self.target_names.contains(&ident.name)
+            {
+                self.found = true;
+                return;
+            }
+            mut_visit::walk_pat(self, pat);
+        }
+
+        fn visit_expr(&mut self, expr: &mut Expr) {
+            if self.found || matches!(expr.kind, ExprKind::Closure(_)) {
+                return;
+            }
+            mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = ShadowingBindingVisitor {
+        target_names,
+        found: false,
+    };
+    mut_visit::walk_block(&mut visitor, block);
+    visitor.found
+}
+
+fn same_call_temp_name(counter: usize, local_name: &str) -> String {
+    let mut component = String::new();
+    for c in local_name.chars() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            component.push(c);
+        } else {
+            component.push('_');
+        }
+    }
+    if component.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        component.insert(0, '_');
+    }
+    format!("__crat_same_call_{counter}_{component}")
 }
 
 fn unwrap_opt_deref_call(expr: &mut Expr) -> Option<(Symbol, bool)> {
