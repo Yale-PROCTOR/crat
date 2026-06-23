@@ -8,6 +8,7 @@ use std::ops::Range;
 
 mod domain;
 mod infer;
+pub(crate) mod borrow_verify;
 pub mod coherence;
 pub mod crate_slots;
 pub mod resolve;

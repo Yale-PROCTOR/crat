@@ -9716,6 +9716,7 @@ mod borrow_ownership_coherence {
         analyses::{
             borrow_ownership::{
                 CrateCtxt, SlotKind,
+                borrow_verify::revalidate,
                 coherence::add_coherence,
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -9795,6 +9796,20 @@ mod borrow_ownership_coherence {
             .unwrap_or_else(|| panic!("slot for local {local:?} depth {depth}"));
 
         SlotRef::Local(fn_did, slot)
+    }
+
+    /// The `Local` whose source-level variable name is `name`, via MIR debug info.
+    fn local_by_var_name(tcx: TyCtxt<'_>, did: LocalDefId, name: &str) -> Local {
+        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+        for vdi in body.var_debug_info.iter() {
+            if vdi.name.as_str() == name
+                && let rustc_middle::mir::VarDebugInfoContents::Place(place) = &vdi.value
+                && let Some(local) = place.as_local()
+            {
+                return local;
+            }
+        }
+        panic!("no local named `{name}` in {did:?}");
     }
 
     #[test]
@@ -10276,6 +10291,71 @@ pub unsafe fn passes_through(p: *mut i32) {
                     model.get(&q),
                     Some(&SlotKind::Ref),
                     "callee `q` stays Ref"
+                );
+            },
+        );
+    }
+
+    /// BB0 (§8 borrow seam): the verifier adapter. `revalidate` runs the production
+    /// borrow pipeline with a BO-model-derived ref-candidacy (here all-Ref = Round-0)
+    /// and maps the conflict edges back to BO `SlotRef`s. The fixture is the borrow
+    /// analysis's own `proof_of_concept` conflict (production demotes `r2`), so the
+    /// result must be NON-EMPTY (non-vacuous) and every involved slot must be a real
+    /// depth-0 local slot of `f`. This proves candidacy-from-model + borrow_inference
+    /// + error extraction + owner→SlotRef translation end-to-end.
+    #[test]
+    fn bb0_revalidate_maps_round0_borrow_conflict_to_slots() {
+        run_compiler(
+            r#"
+unsafe fn f(mut p: *mut i32) -> i32 {
+    let mut r1 = p;
+    let mut r2 = r1;
+    let mut q = r1;
+    *q = 1;
+    *r1 = 2;
+    *r2 = 3;
+    *p = 4;
+    *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let slots = CrateSlots::build(&program);
+
+                // All-Ref Round-0 candidacy + all-mutable (so conflicts register —
+                // `invalidates` skips immutable-base loans).
+                let conflicts = revalidate(&program, &slots, |_| true, true);
+                let f_conflicts = conflicts.get(&f).map(Vec::as_slice).unwrap_or(&[]);
+
+                assert!(
+                    !f_conflicts.is_empty(),
+                    "all-Ref Round-0 borrow inference must surface the `r2` conflict"
+                );
+
+                // Every involved slot is a real depth-0 local of `f`.
+                let involved: Vec<SlotRef> = f_conflicts
+                    .iter()
+                    .flat_map(|c| c.issuer.iter().chain(c.requirers.iter()).copied())
+                    .collect();
+                for s in &involved {
+                    assert!(
+                        matches!(s, SlotRef::Local(d, _) if *d == f),
+                        "every involved slot is a depth-0 local of `f`, got {s:?}"
+                    );
+                }
+
+                // The conflict is concretely attributed (not an empty edge): at least
+                // one issuer, and `r2` — the local production ultimately demotes, so
+                // necessarily a requirer of the round-0 invalid loan — is involved.
+                assert!(
+                    f_conflicts.iter().any(|c| c.issuer.is_some()),
+                    "the conflict must carry a concrete issuer (the loan's assigned owner)"
+                );
+                let r2_slot = local_slot(&slots, f, local_by_var_name(tcx, f, "r2"), 0);
+                assert!(
+                    involved.contains(&r2_slot),
+                    "`r2`'s depth-0 slot must be in the round-0 conflict; involved = {involved:?}"
                 );
             },
         );
