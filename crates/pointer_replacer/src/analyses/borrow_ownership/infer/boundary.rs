@@ -143,79 +143,47 @@ where 'tcx: 'infercx
             if let Some(param) = param.clone()
                 && let Some((arg, is_ref)) = arg.clone()
             {
-                match param {
-                    crate::analyses::borrow_ownership::Param::Output(output_param) => {
-                        let mut output_param = output_param.transpose();
-                        assert!(output_param.size_hint().1.unwrap() > 0);
-                        let ty = if is_ref {
-                            let _ = output_param.next().unwrap();
-                            ty.builtin_deref(true).unwrap()
-                        } else {
-                            ty
-                        };
-                        let arg = arg.transpose();
+                // B4: every arg is `Param::Output` (uniform two-slot Consume);
+                // `Param::Normal` is only the RETURN (handled above). The old
+                // `Param::Normal` arm — `push_linear` plus a c_void range-narrowing
+                // "working around type cast" — became unreachable when
+                // `output_params` was retired, so it is deleted. (If real-corpus
+                // c_void local-call args ever need that narrowing for correct
+                // classification, it must be re-added to this Output arm; the
+                // `c_void_local_call_arg_emits` test guards that the path at least
+                // stays panic-free and satisfiable.)
+                let crate::analyses::borrow_ownership::Param::Output(output_param) = param else {
+                    unreachable!("B4: call args are always Param::Output");
+                };
+                let mut output_param = output_param.transpose();
+                assert!(output_param.size_hint().1.unwrap() > 0);
+                let ty = if is_ref {
+                    let _ = output_param.next().unwrap();
+                    ty.builtin_deref(true).unwrap()
+                } else {
+                    ty
+                };
+                let arg = arg.transpose();
 
-                        matcher(
-                            ty,
-                            output_param,
-                            arg,
-                            infer_cx.struct_ctxt.unrestricted,
-                            infer_cx.database,
-                            |param, arg, database| {
-                                database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                                    (),
-                                    param.r#use,
-                                    arg.r#use,
-                                );
-                                database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                                    (),
-                                    param.def,
-                                    arg.def,
-                                );
-                            },
+                matcher(
+                    ty,
+                    output_param,
+                    arg,
+                    infer_cx.struct_ctxt.unrestricted,
+                    infer_cx.database,
+                    |param, arg, database| {
+                        database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            param.r#use,
+                            arg.r#use,
                         );
-                    }
-                    crate::analyses::borrow_ownership::Param::Normal(param) => {
-                        let mut param = param;
-                        let ty = if is_ref {
-                            tracing::debug!(
-                                "bad output parameter analysis for {}!",
-                                infer_cx.tcx.def_path_str(callee)
-                            );
-                            let _ = param.next().unwrap();
-                            ty.builtin_deref(true).unwrap()
-                        } else {
-                            ty
-                        };
-
-                        // FIXME working around type cast
-                        let mut arg = arg;
-                        if let Some(pointee_ty) = ty.builtin_deref(true)
-                            && format!("{pointee_ty}").ends_with("c_void")
-                        {
-                            arg.r#use = arg.r#use.start..arg.r#use.start + 1u32;
-                            arg.def = arg.def.start..arg.def.start + 1u32;
-                        }
-
-                        let arg = arg.transpose();
-
-                        matcher(
-                            ty,
-                            param,
-                            arg,
-                            infer_cx.struct_ctxt.unrestricted,
-                            infer_cx.database,
-                            |param, arg, database| {
-                                database.push_linear::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                                    (),
-                                    param,
-                                    arg.def,
-                                    arg.r#use,
-                                );
-                            },
+                        database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            param.def,
+                            arg.def,
                         );
-                    }
-                }
+                    },
+                );
             }
         }
     }
@@ -242,7 +210,6 @@ where 'tcx: 'infercx
         ) {
             match (input, sigs) {
                 (Some(input), Some(sigs)) => {
-                    let is_output = sigs.is_output();
                     let input_sigs = sigs.clone().into_input();
                     assert_eq!(
                         input.size_hint().1.unwrap(),
@@ -259,55 +226,44 @@ where 'tcx: 'infercx
                         )
                     }
 
-                    if !is_output {
-                        let mut input = input;
-                        GlobalAssumptionApplier {
-                            global_assumptions,
-                            struct_ctxt,
-                            database,
-                            tcx,
-                        }
-                        .apply(
+                    // B4: every arg is `Param::Output`, so this is always the
+                    // output path. The old `!is_output` branch (one global-assumption
+                    // apply to the input, for non-output params) is unreachable after
+                    // output_params retirement. These global assumptions are
+                    // monotonicity-gated structural `EqMin` constraints — they SOLVE
+                    // escape, they do not assert it.
+                    let monotonicity = fn_ctxt.monotonicity(body.source.def_id());
+                    let mut input_sigs = input_sigs;
+                    let mut output_sigs = sigs.clone().into_output().unwrap();
+                    let mut applier = GlobalAssumptionApplier {
+                        global_assumptions,
+                        struct_ctxt,
+                        database,
+                        tcx,
+                    };
+
+                    if !matches!(monotonicity, FlatSet::Bottom)
+                        && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Dealloc))
+                    {
+                        applier.apply(
                             ty,
                             None,
                             &mut std::iter::empty(),
-                            &mut input,
+                            &mut output_sigs,
                             precision,
                         );
-                    } else {
-                        let monotonicity = fn_ctxt.monotonicity(body.source.def_id());
-                        let mut input_sigs = input_sigs;
-                        let mut output_sigs = sigs.clone().into_output().unwrap();
-                        let mut applier = GlobalAssumptionApplier {
-                            global_assumptions,
-                            struct_ctxt,
-                            database,
-                            tcx,
-                        };
+                    }
 
-                        if !matches!(monotonicity, FlatSet::Bottom)
-                            && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Dealloc))
-                        {
-                            applier.apply(
-                                ty,
-                                None,
-                                &mut std::iter::empty(),
-                                &mut output_sigs,
-                                precision,
-                            );
-                        }
-
-                        if !matches!(monotonicity, FlatSet::Bottom)
-                            && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Alloc))
-                        {
-                            applier.apply(
-                                ty,
-                                None,
-                                &mut std::iter::empty(),
-                                &mut input_sigs,
-                                precision,
-                            );
-                        }
+                    if !matches!(monotonicity, FlatSet::Bottom)
+                        && !matches!(monotonicity, FlatSet::Elem(Monotonicity::Alloc))
+                    {
+                        applier.apply(
+                            ty,
+                            None,
+                            &mut std::iter::empty(),
+                            &mut input_sigs,
+                            precision,
+                        );
                     }
                 }
                 (None, None) => {}
@@ -357,25 +313,21 @@ where 'tcx: 'infercx
 
         for (param, arg) in fn_sig.args.iter().cloned().zip(args) {
             if let Some((param, arg)) = param.zip(arg) {
-                if let Some(param) = param.into_output() {
-                    // if output then output
-                    assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
-                    for (arg, param) in arg.zip(param) {
-                        database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            arg,
-                            param,
-                        );
-                    }
-                } else {
-                    // if not then finalize
-                    for arg in arg {
-                        database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            arg,
-                            false,
-                        );
-                    }
+                // B4: every arg is `Param::Output`, so `into_output()` is always
+                // `Some` — write the actual back to the def signature var. The old
+                // `else` finalize (`push_assume(arg, false)`) asserted escape=false
+                // for non-output params; it was the load-bearing edit retired in
+                // B4a (escape is now solved natively), and is unreachable here.
+                let Some(param) = param.into_output() else {
+                    unreachable!("B4: exit args are always Param::Output");
+                };
+                assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
+                for (arg, param) in arg.zip(param) {
+                    database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                        (),
+                        arg,
+                        param,
+                    );
                 }
             }
         }
