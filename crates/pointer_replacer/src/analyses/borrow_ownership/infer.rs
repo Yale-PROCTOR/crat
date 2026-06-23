@@ -644,13 +644,9 @@ where
         infer_cx.database.record_source_sink();
         Self::assume(infer_cx, result.r#use, false);
         if let Some(sig) = result.def.clone().next() {
-            infer_cx
-                .database
-                .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                    (),
-                    sig,
-                    true,
-                )
+            // Retractable owning: hard by default, selector-gated for BO so the
+            // on-UNSAT relax loop can leak a conflicting allocation (B3a).
+            infer_cx.database.push_source_owning(sig)
         }
     }
 

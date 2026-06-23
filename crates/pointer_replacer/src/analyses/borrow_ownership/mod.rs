@@ -153,7 +153,7 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
     slots: &CrateSlots,
     kind_solver: &KindSolver,
     fn_did: LocalDefId,
-) -> anyhow::Result<BoOwnEmissionStats> {
+) -> anyhow::Result<(BoOwnEmissionStats, Vec<Bool>)> {
     if !crate_ctxt.fns().contains(&fn_did.to_def_id()) {
         anyhow::bail!(
             "function {} is not in borrow_ownership CrateCtxt",
@@ -194,10 +194,14 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
     // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
     link_versions_to_slots(slots, fn_did, body, &summary, &database, kind_solver);
 
-    Ok(BoOwnEmissionStats {
+    // B3a: the relax loop assumes these source selectors; dropping one leaks
+    // that allocation (classifies it non-Owning) to resolve an UNSAT.
+    let source_selectors = database.source_selectors().to_vec();
+    let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
         source_sink_emissions: database.source_sink_emissions(),
-    })
+    };
+    Ok((stats, source_selectors))
 }
 
 /// B2 solidification linking: tie each local pointer slot's `own` bit to the
