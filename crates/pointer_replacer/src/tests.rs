@@ -9268,6 +9268,136 @@ pub unsafe fn copy_tail(
 }
 
 #[test]
+fn test_libgit2_pointer_rewrite_shared_slice_field_offset_from_argument_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub ptr: *const u8,
+}
+
+pub unsafe fn read_entry(entry: *const Entry) -> u8 {
+    *(*entry).ptr.offset(1)
+}
+
+pub unsafe fn distance_from_field_argument(entry: *const Entry, current: *const u8) -> isize {
+    current.offset_from((*entry).ptr)
+}
+"#,
+        &["pub struct Entry<'a>", "pub ptr: &'a [u8]"],
+        &["pub ptr: *const u8"],
+    );
+}
+
+#[test]
+fn test_libgit2_pointer_rewrite_shared_slice_field_offset_from_receiver_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub ptr: *const u8,
+}
+
+pub unsafe fn read_second(ptr: *const u8) -> u8 {
+    *ptr.offset(1)
+}
+
+pub unsafe fn distance_from_field_receiver(buf: [u8; 8], pos: usize) -> isize {
+    let entry = Entry { ptr: buf.as_ptr() };
+    read_second(entry.ptr) as isize + entry.ptr.add(pos).offset_from(buf.as_ptr())
+}
+"#,
+        &["pub struct Entry<'a>", "pub ptr: &'a [u8]"],
+        &["pub ptr: *const u8"],
+    );
+}
+
+#[test]
+fn test_libgit2_pointer_rewrite_shared_slice_field_mut_raw_bridge_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_consume(ptr: *mut u8) -> i32;
+}
+
+#[repr(C)]
+pub struct Entry {
+    pub ptr: *const u8,
+}
+
+pub unsafe fn read_second(ptr: *const u8) -> u8 {
+    *ptr.offset(1)
+}
+
+pub unsafe fn call_raw_bridge(buf: [u8; 8]) -> i32 {
+    let entry = Entry { ptr: buf.as_ptr() };
+    read_second(entry.ptr) as i32 + raw_consume(entry.ptr as *mut u8)
+}
+"#,
+        &["pub struct Entry<'a>", "pub ptr: &'a [u8]"],
+        &["pub ptr: *const u8"],
+    );
+}
+
+#[test]
+fn test_libgit2_pointer_rewrite_const_outer_field_address_cast_to_mut_raw_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct Field {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct Outer {
+    pub field: Field,
+    pub tag: i32,
+}
+
+extern "C" {
+    fn raw_field(field: *mut Field) -> i32;
+}
+
+pub unsafe fn call_raw_field(outer: *const Outer) -> i32 {
+    raw_field(&raw const (*outer).field as *const Field as *mut Field)
+}
+"#,
+        &["pub unsafe fn call_raw_field(outer: &crate::Outer)"],
+        &["pub unsafe fn call_raw_field(outer: *const crate::Outer)"],
+    );
+}
+
+#[test]
+fn test_libgit2_pointer_rewrite_mutable_slice_field_raw_bridge_still_uses_mutable_reference() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn write_raw(ptr: *mut u8);
+}
+
+#[repr(C)]
+pub struct Entry {
+    pub ptr: *mut u8,
+}
+
+pub unsafe fn call_mut_raw_bridge(mut buf: [u8; 8]) -> u8 {
+    let entry = Entry {
+        ptr: buf.as_mut_ptr(),
+    };
+    write_raw(entry.ptr);
+    *entry.ptr.offset(0)
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub ptr: &'a mut [u8]",
+            ".as_mut_ptr()",
+        ],
+        &["pub ptr: *mut u8"],
+    );
+}
+
+#[test]
 fn test_replace_local_borrows_does_not_run_struct_array_field_pre_stage() {
     let code = r#"
 #[repr(C)]
