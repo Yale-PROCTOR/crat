@@ -1669,6 +1669,7 @@ enum AllocatorRoot<'a> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_fn_ptr_contracts<'tcx>(
     rust_program: &RustProgram<'tcx>,
     pre_points_to: &andersen::PreAnalysisData<'tcx>,
@@ -1693,6 +1694,7 @@ fn sync_fn_ptr_contracts<'tcx>(
 }
 
 impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,
         rust_program: &RustProgram<'tcx>,

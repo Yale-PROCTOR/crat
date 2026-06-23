@@ -26,7 +26,7 @@ jobs:
       - name: Check formatting
         run: sudo -u ubuntu bash -lc "cargo fmt --check"
       - name: Apply lints
-        run: sudo -u ubuntu bash -lc "cargo clippy -- -D warnings"
+        run: sudo -u ubuntu bash -lc "cargo clippy --workspace --all-targets -- -D warnings"
 
       - name: Build dependency crate
         run: sudo -u ubuntu bash -lc "cd deps_crate && cargo build"
