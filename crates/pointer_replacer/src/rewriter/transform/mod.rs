@@ -10080,7 +10080,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
         if !m && let Some(receiver) = slice_cursor_mut_temp_as_slice_receiver(e) {
-            let shared_cursor = utils::expr!("({}).as_deref()", pprust::expr_to_string(receiver));
+            let shared_cursor = utils::expr!("({}).into_deref()", pprust::expr_to_string(receiver));
             return self.cursor_from_cursor(&shared_cursor, m, lhs_inner_ty, rhs_inner_ty);
         }
         let need_cast = lhs_inner_ty != rhs_inner_ty;
@@ -10594,7 +10594,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                             }
                         } else if is_slice_cursor_mut_constructor_call(&e) {
                             e = utils::expr!(
-                                "({}).as_deref().offset_by(({}) as isize)",
+                                "({}).into_deref().offset_by(({}) as isize)",
                                 pprust::expr_to_string(&e),
                                 pprust::expr_to_string(offset),
                             );

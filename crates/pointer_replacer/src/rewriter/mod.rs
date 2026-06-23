@@ -433,27 +433,27 @@ fn slice_cursor_mod_str() -> &'static str {
     }
 
     impl<'a, T> SliceCursorMut<'a, T> {
-        pub fn new(base: &'a mut [T]) -> Self {
+        pub const fn new(base: &'a mut [T]) -> Self {
             Self { base, pos: 0 }
         }
 
-        pub fn with_pos(base: &'a mut [T], pos: usize) -> Self {
+        pub const fn with_pos(base: &'a mut [T], pos: usize) -> Self {
             Self { base, pos }
         }
 
-        pub fn empty() -> Self {
+        pub const fn empty() -> Self {
             Self { base: &mut [], pos: 0 }
         }
 
-        pub fn from_mut(val: &'a mut T) -> Self {
+        pub const fn from_mut(val: &'a mut T) -> Self {
             Self { base: std::slice::from_mut(val), pos: 0 }
         }
 
-        pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
+        pub const unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
             unsafe { Self::from_raw_parts_mut(ptr as *mut T, len) }
         }
 
-        pub unsafe fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
+        pub const unsafe fn from_raw_parts_mut(ptr: *mut T, len: usize) -> Self {
             Self { base: unsafe { std::slice::from_raw_parts_mut(ptr, len) }, pos: 0 }
         }
 
@@ -461,15 +461,19 @@ fn slice_cursor_mod_str() -> &'static str {
             SliceCursorMut { base: &mut self.base[..], pos: self.pos }
         }
 
-        pub fn as_deref(self) -> SliceCursor<'a, T> {
+        pub fn as_deref(&self) -> SliceCursor<'_, T> {
+            SliceCursor { base: &self.base[..], pos: self.pos }
+        }
+
+        pub fn into_deref(self) -> SliceCursor<'a, T> {
             SliceCursor { base: self.base, pos: self.pos }
         }
 
-        pub fn seek(&mut self, offset: isize) {
+        pub const fn seek(&mut self, offset: isize) {
             self.pos = self.pos.wrapping_add_signed(offset);
         }
 
-        pub fn offset_by(mut self, offset: isize) -> Self {
+        pub const fn offset_by(mut self, offset: isize) -> Self {
             self.seek(offset);
             self
         }
@@ -517,31 +521,31 @@ fn slice_cursor_mod_str() -> &'static str {
     }
 
     impl<'a, T> SliceCursor<'a, T> {
-        pub fn new(slice: &'a [T]) -> Self {
+        pub const fn new(slice: &'a [T]) -> Self {
             Self { base: slice, pos: 0 }
         }
 
-        pub fn with_pos(base: &'a [T], pos: usize) -> Self {
+        pub const fn with_pos(base: &'a [T], pos: usize) -> Self {
             Self { base, pos }
         }
 
-        pub fn empty() -> Self {
+        pub const fn empty() -> Self {
             Self { base: &[], pos: 0 }
         }
 
-        pub fn from_ref(val: &'a T) -> Self {
+        pub const fn from_ref(val: &'a T) -> Self {
             Self { base: std::slice::from_ref(val), pos: 0 }
         }
 
-        pub unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
+        pub const unsafe fn from_raw_parts(ptr: *const T, len: usize) -> Self {
             Self { base: unsafe { std::slice::from_raw_parts(ptr, len) }, pos: 0 }
         }
 
-        pub fn seek(&mut self, offset: isize) {
+        pub const fn seek(&mut self, offset: isize) {
             self.pos = self.pos.wrapping_add_signed(offset);
         }
 
-        pub fn offset_by(mut self, offset: isize) -> Self {
+        pub const fn offset_by(mut self, offset: isize) -> Self {
             self.seek(offset);
             self
         }

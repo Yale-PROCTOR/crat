@@ -2165,9 +2165,13 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
             ".as_slice()",
-            ".offset_by((-((s.count / 8) as isize))",
+            ".into_deref().offset_by((-((s.count / 8) as",
         ],
-        &["}).as_mut_ptr()", "*(*s).words.offset"],
+        &[
+            "}).as_mut_ptr()",
+            "*(*s).words.offset",
+            ".as_deref().offset_by",
+        ],
     );
 }
 
@@ -7572,6 +7576,160 @@ pub unsafe fn builtin_first_bytes<'a, 'b, 'c>() -> core::ffi::c_int {
             "name: bytemuck::cast_slice(b\"ada\\x00\")",
             "fns: bytemuck::cast_slice(",
             "words: bytemuck::cast_slice(",
+        ],
+    );
+}
+
+#[test]
+fn test_root1_static_mut_shared_array_field_as_ptr_cursor_initializer_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct StaticCursorDesc {
+    pub data: *const i32,
+    pub index: isize,
+}
+
+pub static VALUES: [i32; 4] = [10, 20, 30, 40];
+
+pub static mut SHARED_DESC: StaticCursorDesc = StaticCursorDesc {
+    data: VALUES.as_ptr(),
+    index: 2,
+};
+
+pub unsafe fn read_shared_desc() -> i32 {
+    return *SHARED_DESC.data.offset(SHARED_DESC.index);
+}
+"#,
+        &[
+            "pub struct StaticCursorDesc<'a>",
+            "pub data: crate::slice_cursor::SliceCursor<'a, i32>",
+            "static mut SHARED_DESC: StaticCursorDesc",
+        ],
+        &["pub data: *const i32"],
+    );
+}
+
+#[test]
+fn test_root1_static_null_field_empty_cursor_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct CursorEntry {
+    pub data: *const i32,
+    pub index: isize,
+}
+
+pub static WORDS: [i32; 3] = [3, 5, 8];
+
+pub static mut WORD_DESC: CursorEntry = CursorEntry {
+    data: WORDS.as_ptr(),
+    index: 1,
+};
+
+pub static mut EMPTY_DESC: CursorEntry = CursorEntry {
+    data: core::ptr::null(),
+    index: 0,
+};
+
+pub unsafe fn read_descriptor() -> i32 {
+    return *WORD_DESC.data.offset(WORD_DESC.index) + EMPTY_DESC.index as i32;
+}
+"#,
+        &[
+            "pub struct CursorEntry<'a>",
+            "pub data: crate::slice_cursor::SliceCursor<'a, i32>",
+            "static mut WORD_DESC: CursorEntry",
+            "static mut EMPTY_DESC: CursorEntry",
+            "data: crate::slice_cursor::SliceCursor::empty()",
+        ],
+        &["pub data: *const i32"],
+    );
+}
+
+#[test]
+fn test_root1_static_multiple_cursor_fields_distinct_lifetimes_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct MultiCursorDesc {
+    pub codes: *const i16,
+    pub weights: *const i32,
+    pub code_index: isize,
+    pub weight_index: isize,
+}
+
+pub static CODES: [i16; 4] = [1, 1, 2, 3];
+pub static WEIGHTS: [i32; 4] = [5, 8, 13, 21];
+
+pub static mut MULTI_DESC: MultiCursorDesc = MultiCursorDesc {
+    codes: CODES.as_ptr(),
+    weights: WEIGHTS.as_ptr(),
+    code_index: 2,
+    weight_index: 3,
+};
+
+pub unsafe fn read_multi_desc() -> i32 {
+    return *MULTI_DESC.codes.offset(MULTI_DESC.code_index) as i32
+        + *MULTI_DESC.weights.offset(MULTI_DESC.weight_index);
+}
+"#,
+        &[
+            "pub struct MultiCursorDesc<'a, 'b>",
+            "pub codes: crate::slice_cursor::SliceCursor<'a, i16>",
+            "pub weights: crate::slice_cursor::SliceCursor<'b, i32>",
+            "static mut MULTI_DESC: MultiCursorDesc",
+        ],
+        &["pub codes: *const i16", "pub weights: *const i32"],
+    );
+}
+
+#[test]
+fn test_root1_nested_alias_static_descriptor_cursor_initializers_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct StaticTreeDesc {
+    pub static_tree: *const i32,
+    pub extra_bits: *const i16,
+}
+
+pub type StaticTreeDescAlias = StaticTreeDesc;
+
+#[repr(C)]
+pub struct TreeDesc {
+    pub stat_desc: *const StaticTreeDescAlias,
+}
+
+pub static TREE_VALUES: [i32; 4] = [4, 6, 8, 10];
+pub static EXTRA_VALUES: [i16; 2] = [1, 2];
+
+pub static mut STATIC_TREE_DESC: StaticTreeDescAlias = StaticTreeDesc {
+    static_tree: TREE_VALUES.as_ptr(),
+    extra_bits: EXTRA_VALUES.as_ptr(),
+};
+
+pub unsafe fn read_nested_tree(idx: isize) -> i32 {
+    let desc = TreeDesc {
+        stat_desc: &raw const STATIC_TREE_DESC as *const StaticTreeDescAlias,
+    };
+    let stat = desc.stat_desc;
+    return *(*stat).static_tree.offset(idx)
+        + *(*stat).extra_bits.offset(0) as i32;
+}
+"#,
+        &[
+            "pub struct StaticTreeDesc<'a, 'b>",
+            "pub static_tree: crate::slice_cursor::SliceCursor<'a, i32>",
+            "pub extra_bits: &'b [i16]",
+            "pub type StaticTreeDescAlias<'a, 'b>",
+            "static mut STATIC_TREE_DESC: StaticTreeDescAlias",
+            "pub struct TreeDesc<'a, 'b, 'c>",
+        ],
+        &[
+            "pub static_tree: *const i32",
+            "pub extra_bits: *const i16",
+            "pub type StaticTreeDescAlias = StaticTreeDesc",
         ],
     );
 }
@@ -15468,5 +15626,108 @@ pub unsafe extern "C" fn dispatch(words: &[i32]) -> i32 {
             "write_previous(crate::slice_cursor::SliceCursorMut::new(words))",
             "write_previous((words).as_ptr() as",
         ],
+    );
+}
+
+#[test]
+fn test_root6_mut_cursor_shared_call_then_index_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn root6_peek_prev(mut cursor: *const i32) -> i32 {
+    return *cursor.offset(-1);
+}
+
+pub unsafe fn root6_param_call_then_index(mut stack: *mut i32) -> i32 {
+    let before = root6_peek_prev(stack as *const i32);
+    *stack.offset(-1) = before + 1;
+    return *stack.offset(-1);
+}
+"#,
+        &[
+            "root6_peek_prev",
+            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "root6_param_call_then_index",
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_root6_loop_shared_calls_then_mut_cursor_write_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn root6_peek_prev(mut cursor: *const i32) -> i32 {
+    return *cursor.offset(-1);
+}
+
+pub unsafe fn root6_peek_two_back(mut cursor: *const i32) -> i32 {
+    return *cursor.offset(-2);
+}
+
+pub unsafe fn root6_loop_calls_then_write(mut stack: *mut i32, mut count: i32) -> i32 {
+    let mut total = 0;
+    while count > 0 {
+        total += root6_peek_prev(stack as *const i32);
+        total += root6_peek_two_back(stack as *const i32);
+        *stack.offset(-1) = total;
+        count -= 1;
+    }
+    return total + *stack.offset(-1);
+}
+"#,
+        &[
+            "root6_peek_prev",
+            "root6_peek_two_back",
+            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "root6_loop_calls_then_write",
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_root6_shared_local_from_mut_cursor_then_mut_use_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn root6_local_shared_then_mut_use(mut stack: *mut i32) -> i32 {
+    let view: *const i32 = stack as *const i32;
+    let before = *view.offset(-1);
+    *stack.offset(-1) = before + 2;
+    return *stack.offset(-1);
+}
+"#,
+        &[
+            "root6_local_shared_then_mut_use",
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "let view: crate::slice_cursor::SliceCursor<'_, i32>",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_root6_offset_mut_cursor_shared_call_then_mut_use_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn root6_peek_prev_after_offset(mut cursor: *const i32) -> i32 {
+    return *cursor.offset(-1);
+}
+
+pub unsafe fn root6_offset_call_then_write(mut stack: *mut i32) -> i32 {
+    stack = stack.offset(1);
+    let before = root6_peek_prev_after_offset(stack as *const i32);
+    *stack.offset(-1) = before + 3;
+    return *stack.offset(-1);
+}
+"#,
+        &[
+            "root6_peek_prev_after_offset",
+            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "root6_offset_call_then_write",
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+        ],
+        &[],
     );
 }
