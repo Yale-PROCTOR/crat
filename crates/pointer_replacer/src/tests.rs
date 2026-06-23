@@ -9708,17 +9708,22 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
 
 mod borrow_ownership_coherence {
     use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_index::bit_set::MixedBitSet;
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
     use z3::SatResult;
 
     use crate::{
-        analyses::borrow_ownership::{
-            SlotKind,
-            coherence::add_coherence,
-            crate_slots::CrateSlots,
-            solver::{KindSolver, SlotRef},
-            slots::StructFieldSlot,
+        analyses::{
+            borrow_ownership::{
+                CrateCtxt, SlotKind,
+                coherence::add_coherence,
+                crate_slots::CrateSlots,
+                emit_single_fn_ownership_constraints,
+                slots::StructFieldSlot,
+                solver::{KindSolver, SlotRef},
+            },
+            output_params::OutputParams,
         },
         utils::rustc::RustProgram,
     };
@@ -9792,6 +9797,52 @@ mod borrow_ownership_coherence {
             .unwrap_or_else(|| panic!("slot for local {local:?} depth {depth}"));
 
         SlotRef::Local(fn_did, slot)
+    }
+
+    #[test]
+    fn alloc_free_emits_ownership_into_kind_solver() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_free() {
+    let p = unsafe { malloc(4) };
+    unsafe { free(p) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let alloc_free = function_by_name(&program, "alloc_free");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(alloc_free)
+                    .borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
+
+                let stats = emit_single_fn_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &kind_solver,
+                    alloc_free,
+                )
+                .expect("B1 ownership emission should run");
+
+                assert!(
+                    stats.z3_ast_len > 1,
+                    "expected per-version ownership Bool vars to be allocated"
+                );
+                // 1 source from malloc + 1 sink from free.
+                assert_eq!(stats.source_sink_emissions, 2);
+                assert_eq!(kind_solver.check(), SatResult::Sat);
+            },
+        );
     }
 
     #[test]

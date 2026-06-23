@@ -26,15 +26,20 @@ pub mod ssa;
 #[allow(unused_imports)]
 pub use domain::SlotKind;
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_middle::mir::Body;
 
 use crate::{
     analyses::{
         borrow_ownership::{
             call_graph::FnSig,
+            infer::InferCtxt,
+            solver::{BoOwnDatabase, KindSolver},
             ssa::{
-                constraint::{Database, Var},
-                consume::Consume,
+                constraint::{Database, Debug, Gen, GlobalAssumptions, Var, initialize_local},
+                consume::{Consume, initial_definitions},
+                dom::compute_dominance_frontier,
+                state::SSAState,
             },
         },
         output_params::OutputParams,
@@ -121,7 +126,7 @@ type InterCtxt = FxHashMap<DefId, FnSig<Option<Param<Range<Var>>>>>;
 struct BoOwnershipProbe;
 
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for BoOwnershipProbe {
-    type DB = ();
+    type DB = BoOwnDatabase<'db>;
     type InterCtxt = &'analysis InterCtxt;
     type Results = ();
 
@@ -131,6 +136,124 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for BoOwnershipPro
     ) -> anyhow::Result<Self::Results> {
         unimplemented!("B0 only forks ownership emission; B1 wires a real BO analysis")
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BoOwnEmissionStats {
+    pub z3_ast_len: usize,
+    pub source_sink_emissions: usize,
+}
+
+pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    output_params: &OutputParams,
+    kind_solver: &KindSolver,
+    fn_did: LocalDefId,
+) -> anyhow::Result<BoOwnEmissionStats> {
+    if !crate_ctxt.fns().contains(&fn_did.to_def_id()) {
+        anyhow::bail!(
+            "function {} is not in borrow_ownership CrateCtxt",
+            crate_ctxt.tcx.def_path_str(fn_did.to_def_id())
+        );
+    }
+
+    const B1_PRECISION: Precision = 1;
+
+    let body_ref = crate_ctxt
+        .tcx
+        .mir_drops_elaborated_and_const_checked(fn_did)
+        .borrow();
+    let body = &*body_ref;
+    let mut var_gen = Gen::new();
+    let mut database = BoOwnDatabase::new(kind_solver.optimize());
+    let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
+    let inter_ctxt =
+        initial_single_fn_inter_ctxt(crate_ctxt, output_params, body, &mut var_gen, &mut database);
+    let ssa_state = initial_ssa_state(crate_ctxt, body);
+
+    {
+        let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx);
+        let mut infer_cx = InferCtxt::new(
+            crate_ctxt,
+            B1_PRECISION,
+            body,
+            &mut database,
+            &mut var_gen,
+            &inter_ctxt,
+            &global_assumptions,
+        );
+
+        rn.go::<BoOwnershipProbe>(&mut infer_cx);
+    }
+
+    Ok(BoOwnEmissionStats {
+        z3_ast_len: database.z3_ast_len(),
+        source_sink_emissions: database.source_sink_emissions(),
+    })
+}
+
+fn initial_single_fn_inter_ctxt<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    output_params: &OutputParams,
+    body: &Body<'tcx>,
+    var_gen: &mut Gen,
+    database: &mut impl Database,
+) -> InterCtxt {
+    const INIT_PRECISION: Precision = 1;
+
+    let mut local_decls = body.local_decls.iter_enumerated();
+    let (_, return_local_decl) = local_decls.next().unwrap();
+    let ret = initialize_local(
+        return_local_decl,
+        var_gen,
+        database,
+        crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+    )
+    .map(Param::Normal);
+
+    let output_params = output_params.get(&body.source.def_id().expect_local());
+    let args = local_decls
+        .take(body.arg_count)
+        .map(|(local, local_decl)| {
+            if output_params.is_some_and(|params| params.contains(local)) {
+                let r#use = initialize_local(
+                    local_decl,
+                    var_gen,
+                    database,
+                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                );
+                let def = initialize_local(
+                    local_decl,
+                    var_gen,
+                    database,
+                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                );
+                r#use.zip(def).map(|(r#use, def)| {
+                    database.push_assume::<Debug>((), r#use.start, true);
+                    database.push_assume::<Debug>((), def.start, true);
+                    Param::Output(Consume { r#use, def })
+                })
+            } else {
+                initialize_local(
+                    local_decl,
+                    var_gen,
+                    database,
+                    crate_ctxt.struct_ctxt.with_max_precision(INIT_PRECISION),
+                )
+                .map(Param::Normal)
+            }
+        })
+        .collect();
+
+    let mut inter_ctxt = FxHashMap::default();
+    inter_ctxt.insert(body.source.def_id(), FnSig { ret, args });
+    inter_ctxt
+}
+
+fn initial_ssa_state<'tcx>(crate_ctxt: &CrateCtxt<'tcx>, body: &Body<'tcx>) -> SSAState {
+    let dominance_frontier = compute_dominance_frontier(body);
+    let definitions = initial_definitions(body, crate_ctxt);
+    SSAState::new(body, &dominance_frontier, definitions)
 }
 
 pub struct CrateCtxt<'tcx> {

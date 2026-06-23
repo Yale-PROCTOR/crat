@@ -218,15 +218,6 @@ where
                 }
                 if let Some(ty_mut) = ty.builtin_deref(true) {
                     let var = vars.next().unwrap();
-                    if let Some(dom) = dom {
-                        database
-                            .push_less_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                                (),
-                                var,
-                                dom,
-                            )
-                    }
-
                     dom = Some(var);
 
                     precision -= 1;
@@ -650,6 +641,7 @@ where
     }
 
     fn source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
+        infer_cx.database.record_source_sink();
         Self::assume(infer_cx, result.r#use, false);
         if let Some(sig) = result.def.clone().next() {
             infer_cx
@@ -663,6 +655,7 @@ where
     }
 
     fn sink(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
+        infer_cx.database.record_source_sink();
         if let Some(sig) = result.r#use.clone().next() {
             infer_cx
                 .database

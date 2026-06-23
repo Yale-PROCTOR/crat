@@ -294,6 +294,8 @@ pub trait Database {
         self.push_eq_min_impl(x, y, z);
         Infer::store_eq_min(store, x, y, z);
     }
+
+    fn record_source_sink(&mut self) {}
 }
 
 impl Database for () {
