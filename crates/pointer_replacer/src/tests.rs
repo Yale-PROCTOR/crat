@@ -9793,3 +9793,35 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
         "expected a Prune/Dropped event mentioning the offending assignment: {events:#?}"
     );
 }
+
+#[test]
+fn test_array_local_partial_group_characterization() {
+    // characterization of the spec's partial_group() shape on the pre-item-6
+    // implementation. q's `if`-RHS reassignment is unsupported (rejected at
+    // prune); p is an independent member. updated to the fixpoint expectation
+    // in the dependency-pruning unit.
+    let code = r#"
+pub unsafe fn partial_group() -> i32 {
+    let mut buf = [0i32; 4];
+    let mut p = buf.as_mut_ptr();
+    let mut q = p.offset(1);
+    q = if *p == 0 { p.offset(2) } else { p };
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    // the rewritten source must always compile (no undeclared *_idx).
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // pinned observations: p is rewritten to p_idx, q stays a raw pointer.
+    assert!(changed, "p should be rewritten: {s}");
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(s.contains("let mut p_idx: isize = 0isize"), "p_idx initialized: {s}");
+    assert!(s.contains("let mut q"), "q stays a raw pointer: {s}");
+    assert!(!s.contains("q_idx"), "q is not index-rewritten: {s}");
+    assert!(
+        s.contains("(buf).as_ptr().offset(p_idx) as *mut i32"),
+        "p accesses use buf base with p_idx: {s}"
+    );
+}
