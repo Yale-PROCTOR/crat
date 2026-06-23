@@ -33,7 +33,7 @@ use super::collector::collect_diffs;
 use super::{
     Analysis, BytemuckDependency, Config,
     collector::{collect_diffs_with_diagnostics, collect_diffs_with_fn_ptr_decisions},
-    decision::{PtrKind, SigDecision, SigDecisions, pointee_forces_raw},
+    decision::{PtrKind, SigDecision, SigDecisions, decision_carries_lifetime, pointee_forces_raw},
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
 use crate::{
@@ -65,6 +65,9 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     c_exposed_thin_abi_fields: FxHashSet<StructFieldSlot>,
     c_exposed_cursor_abi_fields: FxHashSet<StructFieldSlot>,
     item_lifetime_plans: ItemLifetimePlans,
+    #[allow(clippy::type_complexity)]
+    signature_input_lifetime_overrides:
+        FxHashMap<(LocalDefId, usize), FxHashMap<LocalDefId, Vec<Option<Symbol>>>>,
     item_ty_context: Vec<LocalDefId>,
     impl_self_lifetimes: Vec<(LocalDefId, Vec<Symbol>)>,
     ast_to_hir: AstToHir,
@@ -122,6 +125,13 @@ struct ItemLifetimeUse {
     owner_did: LocalDefId,
     hir_id: HirId,
     target_did: LocalDefId,
+}
+
+struct SignatureTyRenderContext<'a, 'analysis, 'tcx> {
+    transform: &'a TransformVisitor<'analysis, 'tcx>,
+    planned_lifetimes: &'a mut Vec<Symbol>,
+    used_lifetimes: FxHashSet<Symbol>,
+    tied_ty_names: FxHashMap<(Symbol, String), String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +263,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)].ty,
                     )
                     .is_some();
+                let mut input_signature_tys = vec![None; sig_dec.input_decs.len()];
+                let mut output_signature_ty = None;
 
                 if !sig_dec.signature_locked {
                     let mut planned_lifetimes = Vec::new();
@@ -267,28 +279,51 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             planned_lifetimes.push(lifetime);
                         }
                     }
-                    for (local_decl, input_dec) in
-                        mir_body.local_decls.iter().skip(1).zip(&sig_dec.input_decs)
                     {
-                        if input_dec.is_some()
-                            && let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                        let mut signature_ty_renderer =
+                            SignatureTyRenderContext::new(self, def_id, &mut planned_lifetimes);
+                        let empty_lifetime_overrides = FxHashMap::default();
+                        for (param_index, (local_decl, input_dec)) in mir_body
+                            .local_decls
+                            .iter()
+                            .skip(1)
+                            .zip(&sig_dec.input_decs)
+                            .enumerate()
                         {
-                            self.extend_signature_lifetimes_for_ty(
-                                &mut planned_lifetimes,
-                                inner_ty,
-                            );
+                            let input_lifetime =
+                                sig_dec.input_lifetimes.get(param_index).copied().flatten();
+                            if input_dec.is_some()
+                                && !(matches!(local_decl.ty.kind(), ty::TyKind::Ref(..))
+                                    && input_lifetime.is_none())
+                                && let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(local_decl.ty)
+                            {
+                                let lifetime_overrides = self
+                                    .signature_input_lifetime_overrides
+                                    .get(&(def_id, param_index))
+                                    .unwrap_or(&empty_lifetime_overrides);
+                                input_signature_tys[param_index] =
+                                    Some(signature_ty_renderer.ty_name(
+                                        inner_ty,
+                                        input_lifetime,
+                                        lifetime_overrides,
+                                    ));
+                            }
+                        }
+                        if output_ty_will_be_replaced {
+                            let return_decl =
+                                &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
+                            if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
+                                output_signature_ty = Some(signature_ty_renderer.ty_name(
+                                    inner_ty,
+                                    output_lifetime,
+                                    &empty_lifetime_overrides,
+                                ));
+                            }
                         }
                     }
-                    if output_ty_will_be_replaced {
-                        let return_decl =
-                            &mir_body.local_decls[rustc_middle::mir::Local::from_u32(0)];
-                        if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty) {
-                            self.extend_signature_lifetimes_for_ty(
-                                &mut planned_lifetimes,
-                                inner_ty,
-                            );
-                        }
-                    } else if let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output {
+                    if !output_ty_will_be_replaced
+                        && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
+                    {
                         self.extend_signature_lifetimes_for_ast_ty(&mut planned_lifetimes, ret_ty);
                     }
                     for param in &mut fn_item.sig.decl.inputs {
@@ -328,6 +363,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.mark_param_mut_if_needed(param);
                     let input_lifetime =
                         sig_dec.input_lifetimes.get(param_index).copied().flatten();
+                    let signature_ty = input_signature_tys
+                        .get(param_index)
+                        .and_then(|ty| ty.as_deref());
                     if matches!(local_decl.ty.kind(), ty::TyKind::Ref(..))
                         && input_lifetime.is_none()
                     {
@@ -342,7 +380,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_ref_ty_with_lifetime_str(ty, *m, input_lifetime)
+                            } else {
+                                self.mk_ref_ty_with_lifetime(inner_ty, *m, input_lifetime)
+                            };
                         }
                         Some(PtrKind::OptRef(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -352,8 +394,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_opt_ref_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_opt_ref_ty_with_lifetime_str(ty, *m, input_lifetime)
+                            } else {
+                                self.mk_opt_ref_ty_with_lifetime(inner_ty, *m, input_lifetime)
+                            };
                         }
                         Some(PtrKind::Box) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -363,7 +408,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_box_ty(inner_ty);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_box_ty_str(ty)
+                            } else {
+                                self.mk_box_ty(inner_ty)
+                            };
                         }
                         Some(PtrKind::OptBox) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -373,7 +422,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_opt_box_ty(inner_ty);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_opt_box_ty_str(ty)
+                            } else {
+                                self.mk_opt_box_ty(inner_ty)
+                            };
                         }
                         Some(PtrKind::Slice(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -383,8 +436,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_slice_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_slice_ty_with_lifetime_str(ty, *m, input_lifetime)
+                            } else {
+                                self.mk_slice_ty_with_lifetime(inner_ty, *m, input_lifetime)
+                            };
                         }
                         Some(PtrKind::Raw(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -394,7 +450,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_raw_ptr_ty(inner_ty, *m);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_raw_ptr_ty_str(ty, *m)
+                            } else {
+                                self.mk_raw_ptr_ty(inner_ty, *m)
+                            };
                         }
                         Some(PtrKind::SliceCursor(m)) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -404,8 +464,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty =
-                                self.mk_cursor_ty_with_lifetime(inner_ty, *m, input_lifetime);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_cursor_ty_with_lifetime_str(ty, *m, input_lifetime)
+                            } else {
+                                self.mk_cursor_ty_with_lifetime(inner_ty, *m, input_lifetime)
+                            };
                             self.slice_cursor.set(true);
                         }
                         Some(PtrKind::BoxedSlice) => {
@@ -416,7 +479,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_boxed_slice_ty(inner_ty);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_boxed_slice_ty_str(ty)
+                            } else {
+                                self.mk_boxed_slice_ty(inner_ty)
+                            };
                         }
                         Some(PtrKind::OptBoxedSlice) => {
                             let (inner_ty, _) = unwrap_ptr_from_mir_ty(local_decl.ty)
@@ -426,7 +493,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                         ty = local_decl.ty
                                     )
                                 });
-                            *param.ty = self.mk_opt_boxed_slice_ty(inner_ty);
+                            *param.ty = if let Some(ty) = signature_ty {
+                                self.mk_opt_boxed_slice_ty_str(ty)
+                            } else {
+                                self.mk_opt_boxed_slice_ty(inner_ty)
+                            };
                         }
                         None => {
                             if let Some(hir_id) =
@@ -464,22 +535,52 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     if let Some((inner_ty, _)) = unwrap_ptr_from_mir_ty(return_decl.ty)
                         && let FnRetTy::Ty(ret_ty) = &mut fn_item.sig.decl.output
                     {
+                        let signature_ty = output_signature_ty.as_deref();
                         *ret_ty = P(match output_dec {
-                            PtrKind::Ref(m) => {
-                                self.mk_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
-                            }
-                            PtrKind::OptRef(m) => {
-                                self.mk_opt_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
-                            }
-                            PtrKind::Box => self.mk_box_ty(inner_ty),
-                            PtrKind::OptBox => self.mk_opt_box_ty(inner_ty),
-                            PtrKind::Raw(m) => self.mk_raw_ptr_ty(inner_ty, m),
-                            PtrKind::BoxedSlice => self.mk_boxed_slice_ty(inner_ty),
-                            PtrKind::OptBoxedSlice => self.mk_opt_boxed_slice_ty(inner_ty),
-                            PtrKind::Slice(m) => self.mk_slice_ty(inner_ty, m),
+                            PtrKind::Ref(m) => match signature_ty {
+                                Some(ty) => {
+                                    self.mk_ref_ty_with_lifetime_str(ty, m, output_lifetime)
+                                }
+                                None => self.mk_ref_ty_with_lifetime(inner_ty, m, output_lifetime),
+                            },
+                            PtrKind::OptRef(m) => match signature_ty {
+                                Some(ty) => {
+                                    self.mk_opt_ref_ty_with_lifetime_str(ty, m, output_lifetime)
+                                }
+                                None => {
+                                    self.mk_opt_ref_ty_with_lifetime(inner_ty, m, output_lifetime)
+                                }
+                            },
+                            PtrKind::Box => match signature_ty {
+                                Some(ty) => self.mk_box_ty_str(ty),
+                                None => self.mk_box_ty(inner_ty),
+                            },
+                            PtrKind::OptBox => match signature_ty {
+                                Some(ty) => self.mk_opt_box_ty_str(ty),
+                                None => self.mk_opt_box_ty(inner_ty),
+                            },
+                            PtrKind::Raw(m) => match signature_ty {
+                                Some(ty) => self.mk_raw_ptr_ty_str(ty, m),
+                                None => self.mk_raw_ptr_ty(inner_ty, m),
+                            },
+                            PtrKind::BoxedSlice => match signature_ty {
+                                Some(ty) => self.mk_boxed_slice_ty_str(ty),
+                                None => self.mk_boxed_slice_ty(inner_ty),
+                            },
+                            PtrKind::OptBoxedSlice => match signature_ty {
+                                Some(ty) => self.mk_opt_boxed_slice_ty_str(ty),
+                                None => self.mk_opt_boxed_slice_ty(inner_ty),
+                            },
+                            PtrKind::Slice(m) => match signature_ty {
+                                Some(ty) => self.mk_slice_ty_str(ty, m),
+                                None => self.mk_slice_ty(inner_ty, m),
+                            },
                             PtrKind::SliceCursor(m) => {
                                 self.slice_cursor.set(true);
-                                self.mk_cursor_ty(inner_ty, m)
+                                match signature_ty {
+                                    Some(ty) => self.mk_cursor_ty_with_lifetime_str(ty, m, None),
+                                    None => self.mk_cursor_ty(inner_ty, m),
+                                }
                             }
                         });
                     }
@@ -2237,42 +2338,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &mut ptr_kinds,
             &forced_raw_bindings,
         );
-        apply_field_storage_input_lifetimes(
-            rust_program.tcx,
-            analysis,
-            &lifetime_plans,
-            &demoted_fields,
-            &field_cursor_fields,
-            &mut sig_decs,
-        );
-        if sync_fn_ptr_contracts(
-            rust_program,
-            pre_points_to,
-            points_to_solutions,
-            tss,
-            &fn_ptr_groups,
-            &mut fn_ptr_rewrite,
-            &mut sig_decs,
-            &config.c_exposed_fns,
-        ) {
-            ptr_kinds = collect_diffs_with_fn_ptr_decisions(
-                rust_program,
-                analysis,
-                &sig_decs,
-                &fn_ptr_groups,
-                &fn_ptr_rewrite.group_decisions,
-            );
-        }
-        let raw_bridge_bindings = collect_raw_bridge_bindings(
-            rust_program.tcx,
-            &ptr_kinds,
-            &alloc_wrappers,
-            &free_like_wrappers,
-            &local_raw_param_summaries,
-        );
-        let borrowed_raw_params =
-            collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &sig_decs);
-
         let mut visitor = TransformVisitor {
             tcx: rust_program.tcx,
             analysis,
@@ -2280,8 +2345,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             lifetime_plans,
             ptr_kinds,
             forced_raw_bindings,
-            borrowed_raw_params,
-            raw_bridge_bindings,
+            borrowed_raw_params: FxHashMap::default(),
+            raw_bridge_bindings: FxHashMap::default(),
             raw_scalar_bridge_fields,
             alloc_wrappers,
             free_like_wrappers,
@@ -2291,6 +2356,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             c_exposed_thin_abi_fields,
             c_exposed_cursor_abi_fields,
             item_lifetime_plans: ItemLifetimePlans::default(),
+            signature_input_lifetime_overrides: FxHashMap::default(),
             item_ty_context: Vec::new(),
             impl_self_lifetimes: Vec::new(),
             ast_to_hir,
@@ -2304,6 +2370,34 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             diagnostics,
         };
         visitor.item_lifetime_plans = visitor.build_item_lifetime_plans();
+        visitor.apply_field_storage_input_lifetimes();
+        if sync_fn_ptr_contracts(
+            rust_program,
+            pre_points_to,
+            points_to_solutions,
+            tss,
+            &fn_ptr_groups,
+            &mut visitor.fn_ptr_rewrite,
+            &mut visitor.sig_decs,
+            &config.c_exposed_fns,
+        ) {
+            visitor.ptr_kinds = collect_diffs_with_fn_ptr_decisions(
+                rust_program,
+                analysis,
+                &visitor.sig_decs,
+                &fn_ptr_groups,
+                &visitor.fn_ptr_rewrite.group_decisions,
+            );
+        }
+        visitor.raw_bridge_bindings = collect_raw_bridge_bindings(
+            rust_program.tcx,
+            &visitor.ptr_kinds,
+            &visitor.alloc_wrappers,
+            &visitor.free_like_wrappers,
+            &local_raw_param_summaries,
+        );
+        visitor.borrowed_raw_params =
+            collect_borrowed_raw_params(rust_program.tcx, &initial_sig_decs, &visitor.sig_decs);
         visitor.record_field_decisions();
         visitor
     }
@@ -2951,6 +3045,132 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .and_then(|plan| plan.field_lifetimes.get(&field.field_index).copied())
     }
 
+    fn record_signature_input_lifetime_override(
+        &mut self,
+        did: LocalDefId,
+        input_index: usize,
+        field: StructFieldSlot,
+        lifetime: Symbol,
+    ) {
+        let lifetimes = self.ordered_item_lifetimes(field.struct_did);
+        let Some(slot) = lifetimes
+            .iter()
+            .position(|candidate| *candidate == lifetime)
+        else {
+            return;
+        };
+        let overrides = self
+            .signature_input_lifetime_overrides
+            .entry((did, input_index))
+            .or_default()
+            .entry(field.struct_did)
+            .or_insert_with(|| vec![None; lifetimes.len()]);
+        if let Some(override_lifetime) = overrides.get_mut(slot)
+            && (override_lifetime.is_none() || *override_lifetime == Some(lifetime))
+        {
+            *override_lifetime = Some(lifetime);
+        }
+    }
+
+    fn apply_field_storage_input_lifetimes(&mut self) {
+        struct FieldStorageLifetimeVisitor<'a, 'analysis, 'tcx> {
+            transform: &'a mut TransformVisitor<'analysis, 'tcx>,
+        }
+
+        impl FieldStorageLifetimeVisitor<'_, '_, '_> {
+            fn record_storage(
+                &mut self,
+                field: StructFieldSlot,
+                lhs: Option<&hir::Expr<'_>>,
+                rhs: &hir::Expr<'_>,
+            ) {
+                if !matches!(
+                    self.transform.field_ptr_kind(field),
+                    Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+                ) {
+                    return;
+                }
+                let Some(lifetime) = self.transform.field_lifetime(field) else {
+                    return;
+                };
+                let Some(rhs_hir_id) = field_storage_rhs_source_local_id(rhs) else {
+                    return;
+                };
+                let Some((did, input_index)) =
+                    param_index_for_binding(self.transform.tcx, rhs_hir_id)
+                else {
+                    return;
+                };
+                let Some(sig_dec) = self.transform.sig_decs.data.get_mut(&did) else {
+                    return;
+                };
+                if !decision_carries_lifetime(
+                    sig_dec.input_decs.get(input_index).copied().flatten(),
+                ) {
+                    return;
+                }
+                if let Some(input_lifetime) = sig_dec.input_lifetimes.get_mut(input_index)
+                    && (input_lifetime.is_none() || *input_lifetime == Some(lifetime))
+                {
+                    *input_lifetime = Some(lifetime);
+                }
+                if let Some(lhs) = lhs
+                    && let Some(lhs_hir_id) = field_storage_lhs_root_local_id(lhs)
+                    && let Some((lhs_did, lhs_input_index)) =
+                        param_index_for_binding(self.transform.tcx, lhs_hir_id)
+                    && lhs_did == did
+                {
+                    self.transform.record_signature_input_lifetime_override(
+                        lhs_did,
+                        lhs_input_index,
+                        field,
+                        lifetime,
+                    );
+                }
+            }
+        }
+
+        impl<'tcx> Visitor<'tcx> for FieldStorageLifetimeVisitor<'_, '_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+                match expr.kind {
+                    hir::ExprKind::Assign(lhs, rhs, _) => {
+                        if let Some(field) = hir_struct_field_slot(self.transform.tcx, lhs) {
+                            self.record_storage(field, Some(lhs), rhs);
+                        }
+                    }
+                    hir::ExprKind::Struct(qpath, fields, _) => {
+                        if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
+                            for field_expr in fields {
+                                if let Some(field_index) = hir_field_index_by_name(
+                                    self.transform.tcx,
+                                    struct_did,
+                                    field_expr.ident.name,
+                                ) {
+                                    self.record_storage(
+                                        StructFieldSlot {
+                                            struct_did,
+                                            field_index,
+                                        },
+                                        None,
+                                        field_expr.expr,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+
+        let tcx = self.tcx;
+        let mut visitor = FieldStorageLifetimeVisitor { transform: self };
+        for def_id in tcx.hir_body_owners() {
+            visitor.visit_body(tcx.hir_body_owned_by(def_id));
+        }
+    }
+
     fn should_remove_generated_copy_clone_impl(&self, item: &Item) -> bool {
         if !utils::ast::is_automatically_derived(&item.attrs) {
             return false;
@@ -3577,42 +3797,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             })
     }
 
-    fn extend_lifetimes_for_ty(&self, lifetimes: &mut Vec<Symbol>, ty: ty::Ty<'tcx>) {
-        for lifetime in self.lifetimes_for_ty(ty) {
-            if !lifetimes.contains(&lifetime) {
-                lifetimes.push(lifetime);
-            }
-        }
-    }
-
-    fn extend_signature_lifetimes_for_ty(&self, lifetimes: &mut Vec<Symbol>, ty: ty::Ty<'tcx>) {
-        self.extend_lifetimes_for_ty(lifetimes, ty);
-        match ty.kind() {
-            ty::TyKind::Adt(_, args) => {
-                for arg in args.iter() {
-                    if let ty::GenericArgKind::Type(ty) = arg.kind() {
-                        self.extend_signature_lifetimes_for_ty(lifetimes, ty);
-                    }
-                }
-            }
-            ty::TyKind::RawPtr(pointee, _) => {
-                self.extend_signature_lifetimes_for_ty(lifetimes, *pointee);
-            }
-            ty::TyKind::Ref(_, inner, _) => {
-                self.extend_signature_lifetimes_for_ty(lifetimes, *inner);
-            }
-            ty::TyKind::Array(elem, _) | ty::TyKind::Slice(elem) => {
-                self.extend_signature_lifetimes_for_ty(lifetimes, *elem);
-            }
-            ty::TyKind::Tuple(elems) => {
-                for elem in elems.iter() {
-                    self.extend_signature_lifetimes_for_ty(lifetimes, elem);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn lifetimes_for_ty(&self, ty: ty::Ty<'tcx>) -> Vec<Symbol> {
         let ty::TyKind::Adt(adt_def, _) = ty.kind() else {
             return vec![];
@@ -3772,6 +3956,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("&{lifetime}{m}{ty}")
     }
 
+    fn mk_ref_ty_with_lifetime_str(
+        &self,
+        ty: &str,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("&{lifetime}{m}{ty}")
+    }
+
     fn mk_opt_ref_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.anonymous_ty_name(ty);
         let m = if mutability { "mut " } else { "" };
@@ -3792,8 +3989,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("Option<&{lifetime}{m}{ty}>")
     }
 
+    fn mk_opt_ref_ty_with_lifetime_str(
+        &self,
+        ty: &str,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("Option<&{lifetime}{m}{ty}>")
+    }
+
     fn mk_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.ty_name(ty);
+        utils::ty!("Box<{ty}>")
+    }
+
+    fn mk_box_ty_str(&self, ty: &str) -> Ty {
         utils::ty!("Box<{ty}>")
     }
 
@@ -3807,6 +4021,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("Option<Box<{ty}>>")
     }
 
+    fn mk_opt_box_ty_str(&self, ty: &str) -> Ty {
+        utils::ty!("Option<Box<{ty}>>")
+    }
+
     fn mk_local_opt_box_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.body_ty_name(ty);
         utils::ty!("Option<Box<{ty}>>")
@@ -3817,6 +4035,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("Box<[{ty}]>")
     }
 
+    fn mk_boxed_slice_ty_str(&self, ty: &str) -> Ty {
+        utils::ty!("Box<[{ty}]>")
+    }
+
     fn mk_local_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.body_ty_name(ty);
         utils::ty!("Box<[{ty}]>")
@@ -3824,6 +4046,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn mk_opt_boxed_slice_ty(&self, ty: ty::Ty<'tcx>) -> Ty {
         let ty = self.ty_name(ty);
+        utils::ty!("Option<Box<[{ty}]>>")
+    }
+
+    fn mk_opt_boxed_slice_ty_str(&self, ty: &str) -> Ty {
         utils::ty!("Option<Box<[{ty}]>>")
     }
 
@@ -3859,6 +4085,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("crate::slice_cursor::{cursor}<{lifetime}, {ty}>")
     }
 
+    fn mk_cursor_ty_with_lifetime_str(
+        &self,
+        ty: &str,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let cursor = if mutability {
+            "SliceCursorMut"
+        } else {
+            "SliceCursor"
+        };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{}", lifetime.as_str()))
+            .unwrap_or_else(|| "'_".to_owned());
+        utils::ty!("crate::slice_cursor::{cursor}<{lifetime}, {ty}>")
+    }
+
     fn mk_local_cursor_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.body_ty_name(ty);
         if mutability {
@@ -3870,6 +4113,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn mk_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.ty_name(ty);
+        if mutability {
+            utils::ty!("&mut [{ty}]")
+        } else {
+            utils::ty!("&[{ty}]")
+        }
+    }
+
+    fn mk_slice_ty_str(&self, ty: &str, mutability: bool) -> Ty {
         if mutability {
             utils::ty!("&mut [{ty}]")
         } else {
@@ -3891,6 +4142,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ty!("&{lifetime}{m}[{ty}]")
     }
 
+    fn mk_slice_ty_with_lifetime_str(
+        &self,
+        ty: &str,
+        mutability: bool,
+        lifetime: Option<Symbol>,
+    ) -> Ty {
+        let m = if mutability { "mut " } else { "" };
+        let lifetime = lifetime
+            .map(|lifetime| format!("'{} ", lifetime.as_str()))
+            .unwrap_or_default();
+        utils::ty!("&{lifetime}{m}[{ty}]")
+    }
+
     fn mk_local_slice_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.body_ty_name(ty);
         if mutability {
@@ -3902,6 +4166,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
     fn mk_raw_ptr_ty(&self, ty: ty::Ty<'tcx>, mutability: bool) -> Ty {
         let ty = self.ty_name(ty);
+        let m = if mutability { "mut" } else { "const" };
+        utils::ty!("*{m} {ty}")
+    }
+
+    fn mk_raw_ptr_ty_str(&self, ty: &str, mutability: bool) -> Ty {
         let m = if mutability { "mut" } else { "const" };
         utils::ty!("*{m} {ty}")
     }
@@ -13287,6 +13556,50 @@ fn hir_unwrapped_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
     Some(hir_id)
 }
 
+fn field_storage_rhs_source_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = hir_unwrap_casts(hir_unwrap_addr_of_deref(hir_unwrap_casts(expr)));
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.len() == 1
+                && matches!(
+                    seg.ident.name.as_str(),
+                    "offset" | "add" | "wrapping_add" | "wrapping_sub"
+                ) =>
+        {
+            field_storage_rhs_source_local_id(receiver)
+        }
+        _ => None,
+    }
+}
+
+fn field_storage_lhs_root_local_id(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = hir_unwrap_casts(expr);
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Unary(hir::UnOp::Deref, inner) => field_storage_lhs_root_local_id(inner),
+        hir::ExprKind::Field(base, _) | hir::ExprKind::Index(base, _, _) => {
+            field_storage_lhs_root_local_id(base)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.len() == 1
+                && matches!(
+                    seg.ident.name.as_str(),
+                    "offset" | "add" | "wrapping_add" | "wrapping_sub"
+                ) =>
+        {
+            field_storage_lhs_root_local_id(receiver)
+        }
+        _ => None,
+    }
+}
+
 fn hir_path_source_kind(
     tcx: TyCtxt<'_>,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
@@ -17534,6 +17847,161 @@ fn next_lifetime_symbol(used: &mut FxHashSet<Symbol>) -> Symbol {
     }
 }
 
+impl<'a, 'analysis, 'tcx> SignatureTyRenderContext<'a, 'analysis, 'tcx> {
+    fn new(
+        transform: &'a TransformVisitor<'analysis, 'tcx>,
+        def_id: LocalDefId,
+        planned_lifetimes: &'a mut Vec<Symbol>,
+    ) -> Self {
+        let used_lifetimes = existing_item_lifetime_params(transform.tcx, def_id)
+            .into_iter()
+            .chain(planned_lifetimes.iter().copied())
+            .collect();
+        Self {
+            transform,
+            planned_lifetimes,
+            used_lifetimes,
+            tied_ty_names: FxHashMap::default(),
+        }
+    }
+
+    fn ty_name(
+        &mut self,
+        ty: ty::Ty<'tcx>,
+        outer_lifetime: Option<Symbol>,
+        lifetime_overrides: &FxHashMap<LocalDefId, Vec<Option<Symbol>>>,
+    ) -> String {
+        if let Some(outer_lifetime) = outer_lifetime
+            && lifetime_overrides.is_empty()
+        {
+            let key = (outer_lifetime, mir_ty_to_string(ty, self.transform.tcx));
+            if let Some(ty_name) = self.tied_ty_names.get(&key) {
+                return ty_name.clone();
+            }
+            let ty_name = self.uncached_ty_name(ty, Some(outer_lifetime), lifetime_overrides);
+            self.tied_ty_names.insert(key, ty_name.clone());
+            return ty_name;
+        }
+        self.uncached_ty_name(ty, outer_lifetime, lifetime_overrides)
+    }
+
+    fn uncached_ty_name(
+        &mut self,
+        ty: ty::Ty<'tcx>,
+        outer_lifetime: Option<Symbol>,
+        lifetime_overrides: &FxHashMap<LocalDefId, Vec<Option<Symbol>>>,
+    ) -> String {
+        match ty.kind() {
+            ty::TyKind::Adt(adt_def, args) => {
+                let mut args = args
+                    .iter()
+                    .map(|arg| match arg.kind() {
+                        ty::GenericArgKind::Type(ty) => {
+                            self.ty_name(ty, outer_lifetime, lifetime_overrides)
+                        }
+                        ty::GenericArgKind::Const(cnst) => cnst.to_string(),
+                        ty::GenericArgKind::Lifetime(_) => "'_".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                let lifetime_count = self.transform.lifetimes_for_ty(ty).len();
+                if lifetime_count != 0 {
+                    let promoted_lifetime_args = self
+                        .lifetimes_for_adt(*adt_def, lifetime_count, lifetime_overrides)
+                        .iter()
+                        .map(|lifetime| format!("'{}", lifetime.as_str()))
+                        .collect::<Vec<_>>();
+                    let insert_at = self
+                        .transform
+                        .existing_lifetime_param_count_for_ty(ty)
+                        .min(args.len());
+                    if !generic_args_have_lifetimes(&args, insert_at, promoted_lifetime_args.len())
+                    {
+                        for (offset, lifetime) in promoted_lifetime_args.into_iter().enumerate() {
+                            args.insert(insert_at + offset, lifetime);
+                        }
+                    }
+                }
+                let base = self.transform.adt_type_name(*adt_def);
+                if args.is_empty() {
+                    base
+                } else {
+                    format!("{base}<{}>", args.join(", "))
+                }
+            }
+            ty::TyKind::RawPtr(pointee, mutability) => {
+                let m = if mutability.is_mut() { "mut" } else { "const" };
+                format!(
+                    "*{m} {}",
+                    self.ty_name(*pointee, outer_lifetime, lifetime_overrides)
+                )
+            }
+            ty::TyKind::Ref(_, inner, mutability) => {
+                let m = if mutability.is_mut() { "mut " } else { "" };
+                format!(
+                    "&{m}{}",
+                    self.ty_name(*inner, outer_lifetime, lifetime_overrides)
+                )
+            }
+            ty::TyKind::Array(elem, len) => {
+                format!(
+                    "[{}; {len}]",
+                    self.ty_name(*elem, outer_lifetime, lifetime_overrides)
+                )
+            }
+            ty::TyKind::Slice(elem) => {
+                format!(
+                    "[{}]",
+                    self.ty_name(*elem, outer_lifetime, lifetime_overrides)
+                )
+            }
+            ty::TyKind::Tuple(elems) => {
+                let elems = elems
+                    .iter()
+                    .map(|elem| self.ty_name(elem, outer_lifetime, lifetime_overrides))
+                    .collect::<Vec<_>>();
+                format!("({})", elems.join(", "))
+            }
+            ty::TyKind::Param(param) => param.name.as_str().to_owned(),
+            _ => mir_ty_to_string(ty, self.transform.tcx),
+        }
+    }
+
+    fn lifetimes_for_adt(
+        &mut self,
+        adt_def: ty::AdtDef<'tcx>,
+        count: usize,
+        lifetime_overrides: &FxHashMap<LocalDefId, Vec<Option<Symbol>>>,
+    ) -> Vec<Symbol> {
+        let overrides = adt_def
+            .did()
+            .as_local()
+            .and_then(|did| lifetime_overrides.get(&did));
+        (0..count)
+            .map(|index| {
+                overrides
+                    .and_then(|lifetimes| lifetimes.get(index).copied().flatten())
+                    .inspect(|&lifetime| {
+                        self.ensure_lifetime(lifetime);
+                    })
+                    .unwrap_or_else(|| self.allocate_lifetime())
+            })
+            .collect()
+    }
+
+    fn allocate_lifetime(&mut self) -> Symbol {
+        let lifetime = next_lifetime_symbol(&mut self.used_lifetimes);
+        self.ensure_lifetime(lifetime);
+        lifetime
+    }
+
+    fn ensure_lifetime(&mut self, lifetime: Symbol) {
+        self.used_lifetimes.insert(lifetime);
+        if !self.planned_lifetimes.contains(&lifetime) {
+            self.planned_lifetimes.push(lifetime);
+        }
+    }
+}
+
 fn lifetime_item_components(
     item_dids: &[LocalDefId],
     uses: &[ItemLifetimeUse],
@@ -17848,145 +18316,6 @@ fn hir_struct_field_slot(tcx: TyCtxt<'_>, hir_expr: &hir::Expr<'_>) -> Option<St
         struct_did,
         field_index,
     })
-}
-
-fn apply_field_storage_input_lifetimes(
-    tcx: TyCtxt<'_>,
-    analysis: &Analysis,
-    lifetime_plans: &super::lifetimes::LifetimePlans,
-    demoted_fields: &FxHashSet<StructFieldSlot>,
-    field_cursor_fields: &FxHashSet<StructFieldSlot>,
-    sig_decs: &mut SigDecisions,
-) {
-    struct FieldStorageLifetimeVisitor<'a, 'tcx> {
-        tcx: TyCtxt<'tcx>,
-        analysis: &'a Analysis,
-        lifetime_plans: &'a super::lifetimes::LifetimePlans,
-        demoted_fields: &'a FxHashSet<StructFieldSlot>,
-        field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
-        sig_decs: &'a mut SigDecisions,
-    }
-
-    impl FieldStorageLifetimeVisitor<'_, '_> {
-        fn record_storage(&mut self, field: StructFieldSlot, rhs: &hir::Expr<'_>) {
-            if !matches!(
-                borrow_promoted_array_field_kind(
-                    self.tcx,
-                    self.analysis,
-                    self.demoted_fields,
-                    self.field_cursor_fields,
-                    field,
-                ),
-                Some(PtrKind::Slice(_) | PtrKind::SliceCursor(_))
-            ) {
-                return;
-            }
-            let Some(lifetime) = self
-                .lifetime_plans
-                .structs
-                .get(&field.struct_did)
-                .and_then(|plan| plan.field_lifetimes.get(&field.field_index))
-                .copied()
-            else {
-                return;
-            };
-            let Some(rhs_hir_id) = hir_unwrapped_local_id(hir_unwrap_addr_of_deref(rhs)) else {
-                return;
-            };
-            let Some((did, input_index)) = param_index_for_binding(self.tcx, rhs_hir_id) else {
-                return;
-            };
-            let Some(sig_dec) = self.sig_decs.data.get_mut(&did) else {
-                return;
-            };
-            if let Some(input_lifetime) = sig_dec.input_lifetimes.get_mut(input_index)
-                && (input_lifetime.is_none() || *input_lifetime == Some(lifetime))
-            {
-                *input_lifetime = Some(lifetime);
-            }
-        }
-    }
-
-    impl<'tcx> Visitor<'tcx> for FieldStorageLifetimeVisitor<'_, 'tcx> {
-        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-            match expr.kind {
-                hir::ExprKind::Assign(lhs, rhs, _) => {
-                    if let Some(field) = hir_struct_field_slot(self.tcx, lhs) {
-                        self.record_storage(field, rhs);
-                    }
-                }
-                hir::ExprKind::Struct(qpath, fields, _) => {
-                    if let Some(struct_did) = hir_local_struct_did_from_qpath(qpath) {
-                        for field_expr in fields {
-                            if let Some(field_index) =
-                                hir_field_index_by_name(self.tcx, struct_did, field_expr.ident.name)
-                            {
-                                self.record_storage(
-                                    StructFieldSlot {
-                                        struct_did,
-                                        field_index,
-                                    },
-                                    field_expr.expr,
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            intravisit::walk_expr(self, expr);
-        }
-    }
-
-    let mut visitor = FieldStorageLifetimeVisitor {
-        tcx,
-        analysis,
-        lifetime_plans,
-        demoted_fields,
-        field_cursor_fields,
-        sig_decs,
-    };
-    for def_id in tcx.hir_body_owners() {
-        visitor.visit_body(tcx.hir_body_owned_by(def_id));
-    }
-}
-
-fn borrow_promoted_array_field_kind(
-    tcx: TyCtxt<'_>,
-    analysis: &Analysis,
-    demoted_fields: &FxHashSet<StructFieldSlot>,
-    field_cursor_fields: &FxHashSet<StructFieldSlot>,
-    field: StructFieldSlot,
-) -> Option<PtrKind> {
-    if demoted_fields.contains(&field)
-        || struct_field_is_exactly_owning(analysis, field)
-        || struct_field_pointee_forces_raw(tcx, field)
-    {
-        return None;
-    }
-    let mutability = if analysis
-        .borrow_promotion_result
-        .mutable_fields
-        .contains(&field)
-    {
-        true
-    } else if analysis
-        .borrow_promotion_result
-        .shared_fields
-        .contains(&field)
-    {
-        false
-    } else {
-        return None;
-    };
-    if !analysis_field_is_array_like(analysis, field) {
-        return None;
-    }
-    if field_cursor_fields.contains(&field) {
-        Some(PtrKind::SliceCursor(mutability))
-    } else {
-        Some(PtrKind::Slice(mutability))
-    }
 }
 
 fn analysis_field_is_array_like(analysis: &Analysis, field: StructFieldSlot) -> bool {

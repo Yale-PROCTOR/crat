@@ -63,6 +63,20 @@ fn run_test_with_config(code: &str, config: &Config, includes: &[&str], excludes
     }
 }
 
+fn run_typecheck_test_after_shape_check(code: &str, includes: &[&str], excludes: &[&str]) {
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
 #[test]
 fn test_local_ptr_to_ref() {
     run_test(
@@ -1638,8 +1652,8 @@ pub unsafe fn touch(mut x: i32) -> i32 {
         &[
             "pub struct Holder<'a>",
             "pub p: Option<&'a i32>",
-            "pub unsafe fn id_holder<'a>(h: &'a mut crate::Holder<'a>)",
-            "-> &'a mut crate::Holder<'a>",
+            "pub unsafe fn id_holder<'a, 'b>(h: &'a mut crate::Holder<'b>)",
+            "-> &'a mut crate::Holder<'b>",
             "Holder { p: Some(&x) }",
         ],
         &["pub p: *const i32", "*(*r).p"],
@@ -11490,6 +11504,108 @@ pub unsafe extern "C" fn select_entry(mut map: *mut Map, mut index: usize) {
 }
 
 #[test]
+fn test_struct_field_storage_lifetime_slice_param_indexed_result_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn read_second(p: *const i32) -> i32 {
+    *p.offset(1)
+}
+
+#[repr(C)]
+pub struct Hashmap {
+    pub entries: *mut i32,
+    pub xpp: *const i32,
+}
+
+pub unsafe extern "C" fn fill_hashmap(
+    mut xpp: *const i32,
+    mut result: *mut Hashmap,
+) -> i32 {
+    (*result.offset(0)).xpp = xpp;
+    (*result.offset(0)).entries = (*result.offset(0)).entries;
+    return read_second((*result.offset(0)).xpp) + read_second(xpp);
+}
+"#,
+        &[
+            "pub struct Hashmap<'a>",
+            "pub xpp: &'a [i32]",
+            "pub unsafe fn read_second(p: &[i32])",
+            "mut xpp: &'",
+            "[i32]",
+            "mut result: &mut [crate::Hashmap<'",
+        ],
+        &["pub xpp: *const i32"],
+    );
+}
+
+#[test]
+fn test_struct_field_storage_lifetime_slice_param_deref_result_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn read_second(p: *const i32) -> i32 {
+    *p.offset(1)
+}
+
+#[repr(C)]
+pub struct Hashmap {
+    pub entries: *mut i32,
+    pub xpp: *const i32,
+}
+
+pub unsafe extern "C" fn fill_hashmap_one(
+    mut xpp: *const i32,
+    mut result: *mut Hashmap,
+    mut idx: isize,
+) -> i32 {
+    (*result).xpp = xpp;
+    (*result).entries = (*result).entries;
+    return read_second((*result).xpp) + read_second(xpp) + idx as i32;
+}
+"#,
+        &[
+            "pub struct Hashmap<'a>",
+            "pub xpp: &'a [i32]",
+            "pub unsafe fn read_second(p: &[i32])",
+            "mut xpp: &'",
+            "[i32]",
+            "mut result: &mut crate::Hashmap<'",
+        ],
+        &["pub xpp: *const i32"],
+    );
+}
+
+#[test]
+fn test_struct_field_storage_lifetime_cursor_param_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct Hashmap {
+    pub entries: *mut i32,
+    pub cursor: *const i32,
+}
+
+pub unsafe extern "C" fn install_cursor(
+    mut cursor: *const i32,
+    mut result: *mut Hashmap,
+) -> i32 {
+    (*result.offset(0)).cursor = cursor.offset(3);
+    (*result.offset(0)).entries = (*result.offset(0)).entries;
+    return *(*result.offset(0)).cursor.offset(-1);
+}
+"#,
+        &[
+            "pub struct Hashmap<'a>",
+            "pub cursor: crate::slice_cursor::SliceCursor<'a, i32>",
+            "mut cursor: &'",
+            "[i32]",
+            "mut result: &mut [crate::Hashmap<'",
+            "SliceCursor::with_pos",
+        ],
+        &["pub cursor: *const i32"],
+    );
+}
+
+#[test]
 fn test_section15_option_fn_payload_cast_in_extern_call_keeps_raw_until_supported() {
     let code = r#"
 #[repr(C)]
@@ -12470,12 +12586,138 @@ pub unsafe fn pair_slot_and_identity(
         &[
             "pub struct Pair<'a, 'b>",
             "pub unsafe fn pair_slot_and_identity<'a,",
-            "'b>(flag: bool",
+            "'b,\n    'c>(flag: bool",
             "mut value: Option<&'a mut i32>",
-            "mut out: &mut [*mut crate::Pair<'a, 'b>]",
+            "mut out: &mut [*mut crate::Pair<'b, 'c>]",
             "-> Option<&'a mut i32>",
         ],
         &["pub unsafe fn pair_slot_and_identity<'a>("],
+    );
+}
+
+#[test]
+fn test_fn_signature_uses_nested_item_lifetime_slots_for_second_repeated_shared_field_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct static_tree_desc {
+    pub static_tree: *const i32,
+}
+
+#[repr(C)]
+pub struct tree_desc {
+    pub stat_desc: *const static_tree_desc,
+}
+
+#[repr(C)]
+pub struct internal_state {
+    pub l_desc: tree_desc,
+    pub bl_desc: tree_desc,
+}
+
+pub unsafe fn build_tree(
+    mut s: *mut internal_state,
+    mut desc: *mut tree_desc,
+) -> i32 {
+    return *(*(*desc.offset(0)).stat_desc.offset(0)).static_tree.offset(0);
+}
+
+pub unsafe fn build_bl_tree(mut s: *mut internal_state) -> i32 {
+    return build_tree(s, &raw mut (*s.offset(0)).bl_desc);
+}
+"#,
+        &[
+            "pub struct tree_desc<'a, 'b>",
+            "pub struct internal_state<'a, 'b, 'c, 'd>",
+            "pub l_desc: tree_desc<'a, 'b>",
+            "pub bl_desc: tree_desc<'c, 'd>",
+            "pub unsafe fn build_tree<'a, 'b,",
+        ],
+        &["pub bl_desc: tree_desc,"],
+    );
+}
+
+#[test]
+fn test_fn_signature_uses_nested_item_lifetime_slots_for_second_repeated_mut_chain_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct static_tree_desc {
+    pub static_tree: *mut i32,
+}
+
+#[repr(C)]
+pub struct tree_desc {
+    pub stat_desc: *mut static_tree_desc,
+}
+
+#[repr(C)]
+pub struct internal_state {
+    pub l_desc: tree_desc,
+    pub bl_desc: tree_desc,
+}
+
+pub unsafe fn read_tree_value(
+    mut s: *mut internal_state,
+    mut desc: *mut tree_desc,
+) -> i32 {
+    return *(*(*desc.offset(0)).stat_desc.offset(0)).static_tree.offset(0);
+}
+
+pub unsafe fn read_bl_tree_value(mut s: *mut internal_state) -> i32 {
+    return read_tree_value(s, &raw mut (*s.offset(0)).bl_desc);
+}
+"#,
+        &[
+            "pub struct tree_desc<'a, 'b>",
+            "pub struct internal_state<'a, 'b, 'c, 'd>",
+            "pub l_desc: tree_desc<'a, 'b>",
+            "pub bl_desc: tree_desc<'c, 'd>",
+            "pub unsafe fn read_tree_value<'a, 'b,",
+        ],
+        &["pub bl_desc: tree_desc,"],
+    );
+}
+
+#[test]
+fn test_fn_signature_uses_nested_item_lifetime_slots_for_reversed_second_field_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct static_tree_desc {
+    pub static_tree: *const i32,
+}
+
+#[repr(C)]
+pub struct tree_desc {
+    pub stat_desc: *const static_tree_desc,
+}
+
+#[repr(C)]
+pub struct internal_state {
+    pub bl_desc: tree_desc,
+    pub l_desc: tree_desc,
+}
+
+pub unsafe fn build_tree(
+    mut s: *mut internal_state,
+    mut desc: *mut tree_desc,
+) -> i32 {
+    return *(*(*desc.offset(0)).stat_desc.offset(0)).static_tree.offset(0);
+}
+
+pub unsafe fn build_l_tree(mut s: *mut internal_state) -> i32 {
+    return build_tree(s, &raw mut (*s.offset(0)).l_desc);
+}
+"#,
+        &[
+            "pub struct tree_desc<'a, 'b>",
+            "pub struct internal_state<'a, 'b, 'c, 'd>",
+            "pub bl_desc: tree_desc<'a, 'b>",
+            "pub l_desc: tree_desc<'c, 'd>",
+            "pub unsafe fn build_tree<'a, 'b,",
+        ],
+        &["pub l_desc: tree_desc,"],
     );
 }
 

@@ -425,8 +425,11 @@ impl SigDecision {
     }
 }
 
-fn decision_carries_lifetime(decision: Option<PtrKind>) -> bool {
-    matches!(decision, Some(PtrKind::Ref(_) | PtrKind::OptRef(_)))
+pub(crate) fn decision_carries_lifetime(decision: Option<PtrKind>) -> bool {
+    matches!(
+        decision,
+        Some(PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
+    )
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -525,11 +528,7 @@ impl SigDecisions {
                 .cloned()
                 .unwrap_or_default();
             let output_lifetime = lifetime_plan.output_lifetime;
-            let input_lifetimes = if lifetime_plan.input_lifetimes.len() == input_len {
-                lifetime_plan.input_lifetimes.clone()
-            } else {
-                vec![None; input_len]
-            };
+            let input_lifetimes = vec![None; input_len];
 
             let aliases = analysis.aliases.get(did);
 
@@ -1444,6 +1443,24 @@ pub unsafe fn foo(p: *const i32) {
 
         assert_eq!(sig_dec.input_lifetimes, vec![None]);
         assert_eq!(sig_dec.output_lifetime, Some(lifetime));
+    }
+
+    #[test]
+    fn sig_decision_preserves_input_lifetime_for_slice_like_decisions() {
+        let lifetime = Symbol::new(1);
+        for decision in [PtrKind::Slice(false), PtrKind::SliceCursor(false)] {
+            let mut sig_dec = SigDecision {
+                input_decs: vec![Some(PtrKind::OptRef(false))],
+                input_lifetimes: vec![Some(lifetime)],
+                output_dec: None,
+                output_lifetime: None,
+                signature_locked: false,
+            };
+
+            sig_dec.set_input_dec(0, Some(decision));
+
+            assert_eq!(sig_dec.input_lifetimes, vec![Some(lifetime)]);
+        }
     }
 
     #[test]
