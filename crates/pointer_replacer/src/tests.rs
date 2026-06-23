@@ -9719,7 +9719,7 @@ mod borrow_ownership_coherence {
                 CrateCtxt, SlotKind,
                 coherence::add_coherence,
                 crate_slots::CrateSlots,
-                emit_single_fn_ownership_constraints,
+                emit_crate_ownership_constraints,
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
             },
@@ -9826,12 +9826,11 @@ pub unsafe fn alloc_free() {
                 let mut output_params = OutputParams::default();
                 output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let (stats, selectors) = emit_single_fn_ownership_constraints(
+                let (stats, selectors) = emit_crate_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
                     &kind_solver,
-                    alloc_free,
                 )
                 .expect("B1 ownership emission should run");
 
@@ -9915,12 +9914,11 @@ pub unsafe fn alloc_free() {
                 let mut output_params = OutputParams::default();
                 output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_crate_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
                     &kind_solver,
-                    alloc_free,
                 )
                 .expect("B2 ownership emission should run");
 
@@ -9965,12 +9963,11 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let mut output_params = OutputParams::default();
                 output_params.insert(fill, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_crate_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
                     &kind_solver,
-                    fill,
                 )
                 .expect("B2 ownership emission should run");
                 add_coherence(&kind_solver, &slots, fill, &body);
@@ -10028,12 +10025,11 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 let mut output_params = OutputParams::default();
                 output_params.insert(leak, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_crate_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
                     &kind_solver,
-                    leak,
                 )
                 .expect("B3a ownership emission should run");
 
@@ -10096,12 +10092,11 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                 let mut output_params = OutputParams::default();
                 output_params.insert(two, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_crate_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
                     &kind_solver,
-                    two,
                 )
                 .expect("B3a ownership emission should run");
 
@@ -10130,6 +10125,84 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                     model.get(&b),
                     Some(&SlotKind::Owning),
                     "the leaked allocation must not be Owning"
+                );
+            },
+        );
+    }
+
+    /// B3b headline: interprocedural ownership flow across a *return* edge.
+    /// `make` allocates and returns ownership; `forward` just returns `make()`'s
+    /// result. `forward` contains no `malloc` and no sink, so the *only* path to
+    /// ownership in `forward`'s return slot is `Boundary::call` linking
+    /// `dest.def = make.ret` (and `make.ret` being owning, which requires `make`'s
+    /// body to have been emitted). If that cross-function edge were absent,
+    /// `forward`'s return would be soft-objective non-owning — so the assertion
+    /// is non-vacuous (a local sink cannot satisfy it, unlike a `free(p)` shape).
+    /// `selectors.len() == 1` independently proves `make`'s source was emitted by
+    /// the crate driver; single-fn emission of `forward` alone would instead
+    /// panic on the local call to `make` (absent from a self-entry `InterCtxt`).
+    #[test]
+    fn interproc_alloc_return_flows_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make() -> *mut core::ffi::c_void {
+    unsafe { malloc(4) }
+}
+
+pub unsafe fn forward() -> *mut core::ffi::c_void {
+    unsafe { make() }
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let make = function_by_name(&program, "make");
+                let forward = function_by_name(&program, "forward");
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                for did in [make, forward] {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                    output_params.insert(did, MixedBitSet::new_empty(body.local_decls.len()));
+                }
+
+                let (_stats, selectors) = emit_crate_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &slots,
+                    &kind_solver,
+                )
+                .expect("B3b crate emission should run");
+
+                // The only malloc is in `make`; a selector here proves `make`'s
+                // body was emitted by the crate driver (emitting `forward` alone
+                // would see zero sources).
+                assert_eq!(selectors.len(), 1);
+
+                // Return locals (Local 0) at depth 0.
+                let make_ret = local_slot(&slots, make, Local::from_u32(0), 0);
+                let forward_ret = local_slot(&slots, forward, Local::from_u32(0), 0);
+
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
+                // Diagnostic: `make_ret` owning proves `make` was emitted owning;
+                // `forward_ret` owning proves the cross-function return edge carried
+                // it. A broken edge fails `forward_ret` while `make_ret` still holds.
+                assert_eq!(
+                    model.get(&make_ret),
+                    Some(&SlotKind::Owning),
+                    "`make` must return Owning (its malloc source emitted)"
+                );
+                assert_eq!(
+                    model.get(&forward_ret),
+                    Some(&SlotKind::Owning),
+                    "ownership from `make` must flow across the call into `forward`'s return"
                 );
             },
         );
