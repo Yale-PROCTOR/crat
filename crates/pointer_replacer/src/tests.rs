@@ -9817,7 +9817,10 @@ pub unsafe fn partial_group() -> i32 {
     // pinned observations: p is rewritten to p_idx, q stays a raw pointer.
     assert!(changed, "p should be rewritten: {s}");
     assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
-    assert!(s.contains("let mut p_idx: isize = 0isize"), "p_idx initialized: {s}");
+    assert!(
+        s.contains("let mut p_idx: isize = 0isize"),
+        "p_idx initialized: {s}"
+    );
     assert!(s.contains("let mut q"), "q stays a raw pointer: {s}");
     assert!(!s.contains("q_idx"), "q is not index-rewritten: {s}");
     assert!(
