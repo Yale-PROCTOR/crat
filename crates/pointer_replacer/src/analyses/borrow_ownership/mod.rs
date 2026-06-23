@@ -206,9 +206,9 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
 }
 
 /// Emit one function body's BO constraints into the shared `database`/`KindSolver`
-/// and solidify its per-version ownership onto slots. Shared by the single-fn
-/// (B1–B3a) and crate-level (B3b) drivers; `inter_ctxt` must already contain a
-/// signature for every callee this body can reach.
+/// and solidify its per-version ownership onto slots. The sole body-emission path,
+/// called once per function by `emit_crate_ownership_constraints`; `inter_ctxt`
+/// must already contain a signature for every callee this body can reach.
 fn emit_fn_body_into<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     slots: &CrateSlots,
