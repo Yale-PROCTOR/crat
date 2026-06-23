@@ -1178,6 +1178,152 @@ fn wrapped_stored_output_lifetime() {
 }
 
 #[test]
+fn placeholder_mut_param_local_fallback_unused_after_assignment_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *mut i32) {
+            let mut fallback = 0i32;
+            p = &raw mut fallback;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "p is a signature placeholder; assigning a local fallback to it should be demoted even without later uses"
+    );
+}
+
+#[test]
+fn placeholder_shared_param_local_fallback_unused_after_assignment_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *const i32) {
+            let fallback = 0i32;
+            p = &raw const fallback;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "shared parameter p cannot be promoted when reassigned to a local fallback"
+    );
+}
+
+#[test]
+fn placeholder_mut_param_local_fallback_used_after_assignment_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *mut i32) {
+            let mut fallback = 0i32;
+            p = &raw mut fallback;
+            *p = 1;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "using p after assigning a local fallback still leaves p with its signature lifetime"
+    );
+}
+
+#[test]
+fn placeholder_shared_slice_candidate_local_fallback_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *const u8, len: usize) -> usize {
+            let before = std::slice::from_raw_parts(p, len).len();
+            let fallback = [0u8; 4];
+            p = fallback.as_ptr();
+            before
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "slice-shaped shared parameter p should be demoted after reassignment to a local array fallback"
+    );
+}
+
+#[test]
+fn placeholder_mut_slice_candidate_local_fallback_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *mut u8, len: usize) -> usize {
+            let before = std::slice::from_raw_parts_mut(p, len).len();
+            let mut fallback = [0u8; 4];
+            p = fallback.as_mut_ptr();
+            before
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "slice-shaped mutable parameter p should be demoted after reassignment to a local array fallback"
+    );
+}
+
+#[test]
+fn placeholder_multiple_params_local_fallbacks_are_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *mut i32, mut q: *const i32) {
+            let mut writable = 0i32;
+            let readable = 1i32;
+            p = &raw mut writable;
+            q = &raw const readable;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p", "q"],
+        "each parameter reassigned to local fallback storage should be demoted independently"
+    );
+}
+
+#[test]
+fn placeholder_branch_local_fallback_is_demoted() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(mut p: *mut i32, use_fallback: bool) {
+            if use_fallback {
+                let mut fallback = 0i32;
+                p = &raw mut fallback;
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        vec!["p"],
+        "a parameter assigned to branch-local fallback storage must not be promoted"
+    );
+}
+
+#[test]
+fn placeholder_static_fallback_remains_promotable() {
+    let demoted = run_demote(
+        "
+        static mut FALLBACK: i32 = 0;
+
+        unsafe fn f(mut p: *mut i32) {
+            p = &raw mut FALLBACK;
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        Vec::<String>::new(),
+        "assigning a static fallback to p does not create a local lifetime conflict"
+    );
+}
+
+#[test]
 #[should_panic]
 fn null_ptr_no_provenance() {
     // p is initialized from a null constant — no provenance is created for it.

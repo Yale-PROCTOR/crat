@@ -8,13 +8,12 @@ use rustc_mir_dataflow::{
     points::{DenseLocationMap, PointIndex},
 };
 
-use super::{Provenance, ProvenanceSet, direct_raw_pointer_field_slots_in_ty};
+use super::{Provenance, ProvenanceData, ProvenanceSet, direct_raw_pointer_field_slots_in_ty};
 use crate::analyses::{liveness::MaybeLiveLocals, mir::TerminatorExt};
 
-/// The set of program points that a [`Provenance`] is live on exit
+/// The set of program points where a [`Provenance`] is live.
 pub(crate) type ProvenanceLiveness = SparseBitMatrix<PointIndex, Provenance>;
 
-/// FIXME place holder provenance should be live throughout the fn body
 pub fn compute_provenance_liveness<'tcx>(
     location_map: &DenseLocationMap,
     tcx: TyCtxt<'tcx>,
@@ -22,6 +21,13 @@ pub fn compute_provenance_liveness<'tcx>(
     provenance_set: &ProvenanceSet,
 ) -> ProvenanceLiveness {
     let mut provenance_liveness = ProvenanceLiveness::new(provenance_set.provenance_data.len());
+    let placeholder_provenances: Vec<_> = provenance_set
+        .provenance_data
+        .iter_enumerated()
+        .filter_map(|(provenance, data)| {
+            matches!(data, ProvenanceData::PlaceHolder(..)).then_some(provenance)
+        })
+        .collect();
 
     let mut local_liveness = MaybeLiveLocals
         .iterate_to_fixpoint(tcx, body, None)
@@ -37,6 +43,9 @@ pub fn compute_provenance_liveness<'tcx>(
             };
 
             let point_index = location_map.point_from_location(location);
+            for &provenance in &placeholder_provenances {
+                provenance_liveness.insert(point_index, provenance);
+            }
 
             local_liveness.seek_before_primary_effect(location);
             let liveness = local_liveness.get();
