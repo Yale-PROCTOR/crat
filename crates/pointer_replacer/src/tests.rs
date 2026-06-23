@@ -8229,6 +8229,427 @@ pub unsafe fn builtin_first_bytes<'a, 'b, 'c>() -> core::ffi::c_int {
 }
 
 #[test]
+fn test_dangerous_implicit_autoref_local_array_slice_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_touch(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct SearchInfo {
+    pub found: *const core::ffi::c_char,
+    pub raw: *mut core::ffi::c_void,
+    pub hits: i32,
+}
+
+pub unsafe fn scan_found(mut k: isize) -> i32 {
+    let mut info_storage = [
+        SearchInfo {
+            found: b"hit\0" as *const u8 as *const core::ffi::c_char,
+            raw: core::ptr::null_mut(),
+            hits: 1,
+        },
+        SearchInfo {
+            found: 0 as *const core::ffi::c_char,
+            raw: core::ptr::null_mut(),
+            hits: 0,
+        },
+    ];
+    let mut info = info_storage.as_mut_ptr();
+    let same = info == info_storage.as_mut_ptr();
+    raw_touch((*info.offset(k)).raw);
+    if (*info.offset(k)).found.is_null() {
+        return 0;
+    }
+    return *(*info.offset(k)).found.offset(0) as i32 + same as i32;
+}
+"#,
+        &[
+            "pub struct SearchInfo<'a>",
+            "pub found: &'a [core::ffi::c_char]",
+        ],
+        &["pub found: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_local_array_nested_slice_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_touch(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct InfoName {
+    pub name: *const core::ffi::c_char,
+}
+
+impl Copy for InfoName {}
+
+impl Clone for InfoName {
+    fn clone(&self) -> InfoName {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct SearchInfo {
+    pub name: InfoName,
+    pub raw: *mut core::ffi::c_void,
+    pub hits: i32,
+}
+
+pub unsafe fn force_name_field(info: InfoName) -> i32 {
+    if info.name.is_null() {
+        return 0;
+    }
+    return *info.name.offset(0) as i32;
+}
+
+pub unsafe fn scan_name(mut k: isize) -> i32 {
+    let mut info_storage = [
+        SearchInfo {
+            name: InfoName {
+                name: b"entry\0" as *const u8 as *const core::ffi::c_char,
+            },
+            raw: core::ptr::null_mut(),
+            hits: 1,
+        },
+        SearchInfo {
+            name: InfoName {
+                name: 0 as *const core::ffi::c_char,
+            },
+            raw: core::ptr::null_mut(),
+            hits: 0,
+        },
+    ];
+    let mut info = info_storage.as_mut_ptr();
+    let same = info == info_storage.as_mut_ptr();
+    raw_touch((*info.offset(k)).raw);
+    if (*info.offset(k)).name.name.is_null() {
+        return 0;
+    }
+    return force_name_field((*info.offset(k)).name) + same as i32;
+}
+"#,
+        &[
+            "pub struct InfoName<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+            "pub unsafe fn force_name_field(info: InfoName<'_>) -> i32",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_callback_slice_field_null_check_typechecks() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("write_callback".to_string());
+    run_test_with_config(
+        r#"
+#[repr(C)]
+pub struct WriteData {
+    pub out: *mut u8,
+    pub len: usize,
+}
+
+pub type WriteCallback = Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> i32>;
+
+pub static mut WRITE_CALLBACK: WriteCallback = Some(
+    write_callback as unsafe extern "C" fn(*mut core::ffi::c_void) -> i32,
+);
+
+pub unsafe extern "C" fn write_callback(payload: *mut core::ffi::c_void) -> i32 {
+    let data = payload as *mut WriteData;
+    let same = data == payload as *mut WriteData;
+    if (*data).out.is_null() {
+        return 0;
+    }
+    *(*data).out.offset(0) = 1;
+    return (*data).len as i32 + same as i32;
+}
+
+pub unsafe fn drive_write(mut bytes: [u8; 4]) -> i32 {
+    let mut data = WriteData {
+        out: bytes.as_mut_ptr(),
+        len: 4,
+    };
+    return WRITE_CALLBACK.unwrap()(&raw mut data as *mut core::ffi::c_void);
+}
+"#,
+        &config,
+        &["pub struct WriteData<'a>", "pub out: &'a mut [u8]"],
+        &["pub out: *mut u8"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_scalar_opt_ref_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct ScalarInfo {
+    pub value: *const i32,
+    pub tag: i32,
+}
+
+pub static VALUE: i32 = 7;
+
+static mut SCALARS: [ScalarInfo; 2] = [
+    ScalarInfo {
+        value: &VALUE as *const i32,
+        tag: 1,
+    },
+    ScalarInfo {
+        value: 0 as *const i32,
+        tag: 0,
+    },
+];
+
+pub unsafe fn find_scalar() -> i32 {
+    let mut entry = SCALARS.as_ptr();
+    while !(*entry).value.is_null() {
+        return *(*entry).value + (*entry).tag;
+    }
+    return 0;
+}
+"#,
+        &["pub struct ScalarInfo<'a>", "pub value: Option<&'a i32>"],
+        &["pub value: *const i32"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_static_slice_field_raw_bridge_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_take(ptr: *const core::ffi::c_char);
+}
+
+#[repr(C)]
+pub struct BridgeEntry {
+    pub name: *const core::ffi::c_char,
+    pub value: i32,
+}
+
+static mut BRIDGES: [BridgeEntry; 2] = [
+    BridgeEntry {
+        name: b"one\0" as *const u8 as *const core::ffi::c_char,
+        value: 1,
+    },
+    BridgeEntry {
+        name: 0 as *const core::ffi::c_char,
+        value: 0,
+    },
+];
+
+pub unsafe fn pass_static_raw_bridge() -> i32 {
+    let mut entry = BRIDGES.as_ptr();
+    if (*entry).name.is_null() {
+        return 0;
+    }
+    if *(*entry).name.offset(0) == b'o' as core::ffi::c_char {
+        raw_take((*entry).name);
+    }
+    return (*entry).value;
+}
+"#,
+        &[
+            "pub struct BridgeEntry<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+            ".as_ptr() as *const i8",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_static_mut_table_slice_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct TableEntry {
+    pub name: *const core::ffi::c_char,
+    pub value: i32,
+}
+
+static mut TABLE: [TableEntry; 2] = [
+    TableEntry {
+        name: b"one\0" as *const u8 as *const core::ffi::c_char,
+        value: 1,
+    },
+    TableEntry {
+        name: 0 as *const core::ffi::c_char,
+        value: 0,
+    },
+];
+
+pub unsafe fn find_mut_table() -> i32 {
+    let mut entry = TABLE.as_mut_ptr();
+    while !(*entry).name.is_null() {
+        if *(*entry).name.offset(0) == b'o' as core::ffi::c_char {
+            return (*entry).value;
+        }
+        entry = entry.offset(1);
+    }
+    return 0;
+}
+"#,
+        &[
+            "pub struct TableEntry<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_static_const_table_slice_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct TableEntry {
+    pub name: *const core::ffi::c_char,
+    pub value: i32,
+}
+
+static mut TABLE: [TableEntry; 2] = [
+    TableEntry {
+        name: b"one\0" as *const u8 as *const core::ffi::c_char,
+        value: 1,
+    },
+    TableEntry {
+        name: 0 as *const core::ffi::c_char,
+        value: 0,
+    },
+];
+
+pub unsafe fn find_const_table() -> i32 {
+    let mut entry = TABLE.as_ptr();
+    while !(*entry).name.is_null() {
+        if *(*entry).name.offset(0) == b'o' as core::ffi::c_char {
+            return (*entry).value;
+        }
+        entry = entry.offset(1);
+    }
+    return 0;
+}
+"#,
+        &[
+            "pub struct TableEntry<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_static_nested_slice_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct InfoName {
+    pub name: *const core::ffi::c_char,
+}
+
+impl Copy for InfoName {}
+
+impl Clone for InfoName {
+    fn clone(&self) -> InfoName {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct TableEntry {
+    pub nested: InfoName,
+    pub value: i32,
+}
+
+pub unsafe fn force_name_field(info: InfoName) -> i32 {
+    if info.name.is_null() {
+        return 0;
+    }
+    return *info.name.offset(0) as i32;
+}
+
+static mut TABLE: [TableEntry; 2] = [
+    TableEntry {
+        nested: InfoName {
+            name: b"one\0" as *const u8 as *const core::ffi::c_char,
+        },
+        value: 1,
+    },
+    TableEntry {
+        nested: InfoName {
+            name: 0 as *const core::ffi::c_char,
+        },
+        value: 0,
+    },
+];
+
+pub unsafe fn find_nested_table() -> i32 {
+    let mut entry = TABLE.as_ptr();
+    while !(*entry).nested.name.is_null() {
+        if force_name_field((*entry).nested) == b'o' as core::ffi::c_char as i32 {
+            return (*entry).value;
+        }
+        entry = entry.offset(1);
+    }
+    return 0;
+}
+"#,
+        &[
+            "pub struct InfoName<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_dangerous_implicit_autoref_static_cursor_field_null_check_typechecks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct CursorEntry {
+    pub cursor: *const i32,
+    pub value: i32,
+}
+
+pub static VALUES: [i32; 3] = [10, 20, 30];
+
+static mut CURSORS: [CursorEntry; 2] = [
+    CursorEntry {
+        cursor: VALUES.as_ptr(),
+        value: 1,
+    },
+    CursorEntry {
+        cursor: 0 as *const i32,
+        value: 0,
+    },
+];
+
+pub unsafe fn find_cursor_table() -> i32 {
+    let mut entry = CURSORS.as_ptr();
+    while !(*entry).cursor.is_null() {
+        return *(*entry).cursor.offset(-1) + (*entry).value;
+    }
+    return 0;
+}
+"#,
+        &[
+            "pub struct CursorEntry<'a>",
+            "pub cursor: crate::slice_cursor::SliceCursor<'a, i32>",
+        ],
+        &["pub cursor: *const i32"],
+    );
+}
+
+#[test]
 fn test_root1_static_mut_shared_array_field_as_ptr_cursor_initializer_typechecks() {
     run_typecheck_test_after_shape_check(
         r#"

@@ -1338,8 +1338,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ExprKind::MethodCall(box MethodCall { seg, receiver, .. })
                 if seg.ident.name.as_str() == "is_null" =>
             {
-                let receiver = unwrap_paren(receiver);
-                let hir_receiver = self.ast_to_hir.get_expr(receiver.id, self.tcx);
+                let receiver_id = unwrap_paren(receiver).id;
+                let hir_receiver = self.ast_to_hir.get_expr(receiver_id, self.tcx);
                 if let Some(field_kind) = hir_receiver
                     .and_then(|hir_receiver| self.promoted_field_slot_for_hir_field(hir_receiver))
                     .and_then(|field| self.field_ptr_kind(field))
@@ -1347,9 +1347,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     match field_kind {
                         PtrKind::OptRef(_) | PtrKind::OptBox | PtrKind::OptBoxedSlice => {
                             seg.ident.name = Symbol::intern("is_none");
+                            if let Some(hir_receiver) = hir_receiver {
+                                self.normalize_promoted_field_method_receiver(
+                                    receiver,
+                                    hir_receiver,
+                                    ReceiverBorrow::Shared,
+                                );
+                            }
                         }
                         PtrKind::Slice(_) | PtrKind::SliceCursor(_) => {
                             seg.ident.name = Symbol::intern("is_empty");
+                            if let Some(hir_receiver) = hir_receiver {
+                                self.normalize_promoted_field_method_receiver(
+                                    receiver,
+                                    hir_receiver,
+                                    ReceiverBorrow::Shared,
+                                );
+                            }
                         }
                         PtrKind::Ref(_) | PtrKind::Box | PtrKind::BoxedSlice => {
                             *expr = utils::expr!("false");
@@ -1357,13 +1371,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         PtrKind::Raw(_) => {}
                     }
                 } else if let Some(hir_receiver) = hir_receiver
-                    && let Some(pe) = self.ptr_expr(receiver, hir_receiver)
+                    && let Some(pe) = self.ptr_expr(unwrap_paren(receiver), hir_receiver)
                     && matches!(self.ptr_source_kind(&pe), Some(PtrKind::OptRef(_)))
                     && !pe.projs.is_empty()
                 {
                     *expr = utils::expr!("({}).is_none()", pprust::expr_to_string(pe.base));
-                } else if matches!(receiver.kind, ExprKind::Path(_, _))
-                    && let Some(hir_id) = self.hir_id_of_path(receiver.id)
+                } else if matches!(unwrap_paren(receiver).kind, ExprKind::Path(_, _))
+                    && let Some(hir_id) = self.hir_id_of_path(unwrap_paren(receiver).id)
                     && let Some(ptr_kind) = self.effective_ptr_kind(hir_id)
                 {
                     match ptr_kind {
@@ -1475,13 +1489,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     if let Some(field) = self.promoted_field_slot_for_hir_field(hir_e)
                         && let Some(kind) = self.field_ptr_kind(field)
                     {
-                        let field_str = pprust::expr_to_string(e);
+                        let borrow = if m {
+                            ReceiverBorrow::Mutable
+                        } else {
+                            ReceiverBorrow::Shared
+                        };
+                        let original_field_str = pprust::expr_to_string(e);
+                        let field_str = self.promoted_field_receiver_expr_string(e, hir_e, borrow);
+                        let field_receiver_was_borrowed = field_str != original_field_str;
                         *expr = match kind {
                             PtrKind::OptRef(true) if m => {
                                 utils::expr!("*({field_str}).as_deref_mut().unwrap()")
                             }
                             PtrKind::OptRef(true) => {
                                 utils::expr!("*({field_str}).as_deref().unwrap()")
+                            }
+                            PtrKind::OptRef(false) if field_receiver_was_borrowed => {
+                                utils::expr!("*({field_str}).unwrap()")
                             }
                             PtrKind::OptRef(false) => utils::expr!("*({field_str}.unwrap())"),
                             PtrKind::OptBox if m => {
@@ -1511,7 +1535,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         && !pe.as_ptr
                         && !pe.cast_int
                     {
-                        let base_str = pprust::expr_to_string(pe.base);
+                        let borrow = if m {
+                            ReceiverBorrow::Mutable
+                        } else {
+                            ReceiverBorrow::Shared
+                        };
+                        let base_str =
+                            self.promoted_field_receiver_expr_string(pe.base, pe.hir_base, borrow);
                         let offset_str = pprust::expr_to_string(&offset);
                         *expr = utils::expr!("({})[{}]", base_str, offset_str)
                     } else {
@@ -1614,6 +1644,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 enum PtrCtx {
     Rhs(PtrKind),
     Deref(bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiverBorrow {
+    Shared,
+    Mutable,
 }
 
 #[derive(Clone, Debug)]
@@ -3237,6 +3273,123 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return;
         };
         **base = unwrap_addr_of_deref(inner).clone();
+    }
+
+    fn normalize_promoted_field_method_receiver(
+        &self,
+        receiver: &mut P<Expr>,
+        hir_receiver: &hir::Expr<'tcx>,
+        borrow: ReceiverBorrow,
+    ) {
+        let receiver_expr = unwrap_paren(receiver);
+        let Some(raw_owner_mutability) =
+            self.promoted_field_raw_owner_mutability(receiver_expr, hir_receiver)
+        else {
+            return;
+        };
+        if borrow == ReceiverBorrow::Mutable && !raw_owner_mutability {
+            return;
+        }
+        let receiver_str = pprust::expr_to_string(receiver_expr);
+        **receiver = match borrow {
+            ReceiverBorrow::Shared => utils::expr!("&({receiver_str})"),
+            ReceiverBorrow::Mutable => utils::expr!("&mut ({receiver_str})"),
+        };
+    }
+
+    fn promoted_field_receiver_expr_string(
+        &self,
+        receiver: &Expr,
+        hir_receiver: &hir::Expr<'tcx>,
+        borrow: ReceiverBorrow,
+    ) -> String {
+        let receiver_str = pprust::expr_to_string(receiver);
+        match (
+            borrow,
+            self.promoted_field_raw_owner_mutability(receiver, hir_receiver),
+        ) {
+            (_, None) | (ReceiverBorrow::Mutable, Some(false)) => receiver_str,
+            (ReceiverBorrow::Shared, Some(_)) => format!("&({receiver_str})"),
+            (ReceiverBorrow::Mutable, Some(true)) => format!("&mut ({receiver_str})"),
+        }
+    }
+
+    fn promoted_field_receiver_expr(
+        &self,
+        receiver: &Expr,
+        hir_receiver: &hir::Expr<'tcx>,
+        borrow: ReceiverBorrow,
+    ) -> Expr {
+        let receiver_str = self.promoted_field_receiver_expr_string(receiver, hir_receiver, borrow);
+        if receiver_str == pprust::expr_to_string(receiver) {
+            receiver.clone()
+        } else {
+            utils::expr!("{receiver_str}")
+        }
+    }
+
+    fn promoted_field_raw_owner_mutability(
+        &self,
+        receiver: &Expr,
+        hir_receiver: &hir::Expr<'tcx>,
+    ) -> Option<bool> {
+        if self
+            .promoted_field_slot_for_hir_field(hir_receiver)
+            .is_none()
+            || !self.ast_expr_contains_raw_deref(receiver)
+        {
+            return None;
+        }
+        self.hir_raw_owner_mutability(hir_receiver)
+    }
+
+    fn ast_expr_contains_raw_deref(&self, expr: &Expr) -> bool {
+        match &unwrap_paren(expr).kind {
+            ExprKind::Unary(UnOp::Deref, inner) => {
+                let raw_deref = self
+                    .ast_to_hir
+                    .get_expr(inner.id, self.tcx)
+                    .and_then(|hir_inner| {
+                        let typeck = self.tcx.typeck(hir_inner.hir_id.owner);
+                        unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(hir_inner))
+                    })
+                    .is_some();
+                raw_deref || self.ast_expr_contains_raw_deref(inner)
+            }
+            ExprKind::Field(base, _) => self.ast_expr_contains_raw_deref(base),
+            ExprKind::Index(base, index, _) => {
+                self.ast_expr_contains_raw_deref(base) || self.ast_expr_contains_raw_deref(index)
+            }
+            ExprKind::Cast(inner, _) | ExprKind::Type(inner, _) | ExprKind::AddrOf(_, _, inner) => {
+                self.ast_expr_contains_raw_deref(inner)
+            }
+            ExprKind::MethodCall(call) => {
+                self.ast_expr_contains_raw_deref(&call.receiver)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| self.ast_expr_contains_raw_deref(arg))
+            }
+            _ => false,
+        }
+    }
+
+    fn hir_raw_owner_mutability(&self, hir_expr: &hir::Expr<'tcx>) -> Option<bool> {
+        let hir_expr = utils::hir::unwrap_drop_temps(hir_expr);
+        match hir_expr.kind {
+            hir::ExprKind::Field(base, _) | hir::ExprKind::Index(base, _, _) => {
+                self.hir_raw_owner_mutability(base)
+            }
+            hir::ExprKind::Cast(inner, _) => self.hir_raw_owner_mutability(inner),
+            hir::ExprKind::Unary(UnOp::Deref, inner) => {
+                let inner = utils::hir::unwrap_drop_temps(inner);
+                let typeck = self.tcx.typeck(hir_expr.hir_id.owner);
+                unwrap_ptr_from_mir_ty(typeck.expr_ty_adjusted(inner))
+                    .map(|(_, mutability)| mutability.is_mut())
+                    .or_else(|| self.hir_raw_owner_mutability(inner))
+            }
+            _ => None,
+        }
     }
 
     fn rewrite_borrowed_raw_param_field_base(
@@ -5461,46 +5614,62 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     fn raw_from_promoted_field_expr(
         &self,
         field_expr: &Expr,
+        hir_field_expr: &hir::Expr<'tcx>,
         target_mutability: bool,
         inner_ty: ty::Ty<'tcx>,
         field_kind: PtrKind,
     ) -> Expr {
-        let field_expr = pprust::expr_to_string(field_expr);
+        let shared_field_expr = self.promoted_field_receiver_expr_string(
+            field_expr,
+            hir_field_expr,
+            ReceiverBorrow::Shared,
+        );
+        let mutable_field_expr = self.promoted_field_receiver_expr_string(
+            field_expr,
+            hir_field_expr,
+            ReceiverBorrow::Mutable,
+        );
+        let can_mutably_borrow_field =
+            self.promoted_field_raw_owner_mutability(field_expr, hir_field_expr) != Some(false);
         let inner_ty = self.body_ty_name(inner_ty);
         match field_kind {
             PtrKind::OptRef(source_mutability) => {
-                if target_mutability && source_mutability {
+                if target_mutability && source_mutability && can_mutably_borrow_field {
                     utils::expr!(
-                        "({field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
+                        "({mutable_field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
                     )
                 } else if target_mutability {
                     utils::expr!(
-                        "({field_expr}).as_deref().map_or(std::ptr::null_mut(), |r| (r as *const {inner_ty}).cast_mut())"
+                        "({shared_field_expr}).as_deref().map_or(std::ptr::null_mut(), |r| (r as *const {inner_ty}).cast_mut())"
                     )
                 } else {
                     utils::expr!(
-                        "({field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
+                        "({shared_field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
                     )
                 }
             }
             PtrKind::OptBox => {
-                if target_mutability {
+                if target_mutability && can_mutably_borrow_field {
                     utils::expr!(
-                        "({field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
+                        "({mutable_field_expr}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty})"
+                    )
+                } else if target_mutability {
+                    utils::expr!(
+                        "({shared_field_expr}).as_deref().map_or(std::ptr::null_mut(), |r| (r as *const {inner_ty}).cast_mut())"
                     )
                 } else {
                     utils::expr!(
-                        "({field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
+                        "({shared_field_expr}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty})"
                     )
                 }
             }
             PtrKind::Slice(source_mutability) | PtrKind::SliceCursor(source_mutability) => {
-                if target_mutability && source_mutability {
-                    utils::expr!("({field_expr}).as_mut_ptr() as *mut {inner_ty}")
+                if target_mutability && source_mutability && can_mutably_borrow_field {
+                    utils::expr!("({mutable_field_expr}).as_mut_ptr() as *mut {inner_ty}")
                 } else if target_mutability {
-                    utils::expr!("({field_expr}).as_ptr().cast_mut() as *mut {inner_ty}")
+                    utils::expr!("({shared_field_expr}).as_ptr().cast_mut() as *mut {inner_ty}")
                 } else {
-                    utils::expr!("({field_expr}).as_ptr() as *const {inner_ty}")
+                    utils::expr!("({shared_field_expr}).as_ptr() as *const {inner_ty}")
                 }
             }
             _ => unreachable!(),
@@ -7008,7 +7177,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && let Some(lhs_inner_ty) =
                 expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
         {
-            *ptr = self.raw_from_promoted_field_expr(e, m, lhs_inner_ty, field_kind);
+            *ptr = self.raw_from_promoted_field_expr(e, hir_e, m, lhs_inner_ty, field_kind);
             return PtrKind::Raw(m);
         }
         let mut pe = if let Some(pe) = self.ptr_expr(e, hir_e) {
@@ -10886,7 +11055,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let is_mut_cursor_base =
             matches!(self.ptr_source_kind(pe), Some(PtrKind::SliceCursor(true)));
         let mut owns_cursor = false;
-        let mut e = pe.base.clone();
+        let projection_borrow = if m {
+            ReceiverBorrow::Mutable
+        } else {
+            ReceiverBorrow::Shared
+        };
+        let mut e = if is_raw {
+            pe.base.clone()
+        } else {
+            self.promoted_field_receiver_expr(pe.base, pe.hir_base, projection_borrow)
+        };
         if pe.projs.is_empty() {
             return e;
         }
