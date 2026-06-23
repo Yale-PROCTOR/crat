@@ -105,10 +105,6 @@ impl<Value> Param<Value> {
             None
         }
     }
-
-    pub fn is_output(&self) -> bool {
-        matches!(self, Param::Output(..))
-    }
 }
 
 pub(crate) trait AnalysisKind<'analysis, 'db, 'tcx> {

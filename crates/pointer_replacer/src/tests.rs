@@ -10196,6 +10196,91 @@ pub unsafe fn reader(p: *mut i32) -> i32 {
         );
     }
 
+    /// B4b probe: a local call passing a (cast) pointer to a `*mut c_void` param.
+    /// Post-B4a every arg is `Param::Output`, so the call flows through the `call`
+    /// Output arm — which lacks the c_void range-narrowing the now-dead
+    /// `Param::Normal` arm had. This checks the Output arm handles the c_void
+    /// formal (a deeper actual cast down to c_void) without panicking, deciding
+    /// whether B4b can drop the narrowing or must port it.
+    #[test]
+    fn c_void_local_call_arg_emits() {
+        run_compiler(
+            r#"
+pub unsafe fn take_void(p: *mut core::ffi::c_void) {
+    let _ = p;
+}
+
+pub unsafe fn caller(pp: *mut *mut i32) {
+    unsafe { take_void(pp as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let _take_void = function_by_name(&program, "take_void");
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("B4b: c_void local-call emission should run without panicking");
+
+                assert!(
+                    kind_solver.model_kinds_relaxing(&selectors).is_some(),
+                    "the joint system stays satisfiable with a c_void local-call arg"
+                );
+            },
+        );
+    }
+
+    /// B4b escape-half guard (Codex hardening): a pointer param passed *through*
+    /// to a local callee. The `call` Output arm ties `p` to the callee's formal
+    /// `q`; neither allocates nor frees, so both stay `Ref` (borrowed) — escape
+    /// stays solved, not spuriously promoted to Owning across the interprocedural
+    /// arg edge that B4a's uniform-Output change rewired.
+    #[test]
+    fn passed_through_param_stays_ref() {
+        run_compiler(
+            r#"
+pub unsafe fn sink_it(q: *mut i32) {
+    let _ = q;
+}
+
+pub unsafe fn passes_through(p: *mut i32) {
+    unsafe { sink_it(p) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let sink_it = function_by_name(&program, "sink_it");
+                let passes_through = function_by_name(&program, "passes_through");
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("B4b: pass-through emission should run");
+
+                let p = local_slot(&slots, passes_through, Local::from_u32(1), 0);
+                let q = local_slot(&slots, sink_it, Local::from_u32(1), 0);
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
+                assert_eq!(
+                    model.get(&p),
+                    Some(&SlotKind::Ref),
+                    "passed-through `p` stays Ref (no allocation escapes)"
+                );
+                assert_eq!(
+                    model.get(&q),
+                    Some(&SlotKind::Ref),
+                    "callee `q` stays Ref"
+                );
+            },
+        );
+    }
+
     #[test]
     fn copy_propagates_kind() {
         run_compiler(
