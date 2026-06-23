@@ -841,6 +841,90 @@ pub fn borrow_inference<'tcx>(
     }
 }
 
+/// One borrow conflict (an invalid loan) attributed to its owners: the slot that
+/// issued the loan (`assigned`) and the slots whose provenance required the loan and
+/// is live at the error point. Keyed by the public `ProvenanceOwner` so callers
+/// outside this module can translate to their own slot space. This is the raw
+/// material for the unified analysis's §8 guarded-exclusion clauses.
+#[derive(Clone, Debug)]
+pub struct ConflictEdge {
+    pub issuer: Option<ProvenanceOwner>,
+    pub requirers: Vec<ProvenanceOwner>,
+}
+
+/// §8 verifier (read-only): run `borrow_inference` with a given ref-candidacy +
+/// mutability and return, per function, the conflict edges (invalid loans attributed
+/// to their issuer/requirer owners). Mirrors the error-extraction of
+/// `demote_pointers_iterative_with_fields` WITHOUT mutating the `ProvenanceSet` — so
+/// it is faithful for a Round-0 (all-candidate) set; a *partial* candidacy that
+/// represents demotions would also need the `tree_borrow_local` union replay the
+/// demotion loop performs (the caller's concern).
+pub fn borrow_conflicts<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let inference = borrow_inference(program.tcx, f, &ctxt);
+        let BorrowInferenceResults {
+            borrow_set,
+            provenance_liveness,
+            requires,
+            errors,
+            ..
+        } = &inference;
+        let provenance_set = ctxt.provenances.get(&f).unwrap();
+
+        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
+        for row in errors.rows() {
+            if let Some(loans) = errors.row(row) {
+                invalid_loans.union(loans);
+            }
+        }
+        if invalid_loans.is_empty() {
+            continue;
+        }
+
+        let mut edges = Vec::new();
+        for loan in invalid_loans.iter() {
+            let borrow_data = &borrow_set.loans[loan];
+            let issuer = match borrow_data.assigned {
+                Borrower::Assign(owner) => Some(owner),
+                Borrower::CallArg(..) => None,
+            };
+            let mut requirers = Vec::new();
+            let mut seen: FxHashSet<Provenance> = FxHashSet::default();
+            for row in errors.rows() {
+                let Some(loans) = errors.row(row) else {
+                    continue;
+                };
+                if !loans.contains(loan) {
+                    continue;
+                }
+                let Some(live) = provenance_liveness.row(row) else {
+                    continue;
+                };
+                for provenance in live.iter() {
+                    if requires.contains(provenance, loan) && seen.insert(provenance) {
+                        requirers.push(provenance_set.provenance_data[provenance].owner());
+                    }
+                }
+            }
+            edges.push(ConflictEdge { issuer, requirers });
+        }
+        out.insert(f, edges);
+    }
+    out
+}
+
 #[allow(unused)]
 pub fn dump_borrow_inference_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
