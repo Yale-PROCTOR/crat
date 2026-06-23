@@ -10505,7 +10505,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         && hir_arg_mutable_field_borrow_roots(harg).contains(&root);
                     let hoist_nested_mut_borrow =
                         hir_arg_contains_nested_mut_borrow_of_local(later_arg, root);
-                    if !hoist_raw_parent && !hoist_nested_mut_borrow {
+                    let hoist_immediate_closure_read = hir_expr_ty_is_raw_ptr(self.tcx, later_arg)
+                        && hir_arg_has_hoistable_immediate_closure_local_read(
+                            self.tcx, later_arg, root,
+                        );
+                    if !hoist_raw_parent
+                        && !hoist_nested_mut_borrow
+                        && !hoist_immediate_closure_read
+                    {
                         continue;
                     }
                     if !hargs[..later_index]
@@ -15378,7 +15385,7 @@ fn hir_mutable_borrow_like_local_roots(expr: &hir::Expr<'_>) -> FxHashSet<HirId>
         roots.insert(local);
     }
     roots.extend(
-        hir_top_level_field_projection_uses_in_expr(expr)
+        hir_same_call_top_level_field_projection_uses_in_expr(expr)
             .into_iter()
             .map(|(root, _)| root),
     );
@@ -15386,7 +15393,7 @@ fn hir_mutable_borrow_like_local_roots(expr: &hir::Expr<'_>) -> FxHashSet<HirId>
 }
 
 fn hir_arg_mutable_field_borrow_roots(expr: &hir::Expr<'_>) -> FxHashSet<HirId> {
-    hir_top_level_field_projection_uses_in_expr(expr)
+    hir_same_call_top_level_field_projection_uses_in_expr(expr)
         .into_iter()
         .map(|(root, _)| root)
         .collect()
@@ -15451,6 +15458,31 @@ fn hir_arg_is_simple_same_call_reorderable(expr: &hir::Expr<'_>) -> bool {
         {
             hir_arg_is_simple_same_call_reorderable(receiver)
         }
+        hir::ExprKind::MethodCall(seg, receiver, [arg], _)
+            if is_same_call_transparent_ptr_projection_method(seg.ident.name) =>
+        {
+            hir_arg_is_simple_same_call_reorderable(receiver)
+                && hir_same_call_projection_arg_is_simple(arg)
+        }
+        _ => false,
+    }
+}
+
+fn is_same_call_transparent_ptr_projection_method(name: Symbol) -> bool {
+    matches!(
+        name.as_str(),
+        "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub"
+    )
+}
+
+fn hir_same_call_projection_arg_is_simple(expr: &hir::Expr<'_>) -> bool {
+    let expr = utils::hir::unwrap_drop_temps(expr);
+    match hir_unwrap_casts(expr).kind {
+        hir::ExprKind::Path(_) | hir::ExprKind::Lit(_) => true,
+        hir::ExprKind::Unary(hir::UnOp::Neg, inner) => {
+            hir_same_call_projection_arg_is_simple(inner)
+        }
+        hir::ExprKind::Cast(inner, _) => hir_same_call_projection_arg_is_simple(inner),
         _ => false,
     }
 }
@@ -15555,6 +15587,47 @@ fn hir_arg_has_tempable_same_call_local_read(expr: &hir::Expr<'_>, target: HirId
     visitor.found_read && !visitor.blocked
 }
 
+fn hir_arg_has_hoistable_immediate_closure_local_read<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &hir::Expr<'tcx>,
+    target: HirId,
+) -> bool {
+    hir_option_map_or_closure_body(tcx, expr)
+        .is_some_and(|body| hir_arg_has_tempable_same_call_local_read(body, target))
+}
+
+fn hir_option_map_or_closure_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &hir::Expr<'tcx>,
+) -> Option<&'tcx hir::Expr<'tcx>> {
+    let expr = hir_unwrap_casts(utils::hir::unwrap_drop_temps(expr));
+    match expr.kind {
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if seg.ident.name.as_str() == "map_or" && args.len() == 2 =>
+        {
+            let typeck = tcx.typeck(expr.hir_id.owner);
+            let ty::TyKind::Adt(adt_def, _) = typeck.expr_ty_adjusted(receiver).kind() else {
+                return None;
+            };
+            if !is_option(adt_def.did(), tcx) {
+                return None;
+            }
+            let hir::ExprKind::Closure(hir::Closure { body, .. }) = args[1].kind else {
+                return None;
+            };
+            Some(tcx.hir_body(*body).value)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, [_], _)
+            if is_same_call_transparent_ptr_projection_method(seg.ident.name)
+                && hir_expr_ty_is_raw_ptr(tcx, expr)
+                && hir_expr_ty_is_raw_ptr(tcx, receiver) =>
+        {
+            hir_option_map_or_closure_body(tcx, receiver)
+        }
+        _ => None,
+    }
+}
+
 fn hir_local_ids_in_expr(expr: &hir::Expr<'_>) -> Vec<HirId> {
     struct LocalUseVisitor {
         locals: Vec<HirId>,
@@ -15617,6 +15690,63 @@ fn hir_top_level_field_projection_uses_in_expr(expr: &hir::Expr<'_>) -> Vec<(Hir
     let mut visitor = FieldProjectionVisitor { uses: Vec::new() };
     visitor.visit_expr(expr);
     visitor.uses
+}
+
+fn hir_same_call_top_level_field_projection_uses_in_expr(
+    expr: &hir::Expr<'_>,
+) -> Vec<(HirId, Symbol)> {
+    struct FieldProjectionVisitor {
+        uses: Vec<(HirId, Symbol)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for FieldProjectionVisitor {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Field(base, ident) = expr.kind
+                && let Some(root) = hir_same_call_whole_ptr_root(base)
+            {
+                self.uses.push((root, ident.name));
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = FieldProjectionVisitor { uses: Vec::new() };
+    visitor.visit_expr(expr);
+    visitor.uses
+}
+
+fn hir_same_call_whole_ptr_root(expr: &hir::Expr<'_>) -> Option<HirId> {
+    let expr = hir_unwrap_casts(expr);
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            let Res::Local(hir_id) = path.res else {
+                return None;
+            };
+            Some(hir_id)
+        }
+        hir::ExprKind::AddrOf(_, _, inner) | hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
+            hir_same_call_whole_ptr_root(inner)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, args, _)
+            if args.is_empty()
+                && matches!(
+                    seg.ident.name.as_str(),
+                    "as_deref_mut" | "as_deref" | "unwrap" | "unwrap_unchecked"
+                ) =>
+        {
+            hir_same_call_whole_ptr_root(receiver)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, [arg], _)
+            if is_same_call_transparent_ptr_projection_method(seg.ident.name)
+                && hir_same_call_projection_arg_is_simple(arg) =>
+        {
+            hir_same_call_whole_ptr_root(receiver)
+        }
+        hir::ExprKind::Call(callee, [arg]) if hir_path_name_is(callee, "Some") => {
+            hir_same_call_whole_ptr_root(arg)
+        }
+        _ => None,
+    }
 }
 
 fn hir_expr_verbatim_snippet(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
@@ -22690,6 +22820,280 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
                 in_struct = false;
             }
         }
+    }
+
+    #[test]
+    fn pointer_same_call_map_or_closure_reads_promoted_slice_root_after_mut_field_borrow() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct ZStream {
+    pub total_in: usize,
+}
+
+#[repr(C)]
+pub struct Mapped {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct LooseReadstream {
+    pub zstream: ZStream,
+    pub map: Mapped,
+}
+
+pub unsafe fn git_zstream_set_input(
+    zstream: *mut ZStream,
+    data: *const u8,
+    len: usize,
+) -> usize {
+    (*zstream.offset(0 as isize)).total_in = len;
+    len
+}
+
+pub unsafe fn loose_backend__readstream_packlike(data_idx: Option<usize>) -> usize {
+    let mut storage = [LooseReadstream {
+        zstream: ZStream { total_in: 0 },
+        map: Mapped { data: std::ptr::null::<u8>() },
+    }];
+    let mut stream: *mut LooseReadstream = storage.as_mut_ptr();
+    git_zstream_set_input(
+        &raw mut (*stream.offset(0 as isize)).zstream,
+        data_idx.map_or(std::ptr::null::<u8>(), |idx| {
+            (*stream.offset(0 as isize)).map.data.add(idx)
+        }),
+        4,
+    )
+}
+"#,
+            &[
+                "let mut stream: &mut [crate::LooseReadstream]",
+                "std::slice::from_mut",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_same_call_projected_map_or_closure_reads_root_after_mut_field_borrow() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct ZStream {
+    pub total_in: usize,
+}
+
+#[repr(C)]
+pub struct Mapped {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct LooseReadstream {
+    pub zstream: ZStream,
+    pub map: Mapped,
+}
+
+pub unsafe fn git_zstream_set_input(
+    zstream: *mut ZStream,
+    data: *const core::ffi::c_void,
+    len: usize,
+) -> usize {
+    (*zstream.offset(0 as isize)).total_in = len;
+    len
+}
+
+pub unsafe fn loose_backend__readstream_packlike(
+    data_idx: Option<usize>,
+    head_len: usize,
+) -> usize {
+    let mut storage = [LooseReadstream {
+        zstream: ZStream { total_in: 0 },
+        map: Mapped { data: std::ptr::null::<u8>() },
+    }];
+    let mut stream: *mut LooseReadstream = storage.as_mut_ptr();
+    git_zstream_set_input(
+        &raw mut (*stream.offset(0 as isize)).zstream,
+        data_idx
+            .map_or(std::ptr::null::<u8>(), |idx| {
+                (*stream.offset(0 as isize)).map.data.add(idx)
+            })
+            .offset(head_len as isize) as *const core::ffi::c_void,
+        4,
+    )
+}
+"#,
+            &[
+                "let mut stream: &mut [crate::LooseReadstream]",
+                "std::slice::from_mut",
+                "__crat_same_call",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_same_call_map_or_closure_reads_direct_struct_projection_after_mut_field_borrow() {
+        assert_pointer_lifetime_rewrite_typechecks(
+            r#"
+#[repr(C)]
+pub struct ZStream {
+    pub total_in: usize,
+}
+
+#[repr(C)]
+pub struct Mapped {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct DirectReadstream {
+    pub zstream: ZStream,
+    pub map: Mapped,
+}
+
+pub unsafe fn git_zstream_set_input(
+    zstream: *mut ZStream,
+    data: *const u8,
+    len: usize,
+) -> usize {
+    (*zstream.offset(0 as isize)).total_in = len;
+    len
+}
+
+pub unsafe fn direct_readstream_packlike(data_idx: Option<usize>) -> usize {
+    let mut storage = [DirectReadstream {
+        zstream: ZStream { total_in: 0 },
+        map: Mapped { data: std::ptr::null::<u8>() },
+    }];
+    let mut stream: *mut DirectReadstream = storage.as_mut_ptr();
+    let _force_slice_shape = (*stream.offset(0 as isize)).map.data;
+    git_zstream_set_input(
+        &raw mut (*stream).zstream,
+        data_idx.map_or(std::ptr::null::<u8>(), |idx| {
+            (*stream).map.data.add(idx)
+        }),
+        4,
+    )
+}
+"#,
+            &[
+                "let mut stream: &mut [crate::DirectReadstream]",
+                "std::slice::from_mut",
+            ],
+        );
+    }
+
+    #[test]
+    fn pointer_same_call_nonclosure_disjoint_field_read_stays_direct() {
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(
+            r#"
+#[repr(C)]
+pub struct ZStream {
+    pub total_in: usize,
+}
+
+#[repr(C)]
+pub struct Mapped {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct LooseReadstream {
+    pub zstream: ZStream,
+    pub map: Mapped,
+}
+
+pub unsafe fn git_zstream_set_input(
+    zstream: *mut ZStream,
+    data: *const u8,
+    len: usize,
+) -> usize {
+    (*zstream.offset(0 as isize)).total_in = len;
+    len
+}
+
+pub unsafe fn read_disjoint_field_without_closure() -> usize {
+    let mut storage = [LooseReadstream {
+        zstream: ZStream { total_in: 0 },
+        map: Mapped { data: std::ptr::null::<u8>() },
+    }];
+    let mut stream: *mut LooseReadstream = storage.as_mut_ptr();
+    git_zstream_set_input(
+        &raw mut (*stream.offset(0 as isize)).zstream,
+        (*stream.offset(0 as isize)).map.data,
+        4,
+    )
+}
+"#,
+            |tcx| replace_local_borrows(&Config::default(), tcx),
+        )
+        .unwrap();
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        assert!(
+            rewritten.contains("std::slice::from_mut"),
+            "Expected promoted field borrow in:\n{rewritten}",
+        );
+        assert!(
+            !rewritten.contains("__crat_same_call"),
+            "Unexpected same-call temp for direct disjoint field read:\n{rewritten}",
+        );
+        assert_no_anonymous_lifetimes_in_item_definitions(&rewritten);
+    }
+
+    #[test]
+    fn pointer_same_call_map_or_shadowed_closure_stream_is_not_outer_capture() {
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(
+            r#"
+#[repr(C)]
+pub struct ZStream {
+    pub total_in: usize,
+}
+
+#[repr(C)]
+pub struct Mapped {
+    pub data: *const u8,
+}
+
+#[repr(C)]
+pub struct LooseReadstream {
+    pub zstream: ZStream,
+    pub map: Mapped,
+}
+
+pub unsafe fn git_zstream_set_input(
+    zstream: *mut ZStream,
+    data: *const u8,
+    len: usize,
+) -> usize {
+    (*zstream.offset(0 as isize)).total_in = len;
+    len
+}
+
+pub unsafe fn shadowed_closure_stream(
+    fallback: Option<*const LooseReadstream>,
+) -> usize {
+    let mut storage = [LooseReadstream {
+        zstream: ZStream { total_in: 0 },
+        map: Mapped { data: std::ptr::null::<u8>() },
+    }];
+    let mut stream: *mut LooseReadstream = storage.as_mut_ptr();
+    git_zstream_set_input(
+        &raw mut (*stream.offset(0 as isize)).zstream,
+        fallback.map_or(std::ptr::null::<u8>(), |stream| (*stream).map.data),
+        4,
+    )
+}
+"#,
+            |tcx| replace_local_borrows(&Config::default(), tcx),
+        )
+        .unwrap();
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        assert!(
+            !rewritten.contains("__crat_same_call"),
+            "Shadowed closure parameter should not be rewritten as an outer stream capture:\n{rewritten}",
+        );
+        assert_no_anonymous_lifetimes_in_item_definitions(&rewritten);
     }
 
     #[test]
