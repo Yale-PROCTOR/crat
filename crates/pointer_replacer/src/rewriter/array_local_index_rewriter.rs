@@ -1455,17 +1455,20 @@ fn prune_unsupported_direct_place_uses(
     let mut visitor = UnsupportedDirectPlaceUseVisitor {
         ast_to_hir,
         tcx,
-        planned_rewrites: plan.by_hir_id.clone(),
-        base_rewrites: plan.base_by_key.clone(),
+        plan: &*plan,
         unsupported_hir_ids: FxHashSet::default(),
         trace_enabled: trace.is_enabled(),
         dropped_reasons: Vec::new(),
     };
     visitor.visit_crate(krate);
+    // move results out of the visitor so the immutable borrow on `plan` ends
+    // before the mutable `plan.by_hir_id.retain(...)` below.
+    let unsupported_hir_ids = visitor.unsupported_hir_ids;
+    let dropped_reasons = visitor.dropped_reasons;
     // record one prune drop per member still in the plan (a member can be flagged
     // by more than one site; only the first reason is traced).
     let mut traced_drops: FxHashSet<HirId> = FxHashSet::default();
-    for (hir_id, reason) in &visitor.dropped_reasons {
+    for (hir_id, reason) in &dropped_reasons {
         if !traced_drops.insert(*hir_id) {
             continue;
         }
@@ -1481,9 +1484,9 @@ fn prune_unsupported_direct_place_uses(
             );
         }
     }
-    if !visitor.unsupported_hir_ids.is_empty() {
+    if !unsupported_hir_ids.is_empty() {
         plan.by_hir_id
-            .retain(|hir_id, _| !visitor.unsupported_hir_ids.contains(hir_id));
+            .retain(|hir_id, _| !unsupported_hir_ids.contains(hir_id));
     }
     // snapshot base cursors before orphan pruning so removed ones can be traced.
     let base_cursors_before: Vec<(BaseCursorKey, String, LocalDefId)> = if trace.is_enabled() {
@@ -2027,8 +2030,7 @@ impl BindingUseClassifier<'_, '_> {
 struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
     ast_to_hir: &'a AstToHir,
     tcx: TyCtxt<'tcx>,
-    planned_rewrites: FxHashMap<HirId, BindingRewrite>,
-    base_rewrites: FxHashMap<BaseCursorKey, BaseCursorRewrite>,
+    plan: &'a RewritePlan,
     unsupported_hir_ids: FxHashSet<HirId>,
     // reasons for each prune drop, collected only when the trace is enabled
     // (so the offending assignment text is not pretty-printed otherwise).
@@ -2037,6 +2039,11 @@ struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
 }
 
 impl AstVisitor<'_> for UnsupportedDirectPlaceUseVisitor<'_, '_> {
+    fn visit_local(&mut self, local: &rustc_ast::Local) {
+        self.check_member_init(local);
+        visit::walk_local(self, local);
+    }
+
     fn visit_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
@@ -2066,9 +2073,9 @@ impl AstVisitor<'_> for UnsupportedDirectPlaceUseVisitor<'_, '_> {
 impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
     fn check_assignment(&mut self, lhs: &Expr, rhs: &Expr) {
         if let Some(base_key) =
-            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.base_rewrites, lhs)
+            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, lhs)
         {
-            if let Some(base_rewrite) = self.base_rewrites.get(&base_key) {
+            if let Some(base_rewrite) = self.plan.base_by_key.get(&base_key) {
                 if base_rewrite.base_live {
                     // approach D only supports base self-advance; any other base
                     // mutation (or an offset arg referencing a planned member)
@@ -2079,7 +2086,7 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                             rhs,
                             self.ast_to_hir,
                             self.tcx,
-                            &self.planned_rewrites,
+                            &self.plan.by_hir_id,
                             base_rewrite,
                         )
                     {
@@ -2087,21 +2094,21 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                     }
                     return;
                 }
-                let index = base_assignment_index_expr(
-                    rhs,
-                    self.ast_to_hir,
-                    self.tcx,
-                    &self.planned_rewrites,
-                    base_rewrite,
-                );
-                let unsupported = matches!(index, IndexExpr::Null | IndexExpr::Unsupported)
+                let ctx = DerivationCtx {
+                    ast_to_hir: self.ast_to_hir,
+                    tcx: self.tcx,
+                    plan: self.plan,
+                };
+                let derivation = derive_index(rhs, Anchor::Base(base_rewrite), &ctx);
+                let unsupported = matches!(derivation, Derivation::Unsupported(_))
                     || base_assignment_index_arg_contains_planned_local(
                         rhs,
                         self.ast_to_hir,
                         self.tcx,
-                        &self.planned_rewrites,
+                        &self.plan.by_hir_id,
                         base_rewrite,
                     );
+                // NOTE: Task 3.2 inserts base `DependsOn` edge collection here.
                 if unsupported {
                     self.mark_rewrites_for_base_unsupported(&base_key);
                 }
@@ -2112,31 +2119,36 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
         }
 
         let Some(hir_id) =
-            direct_planned_local_hir_id(self.ast_to_hir, self.tcx, &self.planned_rewrites, lhs)
+            direct_planned_local_hir_id(self.ast_to_hir, self.tcx, &self.plan.by_hir_id, lhs)
         else {
             self.visit_expr(lhs);
             return;
         };
-        let Some(rewrite) = self.planned_rewrites.get(&hir_id) else {
+        let Some(rewrite) = self.plan.by_hir_id.get(&hir_id) else {
             return;
         };
-        let index = assignment_index_expr(
+        let ctx = DerivationCtx {
+            ast_to_hir: self.ast_to_hir,
+            tcx: self.tcx,
+            plan: self.plan,
+        };
+        let derivation = derive_index(rhs, Anchor::Member(rewrite), &ctx);
+        let unsupported = match &derivation {
+            Derivation::Unsupported(_) => true,
+            Derivation::Index(index) | Derivation::DependsOn(index, _) => {
+                index_init_expr(index.clone(), rewrite.nullable).is_none()
+            }
+        } || assignment_index_arg_contains_planned_local(
             rhs,
             self.ast_to_hir,
             self.tcx,
-            &self.planned_rewrites,
-            None,
+            &self.plan.by_hir_id,
             rewrite,
         );
-        if index_init_expr(index, rewrite.nullable).is_none()
-            || assignment_index_arg_contains_planned_local(
-                rhs,
-                self.ast_to_hir,
-                self.tcx,
-                &self.planned_rewrites,
-                rewrite,
-            )
-        {
+        // NOTE: Task 2.1 inserts `decisions.insert(rhs.id, index)` and Task 3.2
+        // inserts `DependsOn` edge collection at this same derivation. Task 1.2
+        // uses only the supported/unsupported distinction.
+        if unsupported {
             if self.trace_enabled {
                 self.dropped_reasons.push((
                     hir_id,
@@ -2150,9 +2162,53 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
         }
     }
 
+    fn check_member_init(&mut self, local: &rustc_ast::Local) {
+        let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx) else {
+            return;
+        };
+        let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
+            return;
+        };
+        let Some(rewrite) = self.plan.by_hir_id.get(&hir_id) else {
+            return;
+        };
+        let init = match &local.kind {
+            LocalKind::Init(init) | LocalKind::InitElse(init, _) => init,
+            LocalKind::Decl => return,
+        };
+        let ctx = DerivationCtx {
+            ast_to_hir: self.ast_to_hir,
+            tcx: self.tcx,
+            plan: self.plan,
+        };
+        // a member whose initializer cannot be derived (or whose derived index is
+        // unexpressible for its nullability) is dropped at validation — the old
+        // code only discovered this at apply time as a divergence. use the SAME
+        // unsupported test as the assignment branch.
+        let derivation = derive_index(init, Anchor::Member(rewrite), &ctx);
+        let unsupported = match &derivation {
+            Derivation::Unsupported(_) => true,
+            Derivation::Index(index) | Derivation::DependsOn(index, _) => {
+                index_init_expr(index.clone(), rewrite.nullable).is_none()
+            }
+        };
+        // NOTE: Task 2.1 extends this init derivation to record decisions, and
+        // Task 3.2 to collect init `DependsOn` edges. Task 1.2 records neither.
+        if unsupported {
+            if self.trace_enabled {
+                self.dropped_reasons.push((
+                    hir_id,
+                    format!("prune: unsupported init `{}`", pprust::expr_to_string(init)),
+                ));
+            }
+            self.unsupported_hir_ids.insert(hir_id);
+        }
+    }
+
     fn mark_rewrites_for_base_unsupported(&mut self, base_key: &BaseCursorKey) {
         let matched: Vec<HirId> = self
-            .planned_rewrites
+            .plan
+            .by_hir_id
             .values()
             .filter(|rewrite| base_cursor_key(rewrite.base_hir_id, &rewrite.base_name) == *base_key)
             .map(|rewrite| rewrite.source_hir_id)
@@ -2170,8 +2226,8 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
 
     fn mark_direct_base_cursor(&mut self, expr: &Expr) -> Option<HirId> {
         let base_key =
-            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.base_rewrites, expr)?;
-        if self.base_rewrites.contains_key(&base_key) {
+            direct_base_cursor_key(self.ast_to_hir, self.tcx, &self.plan.base_by_key, expr)?;
+        if self.plan.base_by_key.contains_key(&base_key) {
             self.mark_rewrites_for_base_unsupported(&base_key);
             Some(base_key.0)
         } else {
@@ -2181,8 +2237,8 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
 
     fn mark_direct_planned_local(&mut self, expr: &Expr) -> Option<HirId> {
         let hir_id =
-            direct_planned_local_hir_id(self.ast_to_hir, self.tcx, &self.planned_rewrites, expr)?;
-        if self.planned_rewrites.contains_key(&hir_id) {
+            direct_planned_local_hir_id(self.ast_to_hir, self.tcx, &self.plan.by_hir_id, expr)?;
+        if self.plan.by_hir_id.contains_key(&hir_id) {
             if self.trace_enabled {
                 self.dropped_reasons.push((
                     hir_id,
@@ -2366,14 +2422,12 @@ enum IndexExpr {
 }
 
 /// what an index derivation is anchored to: a group member or a base cursor.
-#[allow(dead_code)]
 enum Anchor<'a> {
     Member(&'a BindingRewrite),
     Base(&'a BaseCursorRewrite),
 }
 
 /// read-only context for derivation, shared by validation and emission.
-#[allow(dead_code)]
 struct DerivationCtx<'a, 'tcx> {
     ast_to_hir: &'a AstToHir,
     tcx: TyCtxt<'tcx>,
@@ -2386,6 +2440,7 @@ enum Derivation {
     /// fully derivable from the anchor (and possibly the base cursor).
     Index(IndexExpr),
     /// derivable, but only if these planned members are also rewritten.
+    /// (the edge vec is collected in Task 3.2; the reason str in Task 2.1.)
     DependsOn(IndexExpr, Vec<HirId>),
     /// not derivable; the &str is the trace reason.
     Unsupported(&'static str),
@@ -2395,7 +2450,6 @@ enum Derivation {
 /// the same arguments, so they cannot disagree. every planned member is treated
 /// as available; a dependency on another member is recorded via `DependsOn`
 /// rather than gated on an `introduced` set.
-#[allow(dead_code)]
 fn derive_index(rhs: &Expr, anchor: Anchor<'_>, ctx: &DerivationCtx<'_, '_>) -> Derivation {
     match anchor {
         Anchor::Member(rewrite) => derive_member_index(rhs, rewrite, ctx),
@@ -2403,7 +2457,6 @@ fn derive_index(rhs: &Expr, anchor: Anchor<'_>, ctx: &DerivationCtx<'_, '_>) -> 
     }
 }
 
-#[allow(dead_code)]
 fn derive_member_index(
     rhs: &Expr,
     rewrite: &BindingRewrite,
@@ -2445,14 +2498,17 @@ fn derive_member_index(
         && other.base_name == rewrite.base_name
     {
         return Derivation::DependsOn(
-            IndexExpr::Plain(relative_index_expr(&idx_read_expr(other), name, &call.args[0])),
+            IndexExpr::Plain(relative_index_expr(
+                &idx_read_expr(other),
+                name,
+                &call.args[0],
+            )),
             vec![other_hir_id],
         );
     }
     Derivation::Unsupported("member RHS receiver is not the base, self, or a planned member")
 }
 
-#[allow(dead_code)]
 fn derive_base_index(
     rhs: &Expr,
     base_rewrite: &BaseCursorRewrite,
@@ -2467,7 +2523,10 @@ fn derive_base_index(
         && hir_id_of_ast_expr(ctx.ast_to_hir, ctx.tcx, rhs_u.id) == Some(base_rewrite.base_hir_id))
         || (base_rewrite.field_base && expr_matches_base_name(rhs_u, &base_rewrite.base_name))
     {
-        return Derivation::Index(IndexExpr::Plain(utils::expr!("{}", base_rewrite.index_name)));
+        return Derivation::Index(IndexExpr::Plain(utils::expr!(
+            "{}",
+            base_rewrite.index_name
+        )));
     }
     // base = member (same base) -> DependsOn(member_idx, [member]).
     if let Some(hir_id) =
@@ -2505,7 +2564,10 @@ fn derive_base_index(
         || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
     if receiver_is_base {
         let offset = offset_index_arg_expr(name, &call.args[0]);
-        return Derivation::Index(IndexExpr::Plain(add_index_expr(&base_rewrite.index_name, &offset)));
+        return Derivation::Index(IndexExpr::Plain(add_index_expr(
+            &base_rewrite.index_name,
+            &offset,
+        )));
     }
     // base = member.offset(n) (same base) -> DependsOn(member_idx + n, [member]).
     if let Some(hir_id) = receiver_hir_id
@@ -2513,7 +2575,11 @@ fn derive_base_index(
         && same_rewrite_base(member, base_rewrite)
     {
         return Derivation::DependsOn(
-            IndexExpr::Plain(relative_index_expr(&idx_read_expr(member), name, &call.args[0])),
+            IndexExpr::Plain(relative_index_expr(
+                &idx_read_expr(member),
+                name,
+                &call.args[0],
+            )),
             vec![hir_id],
         );
     }
