@@ -1,11 +1,15 @@
+use std::ops::Range;
+
 use rustc_hash::FxHashMap;
+use rustc_index::IndexVec;
 use rustc_span::def_id::LocalDefId;
-use z3::{ast::Bool, Model, Optimize, SatResult};
+use z3::{Model, Optimize, SatResult, ast::Bool};
 
 use super::{
+    SlotKind,
     crate_slots::CrateSlots,
     slots::{SlotId, SlotUniverse},
-    SlotKind,
+    ssa::constraint::{Database, Gen, Var},
 };
 
 /// Global identity for a flattened pointer slot.
@@ -76,6 +80,10 @@ impl KindSolver {
 
     pub fn check(&self) -> SatResult {
         self.solver.check(&[])
+    }
+
+    pub(crate) fn optimize(&self) -> &Optimize {
+        &self.solver
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
@@ -153,4 +161,85 @@ fn is_true(model: &Model, b: &Bool) -> bool {
         .eval(b, true)
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+pub(crate) struct BoOwnDatabase<'opt> {
+    optimize: &'opt Optimize,
+    z3_ast: IndexVec<Var, Bool>,
+    source_sink_emissions: usize,
+}
+
+impl<'opt> BoOwnDatabase<'opt> {
+    pub(crate) fn new(optimize: &'opt Optimize) -> Self {
+        let mut z3_ast = IndexVec::with_capacity(100);
+        z3_ast.push(Bool::fresh_const("own_dummy"));
+        BoOwnDatabase {
+            optimize,
+            z3_ast,
+            source_sink_emissions: 0,
+        }
+    }
+
+    pub(crate) fn z3_ast_len(&self) -> usize {
+        self.z3_ast.len()
+    }
+
+    pub(crate) fn source_sink_emissions(&self) -> usize {
+        self.source_sink_emissions
+    }
+}
+
+impl Database for BoOwnDatabase<'_> {
+    fn new_vars(&mut self, var_gen: &mut Gen, size: u32) -> Range<Var> {
+        let sigs = var_gen.new_sigs(size);
+        for sig in sigs.clone() {
+            assert_eq!(sig, self.z3_ast.push(Bool::fresh_const("own")));
+        }
+        sigs
+    }
+
+    fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
+        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
+        let clause = Bool::or(&[&!x, &!y]);
+        self.optimize.assert(&clause);
+        let clause = Bool::or(&[&!x, z]);
+        self.optimize.assert(&clause);
+        let clause = Bool::or(&[x, y, &!z]);
+        self.optimize.assert(&clause);
+        let clause = Bool::or(&[&!y, z]);
+        self.optimize.assert(&clause);
+    }
+
+    fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        let x = &self.z3_ast[x];
+        let value = Bool::from_bool(sign);
+        let clause = !(x.xor(&value));
+        self.optimize.assert(&clause);
+    }
+
+    fn push_equal_impl(&mut self, x: Var, y: Var) {
+        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
+        let clause = !(x.xor(y));
+        self.optimize.assert(&clause);
+    }
+
+    fn push_less_equal_impl(&mut self, x: Var, y: Var) {
+        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
+        let clause = Bool::or(&[&!x, y]);
+        self.optimize.assert(&clause);
+    }
+
+    fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
+        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
+        let clause = Bool::or(&[&!x, y]);
+        self.optimize.assert(&clause);
+        let clause = Bool::or(&[&!x, z]);
+        self.optimize.assert(&clause);
+        let clause = Bool::or(&[x, &!y, &!z]);
+        self.optimize.assert(&clause);
+    }
+
+    fn record_source_sink(&mut self) {
+        self.source_sink_emissions += 1;
+    }
 }
