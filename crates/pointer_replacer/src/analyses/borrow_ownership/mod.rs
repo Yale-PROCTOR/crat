@@ -27,15 +27,18 @@ pub mod ssa;
 pub use domain::SlotKind;
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::mir::Body;
+use rustc_middle::mir::{Body, Local, Location};
+use z3::ast::Bool;
 
 use crate::{
     analyses::{
         borrow_ownership::{
             call_graph::FnSig,
-            infer::InferCtxt,
-            solver::{BoOwnDatabase, KindSolver},
+            crate_slots::CrateSlots,
+            infer::{FnSummary, InferCtxt},
+            solver::{BoOwnDatabase, KindSolver, SlotRef},
             ssa::{
+                FnResults,
                 constraint::{Database, Debug, Gen, GlobalAssumptions, Var, initialize_local},
                 consume::{Consume, initial_definitions},
                 dom::compute_dominance_frontier,
@@ -147,6 +150,7 @@ pub(crate) struct BoOwnEmissionStats {
 pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     output_params: &OutputParams,
+    slots: &CrateSlots,
     kind_solver: &KindSolver,
     fn_did: LocalDefId,
 ) -> anyhow::Result<BoOwnEmissionStats> {
@@ -171,7 +175,7 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
         initial_single_fn_inter_ctxt(crate_ctxt, output_params, body, &mut var_gen, &mut database);
     let ssa_state = initial_ssa_state(crate_ctxt, body);
 
-    {
+    let summary = {
         let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx);
         let mut infer_cx = InferCtxt::new(
             crate_ctxt,
@@ -184,12 +188,70 @@ pub(crate) fn emit_single_fn_ownership_constraints<'tcx>(
         );
 
         rn.go::<BoOwnershipProbe>(&mut infer_cx);
-    }
+        FnSummary::new(rn, infer_cx)
+    };
+
+    // B2: solidify per-version ownership onto slots (depth 0; B1_PRECISION == 1).
+    link_versions_to_slots(slots, fn_did, body, &summary, &database, kind_solver);
 
     Ok(BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
         source_sink_emissions: database.source_sink_emissions(),
     })
+}
+
+/// B2 solidification linking: tie each local pointer slot's `own` bit to the
+/// disjunction of that slot's per-version ownership Bools — the faithful
+/// OR-latch from `ownership::solidify`. Only depth 0 is emitted by B1's
+/// precision-1 driver, so only depth 0 is linked; inner depths are carried by
+/// `coherence`.
+fn link_versions_to_slots<'tcx>(
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    summary: &FnSummary,
+    database: &BoOwnDatabase<'_>,
+    kind_solver: &KindSolver,
+) {
+    let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+        return;
+    };
+
+    // Collect, per local, the depth-0 ownership Vars over every consume site
+    // (mirrors solidify.rs:225-236: OR the `use`/`def` ownership across sites).
+    let mut depth0_owns: FxHashMap<Local, Vec<Var>> = FxHashMap::default();
+    for (block, bbdata) in body.basic_blocks.iter_enumerated() {
+        // Statements plus the terminator location, matching production's bound
+        // (`len + terminator.is_some()`); a block may lack a terminator.
+        for statement_index in 0..bbdata.statements.len() + bbdata.terminator.is_some() as usize {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            for (local, consume) in summary.location_results(location) {
+                for var in [consume.r#use.clone().next(), consume.def.clone().next()]
+                    .into_iter()
+                    .flatten()
+                {
+                    depth0_owns.entry(local).or_default().push(var);
+                }
+            }
+        }
+    }
+
+    // Only locals with at least one collected version var are linked; a slot
+    // whose local is never consumed is left free (the soft objective makes it
+    // non-owning). Production's `Transient` baseline would hard-link such a slot
+    // to `own=false`; we defer that parity refinement to avoid forcing UNSAT on
+    // slots coherence might legitimately tie to an owning value.
+    for (local, vars) in depth0_owns {
+        let Some(slot_id) = universe.slot_for_local_depth(local, 0) else {
+            continue;
+        };
+        let slot = SlotRef::Local(fn_did, slot_id);
+        let owns: Vec<&Bool> = vars.iter().map(|&var| database.own_bool(var)).collect();
+        kind_solver.link_own(slot, &Bool::or(&owns));
+    }
 }
 
 fn initial_single_fn_inter_ctxt<'tcx>(

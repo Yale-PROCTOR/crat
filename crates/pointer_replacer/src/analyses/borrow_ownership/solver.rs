@@ -78,6 +78,17 @@ impl KindSolver {
         self.solver.assert(&!va.own.xor(&vb.own));
     }
 
+    /// Solidification link: tie a slot's `own` one-hot bit to an external Bool
+    /// (the disjunction of the slot's per-version ownership Bools). Mirrors the
+    /// biconditional idiom in `equate`.
+    pub(crate) fn link_own(&self, slot: SlotRef, external: &Bool) {
+        let vars = self
+            .vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+        self.solver.assert(&!vars.own.xor(external));
+    }
+
     pub fn check(&self) -> SatResult {
         self.solver.check(&[])
     }
@@ -186,6 +197,11 @@ impl<'opt> BoOwnDatabase<'opt> {
 
     pub(crate) fn source_sink_emissions(&self) -> usize {
         self.source_sink_emissions
+    }
+
+    /// The per-version ownership Bool for `var` (for solidification linking).
+    pub(crate) fn own_bool(&self, var: Var) -> &Bool {
+        &self.z3_ast[var]
     }
 }
 

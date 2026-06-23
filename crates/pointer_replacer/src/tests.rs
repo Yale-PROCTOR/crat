@@ -9829,6 +9829,7 @@ pub unsafe fn alloc_free() {
                 let stats = emit_single_fn_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
+                    &slots,
                     &kind_solver,
                     alloc_free,
                 )
@@ -9841,6 +9842,142 @@ pub unsafe fn alloc_free() {
                 // 1 source from malloc + 1 sink from free.
                 assert_eq!(stats.source_sink_emissions, 2);
                 assert_eq!(kind_solver.check(), SatResult::Sat);
+            },
+        );
+    }
+
+    /// Locate the destination `Local` of the first call to `callee` (e.g. the
+    /// `*mut c_void` local that `malloc`'s result is written into). Robust to
+    /// MIR temp renumbering — we never hardcode the index.
+    fn call_destination(
+        tcx: TyCtxt<'_>,
+        body: &rustc_middle::mir::Body<'_>,
+        callee: &str,
+    ) -> Local {
+        for bbdata in body.basic_blocks.iter() {
+            let Some(term) = &bbdata.terminator else {
+                continue;
+            };
+            if let rustc_middle::mir::TerminatorKind::Call {
+                func, destination, ..
+            } = &term.kind
+            {
+                if let Some((def_id, _)) = func.const_fn_def() {
+                    if tcx.def_path_str(def_id).rsplit("::").next() == Some(callee) {
+                        return destination.local;
+                    }
+                }
+            }
+        }
+        panic!("no call to `{callee}` found");
+    }
+
+    /// B2: the per-version ownership forced by `malloc`'s `source` hook must be
+    /// solidified onto the slot — `p`'s depth-0 slot becomes `Owning`. Without
+    /// the version→slot linking, the unconstrained slot would be `Ref` (max-ref).
+    #[test]
+    fn alloc_free_links_owning_to_slot() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_free() {
+    let p = unsafe { malloc(4) };
+    unsafe { free(p) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let alloc_free = function_by_name(&program, "alloc_free");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(alloc_free)
+                    .borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
+
+                emit_single_fn_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &slots,
+                    &kind_solver,
+                    alloc_free,
+                )
+                .expect("B2 ownership emission should run");
+
+                let p_local = call_destination(tcx, &body, "malloc");
+                let p = local_slot(&slots, alloc_free, p_local, 0);
+
+                assert_eq!(kind_solver.check(), SatResult::Sat);
+                let model = kind_solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+            },
+        );
+    }
+
+    /// B2 headline (Ref-over-Owning) via a store-through-pointer `*out = malloc`.
+    /// The inner (`*out`) is `Owning` — malloc's ownership solidified onto the
+    /// temp slot and carried to `out`'s inner depth by coherence; the outer `out`
+    /// is caller storage forced non-owning by `exit`, so §4 (`¬(raw ∧ own)`) +
+    /// max-ref make it `Ref`. Without the version→slot link, `*out` is not
+    /// `Owning` and this fails. NOTE: `output_params` is empty here, so this
+    /// exercises the store-through-deref shape, not output-param *classification*.
+    #[test]
+    fn store_through_ptr_is_ref_over_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
+    *out = unsafe { malloc(4) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let fill = function_by_name(&program, "fill");
+                let body = tcx.mir_drops_elaborated_and_const_checked(fill).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                output_params.insert(fill, MixedBitSet::new_empty(body.local_decls.len()));
+
+                emit_single_fn_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &slots,
+                    &kind_solver,
+                    fill,
+                )
+                .expect("B2 ownership emission should run");
+                add_coherence(&kind_solver, &slots, fill, &body);
+
+                // `out` is param Local 1: out[0] = borrowed caller storage,
+                // out[1] = the malloc-owned inner.
+                let out_outer = local_slot(&slots, fill, Local::from_u32(1), 0);
+                let out_inner = local_slot(&slots, fill, Local::from_u32(1), 1);
+
+                assert_eq!(kind_solver.check(), SatResult::Sat);
+                let model = kind_solver.model_kinds().expect("satisfiable model");
+                assert_eq!(
+                    model.get(&out_inner),
+                    Some(&SlotKind::Owning),
+                    "inner *out = Owning (the malloc'd value)"
+                );
+                assert_eq!(
+                    model.get(&out_outer),
+                    Some(&SlotKind::Ref),
+                    "outer out = Ref (borrowed caller storage)"
+                );
             },
         );
     }
