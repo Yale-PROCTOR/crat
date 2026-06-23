@@ -9826,7 +9826,7 @@ pub unsafe fn alloc_free() {
                 let mut output_params = OutputParams::default();
                 output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
 
-                let stats = emit_single_fn_ownership_constraints(
+                let (stats, selectors) = emit_single_fn_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
@@ -9841,7 +9841,9 @@ pub unsafe fn alloc_free() {
                 );
                 // 1 source from malloc + 1 sink from free.
                 assert_eq!(stats.source_sink_emissions, 2);
-                assert_eq!(kind_solver.check(), SatResult::Sat);
+                // 1 retractable source selector (the malloc).
+                assert_eq!(selectors.len(), 1);
+                assert!(kind_solver.model_kinds_relaxing(&selectors).is_some());
             },
         );
     }
@@ -9849,11 +9851,19 @@ pub unsafe fn alloc_free() {
     /// Locate the destination `Local` of the first call to `callee` (e.g. the
     /// `*mut c_void` local that `malloc`'s result is written into). Robust to
     /// MIR temp renumbering — we never hardcode the index.
-    fn call_destination(
+    fn call_destination(tcx: TyCtxt<'_>, body: &rustc_middle::mir::Body<'_>, callee: &str) -> Local {
+        call_nth_destination(tcx, body, callee, 0)
+    }
+
+    /// Destination `Local` of the `n`-th (0-indexed, in basic-block order) call to
+    /// `callee` — for functions with several calls to the same callee.
+    fn call_nth_destination(
         tcx: TyCtxt<'_>,
         body: &rustc_middle::mir::Body<'_>,
         callee: &str,
+        n: usize,
     ) -> Local {
+        let mut seen = 0;
         for bbdata in body.basic_blocks.iter() {
             let Some(term) = &bbdata.terminator else {
                 continue;
@@ -9864,12 +9874,15 @@ pub unsafe fn alloc_free() {
             {
                 if let Some((def_id, _)) = func.const_fn_def() {
                     if tcx.def_path_str(def_id).rsplit("::").next() == Some(callee) {
-                        return destination.local;
+                        if seen == n {
+                            return destination.local;
+                        }
+                        seen += 1;
                     }
                 }
             }
         }
-        panic!("no call to `{callee}` found");
+        panic!("no call #{n} to `{callee}` found");
     }
 
     /// B2: the per-version ownership forced by `malloc`'s `source` hook must be
@@ -9902,7 +9915,7 @@ pub unsafe fn alloc_free() {
                 let mut output_params = OutputParams::default();
                 output_params.insert(alloc_free, MixedBitSet::new_empty(body.local_decls.len()));
 
-                emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_single_fn_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
@@ -9914,8 +9927,9 @@ pub unsafe fn alloc_free() {
                 let p_local = call_destination(tcx, &body, "malloc");
                 let p = local_slot(&slots, alloc_free, p_local, 0);
 
-                assert_eq!(kind_solver.check(), SatResult::Sat);
-                let model = kind_solver.model_kinds().expect("satisfiable model");
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
                 assert_eq!(model.get(&p), Some(&SlotKind::Owning));
             },
         );
@@ -9951,7 +9965,7 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let mut output_params = OutputParams::default();
                 output_params.insert(fill, MixedBitSet::new_empty(body.local_decls.len()));
 
-                emit_single_fn_ownership_constraints(
+                let (_stats, selectors) = emit_single_fn_ownership_constraints(
                     &crate_ctxt,
                     &output_params,
                     &slots,
@@ -9966,8 +9980,9 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let out_outer = local_slot(&slots, fill, Local::from_u32(1), 0);
                 let out_inner = local_slot(&slots, fill, Local::from_u32(1), 1);
 
-                assert_eq!(kind_solver.check(), SatResult::Sat);
-                let model = kind_solver.model_kinds().expect("satisfiable model");
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
                 assert_eq!(
                     model.get(&out_inner),
                     Some(&SlotKind::Owning),
@@ -9977,6 +9992,144 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                     model.get(&out_outer),
                     Some(&SlotKind::Ref),
                     "outer out = Ref (borrowed caller storage)"
+                );
+            },
+        );
+    }
+
+    /// B3a: a leaked allocation (its `source` owning conflicts with return
+    /// finalization) makes the single solve UNSAT — `source` hard-forces the
+    /// malloc'd local owning while finalize-temporaries hard-forces the same SSA
+    /// version false. The relax loop drops that source's selector (leaks the
+    /// allocation) and returns a SAT model. Assertion is deliberately
+    /// kind-agnostic (solvable ∧ not Owning); the exact non-owning variant
+    /// (Ref vs Raw) is a 3f borrow-integration concern, not pinned here.
+    #[test]
+    fn leaked_alloc_return_relaxes_to_sat() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
+    let mut p = unsafe { malloc(8) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let leak = function_by_name(&program, "leak");
+                let body = tcx.mir_drops_elaborated_and_const_checked(leak).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                output_params.insert(leak, MixedBitSet::new_empty(body.local_decls.len()));
+
+                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &slots,
+                    &kind_solver,
+                    leak,
+                )
+                .expect("B3a ownership emission should run");
+
+                // Prove the relax path is genuinely exercised: exactly one source
+                // selector, and the un-relaxed solve (assuming it) is UNSAT — so a
+                // broken impl that ignored selectors could not pass.
+                assert_eq!(selectors.len(), 1);
+                assert_eq!(
+                    kind_solver.optimize().check(&selectors),
+                    SatResult::Unsat,
+                    "the source-owning constraint must make the single solve UNSAT"
+                );
+
+                // The relax loop must leak the source and return a model.
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("relax loop should resolve the UNSAT by leaking the source");
+
+                let p_local = call_destination(tcx, &body, "malloc");
+                let p = local_slot(&slots, leak, p_local, 0);
+                assert_ne!(
+                    model.get(&p),
+                    Some(&SlotKind::Owning),
+                    "leaked allocation must not be Owning"
+                );
+            },
+        );
+    }
+
+    /// B3a multi-source: relaxation must leak only the *conflicting* allocation.
+    /// `a` is malloc'd and freed (no finalize conflict → stays `Owning`); `b` is
+    /// malloc'd and leaked via `&raw mut b` (its owning conflicts with finalize).
+    /// The relax loop must drop only `b`'s selector — a maximal-source-retention
+    /// policy. A naive "drop any unsat-core member" loop could leak `a` too if
+    /// z3's (non-minimal) core happened to include it.
+    #[test]
+    fn two_allocs_leaks_only_the_conflicting_one() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
+    let a = unsafe { malloc(8) };
+    unsafe { free(a) };
+    let mut b = unsafe { malloc(8) };
+    &raw mut b
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let two = function_by_name(&program, "two_allocs");
+                let body = tcx.mir_drops_elaborated_and_const_checked(two).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let mut output_params = OutputParams::default();
+                output_params.insert(two, MixedBitSet::new_empty(body.local_decls.len()));
+
+                let (_stats, selectors) = emit_single_fn_ownership_constraints(
+                    &crate_ctxt,
+                    &output_params,
+                    &slots,
+                    &kind_solver,
+                    two,
+                )
+                .expect("B3a ownership emission should run");
+
+                // Two sources; assuming both is UNSAT (b conflicts with finalize).
+                assert_eq!(selectors.len(), 2);
+                assert_eq!(
+                    kind_solver.optimize().check(&selectors),
+                    SatResult::Unsat
+                );
+
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("relax loop should leak only b");
+
+                // `a` (freed) must remain Owning; `b` (leaked) must not.
+                let a_local = call_nth_destination(tcx, &body, "malloc", 0);
+                let b_local = call_nth_destination(tcx, &body, "malloc", 1);
+                let a = local_slot(&slots, two, a_local, 0);
+                let b = local_slot(&slots, two, b_local, 0);
+                assert_eq!(
+                    model.get(&a),
+                    Some(&SlotKind::Owning),
+                    "the freed allocation must stay Owning (not over-leaked)"
+                );
+                assert_ne!(
+                    model.get(&b),
+                    Some(&SlotKind::Owning),
+                    "the leaked allocation must not be Owning"
                 );
             },
         );

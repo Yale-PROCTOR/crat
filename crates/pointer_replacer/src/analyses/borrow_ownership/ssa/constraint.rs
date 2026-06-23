@@ -296,6 +296,14 @@ pub trait Database {
     }
 
     fn record_source_sink(&mut self) {}
+
+    /// Force a freshly-allocated (`source`) value's ownership to `true`.
+    /// Default: a hard `assume(var = true)`, faithful to production. Retractable
+    /// backends (the BO on-UNSAT relax loop) override this to gate the owning
+    /// behind a selector literal so the outer loop can leak the allocation.
+    fn push_source_owning(&mut self, var: Var) {
+        self.push_assume_impl(var, true);
+    }
 }
 
 impl Database for () {

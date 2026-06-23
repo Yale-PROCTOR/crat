@@ -101,23 +101,79 @@ impl KindSolver {
         if self.check() != SatResult::Sat {
             return None;
         }
-
         let model = self.solver.get_model()?;
+        Some(self.read_kinds(&model))
+    }
+
+    /// Solve assuming all `source_selectors` (reproducing the hard sources). On
+    /// UNSAT, leak the **minimal** set of conflicting sources and return the
+    /// resulting per-slot kinds, or `None` if the system is UNSAT for non-source
+    /// reasons.
+    ///
+    /// All z3 Bools share the single thread-local context (the analysis is
+    /// single-threaded), so `c == s` is `Z3_is_eq_ast` node identity — valid
+    /// because `Bool::clone` shares the `Z3_ast` pointer and `get_unsat_core`
+    /// returns the original assumption literals.
+    ///
+    /// Terminates: phase 1 drops one of finitely many selectors per UNSAT round;
+    /// phase 2 visits each dropped selector once. Leaking a source classifies
+    /// that allocation non-Owning, which is memory-safe.
+    pub(crate) fn model_kinds_relaxing(
+        &self,
+        source_selectors: &[Bool],
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        let mut assumptions: Vec<Bool> = source_selectors.to_vec();
+        let mut leaked: Vec<Bool> = Vec::new();
+
+        // Phase 1: drop conflicting source selectors until SAT (or give up).
+        loop {
+            match self.solver.check(&assumptions) {
+                SatResult::Sat => break,
+                SatResult::Unsat => {
+                    let core = self.solver.get_unsat_core();
+                    let idx = assumptions.iter().position(|s| core.iter().any(|c| c == s))?;
+                    leaked.push(assumptions.swap_remove(idx));
+                }
+                SatResult::Unknown => return None,
+            }
+        }
+
+        // Phase 2: restore any selector that is not actually needed, so we leak
+        // the minimal set. z3's unsat core is not guaranteed minimal, so phase 1
+        // may drop more than necessary; re-adding a selector that keeps the
+        // system SAT proves that allocation did not need to be leaked.
+        let mut i = 0;
+        while i < leaked.len() {
+            assumptions.push(leaked[i].clone());
+            if self.solver.check(&assumptions) == SatResult::Sat {
+                leaked.swap_remove(i);
+            } else {
+                assumptions.pop();
+                i += 1;
+            }
+        }
+
+        // Final SAT model under the maximal-retention assumption set.
+        match self.solver.check(&assumptions) {
+            SatResult::Sat => Some(self.read_kinds(&self.solver.get_model()?)),
+            _ => None,
+        }
+    }
+
+    fn read_kinds(&self, model: &Model) -> FxHashMap<SlotRef, SlotKind> {
         let mut kinds = FxHashMap::default();
         kinds.reserve(self.vars.len());
-
         for (&slot, vars) in &self.vars {
-            let kind = if is_true(&model, &vars.own) {
+            let kind = if is_true(model, &vars.own) {
                 SlotKind::Owning
-            } else if is_true(&model, &vars.ref_) {
+            } else if is_true(model, &vars.ref_) {
                 SlotKind::Ref
             } else {
                 SlotKind::Raw
             };
             kinds.insert(slot, kind);
         }
-
-        Some(kinds)
+        kinds
     }
 }
 
@@ -178,6 +234,10 @@ pub(crate) struct BoOwnDatabase<'opt> {
     optimize: &'opt Optimize,
     z3_ast: IndexVec<Var, Bool>,
     source_sink_emissions: usize,
+    /// One selector literal per `source` (malloc) ownership assertion. The owning
+    /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
+    /// hard source, while the relax loop can drop a selector to leak that source.
+    source_selectors: Vec<Bool>,
 }
 
 impl<'opt> BoOwnDatabase<'opt> {
@@ -188,6 +248,7 @@ impl<'opt> BoOwnDatabase<'opt> {
             optimize,
             z3_ast,
             source_sink_emissions: 0,
+            source_selectors: Vec::new(),
         }
     }
 
@@ -202,6 +263,12 @@ impl<'opt> BoOwnDatabase<'opt> {
     /// The per-version ownership Bool for `var` (for solidification linking).
     pub(crate) fn own_bool(&self, var: Var) -> &Bool {
         &self.z3_ast[var]
+    }
+
+    /// Selector literals for the emitted `source` ownerships. Assume all of them
+    /// to reproduce the hard source; the relax loop drops some on UNSAT.
+    pub(crate) fn source_selectors(&self) -> &[Bool] {
+        &self.source_selectors
     }
 }
 
@@ -257,5 +324,18 @@ impl Database for BoOwnDatabase<'_> {
 
     fn record_source_sink(&mut self) {
         self.source_sink_emissions += 1;
+    }
+
+    fn push_source_owning(&mut self, var: Var) {
+        // Gate the owning behind a fresh selector: `selector ⇒ owning`.
+        // Assuming the selector forces owning (the hard source); the relax loop
+        // can drop the selector to leak this allocation instead. The selector
+        // shares `self.optimize`'s thread-local z3 context (single-threaded
+        // analysis), so it matches the literal `get_unsat_core` returns.
+        let selector = Bool::fresh_const("src_sel");
+        let not_sel = !&selector;
+        let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
+        self.optimize.assert(&clause);
+        self.source_selectors.push(selector);
     }
 }
