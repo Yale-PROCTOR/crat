@@ -2731,6 +2731,134 @@ pub unsafe fn touch(mut x: i32) -> i32 {
 }
 
 #[test]
+fn test_rewriter_preserves_generated_copy_after_mutable_slice_field_final_demotion() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct ConfigMap {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct MapData {
+    pub name: *const core::ffi::c_char,
+    pub maps: *mut ConfigMap,
+    pub map_count: usize,
+    pub default_value: i32,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for MapData {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for MapData {
+    #[inline]
+    fn clone(&self) -> MapData {
+        let _: ::core::clone::AssertParamIsClone<*const core::ffi::c_char>;
+        let _: ::core::clone::AssertParamIsClone<*mut ConfigMap>;
+        let _: ::core::clone::AssertParamIsClone<usize>;
+        let _: ::core::clone::AssertParamIsClone<i32>;
+        *self
+    }
+}
+
+extern "C" {
+    fn raw_touch(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn rewrite_maps(mut data: *mut MapData) -> i32 {
+    raw_touch((*data).maps as *mut core::ffi::c_void);
+    (*(*data).maps.offset(1)).value = 7;
+    return (*(*data).maps.offset(1)).value + *(*data).name.offset(0) as i32;
+}
+"#,
+        &[
+            "pub struct MapData<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+            "pub maps: *mut ConfigMap",
+            "impl<'a> ::core::marker::Copy for MapData<'a>",
+            "impl<'a> ::core::clone::Clone for MapData<'a>",
+        ],
+        &[
+            "pub maps: &'a mut [ConfigMap]",
+            "impl ::core::marker::Copy for MapData {}",
+            "impl ::core::clone::Clone for MapData {",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_preserves_generated_copy_for_static_repeat_after_final_demotion() {
+    run_test(
+        r#"
+#![feature(derive_clone_copy)]
+
+#[repr(C)]
+pub struct ConfigMap {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct MapData {
+    pub name: *const core::ffi::c_char,
+    pub maps: *mut ConfigMap,
+    pub map_count: usize,
+    pub default_value: i32,
+}
+
+#[automatically_derived]
+impl ::core::marker::Copy for MapData {}
+
+#[automatically_derived]
+impl ::core::clone::Clone for MapData {
+    #[inline]
+    fn clone(&self) -> MapData {
+        let _: ::core::clone::AssertParamIsClone<*const core::ffi::c_char>;
+        let _: ::core::clone::AssertParamIsClone<*mut ConfigMap>;
+        let _: ::core::clone::AssertParamIsClone<usize>;
+        let _: ::core::clone::AssertParamIsClone<i32>;
+        *self
+    }
+}
+
+extern "C" {
+    fn raw_touch(ptr: *mut core::ffi::c_void);
+}
+
+pub static mut DEFAULT_MAPS: [MapData; 15] = [MapData {
+    name: b"default\0" as *const u8 as *const core::ffi::c_char,
+    maps: 0 as *mut ConfigMap,
+    map_count: 0,
+    default_value: 0,
+}; 15];
+
+pub unsafe fn rewrite_maps(mut data: *mut MapData) -> i32 {
+    raw_touch((*data).maps as *mut core::ffi::c_void);
+    (*(*data).maps.offset(1)).value = 7;
+    return (*(*data).maps.offset(1)).value
+        + *(*data).name.offset(0) as i32
+        + DEFAULT_MAPS[0].default_value;
+}
+"#,
+        &[
+            "pub struct MapData<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+            "pub maps: *mut ConfigMap",
+            "impl<'a> ::core::marker::Copy for MapData<'a>",
+            "impl<'a> ::core::clone::Clone for MapData<'a>",
+            "static mut DEFAULT_MAPS: [MapData<'_>; 15]",
+        ],
+        &[
+            "pub maps: &'a mut [ConfigMap]",
+            "impl ::core::marker::Copy for MapData {}",
+            "impl ::core::clone::Clone for MapData {",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_demotes_promoted_field_struct_return_type() {
     run_test(
         r#"

@@ -82,6 +82,17 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     diagnostics: DecisionDiagnostics,
 }
 
+fn final_field_kind_is_copy_capable(kind: PtrKind) -> bool {
+    matches!(
+        kind,
+        PtrKind::Raw(_)
+            | PtrKind::Ref(false)
+            | PtrKind::OptRef(false)
+            | PtrKind::Slice(false)
+            | PtrKind::SliceCursor(false)
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RawBridgeInfo {
     Scalar,
@@ -4346,10 +4357,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let Some(struct_did) = self.local_struct_did_for_ast_ty(&impl_item.self_ty) else {
             return false;
         };
-        self.analysis
-            .struct_copy_result
-            .should_remove_generated_impl(struct_did)
-            || self.struct_has_owning_box_field_candidate(struct_did)
+        self.struct_has_final_noncopy_field_rewrite(struct_did)
     }
 
     fn struct_has_field_rewrite_candidate(&self, struct_did: LocalDefId) -> bool {
@@ -4367,17 +4375,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             })
     }
 
-    fn struct_has_owning_box_field_candidate(&self, struct_did: LocalDefId) -> bool {
+    fn struct_has_final_noncopy_field_rewrite(&self, struct_did: LocalDefId) -> bool {
         self.tcx
             .adt_def(struct_did)
             .non_enum_variant()
             .fields
             .iter_enumerated()
             .any(|(field_index, _)| {
-                self.field_ptr_kind(StructFieldSlot {
+                let Some(kind) = self.field_ptr_kind(StructFieldSlot {
                     struct_did,
                     field_index: field_index.index(),
-                }) == Some(PtrKind::OptBox)
+                }) else {
+                    return false;
+                };
+                !final_field_kind_is_copy_capable(kind)
             })
     }
 

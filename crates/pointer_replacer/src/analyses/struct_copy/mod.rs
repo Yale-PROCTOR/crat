@@ -22,10 +22,6 @@ impl StructCopyAnalysisResult {
         self.copy_impl_structs.contains(&struct_did)
             && !self.copy_removable_structs.contains(&struct_did)
     }
-
-    pub fn should_remove_generated_impl(&self, struct_did: LocalDefId) -> bool {
-        self.copy_removable_structs.contains(&struct_did)
-    }
 }
 
 pub fn analyze(
