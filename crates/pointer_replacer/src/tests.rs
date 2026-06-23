@@ -77,6 +77,30 @@ fn run_typecheck_test_after_shape_check(code: &str, includes: &[&str], excludes:
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
 }
 
+fn run_adt_lifetime_family_test(
+    code: &str,
+    unified_lifetime_includes: &[&str],
+    raw_pointer_includes: &[&str],
+) {
+    let config = Config::default();
+    let (s, _) = rewrite_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+
+    let has_unified_lifetimes = unified_lifetime_includes
+        .iter()
+        .all(|include| s.contains(include));
+    let has_raw_pointers = raw_pointer_includes
+        .iter()
+        .all(|include| s.contains(include));
+    assert!(
+        has_unified_lifetimes || has_raw_pointers,
+        "Expected rewritten code to either use one ADT lifetime family or keep the affected pointers raw.\n\
+Unified-lifetime fragments: {unified_lifetime_includes:?}\n\
+Raw-pointer fragments: {raw_pointer_includes:?}\n\
+Rewritten code:\n{s}",
+    );
+}
+
 #[test]
 fn test_local_ptr_to_ref() {
     run_test(
@@ -12271,9 +12295,10 @@ pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
         &[
             "pub struct Payload<'a>",
             "pub value: Option<&'a mut i32>",
-            "type PayloadVisitor<'a> = unsafe extern \"C\" fn(&mut Payload<'a>) -> i32",
+            "type PayloadVisitor =",
+            "for<'a> unsafe extern \"C\" fn(&mut Payload<'a>) -> i32",
         ],
-        &["fn(&mut Payload) -> i32"],
+        &["type PayloadVisitor<'a>", "fn(&mut Payload) -> i32"],
     );
 }
 
@@ -12304,10 +12329,10 @@ pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
         &[
             "pub struct Payload<'a>",
             "pub value: Option<&'a mut i32>",
-            "type MaybePayloadVisitor<'a> =",
-            "Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+            "type MaybePayloadVisitor =",
+            "Option<for<'a> unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
         ],
-        &["fn(&mut Payload) -> i32"],
+        &["type MaybePayloadVisitor<'a>", "fn(&mut Payload) -> i32"],
     );
 }
 
@@ -12342,10 +12367,10 @@ pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
         &[
             "pub struct Payload<'a>",
             "pub value: Option<&'a mut i32>",
-            "pub struct CallbackTable<'a>",
-            "pub visit: Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+            "pub struct CallbackTable",
+            "pub visit: Option<for<'a> unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
         ],
-        &["fn(&mut Payload) -> i32"],
+        &["pub struct CallbackTable<'a>", "fn(&mut Payload) -> i32"],
     );
 }
 
@@ -12403,23 +12428,395 @@ pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
         &[
             "pub struct Payload<'a>",
             "pub value: Option<&'a mut i32>",
-            "type PayloadVisitor<'a> =",
-            "Option<unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
-            "pub struct RemoteCallbacks<'a>",
-            "pub visit: PayloadVisitor<'a>",
-            "pub struct FetchOptions<'a>",
-            "pub callbacks: RemoteCallbacks<'a>",
-            "pub struct CloneOptions<'a, 'b>",
-            "pub fetch: FetchOptions<'a>",
-            "pub checkout: PayloadVisitor<'b>",
+            "type PayloadVisitor =",
+            "Option<for<'a> unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>",
+            "pub struct RemoteCallbacks",
+            "pub visit: PayloadVisitor",
+            "pub struct FetchOptions",
+            "pub callbacks: RemoteCallbacks",
+            "pub struct CloneOptions",
+            "pub fetch: FetchOptions",
+            "pub checkout: PayloadVisitor",
         ],
         &[
             "fn(&mut Payload) -> i32",
-            "pub visit: PayloadVisitor,",
-            "pub callbacks: RemoteCallbacks,",
-            "pub fetch: FetchOptions,",
-            "pub checkout: PayloadVisitor,",
+            "type PayloadVisitor<'a>",
+            "pub struct RemoteCallbacks<'a>",
+            "pub struct FetchOptions<'a>",
+            "pub struct CloneOptions<'",
         ],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_options_callback_output_return_lifetime_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub inner: Inner,
+    pub id: i32,
+}
+
+pub type RemoteCreateCb =
+    Option<unsafe extern "C" fn(*mut *mut Remote) -> i32>;
+
+#[repr(C)]
+pub struct RemoteCreateOptions {
+    pub create: RemoteCreateCb,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_remote(mut remote: *mut Remote) -> i32 {
+    return *(*remote).inner.value + (*remote).id;
+}
+
+pub unsafe extern "C" fn create_remote(mut out: *mut *mut Remote) -> i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn create_and_configure_origin(
+    mut opts: *mut RemoteCreateOptions,
+    mut fallback: *mut Remote,
+) -> Option<*mut Remote> {
+    let mut remote: *mut Remote = fallback;
+    (*opts).create.expect("create")(&mut remote);
+    if remote.is_null() {
+        return None;
+    }
+    return Some(remote);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_options_callback_local_alias_output_return_lifetime_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Inner {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub inner: Inner,
+    pub id: i32,
+}
+
+pub type RemoteCreateCb =
+    Option<unsafe extern "C" fn(*mut *mut Remote) -> i32>;
+
+#[repr(C)]
+pub struct RemoteCreateOptions {
+    pub create: RemoteCreateCb,
+}
+
+pub unsafe fn promote_inner(value: i32) -> i32 {
+    let inner = Inner { value: &raw const value };
+    return *inner.value;
+}
+
+pub unsafe fn read_remote(mut remote: *mut Remote) -> i32 {
+    return *(*remote).inner.value + (*remote).id;
+}
+
+pub unsafe extern "C" fn create_remote(mut out: *mut *mut Remote) -> i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    return 0;
+}
+
+pub unsafe fn create_and_configure_alias(
+    mut opts: *mut RemoteCreateOptions,
+    mut fallback: *mut Remote,
+) -> Option<*mut Remote> {
+    let mut remote: *mut Remote = fallback;
+    let mut create = (*opts).create;
+    create.expect("create")(&mut remote);
+    if remote.is_null() {
+        return None;
+    }
+    return Some(remote);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_fn_pointer_contract_transport_method_options_lifetime_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct ConnectOptions {
+    pub payload: *mut i32,
+}
+
+pub type ConnectFn =
+    Option<unsafe extern "C" fn(*mut Transport, *mut ConnectOptions) -> i32>;
+
+#[repr(C)]
+pub struct Transport {
+    pub payload: *mut i32,
+    pub connect: ConnectFn,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub transport: *mut Transport,
+}
+
+pub unsafe extern "C" fn connect_impl(
+    mut transport: *mut Transport,
+    mut opts: *mut ConnectOptions,
+) -> i32 {
+    *(*transport).payload += *(*opts).payload;
+    return *(*transport).payload;
+}
+
+pub unsafe fn connect_or_reset_options(
+    mut remote: *mut Remote,
+    mut opts: *mut ConnectOptions,
+) -> i32 {
+    return (*(*remote).transport)
+        .connect
+        .expect("connect")((*remote).transport, opts);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_root3_fn_pointer_static_definition_table_lookup_result_dispatch_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Transport {
+    pub payload: *mut i32,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub transport: *mut Transport,
+    pub payload: *mut i32,
+}
+
+pub type TransportCb =
+    Option<unsafe extern "C" fn(*mut *mut Transport, *mut Remote) -> i32>;
+
+#[repr(C)]
+pub struct TransportDefinition {
+    pub scheme: *const i8,
+    pub callback: TransportCb,
+}
+
+pub unsafe extern "C" fn local_transport(
+    mut out: *mut *mut Transport,
+    mut remote: *mut Remote,
+) -> i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    *(*remote).payload += 1;
+    return *(*remote).payload;
+}
+
+pub unsafe fn read_transport(mut transport: *mut Transport) -> i32 {
+    return *(*transport).payload;
+}
+
+pub static mut TRANSPORTS: [TransportDefinition; 2] = [
+    TransportDefinition {
+        scheme: b"file\0".as_ptr() as *const i8,
+        callback: Some(
+            local_transport
+                as unsafe extern "C" fn(*mut *mut Transport, *mut Remote) -> i32,
+        ),
+    },
+    TransportDefinition {
+        scheme: b"local\0".as_ptr() as *const i8,
+        callback: Some(
+            local_transport
+                as unsafe extern "C" fn(*mut *mut Transport, *mut Remote) -> i32,
+        ),
+    },
+];
+
+pub unsafe fn transport_find_by_url(
+    mut use_second: i32,
+) -> *const TransportDefinition {
+    if use_second != 0 {
+        return &raw const TRANSPORTS[1usize];
+    }
+    return &raw const TRANSPORTS[0usize];
+}
+
+pub unsafe fn transport_find_fn(mut use_second: i32) -> Result<TransportCb, i32> {
+    let definition = transport_find_by_url(use_second);
+    if definition.is_null() {
+        return Err(-1);
+    }
+    return Ok((*definition).callback);
+}
+
+pub unsafe fn dispatch_transport(mut remote: *mut Remote) -> i32 {
+    let mut transport: *mut Transport = core::ptr::null_mut();
+    let callback = transport_find_fn(1).unwrap();
+    return callback.expect("transport")(&mut transport, remote);
+}
+
+pub unsafe fn call_with_non_static_transport(
+    mut transport_payload: i32,
+    mut remote_payload: i32,
+) -> i32 {
+    let mut transport = Transport {
+        payload: &raw mut transport_payload,
+    };
+    let mut remote = Remote {
+        transport: &raw mut transport,
+        payload: &raw mut remote_payload,
+    };
+    return dispatch_transport(&raw mut remote) + read_transport(&raw mut transport);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_root3_fn_pointer_static_mut_single_definition_fallback_tuple_dispatch_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Transport {
+    pub payload: *mut i32,
+}
+
+#[repr(C)]
+pub struct Remote {
+    pub transport: *mut Transport,
+    pub payload: *mut i32,
+}
+
+pub type TransportCb =
+    Option<unsafe extern "C" fn(*mut *mut Transport, *mut Remote) -> i32>;
+
+#[repr(C)]
+pub struct TransportDefinition {
+    pub callback: TransportCb,
+}
+
+pub unsafe extern "C" fn local_transport(
+    mut out: *mut *mut Transport,
+    mut remote: *mut Remote,
+) -> i32 {
+    *out.offset(0) = core::ptr::null_mut();
+    *(*remote).payload += 1;
+    return *(*remote).payload;
+}
+
+pub unsafe fn read_transport(mut transport: *mut Transport) -> i32 {
+    return *(*transport).payload;
+}
+
+pub static mut LOCAL_TRANSPORT_DEFINITION: TransportDefinition =
+    TransportDefinition {
+        callback: Some(
+            local_transport
+                as unsafe extern "C" fn(*mut *mut Transport, *mut Remote) -> i32,
+        ),
+    };
+
+pub unsafe fn transport_find_fallback() -> *const TransportDefinition {
+    return &raw const LOCAL_TRANSPORT_DEFINITION;
+}
+
+pub unsafe fn transport_find_fallback_fn() -> (TransportCb, i32) {
+    let definition = transport_find_fallback();
+    if definition.is_null() {
+        return (None, -1);
+    }
+    return ((*definition).callback, 0);
+}
+
+pub unsafe fn dispatch_fallback(mut remote: *mut Remote) -> i32 {
+    let mut transport: *mut Transport = core::ptr::null_mut();
+    let found = transport_find_fallback_fn();
+    if found.1 != 0 {
+        return found.1;
+    }
+    return found.0.expect("transport")(&mut transport, remote);
+}
+
+pub unsafe fn call_fallback_with_non_static_transport(
+    mut transport_payload: i32,
+    mut remote_payload: i32,
+) -> i32 {
+    let mut transport = Transport {
+        payload: &raw mut transport_payload,
+    };
+    let mut remote = Remote {
+        transport: &raw mut transport,
+        payload: &raw mut remote_payload,
+    };
+    return dispatch_fallback(&raw mut remote) + read_transport(&raw mut transport);
+}
+"#,
+        &[],
+        &[],
+    );
+}
+
+#[test]
+fn test_root3_fn_pointer_mixed_data_and_callback_field_lifetimes_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Payload {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct CallbackTable {
+    pub stored: *mut Payload,
+    pub visit: Option<unsafe extern "C" fn(*mut Payload) -> i32>,
+}
+
+pub unsafe extern "C" fn visit_payload(mut payload: *mut Payload) -> i32 {
+    *(*payload).value += 1;
+    return *(*payload).value;
+}
+
+pub unsafe fn promote_and_visit(mut value: i32) -> i32 {
+    let mut payload = Payload { value: &raw mut value };
+    let table = CallbackTable {
+        stored: &raw mut payload,
+        visit: Some(visit_payload as unsafe extern "C" fn(*mut Payload) -> i32),
+    };
+    return table.visit.expect("payload visitor")(table.stored);
+}
+"#,
+        &[
+            "pub struct CallbackTable<'a, 'b>",
+            "pub stored: &'a mut [Payload<'b>]",
+            "pub visit: Option<for<'c> unsafe extern \"C\" fn(&mut Payload<'c>) -> i32>",
+        ],
+        &["pub visit: Option<for<'a> unsafe extern \"C\" fn(&mut Payload<'a>) -> i32>"],
     );
 }
 
@@ -13011,6 +13408,410 @@ pub unsafe fn maybe_pair_payload(flag: bool) -> Option<*mut PairPayload> {
             "-> Option<*mut PairPayload<'a, 'b>>",
         ],
         &["Option<*mut PairPayload<'_"],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_direct_member_field_store_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Head {
+    pub entry: *mut Entry,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value += 1;
+    return *(*entry).value;
+}
+
+pub unsafe fn install_entry(mut head: *mut Head, mut entry: *mut Entry) {
+    (*head).entry = entry;
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct Head<'a>",
+            "pub unsafe fn install_entry<'a",
+            "crate::Head<'a",
+            "crate::Entry<'a",
+        ],
+        &[
+            "pub struct Head {",
+            "pub entry: *mut Entry",
+            "pub unsafe fn install_entry(mut head: *mut crate::Head",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_indirect_slot_store_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct HeadMap {
+    pub slot: *mut *mut Entry,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value = 3;
+    return *(*entry).value;
+}
+
+pub unsafe fn install_slot(mut head: *mut HeadMap, mut entry: *mut Entry) {
+    *(*head).slot = entry;
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct HeadMap<'a, 'b>",
+            "pub unsafe fn install_slot<'a",
+            "crate::HeadMap<'b, 'a",
+            "crate::Entry<'a",
+        ],
+        &[
+            "pub struct HeadMap {",
+            "pub slot: *mut *mut Entry",
+            "pub unsafe fn install_slot(mut head: *mut crate::HeadMap",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_output_param_retrieval_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Head {
+    pub entry: *mut Entry,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value += 5;
+    return *(*entry).value;
+}
+
+pub unsafe fn get_entry(mut out: *mut *mut Entry, mut head: *mut Head) {
+    *out.offset(0) = (*head).entry;
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct Head<'a>",
+            "pub unsafe fn get_entry<'a",
+            "&mut [*mut crate::Entry<'a>]",
+            "crate::Head<'a",
+        ],
+        &[
+            "pub struct Head {",
+            "pub entry: *mut Entry",
+            "pub unsafe fn get_entry(mut out: *mut *mut crate::Entry",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_cyclic_graph_out_param_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Remote {
+    pub push: *mut Push,
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Push {
+    pub remote: *mut Remote,
+    pub value: *mut i32,
+}
+
+pub unsafe fn promote_push(mut push: *mut Push) -> i32 {
+    *(*push).value += 7;
+    return *(*push).value;
+}
+
+pub unsafe fn link_push(
+    mut out: *mut *mut Push,
+    mut remote: *mut Remote,
+    mut push: *mut Push,
+) {
+    (*push).remote = remote;
+    (*remote).push = push;
+    *out.offset(0) = push;
+}
+"#,
+        &[
+            "pub struct Remote<'a>",
+            "pub struct Push<'a>",
+            "pub unsafe fn link_push<'a",
+            "crate::Push<'a",
+            "crate::Remote<'a",
+        ],
+        &[
+            "pub struct Remote {",
+            "pub push: *mut Push",
+            "pub struct Push {",
+            "pub remote: *mut Remote",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_type_alias_member_store_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+pub type EntryAlias = Entry;
+pub type EntryPtr = *mut EntryAlias;
+
+#[repr(C)]
+pub struct Bucket {
+    pub current: EntryPtr,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value += 9;
+    return *(*entry).value;
+}
+
+pub unsafe fn install_alias(mut bucket: *mut Bucket, mut entry: EntryPtr) {
+    (*bucket).current = entry;
+}
+"#,
+        &[
+            "pub type EntryAlias<'a> = Entry<'a>",
+            "pub type EntryPtr<'a> = *mut EntryAlias<'a>",
+            "pub struct Bucket<'a>",
+            "pub unsafe fn install_alias<'a",
+            "crate::Bucket<'a",
+            "crate::Entry<'a",
+        ],
+        &[
+            "pub type EntryAlias = Entry",
+            "pub type EntryPtr = *mut EntryAlias",
+            "pub struct Bucket {",
+            "pub current: EntryPtr",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_nested_container_store_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Head {
+    pub entry: *mut Entry,
+}
+
+#[repr(C)]
+pub struct Wrapper {
+    pub head: Head,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value += 11;
+    return *(*entry).value;
+}
+
+pub unsafe fn install_nested(mut wrapper: *mut Wrapper, mut entry: *mut Entry) {
+    (*wrapper).head.entry = entry;
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct Head<'a>",
+            "pub struct Wrapper<'a>",
+            "pub unsafe fn install_nested<'a",
+            "crate::Wrapper<'a",
+            "crate::Entry<'a",
+        ],
+        &[
+            "pub struct Head {",
+            "pub entry: *mut Entry",
+            "pub struct Wrapper {",
+            "pub head: Head",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_local_call_field_output_slot_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Leaf {
+    pub value: *const i32,
+}
+
+impl Copy for Leaf {}
+
+impl Clone for Leaf {
+    fn clone(&self) -> Leaf {
+        *self
+    }
+}
+
+#[repr(C)]
+pub struct Index {
+    pub left: Leaf,
+    pub right: Leaf,
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub index: *mut Index,
+    pub count: i32,
+}
+
+pub unsafe fn promote_leaf(value: i32) -> i32 {
+    let leaf = Leaf { value: &raw const value };
+    return *leaf.value;
+}
+
+pub unsafe fn promote_distinct(left: i32, right: i32) -> i32 {
+    let index = Index {
+        left: Leaf { value: &raw const left },
+        right: Leaf { value: &raw const right },
+    };
+    return *index.left.value + *index.right.value;
+}
+
+pub unsafe fn init(mut out: *mut *mut Index, mut index: *mut Index) {
+    (*index).left = (*index).right;
+    *out.offset(0) = index;
+}
+
+pub unsafe fn install(mut src: *mut Holder, mut index: *mut Index) {
+    init(&mut (*src).index, index);
+    (*src).count = 1;
+}
+"#,
+        &[
+            "pub struct Leaf<'a>",
+            "pub struct Index<'a, 'b>",
+            "pub struct Holder<'a, 'b>",
+            "pub unsafe fn init<'a>(mut out: &mut [*mut crate::Index<'a, 'a>]",
+            "pub unsafe fn install<'a>(mut src: &mut crate::Holder<'a, 'a>",
+            "std::slice::from_mut(&mut ((*src).index))",
+        ],
+        &["pub unsafe fn install<'a, 'b>(mut src: &mut crate::Holder<'a, 'b>"],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_local_call_cross_argument_field_slot_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *const i32,
+}
+
+#[repr(C)]
+pub struct Head {
+    pub entry: *const Entry,
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub head: Head,
+    pub pending: *const Entry,
+}
+
+pub unsafe fn promote_entry(value: i32) -> i32 {
+    let entry = Entry { value: &raw const value };
+    return *entry.value;
+}
+
+pub unsafe fn link(mut head: *mut Head, mut entry: *const Entry) {
+    (*head).entry = entry;
+}
+
+pub unsafe fn install_pending(mut holder: *mut Holder) {
+    link(&raw mut (*holder).head, (*holder).pending);
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct Head<'a>",
+            "pub struct Holder<'a, 'b, 'c>",
+            "pub unsafe fn link<'a>",
+            "crate::Head<'a",
+            "crate::Entry<'a",
+            "pub unsafe fn install_pending<'a",
+            "crate::Holder<'b, 'a, 'a>",
+        ],
+        &[
+            "pub struct Holder {",
+            "pub head: Head,",
+            "pub pending: *const Entry",
+            "pub unsafe fn install_pending(mut holder: *mut crate::Holder",
+        ],
+    );
+}
+
+#[test]
+fn test_adt_lifetime_family_let_alias_member_field_store_typechecks() {
+    run_adt_lifetime_family_test(
+        r#"
+#[repr(C)]
+pub struct Entry {
+    pub value: *mut i32,
+}
+
+#[repr(C)]
+pub struct Head {
+    pub entry: *mut Entry,
+}
+
+pub unsafe fn promote_entry(mut entry: *mut Entry) -> i32 {
+    *(*entry).value += 13;
+    return *(*entry).value;
+}
+
+pub unsafe fn install_entry_alias(mut head: *mut Head, mut entry: *mut Entry) {
+    let mut tmp = entry;
+    (*head).entry = tmp;
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub struct Head<'a>",
+            "pub unsafe fn install_entry_alias<'a",
+            "crate::Head<'a",
+            "crate::Entry<'a",
+        ],
+        &[
+            "pub struct Head {",
+            "pub entry: *mut Entry",
+            "pub unsafe fn install_entry_alias(mut head: *mut crate::Head",
+        ],
     );
 }
 
