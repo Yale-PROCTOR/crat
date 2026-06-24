@@ -2039,11 +2039,6 @@ struct UnsupportedDirectPlaceUseVisitor<'a, 'tcx> {
 }
 
 impl AstVisitor<'_> for UnsupportedDirectPlaceUseVisitor<'_, '_> {
-    fn visit_local(&mut self, local: &rustc_ast::Local) {
-        self.check_member_init(local);
-        visit::walk_local(self, local);
-    }
-
     fn visit_expr(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Assign(lhs, rhs, _) => {
@@ -2098,6 +2093,8 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                     ast_to_hir: self.ast_to_hir,
                     tcx: self.tcx,
                     plan: self.plan,
+                    introduced: None,
+                    allow_member_pointer_form: true,
                 };
                 let derivation = derive_index(rhs, Anchor::Base(base_rewrite), &ctx);
                 let unsupported = matches!(derivation, Derivation::Unsupported(_))
@@ -2131,6 +2128,8 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
             ast_to_hir: self.ast_to_hir,
             tcx: self.tcx,
             plan: self.plan,
+            introduced: None,
+            allow_member_pointer_form: true,
         };
         let derivation = derive_index(rhs, Anchor::Member(rewrite), &ctx);
         let unsupported = match &derivation {
@@ -2156,49 +2155,6 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                         "prune: unsupported assignment `{}`",
                         pprust::expr_to_string(rhs)
                     ),
-                ));
-            }
-            self.unsupported_hir_ids.insert(hir_id);
-        }
-    }
-
-    fn check_member_init(&mut self, local: &rustc_ast::Local) {
-        let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx) else {
-            return;
-        };
-        let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
-            return;
-        };
-        let Some(rewrite) = self.plan.by_hir_id.get(&hir_id) else {
-            return;
-        };
-        let init = match &local.kind {
-            LocalKind::Init(init) | LocalKind::InitElse(init, _) => init,
-            LocalKind::Decl => return,
-        };
-        let ctx = DerivationCtx {
-            ast_to_hir: self.ast_to_hir,
-            tcx: self.tcx,
-            plan: self.plan,
-        };
-        // a member whose initializer cannot be derived (or whose derived index is
-        // unexpressible for its nullability) is dropped at validation — the old
-        // code only discovered this at apply time as a divergence. use the SAME
-        // unsupported test as the assignment branch.
-        let derivation = derive_index(init, Anchor::Member(rewrite), &ctx);
-        let unsupported = match &derivation {
-            Derivation::Unsupported(_) => true,
-            Derivation::Index(index) | Derivation::DependsOn(index, _) => {
-                index_init_expr(index.clone(), rewrite.nullable).is_none()
-            }
-        };
-        // NOTE: Task 2.1 extends this init derivation to record decisions, and
-        // Task 3.2 to collect init `DependsOn` edges. Task 1.2 records neither.
-        if unsupported {
-            if self.trace_enabled {
-                self.dropped_reasons.push((
-                    hir_id,
-                    format!("prune: unsupported init `{}`", pprust::expr_to_string(init)),
                 ));
             }
             self.unsupported_hir_ids.insert(hir_id);
@@ -2432,6 +2388,22 @@ struct DerivationCtx<'a, 'tcx> {
     ast_to_hir: &'a AstToHir,
     tcx: TyCtxt<'tcx>,
     plan: &'a RewritePlan,
+    /// the set of members already introduced (index-rewritten) at this point.
+    /// `None` during validation (every planned member is treated as available
+    /// so the `DependsOn` edge is recorded). `Some(set)` during emission, so a
+    /// cross-reference to a member that is planned but not yet introduced —
+    /// e.g. one whose initializer was not index-derivable and stays raw — falls
+    /// back to the runtime `offset_from` form against the member's raw pointer
+    /// (preserving the pre-consolidation behavior).
+    introduced: Option<&'a FxHashSet<HirId>>,
+    /// whether the runtime `offset_from` pointer-form fallback for a
+    /// not-introduced / pruned group member is permitted. the pre-consolidation
+    /// code reached that form only from the *assignment* path
+    /// (`group_member_pointer_assignment_index_expr`), never from the binding
+    /// *initializer* path (`visit_local`/`rewrite_materialized_local_stmt`), so
+    /// this is `true` at assignment sites and `false` at initializer sites to
+    /// stay diff-neutral.
+    allow_member_pointer_form: bool,
 }
 
 /// the single result of deriving an index from an assignment/init RHS.
@@ -2488,11 +2460,15 @@ fn derive_member_index(
             &call.args[0],
         )));
     }
-    // 3. from another planned member of the same group: q = other.offset(n).
-    //    gate on group_member_hir_ids (the frozen group set) AND same base, to
-    //    match the original introduced_group_member_assignment_index_expr.
+    // 3. from another planned member of the same group that is (or, during
+    //    validation, is treated as) introduced: q = other.offset(n) ->
+    //    other_idx + n. gate on group_member_hir_ids (the frozen group set) AND
+    //    same base, matching the original introduced_group_member path.
     if let Some(other_hir_id) = receiver_hir_id
         && rewrite.group_member_hir_ids.contains(&other_hir_id)
+        && ctx
+            .introduced
+            .is_none_or(|introduced| introduced.contains(&other_hir_id))
         && let Some(other) = ctx.plan.by_hir_id.get(&other_hir_id)
         && other.base_hir_id == rewrite.base_hir_id
         && other.base_name == rewrite.base_name
@@ -2506,14 +2482,21 @@ fn derive_member_index(
             vec![other_hir_id],
         );
     }
-    // 4. pruned group member: the receiver is in the frozen group set but was
-    //    removed from the plan (e.g. its init was undecidable). compute the
-    //    index via runtime `offset_from` against the base pointer, preserving
-    //    the emitted form of the old group_member_pointer_assignment_index_expr.
-    //    this keeps groups alive when only a subset of members is index-derivable.
-    if let Some(other_hir_id) = receiver_hir_id
+    // 4. group member that is NOT index-rewritten at this point: either pruned
+    //    from the plan, or planned but not (yet) introduced (e.g. its init was
+    //    undecidable so it stays raw). the member is a raw pointer at runtime,
+    //    so compute the index via runtime `offset_from` against the base
+    //    pointer — the emitted form of the old
+    //    group_member_pointer_assignment_index_expr. this keeps groups alive
+    //    when only a subset of members is index-derivable. only reachable from
+    //    assignment sites (not initializer sites), matching the old code.
+    if ctx.allow_member_pointer_form
+        && let Some(other_hir_id) = receiver_hir_id
         && rewrite.group_member_hir_ids.contains(&other_hir_id)
-        && !ctx.plan.by_hir_id.contains_key(&other_hir_id)
+        && (!ctx.plan.by_hir_id.contains_key(&other_hir_id)
+            || ctx
+                .introduced
+                .is_some_and(|introduced| !introduced.contains(&other_hir_id)))
     {
         let rhs_ptr = pprust::expr_to_string(rhs);
         let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
@@ -3186,6 +3169,10 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
             ast_to_hir: self.ast_to_hir,
             tcx: self.tcx,
             plan: &self.plan,
+            introduced: Some(&self.introduced_hir_ids),
+            // initializer site: no pointer-form fallback (diff-neutral with the
+            // old visit_local path, which never reached the pointer form).
+            allow_member_pointer_form: false,
         };
         let index = match derive_index(init, Anchor::Member(&rewrite), &ctx) {
             Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
@@ -3310,6 +3297,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                     ast_to_hir: self.ast_to_hir,
                     tcx: self.tcx,
                     plan: &self.plan,
+                    introduced: Some(&self.introduced_hir_ids),
+                    allow_member_pointer_form: true,
                 };
                 let index = match derive_index(rhs, Anchor::Member(&rewrite), &ctx) {
                     Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
@@ -3371,6 +3360,10 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
             ast_to_hir: self.ast_to_hir,
             tcx: self.tcx,
             plan: &self.plan,
+            introduced: Some(&self.introduced_hir_ids),
+            // initializer site: no pointer-form fallback (diff-neutral with the
+            // old visit_local path, which never reached the pointer form).
+            allow_member_pointer_form: false,
         };
         let index = match derive_index(init, Anchor::Member(&rewrite), &ctx) {
             Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
@@ -3419,6 +3412,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                         ast_to_hir: self.ast_to_hir,
                         tcx: self.tcx,
                         plan: &self.plan,
+                        introduced: Some(&self.introduced_hir_ids),
+                        allow_member_pointer_form: true,
                     };
                     let index = match derive_index(rhs, Anchor::Base(rewrite), &ctx) {
                         Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
@@ -3445,6 +3440,8 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                         ast_to_hir: self.ast_to_hir,
                         tcx: self.tcx,
                         plan: &self.plan,
+                        introduced: Some(&self.introduced_hir_ids),
+                        allow_member_pointer_form: true,
                     };
                     let index = match derive_index(rhs, Anchor::Member(rewrite), &ctx) {
                         Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
