@@ -38,12 +38,28 @@ pub fn find_errno_calls(tcx: TyCtxt<'_>) -> ErrnoCalls {
             ctx: HirCtx::default(),
         };
         visitor.visit_body(body);
-        assigns.extend(visitor.ctx.errno_assignment_calls);
+        let HirCtx {
+            errno_assignment_calls,
+            errno_comparisons,
+            foreign_calls,
+        } = visitor.ctx;
+        assigns.extend(errno_assignment_calls);
+
+        let errno_comparisons: Vec<_> = errno_comparisons
+            .into_iter()
+            .filter_map(|cmp| {
+                let operand = tcx.hir_expect_expr(cmp.operand);
+                let operand = eval_to_int(operand, tcx)?;
+                let error_code = ErrorCode::try_from_int(operand)?;
+                Some((cmp, error_code))
+            })
+            .collect();
+        if errno_comparisons.is_empty() {
+            continue;
+        }
 
         let thir_to_mir = utils::ir::map_thir_to_mir(def_id, false, tcx);
-        let foreign_calls: FxHashMap<_, _> = visitor
-            .ctx
-            .foreign_calls
+        let foreign_calls: FxHashMap<_, _> = foreign_calls
             .into_iter()
             .filter_map(|call| {
                 let loc = hir_id_to_location(call.hir_id, &hir_to_thir, &thir_to_mir)?;
@@ -54,11 +70,7 @@ pub fn find_errno_calls(tcx: TyCtxt<'_>) -> ErrnoCalls {
         let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
         let dominators = body.basic_blocks.dominators();
 
-        for cmp in &visitor.ctx.errno_comparisons {
-            let operand = tcx.hir_expect_expr(cmp.operand);
-            let operand = some_or!(eval_to_int(operand, tcx), continue);
-            let error_code = some_or!(ErrorCode::try_from_int(operand), continue);
-
+        for (cmp, error_code) in errno_comparisons {
             let call_loc = some_or!(
                 hir_id_to_location(cmp.errno_call, &hir_to_thir, &thir_to_mir),
                 continue
