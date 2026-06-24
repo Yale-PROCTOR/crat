@@ -9717,7 +9717,10 @@ mod borrow_ownership_coherence {
         analyses::{
             borrow_ownership::{
                 CrateCtxt, SlotKind,
-                borrow_verify::{SlotConflict, materialize_guards, revalidate, revalidate_replaying},
+                borrow_verify::{
+                    SlotConflict, materialize_guards, revalidate, revalidate_replaying,
+                    verify_to_fixpoint,
+                },
                 coherence::add_coherence,
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -10584,6 +10587,215 @@ pub unsafe fn f() {
                 assert!(
                     involves_y(&replay),
                     "replay must surface the union-induced y conflict; got {replay:?}"
+                );
+            },
+        );
+    }
+
+
+    /// BB2-ii (§8 CEGAR iteration loop, Mode A). On the two-`&mut local` fixture a single
+    /// demotion is *insufficient*: demoting one involved slot's `Raw` union surfaces a
+    /// further conflict under replay, so `verify_to_fixpoint` must iterate (commit `¬ref`
+    /// on a representative → re-solve) until conflict-free. The necessity is the contrast
+    /// asserted below: a single-step demotion (what a BB1 one-shot reaches) leaves a
+    /// residual, while the loop's fixpoint is clean.
+    ///
+    /// Because both pointers share one base (`local`) and the conflict is asymmetric
+    /// (creating the 2nd borrow invalidates the 1st's live loan), each monotone single-slot
+    /// commit's `tree_borrow_local` union re-surfaces a fresh self-conflict, cascading until
+    /// ALL of this fn's pointer slots are `Raw` — a sound but non-minimal "give up on every
+    /// borrow" fixpoint. (`bb2ii_preserves_independent_borrow` shows the loop instead keeps
+    /// an *independent* borrow `Ref`; that test carries the non-vacuous clean assertion.)
+    #[test]
+    fn bb2ii_cegar_loop_reaches_union_clean_fixpoint() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut local = 0i32;
+    let x = &mut local as *mut i32;
+    let y = &mut local as *mut i32;
+    *x = 1;
+    *y = 2;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+
+                // --- Necessity (deterministic): a single round-0 guard is NOT a fixpoint. ---
+                // The round-0 conflict admits a single-slot demotion — its requirer alone —
+                // that a one-shot disjunctive guard could pick (a valid max-ref choice). Yet
+                // demoting just that slot induces a `tree_borrow_local` union that surfaces a
+                // *further* conflict under replay. Only BB2-ii's re-validation loop catches
+                // that. Asserting this directly (not via the solver) is robust to z3's
+                // tie-break between the equally-good issuer/requirer demotions.
+                let round0 = revalidate(&program, &slots, |_| true, true);
+                let requirer = *round0
+                    .get(&f)
+                    .and_then(|edges| edges.first())
+                    .and_then(|edge| edge.requirers.first())
+                    .expect("round-0 conflict with a requirer");
+                let residual = revalidate_replaying(
+                    &program,
+                    &slots,
+                    |s: SlotRef| s != requirer,
+                    |s: SlotRef| s == requirer,
+                    true,
+                );
+                assert!(
+                    residual.get(&f).is_some_and(|e| !e.is_empty()),
+                    "demoting the round-0 requirer alone must leave a union-induced residual \
+                     (the re-validation loop is necessary); got {residual:?}"
+                );
+
+                // --- BB2-ii loop reaches the clean fixpoint. ---
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges to a SAT model");
+
+                // Non-trivial: the conflict forced a real demotion — ≥1 pointer slot is
+                // Raw. Checking `== Raw` (not `!= Ref`) attributes it to the borrow path:
+                // f has no ownership source, so a borrow commit is the only Raw producer
+                // (an unrelated Owning slot could satisfy `!= Ref` without any demotion).
+                let demoted_to_raw = body.local_decls.indices().any(|local| {
+                    slots
+                        .fn_local_slots
+                        .get(&f)
+                        .and_then(|u| u.slot_for_local_depth(local, 0))
+                        .and_then(|sid| model.get(&SlotRef::Local(f, sid)))
+                        == Some(&SlotKind::Raw)
+                });
+                assert!(
+                    demoted_to_raw,
+                    "fixpoint must demote >=1 pointer slot to Raw; got {model:?}"
+                );
+
+                // The accepted model is genuinely conflict-free under replay.
+                let clean = revalidate_replaying(
+                    &program,
+                    &slots,
+                    |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref),
+                    |s: SlotRef| model.get(&s) == Some(&SlotKind::Raw),
+                    true,
+                );
+                assert!(
+                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    "fixpoint model must be conflict-free under replay; got {clean:?}"
+                );
+            },
+        );
+    }
+
+    /// BB2-ii non-vacuous fixpoint: an INDEPENDENT borrow (distinct base) stays Ref while
+    /// the conflicting borrows demote. `p`,`q` both borrow `a` (conflict); `s` borrows `b`
+    /// (independent). The loop demotes the `a`-chain but never commits `s`, so the fixpoint
+    /// keeps `s` Ref — making the conflict-free assertion load-bearing: `s` is a live Ref
+    /// candidate, so an empty residual is a genuine reconciliation, not the degenerate
+    /// no-Ref-candidates-left reading of the single-base `f` case.
+    #[test]
+    fn bb2ii_preserves_independent_borrow() {
+        run_compiler(
+            r#"
+pub unsafe fn g() {
+    let mut a = 0i32;
+    let mut b = 0i32;
+    let p = &mut a as *mut i32;
+    let q = &mut a as *mut i32;
+    let s = &mut b as *mut i32;
+    *p = 1;
+    *q = 2;
+    *s = 3;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "g");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let s = local_slot(&slots, f, local_by_var_name(tcx, f, "s"), 0);
+
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+
+                // The independent borrow `s` (distinct base `b`) is never committed → Ref.
+                assert_eq!(
+                    model.get(&s),
+                    Some(&SlotKind::Ref),
+                    "independent borrow `s` must remain Ref at the fixpoint; got {:?}",
+                    model.get(&s)
+                );
+
+                // Non-vacuous clean: `s` is a live Ref candidate, so an empty residual means
+                // a genuine reconciliation, not the no-Ref-candidates-left degeneracy.
+                let clean = revalidate_replaying(
+                    &program,
+                    &slots,
+                    |x: SlotRef| model.get(&x) == Some(&SlotKind::Ref),
+                    |x: SlotRef| model.get(&x) == Some(&SlotKind::Raw),
+                    true,
+                );
+                assert!(
+                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    "fixpoint must be conflict-free under replay; got {clean:?}"
+                );
+            },
+        );
+    }
+
+    /// BB2-ii regression: a DEAD copy of a borrowed pointer (`let _r = p;`) must NOT panic
+    /// the loop. coherence's flow-insensitive `equate(_r, p)` drags `_r` to Raw when `p` is
+    /// committed off Ref, but `_r` is dead at the conflict so it is never a borrow demotion
+    /// witness. `borrow_conflicts_replaying`'s former hard "Raw ⟹ witness" assert tripped
+    /// on it; the relaxed *inert-ness* invariant lets the loop converge (the stray Raw `_r`
+    /// is provably in no residual edge). C2Rust output is full of such dead pointer copies.
+    #[test]
+    fn bb2ii_dead_copy_does_not_panic() {
+        run_compiler(
+            r#"
+pub unsafe fn dcu() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    let _r = p;
+    let q = &mut a as *mut i32;
+    *p = 1;
+    *q = 2;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "dcu");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("dead copy must not panic; loop converges");
+
+                let clean = revalidate_replaying(
+                    &program,
+                    &slots,
+                    |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref),
+                    |s: SlotRef| model.get(&s) == Some(&SlotKind::Raw),
+                    true,
+                );
+                assert!(
+                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    "dead-copy fixpoint must be conflict-free under replay; got {clean:?}"
                 );
             },
         );
