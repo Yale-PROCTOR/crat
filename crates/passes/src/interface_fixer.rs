@@ -222,7 +222,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                 }
             }
             if !fixes.is_empty() {
-                let new_name = format!("{name}_internal");
+                let new_name = format!("{name}_internal__");
                 let new_name = Symbol::intern(&new_name);
                 self.fixes.insert(item.owner_id.def_id, (fixes, new_name));
             }
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> 
         utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
             .expect(&transformed);
 
-        assert!(transformed.contains("fn match_0_internal"));
+        assert!(transformed.contains("fn match_0_internal__"));
         assert!(transformed.contains("fn match_0(test: *const f64"));
         assert_eq!(transformed.matches("#[export_name = \"match\"]").count(), 1);
     }
