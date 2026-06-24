@@ -44,7 +44,7 @@ pub fn fix_interfaces(config: &Config, tcx: TyCtxt<'_>) -> String {
 struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
-    fixes: FxHashMap<LocalDefId, (FxHashMap<usize, ParamFix<'tcx>>, Symbol)>,
+    fixes: FxHashMap<LocalDefId, (FxHashMap<usize, ParamFix>, Symbol)>,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -62,13 +62,8 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 let PatKind::Ident(_, ident, _) = &param.pat.kind else { panic!() };
                 let x = ident.name;
                 if let Some(fix) = fixes.get(&i) {
-                    let m = if fix.mutability.is_mut() {
-                        "mut"
-                    } else {
-                        "const"
-                    };
-                    let ty = utils::ir::mir_ty_to_string(fix.ty, self.tcx);
-                    *param.ty = utils::ty!("*{m} {ty}");
+                    let raw_ty = raw_pointer_param_ty(&param.ty, *fix);
+                    *param.ty = raw_ty;
                     match fix.kind {
                         ParamFixKind::Slice => {
                             write!(
@@ -149,10 +144,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
 }
 
 #[derive(Clone, Copy)]
-struct ParamFix<'tcx> {
+struct ParamFix {
     kind: ParamFixKind,
     mutability: ty::Mutability,
-    ty: ty::Ty<'tcx>,
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +158,7 @@ enum ParamFixKind {
 struct HirVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     config: &'a Config,
-    fixes: FxHashMap<LocalDefId, (FxHashMap<usize, ParamFix<'tcx>>, Symbol)>,
+    fixes: FxHashMap<LocalDefId, (FxHashMap<usize, ParamFix>, Symbol)>,
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
@@ -193,14 +187,13 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                 let ty = typeck.node_type(param.pat.hir_id);
 
                 if let ty::TyKind::Ref(_, inner_ty, m) = ty.kind()
-                    && let ty::TyKind::Slice(inner_ty) = inner_ty.kind()
+                    && let ty::TyKind::Slice(_) = inner_ty.kind()
                 {
                     fixes.insert(
                         i,
                         ParamFix {
                             kind: ParamFixKind::Slice,
                             mutability: *m,
-                            ty: *inner_ty,
                         },
                     );
                     continue;
@@ -221,16 +214,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                         continue;
                     };
 
-                    let Some(inner_ty) = generic_args.types().next() else { continue };
+                    if generic_args.types().next().is_none() {
+                        continue;
+                    }
 
-                    fixes.insert(
-                        i,
-                        ParamFix {
-                            kind,
-                            mutability,
-                            ty: inner_ty,
-                        },
-                    );
+                    fixes.insert(i, ParamFix { kind, mutability });
                 }
             }
             if !fixes.is_empty() {
@@ -244,9 +232,101 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
     }
 }
 
+fn raw_pointer_param_ty(param_ty: &Ty, fix: ParamFix) -> Ty {
+    let Some(inner_ty) = raw_pointer_inner_ty(param_ty, fix.kind) else {
+        panic!(
+            "failed to derive raw interface parameter type from `{}`",
+            pprust::ty_to_string(param_ty)
+        );
+    };
+
+    let m = if fix.mutability.is_mut() {
+        "mut"
+    } else {
+        "const"
+    };
+    let mut raw_ty = utils::ty!("*{m} ()");
+    let TyKind::Ptr(mut_ty) = &mut raw_ty.kind else { panic!() };
+    mut_ty.ty = inner_ty;
+    raw_ty
+}
+
+fn raw_pointer_inner_ty(param_ty: &Ty, kind: ParamFixKind) -> Option<P<Ty>> {
+    match kind {
+        ParamFixKind::Slice => slice_element_ty(param_ty),
+        ParamFixKind::SliceCursor => slice_cursor_element_ty(param_ty),
+    }
+}
+
+fn slice_element_ty(param_ty: &Ty) -> Option<P<Ty>> {
+    let param_ty = peel_ty_parens(param_ty);
+    let TyKind::Ref(_, mut_ty) = &param_ty.kind else { return None };
+    let inner_ty = peel_ty_parens(&mut_ty.ty);
+    let TyKind::Slice(element_ty) = &inner_ty.kind else { return None };
+    Some(element_ty.clone())
+}
+
+fn slice_cursor_element_ty(param_ty: &Ty) -> Option<P<Ty>> {
+    let param_ty = peel_ty_parens(param_ty);
+    let TyKind::Path(_, path) = &param_ty.kind else { return None };
+    let args = path.segments.last()?.args.as_ref()?;
+    let GenericArgs::AngleBracketed(args) = &**args else { return None };
+
+    let mut seen_cursor_lifetime = false;
+    let mut element_ty = None;
+    for arg in &args.args {
+        let AngleBracketedArg::Arg(arg) = arg else { return None };
+        match arg {
+            GenericArg::Lifetime(_) if !seen_cursor_lifetime => {
+                seen_cursor_lifetime = true;
+            }
+            GenericArg::Type(ty) if element_ty.is_none() => {
+                element_ty = Some(ty.clone());
+            }
+            _ => return None,
+        }
+    }
+    element_ty
+}
+
+fn peel_ty_parens(ty: &Ty) -> &Ty {
+    if let TyKind::Paren(ty) = &ty.kind {
+        peel_ty_parens(ty)
+    } else {
+        ty
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rustc_hash::FxHashSet;
+
+    fn compact_source(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    fn assert_fixed_interface_typechecks(code: &str, fn_name: &str, expected: &[&[&str]]) {
+        let config = super::Config {
+            c_exposed_fns: FxHashSet::from_iter([fn_name.to_string()]),
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        let compact_transformed = compact_source(&transformed);
+
+        for alternatives in expected {
+            assert!(
+                alternatives
+                    .iter()
+                    .any(|expected| { compact_transformed.contains(&compact_source(expected)) }),
+                "expected to find one of {alternatives:?} in transformed interface:\n{transformed}",
+            );
+        }
+
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+    }
 
     #[test]
     fn wraps_exposed_export_name_function() {
@@ -269,5 +349,232 @@ pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> 
         assert!(transformed.contains("fn match_0_internal"));
         assert!(transformed.contains("fn match_0(test: *const f64"));
         assert_eq!(transformed.matches("#[export_name = \"match\"]").count(), 1);
+    }
+
+    #[test]
+    fn preserves_lifetimes_for_mutable_slice_params() {
+        assert_fixed_interface_typechecks(
+            r#"
+#[repr(C)]
+pub struct Push<'a> {
+    pub marker: *mut &'a i32,
+}
+
+#[repr(C)]
+pub struct Remote<'a> {
+    pub peer: *mut Push<'a>,
+}
+
+pub unsafe extern "C" fn mutable_slices_share_lifetime<'a>(
+    pushes: &mut [*mut Push<'a>],
+    remotes: &mut [Remote<'a>],
+) {
+    let _ = pushes.len() + remotes.len();
+}
+"#,
+            "mutable_slices_share_lifetime",
+            &[
+                &[
+                    "fn mutable_slices_share_lifetime<'a>(pushes: *mut *mut Push<'a>",
+                    "fn mutable_slices_share_lifetime<'a>(pushes: *mut *mut crate::Push<'a>",
+                ],
+                &[
+                    "remotes: *mut Remote<'a>",
+                    "remotes: *mut crate::Remote<'a>",
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn preserves_lifetimes_for_immutable_slice_params_with_invariant_elements() {
+        assert_fixed_interface_typechecks(
+            r#"
+#[repr(C)]
+pub struct ReadLeft<'a> {
+    pub marker: *mut &'a i32,
+}
+
+#[repr(C)]
+pub struct ReadRight<'a> {
+    pub marker: *mut &'a i32,
+}
+
+pub unsafe extern "C" fn immutable_slices_share_lifetime<'a>(
+    left: &[ReadLeft<'a>],
+    right: &[ReadRight<'a>],
+) -> usize {
+    left.len() + right.len()
+}
+"#,
+            "immutable_slices_share_lifetime",
+            &[
+                &[
+                    "fn immutable_slices_share_lifetime<'a>(left: *const ReadLeft<'a>",
+                    "fn immutable_slices_share_lifetime<'a>(left: *const crate::ReadLeft<'a>",
+                ],
+                &[
+                    "right: *const ReadRight<'a>",
+                    "right: *const crate::ReadRight<'a>",
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn preserves_lifetimes_across_fixed_slice_and_raw_pointer_params() {
+        assert_fixed_interface_typechecks(
+            r#"
+#[repr(C)]
+pub struct Node<'a> {
+    pub marker: *mut &'a i32,
+}
+
+pub unsafe extern "C" fn mixed_fixed_and_raw_lifetime<'a>(
+    nodes: &mut [Node<'a>],
+    root: *mut Node<'a>,
+    count: usize,
+) -> *mut Node<'a> {
+    let _ = nodes.len() + count;
+    root
+}
+"#,
+            "mixed_fixed_and_raw_lifetime",
+            &[&[
+                "fn mixed_fixed_and_raw_lifetime<'a>(nodes: *mut Node<'a>, root: *mut Node<'a>",
+                "fn mixed_fixed_and_raw_lifetime<'a>(nodes: *mut crate::Node<'a>, root: *mut Node<'a>",
+            ]],
+        );
+    }
+
+    #[test]
+    fn preserves_inner_lifetimes_for_slice_cursor_params() {
+        assert_fixed_interface_typechecks(
+            r#"
+pub mod slice_cursor {
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+    }
+
+    pub struct SliceCursorMut<'a, T> {
+        base: &'a mut [T],
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub const fn new(base: &'a [T]) -> Self {
+            Self { base }
+        }
+
+        pub const fn empty() -> Self {
+            Self { base: &[] }
+        }
+    }
+
+    impl<'a, T> SliceCursorMut<'a, T> {
+        pub const fn new(base: &'a mut [T]) -> Self {
+            Self { base }
+        }
+
+        pub const fn empty() -> Self {
+            Self { base: &mut [] }
+        }
+    }
+}
+
+#[repr(C)]
+pub struct CursorItem<'a> {
+    pub marker: *mut &'a i32,
+}
+
+pub unsafe extern "C" fn cursor_params_preserve_inner_lifetimes<'a>(
+    read: crate::slice_cursor::SliceCursor<'_, CursorItem<'a>>,
+    write: crate::slice_cursor::SliceCursorMut<'_, CursorItem<'a>>,
+) {
+    let _ = read;
+    let _ = write;
+}
+"#,
+            "cursor_params_preserve_inner_lifetimes",
+            &[&[
+                "fn cursor_params_preserve_inner_lifetimes<'a>(read: *const CursorItem<'a>, write: *mut CursorItem<'a>)",
+                "fn cursor_params_preserve_inner_lifetimes<'a>(read: *const crate::CursorItem<'a>, write: *mut crate::CursorItem<'a>)",
+            ]],
+        );
+    }
+
+    #[test]
+    fn preserves_lifetimes_inside_nested_generic_slice_elements() {
+        assert_fixed_interface_typechecks(
+            r#"
+#[repr(C)]
+pub struct Node<'a> {
+    pub marker: *mut &'a i32,
+}
+
+#[repr(C)]
+pub struct Wrapper<T> {
+    pub inner: *mut T,
+}
+
+pub unsafe extern "C" fn nested_generic_slice_lifetime<'a>(
+    wrapped: &mut [Wrapper<Node<'a>>],
+    nodes: &mut [Node<'a>],
+) {
+    let _ = wrapped.len() + nodes.len();
+}
+"#,
+            "nested_generic_slice_lifetime",
+            &[
+                &[
+                    "fn nested_generic_slice_lifetime<'a>(wrapped: *mut Wrapper<Node<'a>>",
+                    "fn nested_generic_slice_lifetime<'a>(wrapped: *mut crate::Wrapper<crate::Node<'a>>",
+                ],
+                &["nodes: *mut Node<'a>", "nodes: *mut crate::Node<'a>"],
+            ],
+        );
+    }
+
+    #[test]
+    fn preserves_lifetimes_through_parenthesized_param_types() {
+        assert_fixed_interface_typechecks(
+            r#"
+pub mod slice_cursor {
+    pub struct SliceCursor<'a, T> {
+        base: &'a [T],
+    }
+
+    impl<'a, T> SliceCursor<'a, T> {
+        pub const fn new(base: &'a [T]) -> Self {
+            Self { base }
+        }
+
+        pub const fn empty() -> Self {
+            Self { base: &[] }
+        }
+    }
+}
+
+#[repr(C)]
+pub struct Node<'a> {
+    pub marker: *mut &'a i32,
+}
+
+pub unsafe extern "C" fn parenthesized_interface_types<'a>(
+    nodes: (&mut ([Node<'a>])),
+    cursor: (crate::slice_cursor::SliceCursor<'_, Node<'a>>),
+) {
+    let _ = nodes.len();
+    let _ = cursor;
+}
+"#,
+            "parenthesized_interface_types",
+            &[
+                &[
+                    "fn parenthesized_interface_types<'a>(nodes: *mut Node<'a>",
+                    "fn parenthesized_interface_types<'a>(nodes: *mut crate::Node<'a>",
+                ],
+                &["cursor: *const Node<'a>", "cursor: *const crate::Node<'a>"],
+            ],
+        );
     }
 }
