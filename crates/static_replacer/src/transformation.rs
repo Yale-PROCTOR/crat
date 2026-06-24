@@ -7,12 +7,15 @@ use rustc_hir::{
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit,
+    lang_items::LangItem,
 };
+use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::{
     hir::nested_filter,
     ty::{self, Ty, TyCtxt},
 };
-use rustc_span::{Symbol, sym};
+use rustc_span::{DUMMY_SP, Symbol, sym};
+use rustc_trait_selection::traits;
 use utils::{expr, item};
 
 use crate::return_escape;
@@ -46,7 +49,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         if returned_statics.contains(&def_id) {
             continue;
         }
-        if exprs.iter().all(|(_, mutated)| !*mutated) {
+        if exprs.iter().all(|(_, mutated)| !*mutated) && static_ty_is_sync(tcx, def_id) {
             immutables.insert(def_id);
         } else if exprs.iter().all(|(e, _)| {
             !matches!(
@@ -87,6 +90,14 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     visitor.visit_crate(&mut krate);
 
     pprust::crate_to_string_for_macros(&krate)
+}
+
+fn static_ty_is_sync<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
+    let ty = tcx.type_of(def_id).instantiate_identity();
+    let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
+    let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
+    let sync_trait = tcx.require_lang_item(LangItem::Sync, DUMMY_SP);
+    traits::type_known_to_meet_bound_modulo_regions(&infcx, param_env, ty, sync_trait)
 }
 
 struct AstVisitor<'tcx> {
@@ -550,6 +561,15 @@ static mut X: u32 = 0;
 unsafe fn f() -> u32 { X }
 "#;
         run_test(code, &["static X"], &["static mut"]);
+    }
+
+    #[test]
+    fn test_non_sync_immutable_candidate_does_not_become_plain_static() {
+        let code = r#"
+static mut X: *mut u8 = 0 as *mut u8;
+unsafe fn f() -> *mut u8 { X }
+"#;
+        run_test(code, &["std::cell::Cell<*mut u8>", "X.get()"], &[]);
     }
 
     #[test]
