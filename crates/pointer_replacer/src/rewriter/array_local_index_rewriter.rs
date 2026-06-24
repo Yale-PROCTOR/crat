@@ -2105,7 +2105,6 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
                         &self.plan.by_hir_id,
                         base_rewrite,
                     );
-                // NOTE: Task 3.2 inserts base `DependsOn` edge collection here.
                 if unsupported {
                     self.mark_rewrites_for_base_unsupported(&base_key);
                 }
@@ -2144,9 +2143,6 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
             &self.plan.by_hir_id,
             rewrite,
         );
-        // NOTE: Task 2.1 inserts `decisions.insert(rhs.id, index)` and Task 3.2
-        // inserts `DependsOn` edge collection at this same derivation. Task 1.2
-        // uses only the supported/unsupported distinction.
         if unsupported {
             if self.trace_enabled {
                 self.dropped_reasons.push((
@@ -2407,21 +2403,26 @@ struct DerivationCtx<'a, 'tcx> {
 }
 
 /// the single result of deriving an index from an assignment/init RHS.
+// the `DependsOn` member list and the `Unsupported` reason string are not read
+// today (every caller treats `Index` and `DependsOn` alike and ignores the
+// reason); they are retained as the natural carriers for the deferred
+// dependency-cascade / base-cursor work continuing on this branch.
 #[allow(dead_code)]
 enum Derivation {
     /// fully derivable from the anchor (and possibly the base cursor).
     Index(IndexExpr),
-    /// derivable, but only if these planned members are also rewritten.
-    /// (the edge vec is collected in Task 3.2; the reason str in Task 2.1.)
+    /// derivable; the `Vec<HirId>` lists the other planned members it derives
+    /// from (reserved for the deferred dependency-cascade analysis).
     DependsOn(IndexExpr, Vec<HirId>),
-    /// not derivable; the &str is the trace reason.
+    /// not derivable; the &str is the (reserved) trace reason.
     Unsupported(&'static str),
 }
 
-/// the one derivation entry point. validation and emission both call this with
-/// the same arguments, so they cannot disagree. every planned member is treated
-/// as available; a dependency on another member is recorded via `DependsOn`
-/// rather than gated on an `introduced` set.
+/// the one derivation entry point, shared by validation and emission so they
+/// cannot disagree on whether an RHS is derivable. the supported/unsupported
+/// decision is independent of `ctx.introduced`; that set only selects, at
+/// emission, between the index form and the runtime `offset_from` pointer form
+/// for a cross-reference to a member that is not (yet) introduced.
 fn derive_index(rhs: &Expr, anchor: Anchor<'_>, ctx: &DerivationCtx<'_, '_>) -> Derivation {
     match anchor {
         Anchor::Member(rewrite) => derive_member_index(rhs, rewrite, ctx),
