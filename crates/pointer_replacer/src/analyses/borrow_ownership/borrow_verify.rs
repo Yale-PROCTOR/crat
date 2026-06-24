@@ -21,7 +21,7 @@ use super::{
     solver::{KindSolver, SlotRef},
 };
 use crate::{
-    analyses::borrow::{self, ProvenanceOwner},
+    analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
     utils::rustc::RustProgram,
 };
 
@@ -57,6 +57,56 @@ pub(crate) fn revalidate(
         move |_fn_did| move |_local| is_mutable,
     );
 
+    map_edges_to_slots(slots, edges)
+}
+
+/// §8 BB2-i — the CEGAR validate seam **with union replay**. Like `revalidate` but
+/// takes a *partial* candidacy: a pointer local's depth-0 slot is a `Ref` candidate
+/// iff `is_ref`, induces a demotion+union iff `is_raw`, and is an `Owning`
+/// non-candidate otherwise. Delegates to `borrow::borrow_conflicts_replaying`, which
+/// replays the `tree_borrow_local` union the chosen `Raw` slots induce, so a partial
+/// candidacy surfaces the model-dependent conflicts that `revalidate` (round-0) cannot.
+/// This is the seam BB2-ii's CEGAR loop drives with the solved model's actual kinds.
+pub(crate) fn revalidate_replaying(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_raw: impl Fn(SlotRef) -> bool,
+    is_mutable: bool,
+) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let is_ref = &is_ref;
+    let is_raw = &is_raw;
+    let edges = borrow::borrow_conflicts_replaying(
+        program,
+        move |fn_did| {
+            let universe = slots.fn_local_slots.get(&fn_did);
+            move |local: Local| {
+                universe
+                    .and_then(|u| u.slot_for_local_depth(local, 0))
+                    .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
+            }
+        },
+        move |fn_did| {
+            let universe = slots.fn_local_slots.get(&fn_did);
+            move |local: Local| {
+                universe
+                    .and_then(|u| u.slot_for_local_depth(local, 0))
+                    .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
+            }
+        },
+        move |_fn_did| move |_local| is_mutable,
+    );
+
+    map_edges_to_slots(slots, edges)
+}
+
+/// Translate borrow `ConflictEdge`s (keyed by function) into BO `SlotConflict`s,
+/// mapping each `Local` owner to its depth-0 slot (`Field` owners dropped). Shared by
+/// `revalidate` (round-0) and `revalidate_replaying` (CEGAR).
+fn map_edges_to_slots(
+    slots: &CrateSlots,
+    edges: FxHashMap<LocalDefId, Vec<ConflictEdge>>,
+) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     edges
         .into_iter()
         .map(|(fn_did, fn_edges)| {

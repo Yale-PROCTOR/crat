@@ -929,6 +929,77 @@ fn test_demote_strategy_no_ub() {
     assert_eq!(demoted, vec!["x", "y"], "both x and y should be demoted");
 }
 
+/// Map a source-level variable name to its MIR `Local` (via debug info).
+fn local_by_name(tcx: TyCtxt<'_>, did: LocalDefId, name: &str) -> Local {
+    let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+    for vdi in body.var_debug_info.iter() {
+        if vdi.name.as_str() == name
+            && let VarDebugInfoContents::Place(place) = &vdi.value
+            && let Some(local) = place.as_local()
+        {
+            return local;
+        }
+    }
+    panic!("no local named `{name}` in {did:?}");
+}
+
+fn edge_involves(edge: &ConflictEdge, local: Local) -> bool {
+    let target = ProvenanceOwner::Local(local);
+    edge.issuer == Some(target) || edge.requirers.contains(&target)
+}
+
+/// BB2-i (§8 CEGAR validate, union-replay): given a partial candidacy that marks `x`
+/// `Raw` (production's iteration-1 demotion — `probe` confirmed `iter1={x}`,
+/// `final={x,y}`), the verifier must replay the `tree_borrow_local` union and surface
+/// the resulting `y` conflict — the model-dependent conflict the union creates. Plain
+/// BB0 `borrow_conflicts` (no union) does NOT see it, because `y = &mut local` alone
+/// is sound. This is the differential that proves the replay does real work.
+#[test]
+fn bb2i_replay_surfaces_union_induced_conflict() {
+    ::utils::compilation::run_compiler_on_str(
+        "
+        unsafe fn f() {
+            let mut local = 0i32;
+            let x = &mut local as *mut _;
+            let y = &mut local as *mut _;
+            *x = 1;
+            *y = 2;
+        }
+        ",
+        |tcx| {
+            let program = build_rust_program(tcx);
+            let f = program.functions[0];
+            let x = local_by_name(tcx, f, "x");
+            let y = local_by_name(tcx, f, "y");
+
+            let is_mutable = |_: LocalDefId| |_: Local| true;
+            // Candidacy: `x` is Raw (demoted, induces a union); everything else Ref.
+            let is_ref = move |did: LocalDefId| move |local: Local| !(did == f && local == x);
+            let is_raw = move |did: LocalDefId| move |local: Local| did == f && local == x;
+
+            // BB0 (no union replay): `x` is simply a non-candidate, so `y = &mut local`
+            // alone is sound — round-0 finds NO conflict at all for `f`. Asserting
+            // emptiness (not merely "no y") pins the union as the *sole* cause.
+            let bb0 = borrow_conflicts(&program, is_ref, is_mutable);
+            assert!(
+                bb0.get(&f).map_or(true, |edges| edges.is_empty()),
+                "BB0 (no union) must find NO conflict for `f`; got {bb0:?}"
+            );
+
+            // BB2-i replay: demote `x` + union(x, local) ⇒ `y = &mut local` now conflicts.
+            let replay = borrow_conflicts_replaying(&program, is_ref, is_raw, is_mutable);
+            let replay_involves_y = replay
+                .get(&f)
+                .is_some_and(|edges| edges.iter().any(|e| edge_involves(e, y)));
+            assert!(
+                replay_involves_y,
+                "BB2-i replay must surface the union-induced `y` conflict; got {replay:?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
 #[test]
 fn demote_struct_field_assignment_on_conflict() {
     let demoted_fields = run_demote_fields(

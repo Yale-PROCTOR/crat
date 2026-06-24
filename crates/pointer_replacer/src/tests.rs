@@ -9707,6 +9707,7 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
 }
 
 mod borrow_ownership_coherence {
+    use rustc_hash::FxHashMap;
     use rustc_hir::{ItemKind, OwnerNode};
     use rustc_middle::{mir::Local, ty::TyCtxt};
     use rustc_span::def_id::LocalDefId;
@@ -9716,7 +9717,7 @@ mod borrow_ownership_coherence {
         analyses::{
             borrow_ownership::{
                 CrateCtxt, SlotKind,
-                borrow_verify::{materialize_guards, revalidate},
+                borrow_verify::{SlotConflict, materialize_guards, revalidate, revalidate_replaying},
                 coherence::add_coherence,
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -10529,6 +10530,60 @@ pub unsafe fn store_global(out: *mut *mut i32) {
                 assert!(
                     edges.is_empty(),
                     "storing a global address through `*out` is not a borrow conflict; got {edges:?}"
+                );
+            },
+        );
+    }
+
+    /// BB2-i (§8 CEGAR validate seam, union replay) through the BO `SlotRef` API.
+    /// Two `&mut local` borrows: marking `x`'s slot `Raw` (production's iteration-1
+    /// demotion) must, under replay, surface `y`'s conflict via the `tree_borrow_local`
+    /// union — which plain `revalidate` (round-0, no union) does not. Mirrors the
+    /// borrow-side `bb2i_replay_surfaces_union_induced_conflict` through the slot space.
+    #[test]
+    fn bb2i_revalidate_replaying_surfaces_union_induced_slot_conflict() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut local = 0i32;
+    let x = &mut local as *mut i32;
+    let y = &mut local as *mut i32;
+    *x = 1;
+    *y = 2;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let slots = CrateSlots::build(&program);
+                let x = local_slot(&slots, f, local_by_var_name(tcx, f, "x"), 0);
+                let y = local_slot(&slots, f, local_by_var_name(tcx, f, "y"), 0);
+
+                let involves_y = |conflicts: &FxHashMap<LocalDefId, Vec<_>>| {
+                    conflicts.get(&f).is_some_and(|edges: &Vec<SlotConflict>| {
+                        edges
+                            .iter()
+                            .any(|e| e.issuer == Some(y) || e.requirers.contains(&y))
+                    })
+                };
+
+                // Candidacy: `x` Raw, everything else Ref.
+                let is_ref = |s: SlotRef| s != x;
+                let is_raw = |s: SlotRef| s == x;
+
+                // Round-0 `revalidate` (no union): `y = &mut local` alone is sound — no
+                // conflict at all for `f`. Emptiness pins the union as the sole cause.
+                let bb0 = revalidate(&program, &slots, is_ref, true);
+                assert!(
+                    bb0.get(&f).map_or(true, |edges| edges.is_empty()),
+                    "round-0 revalidate must find NO conflict for f; got {bb0:?}"
+                );
+
+                // Replay: demote `x` + union(x, local) ⇒ `y` conflicts.
+                let replay = revalidate_replaying(&program, &slots, is_ref, is_raw, true);
+                assert!(
+                    involves_y(&replay),
+                    "replay must surface the union-induced y conflict; got {replay:?}"
                 );
             },
         );
