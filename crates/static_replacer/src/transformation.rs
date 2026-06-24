@@ -36,8 +36,13 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     let mut visitor = HirVisitor {
         tcx,
         statics: FxHashMap::default(),
+        static_initializer_references: FxHashSet::default(),
+        static_initializer_address_references: FxHashSet::default(),
+        current_static_initializer: None,
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+    let static_initializer_references = visitor.static_initializer_references;
+    let static_initializer_address_references = visitor.static_initializer_address_references;
 
     let mut immutables = FxHashSet::default();
     let mut cells = FxHashSet::default();
@@ -49,7 +54,13 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         if returned_statics.contains(&def_id) {
             continue;
         }
-        if exprs.iter().all(|(_, mutated)| !*mutated) && static_ty_is_sync(tcx, def_id) {
+        let immutable =
+            exprs.iter().all(|(_, mutated)| !*mutated) && static_ty_is_sync(tcx, def_id);
+        if static_initializer_references.contains(&def_id) {
+            if immutable && !static_initializer_address_references.contains(&def_id) {
+                immutables.insert(def_id);
+            }
+        } else if immutable {
             immutables.insert(def_id);
         } else if exprs.iter().all(|(e, _)| {
             !matches!(
@@ -98,6 +109,14 @@ fn static_ty_is_sync<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
     let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
     let sync_trait = tcx.require_lang_item(LangItem::Sync, DUMMY_SP);
     traits::type_known_to_meet_bound_modulo_regions(&infcx, param_env, ty, sync_trait)
+}
+
+fn initializer_use_needs_static_mut(expr: &hir::Expr<'_>, mutated: bool) -> bool {
+    mutated
+        || matches!(
+            expr.kind,
+            hir::ExprKind::AddrOf(_, _, _) | hir::ExprKind::MethodCall(_, _, _, _)
+        )
 }
 
 struct AstVisitor<'tcx> {
@@ -519,6 +538,9 @@ fn find_context<'a, 'tcx>(
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     statics: FxHashMap<LocalDefId, Vec<(&'tcx hir::Expr<'tcx>, bool)>>,
+    static_initializer_references: FxHashSet<LocalDefId>,
+    static_initializer_address_references: FxHashSet<LocalDefId>,
+    current_static_initializer: Option<LocalDefId>,
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
@@ -528,10 +550,31 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         self.tcx
     }
 
+    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+        if let hir::ItemKind::Static(_, _, _, _) = item.kind {
+            let previous = self
+                .current_static_initializer
+                .replace(item.owner_id.def_id);
+            intravisit::walk_item(self, item);
+            self.current_static_initializer = previous;
+        } else {
+            intravisit::walk_item(self, item);
+        }
+    }
+
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         if let Some(def_id) = get_static_from_hir_expr(expr) {
             let context = find_context(expr, self.tcx);
             self.statics.entry(def_id).or_default().push(context);
+            if self
+                .current_static_initializer
+                .is_some_and(|current| current != def_id)
+            {
+                self.static_initializer_references.insert(def_id);
+                if initializer_use_needs_static_mut(context.0, context.1) {
+                    self.static_initializer_address_references.insert(def_id);
+                }
+            }
         }
 
         intravisit::walk_expr(self, expr);
@@ -570,6 +613,64 @@ static mut X: *mut u8 = 0 as *mut u8;
 unsafe fn f() -> *mut u8 { X }
 "#;
         run_test(code, &["std::cell::Cell<*mut u8>", "X.get()"], &[]);
+    }
+
+    #[test]
+    fn test_static_initializer_raw_addr_dependency_keeps_target_const_addressable() {
+        let code = r#"
+struct Opt { value: *mut core::ffi::c_void }
+impl Copy for Opt {}
+impl Clone for Opt { fn clone(&self) -> Self { *self } }
+static mut TARGET: i32 = 0;
+static mut OPTS: [Opt; 1] = unsafe {
+    [{
+        let mut init = Opt { value: &raw const TARGET as *mut core::ffi::c_void };
+        init
+    }]
+};
+unsafe fn f() -> *const Opt {
+    TARGET = 1;
+    OPTS.as_ptr()
+}
+"#;
+        run_test(
+            code,
+            &["static mut TARGET", "std::cell::RefCell<[Opt; 1]>"],
+            &["TARGET.with_borrow"],
+        );
+    }
+
+    #[test]
+    fn test_static_initializer_method_dependency_keeps_target_const_addressable() {
+        let code = r#"
+struct GitStr { ptr: *mut i8, asize: usize, size: usize }
+impl Copy for GitStr {}
+impl Clone for GitStr { fn clone(&self) -> Self { *self } }
+struct Dir { buf: GitStr }
+impl Copy for Dir {}
+impl Clone for Dir { fn clone(&self) -> Self { *self } }
+static mut INIT: [i8; 1] = [0; 1];
+static mut DIRS: [Dir; 1] = unsafe {
+    [{
+        let mut init = Dir {
+            buf: {
+                let mut init = GitStr { ptr: INIT.as_ptr().cast_mut(), asize: 0, size: 0 };
+                init
+            }
+        };
+        init
+    }]
+};
+unsafe fn f() -> *const Dir {
+    INIT[0] = 1;
+    DIRS.as_ptr()
+}
+"#;
+        run_test(
+            code,
+            &["static mut INIT", "std::cell::RefCell<[Dir; 1]>"],
+            &["INIT.with_borrow"],
+        );
     }
 
     #[test]
