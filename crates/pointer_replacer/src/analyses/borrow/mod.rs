@@ -958,22 +958,24 @@ fn extract_conflict_edges(
 /// their unions to a fixpoint (each round demotes ≥1 fresh `Raw` local, so ≤|Raw|
 /// rounds), then extract the residual conflicts over the surviving `Ref` candidates.
 ///
-/// Invariant (asserted, not assumed — every model-`Raw` slot is borrow-justified):
-/// after the fixpoint, no `Raw` pointer local remains a candidate. A `Raw` slot that
-/// was never a demotion witness violates the contract (the solver only commits `¬ref`
-/// from a borrow conflict) and panics rather than silently producing a wrong model.
+/// Invariant (`debug_assert`ed): every model-`Raw` local that was NOT a demotion witness
+/// (so it kept its provenance through the fixpoint) is *inert* — it appears in no residual
+/// conflict edge. This is the relaxation of an earlier, too-strong "every `Raw` slot is a
+/// witness" assert. A non-witness `Raw` local can legitimately arise from coherence's
+/// flow-insensitive equate-closure: a DEAD copy `let _r = p` is `equate`d to `p`, so
+/// committing `¬ref(p)` drags `_r` `Raw`, yet `_r` is never live at the conflict and is
+/// never demoted. Such a local cannot be the live issuer/requirer of a residual invalid
+/// loan (else `to_demote` would be non-empty and the loop would not have broken), and
+/// `extract_conflict_edges` draws owners from exactly those live sources — so it is
+/// provably absent from `edges`. The `debug_assert` is a tripwire on that inert-ness; in
+/// release it compiles out and the stray `Raw` (being inert) is harmless.
 ///
-/// CAVEAT (adversarial review, 2026-06-24): the premise is *mostly* sound — copies
-/// (`q = p`) carry the `requires` edge so a transitively-`Raw` copy is itself a
-/// requirer/witness, and address-of issuers / field-requirers are witnesses too — but
-/// it is **not proven airtight**. If the solved model ever classifies a loan's *issuer*
-/// `Owning`, that loan vanishes under the replay candidacy (`Owning` = non-candidate),
-/// so a different `Raw` slot that required it is no longer a witness and trips this
-/// assert. Whether a borrow-issuer can be `Owning` is unproven (borrows carry no malloc
-/// ownership). The assert is a deliberate **dev-time tripwire**: it cannot fire from the
-/// current witness-candidacy tests, and BO is unconsumed by codegen, so a fire would
-/// surface exactly when BB2-ii first feeds a real model — at which point a non-witness
-/// `Raw` slot needs its union from its *defining* borrow, not a witness.
+/// CAVEAT (adversarial review, 2026-06-24): the inert-ness invariant also absorbs the
+/// Owning-issuer case (a loan whose `issuer` is classed `Owning` vanishes under the replay
+/// candidacy, leaving a former requirer non-witness) — that requirer is likewise inert.
+/// What stays DEFERRED to BB3 is the separate *under-report*: an `Owning` slot issues no
+/// loan, so a conflict *caused by* an `Owning` pointer's exclusivity is invisible to the
+/// replay. BO output is unconsumed by codegen (the §8 guardrail) until that lands.
 pub fn borrow_conflicts_replaying<I, J, M, N, K, L>(
     program: &RustProgram,
     is_ref: I,
@@ -1040,17 +1042,36 @@ where
             }
         };
 
-        // Raw-without-witness invariant: every `Raw` pointer local must have been
-        // demoted (i.e. was a borrow witness). A surviving `Raw` candidate is a bug.
+        // Stray-Raw inert-ness invariant (relaxed from the former "every Raw slot is a
+        // demotion witness", which coherence violates). A model-`Raw` local that was NOT a
+        // witness — so it kept its provenance (`local_data.is_some()`) through the demotion
+        // fixpoint — can legitimately arise from coherence's flow-insensitive equate-closure
+        // (e.g. a DEAD copy `let _r = p`: committing `¬ref(p)` drags `_r` Raw, yet `_r` is
+        // never live at the conflict). Such a local is provably *inert*: it cannot be the
+        // live issuer/requirer of a residual invalid loan (else `to_demote` would have been
+        // non-empty and the loop would not have broken), and `extract_conflict_edges` draws
+        // owners from exactly those live sources — so it appears in NO residual edge. We
+        // assert that inert-ness (a real tripwire) instead of panicking on the valid case.
         let provenance_set = ctxt.provenances.get(&f).unwrap();
-        for (local, data) in provenance_set.local_data.iter_enumerated() {
-            assert!(
-                !(is_raw_f(local) && data.is_some()),
-                "BB2-i Raw-without-witness: local {local:?} in {f:?} is model-Raw but was \
-                 never a borrow demotion witness (the solver only commits ¬ref from a \
-                 borrow conflict, so every Raw slot must be a witness)"
-            );
-        }
+        debug_assert!(
+            provenance_set
+                .local_data
+                .iter_enumerated()
+                .all(|(local, data)| {
+                    if !(is_raw_f(local) && data.is_some()) {
+                        return true;
+                    }
+                    // inert: named by no residual conflict edge (issuer or requirer)
+                    !edges.iter().any(|e| {
+                        matches!(e.issuer, Some(ProvenanceOwner::Local(l)) if l == local)
+                            || e.requirers
+                                .iter()
+                                .any(|o| matches!(o, ProvenanceOwner::Local(l) if *l == local))
+                    })
+                }),
+            "BB2-i stray-Raw: a non-witness Raw local appears in a residual edge in {f:?} \
+             — the inert-ness invariant (stray Raw ⟹ in no residual edge) is violated"
+        );
 
         if !edges.is_empty() {
             out.insert(f, edges);

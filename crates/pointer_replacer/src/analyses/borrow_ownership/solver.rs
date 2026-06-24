@@ -110,6 +110,10 @@ impl KindSolver {
     /// derived from the *same* `CrateSlots` the solver was built from. A foreign slot
     /// panics (`unknown slot`). Today's callers share one `CrateSlots`; a debug-assert
     /// is unnecessary while that discipline holds, but BB2's loop must preserve it.
+    ///
+    /// BB2-ii's Mode-A loop also calls this with a *single* slot
+    /// (`add_borrow_exclusion(Some(slot), &[])`) to commit a monotone `¬ref(slot)` —
+    /// the one-literal degenerate case of the same exclusion clause.
     pub(crate) fn add_borrow_exclusion(&self, issuer: Option<SlotRef>, requirers: &[SlotRef]) {
         let not_ref = |slot: SlotRef| {
             let vars = self

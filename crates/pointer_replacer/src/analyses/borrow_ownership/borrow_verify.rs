@@ -15,8 +15,10 @@
 use rustc_hash::FxHashMap;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
+use z3::ast::Bool;
 
 use super::{
+    SlotKind,
     crate_slots::CrateSlots,
     solver::{KindSolver, SlotRef},
 };
@@ -145,6 +147,128 @@ pub(crate) fn materialize_guards(
     for edge in conflicts.values().flatten() {
         solver.add_borrow_exclusion(edge.issuer, &edge.requirers);
     }
+}
+
+/// §8 BB2-ii — drive the CEGAR validate/re-solve loop to a fixpoint (Mode A).
+///
+/// The solver must arrive with ownership constraints + per-fn coherence already
+/// emitted (so `selectors` are its retractable malloc sources). Each round: solve →
+/// derive the candidacy from the model's *actual* Raw/Ref/Owning kinds →
+/// `revalidate_replaying` (which replays the `tree_borrow_local` union the chosen
+/// `Raw` slots induce) → for each residual conflict, **commit `¬ref` on ONE
+/// representative slot** (the issuer if present, else a requirer — see
+/// `representative`) → re-solve. Accept the model when no residual conflict has a
+/// committable (currently-`Ref`) slot.
+///
+/// Mode A = *monotone single-slot commitment*, deliberately NOT BB1's disjunctive
+/// `materialize_guards`. Committing one currently-`Ref` slot forces exactly that slot off
+/// `Ref`, so the *committed* slot is the demotion witness `revalidate_replaying` expects.
+/// (A disjunctive guard instead lets the solver satisfy `¬ref(a) ∨ ¬ref(b)` by demoting a
+/// *non-minimal* slot — the reason this loop commits one slot, not guards an edge.) Note
+/// this makes the *committed* slot a witness, but coherence's flow-insensitive equate
+/// can still drag a non-committed slot `Raw` (a DEAD copy `let _r = p`); that is a
+/// non-witness-but-*inert* slot handled by `borrow_conflicts_replaying`'s relaxed
+/// inert-ness invariant, not a witness this loop produces.
+///
+/// No separate all-Ref round-0 step is needed: the first solve has no commitments, so
+/// the MaxSMT objective settles every source-free slot to `Ref` and the first iteration
+/// validates that model directly — coinciding with BB1's round-0 only in the
+/// source-free case; with an ownership source the first model legitimately carries
+/// `Owning` slots and we validate *those*.
+///
+/// Termination: each non-accepting round commits ≥1 fresh slot to `¬ref` (a slot that
+/// was `Ref` this round and never can be again), so the loop runs ≤ |slots| rounds. The
+/// round cap is a panic backstop, not the termination proof.
+///
+/// Returns `None` if a re-solve is UNSAT (every involved slot pinned `Ref` by hard
+/// ownership facts — see `KindSolver::add_borrow_exclusion`); callers must treat that
+/// as a real possibility.
+///
+/// SCOPE / SOUNDNESS: an accepted model is accepted **for the current local-only,
+/// depth-0 experimental pass — NOT a proof of global borrow-validity.** Two gaps stay
+/// deferred to BB3, sound only because BO output is unconsumed by codegen (the §8
+/// guardrail): (1) a residual conflict all of whose owners are `Field` (dropped by the
+/// Local-only mapping) has no committable slot and is accepted (the deferred struct
+/// field-slot mapping); (2) an `Owning` slot issues no loan, so a conflict *caused by*
+/// an `Owning` pointer is invisible to the replay and an accepted model may hide it.
+pub(crate) fn verify_to_fixpoint(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    solver: &KindSolver,
+    selectors: &[Bool],
+    is_mutable: bool,
+) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    let cap = round_cap(slots);
+    let mut model = solver.model_kinds_relaxing(selectors)?;
+    for _ in 0..cap {
+        let conflicts = revalidate_replaying(
+            program,
+            slots,
+            |s| model.get(&s) == Some(&SlotKind::Ref),
+            |s| model.get(&s) == Some(&SlotKind::Raw),
+            is_mutable,
+        );
+        debug_assert!(
+            guard_slots_are_ref(&conflicts, &model),
+            "every residual conflict slot must be Ref in the current model"
+        );
+        let mut committed = 0;
+        for conflict in conflicts.values().flatten() {
+            if let Some(slot) = representative(conflict, &model) {
+                // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
+                solver.add_borrow_exclusion(Some(slot), &[]);
+                committed += 1;
+            }
+        }
+        if committed == 0 {
+            // No committable residual: a genuine fixpoint, or only `Field`-owner
+            // residuals (the deferred Local-only gap) — accept for this pass.
+            return Some(model);
+        }
+        model = solver.model_kinds_relaxing(selectors)?;
+    }
+    panic!("BB2-ii CEGAR did not converge within {cap} rounds");
+}
+
+/// Pick the slot of a residual conflict to commit `¬ref` on (Mode A): the issuer if it
+/// is currently `Ref`, else the first currently-`Ref` requirer. Committing the issuer
+/// demotes the loan at its source; any conflict that survives surfaces next round.
+/// Returns `None` only when the conflict has no committable `Local` owner — i.e. a
+/// `Field`-only residual (the deferred struct field-slot gap). A residual `Local` owner
+/// is always currently-`Ref`: `borrow_conflicts_replaying`'s inert-ness invariant keeps
+/// non-witness `Raw` locals out of residual edges, so an "all owners already `Raw`"
+/// residual cannot arise for Locals.
+fn representative(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Option<SlotRef> {
+    conflict
+        .issuer
+        .into_iter()
+        .chain(conflict.requirers.iter().copied())
+        .find(|s| model.get(s) == Some(&SlotKind::Ref))
+}
+
+/// Generous round-cap backstop for `verify_to_fixpoint`. The real bound is ≤ |slots|
+/// (each round commits a fresh slot off `Ref`); `n + slack` covers it with margin. Not
+/// the termination guarantee — only a panic tripwire if the monotone bound is wrong.
+fn round_cap(slots: &CrateSlots) -> usize {
+    let n: usize = slots.field_slots.len()
+        + slots.fn_local_slots.values().map(|u| u.len()).sum::<usize>();
+    n + 8
+}
+
+/// Invariant tripwire for the loop: every slot in a residual conflict edge must be
+/// `Ref` in the current model. `Raw` slots are replay-demoted (witnessed) and `Owning`
+/// slots are non-candidates, so a residual edge can only name surviving `Ref`
+/// candidates; a violation signals the deferred Owning-issuer / under-report cases.
+fn guard_slots_are_ref(
+    conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> bool {
+    conflicts.values().flatten().all(|c| {
+        c.issuer
+            .iter()
+            .chain(c.requirers.iter())
+            .all(|s| model.get(s) == Some(&SlotKind::Ref))
+    })
 }
 
 /// Translate a borrow `ProvenanceOwner` to a BO `SlotRef`. BB0 handles `Local` owners
