@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use etrace::some_or;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{BodyOwnerKind, HirId, LangItem, def_id::LocalDefId};
@@ -256,29 +258,15 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                                 ctx.print_debug("If", thir[cond.expr_id].span.into());
                             }
                         }
-                        let find_target = |targets: &[BasicBlock]| match targets {
-                            [] => panic!(),
-                            [bb] => *bb,
-                            _ => {
-                                let mut targets: Vec<_> = targets
-                                    .iter()
-                                    .map(|bb| {
-                                        let term = body.basic_blocks[*bb].terminator();
-                                        if let TerminatorKind::Goto { target } = term.kind {
-                                            vec![*bb, target]
-                                        } else {
-                                            vec![*bb]
-                                        }
-                                    })
-                                    .collect();
-                                let mut target = targets.pop().unwrap();
-                                for target1 in targets {
-                                    target.retain(|bb| target1.contains(bb));
-                                }
-                                target[0]
-                            }
+                        let Some(true_target) = common_branch_entry(&body, &true_targets) else {
+                            ctx.print_debug("If true target", expr.span.into());
+                            continue;
                         };
-                        (find_target(&true_targets), find_target(&false_targets))
+                        let Some(false_target) = common_branch_entry(&body, &false_targets) else {
+                            ctx.print_debug("If false target", expr.span.into());
+                            continue;
+                        };
+                        (true_target, false_target)
                     };
                 assert_ne!(true_target, false_target);
                 let if_blocks = IfBlocks {
@@ -761,6 +749,90 @@ fn cond_dest(
                 when_false: Some(false),
             }]
         }
+    }
+}
+
+fn common_branch_entry<'tcx>(body: &Body<'tcx>, starts: &[BasicBlock]) -> Option<BasicBlock> {
+    match starts {
+        [] => None,
+        [bb] => Some(*bb),
+        _ => {
+            let reachables: Vec<_> = starts
+                .iter()
+                .map(|bb| reachable_normal_blocks(body, *bb))
+                .collect();
+            let mut best: Option<((usize, usize, BasicBlock), BasicBlock)> = None;
+
+            for (&bb, &distance) in &reachables[0] {
+                let mut max_distance = distance;
+                let mut total_distance = distance;
+                let mut is_common = true;
+                for reachable in &reachables[1..] {
+                    if let Some(&distance) = reachable.get(&bb) {
+                        max_distance = max_distance.max(distance);
+                        total_distance += distance;
+                    } else {
+                        is_common = false;
+                        break;
+                    }
+                }
+                if !is_common {
+                    continue;
+                }
+
+                let key = (max_distance, total_distance, bb);
+                if best.as_ref().is_none_or(|(best_key, _)| key < *best_key) {
+                    best = Some((key, bb));
+                }
+            }
+
+            best.map(|(_, bb)| bb)
+        }
+    }
+}
+
+fn reachable_normal_blocks<'tcx>(
+    body: &Body<'tcx>,
+    start: BasicBlock,
+) -> FxHashMap<BasicBlock, usize> {
+    let mut distances = FxHashMap::default();
+    let mut queue = VecDeque::new();
+    distances.insert(start, 0);
+    queue.push_back(start);
+
+    while let Some(bb) = queue.pop_front() {
+        let distance = distances[&bb];
+        for succ in normal_successors(&body.basic_blocks[bb].terminator().kind) {
+            if distances.contains_key(&succ) {
+                continue;
+            }
+            distances.insert(succ, distance + 1);
+            queue.push_back(succ);
+        }
+    }
+
+    distances
+}
+
+fn normal_successors<'tcx>(terminator: &TerminatorKind<'tcx>) -> SmallVec<[BasicBlock; 4]> {
+    match terminator {
+        TerminatorKind::Goto { target }
+        | TerminatorKind::Drop { target, .. }
+        | TerminatorKind::Assert { target, .. } => smallvec![*target],
+        TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
+        TerminatorKind::SwitchInt { targets, .. } => {
+            targets.all_targets().iter().copied().collect()
+        }
+        TerminatorKind::Yield { resume, .. } => smallvec![*resume],
+        TerminatorKind::FalseEdge { real_target, .. }
+        | TerminatorKind::FalseUnwind { real_target, .. } => smallvec![*real_target],
+        TerminatorKind::InlineAsm { targets, .. } => targets.iter().copied().collect(),
+        TerminatorKind::UnwindResume
+        | TerminatorKind::UnwindTerminate(_)
+        | TerminatorKind::Return
+        | TerminatorKind::Unreachable
+        | TerminatorKind::CoroutineDrop
+        | TerminatorKind::TailCall { .. } => smallvec![],
     }
 }
 

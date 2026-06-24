@@ -88,9 +88,71 @@ fn run_test(code: &str) {
     .unwrap();
 }
 
+fn run_thir_to_mir_test(code: &str) {
+    compilation::run_compiler_on_str(code, |tcx| {
+        for def_id in tcx.hir_body_owners() {
+            if tcx.def_path_str(def_id).starts_with("std::") {
+                continue;
+            }
+            let thir_to_mir = map_thir_to_mir(def_id, false, tcx);
+            if tcx.item_name(def_id.to_def_id()).as_str() == "f" {
+                assert!(!thir_to_mir.if_to_bbs.is_empty());
+            }
+        }
+    })
+    .unwrap();
+}
+
 #[test]
 fn test_item_use() {
     run_test("use std::path::Path;")
+}
+
+#[test]
+fn test_thir_to_mir_if_or_with_drop_before_branch() {
+    run_thir_to_mir_test(
+        r#"
+        fn fflush() -> i32 {
+            0
+        }
+
+        fn f(nl: usize, line: &str) -> i32 {
+            if {
+                use std::io::Write;
+                let string_to_print =
+                    std::fmt::format(format_args!("{1:.0$}", nl, line));
+                match (&mut std::io::stdout()).write_fmt(format_args!("{0}", string_to_print)) {
+                    Ok(_) => string_to_print.len() as i32,
+                    Err(_) => -1,
+                }
+            } < 0 || fflush() != 0 {
+                return -1;
+            }
+            0
+        }
+        "#,
+    )
+}
+
+#[test]
+fn test_thir_to_mir_if_and_with_drop_before_branch() {
+    run_thir_to_mir_test(
+        r#"
+        fn f(enabled: bool) -> i32 {
+            if enabled && {
+                use std::io::Write;
+                let string_to_print = std::fmt::format(format_args!("\n"));
+                match (&mut std::io::stdout()).write_fmt(format_args!("{0}", string_to_print)) {
+                    Ok(_) => string_to_print.len() as i32,
+                    Err(_) => -1,
+                }
+            } < 0 {
+                return -1;
+            }
+            0
+        }
+        "#,
+    )
 }
 
 #[test]
