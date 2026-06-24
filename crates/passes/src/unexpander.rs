@@ -100,6 +100,14 @@ struct AstVisitor<'tcx> {
 impl MutVisitor for AstVisitor<'_> {
     fn flat_map_item(&mut self, item: P<Item>) -> SmallVec<[P<Item>; 1]> {
         if utils::ast::is_automatically_derived(&item.attrs) {
+            if self
+                .ast_to_hir
+                .global_map
+                .get(&item.id)
+                .is_some_and(|def_id| self.ctx.preserved_bitfield_impls.contains(def_id))
+            {
+                return mut_visit::walk_flat_map_item(self, item);
+            }
             return smallvec![];
         }
         if let ItemKind::Impl(imp) = &item.kind
@@ -479,6 +487,7 @@ struct Ctx {
     derived_traits: FxHashMap<LocalDefId, Vec<Symbol>>,
     bytemuck_traits: FxHashMap<LocalDefId, Vec<String>>,
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
+    preserved_bitfield_impls: FxHashSet<LocalDefId>,
     use_intrinsics: bool,
     use_transmute: bool,
 }
@@ -502,6 +511,7 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
             && matches!(item.kind, ItemKind::Impl(_))
         {
             let hir_item = self.ast_to_hir.get_item(item.id, self.tcx).unwrap();
+            let impl_def_id = hir_item.owner_id.def_id;
             let hir::ItemKind::Impl(imp) = hir_item.kind else { panic!() };
             let hir::TyKind::Path(QPath::Resolved(_, self_ty)) = imp.self_ty.kind else { panic!() };
             let Res::Def(_, def_id) = self_ty.res else { panic!() };
@@ -514,6 +524,16 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
                     .or_default()
                     .push(of_trait);
             } else {
+                if !self
+                    .tcx
+                    .generics_of(def_id.to_def_id())
+                    .own_params
+                    .is_empty()
+                {
+                    self.ctx.preserved_bitfield_impls.insert(impl_def_id);
+                    visit::walk_item(self, item);
+                    return;
+                }
                 self.ctx
                     .derived_traits
                     .entry(def_id)
@@ -790,6 +810,171 @@ mod state {
                 "thread_local!",
             ],
             &["LocalKey"],
+        )
+    }
+
+    #[test]
+    fn test_bitfield_non_generic_unexpands_to_derive() {
+        run_test(
+            r#"
+#[macro_use]
+extern crate c2rust_bitfields;
+
+#[repr(C)]
+pub struct PlainBits {
+    pub raw: [u8; 1],
+}
+
+#[automatically_derived]
+impl PlainBits {
+    pub fn flag(&self) -> u8 {
+        let raw = &self.raw;
+        let bits = (0usize, 2usize);
+        0
+    }
+}
+
+pub fn read_flag(bits: &PlainBits) -> u8 {
+    bits.flag()
+}
+            "#,
+            &[
+                "#[derive(BitfieldStruct)]",
+                "#[bitfield(name = \"flag\", ty = \"u8\", bits = \"0..=2\")]",
+            ],
+            &["#[automatically_derived]", "impl PlainBits"],
+        )
+    }
+
+    #[test]
+    fn test_bitfield_lifetime_generic_preserves_accessor_impl() {
+        run_test(
+            r#"
+#[macro_use]
+extern crate c2rust_bitfields;
+
+#[repr(C)]
+pub struct LifetimeBits<'a> {
+    pub raw: [u8; 1],
+    pub marker: &'a u8,
+}
+
+#[automatically_derived]
+impl<'a> LifetimeBits<'a> {
+    pub fn flag(&self) -> u8 {
+        let raw = &self.raw;
+        let bits = (0usize, 2usize);
+        0
+    }
+}
+
+pub fn read_flag(bits: &LifetimeBits<'_>) -> u8 {
+    bits.flag()
+}
+            "#,
+            &["impl<'a> LifetimeBits<'a>", "pub fn flag(&self) -> u8"],
+            &["#[derive(BitfieldStruct)]", "#[bitfield(name = \"flag\""],
+        )
+    }
+
+    #[test]
+    fn test_bitfield_type_generic_preserves_accessor_impl() {
+        run_test(
+            r#"
+#[macro_use]
+extern crate c2rust_bitfields;
+
+#[repr(C)]
+pub struct TypeBits<T> {
+    pub raw: [u8; 1],
+    pub marker: core::marker::PhantomData<T>,
+}
+
+#[automatically_derived]
+impl<T> TypeBits<T> {
+    pub fn flag(&self) -> u8 {
+        let raw = &self.raw;
+        let bits = (0usize, 2usize);
+        0
+    }
+
+    pub fn set_flag(&mut self, value: u8) {
+        let _ = value;
+    }
+}
+
+pub fn update_flag<T>(bits: &mut TypeBits<T>) -> u8 {
+    bits.set_flag(1);
+    bits.flag()
+}
+            "#,
+            &[
+                "impl<T> TypeBits<T>",
+                "pub fn flag(&self) -> u8",
+                "pub fn set_flag(&mut self, value: u8)",
+            ],
+            &["#[derive(BitfieldStruct)]", "#[bitfield(name = \"flag\""],
+        )
+    }
+
+    #[test]
+    fn test_bitfield_const_generic_preserves_accessor_impl() {
+        run_test(
+            r#"
+#[macro_use]
+extern crate c2rust_bitfields;
+
+#[repr(C)]
+pub struct ConstBits<const N: usize> {
+    pub raw: [u8; 1],
+}
+
+#[automatically_derived]
+impl ConstBits<4> {
+    pub fn flag(&self) -> u8 {
+        let raw = &self.raw;
+        let bits = (0usize, 2usize);
+        0
+    }
+}
+
+pub fn read_flag(bits: &ConstBits<4>) -> u8 {
+    bits.flag()
+}
+            "#,
+            &["impl ConstBits<4>", "pub fn flag(&self) -> u8"],
+            &["#[derive(BitfieldStruct)]", "#[bitfield(name = \"flag\""],
+        )
+    }
+
+    #[test]
+    fn test_generic_copy_clone_derive_restoration() {
+        run_test(
+            r#"
+pub struct GenericPair<T> {
+    pub value: T,
+}
+
+#[automatically_derived]
+impl<T: Copy> Copy for GenericPair<T> {}
+
+#[automatically_derived]
+impl<T: Clone> Clone for GenericPair<T> {
+    fn clone(&self) -> Self {
+        GenericPair { value: self.value.clone() }
+    }
+}
+
+pub fn clone_pair<T: Clone>(pair: &GenericPair<T>) -> GenericPair<T> {
+    pair.clone()
+}
+            "#,
+            &["#[derive(Copy)]", "#[derive(Clone)]"],
+            &[
+                "#[automatically_derived]",
+                "impl<T: Copy> Copy",
+                "impl<T: Clone> Clone",
+            ],
         )
     }
 
