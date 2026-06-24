@@ -17,7 +17,7 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseFloat);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some(nptr) = self.c_byte_slice(nptr) {
+        if let Some(nptr) = self.c_byte_slice_for_strto(nptr, endptr) {
             return utils::expr!(
                 "crate::c_lib::strtod(
                     {nptr},
@@ -55,7 +55,7 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseInteger);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some(nptr) = self.c_byte_slice(nptr) {
+        if let Some(nptr) = self.c_byte_slice_for_strto(nptr, endptr) {
             return utils::expr!(
                 "crate::c_lib::strtol(
                     {nptr},
@@ -95,7 +95,7 @@ impl super::TransformVisitor<'_> {
         self.lib_items.insert(LibItem::ParseInteger);
         self.lib_items.insert(LibItem::Peek);
 
-        if let Some(nptr) = self.c_byte_slice(nptr) {
+        if let Some(nptr) = self.c_byte_slice_for_strto(nptr, endptr) {
             return utils::expr!(
                 "crate::c_lib::strtoul(
                     {nptr},

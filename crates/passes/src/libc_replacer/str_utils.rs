@@ -5,7 +5,7 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_hir::{
-    self as hir,
+    self as hir, HirId,
     def::{DefKind, Res},
 };
 use rustc_middle::ty;
@@ -43,6 +43,27 @@ impl<'tcx> super::TransformVisitor<'tcx> {
         }
 
         None
+    }
+
+    pub(super) fn c_byte_slice_for_strto(&mut self, s: &Expr, endptr: &Expr) -> Option<String> {
+        if same_strto_endptr_slice_root(s, endptr, &self.ast_to_hir, self.tcx)
+            && let Some(s) = self.c_byte_slice_from_raw_parts(s)
+        {
+            return Some(s);
+        }
+        self.c_byte_slice(s)
+    }
+
+    fn c_byte_slice_from_raw_parts(&self, s: &Expr) -> Option<String> {
+        let (array, ty) = utils::ir::array_of_as_ptr(s, &self.ast_to_hir, self.tcx)?;
+        if expr_has_with_borrow_call(array) || (ty != self.tcx.types.u8 && ty != self.tcx.types.i8)
+        {
+            return None;
+        }
+        let array = pprust::expr_to_string(array);
+        Some(format!(
+            "{{ let ___strto_slice = &({array}); std::slice::from_raw_parts(___strto_slice.as_ptr() as *const u8, ___strto_slice.len()) }}"
+        ))
     }
 
     pub(super) fn c_byte_slice_mut(&mut self, s: &Expr) -> Option<String> {
@@ -308,6 +329,56 @@ fn expr_is_static_path(expr: &Expr, ast_to_hir: &utils::ir::AstToHir, tcx: ty::T
             ))
         )
     })
+}
+
+fn same_strto_endptr_slice_root(
+    s: &Expr,
+    endptr: &Expr,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: ty::TyCtxt<'_>,
+) -> bool {
+    let Some((array, _)) = utils::ir::array_of_as_ptr(s, ast_to_hir, tcx) else {
+        return false;
+    };
+    let Some(input_root) = local_place_root(array, ast_to_hir, tcx) else {
+        return false;
+    };
+    endptr_root(endptr, ast_to_hir, tcx) == Some(input_root)
+}
+
+fn endptr_root(
+    endptr: &Expr,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: ty::TyCtxt<'_>,
+) -> Option<HirId> {
+    let ExprKind::AddrOf(BorrowKind::Raw | BorrowKind::Ref, Mutability::Mut, pointee) =
+        &utils::ast::unwrap_cast_and_paren(endptr).kind
+    else {
+        return None;
+    };
+    local_place_root(pointee, ast_to_hir, tcx)
+}
+
+fn local_place_root(
+    expr: &Expr,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: ty::TyCtxt<'_>,
+) -> Option<HirId> {
+    hir_local_place_root_without_deref(ast_to_hir.get_expr(expr.id, tcx)?)
+}
+
+fn hir_local_place_root_without_deref(expr: &hir::Expr<'_>) -> Option<HirId> {
+    match utils::hir::unwrap_drop_temps(expr).kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => Some(hir_id),
+            _ => None,
+        },
+        hir::ExprKind::Field(base, _) | hir::ExprKind::Index(base, _, _) => {
+            hir_local_place_root_without_deref(base)
+        }
+        hir::ExprKind::Cast(inner, _) => hir_local_place_root_without_deref(inner),
+        _ => None,
+    }
 }
 
 fn is_offset_by_call(e: &Expr) -> bool {

@@ -256,6 +256,27 @@ pub unsafe fn copy_static(mut src: &[i8], idx: usize) {
 }
 
 #[test]
+fn test_strto_same_endptr_slice_root_typechecks() {
+    run_test(
+        r#"
+extern "C" {
+    fn strtol(__nptr: *const i8, __endptr: *mut *mut i8, __base: i32) -> i64;
+}
+
+pub unsafe fn parse_tail(mut end: &mut [i8]) -> i64 {
+    strtol(end[1..].as_mut_ptr(), &raw mut end as *mut *mut i8, 10)
+}
+        "#,
+        &[
+            "crate::c_lib::strtol",
+            "std::slice::from_raw_parts",
+            "___strto_slice",
+        ],
+        &["strtol(end[1..].as_mut_ptr", "bytemuck::cast_slice"],
+    );
+}
+
+#[test]
 fn test_slice_cursor_offset_by_as_ptr_uses_safe_byte_slice() {
     run_test(
         r#"
