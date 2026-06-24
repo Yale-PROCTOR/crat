@@ -9716,7 +9716,7 @@ mod borrow_ownership_coherence {
         analyses::{
             borrow_ownership::{
                 CrateCtxt, SlotKind,
-                borrow_verify::revalidate,
+                borrow_verify::{materialize_guards, revalidate},
                 coherence::add_coherence,
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -10356,6 +10356,179 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 assert!(
                     involved.contains(&r2_slot),
                     "`r2`'s depth-0 slot must be in the round-0 conflict; involved = {involved:?}"
+                );
+            },
+        );
+    }
+
+    /// BB1 (§8 guard encoder): Round-0 borrow conflicts become `¬ref` exclusion
+    /// clauses on the `KindSolver`. The `proof_of_concept` fixture (production demotes
+    /// `r2`) has a genuine all-Ref reference-aliasing conflict but NO ownership source,
+    /// so the bare BO solve (soft objective maxes Ref) makes every pointer slot `Ref`.
+    /// Applying the guards must force >=1 conflict-involved slot OFF Ref. Two
+    /// independent solvers prove the guard is the *sole* cause (non-vacuous): baseline
+    /// = all Ref; guarded = >=1 non-Ref.
+    #[test]
+    fn bb1_guard_forces_conflict_slot_off_ref() {
+        run_compiler(
+            r#"
+unsafe fn f(mut p: *mut i32) -> i32 {
+    let mut r1 = p;
+    let mut r2 = r1;
+    let mut q = r1;
+    *q = 1;
+    *r1 = 2;
+    *r2 = 3;
+    *p = 4;
+    *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+
+                let involved = ["p", "r1", "r2", "q"];
+                let slot_of = |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
+
+                // Solver A — baseline (no guards). `f` has no ownership source, so the
+                // soft objective settles every pointer slot to Ref. We assert on the
+                // solved *model* (never `KindSolver::assume`, which is a hard constraint
+                // — hard-assuming Ref then adding the exclusion would be UNSAT by
+                // construction); the guard in Solver B is thus the only added hard fact.
+                let solver_a = KindSolver::new(&slots);
+                let (_a, selectors_a) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver_a)
+                        .expect("BB1 baseline emission");
+                add_coherence(&solver_a, &slots, f, &body);
+                let model_a = solver_a
+                    .model_kinds_relaxing(&selectors_a)
+                    .expect("baseline satisfiable");
+                for name in involved {
+                    assert_eq!(
+                        model_a.get(&slot_of(name)),
+                        Some(&SlotKind::Ref),
+                        "baseline (no guards): `{name}` should be Ref (max-ref, no source)"
+                    );
+                }
+
+                // Solver B — same, plus BB1 guards from the Round-0 (all-Ref,
+                // all-mutable) conflict. The guard `¬ref(issuer) ∨ ⋁¬ref(requirers)`
+                // must demote >=1 involved slot off Ref.
+                let solver_b = KindSolver::new(&slots);
+                let (_b, selectors_b) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver_b)
+                        .expect("BB1 guarded emission");
+                add_coherence(&solver_b, &slots, f, &body);
+                let conflicts = revalidate(&program, &slots, |_| true, true);
+                materialize_guards(&solver_b, &conflicts);
+
+                let model_b = solver_b
+                    .model_kinds_relaxing(&selectors_b)
+                    .expect("guarded satisfiable");
+                let non_ref = involved
+                    .iter()
+                    .filter(|name| model_b.get(&slot_of(name)) != Some(&SlotKind::Ref))
+                    .count();
+                assert!(
+                    non_ref >= 1,
+                    "BB1 guards must force >=1 conflict-involved slot off Ref (all stayed Ref)"
+                );
+            },
+        );
+    }
+
+    /// PROBE (caller-side out-param escape): a caller passes `&raw mut local` to a
+    /// callee that writes `*out = malloc`. The malloc'd ownership must flow back so the
+    /// caller's `local` (depth-0 slot) becomes `Owning` after the call. This pins the
+    /// before/after caller state the legacy ownership analysis modeled, now meant to be
+    /// carried by the uniform two-version use/def encoding rather than an output-param
+    /// flag.
+    ///
+    /// KNOWN GAP (currently `Ref`, target `Owning`): the escape reaches the arg temp's
+    /// depth-1 *version* via the `call` hook (`arg.def ↔ callee.sig.def`), but
+    /// `link_versions_to_slots` solidifies only **depth 0** version→slot, so the Owning
+    /// at the arg temp's depth-1 (≡ `local`) never lands on a slot and the soft
+    /// objective leaves `local` at `Ref`. This is a B-precision / depth>0 cross-boundary
+    /// solidification item (the canonical C2Rust output-param shape), NOT a BB1 concern;
+    /// the callee-side (`store_through_ptr_is_ref_over_owning`) and return-edge
+    /// (`interproc_alloc_return_flows_owning`) escapes already work. Un-ignore when the
+    /// depth>0 cross-function solidification lands (tracked for BB-parity).
+    #[ignore = "KNOWN GAP: caller-side out-param escape needs depth>0 cross-fn solidification (not BB1)"]
+    #[test]
+    fn caller_side_outparam_escape_flows_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make(out: *mut *mut core::ffi::c_void) {
+    *out = unsafe { malloc(4) };
+}
+
+pub unsafe fn caller() {
+    let mut local: *mut core::ffi::c_void = core::ptr::null_mut();
+    unsafe { make(&raw mut local) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let make = function_by_name(&program, "make");
+                let caller = function_by_name(&program, "caller");
+                let make_body = tcx.mir_drops_elaborated_and_const_checked(make).borrow();
+                let caller_body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("escape emission should run");
+                add_coherence(&kind_solver, &slots, make, &make_body);
+                add_coherence(&kind_solver, &slots, caller, &caller_body);
+
+                let local = local_slot(&slots, caller, local_by_var_name(tcx, caller, "local"), 0);
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
+                assert_eq!(
+                    model.get(&local),
+                    Some(&SlotKind::Owning),
+                    "caller's `local` must become Owning after the out-param call"
+                );
+            },
+        );
+    }
+
+    /// PROBE (headline-reframing rationale): storing a global address through `*out`
+    /// does NOT produce a round-0 *borrow* conflict — `&raw mut G` is a 'static-region
+    /// raw borrow of a static, not a reference-aliasing loan. This confirms the
+    /// `*out = g` exclusivity hazard is an *ownership* concern (a global is a
+    /// non-owning source), not a borrow one, which is why BB1's headline uses the
+    /// `proof_of_concept` reference-aliasing conflict instead.
+    #[test]
+    fn store_global_through_outparam_no_borrow_conflict() {
+        run_compiler(
+            r#"
+static mut G: i32 = 0;
+
+pub unsafe fn store_global(out: *mut *mut i32) {
+    *out = &raw mut G;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let store_global = function_by_name(&program, "store_global");
+                let slots = CrateSlots::build(&program);
+
+                let conflicts = revalidate(&program, &slots, |_| true, true);
+                let edges = conflicts.get(&store_global).map(Vec::as_slice).unwrap_or(&[]);
+                assert!(
+                    edges.is_empty(),
+                    "storing a global address through `*out` is not a borrow conflict; got {edges:?}"
                 );
             },
         );

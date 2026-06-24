@@ -89,6 +89,47 @@ impl KindSolver {
         self.solver.assert(&!vars.own.xor(external));
     }
 
+    /// §8 BB1 — assert a borrow-exclusion guard for one conflict edge: at least one
+    /// of the involved slots must NOT be a reference. `¬ref(issuer) ∨ ⋁ ¬ref(requirer)`,
+    /// a hard clause over the slots' `ref_` one-hot bits. Committing `¬ref` (not `raw`)
+    /// is deliberate — a borrow conflict only refutes the *reference* reading; the
+    /// slot's ownership bit may still legitimately settle `Owning`. NO-OP when no slot
+    /// is supplied (an all-`Field`-owner edge that BB0's Local-only mapping dropped):
+    /// an empty `Bool::or` is `false` and would force spurious UNSAT, so the
+    /// field-exclusivity gap is left unconstrained here rather than crashing the
+    /// solve (deferred to the struct field-slot mapping).
+    ///
+    /// A non-empty guard is *not* guaranteed satisfiable: it is unsatisfiable iff
+    /// every involved slot is independently pinned to `Ref` by hard ownership facts
+    /// (`own(d+1)` true forces `¬raw(d)` via I1, and `own(d)` false), which
+    /// `model_kinds_relaxing` cannot repair — it only drops malloc source selectors.
+    /// Harmless while BO output is unconsumed; once consumed (post-BB2) the caller
+    /// must treat a `None` model as a real possibility, not assume guards never UNSAT.
+    ///
+    /// Precondition: every supplied `SlotRef` must be registered in this solver — i.e.
+    /// derived from the *same* `CrateSlots` the solver was built from. A foreign slot
+    /// panics (`unknown slot`). Today's callers share one `CrateSlots`; a debug-assert
+    /// is unnecessary while that discipline holds, but BB2's loop must preserve it.
+    pub(crate) fn add_borrow_exclusion(&self, issuer: Option<SlotRef>, requirers: &[SlotRef]) {
+        let not_ref = |slot: SlotRef| {
+            let vars = self
+                .vars
+                .get(&slot)
+                .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+            !&vars.ref_
+        };
+        let literals: Vec<Bool> = issuer
+            .into_iter()
+            .chain(requirers.iter().copied())
+            .map(not_ref)
+            .collect();
+        if literals.is_empty() {
+            return;
+        }
+        let refs: Vec<&Bool> = literals.iter().collect();
+        self.solver.assert(&Bool::or(&refs));
+    }
+
     pub fn check(&self) -> SatResult {
         self.solver.check(&[])
     }
