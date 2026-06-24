@@ -1,4 +1,3 @@
-use etrace::some_or;
 use rustc_ast::{mut_visit::MutVisitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -97,6 +96,7 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
         cells,
         refcells,
         borrows: FxHashMap::default(),
+        protected_borrows: Vec::new(),
     };
     visitor.visit_crate(&mut krate);
 
@@ -126,11 +126,37 @@ struct AstVisitor<'tcx> {
     cells: FxHashSet<LocalDefId>,
     refcells: FxHashSet<LocalDefId>,
     borrows: FxHashMap<Symbol, bool>,
+    protected_borrows: Vec<FxHashSet<Symbol>>,
 }
 
 impl<'tcx> AstVisitor<'tcx> {
-    fn introduce_borrow(&mut self, expr: &mut Expr) {
-        for (x, is_mut) in self.borrows.drain() {
+    fn protected_borrow_names(&self, protected: &FxHashMap<Symbol, bool>) -> FxHashSet<Symbol> {
+        let mut names: FxHashSet<_> = protected.keys().copied().collect();
+        for protected in &self.protected_borrows {
+            names.extend(protected.iter().copied());
+        }
+        names
+    }
+
+    fn merge_borrows(&mut self, borrows: FxHashMap<Symbol, bool>) {
+        for (x, is_mut) in borrows {
+            *self.borrows.entry(x).or_default() |= is_mut;
+        }
+    }
+
+    fn introduce_borrow(&mut self, expr: &mut Expr, protected: &FxHashMap<Symbol, bool>) {
+        let protected = self.protected_borrow_names(protected);
+        let mut borrows = FxHashMap::default();
+        self.borrows.retain(|x, is_mut| {
+            if protected.contains(x) {
+                true
+            } else {
+                borrows.insert(*x, *is_mut);
+                false
+            }
+        });
+
+        for (x, is_mut) in borrows {
             let method = if is_mut {
                 "with_borrow_mut"
             } else {
@@ -141,15 +167,35 @@ impl<'tcx> AstVisitor<'tcx> {
         }
     }
 
-    fn has_only_new_shared_borrows(&self, had_previous_borrows: bool) -> bool {
-        !had_previous_borrows
-            && !self.borrows.is_empty()
-            && self.borrows.values().all(|is_mut| !*is_mut)
+    fn has_only_unprotected_shared_borrows(&self, protected: &FxHashMap<Symbol, bool>) -> bool {
+        let protected = self.protected_borrow_names(protected);
+        let mut found = false;
+        for (x, is_mut) in &self.borrows {
+            if protected.contains(x) {
+                continue;
+            }
+            found = true;
+            if *is_mut {
+                return false;
+            }
+        }
+        found
     }
 
     fn hir_expr_type_contains_ref_or_raw_ptr(&self, expr: &hir::Expr<'_>) -> bool {
         let typeck = self.tcx.typeck(expr.hir_id.owner);
         ty_contains_ref_or_raw_ptr(typeck.expr_ty(expr))
+    }
+
+    fn is_value_boundary_parent(&self, parent: &hir::Expr<'_>, child: &hir::Expr<'_>) -> bool {
+        match parent.kind {
+            hir::ExprKind::Call(_, args) => args.iter().any(|arg| arg.hir_id == child.hir_id),
+            hir::ExprKind::Binary(op, lhs, rhs) => {
+                matches!(op.node, hir::BinOpKind::And | hir::BinOpKind::Or)
+                    && (lhs.hir_id == child.hir_id || rhs.hir_id == child.hir_id)
+            }
+            _ => false,
+        }
     }
 
     fn get_hir_parent(&self, hir_id: HirId) -> hir::Node<'tcx> {
@@ -201,260 +247,262 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        let had_previous_borrows = !self.borrows.is_empty();
+        let outer_borrows = std::mem::take(&mut self.borrows);
+        self.protected_borrows
+            .push(outer_borrows.keys().copied().collect());
         mut_visit::walk_expr(self, expr);
+        self.protected_borrows.pop();
 
-        let hir_expr = some_or!(self.ast_to_hir.get_expr(expr.id, self.tcx), return);
-        match &mut expr.kind {
-            ExprKind::Path(_, _) => {
-                if let Some(def_id) = get_static_from_hir_expr(hir_expr) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    if self.cells.contains(&def_id) {
-                        if !find_context(hir_expr, self.tcx).1 {
-                            *expr = expr!("{x}.get()");
+        if let Some(hir_expr) = self.ast_to_hir.get_expr(expr.id, self.tcx) {
+            match &mut expr.kind {
+                ExprKind::Path(_, _) => {
+                    if let Some(def_id) = get_static_from_hir_expr(hir_expr) {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        if self.cells.contains(&def_id) {
+                            if !find_context(hir_expr, self.tcx).1 {
+                                *expr = expr!("{x}.get()");
+                            }
+                        } else if self.refcells.contains(&def_id)
+                            && let (ctx, is_mut) = find_context(hir_expr, self.tcx)
+                            && matches!(ctx.kind, hir::ExprKind::Path(..))
+                        {
+                            *self.borrows.entry(x).or_default() |= is_mut;
+                            *expr = expr!("*{x}_ref");
                         }
-                    } else if self.refcells.contains(&def_id)
-                        && let (ctx, is_mut) = find_context(hir_expr, self.tcx)
-                        && matches!(ctx.kind, hir::ExprKind::Path(..))
-                    {
-                        *self.borrows.entry(x).or_default() |= is_mut;
-                        *expr = expr!("*{x}_ref");
                     }
                 }
-            }
-            ExprKind::Index(base, idx, _) => {
-                let hir::ExprKind::Index(hir_base, _, _) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_base) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    if self.cells.contains(&def_id) {
-                        if !find_context(hir_expr, self.tcx).1 {
-                            let idx = pprust::expr_to_string(idx);
-                            *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].get())");
-                        }
-                    } else if self.refcells.contains(&def_id) {
-                        let is_mut = find_context(hir_expr, self.tcx).1;
-                        *self.borrows.entry(x).or_default() |= is_mut;
-                        **base = expr!("{x}_ref");
-                    }
-                }
-            }
-            ExprKind::Field(e, _) => {
-                let hir::ExprKind::Field(hir_base, _) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_base)
-                    && self.refcells.contains(&def_id)
-                {
-                    let m = find_context(hir_expr, self.tcx).1;
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= m;
-                    **e = expr!("{x}_ref");
-                }
-            }
-            ExprKind::Assign(lhs, rhs, _) => {
-                let hir::ExprKind::Assign(hir_lhs, _, _) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    if self.cells.contains(&def_id) {
-                        let rhs = pprust::expr_to_string(rhs);
-                        *expr = expr!("{x}.set({rhs})");
-                    } else if self.refcells.contains(&def_id) {
-                        *self.borrows.entry(x).or_default() |= true;
-                        **lhs = expr!("*{x}_ref");
-                    }
-                } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
-                    && let Some(def_id) = get_static_from_hir_expr(hir_base)
-                    && self.cells.contains(&def_id)
-                {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    let rhs = pprust::expr_to_string(rhs);
-                    let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
-                    let idx = pprust::expr_to_string(idx);
-                    *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].set({rhs}))");
-                }
-            }
-            ExprKind::AssignOp(op, lhs, rhs) => {
-                let hir::ExprKind::AssignOp(_, hir_lhs, _) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                let op = match op.node {
-                    AssignOpKind::AddAssign => "+",
-                    AssignOpKind::SubAssign => "-",
-                    AssignOpKind::MulAssign => "*",
-                    AssignOpKind::DivAssign => "/",
-                    AssignOpKind::RemAssign => "%",
-                    AssignOpKind::BitXorAssign => "^",
-                    AssignOpKind::BitAndAssign => "&",
-                    AssignOpKind::BitOrAssign => "|",
-                    AssignOpKind::ShlAssign => "<<",
-                    AssignOpKind::ShrAssign => ">>",
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    if self.cells.contains(&def_id) {
-                        let rhs = pprust::expr_to_string(rhs);
-                        *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
-                    } else if self.refcells.contains(&def_id) {
-                        *self.borrows.entry(x).or_default() |= true;
-                        **lhs = expr!("*{x}_ref");
-                    }
-                } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
-                    && let Some(def_id) = get_static_from_hir_expr(hir_base)
-                    && self.cells.contains(&def_id)
-                {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    let rhs = pprust::expr_to_string(rhs);
-                    let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
-                    let idx = pprust::expr_to_string(idx);
-                    *expr = expr!(
-                        "{x}.with(|__v| {{
-                            let __v = &__v.as_array_of_cells()[{idx}];
-                            __v.set(__v.get() {op} ({rhs}));
-                        }})"
-                    );
-                }
-            }
-            ExprKind::AddrOf(kind, mutability, _) => {
-                let hir::ExprKind::AddrOf(_, _, hir_e) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_e)
-                    && self.refcells.contains(&def_id)
-                {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= mutability.is_mut();
-                    *expr = match (kind, mutability) {
-                        (BorrowKind::Ref, _) => expr!("{x}_ref"),
-                        (BorrowKind::Raw, Mutability::Not) => expr!("({x}_ref as *const _)"),
-                        (BorrowKind::Raw, Mutability::Mut) => expr!("({x}_ref as *mut _)"),
+                ExprKind::Index(base, idx, _) => {
+                    let hir::ExprKind::Index(hir_base, _, _) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
                     };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_base) {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        if self.cells.contains(&def_id) {
+                            if !find_context(hir_expr, self.tcx).1 {
+                                let idx = pprust::expr_to_string(idx);
+                                *expr =
+                                    expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].get())");
+                            }
+                        } else if self.refcells.contains(&def_id) {
+                            let is_mut = find_context(hir_expr, self.tcx).1;
+                            *self.borrows.entry(x).or_default() |= is_mut;
+                            **base = expr!("{x}_ref");
+                        }
+                    }
                 }
-            }
-            ExprKind::MethodCall(call) => {
-                let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = &hir_expr.kind else {
-                    panic!("{hir_expr:?}");
-                };
-                if let Some(def_id) = get_static_from_hir_expr(hir_receiver)
-                    && self.refcells.contains(&def_id)
-                    && let name = call.seg.ident.name.as_str()
-                    && (name == "as_mut_ptr"
-                        || name == "as_ptr"
-                        || name == "as_mut"
-                        || name == "take"
-                        || name == "copy_from_slice"
-                        || name == "fill")
-                {
-                    let x = self.tcx.item_name(def_id.to_def_id());
-                    *self.borrows.entry(x).or_default() |= true;
-                    *expr = expr!("{x}_ref.{name}()");
+                ExprKind::Field(e, _) => {
+                    let hir::ExprKind::Field(hir_base, _) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
+                    };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_base)
+                        && self.refcells.contains(&def_id)
+                    {
+                        let m = find_context(hir_expr, self.tcx).1;
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        *self.borrows.entry(x).or_default() |= m;
+                        **e = expr!("{x}_ref");
+                    }
                 }
-            }
-            ExprKind::Call(box callee, args) => {
-                if let Some(box arg) = args.first()
-                    && pprust::expr_to_string(arg).ends_with("_ref")
-                {
-                    let callee_name = pprust::expr_to_string(callee);
-
-                    if callee_name.ends_with("SliceCursor::new") {
-                        assert!(args.len() == 1);
-                        let arg = pprust::expr_to_string(&args[0]);
+                ExprKind::Assign(lhs, rhs, _) => {
+                    let hir::ExprKind::Assign(hir_lhs, _, _) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
+                    };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        if self.cells.contains(&def_id) {
+                            let rhs = pprust::expr_to_string(rhs);
+                            *expr = expr!("{x}.set({rhs})");
+                        } else if self.refcells.contains(&def_id) {
+                            *self.borrows.entry(x).or_default() |= true;
+                            **lhs = expr!("*{x}_ref");
+                        }
+                    } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
+                        && let Some(def_id) = get_static_from_hir_expr(hir_base)
+                        && self.cells.contains(&def_id)
+                    {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        let rhs = pprust::expr_to_string(rhs);
+                        let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
+                        let idx = pprust::expr_to_string(idx);
+                        *expr = expr!("{x}.with(|__v| __v.as_array_of_cells()[{idx}].set({rhs}))");
+                    }
+                }
+                ExprKind::AssignOp(op, lhs, rhs) => {
+                    let hir::ExprKind::AssignOp(_, hir_lhs, _) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
+                    };
+                    let op = match op.node {
+                        AssignOpKind::AddAssign => "+",
+                        AssignOpKind::SubAssign => "-",
+                        AssignOpKind::MulAssign => "*",
+                        AssignOpKind::DivAssign => "/",
+                        AssignOpKind::RemAssign => "%",
+                        AssignOpKind::BitXorAssign => "^",
+                        AssignOpKind::BitAndAssign => "&",
+                        AssignOpKind::BitOrAssign => "|",
+                        AssignOpKind::ShlAssign => "<<",
+                        AssignOpKind::ShrAssign => ">>",
+                    };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_lhs) {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        if self.cells.contains(&def_id) {
+                            let rhs = pprust::expr_to_string(rhs);
+                            *expr = expr!("{x}.set({x}.get() {op} ({rhs}))");
+                        } else if self.refcells.contains(&def_id) {
+                            *self.borrows.entry(x).or_default() |= true;
+                            **lhs = expr!("*{x}_ref");
+                        }
+                    } else if let hir::ExprKind::Index(hir_base, _, _) = hir_lhs.kind
+                        && let Some(def_id) = get_static_from_hir_expr(hir_base)
+                        && self.cells.contains(&def_id)
+                    {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        let rhs = pprust::expr_to_string(rhs);
+                        let ExprKind::Index(_, idx, _) = &lhs.kind else { panic!("{lhs:?}") };
+                        let idx = pprust::expr_to_string(idx);
                         *expr = expr!(
-                            "crate::slice_cursor::SliceCursor::new(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }})"
-                        );
-                    } else if callee_name.ends_with("SliceCursorMut::new") {
-                        assert!(args.len() == 1);
-                        let arg = pprust::expr_to_string(&args[0]);
-                        *expr = expr!(
-                            "crate::slice_cursor::SliceCursorMut::new(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }})"
-                        );
-                    } else if callee_name.ends_with("SliceCursor::with_pos") {
-                        assert!(args.len() == 2);
-                        let arg = pprust::expr_to_string(&args[0]);
-                        let pos = pprust::expr_to_string(&args[1]);
-                        *expr = expr!(
-                            "crate::slice_cursor::SliceCursor::with_pos(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }}, {pos})"
-                        );
-                    } else if callee_name.ends_with("SliceCursorMut::with_pos") {
-                        assert!(args.len() == 2);
-                        let arg = pprust::expr_to_string(&args[0]);
-                        let pos = pprust::expr_to_string(&args[1]);
-                        *expr = expr!(
-                            "crate::slice_cursor::SliceCursorMut::with_pos(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }}, {pos})"
+                            "{x}.with(|__v| {{
+                                let __v = &__v.as_array_of_cells()[{idx}];
+                                __v.set(__v.get() {op} ({rhs}));
+                            }})"
                         );
                     }
                 }
+                ExprKind::AddrOf(kind, mutability, _) => {
+                    let hir::ExprKind::AddrOf(_, _, hir_e) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
+                    };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_e)
+                        && self.refcells.contains(&def_id)
+                    {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        *self.borrows.entry(x).or_default() |= mutability.is_mut();
+                        *expr = match (kind, mutability) {
+                            (BorrowKind::Ref, _) => expr!("{x}_ref"),
+                            (BorrowKind::Raw, Mutability::Not) => expr!("({x}_ref as *const _)"),
+                            (BorrowKind::Raw, Mutability::Mut) => expr!("({x}_ref as *mut _)"),
+                        };
+                    }
+                }
+                ExprKind::MethodCall(call) => {
+                    let hir::ExprKind::MethodCall(_, hir_receiver, _, _) = &hir_expr.kind else {
+                        panic!("{hir_expr:?}");
+                    };
+                    if let Some(def_id) = get_static_from_hir_expr(hir_receiver)
+                        && self.refcells.contains(&def_id)
+                        && let name = call.seg.ident.name.as_str()
+                        && (name == "as_mut_ptr"
+                            || name == "as_ptr"
+                            || name == "as_mut"
+                            || name == "take"
+                            || name == "copy_from_slice"
+                            || name == "fill")
+                    {
+                        let x = self.tcx.item_name(def_id.to_def_id());
+                        *self.borrows.entry(x).or_default() |= true;
+                        *expr = expr!("{x}_ref.{name}()");
+                    }
+                }
+                ExprKind::Call(box callee, args) => {
+                    if let Some(box arg) = args.first()
+                        && pprust::expr_to_string(arg).ends_with("_ref")
+                    {
+                        let callee_name = pprust::expr_to_string(callee);
+
+                        if callee_name.ends_with("SliceCursor::new") {
+                            assert!(args.len() == 1);
+                            let arg = pprust::expr_to_string(&args[0]);
+                            *expr = expr!(
+                                "crate::slice_cursor::SliceCursor::new(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }})"
+                            );
+                        } else if callee_name.ends_with("SliceCursorMut::new") {
+                            assert!(args.len() == 1);
+                            let arg = pprust::expr_to_string(&args[0]);
+                            *expr = expr!(
+                                "crate::slice_cursor::SliceCursorMut::new(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }})"
+                            );
+                        } else if callee_name.ends_with("SliceCursor::with_pos") {
+                            assert!(args.len() == 2);
+                            let arg = pprust::expr_to_string(&args[0]);
+                            let pos = pprust::expr_to_string(&args[1]);
+                            *expr = expr!(
+                                "crate::slice_cursor::SliceCursor::with_pos(unsafe {{ std::slice::from_raw_parts(({arg}).as_ptr(), ({arg}).len()) }}, {pos})"
+                            );
+                        } else if callee_name.ends_with("SliceCursorMut::with_pos") {
+                            assert!(args.len() == 2);
+                            let arg = pprust::expr_to_string(&args[0]);
+                            let pos = pprust::expr_to_string(&args[1]);
+                            *expr = expr!(
+                                "crate::slice_cursor::SliceCursorMut::with_pos(unsafe {{ std::slice::from_raw_parts_mut(({arg}).as_mut_ptr(), ({arg}).len()) }}, {pos})"
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+
+            match self.get_hir_parent(hir_expr.hir_id) {
+                hir::Node::Expr(e) => {
+                    if self.has_only_unprotected_shared_borrows(&outer_borrows)
+                        && self.is_value_boundary_parent(e, hir_expr)
+                        && !self.hir_expr_type_contains_ref_or_raw_ptr(hir_expr)
+                    {
+                        self.introduce_borrow(expr, &outer_borrows);
+                    }
+
+                    if let hir::ExprKind::If(p, _, _) | hir::ExprKind::Ret(Some(p)) = e.kind
+                        && std::iter::once(hir_expr.hir_id)
+                            .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
+                            .any(|id| id == p.hir_id)
+                    {
+                        // Don't introduce borrows at If condition boundary when
+                        // the If is embedded in a larger expression — the Stmt
+                        // boundary will wrap the whole statement instead.
+                        // But do NOT skip for else-if: the inner If is in the
+                        // else branch and its condition is a separate scope.
+                        let parent_of_if = self.get_hir_parent(e.hir_id);
+                        let is_else_if = if let hir::Node::Expr(pe) = parent_of_if
+                            && let hir::ExprKind::If(cond, _, _) = &pe.kind
+                        {
+                            e.hir_id != cond.hir_id
+                                && !self
+                                    .tcx
+                                    .hir_parent_id_iter(e.hir_id)
+                                    .any(|id| id == cond.hir_id)
+                        } else {
+                            false
+                        };
+                        let skip = matches!(e.kind, hir::ExprKind::If(..))
+                            && !is_else_if
+                            && !matches!(
+                                parent_of_if,
+                                hir::Node::Stmt(_) | hir::Node::LetStmt(_) | hir::Node::Block(_)
+                            );
+                        if !skip {
+                            self.introduce_borrow(expr, &outer_borrows);
+                        }
+                    }
+                }
+                hir::Node::Stmt(_) | hir::Node::LetStmt(_) => {
+                    self.introduce_borrow(expr, &outer_borrows);
+                }
+                hir::Node::Block(block) => {
+                    let mut parent = self.get_hir_parent(block.hir_id);
+                    if let hir::Node::Expr(e) = parent
+                        && matches!(e.kind, hir::ExprKind::Block(..))
+                    {
+                        parent = self.get_hir_parent(e.hir_id);
+                    }
+                    if !matches!(parent, hir::Node::Expr(e) if matches!(e.kind, hir::ExprKind::If(..)))
+                    {
+                        self.introduce_borrow(expr, &outer_borrows);
+                    }
+                }
+                _ => {}
+            }
         }
 
-        match self.get_hir_parent(hir_expr.hir_id) {
-            hir::Node::Expr(e) => {
-                if self.has_only_new_shared_borrows(had_previous_borrows)
-                    && match e.kind {
-                        hir::ExprKind::Call(_, args) => {
-                            args.iter().any(|arg| arg.hir_id == hir_expr.hir_id)
-                        }
-                        _ => false,
-                    }
-                    && !self.hir_expr_type_contains_ref_or_raw_ptr(hir_expr)
-                {
-                    self.introduce_borrow(expr);
-                }
-
-                if let hir::ExprKind::If(p, _, _) | hir::ExprKind::Ret(Some(p)) = e.kind
-                    && std::iter::once(hir_expr.hir_id)
-                        .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
-                        .any(|id| id == p.hir_id)
-                {
-                    // Don't introduce borrows at If condition boundary when
-                    // the If is embedded in a larger expression — the Stmt
-                    // boundary will wrap the whole statement instead.
-                    // But do NOT skip for else-if: the inner If is in the
-                    // else branch and its condition is a separate scope.
-                    let parent_of_if = self.get_hir_parent(e.hir_id);
-                    let is_else_if = if let hir::Node::Expr(pe) = parent_of_if
-                        && let hir::ExprKind::If(cond, _, _) = &pe.kind
-                    {
-                        e.hir_id != cond.hir_id
-                            && !self
-                                .tcx
-                                .hir_parent_id_iter(e.hir_id)
-                                .any(|id| id == cond.hir_id)
-                    } else {
-                        false
-                    };
-                    let skip = matches!(e.kind, hir::ExprKind::If(..))
-                        && !is_else_if
-                        && !matches!(
-                            parent_of_if,
-                            hir::Node::Stmt(_) | hir::Node::LetStmt(_) | hir::Node::Block(_)
-                        );
-                    if !skip {
-                        self.introduce_borrow(expr);
-                    }
-                }
-            }
-            hir::Node::Stmt(_) | hir::Node::LetStmt(_) => {
-                self.introduce_borrow(expr);
-            }
-            hir::Node::Block(block) => {
-                let mut parent = self.get_hir_parent(block.hir_id);
-                if let hir::Node::Expr(e) = parent
-                    && matches!(e.kind, hir::ExprKind::Block(..))
-                {
-                    parent = self.get_hir_parent(e.hir_id);
-                }
-                if !matches!(parent, hir::Node::Expr(e) if matches!(e.kind, hir::ExprKind::If(..)))
-                {
-                    self.introduce_borrow(expr);
-                }
-            }
-            _ => {}
-        }
+        self.merge_borrows(outer_borrows);
     }
 }
 
@@ -1037,6 +1085,202 @@ unsafe fn f() -> *const u8 {
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow("],
             &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_while_field_lhs_rhs_block() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [0; 4] };
+unsafe fn f(mut i: usize) -> i32 {
+    touch(&mut REG);
+    let mut value = 0;
+    while i < REG.length && { value = REG.items[i]; true } {
+        i += 1;
+    }
+    value
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_loop_break_field_lhs_rhs_block() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [0; 4] };
+unsafe fn f(mut i: usize) -> i32 {
+    touch(&mut REG);
+    let mut value = 0;
+    loop {
+        if !(i < REG.length && { value = REG.items[i]; true }) {
+            break;
+        }
+        i += 1;
+    }
+    value
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_rhs_assignment_block() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [1; 4] };
+unsafe fn f() -> i32 {
+    touch(&mut REG);
+    let mut value = 0;
+    if REG.length != 0 && { value = REG.items[0]; value != 0 } {
+        value += 1;
+    }
+    value
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_two_reads_same_static() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [1; 4] };
+unsafe fn f() -> bool {
+    touch(&mut REG);
+    REG.length != 0 && { REG.items[0] != 0 }
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_or_lhs_field_rhs_block() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [0; 4] };
+unsafe fn f() -> i32 {
+    touch(&mut REG);
+    let mut value = 0;
+    if REG.length == 0 || { value = REG.items[0]; false } {
+        value += 1;
+    }
+    value
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_nested_condition() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [1; 4] };
+unsafe fn f(ready: bool, i: usize) -> i32 {
+    touch(&mut REG);
+    let mut value = 0;
+    if ready && (i < REG.length && { value = REG.items[i]; true }) {
+        value += 1;
+    }
+    value
+}
+unsafe fn touch(_r: &mut Registry) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_static_array_index_lhs_rhs_block() {
+        let code = r#"
+static mut ARR: [i32; 4] = [1; 4];
+unsafe fn f(i: usize) -> i32 {
+    touch(ARR.as_mut_ptr());
+    let mut value = 0;
+    if ARR[0] != 0 && { value = ARR[i]; true } {
+        value += 1;
+    }
+    value
+}
+unsafe fn touch(_p: *mut i32) {}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "ARR.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_short_circuit_call_arg_scope_is_not_widened() {
+        let code = r#"
+struct Registry { length: usize, items: [i32; 4] }
+static mut REG: Registry = Registry { length: 4, items: [1; 4] };
+unsafe fn f(i: usize) -> i32 {
+    touch(&mut REG);
+    choose(REG.length, if i < REG.length && { REG.items[i] != 0 } { 1 } else { 0 })
+}
+unsafe fn touch(_r: &mut Registry) {}
+unsafe fn choose(length: usize, flag: i32) -> i32 { length as i32 + flag }
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "choose(REG.with_borrow("],
+            &["static mut", "REG.with_borrow(|REG_ref| choose("],
+        );
+    }
+
+    #[test]
+    fn test_refcell_reference_call_arg_keeps_block_arg_in_scope() {
+        let code = r#"
+static mut S: [i32; 2] = [1; 2];
+unsafe fn f() -> i32 {
+    touch(S.as_mut_ptr());
+    h(std::slice::from_ref(&S[0]), { S[1] })
+}
+unsafe fn touch(_p: *mut i32) {}
+unsafe fn h(x: &[i32], y: i32) -> i32 { x[0] + y }
+"#;
+        run_test(
+            code,
+            &[
+                "std::cell::RefCell",
+                "S.with_borrow(|S_ref| h(std::slice::from_ref(&S_ref[0]), { S_ref[1] }))",
+            ],
+            &[
+                "static mut",
+                "h(std::slice::from_ref(&S.with_borrow(",
+                "{ S.with_borrow(|S_ref| S_ref[1]) }",
+            ],
         );
     }
 
