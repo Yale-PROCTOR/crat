@@ -165,19 +165,9 @@ impl<'tcx> AstVisitor<'tcx> {
         }
     }
 
-    fn has_only_unprotected_shared_borrows(&self, protected: &FxHashMap<Symbol, bool>) -> bool {
+    fn has_unprotected_borrows(&self, protected: &FxHashMap<Symbol, bool>) -> bool {
         let protected = self.protected_borrow_names(protected);
-        let mut found = false;
-        for (x, is_mut) in &self.borrows {
-            if protected.contains(x) {
-                continue;
-            }
-            found = true;
-            if *is_mut {
-                return false;
-            }
-        }
-        found
+        self.borrows.keys().any(|x| !protected.contains(x))
     }
 
     fn hir_expr_type_contains_ref_or_raw_ptr(&self, expr: &hir::Expr<'_>) -> bool {
@@ -185,14 +175,44 @@ impl<'tcx> AstVisitor<'tcx> {
         ty_contains_ref_or_raw_ptr(typeck.expr_ty(expr))
     }
 
-    fn is_value_boundary_parent(&self, parent: &hir::Expr<'_>, child: &hir::Expr<'_>) -> bool {
-        match parent.kind {
-            hir::ExprKind::Call(_, args) => args.iter().any(|arg| arg.hir_id == child.hir_id),
-            hir::ExprKind::Binary(op, lhs, rhs) => {
-                matches!(op.node, hir::BinOpKind::And | hir::BinOpKind::Or)
-                    && (lhs.hir_id == child.hir_id || rhs.hir_id == child.hir_id)
-            }
+    fn is_value_boundary_parent(&self, parent: &hir::Node<'_>, child: &hir::Expr<'_>) -> bool {
+        match parent {
+            hir::Node::Expr(parent) => match parent.kind {
+                hir::ExprKind::Call(_, args) => args.iter().any(|arg| arg.hir_id == child.hir_id),
+                hir::ExprKind::MethodCall(_, receiver, args, _) => {
+                    receiver.hir_id != child.hir_id
+                        && args.iter().any(|arg| arg.hir_id == child.hir_id)
+                }
+                hir::ExprKind::Array(exprs) | hir::ExprKind::Tup(exprs) => {
+                    exprs.iter().any(|expr| expr.hir_id == child.hir_id)
+                }
+                hir::ExprKind::Repeat(expr, _) => expr.hir_id == child.hir_id,
+                hir::ExprKind::Struct(_, _, hir::StructTailExpr::Base(base)) => {
+                    base.hir_id == child.hir_id
+                }
+                hir::ExprKind::Binary(op, lhs, rhs) => {
+                    matches!(op.node, hir::BinOpKind::And | hir::BinOpKind::Or)
+                        && (lhs.hir_id == child.hir_id || rhs.hir_id == child.hir_id)
+                }
+                _ => false,
+            },
+            hir::Node::ExprField(_) => true,
             _ => false,
+        }
+    }
+
+    fn introduce_borrow_at_value_boundary(
+        &mut self,
+        expr: &mut Expr,
+        hir_expr: &hir::Expr<'_>,
+        parent: &hir::Node<'_>,
+        protected: &FxHashMap<Symbol, bool>,
+    ) {
+        if self.has_unprotected_borrows(protected)
+            && self.is_value_boundary_parent(parent, hir_expr)
+            && !self.hir_expr_type_contains_ref_or_raw_ptr(hir_expr)
+        {
+            self.introduce_borrow(expr, protected);
         }
     }
 
@@ -439,15 +459,11 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 _ => {}
             }
 
-            match self.get_hir_parent(hir_expr.hir_id) {
-                hir::Node::Expr(e) => {
-                    if self.has_only_unprotected_shared_borrows(&outer_borrows)
-                        && self.is_value_boundary_parent(e, hir_expr)
-                        && !self.hir_expr_type_contains_ref_or_raw_ptr(hir_expr)
-                    {
-                        self.introduce_borrow(expr, &outer_borrows);
-                    }
+            let parent = self.get_hir_parent(hir_expr.hir_id);
+            self.introduce_borrow_at_value_boundary(expr, hir_expr, &parent, &outer_borrows);
 
+            match parent {
+                hir::Node::Expr(e) => {
                     if let hir::ExprKind::If(p, _, _) | hir::ExprKind::Ret(Some(p)) = e.kind
                         && std::iter::once(hir_expr.hir_id)
                             .chain(self.tcx.hir_parent_id_iter(hir_expr.hir_id))
@@ -1394,6 +1410,157 @@ unsafe fn h(x: &[i32], y: i32) -> i32 { x[0] + y }
                 "static mut",
                 "h(std::slice::from_ref(&S.with_borrow(",
                 "{ S.with_borrow(|S_ref| S_ref[1]) }",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_refcell_return_tuple_keeps_backing_local_read_outside_static_borrow() {
+        let code = r#"
+struct Registry { field: i32 }
+static mut REG: Registry = Registry { field: 1 };
+unsafe fn f(flag: bool) -> (usize, Option<usize>) {
+    touch(&mut REG);
+    let mut pos___v = 0usize;
+    let pos: &mut [usize] = std::slice::from_mut(&mut pos___v);
+    return (search(pos, std::slice::from_ref(&REG.field)), if flag { Some(pos___v) } else { None });
+}
+unsafe fn touch(_r: &mut Registry) {}
+fn search(pos: &mut [usize], needle: &[i32]) -> usize {
+    pos[0] += needle[0] as usize;
+    pos[0]
+}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_let_tuple_keeps_backing_local_read_outside_static_borrow() {
+        let code = r#"
+struct Registry { field: i32 }
+static mut REG: Registry = Registry { field: 1 };
+unsafe fn f(flag: bool) -> (usize, Option<usize>) {
+    touch(&mut REG);
+    let mut pos___v = 0usize;
+    let pos: &mut [usize] = std::slice::from_mut(&mut pos___v);
+    let out = (search(pos, std::slice::from_ref(&REG.field)), if flag { Some(pos___v) } else { None });
+    out
+}
+unsafe fn touch(_r: &mut Registry) {}
+fn search(pos: &mut [usize], needle: &[i32]) -> usize {
+    pos[0] += needle[0] as usize;
+    pos[0]
+}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_later_tuple_element_keeps_backing_local_read_outside_static_borrow() {
+        let code = r#"
+struct Registry { field: i32 }
+static mut REG: Registry = Registry { field: 1 };
+unsafe fn f(flag: bool) -> (usize, usize, Option<usize>) {
+    touch(&mut REG);
+    let mut pos___v = 0usize;
+    let pos: &mut [usize] = std::slice::from_mut(&mut pos___v);
+    return (7, search(pos, std::slice::from_ref(&REG.field)), if flag { Some(pos___v) } else { None });
+}
+unsafe fn touch(_r: &mut Registry) {}
+fn search(pos: &mut [usize], needle: &[i32]) -> usize {
+    pos[0] += needle[0] as usize;
+    pos[0]
+}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_array_keeps_backing_local_read_outside_static_borrow() {
+        let code = r#"
+struct Registry { field: i32 }
+static mut REG: Registry = Registry { field: 1 };
+unsafe fn f(flag: bool) -> [usize; 2] {
+    touch(&mut REG);
+    let mut pos___v = 0usize;
+    let pos: &mut [usize] = std::slice::from_mut(&mut pos___v);
+    return [search(pos, std::slice::from_ref(&REG.field)), if flag { pos___v } else { 0 }];
+}
+unsafe fn touch(_r: &mut Registry) {}
+fn search(pos: &mut [usize], needle: &[i32]) -> usize {
+    pos[0] += needle[0] as usize;
+    pos[0]
+}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_nested_struct_tuple_keeps_backing_local_read_outside_static_borrow() {
+        let code = r#"
+struct Registry { field: i32 }
+struct Out { found: usize, pos: Option<usize> }
+static mut REG: Registry = Registry { field: 1 };
+unsafe fn f(flag: bool) -> (Out, usize) {
+    touch(&mut REG);
+    let mut pos___v = 0usize;
+    let pos: &mut [usize] = std::slice::from_mut(&mut pos___v);
+    return (Out {
+        found: search(pos, std::slice::from_ref(&REG.field)),
+        pos: if flag { Some(pos___v) } else { None },
+    }, 0);
+}
+unsafe fn touch(_r: &mut Registry) {}
+fn search(pos: &mut [usize], needle: &[i32]) -> usize {
+    pos[0] += needle[0] as usize;
+    pos[0]
+}
+"#;
+        run_test(
+            code,
+            &["std::cell::RefCell", "REG.with_borrow"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_tuple_boundary_keeps_reference_call_args_together() {
+        let code = r#"
+static mut S: [i32; 2] = [1; 2];
+unsafe fn f(local: i32) -> (i32, i32) {
+    touch(S.as_mut_ptr());
+    (h(std::slice::from_ref(&S[0]), S[1]), local)
+}
+unsafe fn touch(_p: *mut i32) {}
+unsafe fn h(x: &[i32], y: i32) -> i32 { x[0] + y }
+"#;
+        run_test(
+            code,
+            &[
+                "std::cell::RefCell",
+                "S.with_borrow(|S_ref| h(std::slice::from_ref(&S_ref[0]), S_ref[1]))",
+            ],
+            &[
+                "static mut",
+                "S.with_borrow(|S_ref| (h(std::slice::from_ref(&S_ref[0]), S_ref[1]), local))",
+                "h(std::slice::from_ref(&S.with_borrow(",
+                "S.with_borrow(|S_ref| S_ref[1])",
             ],
         );
     }
