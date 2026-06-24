@@ -412,6 +412,9 @@ impl<'tcx> AstVisitor<'tcx> {
         for (parent_id, parent_node) in self.tcx.hir_parent_iter(expr.hir_id) {
             let hir::Node::Expr(parent) = parent_node else { break };
             match parent.kind {
+                hir::ExprKind::Unary(hir::UnOp::Neg, e) if e.hir_id == curr_id => {
+                    return true;
+                }
                 hir::ExprKind::MethodCall(_, receiver, _, _) => {
                     return receiver.hir_id == curr_id;
                 }
@@ -755,6 +758,15 @@ mod tests {
     #[test]
     fn test_neg_int_cast() {
         run_test("fn f() { -1 as i32 as i64; }", &["-1"], &["as"])
+    }
+
+    #[test]
+    fn test_neg_int_cast_to_raw_pointer() {
+        run_test(
+            "pub const MAP_FAILED: *mut core::ffi::c_void = -(1 as core::ffi::c_int) as *mut core::ffi::c_void;",
+            &["-1i32 as *mut core::ffi::c_void"],
+            &["-1 as *mut core::ffi::c_void", "1 as core::ffi::c_int"],
+        )
     }
 
     #[test]
