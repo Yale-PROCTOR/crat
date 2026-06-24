@@ -146,21 +146,23 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                 static_item.mutability = Mutability::Not;
             } else if self.cells.contains(def_id) {
                 let name = static_item.ident.name;
+                let vis = pprust::vis_to_string(&item.vis);
                 let ty = pprust::ty_to_string(&static_item.ty);
                 let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
                 *item = item!(
                     "thread_local! {{
-                        static {name}: std::cell::Cell<{ty}> =
+                        {vis} static {name}: std::cell::Cell<{ty}> =
                             const {{ std::cell::Cell::new({init}) }};
                     }}"
                 );
             } else if self.refcells.contains(def_id) {
                 let name = static_item.ident.name;
+                let vis = pprust::vis_to_string(&item.vis);
                 let ty = pprust::ty_to_string(&static_item.ty);
                 let init = pprust::expr_to_string(static_item.expr.as_ref().unwrap());
                 *item = item!(
                     "thread_local! {{
-                        static {name}: std::cell::RefCell<{ty}> =
+                        {vis} static {name}: std::cell::RefCell<{ty}> =
                             const {{ std::cell::RefCell::new({init}) }};
                     }}"
                 );
@@ -577,6 +579,20 @@ unsafe fn f(x: u32) { X += x; }
     }
 
     #[test]
+    fn test_public_cell_keeps_visibility() {
+        let code = r#"
+pub mod globals {
+    pub static mut X: u32 = 0;
+}
+pub mod user {
+    use crate::globals::X;
+    unsafe fn f(x: u32) { X = X + x; }
+}
+"#;
+        run_test(code, &["pub static X"], &["static mut"]);
+    }
+
+    #[test]
     fn test_cell_array_assign() {
         let code = r#"
 static mut X: [u32; 1] = [0; 1];
@@ -620,6 +636,21 @@ unsafe fn h(x: &i32) -> i32 { *x }
             ],
             &["static mut"],
         );
+    }
+
+    #[test]
+    fn test_public_refcell_keeps_visibility() {
+        let code = r#"
+pub mod globals {
+    pub static mut X: i32 = 0;
+}
+pub mod user {
+    use crate::globals::X;
+    unsafe fn f() { g(&mut X); }
+    unsafe fn g(x: &mut i32) { *x = 1; }
+}
+"#;
+        run_test(code, &["pub static X"], &["static mut"]);
     }
 
     #[test]
