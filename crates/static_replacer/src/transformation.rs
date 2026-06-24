@@ -61,12 +61,10 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             }
         } else if immutable {
             immutables.insert(def_id);
-        } else if exprs.iter().all(|(e, _)| {
-            !matches!(
-                e.kind,
-                hir::ExprKind::AddrOf(_, _, _) | hir::ExprKind::MethodCall(_, _, _, _)
-            )
-        }) {
+        } else if exprs
+            .iter()
+            .all(|(e, mutated)| cell_eligible_static_context(def_id, e, *mutated))
+        {
             cells.insert(def_id);
         } else {
             refcells.insert(def_id);
@@ -527,6 +525,30 @@ fn get_static_from_hir_expr(expr: &hir::Expr<'_>) -> Option<LocalDefId> {
     }
 }
 
+fn cell_eligible_static_context(def_id: LocalDefId, ctx: &hir::Expr<'_>, mutated: bool) -> bool {
+    if !mutated {
+        return is_static_path(def_id, ctx) || is_direct_static_index(def_id, ctx);
+    }
+
+    match ctx.kind {
+        hir::ExprKind::Assign(lhs, _, _) | hir::ExprKind::AssignOp(_, lhs, _) => {
+            is_static_path(def_id, lhs) || is_direct_static_index(def_id, lhs)
+        }
+        _ => false,
+    }
+}
+
+fn is_static_path(def_id: LocalDefId, expr: &hir::Expr<'_>) -> bool {
+    get_static_from_hir_expr(expr) == Some(def_id)
+}
+
+fn is_direct_static_index(def_id: LocalDefId, expr: &hir::Expr<'_>) -> bool {
+    matches!(
+        expr.kind,
+        hir::ExprKind::Index(base, _, _) if is_static_path(def_id, base)
+    )
+}
+
 fn find_context<'a, 'tcx>(
     mut expr: &'a hir::Expr<'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -783,6 +805,98 @@ unsafe fn f(i: usize, x: u32) { X[i] += x; }
         run_test(
             code,
             &["thread_local", "std::cell::Cell", ".get()", ".set"],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_cell_struct_field_assign_uses_refcell() {
+        let code = r#"
+struct S { x: u32 }
+static mut X: S = S { x: 0 };
+unsafe fn f(x: u32) { X.x = x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut", "std::cell::Cell<"],
+        );
+    }
+
+    #[test]
+    fn test_cell_struct_field_assign_op_uses_refcell() {
+        let code = r#"
+struct S { x: u32 }
+static mut X: S = S { x: 0 };
+unsafe fn f(x: u32) { X.x += x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut", "std::cell::Cell<"],
+        );
+    }
+
+    #[test]
+    fn test_cell_nested_struct_field_assign_uses_refcell() {
+        let code = r#"
+struct Inner { value: u32 }
+struct Outer { inner: Inner }
+static mut X: Outer = Outer { inner: Inner { value: 0 } };
+unsafe fn f(value: u32) { X.inner.value = value; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut", "std::cell::Cell<"],
+        );
+    }
+
+    #[test]
+    fn test_cell_tuple_field_assign_uses_refcell() {
+        let code = r#"
+static mut X: (u32, u32) = (0, 0);
+unsafe fn f(x: u32) { X.0 = x; }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut", "std::cell::Cell<"],
+        );
+    }
+
+    #[test]
+    fn test_cell_non_sync_struct_field_read_uses_refcell() {
+        let code = r#"
+struct S { ptr: *mut u8 }
+static mut X: S = S { ptr: 0 as *mut u8 };
+unsafe fn f() -> *mut u8 { X.ptr }
+"#;
+        run_test(
+            code,
+            &["thread_local", "std::cell::RefCell", ".with_borrow("],
+            &["static mut", "std::cell::Cell<"],
+        );
+    }
+
+    #[test]
+    fn test_cell_array_element_assign_stays_cell_with_projected_static() {
+        let code = r#"
+struct S { x: u32 }
+static mut X: S = S { x: 0 };
+static mut A: [u32; 2] = [0; 2];
+unsafe fn f(i: usize, x: u32) {
+    X.x = x;
+    A[i] = x;
+}
+"#;
+        run_test(
+            code,
+            &[
+                "std::cell::RefCell<S>",
+                "std::cell::Cell<[u32; 2]>",
+                "as_array_of_cells",
+            ],
             &["static mut"],
         );
     }
