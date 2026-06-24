@@ -16,7 +16,10 @@ use rustc_hash::FxHashMap;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 
-use super::{crate_slots::CrateSlots, solver::SlotRef};
+use super::{
+    crate_slots::CrateSlots,
+    solver::{KindSolver, SlotRef},
+};
 use crate::{
     analyses::borrow::{self, ProvenanceOwner},
     utils::rustc::RustProgram,
@@ -71,6 +74,27 @@ pub(crate) fn revalidate(
             (fn_did, translated)
         })
         .collect()
+}
+
+/// §8 BB1 — encode Round-0 borrow conflicts as exclusion guards on the solver. For
+/// each conflict edge, assert `¬ref(issuer) ∨ ⋁¬ref(requirers)` via
+/// `KindSolver::add_borrow_exclusion`. Hard clauses, applied before the single
+/// `model_kinds_relaxing` solve. BB1 is one shot: it encodes the round-0 (all-Ref)
+/// conflicts only — the CEGAR validate/re-solve loop that closes over the solved
+/// model's actual candidacy is BB2, so BB1 alone is not yet sound on its own.
+///
+/// Edges with `Field` owners are partially dropped by BB0's Local-only mapping: an
+/// all-`Field` edge becomes a NO-OP (the deferred field-exclusivity gap), and a mixed
+/// edge keeps only its surviving `Local` literals — a *stronger* (still sound: forces
+/// ≥1 off Ref) but over-constraining guard. Both resolve when the struct field-slot
+/// mapping lands; a precision concern only post-BB2.
+pub(crate) fn materialize_guards(
+    solver: &KindSolver,
+    conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
+) {
+    for edge in conflicts.values().flatten() {
+        solver.add_borrow_exclusion(edge.issuer, &edge.requirers);
+    }
 }
 
 /// Translate a borrow `ProvenanceOwner` to a BO `SlotRef`. BB0 handles `Local` owners
