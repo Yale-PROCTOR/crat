@@ -193,9 +193,24 @@ impl MutVisitor for AstVisitor<'_> {
                     && let StmtKind::Expr(init) = &stmt.kind
                 {
                     let name = const_item.ident.name;
+                    let attrs = item
+                        .attrs
+                        .iter()
+                        .filter(|attr| attr.style == AttrStyle::Outer)
+                        .map(pprust::attribute_to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let attrs = if attrs.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{attrs}\n")
+                    };
+                    let vis = pprust::vis_to_string(&item.vis);
                     let ty = pprust::ty_to_string(ty);
                     let init = pprust::expr_to_string(init);
-                    *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
+                    *item = item!(
+                        "thread_local! {{ {attrs}{vis} static {name}: {ty} = const {{ {init} }}; }}"
+                    );
                 }
             }
             ItemKind::Mod(_, _, ModKind::Loaded(items, ..)) => {
@@ -698,6 +713,83 @@ fn f() {
             "#,
             &["write!"],
             &["write_fmt", "format_args"],
+        )
+    }
+
+    #[test]
+    fn test_thread_local_preserves_public_visibility_for_sibling_import() {
+        run_test(
+            r#"
+mod state {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        pub static COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+}
+
+mod user {
+    use crate::state::COUNT;
+
+    pub fn get() -> u32 {
+        COUNT.with(|count| count.get())
+    }
+}
+            "#,
+            &["pub static COUNT: Cell<u32>", "thread_local!"],
+            &["LocalKey"],
+        )
+    }
+
+    #[test]
+    fn test_thread_local_preserves_restricted_visibility_for_sibling_import() {
+        run_test(
+            r#"
+mod parent {
+    pub mod state {
+        use std::cell::RefCell;
+
+        std::thread_local! {
+            pub(super) static VALUE: RefCell<i32> = const { RefCell::new(7) };
+        }
+    }
+
+    mod user {
+        use super::state::VALUE;
+
+        pub fn get() -> i32 {
+            VALUE.with(|value| *value.borrow())
+        }
+    }
+}
+            "#,
+            &["pub(super) static VALUE: RefCell<i32>", "thread_local!"],
+            &["LocalKey"],
+        )
+    }
+
+    #[test]
+    fn test_thread_local_preserves_attributes_and_multiple_visibility_items() {
+        run_test(
+            r#"
+mod state {
+    use std::cell::Cell;
+    use std::cell::RefCell;
+
+    std::thread_local! {
+        #[allow(non_upper_case_globals)]
+        pub static mixedCase: Cell<u32> = const { Cell::new(1) };
+        pub(crate) static LOG: RefCell<i32> = const { RefCell::new(2) };
+    }
+}
+            "#,
+            &[
+                "#[allow(non_upper_case_globals)]",
+                "pub static mixedCase: Cell<u32>",
+                "pub(crate) static LOG: RefCell<i32>",
+                "thread_local!",
+            ],
+            &["LocalKey"],
         )
     }
 
