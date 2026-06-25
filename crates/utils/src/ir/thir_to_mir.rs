@@ -5,8 +5,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{BodyOwnerKind, HirId, LangItem, def_id::LocalDefId};
 use rustc_middle::{
     mir::{
-        AggregateKind, AssignOp, BasicBlock, BinOp, Body, CastKind, Local, Location, Operand,
-        Place, Rvalue, Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
+        AggregateKind, BasicBlock, BinOp, Body, CastKind, Local, Location, Operand, Place, Rvalue,
+        Statement, StatementKind, SwitchTargets, Terminator, TerminatorKind, UnOp,
     },
     thir::{
         self, AdtExpr, BlockId, ExprId, ExprKind, LogicalOp, Pat, PatKind, StmtKind, Thir,
@@ -205,9 +205,7 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                         .as_str()
                         == "VaListImpl"
                 {
-                } else if let Some(assign) =
-                    ctx.find_assign_location(thir[lhs].ty, expr.span.into(), false)
-                {
+                } else if let Some(assign) = ctx.find_assign_location(lhs, expr.span.into()) {
                     ctx.thir_to_mir
                         .expr_to_locs
                         .insert(expr_id, smallvec![assign.loc]);
@@ -440,12 +438,8 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
             }
 
             ExprKind::Assign { .. } => {}
-            ExprKind::AssignOp { op, lhs, .. } => {
-                if let Some(assign) = ctx.find_assign_location(
-                    thir[lhs].ty,
-                    expr.span.into(),
-                    matches!(op, AssignOp::DivAssign | AssignOp::RemAssign),
-                ) {
+            ExprKind::AssignOp { lhs, .. } => {
+                if let Some(assign) = ctx.find_assign_location(lhs, expr.span.into()) {
                     ctx.thir_to_mir
                         .expr_to_locs
                         .insert(expr_id, smallvec![assign.loc]);
@@ -836,6 +830,14 @@ fn normal_successors<'tcx>(terminator: &TerminatorKind<'tcx>) -> SmallVec<[Basic
     }
 }
 
+fn is_assignment_result_temp<'tcx>(
+    lhs: &Place<'tcx>,
+    lhs_ty: Ty<'tcx>,
+    root_local: Option<Local>,
+) -> bool {
+    lhs_ty.is_unit() && lhs.projection.is_empty() && Some(lhs.local) != root_local
+}
+
 /// MIR assignment statement
 struct Assign<'a, 'tcx> {
     ty: Ty<'tcx>,
@@ -1027,34 +1029,48 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         }
     }
 
-    fn find_assign_location(
-        &self,
-        ty: Ty<'tcx>,
-        span: LoHi,
-        allow_checks: bool,
-    ) -> Option<Assign<'a, 'tcx>> {
+    fn find_assign_location(&self, lhs_expr: ExprId, span: LoHi) -> Option<Assign<'a, 'tcx>> {
+        let ty = self.thir[lhs_expr].ty;
+        let root_local = self.thir_place_root_local(lhs_expr);
         let locs = self.stmt_span_to_locs.get(&span)?;
-        for (i, loc) in locs.iter().enumerate() {
+        let mut typed_assign = None;
+        let mut root_assign = None;
+        for loc in locs {
             let stmt = self.get_statement(*loc);
             let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { panic!() };
-            if i < locs.len() - 1 {
-                if !allow_checks && !matches!(rhs, Rvalue::CopyForDeref(_)) {
-                    break;
-                }
-            } else {
-                let lhs_ty = lhs.ty(&self.body.local_decls, self.tcx).ty;
-                if lhs_ty == ty {
-                    let assign = Assign {
-                        ty,
-                        rvalue: rhs,
-                        loc: *loc,
-                        span,
-                    };
-                    return Some(assign);
-                }
+            let lhs_ty = lhs.ty(&self.body.local_decls, self.tcx).ty;
+            if lhs_ty != ty {
+                continue;
+            }
+
+            let assign = Assign {
+                ty,
+                rvalue: rhs,
+                loc: *loc,
+                span,
+            };
+            if root_local.is_some_and(|local| lhs.local == local) {
+                root_assign = Some(assign);
+            } else if !is_assignment_result_temp(lhs, lhs_ty, root_local) {
+                typed_assign = Some(assign);
             }
         }
-        None
+        root_assign.or(typed_assign)
+    }
+
+    fn thir_place_root_local(&self, expr_id: ExprId) -> Option<Local> {
+        let mut expr_id = unwrap_expr(expr_id, self.thir);
+        loop {
+            match self.thir[expr_id].kind {
+                ExprKind::Deref { arg }
+                | ExprKind::Field { lhs: arg, .. }
+                | ExprKind::Index { lhs: arg, .. } => expr_id = unwrap_expr(arg, self.thir),
+                ExprKind::VarRef { id } => {
+                    return self.thir_to_mir.binding_to_local.get(&id.0).copied();
+                }
+                _ => return None,
+            }
+        }
     }
 
     #[inline]

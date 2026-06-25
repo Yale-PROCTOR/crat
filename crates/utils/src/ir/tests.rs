@@ -1,5 +1,6 @@
 use rustc_ast::{visit::Visitor, *};
 use rustc_hir::{self as hir, def_id::LocalModDefId};
+use rustc_middle::{mir::StatementKind, thir::ExprKind as ThirExprKind};
 use rustc_span::FileName;
 
 use super::*;
@@ -103,9 +104,80 @@ fn run_thir_to_mir_test(code: &str) {
     .unwrap();
 }
 
+fn check_thir_assign_maps_to_store(code: &str, needle: &str) {
+    compilation::run_compiler_on_str(code, |tcx| {
+        let def_id = tcx
+            .hir_body_owners()
+            .find(|def_id| {
+                let path = tcx.def_path_str(def_id.to_def_id());
+                path == "f" || path.ends_with("::f")
+            })
+            .unwrap();
+        let (thir, _) = tcx.thir_body(def_id).unwrap();
+        let thir = thir.borrow();
+        let source_map = tcx.sess.source_map();
+        let (assign_id, lhs_id) = thir
+            .exprs
+            .iter_enumerated()
+            .find_map(|(expr_id, expr)| {
+                if let ThirExprKind::Assign { lhs, .. } = expr.kind
+                    && source_map
+                        .span_to_snippet(expr.span)
+                        .is_ok_and(|s| s.contains(needle))
+                {
+                    Some((expr_id, lhs))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let expected_ty = thir[lhs_id].ty;
+        assert!(!expected_ty.is_unit());
+
+        let thir_to_mir = map_thir_to_mir(def_id, false, tcx);
+        let locs = thir_to_mir
+            .expr_to_locs
+            .get(&assign_id)
+            .expect("assignment expression should map to the MIR store");
+        assert_eq!(locs.len(), 1);
+
+        let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
+        let body = body.borrow();
+        let stmt = &body.basic_blocks[locs[0].block].statements[locs[0].statement_index];
+        let StatementKind::Assign(box (lhs, _)) = &stmt.kind else {
+            panic!("assignment expression mapped to non-assign MIR statement");
+        };
+        assert_eq!(lhs.ty(&body.local_decls, tcx).ty, expected_ty);
+    })
+    .unwrap();
+}
+
 #[test]
 fn test_item_use() {
     run_test("use std::path::Path;")
+}
+
+#[test]
+fn test_thir_to_mir_assign_array_index_tail_expr_maps_to_store() {
+    check_thir_assign_maps_to_store(
+        r#"
+        #[repr(C)]
+        struct Entry {
+            path_len: usize,
+            path: [i8; 1024],
+        }
+
+        fn f(entry: *mut Entry) {
+            unsafe {
+                {
+                    let __idx_0 = (*entry).path_len as usize;
+                    (*entry).path[__idx_0] = '\0' as i32 as core::ffi::c_char
+                };
+            }
+        }
+        "#,
+        "path[__idx_0]",
+    )
 }
 
 #[test]
