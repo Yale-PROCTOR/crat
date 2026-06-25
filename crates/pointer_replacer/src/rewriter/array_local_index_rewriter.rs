@@ -2385,28 +2385,18 @@ struct DerivationCtx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     plan: &'a RewritePlan,
     /// the set of members already introduced (index-rewritten) at this point.
-    /// `None` during validation (every planned member is treated as available
-    /// so the `DependsOn` edge is recorded). `Some(set)` during emission, so a
+    /// `None` during validation, `Some(set)` during emission
     /// cross-reference to a member that is planned but not yet introduced —
     /// e.g. one whose initializer was not index-derivable and stays raw — falls
     /// back to the runtime `offset_from` form against the member's raw pointer
-    /// (preserving the pre-consolidation behavior).
     introduced: Option<&'a FxHashSet<HirId>>,
     /// whether the runtime `offset_from` pointer-form fallback for a
-    /// not-introduced / pruned group member is permitted. the pre-consolidation
-    /// code reached that form only from the *assignment* path
-    /// (`group_member_pointer_assignment_index_expr`), never from the binding
-    /// *initializer* path (`visit_local`/`rewrite_materialized_local_stmt`), so
-    /// this is `true` at assignment sites and `false` at initializer sites to
-    /// stay diff-neutral.
+    /// not-introduced / pruned group member is permitted. this is `true` at
+    /// assignment sites and `false` at initializer sites to stay diff-neutral.
     allow_member_pointer_form: bool,
 }
 
 /// the single result of deriving an index from an assignment/init RHS.
-// the `DependsOn` member list and the `Unsupported` reason string are not read
-// today (every caller treats `Index` and `DependsOn` alike and ignores the
-// reason); they are retained as the natural carriers for the deferred
-// dependency-cascade / base-cursor work continuing on this branch.
 #[allow(dead_code)]
 enum Derivation {
     /// fully derivable from the anchor (and possibly the base cursor).
@@ -2414,15 +2404,12 @@ enum Derivation {
     /// derivable; the `Vec<HirId>` lists the other planned members it derives
     /// from (reserved for the deferred dependency-cascade analysis).
     DependsOn(IndexExpr, Vec<HirId>),
-    /// not derivable; the &str is the (reserved) trace reason.
+    /// not derivable; the &str is the trace reason.
     Unsupported(&'static str),
 }
 
 /// the one derivation entry point, shared by validation and emission so they
-/// cannot disagree on whether an RHS is derivable. the supported/unsupported
-/// decision is independent of `ctx.introduced`; that set only selects, at
-/// emission, between the index form and the runtime `offset_from` pointer form
-/// for a cross-reference to a member that is not (yet) introduced.
+/// cannot disagree on whether an RHS is derivable.
 fn derive_index(rhs: &Expr, anchor: Anchor<'_>, ctx: &DerivationCtx<'_, '_>) -> Derivation {
     match anchor {
         Anchor::Member(rewrite) => derive_member_index(rhs, rewrite, ctx),
@@ -2463,8 +2450,7 @@ fn derive_member_index(
     }
     // 3. from another planned member of the same group that is (or, during
     //    validation, is treated as) introduced: q = other.offset(n) ->
-    //    other_idx + n. gate on group_member_hir_ids (the frozen group set) AND
-    //    same base, matching the original introduced_group_member path.
+    //    other_idx + n.
     if let Some(other_hir_id) = receiver_hir_id
         && rewrite.group_member_hir_ids.contains(&other_hir_id)
         && ctx
@@ -2487,10 +2473,6 @@ fn derive_member_index(
     //    from the plan, or planned but not (yet) introduced (e.g. its init was
     //    undecidable so it stays raw). the member is a raw pointer at runtime,
     //    so compute the index via runtime `offset_from` against the base
-    //    pointer — the emitted form of the old
-    //    group_member_pointer_assignment_index_expr. this keeps groups alive
-    //    when only a subset of members is index-derivable. only reachable from
-    //    assignment sites (not initializer sites), matching the old code.
     if ctx.allow_member_pointer_form
         && let Some(other_hir_id) = receiver_hir_id
         && rewrite.group_member_hir_ids.contains(&other_hir_id)
@@ -2915,7 +2897,7 @@ fn pointer_index_from_base_expr(
 /// For a live (caller-visible) field base, recognizes a base self-advance
 /// `(*s).out = (*s).out.offset(n)` / `.add(n)` and returns the counter update
 /// expression `out_idx + n`. Returns `None` for any other RHS (e.g. assignment
-/// from a member), which approach D does not support.
+/// from a member)
 fn live_base_self_advance_counter(
     rhs: &Expr,
     ast_to_hir: &AstToHir,
@@ -3171,8 +3153,7 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
             tcx: self.tcx,
             plan: &self.plan,
             introduced: Some(&self.introduced_hir_ids),
-            // initializer site: no pointer-form fallback (diff-neutral with the
-            // old visit_local path, which never reached the pointer form).
+            // initializer site: no pointer-form fallback
             allow_member_pointer_form: false,
         };
         let index = match derive_index(init, Anchor::Member(&rewrite), &ctx) {
