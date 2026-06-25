@@ -4481,8 +4481,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     unreachable!("non-optional pointer targets are handled before as_ptr")
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                    // when the source used as_ptr() (const) but there is an offset projection
+                    // (a materialized cursor), the outer as-*mut cast was stripped by
+                    // transform_ptr before ptr_expr ran, so projected_expr produces a const
+                    // slice view. we must restore the mut intent via .cast_mut().
+                    let has_offset_proj =
+                        pe.projs.iter().any(|p| matches!(p, PtrExprProj::Offset(_)));
+                    let needs_mut_cast = m && !pe.as_mut_ptr && has_offset_proj;
                     if !need_cast {
-                        *ptr = raw_expr;
+                        *ptr = if needs_mut_cast {
+                            utils::expr!("({}).cast_mut()", pprust::expr_to_string(&raw_expr))
+                        } else {
+                            raw_expr
+                        };
                     } else {
                         *ptr = utils::expr!(
                             "({}) as *{} _",
