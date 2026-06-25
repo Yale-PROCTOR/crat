@@ -14,4 +14,4 @@ extern crate rustc_trait_selection;
 mod return_escape;
 mod transformation;
 
-pub use transformation::replace_static;
+pub use transformation::{Config, replace_static};

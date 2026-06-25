@@ -28,6 +28,7 @@ pub struct Config {
     pub replace_pub: bool,
 
     pub c_exposed_fns: FxHashSet<String>,
+    pub c_exposed_statics: FxHashSet<String>,
 }
 
 pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
@@ -39,6 +40,7 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         tcx,
         mains: vec![],
         fns: vec![],
+        statics: vec![],
         uses: vec![],
         used: FxHashMap::default(),
         used_locals: FxHashSet::default(),
@@ -64,13 +66,13 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
 
     let mut entries = visitor.mains;
     for f in visitor.fns {
-        let name = tcx.item_name(f.to_def_id());
-        let has_exposed_export_name = tcx.get_attrs(f.to_def_id(), sym::export_name).any(|attr| {
-            attr.value_str()
-                .is_some_and(|s| config.c_exposed_fns.contains(s.as_str()))
-        });
-        if config.c_exposed_fns.contains(name.as_str()) || has_exposed_export_name {
+        if is_c_exposed_item(tcx, f, &config.c_exposed_fns) {
             entries.push(f);
+        }
+    }
+    for static_id in visitor.statics {
+        if is_c_exposed_item(tcx, static_id, &config.c_exposed_statics) {
+            entries.push(static_id);
         }
     }
     entries.extend(visitor.used_attr_items);
@@ -212,7 +214,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
     fn visit_item(&mut self, item: &mut ast::Item) {
         mut_visit::walk_item(self, item);
 
-        let is_exposed_fn = if let ast::ItemKind::Fn(box ast::Fn {
+        let is_exposed_item = if let ast::ItemKind::Fn(box ast::Fn {
             ident, sig, body, ..
         }) = &mut item.kind
         {
@@ -289,11 +291,17 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
             }
 
             is_exposed_fn
+        } else if let ast::ItemKind::Static(box static_item) = &mut item.kind {
+            is_c_exposed_ast_item(
+                &item.attrs,
+                static_item.ident.name,
+                &self.config.c_exposed_statics,
+            )
         } else {
             false
         };
 
-        if self.config.remove_no_mangle && !is_exposed_fn {
+        if self.config.remove_no_mangle && !is_exposed_item {
             item.attrs.retain(|attr| {
                 let ast::AttrKind::Normal(normal) = &attr.kind else { return true };
                 normal.item.path.segments.last().unwrap().ident.name != sym::no_mangle
@@ -338,6 +346,7 @@ struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     mains: Vec<LocalDefId>,
     fns: Vec<LocalDefId>,
+    statics: Vec<LocalDefId>,
     uses: Vec<(LocalDefId, Vec<DefId>)>,
     used: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     used_locals: FxHashSet<HirId>,
@@ -373,6 +382,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 if ident.name == sym::main {
                     self.mains.push(item.owner_id.def_id);
                 }
+            }
+            hir::ItemKind::Static(_, _, _, _) => {
+                self.statics.push(item.owner_id.def_id);
             }
             hir::ItemKind::Impl(imp) => {
                 if let Some(of_trait) = imp.of_trait
@@ -635,6 +647,35 @@ fn find_unsafe_fns(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
         unsafe_fns.extend(&sccs.scc_elems[scc_id]);
     }
     unsafe_fns
+}
+
+fn is_c_exposed_item(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    exposed_names: &FxHashSet<String>,
+) -> bool {
+    let name = tcx.item_name(def_id.to_def_id());
+    exposed_names.contains(name.as_str())
+        || tcx
+            .get_attrs(def_id.to_def_id(), sym::export_name)
+            .any(|attr| {
+                attr.value_str()
+                    .is_some_and(|s| exposed_names.contains(s.as_str()))
+            })
+}
+
+fn is_c_exposed_ast_item(
+    attrs: &[ast::Attribute],
+    name: rustc_span::Symbol,
+    exposed_names: &FxHashSet<String>,
+) -> bool {
+    exposed_names.contains(name.as_str())
+        || attrs.iter().any(|attr| {
+            attr.has_name(sym::export_name)
+                && attr
+                    .value_str()
+                    .is_some_and(|s| exposed_names.contains(s.as_str()))
+        })
 }
 
 #[cfg(test)]

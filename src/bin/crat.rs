@@ -140,6 +140,12 @@ struct Args {
     points_to_file: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Names of static variables exposed to C"
+    )]
+    c_exposed_static: Vec<String>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -213,9 +219,13 @@ struct Config {
     andersen: points_to::andersen::Config,
     #[serde(default)]
     punning: union_replacer::punning::Config,
+    #[serde(default)]
+    r#static: static_replacer::Config,
 
     #[serde(default)]
     c_exposed_fns: Vec<String>,
+    #[serde(default)]
+    c_exposed_statics: Vec<String>,
 
     #[serde(default)]
     verbose: bool,
@@ -240,6 +250,7 @@ fn main() {
         })
         .unwrap_or_default();
     config.c_exposed_fns.extend(args.c_exposed_fn);
+    config.c_exposed_statics.extend(args.c_exposed_static);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
     config.pointer.verbose |= args.pointer_verbose;
@@ -382,6 +393,14 @@ fn main() {
         .r#unsafe
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
+    config
+        .r#unsafe
+        .c_exposed_statics
+        .extend(config.c_exposed_statics.iter().cloned());
+    config
+        .r#static
+        .c_exposed_statics
+        .extend(config.c_exposed_statics.iter().cloned());
     config
         .pointer
         .c_exposed_fns
@@ -595,7 +614,10 @@ fn main() {
                 }
             }
             Pass::Static => {
-                let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();
+                let s = run_compiler_on_path(&file, |tcx| {
+                    static_replacer::replace_static(&config.r#static, tcx)
+                })
+                .unwrap();
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Simpl => {

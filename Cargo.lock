@@ -1383,6 +1383,7 @@ name = "static_replacer"
 version = "0.1.0"
 dependencies = [
  "etrace",
+ "serde",
  "utils",
 ]
 

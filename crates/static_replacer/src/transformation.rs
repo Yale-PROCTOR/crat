@@ -15,11 +15,17 @@ use rustc_middle::{
 };
 use rustc_span::{DUMMY_SP, Symbol, sym};
 use rustc_trait_selection::traits;
+use serde::Deserialize;
 use utils::{expr, item};
 
 use crate::return_escape;
 
-pub fn replace_static(tcx: TyCtxt<'_>) -> String {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Config {
+    pub c_exposed_statics: FxHashSet<String>,
+}
+
+pub fn replace_static(config: &Config, tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -51,6 +57,9 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
             continue;
         }
         if returned_statics.contains(&def_id) {
+            continue;
+        }
+        if is_c_exposed_static(config, tcx, def_id) {
             continue;
         }
         let immutable =
@@ -99,6 +108,17 @@ pub fn replace_static(tcx: TyCtxt<'_>) -> String {
     visitor.visit_crate(&mut krate);
 
     pprust::crate_to_string_for_macros(&krate)
+}
+
+fn is_c_exposed_static(config: &Config, tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    let name = tcx.item_name(def_id.to_def_id());
+    config.c_exposed_statics.contains(name.as_str())
+        || tcx
+            .get_attrs(def_id.to_def_id(), sym::export_name)
+            .any(|attr| {
+                attr.value_str()
+                    .is_some_and(|s| config.c_exposed_statics.contains(s.as_str()))
+            })
 }
 
 fn static_ty_is_sync<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
@@ -669,8 +689,25 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashSet;
+
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
-        let s = utils::compilation::run_compiler_on_str(code, super::replace_static).unwrap();
+        run_test_with_exposed_statics(code, &[], includes, excludes);
+    }
+
+    fn run_test_with_exposed_statics(
+        code: &str,
+        c_exposed_statics: &[&str],
+        includes: &[&str],
+        excludes: &[&str],
+    ) {
+        let c_exposed_statics =
+            FxHashSet::from_iter(c_exposed_statics.iter().map(|s| s.to_string()));
+        let s = utils::compilation::run_compiler_on_str(code, |tcx| {
+            let config = super::Config { c_exposed_statics };
+            super::replace_static(&config, tcx)
+        })
+        .unwrap();
         utils::compilation::run_compiler_on_str(&s, utils::type_check).expect(&s);
         for include in includes {
             assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
@@ -681,6 +718,46 @@ mod tests {
                 "Expected not to find `{exclude}` in:\n{s}"
             );
         }
+    }
+
+    #[test]
+    fn test_exposed_cell_candidate_stays_static_mut() {
+        let code = r#"
+static mut X: u32 = 0;
+unsafe fn f(x: u32) { X = X + x; }
+"#;
+        run_test_with_exposed_statics(
+            code,
+            &["X"],
+            &["static mut X"],
+            &[
+                "thread_local",
+                "std::cell::Cell",
+                "std::cell::RefCell",
+                "X.get()",
+                "X.set(",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_exposed_refcell_candidate_stays_static_mut() {
+        let code = r#"
+struct S { x: u32 }
+static mut X: S = S { x: 0 };
+unsafe fn f(x: u32) { X.x = x; }
+"#;
+        run_test_with_exposed_statics(
+            code,
+            &["X"],
+            &["static mut X"],
+            &[
+                "thread_local",
+                "std::cell::Cell",
+                "std::cell::RefCell",
+                "with_borrow",
+            ],
+        );
     }
 
     #[test]

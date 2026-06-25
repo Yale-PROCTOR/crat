@@ -8,6 +8,7 @@ fn run_transformation_test(code: &str, remove_unused: bool, includes: &[&str], e
             remove_extern_c: false,
             replace_pub: false,
             c_exposed_fns: FxHashSet::default(),
+            c_exposed_statics: FxHashSet::default(),
         };
         super::resolve_unsafe(&config, tcx)
     })
@@ -411,6 +412,7 @@ fn run_exposed_test(code: &str, c_exposed_fns: &[&str], includes: &[&str], exclu
             remove_extern_c: false,
             replace_pub: false,
             c_exposed_fns,
+            c_exposed_statics: FxHashSet::default(),
         };
         super::resolve_unsafe(&config, tcx)
     })
@@ -459,6 +461,7 @@ fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
             remove_extern_c: true,
             replace_pub: false,
             c_exposed_fns: FxHashSet::default(),
+            c_exposed_statics: FxHashSet::default(),
         };
         super::resolve_unsafe(&config, tcx)
     })
@@ -510,4 +513,39 @@ fn main() {
 }
 "#;
     run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
+}
+
+#[test]
+fn test_exposed_static_no_mangle_preserved() {
+    let code = r#"
+#[no_mangle]
+pub static mut EXPOSED: i32 = 0;
+#[no_mangle]
+pub static mut INTERNAL: i32 = 0;
+fn main() {}
+"#;
+    let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+        let config = super::Config {
+            remove_unused: true,
+            remove_no_mangle: true,
+            remove_extern_c: false,
+            replace_pub: false,
+            c_exposed_fns: FxHashSet::default(),
+            c_exposed_statics: FxHashSet::from_iter(["EXPOSED".to_string()]),
+        };
+        super::resolve_unsafe(&config, tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&transformed, |tcx| {
+        utils::type_check(tcx);
+    })
+    .expect(&transformed);
+    assert!(
+        transformed.contains("#[no_mangle]\npub static mut EXPOSED"),
+        "{transformed}\ndoes not contain exposed static with no_mangle",
+    );
+    assert!(
+        !transformed.contains("INTERNAL"),
+        "{transformed}\ncontains unused internal static",
+    );
 }
