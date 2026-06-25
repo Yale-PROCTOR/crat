@@ -9949,6 +9949,51 @@ pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
     // cursor update; q's self-advance inside it stays handled as today.
 }
 
+// ANALYSIS GAP — ignored pending a fix in classify_rewrite_groups.
+//
+// root cause: the simultaneous-liveness gate in classify_rewrite_groups
+// (analyses/array_local_provenance/mod.rs) requires that p and q are live at the
+// same MIR location.  when q is declared *inside* the outer while loop body, the
+// MIR live ranges of p and q do not overlap: p dies immediately after "q = p" (its
+// next use is the overwrite "p = if …"), and q is not yet live at the loop-condition
+// check.  so has_conflict is false, no group is formed, and neither p nor q is
+// rewritten to indices.  fixing this requires extending the liveness gate or the
+// group-formation criterion to handle loop-scoped locals that share a base.
+#[ignore]
+#[test]
+fn test_array_local_rewriter_rewrites_tu_linkage_read_stdin_shape() {
+    // mirrors B02_synthetic/tu_linkage::read_stdin: a local array base with two
+    // cursors — q is copied from p (q = p) and p is updated by a conditional
+    // (p = if *q != 0 { q.offset(1) } else { q }). both must rewrite to indices.
+    let code = r#"
+pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
+    let mut total: i32 = 0;
+    let mut p: *mut i32 = buf.as_mut_ptr();
+    while *p != 0 {
+        let mut q: *mut i32 = p;
+        while *q != 0 && *q != 32 {
+            q = q.offset(1);
+        }
+        total += *q;
+        p = if *q != 0 { q.offset(1) } else { q };
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    assert!(
+        s.contains("p_idx = if"),
+        "p updated via index conditional: {s}"
+    );
+    // no raw pointer offset operations remain for the two cursors.
+    assert!(!s.contains("q = q.offset(1)"), "q advance lowered: {s}");
+    assert!(!s.contains("p = if *q"), "p conditional lowered: {s}");
+}
+
 #[test]
 fn test_array_local_rewriter_copies_nullable_group_member() {
     // q starts null (Option<isize>) and is later copied from p; the copy must
