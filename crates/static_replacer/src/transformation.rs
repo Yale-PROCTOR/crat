@@ -605,7 +605,8 @@ fn find_context<'a, 'tcx>(
                             "as_ptr" | "offset" => {
                                 expr = parent;
                             }
-                            "is_null" | "is_none" | "is_some" | "unwrap" | "expect" => {}
+                            "is_null" | "is_none" | "is_some" | "is_empty" | "unwrap"
+                            | "expect" => {}
                             _ if method.starts_with("wrapping_") => {}
                             _ => panic!("{method}"),
                         }
@@ -1274,6 +1275,33 @@ unsafe fn f() {
         run_test(
             code,
             &["thread_local", "std::cell::RefCell", ".with_borrow_mut("],
+            &["static mut"],
+        );
+    }
+
+    #[test]
+    fn test_refcell_slice_field_is_empty() {
+        let code = r#"
+struct Def<'a> { name: &'a [i8] }
+impl<'a> Copy for Def<'a> {}
+impl<'a> Clone for Def<'a> { fn clone(&self) -> Self { *self } }
+static mut DEFS: [Def<'static>; 1] = [Def { name: &[1, 0] }];
+unsafe fn f(i: usize) -> *mut Def<'static> {
+    let mut out = core::ptr::null_mut();
+    if !DEFS[i].name.is_empty() {
+        out = (&mut DEFS)[i..].as_mut_ptr();
+    }
+    out
+}
+"#;
+        run_test(
+            code,
+            &[
+                "thread_local",
+                "std::cell::RefCell",
+                ".with_borrow_mut(",
+                ".is_empty()",
+            ],
             &["static mut"],
         );
     }
