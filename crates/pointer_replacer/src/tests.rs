@@ -2087,7 +2087,9 @@ pub unsafe fn fill() -> *mut i32 {
         &[
             "pub unsafe fn fill() -> Option<Box<[i32]>>",
             "Option<Box<[i32]>>",
-            ".as_mut_ptr().add(1usize)",
+            "std::ptr::null_mut::<i32>()",
+            "(_x).as_mut_ptr()",
+            "} else { ((_x).as_mut_ptr()).add(1usize) }",
         ],
         &["Box::leak(", "Box::into_raw("],
     );
@@ -2131,7 +2133,11 @@ pub unsafe fn dup_tail(s: *const core::ffi::c_char) -> *mut core::ffi::c_char {
     return strdup(s);
 }
 "#,
-        &["-> *mut i8", "return strdup((s).as_ptr());"],
+        &[
+            "-> *mut i8",
+            "return strdup(if (s).is_empty()",
+            "std::ptr::null::<i8>()",
+        ],
         &["Option<Box", "Option<Box<["],
     );
 }
@@ -5197,7 +5203,8 @@ pub unsafe fn copy_and_sum(src: *mut i32, count: usize) -> i32 {
             "pub unsafe fn copy_and_sum(src: &[i32], count: usize) -> i32",
             "let mut dest: Box<[i32]>",
             "collect::<Vec<i32>>().into_boxed_slice()",
-            "memcpy((&mut (dest)[..]).as_mut_ptr() as *mut _,",
+            "std::ptr::null_mut::<std::ffi::c_void>()",
+            "(_x).as_mut_ptr() as *mut std::ffi::c_void",
             "drop(dest);",
         ],
         &[
@@ -5319,7 +5326,8 @@ pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
             "pub unsafe fn helper(out: &[i8]) -> i32",
             "let mut buf: Box<[i8]>",
             "collect::<Vec<i8>>().into_boxed_slice()",
-            "puts((&mut (buf)[..]).as_mut_ptr());",
+            "std::ptr::null_mut::<i8>()",
+            "(_x).as_mut_ptr()",
             "drop(buf);",
         ],
         &[
@@ -6514,7 +6522,11 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q as libc::c_int;
 }
 "#,
-        &["as_mut_ptr() as *mut _", "&mut [i32]"],
+        &[
+            "std::ptr::null_mut::<i16>()",
+            "(p).as_mut_ptr() as *mut i16",
+            "&mut [i32]",
+        ],
         &["bytemuck"],
     );
 }
@@ -7085,6 +7097,92 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 "#,
         &["is_empty", "&mut [i32]"],
         &["is_null"],
+    );
+}
+
+#[test]
+fn test_empty_slice_raw_bridge_preserves_null() {
+    run_test(
+        r#"
+pub unsafe extern "C" fn bar(mut p: *mut i32, mut q: *const i32) {
+    if p.is_null() {
+        return;
+    }
+    if q.is_null() {
+        return;
+    }
+    *p.offset(1) = *q.offset(1);
+}
+
+pub unsafe extern "C" fn foo(mut p: *mut i32) {
+    bar(p, p);
+}
+
+pub unsafe extern "C" fn main_0() -> i32 {
+    let mut p: *mut i32 = 0 as *mut i32;
+    foo(p);
+    let mut arr: [i32; 10] = [0; 10];
+    let mut q: *mut i32 = arr.as_mut_ptr();
+    foo(q);
+    return 0;
+}
+"#,
+        &[
+            "mut p: &mut [i32]",
+            "bar(if (p).is_empty()",
+            "std::ptr::null_mut::<i32>()",
+            "std::ptr::null::<i32>()",
+        ],
+        &["bar((p).as_mut_ptr(), (p).as_ptr())"],
+    );
+}
+
+#[test]
+fn test_empty_slice_raw_bridge_wraps_chained_add_receiver() {
+    run_test(
+        r#"
+extern "C" {
+    fn sink(p: *const i8);
+}
+
+pub unsafe extern "C" fn publish(mut data: *const i8) -> i32 {
+    if data.is_null() {
+        return 0;
+    }
+    sink(data.add(1usize).add(2usize));
+    return *data.offset(0) as i32;
+}
+"#,
+        &[
+            "mut data: &[i8]",
+            "} else { (((data).as_ptr()).add(1usize)).add(2usize) }",
+        ],
+        &["}.add(2usize)"],
+    );
+}
+
+#[test]
+fn test_empty_slice_to_opt_ref_field_uses_first_mut() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe extern "C" fn store(mut p: *mut i32) -> i32 {
+    let mut h = Holder { p: 0 as *mut i32 };
+    *p.offset(0) = 1;
+    h.p = p;
+    if h.p.is_null() {
+        return 0;
+    }
+    *h.p = 2;
+    return *h.p;
+}
+"#,
+        &["pub p: Option<&'a mut i32>", "h.p = (p).first_mut()"],
+        &["as_mut_ptr().as_mut()", "as_ptr().as_ref()"],
     );
 }
 
@@ -8460,7 +8558,8 @@ pub unsafe fn pass_static_raw_bridge() -> i32 {
         &[
             "pub struct BridgeEntry<'a>",
             "pub name: &'a [core::ffi::c_char]",
-            ".as_ptr() as *const i8",
+            "std::ptr::null::<i8>()",
+            "(&((*entry).name)).as_ptr()",
         ],
         &["pub name: *const core::ffi::c_char"],
     );
@@ -9300,7 +9399,11 @@ pub unsafe extern "C" fn parse(osd: *mut OsData, s: *const i8) -> i32 {
 }
 "#,
         &config,
-        &["pub arch: *mut i8", "osd.arch = strdup((s).as_ptr());"],
+        &[
+            "pub arch: *mut i8",
+            "std::ptr::null::<i8>()",
+            "strdup(if (s).is_empty()",
+        ],
         &[
             "pub struct OsData<'",
             "pub arch: Option<&",
@@ -10017,7 +10120,7 @@ pub unsafe fn foo(mut raw: *mut i32, mut take: bool, mut k: isize) -> *mut i32 {
     let compact = s.split_whitespace().collect::<String>();
     assert!(
         compact.contains(
-            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|___idx|((raw)[(___idx)asusize..]).as_mut_ptr())"
+            "prev_idx.map_or(std::ptr::null_mut()as*muti32,|___idx|if((raw)[(___idx)asusize..]).is_empty(){std::ptr::null_mut::<i32>()}else{((raw)[(___idx)asusize..]).as_mut_ptr()})"
         ),
         "{s}"
     );
@@ -12030,7 +12133,12 @@ pub unsafe extern "C" fn crc32_align(mut buf: *const u8, mut len: usize) -> u64 
     return sum;
 }
 "#,
-        &["mut buf: &[u8]", "(buf).as_ptr() as core::ffi::c_ulong"],
+        &[
+            "mut buf: &[u8]",
+            "if (buf).is_empty()",
+            "std::ptr::null::<u8>()",
+            "(buf).as_ptr() } as core::ffi::c_ulong",
+        ],
         &["buf as core::ffi::c_ulong"],
     );
 }
@@ -12055,7 +12163,8 @@ pub unsafe extern "C" fn collect_parent(
 "#,
         &[
             "mut parent: &mut [crate::GitCommit]",
-            "(parent).as_ptr() as *const",
+            "std::ptr::null::<crate::GitCommit>()",
+            "(parent).as_ptr() } as *const GitCommit",
         ],
         &[
             "parent as *const crate::GitCommit",
@@ -12083,7 +12192,8 @@ pub unsafe extern "C" fn checkout_repo(mut repo: *mut GitRepository, mut slot: u
 "#,
         &[
             "mut repo: &mut [crate::GitRepository]",
-            "(repo).as_mut_ptr() as *mut",
+            "std::ptr::null_mut::<crate::GitRepository>()",
+            "(repo).as_mut_ptr() } as",
         ],
         &["repo as *mut core::ffi::c_void"],
     );
@@ -12109,7 +12219,11 @@ pub unsafe extern "C" fn check_ref(mut ref_0: *const core::ffi::c_char) -> i32 {
     return *ref_0.offset(0) as i32;
 }
 "#,
-        &["mut ref_0: &[i8]", "(ref_0).as_ptr() as *const"],
+        &[
+            "mut ref_0: &[i8]",
+            "std::ptr::null::<i8>()",
+            "(ref_0).as_ptr() } as *const core::ffi::c_char",
+        ],
         &["ref_0 as *const core::ffi::c_char"],
     );
 }
@@ -12198,9 +12312,10 @@ pub unsafe extern "C" fn publish(mut data: *const i8) -> i32 {
         &[
             "mut data: &[i8]",
             "pub struct RawBundle {",
-            "first: (data).as_ptr().offset(0)",
-            "nested: ((data).as_ptr().add(1usize),",
-            "[(data).as_ptr(), (data).as_ptr().add(2usize)]",
+            "std::ptr::null::<i8>()",
+            "} else { ((data).as_ptr()).offset(0) }",
+            "} else { ((data).as_ptr()).add(1usize) }",
+            "} else { ((data).as_ptr()).add(2usize) }",
         ],
         &[
             "RawBundle<'",
@@ -12232,7 +12347,7 @@ pub unsafe extern "C" fn collect(mut data: *const i8) -> i32 {
             "mut data: &[i8]",
             "let pair: (*const i8, *const i8)",
             "(data).as_ptr()",
-            "(data).as_ptr().add(1usize)",
+            "} else { ((data).as_ptr()).add(1usize) }",
         ],
         &["(data, data.add(1usize))", "data.add(1usize)"],
     );
@@ -12257,7 +12372,7 @@ pub unsafe extern "C" fn call_table(mut data: *const i8) -> i32 {
             "mut data: &[i8]",
             "pub unsafe fn take_table(table: [*const i8; 2])",
             "(data).as_ptr()",
-            "(data).as_ptr().add(1usize)",
+            "} else { ((data).as_ptr()).add(1usize) }",
         ],
         &["take_table([data, data.add(1usize)])", "data.add(1usize)"],
     );
@@ -12685,7 +12800,8 @@ pub unsafe extern "C" fn compact(mut str: *mut core::ffi::c_char) -> usize {
             "mut str:",
             "crate::slice_cursor::SliceCursorMut<'_, i8>",
             "as_deref_mut().offset_by((pos_idx) as",
-            ")).as_mut_ptr() as",
+            "std::ptr::null_mut::<i8>()",
+            "(_x).as_mut_ptr()",
             "*mut i8",
         ],
         &["(str).offset(pos_idx) as *mut i8"],
@@ -12762,7 +12878,8 @@ pub unsafe extern "C" fn getseed(mut seed: *mut u64) -> u64 {
 "#,
         &[
             "mut seed: &mut [u64]",
-            "(seed).as_mut_ptr() as *mut core::ffi::c_void as usize as u64",
+            "std::ptr::null_mut::<u64>()",
+            "(seed).as_mut_ptr() } as *mut core::ffi::c_void as",
         ],
         &["seed as *mut core::ffi::c_void as usize as u64"],
     );
@@ -12878,7 +12995,9 @@ pub unsafe extern "C" fn select_entry(mut map: *mut Map, mut index: usize) {
         &[
             "pub entries: &'a mut [Entry]",
             "pub last: *mut Entry",
-            "map.last = ((map.entries)[(index as isize) as usize..]).as_mut_ptr();",
+            "if ((map.entries)[(index as isize) as usize..]).is_empty()",
+            "std::ptr::null_mut::<crate::Entry>()",
+            "} else { ((map.entries)[(index as isize) as usize..]).as_mut_ptr() };",
         ],
         &["pub last: &", "pub last: Option<&"],
     );
@@ -16714,7 +16833,8 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
         &[
             "fn write_word(mut words: &mut [i32], idx: usize)",
             "fn dispatch(mut words: &[i32], idx: usize) -> i32",
-            "write_word(std::slice::from_raw_parts_mut((words).as_ptr().cast_mut()",
+            "write_word(if (words).is_empty()",
+            "std::slice::from_raw_parts_mut((words).as_ptr().cast_mut()",
         ],
         &["write_word((words), idx)"],
     );
@@ -16738,7 +16858,8 @@ pub unsafe extern "C" fn dispatch(mut slots: *const i16, idx: usize) -> i16 {
         &[
             "fn write_slot(mut slots: &mut [i16], idx: usize)",
             "let local: &[i16]",
-            "write_slot(std::slice::from_raw_parts_mut((local).as_ptr().cast_mut()",
+            "write_slot(if (local).is_empty()",
+            "std::slice::from_raw_parts_mut((local).as_ptr().cast_mut()",
         ],
         &["write_slot((local), idx)", "write_slot(((local"],
     );
@@ -16762,7 +16883,8 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32) -> i32 {
         &[
             "crate::slice_cursor::SliceCursorMut<'_, i32>",
             "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
-            "write_previous(crate::slice_cursor::SliceCursorMut::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
+            "write_previous(if (cursor).is_empty()",
+            "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
         ],
         &["write_previous(cursor)", "write_previous((cursor as"],
     );
@@ -16786,7 +16908,8 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
         &[
             "fn write_window(mut words: &mut [i32], idx: usize)",
             "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
-            "write_window(std::slice::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
+            "write_window(if (cursor).is_empty()",
+            "std::slice::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
         ],
         &[
             "write_window((cursor).as_slice_mut(), idx)",
