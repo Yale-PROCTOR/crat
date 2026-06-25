@@ -1295,6 +1295,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             pprust::expr_to_string(arg)
                         ));
                     }
+                    if param_kind == PtrKind::SliceCursor(true)
+                        && self
+                            .promoted_field_slot_for_hir_field(harg)
+                            .and_then(|field| self.field_ptr_kind(field))
+                            == Some(PtrKind::SliceCursor(true))
+                    {
+                        let arg_str = self.promoted_field_receiver_expr_string(
+                            arg,
+                            harg,
+                            ReceiverBorrow::Mutable,
+                        );
+                        *arg = P(utils::expr!("({arg_str}).as_deref_mut()"));
+                    }
                     if ty_contains_raw_ptr_leaf(self.tcx, ty) {
                         self.transform_raw_aggregate_context_after_pointer_conversion(
                             arg, harg, ty,
@@ -5626,7 +5639,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         field_expr: &Expr,
         hir_field_expr: &hir::Expr<'tcx>,
         target_mutability: bool,
-        inner_ty: ty::Ty<'tcx>,
+        target_inner_ty: ty::Ty<'tcx>,
+        source_inner_ty: ty::Ty<'tcx>,
         field_kind: PtrKind,
     ) -> Expr {
         let shared_field_expr =
@@ -5637,35 +5651,46 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let mutable_field_expr_str = pprust::expr_to_string(&mutable_field_expr);
         let can_mutably_borrow_field =
             self.promoted_field_raw_owner_mutability(field_expr, hir_field_expr) != Some(false);
-        let inner_ty_str = self.body_ty_name(inner_ty);
+        let target_inner_ty_str = self.body_ty_name(target_inner_ty);
+        let source_inner_ty_str = self.body_ty_name(source_inner_ty);
+        let shared_raw = if target_inner_ty == source_inner_ty {
+            format!("r as *const {target_inner_ty_str}")
+        } else {
+            format!("r as *const {source_inner_ty_str} as *const {target_inner_ty_str}")
+        };
+        let mutable_raw = if target_inner_ty == source_inner_ty {
+            format!("r as *mut {target_inner_ty_str}")
+        } else {
+            format!("r as *mut {source_inner_ty_str} as *mut {target_inner_ty_str}")
+        };
         match field_kind {
             PtrKind::OptRef(source_mutability) => {
                 if target_mutability && source_mutability && can_mutably_borrow_field {
                     utils::expr!(
-                        "({mutable_field_expr_str}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty_str})"
+                        "({mutable_field_expr_str}).as_deref_mut().map_or(std::ptr::null_mut::<{target_inner_ty_str}>(), |r| {mutable_raw})"
                     )
                 } else if target_mutability {
                     utils::expr!(
-                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null_mut(), |r| (r as *const {inner_ty_str}).cast_mut())"
+                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null_mut::<{target_inner_ty_str}>(), |r| ({shared_raw}).cast_mut())"
                     )
                 } else {
                     utils::expr!(
-                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty_str})"
+                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null::<{target_inner_ty_str}>(), |r| {shared_raw})"
                     )
                 }
             }
             PtrKind::OptBox => {
                 if target_mutability && can_mutably_borrow_field {
                     utils::expr!(
-                        "({mutable_field_expr_str}).as_deref_mut().map_or(std::ptr::null_mut(), |r| r as *mut {inner_ty_str})"
+                        "({mutable_field_expr_str}).as_deref_mut().map_or(std::ptr::null_mut::<{target_inner_ty_str}>(), |r| {mutable_raw})"
                     )
                 } else if target_mutability {
                     utils::expr!(
-                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null_mut(), |r| (r as *const {inner_ty_str}).cast_mut())"
+                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null_mut::<{target_inner_ty_str}>(), |r| ({shared_raw}).cast_mut())"
                     )
                 } else {
                     utils::expr!(
-                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null(), |r| r as *const {inner_ty_str})"
+                        "({shared_field_expr_str}).as_deref().map_or(std::ptr::null::<{target_inner_ty_str}>(), |r| {shared_raw})"
                     )
                 }
             }
@@ -5675,24 +5700,24 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         &mutable_field_expr,
                         true,
                         true,
-                        inner_ty,
-                        inner_ty,
+                        target_inner_ty,
+                        source_inner_ty,
                     )
                 } else if target_mutability {
                     self.raw_from_slice_or_cursor(
                         &shared_field_expr,
                         true,
                         false,
-                        inner_ty,
-                        inner_ty,
+                        target_inner_ty,
+                        source_inner_ty,
                     )
                 } else {
                     self.raw_from_slice_or_cursor(
                         &shared_field_expr,
                         false,
                         false,
-                        inner_ty,
-                        inner_ty,
+                        target_inner_ty,
+                        source_inner_ty,
                     )
                 }
             }
@@ -7012,6 +7037,13 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     self.found = true;
                     return;
                 }
+                if hir_projection_root_local_id(expr).is_some_and(|id| id == self.target_hir_id)
+                    && let Some(field) = self.transform.promoted_field_slot_for_hir_field(expr)
+                    && self.transform.field_ptr_kind(field) == Some(PtrKind::SliceCursor(true))
+                {
+                    self.found = true;
+                    return;
+                }
                 intravisit::walk_expr(self, expr);
             }
         }
@@ -7345,8 +7377,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             )
             && let Some(lhs_inner_ty) =
                 expected_inner_ty.or_else(|| unwrap_ptr_from_mir_ty(lhs_ty).map(|(inner, _)| inner))
+            && let Some(source_inner_ty) = struct_field_raw_pointee_ty(self.tcx, field)
         {
-            *ptr = self.raw_from_promoted_field_expr(e, hir_e, m, lhs_inner_ty, field_kind);
+            *ptr = self.raw_from_promoted_field_expr(
+                e,
+                hir_e,
+                m,
+                lhs_inner_ty,
+                source_inner_ty,
+                field_kind,
+            );
             return PtrKind::Raw(m);
         }
         let mut pe = if let Some(pe) = self.ptr_expr(e, hir_e) {

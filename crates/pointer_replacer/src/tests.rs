@@ -10122,6 +10122,178 @@ pub unsafe fn call_mut_raw_bridge(mut buf: [u8; 8]) -> u8 {
 }
 
 #[test]
+fn test_field_raw_bridge_pointee_cast_shared_c_char_slice_to_const_c_void() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_read(ptr: *const core::ffi::c_void) -> i32;
+}
+
+#[repr(C)]
+pub struct Entry {
+    pub name: *const core::ffi::c_char,
+}
+
+pub unsafe fn read_second(ptr: *const core::ffi::c_char) -> core::ffi::c_char {
+    *ptr.offset(1)
+}
+
+pub unsafe fn call_raw_bridge(buf: [core::ffi::c_char; 8]) -> i32 {
+    let entry = Entry { name: buf.as_ptr() };
+    read_second(entry.name) as i32 + raw_read(entry.name as *const core::ffi::c_void)
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub name: &'a [core::ffi::c_char]",
+            "raw_read(if (entry.name).is_empty()",
+            "(entry.name).as_ptr()",
+        ],
+        &["pub name: *const core::ffi::c_char"],
+    );
+}
+
+#[test]
+fn test_field_raw_bridge_pointee_cast_mut_u8_slice_to_mut_c_void() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_write(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Entry {
+    pub data: *mut u8,
+}
+
+pub unsafe fn write_second(ptr: *mut u8) {
+    *ptr.offset(1) = 9;
+}
+
+pub unsafe fn call_raw_bridge(mut buf: [u8; 8]) -> u8 {
+    let entry = Entry {
+        data: buf.as_mut_ptr(),
+    };
+    write_second(entry.data);
+    raw_write(entry.data as *mut core::ffi::c_void);
+    *entry.data.offset(0)
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub data: &'a mut [u8]",
+            "raw_write(if (entry.data).is_empty()",
+            "(entry.data).as_mut_ptr()",
+        ],
+        &["pub data: *mut u8"],
+    );
+}
+
+#[test]
+fn test_field_raw_bridge_pointee_cast_shared_u8_slice_to_const_u16() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_word(ptr: *const u16) -> i32;
+}
+
+#[repr(C)]
+pub struct Entry {
+    pub bytes: *const u8,
+}
+
+pub unsafe fn read_second(ptr: *const u8) -> u8 {
+    *ptr.offset(1)
+}
+
+pub unsafe fn call_raw_bridge(buf: [u8; 8]) -> i32 {
+    let entry = Entry {
+        bytes: buf.as_ptr(),
+    };
+    read_second(entry.bytes) as i32 + raw_word(entry.bytes as *const u16)
+}
+"#,
+        &[
+            "pub struct Entry<'a>",
+            "pub bytes: &'a [u8]",
+            "raw_word(if (entry.bytes).is_empty()",
+            "(entry.bytes).as_ptr()",
+        ],
+        &["pub bytes: *const u8"],
+    );
+}
+
+#[test]
+fn test_field_raw_bridge_pointee_cast_shared_cursor_to_const_u16() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_word(ptr: *const u16) -> i32;
+}
+
+#[repr(C)]
+pub struct Window {
+    pub cursor: *const u8,
+}
+
+pub unsafe fn read_previous(ptr: *const u8) -> u8 {
+    *ptr.offset(-1)
+}
+
+pub unsafe fn call_raw_bridge(buf: [u8; 8]) -> i32 {
+    let window = Window {
+        cursor: buf.as_ptr().offset(4),
+    };
+    read_previous(window.cursor) as i32 + raw_word(window.cursor as *const u16)
+}
+"#,
+        &[
+            "pub struct Window<'a>",
+            "pub cursor: crate::slice_cursor::SliceCursor<'a, u8>",
+            "raw_word(if (window.cursor).is_empty()",
+            "(window.cursor).as_ptr()",
+        ],
+        &["pub cursor: *const u8"],
+    );
+}
+
+#[test]
+fn test_field_raw_bridge_pointee_cast_mut_cursor_to_mut_c_void() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn raw_write(ptr: *mut core::ffi::c_void);
+}
+
+#[repr(C)]
+pub struct Window {
+    pub cursor: *mut u8,
+}
+
+pub unsafe fn write_previous(ptr: *mut u8) {
+    *ptr.offset(-1) = 7;
+}
+
+pub unsafe fn call_raw_bridge(mut buf: [u8; 8]) -> u8 {
+    let window = Window {
+        cursor: buf.as_mut_ptr().offset(4),
+    };
+    write_previous(window.cursor);
+    raw_write(window.cursor as *mut core::ffi::c_void);
+    *window.cursor.offset(-1)
+}
+"#,
+        &[
+            "pub struct Window<'a>",
+            "pub cursor: crate::slice_cursor::SliceCursorMut<'a, u8>",
+            "raw_write(if (window.cursor).is_empty()",
+            "(window.cursor).as_mut_ptr()",
+        ],
+        &["pub cursor: *mut u8"],
+    );
+}
+
+#[test]
 fn test_replace_local_borrows_does_not_run_struct_array_field_pre_stage() {
     let code = r#"
 #[repr(C)]
