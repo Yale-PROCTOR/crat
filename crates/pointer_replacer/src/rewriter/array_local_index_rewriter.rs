@@ -2136,6 +2136,7 @@ impl UnsupportedDirectPlaceUseVisitor<'_, '_> {
             Derivation::Index(index) | Derivation::DependsOn(index, _) => {
                 index_init_expr(index.clone(), rewrite.nullable).is_none()
             }
+            Derivation::Conditional { .. } => false,
         } || assignment_index_arg_contains_planned_local(
             rhs,
             self.ast_to_hir,
@@ -2407,6 +2408,14 @@ enum Derivation {
     /// derivable; the `Vec<HirId>` lists the other planned members it derives
     /// from (reserved for the deferred dependency-cascade analysis).
     DependsOn(IndexExpr, Vec<HirId>),
+    /// a pointer-valued `if`/`else` whose branches each derive to an index
+    /// relative to the same group base.
+    Conditional {
+        then_index: IndexExpr,
+        else_index: IndexExpr,
+        #[allow(dead_code)]
+        deps: Vec<HirId>,
+    },
     /// not derivable; the &str is the trace reason.
     Unsupported(&'static str),
 }
@@ -2476,6 +2485,71 @@ fn derive_member_copy(
     ))
 }
 
+/// the trailing expression of a block of the form `{ <expr> }` (a single
+/// expression statement and nothing else). returns `None` otherwise.
+fn block_tail_expr(block: &Block) -> Option<&Expr> {
+    let [stmt] = block.stmts.as_slice() else {
+        return None;
+    };
+    match &stmt.kind {
+        StmtKind::Expr(expr) => Some(expr),
+        _ => None,
+    }
+}
+
+/// derives a pointer-valued `if cond { a } else { b }` assigned to a member,
+/// where both branch tails derive to an index against the same anchor.
+fn derive_member_conditional(
+    rhs: &Expr,
+    rewrite: &BindingRewrite,
+    ctx: &DerivationCtx<'_, '_>,
+) -> Derivation {
+    let ExprKind::If(_cond, then_block, Some(else_expr)) = &rhs.kind else {
+        return Derivation::Unsupported("conditional cursor update without an else branch");
+    };
+    let (Some(then_tail), ExprKind::Block(else_block, _)) =
+        (block_tail_expr(then_block), &else_expr.kind)
+    else {
+        return Derivation::Unsupported("conditional branch is not a simple block");
+    };
+    let Some(else_tail) = block_tail_expr(else_block) else {
+        return Derivation::Unsupported("conditional else branch is not a simple block");
+    };
+    let mut deps = Vec::new();
+    let then_index = match derive_member_index(then_tail, rewrite, ctx) {
+        Derivation::Index(index) => index,
+        Derivation::DependsOn(index, d) => {
+            deps.extend(d);
+            index
+        }
+        _ => return Derivation::Unsupported("conditional then branch is not index-derivable"),
+    };
+    let else_index = match derive_member_index(else_tail, rewrite, ctx) {
+        Derivation::Index(index) => index,
+        Derivation::DependsOn(index, d) => {
+            deps.extend(d);
+            index
+        }
+        _ => return Derivation::Unsupported("conditional else branch is not index-derivable"),
+    };
+    // both branches must be expressible for the destination's nullability. a
+    // `Null` branch is only expressible for a nullable destination, so this also
+    // enforces the spec's null-branch rule. (`IndexExpr` already derives `Clone`
+    // — the validation site at ~2136 calls `index.clone()`.)
+    if index_init_expr(then_index.clone(), rewrite.nullable).is_none()
+        || index_init_expr(else_index.clone(), rewrite.nullable).is_none()
+    {
+        return Derivation::Unsupported(
+            "conditional branch is null for a non-nullable destination",
+        );
+    }
+    Derivation::Conditional {
+        then_index,
+        else_index,
+        deps,
+    }
+}
+
 fn derive_member_index(
     rhs: &Expr,
     rewrite: &BindingRewrite,
@@ -2490,6 +2564,9 @@ fn derive_member_index(
     // direct member copy: q = p where p is another planned member of the same group.
     if let Some(derivation) = derive_member_copy(rhs, rewrite, ctx) {
         return derivation;
+    }
+    if let ExprKind::If(..) = &rhs.kind {
+        return derive_member_conditional(rhs, rewrite, ctx);
     }
     let ExprKind::MethodCall(call) = &rhs.kind else {
         return Derivation::Unsupported("member RHS is not base-derived or a method call");
@@ -3195,6 +3272,30 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         }
     }
 
+    /// builds the index RHS for a conditional cursor update: visits the original
+    /// condition (rewriting pointer uses such as `*q`) and assembles
+    /// `if <cond'> { then } else { else }`. `rhs` is the original `if` expression.
+    fn conditional_index_rhs(
+        &mut self,
+        rhs: &mut Expr,
+        then_index: IndexExpr,
+        else_index: IndexExpr,
+        nullable: bool,
+    ) -> Option<Expr> {
+        let then_rhs = index_assignment_rhs_expr(then_index, nullable)?;
+        let else_rhs = index_assignment_rhs_expr(else_index, nullable)?;
+        let ExprKind::If(cond, _, _) = &mut rhs.kind else {
+            return None;
+        };
+        self.visit_expr(cond);
+        Some(utils::expr!(
+            "if {} {{ {} }} else {{ {} }}",
+            pprust::expr_to_string(cond),
+            pprust::expr_to_string(&then_rhs),
+            pprust::expr_to_string(&else_rhs)
+        ))
+    }
+
     fn rewrite_materialized_local_stmt(&mut self, local: &mut rustc_ast::Local) -> Option<Stmt> {
         let let_stmt = self.ast_to_hir.get_let_stmt(local.id, self.tcx)?;
         let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind else {
@@ -3224,6 +3325,7 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         };
         let index = match derive_index(init, Anchor::Member(&rewrite), &ctx) {
             Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
+            Derivation::Conditional { .. } => IndexExpr::Unsupported,
             Derivation::Unsupported(_) => IndexExpr::Unsupported,
         };
         let Some(new_index_init) = index_init_expr(index, rewrite.nullable) else {
@@ -3348,11 +3450,19 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                     introduced: Some(&self.introduced_hir_ids),
                     allow_member_pointer_form: true,
                 };
-                let index = match derive_index(rhs, Anchor::Member(&rewrite), &ctx) {
-                    Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
-                    Derivation::Unsupported(_) => IndexExpr::Unsupported,
+                let derivation = derive_index(rhs, Anchor::Member(&rewrite), &ctx);
+                let new_rhs = match derivation {
+                    Derivation::Index(index) | Derivation::DependsOn(index, _) => {
+                        index_assignment_rhs_expr(index, rewrite.nullable)
+                    }
+                    Derivation::Conditional {
+                        then_index,
+                        else_index,
+                        ..
+                    } => self.conditional_index_rhs(rhs, then_index, else_index, rewrite.nullable),
+                    Derivation::Unsupported(_) => None,
                 };
-                if let Some(new_rhs) = index_assignment_rhs_expr(index, rewrite.nullable) {
+                if let Some(new_rhs) = new_rhs {
                     let idx_stmt = utils::stmt!(
                         "{} = {};",
                         rewrite.index_name,
@@ -3415,6 +3525,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         };
         let index = match derive_index(init, Anchor::Member(&rewrite), &ctx) {
             Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
+            Derivation::Conditional { .. } => IndexExpr::Unsupported,
             Derivation::Unsupported(_) => IndexExpr::Unsupported,
         };
         let Some(new_init) = index_init_expr(index, rewrite.nullable) else {
@@ -3465,6 +3576,7 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                     };
                     let index = match derive_index(rhs, Anchor::Base(rewrite), &ctx) {
                         Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
+                        Derivation::Conditional { .. } => IndexExpr::Unsupported,
                         Derivation::Unsupported(_) => IndexExpr::Unsupported,
                     };
                     if let IndexExpr::Plain(new_rhs) = index {
@@ -3491,12 +3603,22 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                         introduced: Some(&self.introduced_hir_ids),
                         allow_member_pointer_form: true,
                     };
-                    let index = match derive_index(rhs, Anchor::Member(rewrite), &ctx) {
-                        Derivation::Index(index) | Derivation::DependsOn(index, _) => index,
-                        Derivation::Unsupported(_) => IndexExpr::Unsupported,
+                    let derivation = derive_index(rhs, Anchor::Member(rewrite), &ctx);
+                    let index_name = rewrite.index_name.clone();
+                    let nullable = rewrite.nullable;
+                    let new_rhs = match derivation {
+                        Derivation::Index(index) | Derivation::DependsOn(index, _) => {
+                            index_assignment_rhs_expr(index, nullable)
+                        }
+                        Derivation::Conditional {
+                            then_index,
+                            else_index,
+                            ..
+                        } => self.conditional_index_rhs(rhs, then_index, else_index, nullable),
+                        Derivation::Unsupported(_) => None,
                     };
-                    if let Some(new_rhs) = index_assignment_rhs_expr(index, rewrite.nullable) {
-                        *lhs = P(utils::expr!("{}", rewrite.index_name));
+                    if let Some(new_rhs) = new_rhs {
+                        *lhs = P(utils::expr!("{}", index_name));
                         *rhs = P(new_rhs);
                         self.changed = true;
                     } else {

@@ -9796,10 +9796,9 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
 
 #[test]
 fn test_array_local_partial_group_characterization() {
-    // characterization of the spec's partial_group() shape on the pre-item-6
-    // implementation. q's `if`-RHS reassignment is unsupported (rejected at
-    // prune); p is an independent member. updated to the fixpoint expectation
-    // in the dependency-pruning unit.
+    // characterization of the spec's partial_group() shape. with conditional
+    // cursor support (task 2), q's `if`-RHS is now derivable: both branches
+    // express as index values relative to `p_idx`, so q is fully index-rewritten.
     let code = r#"
 pub unsafe fn partial_group() -> i32 {
     let mut buf = [0i32; 4];
@@ -9814,15 +9813,14 @@ pub unsafe fn partial_group() -> i32 {
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
     // the rewritten source must always compile (no undeclared *_idx).
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    // pinned observations: p is rewritten to p_idx, q stays a raw pointer.
-    assert!(changed, "p should be rewritten: {s}");
+    // both p and q are now index-rewritten.
+    assert!(changed, "p and q should be rewritten: {s}");
     assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
     assert!(
         s.contains("let mut p_idx: isize = 0isize"),
         "p_idx initialized: {s}"
     );
-    assert!(s.contains("let mut q"), "q stays a raw pointer: {s}");
-    assert!(!s.contains("q_idx"), "q is not index-rewritten: {s}");
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
     assert!(
         s.contains("(buf).as_ptr().offset(p_idx) as *mut i32"),
         "p accesses use buf base with p_idx: {s}"
@@ -9876,6 +9874,79 @@ pub unsafe fn foo(mut base: *mut i32, other: *mut i32, n: isize) -> i32 {
         "cross-group copy stays raw: {s}"
     );
     assert!(!s.contains("q_idx"), "q not index-rewritten: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_member_relative_conditional() {
+    // p is updated by a conditional whose branches are q.offset(1) and q (a
+    // sibling member). it must lower to an index-valued conditional.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    q = q.offset(1);
+    p = if *q != 0 { q.offset(1) } else { q };
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the emitted form splits `p_idx =` and `if` across a line break, so check
+    // both parts independently.
+    assert!(
+        s.contains("p_idx ="),
+        "p updated via an index assignment: {s}"
+    );
+    assert!(
+        s.contains("if *((base).offset(q_idx)"),
+        "condition rewrites *q to base-indexed deref: {s}"
+    );
+    assert!(
+        s.contains("(q_idx) + ((1) as isize)"),
+        "then branch is q_idx+1: {s}"
+    );
+    assert!(s.contains("else { q_idx }"), "else branch is q_idx: {s}");
+    assert!(
+        !s.contains("p = if"),
+        "no raw pointer conditional for p: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_base_relative_conditional() {
+    // both branches derive from the base; indices 2 and 0. a second member `p`
+    // ensures the planner forms a group (a lone `q = base` with no offset may
+    // not trigger planning).
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, c: bool) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base;
+    q = if c { base.offset(2) } else { base };
+    *q + *p
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx"), "q rewritten with index: {s}");
+    assert!(!s.contains("q = if"), "no raw pointer conditional: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_conditional_without_else() {
+    // a conditional missing an else branch is unsupported; q stays raw.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut q: *mut i32 = base.offset(n);
+    if c { q = q.offset(1); }
+    *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // an `if` statement (no else, not an assignment RHS) is not a conditional
+    // cursor update; q's self-advance inside it stays handled as today.
 }
 
 #[test]
