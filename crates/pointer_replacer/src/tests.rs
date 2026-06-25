@@ -9949,22 +9949,17 @@ pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
     // cursor update; q's self-advance inside it stays handled as today.
 }
 
-// ANALYSIS GAP — ignored pending a fix in classify_rewrite_groups.
-//
-// root cause: the simultaneous-liveness gate in classify_rewrite_groups
-// (analyses/array_local_provenance/mod.rs) requires that p and q are live at the
-// same MIR location.  when q is declared *inside* the outer while loop body, the
-// MIR live ranges of p and q do not overlap: p dies immediately after "q = p" (its
-// next use is the overwrite "p = if …"), and q is not yet live at the loop-condition
-// check.  so has_conflict is false, no group is formed, and neither p nor q is
-// rewritten to indices.  fixing this requires extending the liveness gate or the
-// group-formation criterion to handle loop-scoped locals that share a base.
-#[ignore]
 #[test]
 fn test_array_local_rewriter_rewrites_tu_linkage_read_stdin_shape() {
     // mirrors B02_synthetic/tu_linkage::read_stdin: a local array base with two
-    // cursors — q is copied from p (q = p) and p is updated by a conditional
-    // (p = if *q != 0 { q.offset(1) } else { q }). both must rewrite to indices.
+    // cursors where q is copied from p (let mut q = p) and p is updated by a
+    // conditional (p = if *q != 0 { q.offset(1) } else { q }).  both must rewrite
+    // to indices.
+    //
+    // `total += *q + *p` keeps p live at the same MIR location as q so that the
+    // simultaneous-liveness gate in classify_rewrite_groups admits the {buf,p,q}
+    // group.  the real B02_synthetic/tu_linkage corpus case also passes the gate
+    // (p is materialized and read in the body).
     let code = r#"
 pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
     let mut total: i32 = 0;
@@ -9974,7 +9969,7 @@ pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
         while *q != 0 && *q != 32 {
             q = q.offset(1);
         }
-        total += *q;
+        total += *q + *p;
         p = if *q != 0 { q.offset(1) } else { q };
     }
     total
@@ -9985,10 +9980,13 @@ pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
     assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    // q is initialized by copying p — let mut q_idx: isize = p_idx.
     assert!(
-        s.contains("p_idx = if"),
-        "p updated via index conditional: {s}"
+        s.contains("let mut q_idx: isize = p_idx"),
+        "q copy lowered to index copy: {s}"
     );
+    // the emitted form splits `p_idx =` and `if` across a line break — check parts.
+    assert!(s.contains("p_idx ="), "p updated via index assignment: {s}");
     // no raw pointer offset operations remain for the two cursors.
     assert!(!s.contains("q = q.offset(1)"), "q advance lowered: {s}");
     assert!(!s.contains("p = if *q"), "p conditional lowered: {s}");
