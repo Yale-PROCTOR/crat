@@ -9828,3 +9828,80 @@ pub unsafe fn partial_group() -> i32 {
         "p accesses use buf base with p_idx: {s}"
     );
 }
+
+#[test]
+fn test_array_local_rewriter_copies_group_member_in_init_and_assignment() {
+    // q is initialized and re-assigned by directly copying p (another member of
+    // the same {base, p, q} group). both must lower to an index copy q_idx = p_idx.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    *q = 1;
+    q = p;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten: {s}");
+    assert!(s.contains("q_idx"), "q rewritten: {s}");
+    // both the init and the assignment copy the index.
+    assert!(s.matches("q_idx").count() >= 2, "q copied from p_idx: {s}");
+    assert!(
+        !s.contains("let mut q: *mut i32 = p"),
+        "raw copy removed: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_cross_group_copy() {
+    // q is copied from `other`, a raw pointer that is NOT in q's group. q must
+    // stay raw (item-6 model) and the output must still compile.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, other: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = other;
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("let mut q: *mut i32 = other"),
+        "cross-group copy stays raw: {s}"
+    );
+    assert!(!s.contains("q_idx"), "q not index-rewritten: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_copies_nullable_group_member() {
+    // q starts null (Option<isize>) and is later copied from p; the copy must
+    // preserve the Option value (q_idx = p_idx), not re-wrap it.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut p: *mut i32 = std::ptr::null_mut();
+    if c { p = base.offset(n); }
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p;
+    if !q.is_null() { *q = 7; }
+    0
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // p and q are Option<isize>; the copy is a plain Option assignment.
+    assert!(
+        s.contains("q_idx = p_idx"),
+        "nullable copy preserves the Option: {s}"
+    );
+    assert!(
+        !s.contains("q_idx = Some(p_idx)"),
+        "no re-wrap of the Option: {s}"
+    );
+}

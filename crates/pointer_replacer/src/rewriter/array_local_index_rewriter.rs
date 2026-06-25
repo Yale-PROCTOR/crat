@@ -2369,6 +2369,9 @@ fn direct_local_hir_id(ast_to_hir: &AstToHir, tcx: TyCtxt<'_>, expr: &Expr) -> O
 #[derive(Clone)]
 enum IndexExpr {
     Plain(Expr),
+    /// an index expression already in the target representation (`isize` or
+    /// `Option<isize>`); emitted verbatim, never wrapped. used for member copies.
+    Verbatim(Expr),
     Null,
     Unsupported,
 }
@@ -2417,6 +2420,62 @@ fn derive_index(rhs: &Expr, anchor: Anchor<'_>, ctx: &DerivationCtx<'_, '_>) -> 
     }
 }
 
+/// derives `q = other` where `other` is a direct path to another planned member
+/// of the same group. returns `None` if `rhs` is not a path to a group member
+/// (so derivation falls through to the method-call forms); returns
+/// `Some(Unsupported)` if it is a member copy but not expressible.
+fn derive_member_copy(
+    rhs: &Expr,
+    rewrite: &BindingRewrite,
+    ctx: &DerivationCtx<'_, '_>,
+) -> Option<Derivation> {
+    let other_hir_id = hir_id_of_ast_expr(ctx.ast_to_hir, ctx.tcx, rhs.id)?;
+    if !rewrite.group_member_hir_ids.contains(&other_hir_id) {
+        return None;
+    }
+    let other = ctx.plan.by_hir_id.get(&other_hir_id)?;
+    if other.base_hir_id != rewrite.base_hir_id || other.base_name != rewrite.base_name {
+        return None;
+    }
+    if other.nullable != rewrite.nullable {
+        return Some(Derivation::Unsupported(
+            "member copy with mismatched nullability",
+        ));
+    }
+    // introduced (or, during validation, treated as available): copy the index
+    // value verbatim (q_idx = other_idx), preserving the null state for nullable
+    // members.
+    if ctx
+        .introduced
+        .is_none_or(|introduced| introduced.contains(&other_hir_id))
+    {
+        return Some(Derivation::DependsOn(
+            IndexExpr::Verbatim(utils::expr!("{}", other.index_name)),
+            vec![other_hir_id],
+        ));
+    }
+    // not introduced: `other` is still a raw pointer at runtime, so compute the
+    // index via `offset_from` (a non-null index, so `Plain` wraps correctly for
+    // a nullable destination). only at assignment sites, matching item 6.
+    if ctx.allow_member_pointer_form {
+        let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
+        let base_ptr = base_offset_expr_for_index(rewrite, base_index);
+        let relative = utils::expr!(
+            "({}).offset_from({})",
+            pprust::expr_to_string(rhs),
+            base_ptr
+        );
+        let index = match base_current_index_expr(rewrite) {
+            Some(name) => add_index_expr(name, &relative),
+            None => relative,
+        };
+        return Some(Derivation::Index(IndexExpr::Plain(index)));
+    }
+    Some(Derivation::Unsupported(
+        "member copy from a not-introduced member at an initializer site",
+    ))
+}
+
 fn derive_member_index(
     rhs: &Expr,
     rewrite: &BindingRewrite,
@@ -2428,6 +2487,10 @@ fn derive_member_index(
         index => return Derivation::Index(index),
     }
     let rhs = unwrap_pointer_producing_expr(rhs);
+    // direct member copy: q = p where p is another planned member of the same group.
+    if let Some(derivation) = derive_member_copy(rhs, rewrite, ctx) {
+        return derivation;
+    }
     let ExprKind::MethodCall(call) = &rhs.kind else {
         return Derivation::Unsupported("member RHS is not base-derived or a method call");
     };
@@ -2940,6 +3003,7 @@ fn index_init_expr(index: IndexExpr, nullable: bool) -> Option<Expr> {
         (IndexExpr::Plain(expr), true) => {
             Some(utils::expr!("Some({})", pprust::expr_to_string(&expr)))
         }
+        (IndexExpr::Verbatim(expr), _) => Some(expr),
         (IndexExpr::Null, true) => Some(utils::expr!("None")),
         (IndexExpr::Null, false) | (IndexExpr::Unsupported, _) => None,
     }
@@ -3124,7 +3188,9 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
             return Some(idx_read_expr(rewrite));
         }
         match pointer_index_from_base_expr(expr, self.ast_to_hir, self.tcx, anchor) {
-            IndexExpr::Plain(index) => Some(pprust::expr_to_string(&index)),
+            IndexExpr::Plain(index) | IndexExpr::Verbatim(index) => {
+                Some(pprust::expr_to_string(&index))
+            }
             IndexExpr::Null | IndexExpr::Unsupported => None,
         }
     }
