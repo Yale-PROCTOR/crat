@@ -6629,11 +6629,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             ),
             _ => return None,
         };
-        let receiver_str = pprust::expr_to_string(&receiver);
-        let has_side_effects = utils::ast::has_side_effects(&receiver);
-        Some(self.raw_from_slice_or_cursor_projected_str(
-            &receiver_str,
-            has_side_effects,
+        Some(self.raw_from_slice_or_cursor_projected_expr(
+            &receiver,
             SliceRawPtrBridge {
                 target_mutability: expected_mutability,
                 source_mutability,
@@ -9995,7 +9992,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             PtrKind::Slice(true) | PtrKind::SliceCursor(true)
         ));
         let base = self.projected_expr(pe, false, false);
-        let base_str = pprust::expr_to_string(&base);
         let build = |receiver: &str| {
             let raw = self.slice_or_cursor_raw_ptr_expr_str(
                 receiver,
@@ -10024,28 +10020,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             _ => unreachable!(),
         };
-        if utils::ast::has_side_effects(&base) {
-            let non_empty = build("_x");
-            utils::expr!(
-                "{{
-                    let _x = {base_str};
-                    if _x.is_empty() {{
-                        {empty}
-                    }} else {{
-                        {non_empty}
-                    }}
-                }}"
-            )
-        } else {
-            let non_empty = build(&base_str);
-            utils::expr!(
-                "if ({base_str}).is_empty() {{
-                    {empty}
-                }} else {{
-                    {non_empty}
-                }}"
-            )
-        }
+        self.empty_checked_slice_or_cursor_expr(&base, false, empty, build)
     }
 
     fn slice_or_cursor_raw_ptr_expr_str(
@@ -10079,10 +10054,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         )
     }
 
-    fn raw_from_slice_or_cursor_projected_str(
+    fn raw_from_slice_or_cursor_projected_expr(
         &self,
-        e: &str,
-        has_side_effects: bool,
+        e: &Expr,
         bridge: SliceRawPtrBridge<'tcx>,
         project_raw: impl FnOnce(String) -> String,
     ) -> Expr {
@@ -10094,55 +10068,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             rhs_inner_ty,
         } = bridge;
         let null = self.null_raw_ptr_expr_str(m, null_inner_ty);
-        if has_side_effects {
-            let bind_mut = if m && m1 { "mut " } else { "" };
+        self.empty_checked_slice_or_cursor_expr(e, m && m1, &null, |receiver| {
             let raw =
-                self.slice_or_cursor_raw_ptr_expr_str("_x", m, m1, raw_inner_ty, rhs_inner_ty);
-            let raw = project_raw(raw);
-            utils::expr!(
-                "{{
-                    let {bind_mut}_x = {e};
-                    if _x.is_empty() {{
-                        {null}
-                    }} else {{
-                        {raw}
-                    }}
-                }}"
-            )
-        } else {
-            let raw = self.slice_or_cursor_raw_ptr_expr_str(e, m, m1, raw_inner_ty, rhs_inner_ty);
-            let raw = project_raw(raw);
-            utils::expr!(
-                "if ({e}).is_empty() {{
-                    {null}
-                }} else {{
-                    {raw}
-                }}"
-            )
-        }
-    }
-
-    fn raw_from_slice_or_cursor_str(
-        &self,
-        e: &str,
-        has_side_effects: bool,
-        m: bool,
-        m1: bool,
-        lhs_inner_ty: ty::Ty<'tcx>,
-        rhs_inner_ty: ty::Ty<'tcx>,
-    ) -> Expr {
-        self.raw_from_slice_or_cursor_projected_str(
-            e,
-            has_side_effects,
-            SliceRawPtrBridge {
-                target_mutability: m,
-                source_mutability: m1,
-                null_inner_ty: lhs_inner_ty,
-                raw_inner_ty: lhs_inner_ty,
-                rhs_inner_ty,
-            },
-            |raw| raw,
-        )
+                self.slice_or_cursor_raw_ptr_expr_str(receiver, m, m1, raw_inner_ty, rhs_inner_ty);
+            project_raw(raw)
+        })
     }
 
     fn empty_checked_slice_or_cursor_expr<F>(
@@ -10153,15 +10083,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         non_empty_expr: F,
     ) -> Expr
     where
-        F: std::ops::Fn(&str) -> String,
+        F: std::ops::FnOnce(&str) -> String,
     {
         let e_str = pprust::expr_to_string(e);
         if utils::ast::has_side_effects(e) {
+            let init = cached_slice_or_cursor_init_expr_str(e, bind_mut);
             let bind_mut = if bind_mut { "mut " } else { "" };
             let non_empty = non_empty_expr("_x");
             utils::expr!(
                 "{{
-                    let {bind_mut}_x = {e_str};
+                    let {bind_mut}_x = {init};
                     if _x.is_empty() {{
                         {empty_expr}
                     }} else {{
@@ -10260,13 +10191,16 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        self.raw_from_slice_or_cursor_str(
-            &pprust::expr_to_string(e),
-            utils::ast::has_side_effects(e),
-            m,
-            m1,
-            lhs_inner_ty,
-            rhs_inner_ty,
+        self.raw_from_slice_or_cursor_projected_expr(
+            e,
+            SliceRawPtrBridge {
+                target_mutability: m,
+                source_mutability: m1,
+                null_inner_ty: lhs_inner_ty,
+                raw_inner_ty: lhs_inner_ty,
+                rhs_inner_ty,
+            },
+            |raw| raw,
         )
     }
 
@@ -21474,6 +21408,26 @@ fn block_tail_expr(block: &Block) -> Option<&Expr> {
     Some(expr)
 }
 
+fn cached_slice_or_cursor_init_expr_str(expr: &Expr, borrow_mut: bool) -> String {
+    let expr_str = pprust::expr_to_string(expr);
+    if slice_range_projection_needs_binding_borrow(expr) {
+        if borrow_mut {
+            format!("&mut ({expr_str})")
+        } else {
+            format!("&({expr_str})")
+        }
+    } else {
+        expr_str
+    }
+}
+
+fn slice_range_projection_needs_binding_borrow(expr: &Expr) -> bool {
+    let ExprKind::Index(_, index, _) = &unwrap_paren(expr).kind else {
+        return false;
+    };
+    matches!(unwrap_paren(index).kind, ExprKind::Range(..))
+}
+
 fn is_plain_slice_expr(expr: &Expr) -> bool {
     let expr = unwrap_paren(expr);
     if matches!(expr.kind, ExprKind::Index(..) | ExprKind::Array(..)) {
@@ -21797,6 +21751,48 @@ mod tests {
         rewriter::{Config, replace_local_borrows},
         utils::rustc::RustProgram,
     };
+
+    #[test]
+    fn cached_slice_or_cursor_init_borrows_shared_range_projection() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let expr = utils::expr!("slice[(idx) as usize..]");
+            let init = cached_slice_or_cursor_init_expr_str(&expr, false);
+            assert!(init.starts_with("&("), "{init}");
+            assert!(!init.starts_with("&mut"), "{init}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_slice_or_cursor_init_borrows_mut_range_projection() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let expr = utils::expr!("slice[(idx) as usize..]");
+            let init = cached_slice_or_cursor_init_expr_str(&expr, true);
+            assert!(init.starts_with("&mut ("), "{init}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_slice_or_cursor_init_does_not_borrow_scalar_index() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let expr = utils::expr!("slice[(idx) as usize]");
+            let init = cached_slice_or_cursor_init_expr_str(&expr, false);
+            assert!(!init.starts_with("&"), "{init}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_slice_or_cursor_init_does_not_reborrow_existing_slice_ref() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let expr = utils::expr!("&(slice[(idx) as usize..])");
+            let init = cached_slice_or_cursor_init_expr_str(&expr, false);
+            assert!(!init.starts_with("&(&"), "{init}");
+            assert!(!init.starts_with("&mut"), "{init}");
+        })
+        .unwrap();
+    }
 
     fn with_simplified_cursor_projection(source: &str, check: impl FnOnce(&Expr) + Send) {
         utils::compilation::run_compiler_on_str("fn f() {}", move |_| {

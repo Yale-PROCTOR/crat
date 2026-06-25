@@ -7016,6 +7016,206 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_unsized_projection_shared_slice_offset_to_raw_output_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+pub unsafe fn shared_tail(mut commit: *const Commit, out: *mut *const core::ffi::c_char) {
+    let _header = (*commit.offset(0)).header;
+    *out.offset(0) =
+        (commit as *const core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize);
+}
+"#,
+        &[
+            "mut commit: &[crate::Commit]",
+            "mut out: &mut [*const i8]",
+            "std::slice::from_raw_parts",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            ".as_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_mut_slice_offset_returned_as_raw_pointer_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+pub unsafe fn mut_tail(mut commit: *mut Commit) -> *mut core::ffi::c_char {
+    (*commit.offset(0)).header = 1;
+    (commit as *mut core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize)
+}
+"#,
+        &[
+            "mut commit: &mut [crate::Commit]",
+            "std::slice::from_raw_parts_mut",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            "_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_range_used_as_raw_function_argument_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+extern "C" {
+    fn consume_tail(ptr: *const core::ffi::c_char);
+}
+
+pub unsafe fn call_tail(mut commit: *const Commit) -> u32 {
+    let header = (*commit.offset(0)).header;
+    consume_tail((commit as *const core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize));
+    header
+}
+"#,
+        &[
+            "mut commit: &[crate::Commit]",
+            "std::slice::from_raw_parts",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            ".as_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_range_returned_as_raw_pointer_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+pub unsafe fn return_tail(mut commit: *const Commit) -> *const core::ffi::c_char {
+    let _header = (*commit.offset(0)).header;
+    (commit as *const core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize)
+}
+"#,
+        &[
+            "mut commit: &[crate::Commit]",
+            "pub unsafe fn return_tail",
+            "std::slice::from_raw_parts",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            ".as_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_range_stored_in_raw_output_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+pub unsafe fn store_tail(mut commit: *mut Commit, out: *mut *mut core::ffi::c_char) {
+    (*commit.offset(0)).header = 1;
+    *out.offset(0) =
+        (commit as *mut core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize);
+}
+"#,
+        &[
+            "mut commit: &mut [crate::Commit]",
+            "mut out: &mut [*mut i8]",
+            "std::slice::from_raw_parts_mut",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            ".as_mut_ptr()",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_offset_from_projected_byte_slice_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+pub unsafe fn projected_distance(mut commit: *const Commit) -> isize {
+    let _header = (*commit.offset(0)).header;
+    (commit as *const core::ffi::c_char)
+        .offset(core::mem::size_of::<Commit>() as isize)
+        .offset_from((commit as *const core::ffi::c_char).offset(core::mem::size_of::<u32>() as isize))
+}
+"#,
+        &[
+            "mut commit: &[crate::Commit]",
+            "std::slice::from_raw_parts",
+            "core::mem::size_of::<Commit>()",
+            "core::mem::size_of::<u32>()",
+            "as usize..",
+            ".as_ptr()",
+            ".offset_from",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_unsized_projection_cast_reslice_offset_to_raw_char_typechecks() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub header: u32,
+    pub payload: u32,
+}
+
+extern "C" {
+    fn consume_payload(ptr: *mut core::ffi::c_char);
+}
+
+pub unsafe fn commit_payload(mut commit: *mut Commit) {
+    (*commit.offset(0)).header = 1;
+    consume_payload((commit as *mut core::ffi::c_char).offset(core::mem::size_of::<Commit>() as isize));
+}
+"#,
+        &[
+            "mut commit: &mut [crate::Commit]",
+            "std::slice::from_raw_parts_mut",
+            "core::mem::size_of::<Commit>()",
+            "as usize..",
+            ".as_mut_ptr()",
+        ],
+        &[],
+    );
+}
+
 // ===== visit_expr code path tests =====
 
 /// Binary pointer comparison (ExprKind::Binary with comparison ops on pointer-typed operands).
