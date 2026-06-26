@@ -13641,6 +13641,174 @@ pub unsafe extern "C" fn list_branches() -> i32 {
 }
 
 #[test]
+fn test_pointer_output_call_keeps_local_storage_raw_with_mut_address() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    set_slot(&mut p, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "let mut p: *mut i32",
+            "set_slot(std::slice::from_mut(&mut (p))",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_call_keeps_local_storage_raw_with_raw_mut_address() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    set_slot(&raw mut p, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "let mut p: *mut i32",
+            "set_slot(std::slice::from_mut(&mut (p))",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_wrapper_keeps_forwarded_local_storage_raw() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn forward(mut out: *mut *mut i32, mut value: *mut i32) {
+    set_slot(out, value);
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    forward(&mut p, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "pub unsafe fn forward(mut out: &mut [*mut i32]",
+            "let mut p: *mut i32",
+            "forward(std::slice::from_mut(&mut (p))",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_alias_call_keeps_local_storage_raw() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    let out: *mut *mut i32 = &raw mut p;
+    set_slot(out, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "let mut p: *mut i32",
+            "set_slot(",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_call_keeps_caller_parameter_storage_raw() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn caller(mut p: *mut i32, mut value: *mut i32, idx: usize) -> i32 {
+    set_slot(&mut p, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "pub unsafe fn caller(mut p: *mut i32",
+            "set_slot(std::slice::from_mut(&mut (p))",
+        ],
+        &[
+            "pub unsafe fn caller(mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_fn_ptr_call_keeps_local_storage_raw() {
+    run_test(
+        r#"
+pub unsafe fn set_slot(mut out: *mut *mut i32, mut value: *mut i32) {
+    *out.offset(0) = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let cb: unsafe fn(*mut *mut i32, *mut i32) = set_slot;
+    let mut p: *mut i32 = value;
+    cb(&mut p, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn set_slot(mut out: &mut [*mut i32]",
+            "let mut p: *mut i32",
+            "std::slice::from_mut(&mut (p))",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "std::slice::from_raw_parts_mut(&raw mut (p) as *mut _",
+            "&raw mut (p) as",
+        ],
+    );
+}
+
+#[test]
 fn test_section4_keeps_opaque_foreign_api_handle_raw() {
     run_test(
         r#"

@@ -2346,6 +2346,12 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 collect_raw_local_assignment_bindings(rust_program.tcx, &ptr_kinds);
             let fn_ptr_raw_call_arg_bindings =
                 collect_fn_ptr_raw_call_arg_bindings(rust_program.tcx, &fn_ptr_rewrite);
+            let pointer_output_storage_bindings = collect_pointer_output_storage_bindings(
+                rust_program.tcx,
+                &sig_decs,
+                &ptr_kinds,
+                Some(&fn_ptr_rewrite),
+            );
             record_binding_events_excluding(
                 &mut diagnostics,
                 rust_program.tcx,
@@ -2369,6 +2375,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 &fn_ptr_raw_call_arg_bindings,
                 &forced_raw_bindings,
                 DecisionReason::RawLocalCallArg,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &pointer_output_storage_bindings,
+                &forced_raw_bindings,
+                DecisionReason::PointerOutputStorage,
             );
             for hir_id in &raw_local_assignment_bindings {
                 if param_index_for_binding(rust_program.tcx, *hir_id).is_some()
@@ -2483,6 +2497,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     DecisionReason::RawLocalCallArg,
                 ),
                 (
+                    &pointer_output_storage_bindings,
+                    DecisionReason::PointerOutputStorage,
+                ),
+                (
                     &unsupported_box_target_bindings,
                     DecisionReason::UnsupportedBoxTarget,
                 ),
@@ -2504,6 +2522,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);
             forced_raw_bindings.extend(fn_ptr_raw_call_arg_bindings);
+            forced_raw_bindings.extend(pointer_output_storage_bindings);
             forced_raw_bindings.extend(unsupported_box_target_bindings);
             forced_raw_bindings.extend(unsupported_box_usage_bindings);
             if forced_raw_bindings.len() != old_len {
@@ -15610,6 +15629,186 @@ fn callback_raw_arg_source_binding(expr: &hir::Expr<'_>) -> Option<HirId> {
     }
 }
 
+fn collect_pointer_output_storage_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    fn_ptr_rewrite: Option<&FnPtrRewriteDecision>,
+) -> FxHashSet<HirId> {
+    struct PointerOutputStorageVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        fn_ptr_rewrite: Option<&'a FnPtrRewriteDecision>,
+        aliases: FxHashMap<HirId, HirId>,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> PointerOutputStorageVisitor<'_, 'tcx> {
+        fn update_alias(&mut self, alias: HirId, init: &'tcx hir::Expr<'tcx>) {
+            if pointer_output_storage_alias_type(self.tcx, alias)
+                && let Some(storage) = pointer_output_storage_source_binding(init, &self.aliases)
+                && pointer_output_storage_binding_type(self.tcx, storage)
+            {
+                self.aliases.insert(alias, storage);
+            } else {
+                self.aliases.remove(&alias);
+            }
+        }
+
+        fn visit_call(&mut self, callee: &'tcx hir::Expr<'tcx>, args: &'tcx [hir::Expr<'tcx>]) {
+            let typeck = self.tcx.typeck(callee.hir_id.owner);
+            for (idx, arg) in args.iter().enumerate() {
+                let arg_ty = typeck.expr_ty_adjusted(arg);
+                if !arg_exposes_pointer_valued_output_storage(
+                    self.tcx,
+                    self.sig_decs,
+                    self.fn_ptr_rewrite,
+                    callee,
+                    idx,
+                    arg_ty,
+                ) {
+                    continue;
+                }
+                let Some(storage) = pointer_output_storage_source_binding(arg, &self.aliases)
+                else {
+                    continue;
+                };
+                if pointer_output_storage_binding_is_demotable(self.tcx, self.ptr_kinds, storage) {
+                    self.bindings.insert(storage);
+                }
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for PointerOutputStorageVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.update_alias(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Call(callee, args) => self.visit_call(callee, args),
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(hir_id) = hir_unwrapped_local_id(lhs) {
+                        self.update_alias(hir_id, rhs);
+                    }
+                }
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = PointerOutputStorageVisitor {
+        tcx,
+        sig_decs,
+        ptr_kinds,
+        fn_ptr_rewrite,
+        aliases: FxHashMap::default(),
+        bindings: FxHashSet::default(),
+    };
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        visitor.aliases.clear();
+        visitor.visit_body(body);
+    }
+    visitor.bindings
+}
+
+fn arg_exposes_pointer_valued_output_storage<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    fn_ptr_rewrite: Option<&FnPtrRewriteDecision>,
+    callee: &'tcx hir::Expr<'tcx>,
+    arg_index: usize,
+    arg_ty: ty::Ty<'tcx>,
+) -> bool {
+    let Some((inner_ty, mutability)) = unwrap_ptr_from_mir_ty(arg_ty) else {
+        return false;
+    };
+    if !mutability.is_mut() || !ty_contains_raw_ptr_leaf(tcx, inner_ty) {
+        return false;
+    }
+    pointer_output_param_kind(tcx, sig_decs, fn_ptr_rewrite, callee, arg_index, arg_ty)
+        .is_some_and(pointer_output_storage_param_kind)
+}
+
+fn pointer_output_param_kind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+    fn_ptr_rewrite: Option<&FnPtrRewriteDecision>,
+    callee: &'tcx hir::Expr<'tcx>,
+    arg_index: usize,
+    arg_ty: ty::Ty<'tcx>,
+) -> Option<PtrKind> {
+    hir_callee_local_def_id(tcx, callee)
+        .and_then(|did| {
+            sig_decs
+                .data
+                .get(&did)
+                .and_then(|sig_dec| sig_dec.input_decs.get(arg_index).copied().flatten())
+        })
+        .or_else(|| {
+            fn_ptr_rewrite
+                .and_then(|fn_ptr_rewrite| {
+                    fn_ptr_input_decisions_for_callee_expr(tcx, fn_ptr_rewrite, callee)
+                })
+                .and_then(|decs| decs.get(arg_index).copied().flatten())
+        })
+        .or_else(|| {
+            unwrap_ptr_from_mir_ty(arg_ty).map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
+        })
+}
+
+fn pointer_output_storage_param_kind(kind: PtrKind) -> bool {
+    is_mutable_borrow_like_decision(kind) || matches!(kind, PtrKind::Raw(true))
+}
+
+fn pointer_output_storage_source_binding(
+    expr: &hir::Expr<'_>,
+    aliases: &FxHashMap<HirId, HirId>,
+) -> Option<HirId> {
+    let expr = hir_unwrap_casts(expr);
+    match expr.kind {
+        hir::ExprKind::AddrOf(_, mutability, pointee) if mutability.is_mut() => {
+            hir_unwrapped_local_id(pointee)
+        }
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => aliases.get(&hir_id).copied(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn pointer_output_storage_alias_type(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+        .is_some_and(|(inner, _)| ty_contains_raw_ptr_leaf(tcx, inner))
+}
+
+fn pointer_output_storage_binding_type(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
+    unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id)).is_some()
+}
+
+fn pointer_output_storage_binding_is_demotable(
+    tcx: TyCtxt<'_>,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    hir_id: HirId,
+) -> bool {
+    pointer_output_storage_binding_type(tcx, hir_id)
+        && ptr_kinds
+            .get(&hir_id)
+            .copied()
+            .is_some_and(|kind| !matches!(kind, PtrKind::Raw(_)))
+}
+
 fn fn_ptr_input_decisions_for_callee_expr<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_ptr_rewrite: &'a FnPtrRewriteDecision,
@@ -24084,6 +24283,8 @@ pub unsafe fn read(x: i32) -> i32 {
                 collect_raw_call_result_bindings(tcx, &sig_decs, &ptr_kinds);
             let raw_local_assignment_bindings =
                 collect_raw_local_assignment_bindings(tcx, &ptr_kinds);
+            let pointer_output_storage_bindings =
+                collect_pointer_output_storage_bindings(tcx, &sig_decs, &ptr_kinds, None);
             let unsupported_box_target_bindings =
                 collect_unsupported_box_target_bindings(tcx, &sig_decs, &ptr_kinds);
             let unsupported_box_usage_subreasons = collect_unsupported_box_usage_subreasons(
@@ -24139,6 +24340,7 @@ pub unsafe fn read(x: i32) -> i32 {
             record_new(&unsupported_box_input_bindings, "unsupported_box_input");
             record_new(&raw_call_result_bindings, "raw_call_result");
             record_new(&raw_local_assignment_bindings, "raw_local_assignment");
+            record_new(&pointer_output_storage_bindings, "pointer_output_storage");
             record_new(&unsupported_box_target_bindings, "unsupported_box_target");
             record_new(&unsupported_box_usage_bindings, "unsupported_box_usage");
             for hir_id in &unsupported_box_usage_bindings {
@@ -24198,6 +24400,10 @@ pub unsafe fn read(x: i32) -> i32 {
                     DecisionReason::RawLocalAssignment,
                 ),
                 (
+                    &pointer_output_storage_bindings,
+                    DecisionReason::PointerOutputStorage,
+                ),
+                (
                     &unsupported_box_target_bindings,
                     DecisionReason::UnsupportedBoxTarget,
                 ),
@@ -24218,6 +24424,7 @@ pub unsafe fn read(x: i32) -> i32 {
             forced_raw_bindings.extend(unsupported_box_input_bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);
+            forced_raw_bindings.extend(pointer_output_storage_bindings);
             forced_raw_bindings.extend(unsupported_box_target_bindings);
             forced_raw_bindings.extend(unsupported_box_usage_bindings);
             if forced_raw_bindings.len() != old_len {
