@@ -121,9 +121,8 @@ impl BindingUseSummary {
         if self.unsupported_escape || self.address_taken_count > 0 {
             return None;
         }
-        if self.call_arg_count > 0 {
-            return Some(MaterializationKind::RawPtr);
-        }
+        // a call argument is inline-materialized at the call site (via the
+        // pointer_value_expr fallback), so it does not force a kept raw pointer.
         if self.pointer_value_count > 0 {
             return Some(MaterializationKind::RawPtr);
         }
@@ -169,16 +168,15 @@ mod binding_use_summary_tests {
     }
 
     #[test]
-    fn call_argument_use_materializes_as_raw_pointer() {
+    fn call_argument_use_does_not_force_materialization() {
+        // a call argument is inline-materialized at the call site, so it does not
+        // force a kept raw-pointer binding.
         let summary = BindingUseSummary {
             call_arg_count: 1,
             ..BindingUseSummary::default()
         };
 
-        assert_eq!(
-            summary.materialization_kind(false),
-            Some(MaterializationKind::RawPtr)
-        );
+        assert_eq!(summary.materialization_kind(false), None);
     }
 
     #[test]

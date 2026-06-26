@@ -10051,3 +10051,34 @@ pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
         "moving deref cursors are index-only, not kept references: {s}"
     );
 }
+
+#[test]
+fn test_array_local_rewriter_inline_materializes_call_argument_cursor() {
+    // a moving cursor passed to a foreign function stays index-only; the raw
+    // pointer is reconstructed inline at the call, with no kept binding.
+    let code = r#"
+unsafe extern "C" { fn sink(p: *const i32) -> i32; }
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += sink(p) + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p is index-only: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i32"),
+        "no kept raw pointer for p: {s}"
+    );
+    assert!(s.contains("sink("), "call preserved: {s}");
+}
