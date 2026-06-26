@@ -93,6 +93,124 @@ fn final_field_kind_is_copy_capable(kind: PtrKind) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct FieldPtrKindContext<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    analysis: &'a Analysis,
+    sig_decs: &'a SigDecisions,
+    ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+    demoted_fields: &'a FxHashSet<StructFieldSlot>,
+    field_cursor_fields: &'a FxHashSet<StructFieldSlot>,
+    c_exposed_abi_fields: &'a FxHashSet<StructFieldSlot>,
+    c_exposed_thin_abi_fields: &'a FxHashSet<StructFieldSlot>,
+    c_exposed_cursor_abi_fields: &'a FxHashSet<StructFieldSlot>,
+}
+
+impl<'a, 'tcx> FieldPtrKindContext<'a, 'tcx> {
+    fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if struct_field_pointee_forces_raw(self.tcx, field) {
+            return None;
+        }
+        let kind = if struct_field_is_exactly_owning(self.analysis, field) {
+            self.ownership_field_kind(field)
+        } else {
+            self.promoted_field_kind(field)
+        };
+        if self.c_exposed_abi_fields.contains(&field) {
+            return None;
+        }
+        if self.c_exposed_thin_abi_fields.contains(&field)
+            && !matches!(kind, Some(PtrKind::OptRef(_)))
+        {
+            return None;
+        }
+        if self.c_exposed_cursor_abi_fields.contains(&field)
+            && matches!(kind, Some(PtrKind::SliceCursor(_)))
+        {
+            return None;
+        }
+        kind
+    }
+
+    fn ownership_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        ownership_field_ptr_kind(
+            self.tcx,
+            self.analysis,
+            self.sig_decs,
+            self.ptr_kinds,
+            field,
+        )
+    }
+
+    fn promoted_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        if self.demoted_fields.contains(&field) {
+            return None;
+        }
+        let mutability = if self
+            .analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            true
+        } else if self
+            .analysis
+            .borrow_promotion_result
+            .shared_fields
+            .contains(&field)
+        {
+            false
+        } else {
+            return None;
+        };
+        if struct_field_pointee_forces_raw(self.tcx, field) {
+            return None;
+        }
+        if self.field_is_array_like(field) {
+            if self.field_cursor_fields.contains(&field) {
+                Some(PtrKind::SliceCursor(mutability))
+            } else {
+                Some(PtrKind::Slice(mutability))
+            }
+        } else {
+            Some(PtrKind::OptRef(mutability))
+        }
+    }
+
+    fn promoted_field_kind_without_demotions(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        let mutability = if self
+            .analysis
+            .borrow_promotion_result
+            .mutable_fields
+            .contains(&field)
+        {
+            true
+        } else if self
+            .analysis
+            .borrow_promotion_result
+            .shared_fields
+            .contains(&field)
+        {
+            false
+        } else {
+            return None;
+        };
+        if self.field_is_array_like(field) {
+            if self.field_cursor_fields.contains(&field) {
+                Some(PtrKind::SliceCursor(mutability))
+            } else {
+                Some(PtrKind::Slice(mutability))
+            }
+        } else {
+            Some(PtrKind::OptRef(mutability))
+        }
+    }
+
+    fn field_is_array_like(&self, field: StructFieldSlot) -> bool {
+        analysis_field_is_array_like(self.analysis, field)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum RawBridgeInfo {
     Scalar,
@@ -2574,14 +2692,21 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
         let demoted_fields =
             collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        let field_ctx = FieldPtrKindContext {
+            tcx: rust_program.tcx,
+            analysis,
+            sig_decs: &sig_decs,
+            ptr_kinds: &ptr_kinds,
+            demoted_fields: &demoted_fields,
+            field_cursor_fields: &field_cursor_fields,
+            c_exposed_abi_fields: &c_exposed_abi_fields,
+            c_exposed_thin_abi_fields: &c_exposed_thin_abi_fields,
+            c_exposed_cursor_abi_fields: &c_exposed_cursor_abi_fields,
+        };
         let (demoted_field_source_bindings, raw_field_source_callees) =
-            collect_raw_field_source_bindings(
-                rust_program.tcx,
-                analysis,
-                &sig_decs,
-                &ptr_kinds,
-                &demoted_fields,
-            );
+            collect_raw_field_source_bindings(rust_program.tcx, field_ctx);
+        let final_raw_field_source_uses =
+            collect_final_raw_field_source_uses(rust_program.tcx, &sig_decs, field_ctx);
         let mut sig_changed = false;
         for hir_id in &demoted_field_source_bindings {
             if force_signature_input_raw_for_binding(rust_program.tcx, &mut sig_decs, *hir_id) {
@@ -2606,6 +2731,45 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             &forced_raw_bindings,
             DecisionReason::DemotedFieldSource,
         );
+        for hir_id in &final_raw_field_source_uses.bindings {
+            if force_signature_input_original_raw_for_binding(
+                rust_program.tcx,
+                &mut sig_decs,
+                *hir_id,
+            ) {
+                sig_changed = true;
+                if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, *hir_id) {
+                    record_signature_input_event(
+                        &mut diagnostics,
+                        rust_program.tcx,
+                        &sig_decs,
+                        did,
+                        idx,
+                        DecisionReason::CursorFromRawFieldSource,
+                    );
+                }
+            }
+        }
+        record_binding_events_excluding(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &final_raw_field_source_uses.bindings,
+            &forced_raw_bindings,
+            DecisionReason::CursorFromRawFieldSource,
+        );
+        for callee_did in &final_raw_field_source_uses.outputs {
+            if force_signature_output_original_raw(rust_program.tcx, &mut sig_decs, *callee_did) {
+                sig_changed = true;
+                record_signature_output_event(
+                    &mut diagnostics,
+                    rust_program.tcx,
+                    &sig_decs,
+                    *callee_did,
+                    DecisionReason::CursorFromRawFieldSource,
+                );
+            }
+        }
         for callee_did in raw_field_source_callees {
             if force_signature_output_raw(rust_program.tcx, &mut sig_decs, callee_did) {
                 sig_changed = true;
@@ -2619,6 +2783,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
         }
         forced_raw_bindings.extend(demoted_field_source_bindings);
+        forced_raw_bindings.extend(final_raw_field_source_uses.bindings);
         if sig_changed {
             sync_fn_ptr_contracts(
                 rust_program,
@@ -2963,74 +3128,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         );
     }
 
-    fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        if struct_field_pointee_forces_raw(self.tcx, field) {
-            return None;
+    fn field_kind_context(&self) -> FieldPtrKindContext<'_, 'tcx> {
+        FieldPtrKindContext {
+            tcx: self.tcx,
+            analysis: self.analysis,
+            sig_decs: &self.sig_decs,
+            ptr_kinds: &self.ptr_kinds,
+            demoted_fields: &self.demoted_fields,
+            field_cursor_fields: &self.field_cursor_fields,
+            c_exposed_abi_fields: &self.c_exposed_abi_fields,
+            c_exposed_thin_abi_fields: &self.c_exposed_thin_abi_fields,
+            c_exposed_cursor_abi_fields: &self.c_exposed_cursor_abi_fields,
         }
-        let kind = if struct_field_is_exactly_owning(self.analysis, field) {
-            self.ownership_field_kind(field)
-        } else {
-            self.promoted_field_kind(field)
-        };
-        if self.c_exposed_abi_fields.contains(&field) {
-            return None;
-        }
-        if self.c_exposed_thin_abi_fields.contains(&field)
-            && !matches!(kind, Some(PtrKind::OptRef(_)))
-        {
-            return None;
-        }
-        if self.c_exposed_cursor_abi_fields.contains(&field)
-            && matches!(kind, Some(PtrKind::SliceCursor(_)))
-        {
-            return None;
-        }
-        kind
     }
 
-    fn ownership_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        ownership_field_ptr_kind(
-            self.tcx,
-            self.analysis,
-            &self.sig_decs,
-            &self.ptr_kinds,
-            field,
-        )
+    fn field_ptr_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
+        self.field_kind_context().field_ptr_kind(field)
     }
 
     fn promoted_field_kind(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        if self.demoted_fields.contains(&field) {
-            return None;
-        }
-        let mutability = if self
-            .analysis
-            .borrow_promotion_result
-            .mutable_fields
-            .contains(&field)
-        {
-            true
-        } else if self
-            .analysis
-            .borrow_promotion_result
-            .shared_fields
-            .contains(&field)
-        {
-            false
-        } else {
-            return None;
-        };
-        if struct_field_pointee_forces_raw(self.tcx, field) {
-            return None;
-        }
-        if self.field_is_array_like(field) {
-            if self.field_cursor_fields.contains(&field) {
-                Some(PtrKind::SliceCursor(mutability))
-            } else {
-                Some(PtrKind::Slice(mutability))
-            }
-        } else {
-            Some(PtrKind::OptRef(mutability))
-        }
+        self.field_kind_context().promoted_field_kind(field)
     }
 
     fn record_field_decisions(&mut self) {
@@ -3243,32 +3360,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
     }
 
     fn promoted_field_kind_without_demotions(&self, field: StructFieldSlot) -> Option<PtrKind> {
-        let mutability = if self
-            .analysis
-            .borrow_promotion_result
-            .mutable_fields
-            .contains(&field)
-        {
-            true
-        } else if self
-            .analysis
-            .borrow_promotion_result
-            .shared_fields
-            .contains(&field)
-        {
-            false
-        } else {
-            return None;
-        };
-        if self.field_is_array_like(field) {
-            if self.field_cursor_fields.contains(&field) {
-                Some(PtrKind::SliceCursor(mutability))
-            } else {
-                Some(PtrKind::Slice(mutability))
-            }
-        } else {
-            Some(PtrKind::OptRef(mutability))
-        }
+        self.field_kind_context()
+            .promoted_field_kind_without_demotions(field)
     }
 
     fn field_is_array_like(&self, field: StructFieldSlot) -> bool {
@@ -14355,6 +14448,34 @@ fn force_signature_input_raw_for_binding(
     true
 }
 
+fn force_signature_input_original_raw_for_binding(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    hir_id: HirId,
+) -> bool {
+    let Some((did, idx)) = param_index_for_binding(tcx, hir_id) else {
+        return true;
+    };
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    let raw_mut = unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
+        .map(|(_, mutability)| mutability.is_mut())
+        .unwrap_or(true);
+    let decision = match sig_dec.input_decs.get(idx).copied().flatten() {
+        Some(PtrKind::Raw(existing_mut)) => Some(PtrKind::Raw(existing_mut || raw_mut)),
+        _ => Some(PtrKind::Raw(raw_mut)),
+    };
+    if sig_dec.input_decs.get(idx).copied().flatten() == decision {
+        return false;
+    }
+    sig_dec.set_input_dec(idx, decision);
+    true
+}
+
 fn force_signature_inputs_raw_for_bindings(
     tcx: TyCtxt<'_>,
     sig_decs: &mut SigDecisions,
@@ -14424,6 +14545,33 @@ fn force_signature_output_raw(
         })
         .unwrap_or(true);
     sig_dec.set_output_dec(Some(PtrKind::Raw(output_mut)));
+    true
+}
+
+fn force_signature_output_original_raw(
+    tcx: TyCtxt<'_>,
+    sig_decs: &mut SigDecisions,
+    did: LocalDefId,
+) -> bool {
+    let Some(sig_dec) = sig_decs.data.get_mut(&did) else {
+        return false;
+    };
+    if sig_dec.signature_locked {
+        return false;
+    }
+    let sig = tcx.fn_sig(did).skip_binder().skip_binder();
+    let ty::TyKind::RawPtr(_, mutability) = sig.output().kind() else {
+        return false;
+    };
+    let raw_mut = mutability.is_mut();
+    let decision = match sig_dec.output_dec {
+        Some(PtrKind::Raw(existing_mut)) => Some(PtrKind::Raw(existing_mut || raw_mut)),
+        _ => Some(PtrKind::Raw(raw_mut)),
+    };
+    if sig_dec.output_dec == decision {
+        return false;
+    }
+    sig_dec.set_output_dec(decision);
     true
 }
 
@@ -19998,89 +20146,54 @@ fn for_each_hir_fn_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     mut f: impl FnMut(&'tcx hir::Body<'tcx>, &'tcx rustc_middle::ty::TypeckResults<'tcx>),
 ) {
+    for_each_hir_fn_body_with_did(tcx, |_, body, typeck| f(body, typeck));
+}
+
+fn for_each_hir_fn_body_with_did<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mut f: impl FnMut(LocalDefId, &'tcx hir::Body<'tcx>, &'tcx rustc_middle::ty::TypeckResults<'tcx>),
+) {
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
             continue;
         };
-        let body_id = match owner.node() {
+        let (did, body_id) = match owner.node() {
             hir::OwnerNode::Item(item) => match item.kind {
-                hir::ItemKind::Fn { body, .. } => body,
+                hir::ItemKind::Fn { body, .. } => (item.owner_id.def_id, body),
                 _ => continue,
             },
             hir::OwnerNode::ImplItem(item) => match item.kind {
-                hir::ImplItemKind::Fn(_, body) => body,
+                hir::ImplItemKind::Fn(_, body) => (item.owner_id.def_id, body),
                 _ => continue,
             },
             _ => continue,
         };
         let body = tcx.hir_body(body_id);
-        f(body, tcx.typeck_body(body.id()));
+        f(did, body, tcx.typeck_body(body.id()));
     }
 }
 
-fn collect_raw_field_source_bindings(
-    tcx: TyCtxt<'_>,
-    analysis: &Analysis,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    demoted_fields: &FxHashSet<StructFieldSlot>,
+fn collect_raw_field_source_bindings<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    field_ctx: FieldPtrKindContext<'a, 'tcx>,
 ) -> (FxHashSet<HirId>, FxHashSet<LocalDefId>) {
-    let mut promoted_fields = analysis.borrow_promotion_result.mutable_fields.clone();
-    promoted_fields.extend(
-        analysis
-            .borrow_promotion_result
-            .shared_fields
-            .iter()
-            .copied(),
-    );
-
     struct DemotedFieldSourceVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
-        analysis: &'a Analysis,
-        sig_decs: &'a SigDecisions,
-        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
-        promoted_fields: &'a FxHashSet<StructFieldSlot>,
-        demoted_fields: &'a FxHashSet<StructFieldSlot>,
+        field_ctx: FieldPtrKindContext<'a, 'tcx>,
         bindings: FxHashSet<HirId>,
         callees: FxHashSet<LocalDefId>,
     }
 
     impl<'tcx> DemotedFieldSourceVisitor<'_, 'tcx> {
         fn field_stays_raw(&self, field: StructFieldSlot) -> bool {
-            if scalar_owning_raw_field_inner_ty(self.tcx, self.analysis, field).is_some() {
-                return ownership_field_ptr_kind(
-                    self.tcx,
-                    self.analysis,
-                    self.sig_decs,
-                    self.ptr_kinds,
-                    field,
-                )
-                .is_none();
-            }
-            if ownership_field_ptr_kind(
-                self.tcx,
-                self.analysis,
-                self.sig_decs,
-                self.ptr_kinds,
-                field,
-            )
-            .is_some()
-            {
-                return false;
-            }
-            if self.demoted_fields.contains(&field) {
-                return true;
-            }
-            if self.promoted_fields.contains(&field) {
-                return false;
-            }
-            hir_field_is_raw_ptr(self.tcx, field)
+            hir_field_is_raw_ptr(self.tcx, field) && self.field_ctx.field_ptr_kind(field).is_none()
         }
 
         fn rhs_promoted_source_can_bridge_to_raw(&self, rhs: &'tcx hir::Expr<'tcx>) -> bool {
             if let Some(hir_id) = hir_unwrapped_local_id(rhs)
                 && self
+                    .field_ctx
                     .ptr_kinds
                     .get(&hir_id)
                     .copied()
@@ -20092,7 +20205,7 @@ fn collect_raw_field_source_bindings(
         }
 
         fn record_rhs(&mut self, field: StructFieldSlot, rhs: &'tcx hir::Expr<'tcx>) {
-            if self.demoted_fields.contains(&field)
+            if self.field_ctx.demoted_fields.contains(&field)
                 && self.rhs_promoted_source_can_bridge_to_raw(rhs)
             {
                 return;
@@ -20151,11 +20264,7 @@ fn collect_raw_field_source_bindings(
         let mut visitor = DemotedFieldSourceVisitor {
             tcx,
             typeck,
-            analysis,
-            sig_decs,
-            ptr_kinds,
-            promoted_fields: &promoted_fields,
-            demoted_fields,
+            field_ctx,
             bindings: FxHashSet::default(),
             callees: FxHashSet::default(),
         };
@@ -20164,6 +20273,242 @@ fn collect_raw_field_source_bindings(
         callees.extend(visitor.callees);
     });
     (bindings, callees)
+}
+
+struct FinalRawFieldSourceUses {
+    bindings: FxHashSet<HirId>,
+    outputs: FxHashSet<LocalDefId>,
+}
+
+fn collect_final_raw_field_source_uses<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &'a SigDecisions,
+    field_ctx: FieldPtrKindContext<'a, 'tcx>,
+) -> FinalRawFieldSourceUses {
+    struct RawFieldSourceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        did: LocalDefId,
+        sig_decs: &'a SigDecisions,
+        field_ctx: FieldPtrKindContext<'a, 'tcx>,
+        source_bindings: FxHashSet<HirId>,
+        forced_bindings: FxHashSet<HirId>,
+        forced_outputs: FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> RawFieldSourceVisitor<'_, 'tcx> {
+        fn field_is_final_raw_source(&self, field: StructFieldSlot) -> bool {
+            hir_field_is_raw_ptr(self.tcx, field) && self.field_ctx.field_ptr_kind(field).is_none()
+        }
+
+        fn expr_is_raw_field_derived(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            let expr = hir_unwrap_casts(expr);
+            if let Some(field) = hir_struct_field_slot(self.tcx, expr) {
+                return self.field_is_final_raw_source(field);
+            }
+            match expr.kind {
+                hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+                    matches!(path.res, Res::Local(hir_id) if self.source_bindings.contains(&hir_id))
+                }
+                hir::ExprKind::MethodCall(seg, receiver, args, _) => {
+                    let method = seg.ident.name.as_str();
+                    let transparent_ptr_method = args.len() == 1
+                        && matches!(
+                            method,
+                            "offset"
+                                | "add"
+                                | "sub"
+                                | "wrapping_offset"
+                                | "wrapping_add"
+                                | "wrapping_sub"
+                        );
+                    let cast_method = args.is_empty() && method == "cast";
+                    (transparent_ptr_method || cast_method)
+                        && self.typeck.expr_ty_adjusted(receiver).is_raw_ptr()
+                        && self.expr_is_raw_field_derived(receiver)
+                }
+                hir::ExprKind::Block(block, _) if block.stmts.is_empty() => block
+                    .expr
+                    .is_some_and(|expr| self.expr_is_raw_field_derived(expr)),
+                _ => false,
+            }
+        }
+
+        fn expr_is_backward_raw_field_projection(&self, expr: &'tcx hir::Expr<'tcx>) -> bool {
+            let expr = hir_unwrap_casts(expr);
+            match expr.kind {
+                hir::ExprKind::MethodCall(seg, receiver, args, _) => {
+                    let backward = match seg.ident.name.as_str() {
+                        "sub" | "wrapping_sub" => true,
+                        "offset" | "wrapping_offset" => args
+                            .first()
+                            .is_some_and(|arg| hir_expr_is_syntactically_negative(self.tcx, arg)),
+                        _ => false,
+                    };
+                    if backward && self.expr_is_raw_field_derived(receiver) {
+                        return true;
+                    }
+                    self.expr_is_backward_raw_field_projection(receiver)
+                }
+                hir::ExprKind::Block(block, _) if block.stmts.is_empty() => block
+                    .expr
+                    .is_some_and(|expr| self.expr_is_backward_raw_field_projection(expr)),
+                _ => false,
+            }
+        }
+
+        fn force_source_bindings_in_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let expr = hir_unwrap_casts(expr);
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind
+                && let Res::Local(hir_id) = path.res
+                && self.source_bindings.contains(&hir_id)
+            {
+                self.forced_bindings.insert(hir_id);
+            }
+            match expr.kind {
+                hir::ExprKind::MethodCall(_, receiver, args, _) => {
+                    self.force_source_bindings_in_expr(receiver);
+                    for arg in args {
+                        self.force_source_bindings_in_expr(arg);
+                    }
+                }
+                hir::ExprKind::Block(block, _) => {
+                    for stmt in block.stmts {
+                        if let hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) = stmt.kind {
+                            self.force_source_bindings_in_expr(expr);
+                        }
+                    }
+                    if let Some(expr) = block.expr {
+                        self.force_source_bindings_in_expr(expr);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn binding_is_slice_cursor(&self, hir_id: HirId) -> bool {
+            matches!(
+                self.field_ctx.ptr_kinds.get(&hir_id).copied(),
+                Some(PtrKind::SliceCursor(_))
+            )
+        }
+
+        fn record_binding_source(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            if !self.typeck.node_type(hir_id).is_raw_ptr() {
+                return;
+            }
+            if !self.expr_is_raw_field_derived(rhs) {
+                return;
+            }
+            self.source_bindings.insert(hir_id);
+            if self.binding_is_slice_cursor(hir_id)
+                || self.expr_is_backward_raw_field_projection(rhs)
+            {
+                self.forced_bindings.insert(hir_id);
+            }
+            if self.expr_is_backward_raw_field_projection(rhs) {
+                self.force_source_bindings_in_expr(rhs);
+            }
+        }
+
+        fn record_call_inputs(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                return;
+            };
+            let Some(sig_dec) = self.sig_decs.data.get(&callee_did) else {
+                return;
+            };
+            let hir::ExprKind::Call(_, args) = hir_unwrap_casts(expr).kind else {
+                return;
+            };
+            for (idx, arg) in args.iter().enumerate() {
+                let Some(input_dec) = sig_dec.input_decs.get(idx).copied().flatten() else {
+                    continue;
+                };
+                let needs_raw = matches!(input_dec, PtrKind::SliceCursor(_))
+                    || callee_input_has_syntactic_negative_offset(self.tcx, callee_did, idx);
+                if !needs_raw || !self.expr_is_raw_field_derived(arg) {
+                    continue;
+                }
+                self.force_source_bindings_in_expr(arg);
+                if let Some(param_hir_id) = callee_input_param_binding(self.tcx, callee_did, idx) {
+                    self.forced_bindings.insert(param_hir_id);
+                }
+            }
+        }
+
+        fn record_return_source(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let cursor_output = matches!(
+                self.sig_decs
+                    .data
+                    .get(&self.did)
+                    .and_then(|sig_dec| sig_dec.output_dec),
+                Some(PtrKind::SliceCursor(_))
+            );
+            if !(cursor_output || self.expr_is_backward_raw_field_projection(expr))
+                || !self.expr_is_raw_field_derived(expr)
+            {
+                return;
+            }
+            self.force_source_bindings_in_expr(expr);
+            self.forced_outputs.insert(self.did);
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for RawFieldSourceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_binding_source(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if self.expr_is_backward_raw_field_projection(expr) {
+                self.force_source_bindings_in_expr(expr);
+            }
+            match expr.kind {
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(hir_id) = hir_unwrapped_local_id(lhs) {
+                        self.record_binding_source(hir_id, rhs);
+                    }
+                }
+                hir::ExprKind::Call(_, _) => self.record_call_inputs(expr),
+                hir::ExprKind::Ret(Some(ret)) => self.record_return_source(ret),
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    let mut outputs = FxHashSet::default();
+    for_each_hir_fn_body_with_did(tcx, |did, body, typeck| {
+        let mut visitor = RawFieldSourceVisitor {
+            tcx,
+            typeck,
+            did,
+            sig_decs,
+            field_ctx,
+            source_bindings: FxHashSet::default(),
+            forced_bindings: FxHashSet::default(),
+            forced_outputs: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        if let hir::ExprKind::Block(block, _) = body.value.kind {
+            if let Some(tail) = block.expr {
+                visitor.record_return_source(tail);
+            }
+        } else {
+            visitor.record_return_source(body.value);
+        }
+        bindings.extend(visitor.forced_bindings);
+        outputs.extend(visitor.forced_outputs);
+    });
+    FinalRawFieldSourceUses { bindings, outputs }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22824,6 +23169,32 @@ mod tests {
         .unwrap()
     }
 
+    fn initial_field_conflict_reason_names_for_code(
+        code: &str,
+    ) -> FxHashMap<String, Vec<&'static str>> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (input, analysis) = build_analysis(tcx);
+            let lifetime_plans = super::super::lifetimes::LifetimePlans::new(&input, &analysis);
+            let fn_ptr_groups = FnPtrGroups::default();
+            let sig_decs = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+            let ptr_kinds = collect_diffs(&input, &analysis, &sig_decs, &fn_ptr_groups);
+            let reasons =
+                collect_field_conflict_demotion_reasons(tcx, &analysis, &sig_decs, &ptr_kinds);
+            reasons
+                .into_iter()
+                .map(|(field, reasons)| {
+                    let mut reason_names = reasons
+                        .into_iter()
+                        .map(|reason| reason.as_str())
+                        .collect::<Vec<_>>();
+                    reason_names.sort();
+                    (field_slot_label(tcx, field), reason_names)
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
     fn force_test_input_raw(tcx: TyCtxt<'_>, sig_decs: &mut SigDecisions, name: &str) {
         for maybe_owner in tcx.hir_crate(()).owners.iter() {
             let Some(owner) = maybe_owner.as_owner() else {
@@ -22894,7 +23265,7 @@ pub unsafe fn conflict(mut x: i32, mut y: i32, raw: *mut i32, owner: *mut Holder
 }
 "#,
         );
-        let incompatible_raw_storage_reasons = field_conflict_reason_names_for_code(
+        let incompatible_raw_storage_reasons = initial_field_conflict_reason_names_for_code(
             r#"
 #[repr(C)]
 pub struct State {
@@ -23846,6 +24217,361 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         }
     }
 
+    fn rewrite_pointer_code(code: &str) -> String {
+        rewrite_pointer_code_with_config(code, Config::default())
+    }
+
+    fn rewrite_pointer_code_with_config(code: &str, config: Config) -> String {
+        let (rewritten, _) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            replace_local_borrows(&config, tcx)
+        })
+        .unwrap();
+        ::utils::compilation::run_compiler_on_str(&rewritten, ::utils::type_check)
+            .unwrap_or_else(|_| panic!("rewritten snippet failed to compile:\n{rewritten}"));
+        rewritten
+    }
+
+    fn pointer_config_with_c_exposed(name: &str) -> Config {
+        let mut config = Config::default();
+        config.c_exposed_fns.insert(name.to_owned());
+        config
+    }
+
+    fn assert_binding_raw_pointer(
+        rewritten: &str,
+        fn_name: &str,
+        binding_name: &str,
+        expected_mutability: bool,
+    ) {
+        ::utils::compilation::run_compiler_on_str(rewritten, |tcx| {
+            let binding_ty = binding_ty_in_fn(tcx, fn_name, binding_name);
+            assert!(
+                matches!(
+                    binding_ty.kind(),
+                    ty::TyKind::RawPtr(_, mutability)
+                        if mutability.is_mut() == expected_mutability
+                ),
+                "expected {fn_name}::{binding_name} to stay a raw {} pointer, got {binding_ty}; rewritten:\n{rewritten}",
+                if expected_mutability { "mutable" } else { "const" },
+            );
+        })
+        .unwrap();
+    }
+
+    fn assert_binding_slice_cursor(
+        rewritten: &str,
+        fn_name: &str,
+        binding_name: &str,
+        expected_mutability: bool,
+    ) {
+        ::utils::compilation::run_compiler_on_str(rewritten, |tcx| {
+            let binding_ty = binding_ty_in_fn(tcx, fn_name, binding_name);
+            let binding_ty = binding_ty.to_string();
+            let expected = if expected_mutability {
+                "SliceCursorMut"
+            } else {
+                "SliceCursor"
+            };
+            assert!(
+                binding_ty.contains(expected)
+                    && (expected_mutability || !binding_ty.contains("SliceCursorMut")),
+                "expected {fn_name}::{binding_name} to become {expected}, got {binding_ty}; rewritten:\n{rewritten}",
+            );
+        })
+        .unwrap();
+    }
+
+    fn assert_fn_output_raw_pointer(rewritten: &str, fn_name: &str, expected_mutability: bool) {
+        ::utils::compilation::run_compiler_on_str(rewritten, |tcx| {
+            let did = find_fn_did(tcx, fn_name);
+            let output = tcx.fn_sig(did).skip_binder().skip_binder().output();
+            assert!(
+                matches!(
+                    output.kind(),
+                    ty::TyKind::RawPtr(_, mutability)
+                        if mutability.is_mut() == expected_mutability
+                ),
+                "expected {fn_name} output to stay a raw {} pointer, got {output}; rewritten:\n{rewritten}",
+                if expected_mutability { "mutable" } else { "const" },
+            );
+        })
+        .unwrap();
+    }
+
+    fn binding_ty_in_fn<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        fn_name: &str,
+        binding_name: &str,
+    ) -> ty::Ty<'tcx> {
+        let did = find_fn_did(tcx, fn_name);
+        let hir::Node::Item(item) = tcx.hir_node_by_def_id(did) else {
+            panic!("expected item for {fn_name}");
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            panic!("expected fn item for {fn_name}");
+        };
+
+        struct BindingTyVisitor<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            typeck: &'a rustc_middle::ty::TypeckResults<'tcx>,
+            binding_name: &'a str,
+            found: Option<ty::Ty<'tcx>>,
+        }
+
+        impl<'tcx> hir::intravisit::Visitor<'tcx> for BindingTyVisitor<'_, 'tcx> {
+            type NestedFilter = OnlyBodies;
+
+            fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                self.tcx
+            }
+
+            fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Self::Result {
+                if let hir::PatKind::Binding(_, hir_id, ident, _) = pat.kind
+                    && ident.name.as_str() == self.binding_name
+                {
+                    self.found = Some(self.typeck.node_type(hir_id));
+                }
+                hir::intravisit::walk_pat(self, pat);
+            }
+        }
+
+        let typeck = tcx.typeck(did);
+        let mut visitor = BindingTyVisitor {
+            tcx,
+            typeck,
+            binding_name,
+            found: None,
+        };
+        visitor.visit_body(tcx.hir_body(body));
+        visitor
+            .found
+            .unwrap_or_else(|| panic!("missing binding {fn_name}::{binding_name}"))
+    }
+
+    #[test]
+    fn pointer_field_source_mut_init_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *mut i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn field_init_direct_negative_offset() -> i32 {
+    let mut arr = [10, 20, 30];
+    let p = Holder { x: &raw mut arr[1] };
+    let q = p.x;
+    *q.offset(-1)
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_binding_raw_pointer(&rewritten, "field_init_direct_negative_offset", "q", true);
+    }
+
+    #[test]
+    fn pointer_field_source_const_assignment_negative_sub_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *const i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn field_assignment_negative_sub() -> i32 {
+    let arr = [10, 20, 30];
+    let p = Holder { x: &raw const arr[1] };
+    let mut q = std::ptr::null();
+    q = p.x;
+    *q.sub(1)
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_binding_raw_pointer(&rewritten, "field_assignment_negative_sub", "q", false);
+    }
+
+    #[test]
+    fn pointer_field_source_const_init_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *const i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn shared_field_init_direct_negative_offset() -> i32 {
+    let arr = [10, 20, 30];
+    let p = Holder { x: &raw const arr[1] };
+    let q = p.x;
+    *q.offset(-1)
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "shared_field_init_direct_negative_offset",
+            "q",
+            false,
+        );
+    }
+
+    #[test]
+    fn pointer_field_source_mut_callee_negative_offset_keeps_source_and_param_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *mut i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn read_previous(q: *mut i32) -> i32 {
+    *q.offset(-1)
+}
+
+pub unsafe fn field_source_callee_negative_offset() -> i32 {
+    let mut arr = [10, 20, 30];
+    let p = Holder { x: &raw mut arr[1] };
+    let q = p.x;
+    read_previous(q)
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_binding_raw_pointer(&rewritten, "read_previous", "q", true);
+        assert_binding_raw_pointer(&rewritten, "field_source_callee_negative_offset", "q", true);
+    }
+
+    #[test]
+    fn pointer_field_source_local_propagation_cast_wrapping_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *mut i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn field_source_local_propagation_cast_wrapping() -> i32 {
+    let mut arr = [10, 20, 30];
+    let p = Holder { x: &raw mut arr[1] };
+    let raw = p.x as *mut i32;
+    let q = raw.wrapping_sub(1);
+    *q
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "field_source_local_propagation_cast_wrapping",
+            "raw",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "field_source_local_propagation_cast_wrapping",
+            "q",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_field_source_returned_cursor_output_keeps_output_raw() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *mut i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn field_source_output(p: Holder) -> *mut i32 {
+    p.x.offset(-1)
+}
+
+pub unsafe fn field_source_output_driver() -> i32 {
+    let mut arr = [10, 20, 30];
+    let p = Holder { x: &raw mut arr[1] };
+    *field_source_output(p) = 5;
+    arr[0]
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        assert_fn_output_raw_pointer(&rewritten, "field_source_output", true);
+    }
+
+    #[test]
+    fn pointer_field_source_positive_offset_can_still_be_slice() {
+        let rewritten = rewrite_pointer_code_with_config(
+            r#"
+#[repr(C)]
+pub struct Holder {
+    pub x: *mut i32,
+}
+
+pub unsafe fn expose_holder(_: Holder) {
+}
+
+pub unsafe fn field_source_positive_offset() -> i32 {
+    let mut arr = [10, 20, 30];
+    let p = Holder { x: &raw mut arr[0] };
+    let q = p.x;
+    *q.offset(1)
+}
+"#,
+            pointer_config_with_c_exposed("expose_holder"),
+        );
+
+        ::utils::compilation::run_compiler_on_str(&rewritten, |tcx| {
+            let binding_ty = binding_ty_in_fn(tcx, "field_source_positive_offset", "q");
+            assert!(
+                matches!(binding_ty.kind(), ty::TyKind::Ref(..)),
+                "expected field_source_positive_offset::q to become a slice/reference, got {binding_ty}; rewritten:\n{rewritten}",
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pointer_field_source_anchored_array_negative_offset_can_still_be_cursor() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn anchored_array_cursor() -> i32 {
+    let mut arr = [10, 20, 30];
+    let q = arr.as_mut_ptr().add(1);
+    *q.offset(-1)
+}
+"#,
+        );
+
+        assert_binding_slice_cursor(&rewritten, "anchored_array_cursor", "q", true);
+    }
+
     #[test]
     fn pointer_same_call_map_or_closure_reads_promoted_slice_root_after_mut_field_borrow() {
         assert_pointer_lifetime_rewrite_typechecks(
@@ -24633,6 +25359,61 @@ pub unsafe fn read(x: i32) -> i32 {
             }
         }
 
+        let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
+        let demoted_fields = collect_demoted_promoted_fields(tcx, analysis, &sig_decs, &ptr_kinds);
+        let c_exposed_abi_fields = FxHashSet::default();
+        let c_exposed_thin_abi_fields = FxHashSet::default();
+        let c_exposed_cursor_abi_fields = FxHashSet::default();
+        let field_ctx = FieldPtrKindContext {
+            tcx,
+            analysis,
+            sig_decs: &sig_decs,
+            ptr_kinds: &ptr_kinds,
+            demoted_fields: &demoted_fields,
+            field_cursor_fields: &field_cursor_fields,
+            c_exposed_abi_fields: &c_exposed_abi_fields,
+            c_exposed_thin_abi_fields: &c_exposed_thin_abi_fields,
+            c_exposed_cursor_abi_fields: &c_exposed_cursor_abi_fields,
+        };
+        let (demoted_field_source_bindings, _) = collect_raw_field_source_bindings(tcx, field_ctx);
+        let final_raw_field_source_uses =
+            collect_final_raw_field_source_uses(tcx, &sig_decs, field_ctx);
+        for (bindings, reason) in [
+            (&demoted_field_source_bindings, "demoted_field_source"),
+            (
+                &final_raw_field_source_uses.bindings,
+                "cursor_from_raw_field_source",
+            ),
+        ] {
+            for hir_id in bindings {
+                if !forced_raw_bindings.contains(hir_id) {
+                    reason_map.entry(*hir_id).or_default().push(reason);
+                }
+            }
+        }
+        let mut sig_changed = false;
+        sig_changed |= force_signature_inputs_raw_for_bindings(
+            tcx,
+            &mut sig_decs,
+            &demoted_field_source_bindings,
+            None,
+            DecisionReason::DemotedFieldSource,
+        );
+        for hir_id in &final_raw_field_source_uses.bindings {
+            sig_changed |=
+                force_signature_input_original_raw_for_binding(tcx, &mut sig_decs, *hir_id);
+        }
+        for did in final_raw_field_source_uses.outputs {
+            sig_changed |= force_signature_output_original_raw(tcx, &mut sig_decs, did);
+        }
+        forced_raw_bindings.extend(demoted_field_source_bindings);
+        forced_raw_bindings.extend(final_raw_field_source_uses.bindings);
+        if sig_changed {
+            ptr_kinds = collect_diffs(input, analysis, &sig_decs, &fn_ptr_groups);
+        }
+        normalize_forced_raw_bindings(tcx, &mut ptr_kinds, &forced_raw_bindings);
+        normalize_owning_call_result_bindings(tcx, &sig_decs, &mut ptr_kinds, &forced_raw_bindings);
+
         (sig_decs, ptr_kinds, reason_map, usage_subreason_map)
     }
 
@@ -25237,6 +26018,140 @@ pub unsafe fn id(x: *mut i32) -> *mut i32 {
             assert_eq!(sig_dec.input_decs[0], Some(PtrKind::Raw(true)));
             assert_eq!(sig_dec.input_lifetimes[0], None);
             assert_eq!(sig_dec.output_lifetime, Some(lifetime));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn force_signature_input_original_raw_preserves_existing_raw_mutability() {
+        let code = r#"
+pub unsafe fn read(x: *const i32) -> *const i32 {
+    x
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = find_fn_did(tcx, "read");
+            let x_hir_id = find_param_hir_id(tcx, "read", "x");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Raw(true))],
+                    input_lifetimes: vec![None],
+                    output_dec: None,
+                    output_lifetime: None,
+                    signature_locked: false,
+                },
+            );
+
+            assert!(!force_signature_input_original_raw_for_binding(
+                tcx,
+                &mut sig_decs,
+                x_hir_id,
+            ));
+            assert_eq!(sig_decs.data[&did].input_decs[0], Some(PtrKind::Raw(true)));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn force_signature_input_original_raw_restores_original_mutability() {
+        let code = r#"
+pub unsafe fn read(x: *mut i32) -> *mut i32 {
+    x
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = find_fn_did(tcx, "read");
+            let x_hir_id = find_param_hir_id(tcx, "read", "x");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                did,
+                SigDecision {
+                    input_decs: vec![Some(PtrKind::Raw(false))],
+                    input_lifetimes: vec![None],
+                    output_dec: None,
+                    output_lifetime: None,
+                    signature_locked: false,
+                },
+            );
+
+            assert!(force_signature_input_original_raw_for_binding(
+                tcx,
+                &mut sig_decs,
+                x_hir_id,
+            ));
+            assert_eq!(sig_decs.data[&did].input_decs[0], Some(PtrKind::Raw(true)));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn force_signature_output_original_raw_preserves_existing_raw_mutability() {
+        let code = r#"
+pub unsafe fn read(x: *const i32) -> *const i32 {
+    x
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = find_fn_did(tcx, "read");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                did,
+                SigDecision {
+                    input_decs: vec![None],
+                    input_lifetimes: vec![None],
+                    output_dec: Some(PtrKind::Raw(true)),
+                    output_lifetime: None,
+                    signature_locked: false,
+                },
+            );
+
+            assert!(!force_signature_output_original_raw(
+                tcx,
+                &mut sig_decs,
+                did,
+            ));
+            assert_eq!(sig_decs.data[&did].output_dec, Some(PtrKind::Raw(true)));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn force_signature_output_original_raw_restores_original_mutability() {
+        let code = r#"
+pub unsafe fn identity(x: *mut i32) -> *mut i32 {
+    x
+}
+"#;
+
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let did = find_fn_did(tcx, "identity");
+            let mut sig_decs = SigDecisions {
+                data: FxHashMap::default(),
+            };
+            sig_decs.data.insert(
+                did,
+                SigDecision {
+                    input_decs: vec![None],
+                    input_lifetimes: vec![None],
+                    output_dec: Some(PtrKind::Raw(false)),
+                    output_lifetime: None,
+                    signature_locked: false,
+                },
+            );
+
+            assert!(force_signature_output_original_raw(tcx, &mut sig_decs, did,));
+            assert_eq!(sig_decs.data[&did].output_dec, Some(PtrKind::Raw(true)));
         })
         .unwrap();
     }
