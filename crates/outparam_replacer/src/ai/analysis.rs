@@ -343,7 +343,7 @@ pub fn analyze(
                     .unwrap_or_default();
 
                 // If there is a merged block, always check all parameters
-                let (candidates, nonnull_params) = if is_merged {
+                let (candidates, _nonnull_params) = if is_merged {
                     (
                         (1..=(analyzer.info.inputs))
                             .map(Local::from_usize)
@@ -462,7 +462,7 @@ pub fn analyze(
                     st.add_excludes(alias_exclude_paths.iter().cloned());
                     st.add_null_excludes(null_exclude_paths.iter().cloned());
 
-                    st.null_excludes.remove(&nonnull_params);
+                    // st.null_excludes.remove(&nonnull_params);
                 }
 
                 let mut has_side_effects = call_info_map.values().flatten().any(|kind| {
