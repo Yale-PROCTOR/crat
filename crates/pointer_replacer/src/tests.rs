@@ -9990,6 +9990,11 @@ pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
     // no raw pointer offset operations remain for the two cursors.
     assert!(!s.contains("q = q.offset(1)"), "q advance lowered: {s}");
     assert!(!s.contains("p = if *q"), "p conditional lowered: {s}");
+    // p is fully index-only: no kept raw pointer or reference binding.
+    assert!(
+        !s.contains("let mut p: *mut i32") && !s.contains("let mut p: &i32"),
+        "p is index-only: {s}"
+    );
 }
 
 #[test]

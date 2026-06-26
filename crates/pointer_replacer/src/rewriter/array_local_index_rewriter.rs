@@ -1857,10 +1857,20 @@ impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 self.record_multi_cursor_deref_expr([&**lhs, &**rhs]);
-                if let Some(hir_id) = self.direct_planned_local_hir_id(lhs) {
+                let lhs_hir = self.direct_planned_local_hir_id(lhs);
+                if let Some(hir_id) = lhs_hir {
                     self.summaries.entry(hir_id).or_default().movement_count += 1;
                 }
                 self.record_write_through_pointer(lhs);
+                // a member copy `q = p` (both same-group planned members) is an
+                // index operation, not a pointer-value use of `p`.
+                if let Some(lhs_hir) = lhs_hir
+                    && let Some(rhs_hir) = self.direct_planned_local_hir_id(rhs)
+                    && self.same_group_members(lhs_hir, rhs_hir)
+                {
+                    self.summaries.entry(rhs_hir).or_default().movement_count += 1;
+                    return;
+                }
                 self.visit_expr(rhs);
                 return;
             }
@@ -1948,9 +1958,34 @@ impl AstVisitor<'_> for BindingUseClassifier<'_, '_> {
         }
         visit::walk_expr(self, expr);
     }
+
+    fn visit_local(&mut self, local: &rustc_ast::Local) {
+        // a member-copy initializer `let q = p` (both same-group planned members)
+        // is an index operation, not a pointer-value use of `p`.
+        if let Some(let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
+            && let hir::PatKind::Binding(_, q_hir, _, _) = let_stmt.pat.kind
+            && self.planned_rewrites.contains_key(&q_hir)
+            && let LocalKind::Init(init) | LocalKind::InitElse(init, _) = &local.kind
+            && let Some(p_hir) = self.direct_planned_local_hir_id(init)
+            && self.same_group_members(q_hir, p_hir)
+        {
+            self.summaries.entry(p_hir).or_default().movement_count += 1;
+            return;
+        }
+        visit::walk_local(self, local);
+    }
 }
 
 impl BindingUseClassifier<'_, '_> {
+    /// true when both hir ids are planned members of the same group (same base).
+    fn same_group_members(&self, a: HirId, b: HirId) -> bool {
+        let (Some(ra), Some(rb)) = (self.planned_rewrites.get(&a), self.planned_rewrites.get(&b))
+        else {
+            return false;
+        };
+        ra.base_hir_id == rb.base_hir_id && ra.base_name == rb.base_name
+    }
+
     fn direct_planned_local_hir_id(&self, expr: &Expr) -> Option<HirId> {
         direct_planned_local_hir_id(
             self.ast_to_hir,
