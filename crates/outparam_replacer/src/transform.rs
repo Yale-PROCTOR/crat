@@ -18,7 +18,10 @@ use rustc_middle::{
     mir::{BasicBlock, Local, Location, TerminatorKind},
     ty::{TyCtxt, TyKind as MirTyKind},
 };
-use rustc_span::{Span, def_id::LocalDefId};
+use rustc_span::{
+    Span,
+    def_id::{DefId, LocalDefId},
+};
 use utils::{
     expr,
     ir::{AstToHir, HirToThir, ThirToMir, mir_ty_to_string},
@@ -185,6 +188,97 @@ fn ast_mut_ptr_pointee_ty_str(ty: &Ty) -> Option<String> {
     }
 }
 
+fn complete_write_callee(
+    tcx: TyCtxt<'_>,
+    local_def_id: LocalDefId,
+    write: &CompleteWrite,
+) -> Option<DefId> {
+    let mir_body = tcx
+        .mir_drops_elaborated_and_const_checked(local_def_id)
+        .borrow();
+    let block = BasicBlock::from_usize(write.block);
+    let bbd = &mir_body.basic_blocks[block];
+    if write.statement_index != bbd.statements.len() {
+        return None;
+    }
+    let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else {
+        return None;
+    };
+    func.const_fn_def().map(|(def_id, _)| def_id)
+}
+
+fn transformable_output_params(
+    tcx: TyCtxt<'_>,
+    config: &crate::Config,
+    analysis_result: &AnalysisResult,
+) -> FxHashSet<(LocalDefId, usize)> {
+    let mut fn_results = FxHashMap::default();
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
+        let HirItemKind::Fn { ident, .. } = item.kind else {
+            continue;
+        };
+
+        if config.c_exposed_fns.contains(ident.name.as_str()) {
+            continue;
+        }
+
+        let local_def_id = id.owner_id.def_id;
+        let name = tcx.def_path_str(local_def_id.to_def_id());
+        if let Some(result) = analysis_result.get(&name) {
+            fn_results.insert(local_def_id, result);
+        }
+    }
+
+    let mut params = fn_results
+        .iter()
+        .flat_map(|(local_def_id, result)| {
+            result
+                .output_params
+                .iter()
+                .map(|p| (*local_def_id, p.index))
+        })
+        .collect::<FxHashSet<_>>();
+
+    loop {
+        let mut removed = vec![];
+        for (local_def_id, result) in &fn_results {
+            for param in &result.output_params {
+                let key = (*local_def_id, param.index);
+                if !params.contains(&key) {
+                    continue;
+                }
+
+                let has_untransformable_dependency = param.complete_writes.iter().any(|write| {
+                    let Some(write_arg) = write.write_arg else {
+                        return false;
+                    };
+                    let Some(callee) = complete_write_callee(tcx, *local_def_id, write) else {
+                        return true;
+                    };
+                    let Some(callee) = callee.as_local() else {
+                        return true;
+                    };
+                    !params.contains(&(callee, write_arg))
+                });
+                if has_untransformable_dependency {
+                    removed.push(key);
+                }
+            }
+        }
+
+        if removed.is_empty() {
+            break;
+        }
+
+        for key in removed {
+            params.remove(&key);
+        }
+    }
+
+    params
+}
+
 pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded_ast, tcx);
@@ -221,6 +315,7 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
     let mut funcs = FxHashMap::default();
     let mut write_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut counter = Counter::default();
+    let transformable_params = transformable_output_params(tcx, config, &analysis_result);
 
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
@@ -288,6 +383,10 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
                 complete_writes,
                 ..
             } = p;
+            if !transformable_params.contains(&(local_def_id, *index)) {
+                continue;
+            }
+
             let param = &hir_body.params[*index];
             let param_index = ParamIdx::from_usize(*index);
             let mir_local = Local::from_usize(*index + 1);
@@ -457,6 +556,10 @@ pub fn transform(tcx: TyCtxt<'_>, config: &crate::Config, verbose: bool) -> Stri
                     default_init,
                 },
             );
+        }
+
+        if index_map.is_empty() {
+            continue;
         }
 
         // Post-process direct_returns: if rhs is "*name" for a simplified output param,
