@@ -1126,17 +1126,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
                 match lhs_kind {
                     PtrKind::SliceCursor(_) => {
-                        // Detect self-assignment with offset: p = p.offset(k)
+                        // Detect self-assignment with offsets: p = p.offset(k).add(n)
                         if let Some(lhs_hir_id) = self.hir_id_of_path(lhs.id) {
                             let rhs_e = unwrap_addr_of_deref(unwrap_cast_and_paren(rhs));
                             let hir_rhs_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_rhs));
                             let seek_offset = self.ptr_expr(rhs_e, hir_rhs_e).and_then(|pe| {
                                 if let PtrExprBaseKind::Path(Res::Local(rhs_hir_id)) = pe.base_kind
                                     && rhs_hir_id == lhs_hir_id
-                                    && pe.projs.len() == 1
-                                    && let PtrExprProj::Offset(offset_expr, _) = &pe.projs[0]
                                 {
-                                    Some(pprust::expr_to_string(offset_expr))
+                                    cursor_self_assignment_offset(&pe.projs)
                                 } else {
                                     None
                                 }
@@ -6547,6 +6545,51 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         self.raw_pointer_projection_str_and_ty(raw, projs, None).0
     }
 
+    fn raw_pointer_projection_expr(
+        &self,
+        base: &Expr,
+        projs: &[PtrExprProj<'_, 'tcx>],
+    ) -> Option<Expr> {
+        let mut raw = base.clone();
+        for proj in projs {
+            match *proj {
+                PtrExprProj::Offset(offset, kind) => {
+                    let method = match kind {
+                        OffsetKind::Offset => "offset",
+                        OffsetKind::Add => "add",
+                    };
+                    raw = utils::expr!(
+                        "({}).{}({})",
+                        pprust::expr_to_string(&raw),
+                        method,
+                        pprust::expr_to_string(offset),
+                    );
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, to_mutability) = unwrap_ptr_from_mir_ty(ty)?;
+                    let raw_str = pprust::expr_to_string(&raw);
+                    let cast = format!(
+                        "as *{} {}",
+                        if to_mutability.is_mut() {
+                            "mut"
+                        } else {
+                            "const"
+                        },
+                        self.body_ty_name(to_ty),
+                    );
+                    raw = if matches!(raw.kind, ExprKind::MethodCall(_)) {
+                        utils::expr!("{raw_str} {cast}")
+                    } else {
+                        utils::expr!("({raw_str}) {cast}")
+                    };
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+        Some(raw)
+    }
+
     fn raw_pointer_projection_str_and_ty(
         &self,
         mut raw: String,
@@ -8454,8 +8497,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 }
                 (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Raw(m1)) => {
                     self.slice_cursor.set(true);
-                    // to keep offsets, we use `e` instead of `pe.base`
-                    *ptr = self.cursor_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    *ptr = self
+                        .cursor_from_raw_offset_chain(&pe, m, m1, lhs_inner_ty)
+                        .unwrap_or_else(|| {
+                            self.cursor_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty)
+                        });
                     return PtrKind::SliceCursor(m);
                 }
                 (PtrCtx::Rhs(PtrKind::SliceCursor(m)), PtrKind::Ref(m1)) => {
@@ -8785,7 +8831,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
                 self.slice_cursor.set(true);
-                *ptr = self.cursor_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty);
+                *ptr = self
+                    .cursor_from_raw_offset_chain(&pe, m, m1, lhs_inner_ty)
+                    .unwrap_or_else(|| self.cursor_from_raw(e, m, m1, lhs_inner_ty, rhs_inner_ty));
                 PtrKind::SliceCursor(m)
             }
             PtrCtx::Rhs(PtrKind::Slice(m)) => {
@@ -10598,24 +10646,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
-            if !need_cast {
-                utils::expr!(
-                    "{}::from_raw_parts{}(({}){}, 1_000_000)",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "{}::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
+            self.cursor_from_raw_parts(e, m, m1, lhs_inner_ty, rhs_inner_ty)
         } else if !utils::ast::has_side_effects(e) {
             if !need_cast {
                 utils::expr!(
@@ -10677,6 +10708,150 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 if m { "mut" } else { "const" },
             )
         }
+    }
+
+    fn cursor_from_raw_parts(
+        &self,
+        e: &Expr,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let need_cast = lhs_inner_ty != rhs_inner_ty;
+        let cast_mut = if m && !m1 { " as *mut _" } else { "" };
+        let cursor_ty = if m {
+            "crate::slice_cursor::SliceCursorMut"
+        } else {
+            "crate::slice_cursor::SliceCursor"
+        };
+
+        if !need_cast {
+            utils::expr!(
+                "{}::from_raw_parts{}(({}){}, 1_000_000)",
+                cursor_ty,
+                if m { "_mut" } else { "" },
+                pprust::expr_to_string(e),
+                cast_mut,
+            )
+        } else {
+            utils::expr!(
+                "{}::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
+                cursor_ty,
+                if m { "_mut" } else { "" },
+                pprust::expr_to_string(e),
+                cast_mut,
+                if m { "mut" } else { "const" },
+            )
+        }
+    }
+
+    fn cursor_from_raw_offset_chain(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        base_mutability: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Option<Expr> {
+        if pe.addr_of || pe.as_ptr || pe.cast_int || pe.projs.is_empty() {
+            return None;
+        }
+
+        let (base_inner_ty, base_mutability_ty) = unwrap_ptr_from_mir_ty(pe.base_ty)?;
+        let mut current_inner_ty = base_inner_ty;
+        let mut current_mutability = base_mutability_ty.is_mut();
+        let mut anchor_len = 0;
+        for (idx, proj) in pe.projs.iter().enumerate() {
+            match *proj {
+                PtrExprProj::Offset(..) => {}
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, to_mutability) = unwrap_ptr_from_mir_ty(ty)?;
+                    let to_mutability = to_mutability.is_mut();
+                    if to_ty != current_inner_ty || to_mutability != current_mutability {
+                        anchor_len = idx + 1;
+                    }
+                    current_inner_ty = to_ty;
+                    current_mutability = to_mutability;
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+
+        let mut anchor_inner_ty = base_inner_ty;
+        let mut anchor_mutability = base_mutability;
+        for proj in &pe.projs[..anchor_len] {
+            match *proj {
+                PtrExprProj::Offset(..) => {}
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, to_mutability) = unwrap_ptr_from_mir_ty(ty)?;
+                    anchor_inner_ty = to_ty;
+                    anchor_mutability = to_mutability.is_mut();
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+
+        let mut replay_offsets = Vec::new();
+        let mut suffix_inner_ty = anchor_inner_ty;
+        for proj in &pe.projs[anchor_len..] {
+            match *proj {
+                PtrExprProj::Offset(offset, OffsetKind::Offset | OffsetKind::Add) => {
+                    replay_offsets.push(offset);
+                }
+                PtrExprProj::Cast(ty) if ty.is_usize() => return None,
+                PtrExprProj::Cast(ty) => {
+                    let (to_ty, _) = unwrap_ptr_from_mir_ty(ty)?;
+                    if to_ty != suffix_inner_ty {
+                        return None;
+                    }
+                    suffix_inner_ty = to_ty;
+                }
+                PtrExprProj::IntegerOp(..) | PtrExprProj::IntegerBinOp(..) => return None,
+            }
+        }
+        if replay_offsets.is_empty() {
+            return None;
+        }
+        if anchor_inner_ty != lhs_inner_ty {
+            return None;
+        }
+
+        let anchor = self.raw_pointer_projection_expr(pe.base, &pe.projs[..anchor_len])?;
+        let cursor_anchor = self.cursor_from_raw_parts(
+            &anchor,
+            m,
+            anchor_mutability,
+            lhs_inner_ty,
+            anchor_inner_ty,
+        );
+        let use_anchor_temp = replay_offsets.len() > 1;
+        if use_anchor_temp {
+            let (last_offset, leading_offsets) = replay_offsets.split_last().unwrap();
+            let mut stmts = format!("let _x = {};", pprust::expr_to_string(&cursor_anchor));
+            for offset in leading_offsets {
+                stmts.push_str(&format!(
+                    "let _x = _x.offset_by(({}) as isize);",
+                    pprust::expr_to_string(offset),
+                ));
+            }
+            let tail = format!(
+                "_x.offset_by(({}) as isize)",
+                pprust::expr_to_string(last_offset),
+            );
+            return Some(utils::expr!("{{ {stmts} {tail} }}"));
+        }
+
+        let mut cursor = cursor_anchor;
+        for offset in replay_offsets {
+            cursor = utils::expr!(
+                "{}.offset_by(({}) as isize)",
+                pprust::expr_to_string(&cursor),
+                pprust::expr_to_string(offset),
+            );
+        }
+        Some(cursor)
     }
 
     fn cursor_from_ref(
@@ -11978,6 +12153,21 @@ fn combined_cursor_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
         })
         .collect::<Option<Vec<_>>>()?;
     combined_offsets(&offsets, true)
+}
+
+fn cursor_self_assignment_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<String> {
+    let offsets = projs
+        .iter()
+        .map(|proj| match proj {
+            PtrExprProj::Offset(offset, _) => Some(*offset),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match offsets.as_slice() {
+        [] => None,
+        [offset] => Some(pprust::expr_to_string(offset)),
+        _ => combined_offsets(&offsets, true).map(|offset| pprust::expr_to_string(&offset)),
+    }
 }
 
 #[derive(Default)]

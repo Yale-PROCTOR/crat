@@ -9799,6 +9799,194 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_raw_offset_let_init_shared_cursor_preserves_base_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn read_before(s: *mut core::ffi::c_void, n: isize) -> u8 {
+    let mut p: *mut u8 = (s as *mut u8).offset(n);
+    let before = *p.offset(-1);
+    p = p.offset(1);
+    before + *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
+            ".offset_by((n) as isize)",
+            "p.seek((1) as isize)",
+        ],
+        &[".offset(n)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_assignment_mut_cursor_preserves_base_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn write_before(s: *mut core::ffi::c_void, n: isize, value: u8) -> u8 {
+    let mut p: *mut u8 = core::ptr::null_mut();
+    p = (s as *mut u8).offset(n);
+    *p.offset(-1) = value;
+    p = p.offset(1);
+    *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
+            ".offset_by((n) as isize)",
+            "(p)[(-1) as isize] = value",
+            "p.seek((1) as isize)",
+        ],
+        &[".offset(n)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_chain_with_cast_mut_cursor_preserves_each_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn write_chained(
+    s: *mut core::ffi::c_void,
+    n: isize,
+    m: isize,
+    k: isize,
+    value: u8,
+) -> u8 {
+    let mut p: *mut u8 =
+        (((s as *mut u8).offset(n) as *mut u8).offset(m)).offset(k);
+    *p.offset(-2) = value;
+    *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
+            ".offset_by((n) as isize)",
+            ".offset_by((m) as isize)",
+            ".offset_by((k) as isize)",
+            "(p)[(-2) as isize] = value",
+        ],
+        &[
+            ".offset(n) as *mut u8).offset(m)).offset(k)",
+            ".offset(k)),",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_offset_cursor_return_bridge_preserves_base_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn raw_prev(s: *mut core::ffi::c_void, n: isize) -> *mut u8 {
+    let p: *mut u8 = (s as *mut u8).offset(n);
+    return p.offset(-1);
+}
+"#,
+        &[
+            "let p: crate::slice_cursor::SliceCursor<'_, u8>",
+            ".offset_by((n) as isize)",
+            "let _x = (p).offset_by((-1) as isize)",
+        ],
+        &[".offset(n)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_add_then_offset_cursor_preserves_each_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn read_add_then_offset(s: *mut core::ffi::c_void, n: usize, m: isize) -> u8 {
+    let mut p: *mut u8 = (s as *mut u8).add(n).offset(m);
+    let before = *p.offset(-1);
+    p = p.offset(1);
+    before + *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
+            ".offset_by((n) as isize)",
+            ".offset_by((m) as isize)",
+            "p.seek((1) as isize)",
+        ],
+        &[".add(n).offset(m)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_const_void_base_shared_cursor_preserves_base_offset() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn read_const_before(s: *const core::ffi::c_void, n: isize) -> u8 {
+    let mut p: *const u8 = (s as *const u8).offset(n);
+    let before = *p.offset(-1);
+    p = p.offset(1);
+    before + *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
+            ".offset_by((n) as isize)",
+            "p.seek((1) as isize)",
+        ],
+        &[".offset(n)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_type_changing_cast_moves_only_same_typed_suffix() {
+    run_typecheck_test_after_shape_check(
+        r#"
+#[repr(C)]
+pub struct Header {
+    pub value: u32,
+}
+
+pub unsafe fn read_header(
+    s: *mut core::ffi::c_void,
+    byte_off: isize,
+    header_off: isize,
+) -> u32 {
+    let mut p: *mut Header =
+        ((s as *mut u8).offset(byte_off) as *mut Header).offset(header_off);
+    let before = (*p.offset(-1)).value;
+    p = p.offset(1);
+    before + (*p).value
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursor<'_,",
+            ".offset(byte_off) as",
+            ".offset_by((header_off) as isize)",
+            "p.seek((1) as isize)",
+        ],
+        &[".offset(header_off)), 1_000_000"],
+    );
+}
+
+#[test]
+fn test_raw_offset_type_preserving_mut_cast_stays_in_anchor() {
+    run_typecheck_test_after_shape_check(
+        r#"
+extern "C" {
+    fn get() -> *const u8;
+}
+
+pub unsafe fn write_from_get(n: isize, value: u8) -> u8 {
+    let mut p: *mut u8 = (get() as *mut u8).offset(n);
+    *p.offset(-1) = value;
+    *p
+}
+"#,
+        &[
+            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
+            "from_raw_parts_mut(((get()) as",
+            "*mut u8), 1_000_000).offset_by((n) as isize)",
+            ".offset_by((n) as isize)",
+            "(p)[(-1) as isize] = value",
+        ],
+        &["from_raw_parts_mut((get())"],
+    );
+}
+
+#[test]
 fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
     run_test(
         r#"
