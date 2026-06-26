@@ -4,4 +4,4 @@ benchmarks/analyses/
 benchmarks/tmp
 benchmarks/rs-*
 .z3-trace
-lib.long-type-*.txt
+*.long-type-*.txt
