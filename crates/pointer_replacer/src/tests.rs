@@ -10019,3 +10019,35 @@ pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
         "no re-wrap of the Option: {s}"
     );
 }
+
+#[test]
+fn test_array_local_rewriter_keeps_moving_deref_cursor_index_only() {
+    // two cursors that both move and deref (never passed to a call, never stored
+    // as a pointer value) stay index-only instead of kept &T references.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += *p + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("p_idx") && s.contains("q_idx"),
+        "cursors index-rewritten: {s}"
+    );
+    assert!(
+        !s.contains("let mut p: &i32") && !s.contains("let mut q: &i32"),
+        "moving deref cursors are index-only, not kept references: {s}"
+    );
+}

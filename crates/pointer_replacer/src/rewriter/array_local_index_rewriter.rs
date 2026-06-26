@@ -1568,6 +1568,13 @@ fn choose_binding_representations(
                 rewrite.representation = BindingRepresentation::IndexOnly;
                 continue;
             }
+            // a moving cursor whose only materialization reason is shared value
+            // uses (derefs) stays index-only; its uses are inline-materialized
+            // rather than kept as a `&T` binding.
+            if !matches!(kind, MaterializationKind::RawPtr) && summary.has_index_benefit() {
+                rewrite.representation = BindingRepresentation::IndexOnly;
+                continue;
+            }
             rewrite.representation = BindingRepresentation::Materialized(kind);
         } else if !summary.has_index_benefit() {
             rewrite.representation = BindingRepresentation::IndexOnly;
