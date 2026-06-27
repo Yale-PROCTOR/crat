@@ -20,6 +20,7 @@ use rustc_span::{DUMMY_SP, Ident, Symbol, sym};
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
+    FALLBACK_SLICE_LEN,
     ast::{unwrap_cast_and_paren, unwrap_cast_and_paren_mut, unwrap_paren, unwrap_paren_mut},
     bytemuck::{
         BytemuckDerivePlan, BytemuckDeriveVisitor, BytemuckRequirement, BytemuckTypeClassifier,
@@ -8129,7 +8130,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         );
                     } else {
                         *ptr = utils::expr!(
-                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} _, 1_000_000)",
+                            "std::slice::from_raw_parts{0}(&raw {1} ({2}) as *{1} _, {FALLBACK_SLICE_LEN})",
                             if m { "_mut" } else { "" },
                             if m { "mut" } else { "const" },
                             pprust::expr_to_string(e),
@@ -9847,7 +9848,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let source_inner_ty = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx)?;
         let raw = self.raw_from_opt_ref(pe.base, m, source_mut, source_inner_ty, source_inner_ty);
         let mut expr = utils::expr!(
-            "std::slice::from_raw_parts{}({}, 1_000_000)",
+            "std::slice::from_raw_parts{}({}, {FALLBACK_SLICE_LEN})",
             if m { "_mut" } else { "" },
             pprust::expr_to_string(&raw),
         );
@@ -10430,11 +10431,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             );
             match target_kind {
                 PtrKind::Slice(true) => {
-                    format!("std::slice::from_raw_parts_mut({raw}, 1_000_000)")
+                    format!("std::slice::from_raw_parts_mut({raw}, {FALLBACK_SLICE_LEN})")
                 }
                 PtrKind::SliceCursor(true) => {
                     format!(
-                        "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut({raw}, 1_000_000)"
+                        "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut({raw}, {FALLBACK_SLICE_LEN})"
                     )
                 }
                 _ => unreachable!(),
@@ -10552,7 +10553,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let empty = if m { "&mut []" } else { "&[]" };
         self.empty_checked_slice_or_cursor_expr(e, m, empty, |receiver| {
             format!(
-                "std::slice::from_raw_parts{}(({}).{}() as *{} {}, 1_000_000)",
+                "std::slice::from_raw_parts{}(({}).{}() as *{} {}, {FALLBACK_SLICE_LEN})",
                 if m { "_mut" } else { "" },
                 receiver,
                 ptr_method,
@@ -10579,7 +10580,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let empty = format!("{cursor_ty}::empty()");
         self.empty_checked_slice_or_cursor_expr(e, m, &empty, |receiver| {
             format!(
-                "{}::from_raw_parts{}(({}).{}() as *{} {}, 1_000_000)",
+                "{}::from_raw_parts{}(({}).{}() as *{} {}, {FALLBACK_SLICE_LEN})",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 receiver,
@@ -10601,7 +10602,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let empty = format!("{cursor_ty}::empty()");
         self.empty_checked_slice_or_cursor_expr(e, false, &empty, |receiver| {
             format!(
-                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, 1_000_000)",
+                "{}::from_raw_parts{}(({}).as_ptr() as *{} {}, {FALLBACK_SLICE_LEN})",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 receiver,
@@ -10789,14 +10790,14 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             if !need_cast {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){}, 1_000_000)",
+                    "std::slice::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
                 )
             } else {
                 utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
+                    "std::slice::from_raw_parts{}(({}){} as *{} _, {FALLBACK_SLICE_LEN})",
                     if m { "_mut" } else { "" },
                     pprust::expr_to_string(e),
                     cast_mut,
@@ -10809,7 +10810,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     "if ({0}).is_null() {{
                         &{1}[]
                     }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3}, 1_000_000)
+                        std::slice::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
                     }}",
                     pprust::expr_to_string(e),
                     if m { "mut " } else { "" },
@@ -10821,7 +10822,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     "if ({0}).is_null() {{
                         &{1}[]
                     }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, 1_000_000)
+                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, {FALLBACK_SLICE_LEN})
                     }}",
                     pprust::expr_to_string(e),
                     if m { "mut " } else { "" },
@@ -10837,7 +10838,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
-                        std::slice::from_raw_parts{}(_x{}, 1_000_000)
+                        std::slice::from_raw_parts{}(_x{}, {FALLBACK_SLICE_LEN})
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -10852,7 +10853,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         &{}[]
                     }} else {{
-                        std::slice::from_raw_parts{}(_x{} as *{} _, 1_000_000)
+                        std::slice::from_raw_parts{}(_x{} as *{} _, {FALLBACK_SLICE_LEN})
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -10974,7 +10975,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        {1}::from_raw_parts{2}(({0}){3}, 1_000_000)
+                        {1}::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -10986,7 +10987,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     "if ({0}).is_null() {{
                         {1}::empty()
                     }} else {{
-                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, 1_000_000)
+                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, {FALLBACK_SLICE_LEN})
                     }}",
                     pprust::expr_to_string(e),
                     cursor_ty,
@@ -11002,7 +11003,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        {}::from_raw_parts{}(_x{}, 1_000_000)
+                        {}::from_raw_parts{}(_x{}, {FALLBACK_SLICE_LEN})
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -11018,7 +11019,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     if _x.is_null() {{
                         {}::empty()
                     }} else {{
-                        {}::from_raw_parts{}(_x{} as *{} _, 1_000_000)
+                        {}::from_raw_parts{}(_x{} as *{} _, {FALLBACK_SLICE_LEN})
                     }}
                 }}",
                 pprust::expr_to_string(e),
@@ -11049,7 +11050,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
 
         if !need_cast {
             utils::expr!(
-                "{}::from_raw_parts{}(({}){}, 1_000_000)",
+                "{}::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),
@@ -11057,7 +11058,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             )
         } else {
             utils::expr!(
-                "{}::from_raw_parts{}(({}){} as *{} _, 1_000_000)",
+                "{}::from_raw_parts{}(({}){} as *{} _, {FALLBACK_SLICE_LEN})",
                 cursor_ty,
                 if m { "_mut" } else { "" },
                 pprust::expr_to_string(e),

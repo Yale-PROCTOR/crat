@@ -6907,7 +6907,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
             "bytemuck::cast_slice_mut::<_, i32>",
             "&mut [i32]",
         ],
-        &["from_raw_parts_mut", "1_000_000"],
+        &["from_raw_parts_mut", ::utils::FALLBACK_SLICE_LEN],
     );
 }
 
@@ -7162,7 +7162,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 
 /// addr_of with Slice context, non-bytemuck cast: different-size numerics
 /// (c_int vs c_short) with .offset() usage.
-/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 1_000_000)`.
+/// Output: `std::slice::from_raw_parts_mut(&raw mut (x) as *mut _, 1_000_000_000)`.
 #[test]
 fn test_addr_of_slice_cast() {
     run_test(
@@ -7194,7 +7194,11 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 "#,
         &["bytemuck::cast_slice_mut::<_, i16>", "&mut [i16]"],
-        &["from_raw_parts_mut", "1_000_000", "&raw mut"],
+        &[
+            "from_raw_parts_mut",
+            ::utils::FALLBACK_SLICE_LEN,
+            "&raw mut",
+        ],
     );
 }
 
@@ -8537,7 +8541,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
             "bytemuck::cast_slice_mut::<_, i32>",
             "&mut [i32]",
         ],
-        &["from_raw_parts", "1_000_000"],
+        &["from_raw_parts", ::utils::FALLBACK_SLICE_LEN],
     );
 }
 
@@ -9678,7 +9682,8 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
         &[
             "crate::slice_cursor::SliceCursorMut<'_, u32>",
             "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
+            "as *mut u8",
+            ::utils::FALLBACK_SLICE_LEN,
             "set_type((leaf_addr).as_deref_mut(), offset, value);",
         ],
         &[
@@ -9716,7 +9721,8 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
         &[
             "crate::slice_cursor::SliceCursorMut<'_, u32>",
             "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
+            "as *mut u8",
+            ::utils::FALLBACK_SLICE_LEN,
             "set_type(if (leaf_addr).is_null()",
             "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
         ],
@@ -18403,7 +18409,8 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
             "fn write_window(mut words: &mut [i32], idx: usize)",
             "let cursor: *const i32 = words;",
             "write_window(if (cursor).is_null()",
-            "std::slice::from_raw_parts_mut((cursor) as *mut _, 1_000_000)",
+            "std::slice::from_raw_parts_mut((cursor) as *mut _,",
+            ::utils::FALLBACK_SLICE_LEN,
         ],
         &[
             "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",

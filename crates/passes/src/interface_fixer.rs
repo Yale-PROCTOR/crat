@@ -12,7 +12,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
 use rustc_span::{Symbol, sym};
 use serde::Deserialize;
-use utils::ir::AstToHir;
+use utils::{FALLBACK_SLICE_LEN, ir::AstToHir};
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
@@ -68,7 +68,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         ParamFixKind::Slice => {
                             write!(
                                 call,
-                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1_000_000) }}, ",
+                                "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, {FALLBACK_SLICE_LEN}) }}, ",
                                 if fix.mutability.is_mut() { "mut " } else { "" },
                                 if fix.mutability.is_mut() { "_mut" } else { "" },
                             )
@@ -78,13 +78,13 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             if fix.mutability.is_mut() {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, 1_000_000)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursorMut::empty() }} else {{ crate::slice_cursor::SliceCursorMut::new(std::slice::from_raw_parts_mut({x}, {FALLBACK_SLICE_LEN})) }}, ",
                                 )
                                 .unwrap();
                             } else {
                                 write!(
                                     call,
-                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, 1_000_000)) }}, ",
+                                    "if {x}.is_null() {{ crate::slice_cursor::SliceCursor::empty() }} else {{ crate::slice_cursor::SliceCursor::new(std::slice::from_raw_parts({x}, {FALLBACK_SLICE_LEN})) }}, ",
                                 )
                                 .unwrap();
                             }

@@ -704,7 +704,7 @@ fn lifetime_flow_known_slice_search_pipeline_return() {
             let search = if found.is_null() {
                 &[]
             } else {
-                unsafe { std::slice::from_raw_parts(found, 1_000_000) }
+                unsafe { std::slice::from_raw_parts(found, 1_000_000_000) }
             };
             if search.is_empty() {
                 path.as_ptr()

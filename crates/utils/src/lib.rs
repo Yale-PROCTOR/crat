@@ -37,6 +37,8 @@ pub mod ir;
 pub mod ty_shape;
 pub mod unsafety;
 
+pub const FALLBACK_SLICE_LEN: &str = "1_000_000_000";
+
 pub fn find_lib_path(dir: &std::path::Path) -> Result<String, String> {
     let cargo_file = dir.join("Cargo.toml");
     if !cargo_file.exists() {
