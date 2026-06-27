@@ -1690,6 +1690,20 @@ pub(crate) fn base_slot_info<'a>(
     provenance.slot_table.slot_infos.get(base_slot)
 }
 
+/// last-segment names of external calls whose arg 0 is a base-preserving
+/// pointer cursor that can be inline-materialised at the call site.
+pub(crate) fn is_inlineable_pointer_arg(name: &str, arg_index: usize) -> bool {
+    matches!(
+        name,
+        "memchr" | "memset" | "strstr" | "strchr" | "strrchr" | "strpbrk"
+    ) && arg_index == 0
+}
+
+pub(crate) fn is_inlineable_call(name: &str) -> bool {
+    // every inlineable call's pointer arg is arg 0, so reuse the single list.
+    is_inlineable_pointer_arg(name, 0)
+}
+
 #[allow(dead_code)]
 pub fn debug_rewrite_groups<'tcx>(
     groups: &[RewriteGroup],

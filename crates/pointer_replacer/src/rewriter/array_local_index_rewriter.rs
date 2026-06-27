@@ -848,14 +848,13 @@ fn call_path_last_segment(expr: &Expr) -> Option<&str> {
 }
 
 fn inlineable_memory_pointer_arg(callee: &Expr, arg_index: usize) -> bool {
-    match call_path_last_segment(callee) {
-        Some("memchr" | "memset") => arg_index == 0,
-        _ => false,
-    }
+    call_path_last_segment(callee).is_some_and(|name| {
+        analyses::array_local_provenance::is_inlineable_pointer_arg(name, arg_index)
+    })
 }
 
 fn inlineable_memory_call(callee: &Expr) -> bool {
-    matches!(call_path_last_segment(callee), Some("memchr" | "memset"))
+    call_path_last_segment(callee).is_some_and(analyses::array_local_provenance::is_inlineable_call)
 }
 
 fn binding_names_in_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> FxHashSet<String> {
