@@ -63,6 +63,49 @@ fn run_test_with_config(code: &str, config: &Config, includes: &[&str], excludes
     }
 }
 
+fn assert_slop_prone_slice_cast_trims_byte_prefix(
+    s: &str,
+    cast_fn: &str,
+    target_ty: &str,
+    direct_sources: &[&str],
+) {
+    let size_patterns = [
+        format!("std::mem::size_of::<{target_ty}>()"),
+        format!("::std::mem::size_of::<{target_ty}>()"),
+        format!("core::mem::size_of::<{target_ty}>()"),
+        format!("::core::mem::size_of::<{target_ty}>()"),
+    ];
+    assert!(
+        size_patterns.iter().any(|pattern| s.contains(pattern)),
+        "Expected slop-prone bytemuck cast to trim with target size {target_ty}:\n{s}"
+    );
+
+    assert!(
+        s.contains("bytemuck::cast_slice::<_, u8>")
+            || s.contains("bytemuck::cast_slice_mut::<_, u8>"),
+        "Expected slop-prone bytemuck cast to build a byte-prefix view before target cast:\n{s}"
+    );
+
+    for source in direct_sources {
+        let direct_cast = format!("bytemuck::{cast_fn}::<_, {target_ty}>({source})");
+        assert!(
+            !s.contains(&direct_cast),
+            "Expected slop-prone bytemuck cast not to reinterpret the whole source slice `{source}` directly:\n{s}"
+        );
+    }
+}
+
+fn assert_direct_slice_cast_without_byte_prefix(s: &str, cast_fn: &str, target_ty: &str) {
+    assert!(
+        s.contains(&format!("bytemuck::{cast_fn}::<_, {target_ty}>")),
+        "Expected direct bytemuck cast to {target_ty}:\n{s}"
+    );
+    assert!(
+        !s.contains("__crat_bytes") && !s.contains("__crat_len"),
+        "Expected divisible bytemuck cast not to use byte-prefix trimming:\n{s}"
+    );
+}
+
 fn run_typecheck_test_after_shape_check(code: &str, includes: &[&str], excludes: &[&str]) {
     let (s, _) = rewrite_with_config(code, &Config::default());
     for include in includes {
@@ -6465,6 +6508,181 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
         &["bytemuck::cast_slice_mut", "&mut [u32]", "&mut [i32]"],
         &["*mut"],
     );
+}
+
+#[test]
+fn test_mut_c_char_21_slice_to_i32_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i32 {
+    let mut buf: [core::ffi::c_char; 21] = [0; 21];
+    let mut p: *mut core::ffi::c_char = buf.as_mut_ptr();
+    *p.offset(0 as isize) = 1 as core::ffi::c_char;
+    *p.offset(20 as isize) = 2 as core::ffi::c_char;
+    let mut q: *mut i32 = p as *mut i32;
+    *q.offset(0 as isize) = 7;
+    return *q.offset(4 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&mut [i8]"), "{s}");
+    assert!(s.contains("&mut [i32]"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(
+        &s,
+        "cast_slice_mut",
+        "i32",
+        &["(p)", "&mut (p)"],
+    );
+}
+
+#[test]
+fn test_shared_i8_slice_to_i32_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i32 {
+    let buf: [i8; 21] = [0; 21];
+    let p: *const i8 = buf.as_ptr();
+    let first = *p.offset(0 as isize) as i32;
+    let q: *const i32 = p as *const i32;
+    return first + *q.offset(4 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&[i8]"), "{s}");
+    assert!(s.contains("&[i32]"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(&s, "cast_slice", "i32", &["(p)", "&(p)"]);
+}
+
+#[test]
+fn test_mut_i8_slice_to_i16_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i16 {
+    let mut buf: [i8; 5] = [0; 5];
+    let mut p: *mut i8 = buf.as_mut_ptr();
+    *p.offset(4 as isize) = 1;
+    let mut q: *mut i16 = p as *mut i16;
+    *q.offset(0 as isize) = 7;
+    return *q.offset(1 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&mut [i8]"), "{s}");
+    assert!(s.contains("&mut [i16]"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(
+        &s,
+        "cast_slice_mut",
+        "i16",
+        &["(p)", "&mut (p)"],
+    );
+}
+
+#[test]
+fn test_mut_i16_slice_to_i32_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i32 {
+    let mut buf: [i16; 3] = [0; 3];
+    let mut p: *mut i16 = buf.as_mut_ptr();
+    *p.offset(2 as isize) = 1;
+    let mut q: *mut i32 = p as *mut i32;
+    *q.offset(0 as isize) = 7;
+    return *q.offset(0 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&mut [i16]"), "{s}");
+    assert!(s.contains("&mut [i32]"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(
+        &s,
+        "cast_slice_mut",
+        "i32",
+        &["(p)", "&mut (p)"],
+    );
+}
+
+#[test]
+fn test_as_mut_ptr_i8_array_to_i32_slice_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i32 {
+    let mut buf: [i8; 21] = [0; 21];
+    let mut q: *mut i32 = buf.as_mut_ptr() as *mut i32;
+    *q.offset(0 as isize) = 7;
+    return *q.offset(4 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&mut [i32]"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(
+        &s,
+        "cast_slice_mut",
+        "i32",
+        &["&mut (buf)", "(&mut (buf))"],
+    );
+}
+
+#[test]
+fn test_shared_i8_cursor_to_i32_cursor_bytemuck_cast_trims_slop() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe fn foo(p: *const i8) -> i32 {
+    let q: *const i32 = (p as *const i32).offset(-(1 as isize));
+    return *q.offset(1 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("crate::slice_cursor::SliceCursor<'_, i8>"),
+        "{s}"
+    );
+    assert!(s.contains("crate::slice_cursor::SliceCursor::new"), "{s}");
+    assert_slop_prone_slice_cast_trims_byte_prefix(
+        &s,
+        "cast_slice",
+        "i32",
+        &["(p).as_slice()", "((p).as_slice())"],
+    );
+}
+
+#[test]
+fn test_mut_i32_slice_to_i8_bytemuck_cast_stays_direct() {
+    let (s, bytemuck) = rewrite_with_config(
+        r#"
+pub unsafe extern "C" fn foo() -> i8 {
+    let mut buf: [i32; 5] = [0; 5];
+    let mut p: *mut i32 = buf.as_mut_ptr();
+    *p.offset(0 as isize) = 7;
+    let mut q: *mut i8 = p as *mut i8;
+    *q.offset(3 as isize) = 1;
+    return *q.offset(7 as isize);
+}
+"#,
+        &Config::default(),
+    );
+    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("&mut [i32]"), "{s}");
+    assert!(s.contains("&mut [i8]"), "{s}");
+    assert_direct_slice_cast_without_byte_prefix(&s, "cast_slice_mut", "i8");
 }
 
 // ===== Non-bytemuck type cast tests =====
