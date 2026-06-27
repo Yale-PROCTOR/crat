@@ -120,6 +120,24 @@ fn run_typecheck_test_after_shape_check(code: &str, includes: &[&str], excludes:
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
 }
 
+fn run_raw_origin_cursor_rejection_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    for exclude in ["crate::slice_cursor::SliceCursor", "from_raw_parts"]
+        .iter()
+        .copied()
+        .chain(excludes.iter().copied())
+    {
+        assert!(
+            !s.contains(exclude),
+            "Expected raw-origin rewrite not to find `{exclude}` in:\n{s}",
+        );
+    }
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+}
+
 fn run_adt_lifetime_family_test(
     code: &str,
     unified_lifetime_includes: &[&str],
@@ -2617,7 +2635,7 @@ pub unsafe extern "C" fn first(buffer: *const Buffer) -> libc::c_int {
 }
 
 #[test]
-fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_with_disjoint_root_update() {
+fn test_rewriter_keeps_raw_field_copied_to_local_offset_alias_with_disjoint_root_update() {
     run_test(
         r#"
 #[repr(C)]
@@ -2639,21 +2657,20 @@ pub unsafe fn get_bits(bs: *mut Bs, n: i32) -> u32 {
 }
 "#,
         &[
-            "pub struct Bs<'a>",
-            "pub buf: crate::slice_cursor::SliceCursor<'a, u8>",
-            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
-            "p.seek((1) as isize)",
+            "pub struct Bs {",
+            "pub buf: *const u8",
+            "let mut p: *const u8 = (bs.buf).offset",
+            "p = p.offset(1)",
         ],
         &[
-            "pub buf: *const u8",
+            "crate::slice_cursor::SliceCursor",
             "std::slice::from_raw_parts(((bs.buf).offset",
-            "*p.offset",
         ],
     );
 }
 
 #[test]
-fn test_rewriter_promotes_cursor_field_copied_to_local_offset_alias_without_root_mutation() {
+fn test_rewriter_keeps_raw_field_copied_to_local_offset_alias_without_root_mutation() {
     run_test(
         r#"
 #[repr(C)]
@@ -2674,15 +2691,14 @@ pub unsafe fn read_two(bs: *const Bs) -> u32 {
 }
 "#,
         &[
-            "pub struct Bs<'a>",
-            "pub buf: crate::slice_cursor::SliceCursor<'a, u8>",
-            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
-            "p.seek((1) as isize)",
+            "pub struct Bs {",
+            "pub buf: *const u8",
+            "let mut p: *const u8 = (bs.buf).offset",
+            "p = p.offset(1)",
         ],
         &[
-            "pub buf: *const u8",
+            "crate::slice_cursor::SliceCursor",
             "std::slice::from_raw_parts(((bs.buf).offset",
-            "*p as u32",
         ],
     );
 }
@@ -2746,7 +2762,7 @@ pub unsafe fn cp_ptr(s: *const State) -> *const i8 {
 }
 
 #[test]
-fn test_rewriter_cursor_numeric_cast_uses_bytemuck_not_raw_parts() {
+fn test_rewriter_raw_pointer_numeric_cast_stays_raw() {
     run_test(
         r#"
 #[repr(C)]
@@ -2760,12 +2776,14 @@ pub unsafe fn container_from_b(i: *const i32) -> *const Pair {
 }
 "#,
         &[
-            "pub unsafe fn container_from_b(i: crate::slice_cursor::SliceCursor<'_, i32>)",
-            "bytemuck::cast_slice::<_,",
-            "i8>((i).as_slice())",
-            ".offset_by((-(4 as isize))",
+            "pub unsafe fn container_from_b(i: *const i32) -> *const crate::Pair",
+            "((i as *const i8).offset(-(4 as isize))) as *const Pair",
         ],
-        &["crate::slice_cursor::SliceCursor::from_raw_parts((i).as_ptr()"],
+        &[
+            "crate::slice_cursor::SliceCursor",
+            "bytemuck::cast_slice",
+            "from_raw_parts((i).as_ptr()",
+        ],
     );
 }
 
@@ -3463,7 +3481,7 @@ pub unsafe fn show(fields: *mut Record, i: isize) -> i32 {
             "pub struct Record<'a>",
             "pub name: &'a [i8]",
             "pub unsafe fn consume_c_string(s: &[i8])",
-            "consume_c_string(((fields)[(i) as isize]).name)",
+            "consume_c_string((*fields.offset(i)).name)",
         ],
         &["pub name: Option<&'a i8>", "pub name: *const i8"],
     );
@@ -6638,7 +6656,7 @@ pub unsafe extern "C" fn foo() -> i32 {
 }
 
 #[test]
-fn test_shared_i8_cursor_to_i32_cursor_bytemuck_cast_trims_slop() {
+fn test_raw_i8_pointer_to_i32_pointer_cast_stays_raw_without_bytemuck() {
     let (s, bytemuck) = rewrite_with_config(
         r#"
 pub unsafe fn foo(p: *const i8) -> i32 {
@@ -6648,19 +6666,16 @@ pub unsafe fn foo(p: *const i8) -> i32 {
 "#,
         &Config::default(),
     );
-    assert_eq!(bytemuck, BytemuckDependency::Runtime);
+    assert_eq!(bytemuck, BytemuckDependency::None);
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("pub unsafe fn foo(p: *const i8) -> i32"), "{s}");
     assert!(
-        s.contains("crate::slice_cursor::SliceCursor<'_, i8>"),
+        s.contains("let q: *const i32 = (p as *const i32).offset(-(1 as isize));"),
         "{s}"
     );
-    assert!(s.contains("crate::slice_cursor::SliceCursor::new"), "{s}");
-    assert_slop_prone_slice_cast_trims_byte_prefix(
-        &s,
-        "cast_slice",
-        "i32",
-        &["(p).as_slice()", "((p).as_slice())"],
-    );
+    assert!(!s.contains("crate::slice_cursor::SliceCursor"), "{s}");
+    assert!(!s.contains("bytemuck::cast_slice"), "{s}");
+    assert!(!s.contains("from_raw_parts"), "{s}");
 }
 
 #[test]
@@ -10016,140 +10031,290 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
-fn test_raw_offset_let_init_shared_cursor_preserves_base_offset() {
-    run_typecheck_test_after_shape_check(
+fn test_raw_origin_param_assigned_to_cursor_like_local_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
         r#"
-pub unsafe fn read_before(s: *mut core::ffi::c_void, n: isize) -> u8 {
-    let mut p: *mut u8 = (s as *mut u8).offset(n);
-    let before = *p.offset(-1);
-    p = p.offset(1);
-    before + *p
+pub unsafe fn raw_param_assigned_to_cursor_like_local(p: *const core::ffi::c_void) -> i32 {
+    let mut q: *const i32 = p as *const i32;
+    let before = *q.offset(-1);
+    q = q.offset(1);
+    before + *q
 }
 "#,
         &[
-            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
-            ".offset_by((n) as isize)",
-            "p.seek((1) as isize)",
+            "pub unsafe fn raw_param_assigned_to_cursor_like_local",
+            "*const std::ffi::c_void",
+            "let mut q: *const i32 = p as *const i32;",
         ],
-        &[".offset(n)), 1_000_000"],
+        &[],
     );
 }
 
 #[test]
-fn test_raw_offset_assignment_mut_cursor_preserves_base_offset() {
-    run_typecheck_test_after_shape_check(
+fn test_raw_origin_param_offset_add_sub_chain_before_negative_index_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
         r#"
-pub unsafe fn write_before(s: *mut core::ffi::c_void, n: isize, value: u8) -> u8 {
-    let mut p: *mut u8 = core::ptr::null_mut();
-    p = (s as *mut u8).offset(n);
-    *p.offset(-1) = value;
-    p = p.offset(1);
-    *p
-}
-"#,
-        &[
-            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
-            ".offset_by((n) as isize)",
-            "(p)[(-1) as isize] = value",
-            "p.seek((1) as isize)",
-        ],
-        &[".offset(n)), 1_000_000"],
-    );
-}
-
-#[test]
-fn test_raw_offset_chain_with_cast_mut_cursor_preserves_each_offset() {
-    run_typecheck_test_after_shape_check(
-        r#"
-pub unsafe fn write_chained(
-    s: *mut core::ffi::c_void,
-    n: isize,
+pub unsafe fn raw_param_offset_add_sub_chain_before_negative_index(
+    p: *const core::ffi::c_void,
+    n: usize,
     m: isize,
-    k: isize,
+) -> u8 {
+    let q: *const u8 = (p as *const u8).add(n).offset(m).sub(1);
+    *q.offset(-1)
+}
+"#,
+        &["*const std::ffi::c_void", "let q: *const u8"],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_origin_returning_functions_assigned_to_cursor_like_locals_stay_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+extern "C" {
+    fn foreign_raw() -> *const i32;
+}
+
+pub unsafe fn local_raw(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn raw_returning_functions_assigned_to_cursor_like_locals(p: *mut i32) -> i32 {
+    let q = foreign_raw().offset(1);
+    let r = local_raw(p).offset(1);
+    *r.offset(-1) = *q.offset(-1);
+    *r
+}
+"#,
+        &["foreign_raw", "-> *const i32", "local_raw", "-> *mut i32"],
+        &[
+            "from_raw_parts((foreign_raw())",
+            "from_raw_parts_mut((local_raw(",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_origin_function_return_converted_to_cursor_output_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+pub unsafe fn raw_function_return_converted_to_cursor_output(
+    p: *mut core::ffi::c_void,
+    n: isize,
+) -> *mut u8 {
+    let q: *mut u8 = (p as *mut u8).offset(n);
+    q.offset(-1)
+}
+
+pub unsafe fn raw_function_return_converted_to_cursor_output_driver(
+    p: *mut core::ffi::c_void,
+    n: isize,
     value: u8,
 ) -> u8 {
-    let mut p: *mut u8 =
-        (((s as *mut u8).offset(n) as *mut u8).offset(m)).offset(k);
-    *p.offset(-2) = value;
-    *p
+    let q = raw_function_return_converted_to_cursor_output(p, n);
+    *q = value;
+    *q
 }
 "#,
         &[
-            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
-            ".offset_by((n) as isize)",
-            ".offset_by((m) as isize)",
-            ".offset_by((k) as isize)",
-            "(p)[(-2) as isize] = value",
+            "pub unsafe fn raw_function_return_converted_to_cursor_output(",
+            "-> *mut u8",
+            "let mut q: *mut u8",
         ],
-        &[
-            ".offset(n) as *mut u8).offset(m)).offset(k)",
-            ".offset(k)),",
-        ],
+        &["from_raw_parts_mut((p) as"],
     );
 }
 
 #[test]
-fn test_raw_offset_cursor_return_bridge_preserves_base_offset() {
+fn test_raw_origin_struct_field_direct_and_offset_sources_stay_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+#[repr(C)]
+pub struct RawFieldHolder {
+    pub data: *const i32,
+}
+
+pub unsafe fn raw_struct_field_direct_and_offset_sources(
+    h: RawFieldHolder,
+    n: isize,
+) -> i32 {
+    let direct = h.data;
+    let shifted = h.data.offset(n);
+    *direct.offset(-1) + *shifted.offset(-1)
+}
+"#,
+        &[
+            "pub struct RawFieldHolder {",
+            "pub data: *const i32",
+            "let direct: *const i32",
+            "let shifted: *const i32",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_origin_tuple_destructured_pointer_source_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+pub unsafe fn raw_tuple_source(p: *const i32) -> (*const i32, i32) {
+    (p, 7)
+}
+
+pub unsafe fn raw_tuple_destructured_pointer_source(p: *const i32) -> i32 {
+    let (q, tag) = raw_tuple_source(p);
+    *q.offset(-1) + tag
+}
+"#,
+        &["-> (*const i32, i32)", "let (q, tag)"],
+        &[],
+    );
+}
+
+#[test]
+fn test_raw_origin_call_argument_to_cursor_candidate_callee_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+pub unsafe fn raw_cursor_candidate_callee(p: *const i32) -> i32 {
+    *p.offset(-1)
+}
+
+pub unsafe fn raw_call_argument_to_cursor_candidate_callee(p: *const i32) -> i32 {
+    let q = p.offset(1);
+    raw_cursor_candidate_callee(q)
+}
+"#,
+        &[
+            "pub unsafe fn raw_cursor_candidate_callee(p: *const i32)",
+            "let q: *const i32",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_array_and_slice_pointer_sources_can_still_form_cursors() {
     run_typecheck_test_after_shape_check(
         r#"
-pub unsafe fn raw_prev(s: *mut core::ffi::c_void, n: isize) -> *mut u8 {
-    let p: *mut u8 = (s as *mut u8).offset(n);
-    return p.offset(-1);
+pub unsafe fn slice_as_ptr_source_can_form_cursor() -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    let q = (&buf[..]).as_ptr().add(2);
+    *q.offset(-1)
+}
+
+pub unsafe fn slice_as_mut_ptr_source_can_form_cursor() -> u8 {
+    let mut buf = [1u8, 2, 3, 4];
+    let r = (&mut buf[..]).as_mut_ptr().add(2);
+    *r.offset(-1) = 9;
+    *r.offset(-1)
 }
 "#,
         &[
-            "let p: crate::slice_cursor::SliceCursor<'_, u8>",
-            ".offset_by((n) as isize)",
-            "let _x = (p).offset_by((-1) as isize)",
+            "let q: crate::slice_cursor::SliceCursor<'_, u8>",
+            "let mut r: crate::slice_cursor::SliceCursorMut<'_, u8>",
         ],
-        &[".offset(n)), 1_000_000"],
+        &["let q: *const u8", "let r: *mut u8"],
     );
 }
 
 #[test]
-fn test_raw_offset_add_then_offset_cursor_preserves_each_offset() {
+fn test_mixed_raw_and_anchored_assignments_converge_to_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+pub unsafe fn mixed_raw_and_anchored_assignments(use_raw: bool, raw: *const u8) -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    let mut p: *const u8 = buf.as_ptr().add(1);
+    if use_raw {
+        p = raw;
+    }
+    *p.offset(-1)
+}
+"#,
+        &[
+            "pub unsafe fn mixed_raw_and_anchored_assignments",
+            "let mut p: *const u8",
+            "*p.offset(-1)",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_recursive_raw_param_source_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
+        r#"
+pub unsafe fn recursive_raw_param_source(p: *const i32, n: i32) -> i32 {
+    if n == 0 {
+        return *p.offset(-1);
+    }
+    recursive_raw_param_source(p.offset(1), n - 1)
+}
+"#,
+        &[
+            "pub unsafe fn recursive_raw_param_source(p: *const i32, n: i32) -> i32",
+            "*p.offset(-1)",
+            "recursive_raw_param_source(p.offset(1), n - 1)",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn test_reordered_struct_destructure_preserves_field_provenance() {
     run_typecheck_test_after_shape_check(
         r#"
-pub unsafe fn read_add_then_offset(s: *mut core::ffi::c_void, n: usize, m: isize) -> u8 {
-    let mut p: *mut u8 = (s as *mut u8).add(n).offset(m);
-    let before = *p.offset(-1);
-    p = p.offset(1);
-    before + *p
+#[repr(C)]
+pub struct Pair {
+    pub anchored: *const u8,
+    pub raw: *const u8,
+}
+
+pub unsafe fn reordered_struct_destructure_preserves_field_provenance(raw: *const u8) -> u8 {
+    let buf = [1u8, 2, 3, 4];
+    let pair = Pair {
+        anchored: buf.as_ptr().add(1),
+        raw,
+    };
+    let Pair { raw: q, anchored: p } = pair;
+    *q.offset(-1) + *p.offset(-1)
 }
 "#,
         &[
-            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
-            ".offset_by((n) as isize)",
-            ".offset_by((m) as isize)",
-            "p.seek((1) as isize)",
+            "reordered_struct_destructure_preserves_field_provenance",
+            "*q.offset(-1)",
+            "crate::slice_cursor::SliceCursor",
         ],
-        &[".add(n).offset(m)), 1_000_000"],
+        &["std::slice::from_raw_parts((q)"],
     );
 }
 
 #[test]
-fn test_raw_offset_const_void_base_shared_cursor_preserves_base_offset() {
+fn test_anchored_aggregate_return_sources_stay_raw_without_aggregate_output_rewrite() {
     run_typecheck_test_after_shape_check(
         r#"
-pub unsafe fn read_const_before(s: *const core::ffi::c_void, n: isize) -> u8 {
-    let mut p: *const u8 = (s as *const u8).offset(n);
-    let before = *p.offset(-1);
-    p = p.offset(1);
-    before + *p
+pub unsafe fn anchored_tuple_sources(buf: &[u8]) -> (*const u8, *const u8) {
+    (buf.as_ptr().add(1), buf.as_ptr().add(2))
+}
+
+pub unsafe fn anchored_aggregate_return_sources_can_still_form_cursors(buf: &[u8]) -> u8 {
+    let (p, q) = anchored_tuple_sources(buf);
+    *p.offset(-1) + *q.offset(-1)
 }
 "#,
         &[
-            "let mut p: crate::slice_cursor::SliceCursor<'_, u8>",
-            ".offset_by((n) as isize)",
-            "p.seek((1) as isize)",
+            "anchored_aggregate_return_sources_can_still_form_cursors",
+            "pub unsafe fn anchored_tuple_sources(buf: &[u8]) -> (*const u8, *const u8)",
+            "let (p, q)",
+            "*p.offset(-1) + *q.offset(-1)",
         ],
-        &[".offset(n)), 1_000_000"],
+        &["crate::slice_cursor::SliceCursor", "from_raw_parts"],
     );
 }
 
 #[test]
-fn test_raw_offset_type_changing_cast_moves_only_same_typed_suffix() {
-    run_typecheck_test_after_shape_check(
+fn test_raw_origin_param_type_changing_cast_chain_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
         r#"
 #[repr(C)]
 pub struct Header {
@@ -10169,18 +10334,17 @@ pub unsafe fn read_header(
 }
 "#,
         &[
-            "let mut p: crate::slice_cursor::SliceCursor<'_,",
-            ".offset(byte_off) as",
-            ".offset_by((header_off) as isize)",
-            "p.seek((1) as isize)",
+            "pub unsafe fn read_header(",
+            "*mut std::ffi::c_void",
+            "let mut p: *mut crate::Header",
         ],
-        &[".offset(header_off)), 1_000_000"],
+        &[],
     );
 }
 
 #[test]
-fn test_raw_offset_type_preserving_mut_cast_stays_in_anchor() {
-    run_typecheck_test_after_shape_check(
+fn test_raw_origin_function_return_type_preserving_mut_cast_stays_raw() {
+    run_raw_origin_cursor_rejection_test(
         r#"
 extern "C" {
     fn get() -> *const u8;
@@ -10192,32 +10356,32 @@ pub unsafe fn write_from_get(n: isize, value: u8) -> u8 {
     *p
 }
 "#,
-        &[
-            "let mut p: crate::slice_cursor::SliceCursorMut<'_, u8>",
-            "from_raw_parts_mut(((get()) as",
-            "*mut u8), 1_000_000).offset_by((n) as isize)",
-            ".offset_by((n) as isize)",
-            "(p)[(-1) as isize] = value",
-        ],
-        &["from_raw_parts_mut((get())"],
+        &["fn get()", "-> *const u8", "let mut p: *mut u8"],
+        &["from_raw_parts_mut(((get())"],
     );
 }
 
 #[test]
-fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
+fn test_raw_param_multi_offset_deref_stays_raw() {
     run_test(
         r#"
 pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
     *p.offset(a).offset(b) = 1;
 }
 "#,
-        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
-        &["(p).as_deref_mut().offset_by"],
+        &[
+            "pub unsafe fn write_offset(mut p: *mut i32, a: isize, b: isize)",
+            "*p.offset(a).offset(b) = 1",
+        ],
+        &[
+            "crate::slice_cursor::SliceCursor",
+            "(p).as_deref_mut().offset_by",
+        ],
     );
 }
 
 #[test]
-fn test_mut_cursor_multi_offset_call_reborrows_once() {
+fn test_raw_param_recursive_multi_offset_call_stays_raw() {
     run_test(
         r#"
 pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
@@ -10228,8 +10392,12 @@ pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
     *items = b as i32;
 }
 "#,
-        &["as_deref_mut", ")).offset_by((b) as isize)"],
-        &["as_deref_mut().offset_by((b) as isize)"],
+        &[
+            "pub unsafe fn recurse(mut items: *mut i32, a: isize, b: isize)",
+            "recurse(items.offset(a).offset(b), a, b - 1)",
+            "*items = b as i32",
+        ],
+        &["crate::slice_cursor::SliceCursor", "from_raw_parts"],
     );
 }
 
@@ -13545,7 +13713,7 @@ pub unsafe extern "C" fn dispatch(mut data: *const i8) -> i32 {
 }
 
 #[test]
-fn test_section7_cursor_offset_raw_cast_is_not_revisited_as_offset_call() {
+fn test_section7_raw_origin_offset_raw_cast_is_not_promoted_to_cursor() {
     run_test(
         r#"
 pub unsafe extern "C" fn compact(mut str: *mut core::ffi::c_char) -> usize {
@@ -13575,13 +13743,11 @@ pub unsafe extern "C" fn compact(mut str: *mut core::ffi::c_char) -> usize {
 "#,
         &[
             "mut str:",
-            "crate::slice_cursor::SliceCursorMut<'_, i8>",
-            "as_deref_mut().offset_by((pos_idx) as",
-            "std::ptr::null_mut::<i8>()",
-            "(_x).as_mut_ptr()",
+            "(str).offset(pos_idx)",
+            "return pos_idx as usize",
             "*mut i8",
         ],
-        &["(str).offset(pos_idx) as *mut i8"],
+        &["crate::slice_cursor::SliceCursorMut"],
     );
 }
 
@@ -13871,14 +14037,17 @@ pub unsafe extern "C" fn install_cursor(
 }
 "#,
         &[
-            "pub struct Hashmap<'a>",
-            "pub cursor: crate::slice_cursor::SliceCursor<'a, i32>",
-            "mut cursor: &'",
-            "[i32]",
-            "mut result: &mut [crate::Hashmap<'",
+            "pub struct Hashmap {",
+            "pub cursor: *const i32",
+            "mut cursor: &[i32]",
+            "mut result: &mut [crate::Hashmap]",
+            "((cursor)[(3) as usize..]).as_ptr()",
+            ".cursor.offset(-1)",
+        ],
+        &[
+            "pub cursor: crate::slice_cursor::SliceCursor",
             "SliceCursor::with_pos",
         ],
-        &["pub cursor: *const i32"],
     );
 }
 
@@ -17838,6 +18007,132 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32) -> i32 {
 }
 
 #[test]
+fn test_struct_array_field_as_mut_ptr_to_cursor_uses_field_slice() {
+    run_test(
+        r#"
+#![deny(dangerous_implicit_autorefs)]
+
+#[repr(C)]
+pub struct Holder {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn write_at(mut values: *mut i32, idx: isize) {
+    *values.offset(idx) = 7;
+}
+
+pub unsafe extern "C" fn dispatch(mut holder: *mut Holder, idx: isize) {
+    write_at((*holder).values.as_mut_ptr(), idx);
+}
+"#,
+        &[
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "write_at(crate::slice_cursor::SliceCursorMut::new(&mut (&mut ((*holder).values))[..])",
+        ],
+        &[
+            "write_at((*holder).values.as_mut_ptr(), idx)",
+            "SliceCursorMut::from_raw_parts_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_struct_array_field_as_ptr_to_cursor_uses_field_slice() {
+    run_test(
+        r#"
+#![deny(dangerous_implicit_autorefs)]
+
+#[repr(C)]
+pub struct Holder {
+    pub values: [i32; 4],
+}
+
+pub unsafe fn read_at(mut values: *const i32, idx: isize) -> i32 {
+    *values.offset(idx)
+}
+
+pub unsafe extern "C" fn dispatch(holder: *const Holder, idx: isize) -> i32 {
+    read_at((*holder).values.as_ptr(), idx)
+}
+"#,
+        &[
+            "mut values: crate::slice_cursor::SliceCursor<'_, i32>",
+            "read_at(crate::slice_cursor::SliceCursor::new(&(&((*holder).values))[..])",
+        ],
+        &[
+            "read_at((*holder).values.as_ptr(), idx)",
+            "SliceCursor::from_raw_parts",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_parent_struct_array_field_as_mut_ptr_to_cursor_uses_field_slice() {
+    run_test(
+        r#"
+#![deny(dangerous_implicit_autorefs)]
+
+#[repr(C)]
+pub struct Holder {
+    pub values: [i32; 4],
+}
+
+pub static mut HOLDER_SLOT: *mut Holder = 0 as *mut Holder;
+
+pub unsafe fn write_at(mut values: *mut i32, idx: isize) {
+    *values.offset(idx) = 7;
+}
+
+pub unsafe fn dispatch(idx: isize) {
+    let holder = HOLDER_SLOT;
+    write_at((*holder).values.as_mut_ptr(), idx);
+}
+"#,
+        &[
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "write_at(crate::slice_cursor::SliceCursorMut::new(&mut (&mut ((*holder).values))[..])",
+        ],
+        &[
+            "write_at((*holder).values.as_mut_ptr(), idx)",
+            "SliceCursorMut::from_raw_parts_mut",
+        ],
+    );
+}
+
+#[test]
+fn test_raw_parent_struct_array_field_as_ptr_to_cursor_uses_field_slice() {
+    run_test(
+        r#"
+#![deny(dangerous_implicit_autorefs)]
+
+#[repr(C)]
+pub struct Holder {
+    pub values: [i32; 4],
+}
+
+pub static mut HOLDER_SLOT: *const Holder = 0 as *const Holder;
+
+pub unsafe fn read_at(mut values: *const i32, idx: isize) -> i32 {
+    *values.offset(idx)
+}
+
+pub unsafe fn dispatch(idx: isize) -> i32 {
+    let holder = HOLDER_SLOT;
+    read_at((*holder).values.as_ptr(), idx)
+}
+"#,
+        &[
+            "mut values: crate::slice_cursor::SliceCursor<'_, i32>",
+            "read_at(crate::slice_cursor::SliceCursor::new(&(&((*holder).values))[..])",
+        ],
+        &[
+            "read_at((*holder).values.as_ptr(), idx)",
+            "SliceCursor::from_raw_parts",
+        ],
+    );
+}
+
+#[test]
 fn test_direct_call_mutability_contract_cursor_arg_to_mut_slice() {
     run_test(
         r#"
@@ -17979,7 +18274,7 @@ pub unsafe fn root6_local_shared_then_mut_use(mut stack: *mut i32) -> i32 {
 }
 
 #[test]
-fn test_root6_offset_mut_cursor_shared_call_then_mut_use_typechecks() {
+fn test_root6_raw_origin_offset_call_then_write_stays_raw_typechecks() {
     run_typecheck_test_after_shape_check(
         r#"
 pub unsafe fn root6_peek_prev_after_offset(mut cursor: *const i32) -> i32 {
@@ -17995,10 +18290,12 @@ pub unsafe fn root6_offset_call_then_write(mut stack: *mut i32) -> i32 {
 "#,
         &[
             "root6_peek_prev_after_offset",
-            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "pub unsafe fn root6_peek_prev_after_offset(mut cursor: *const i32) -> i32",
+            "*cursor.offset(-1)",
             "root6_offset_call_then_write",
-            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "pub unsafe fn root6_offset_call_then_write(mut stack: *mut i32) -> i32",
+            "*stack.offset(-1) = before + 3",
         ],
-        &[],
+        &["crate::slice_cursor::SliceCursor"],
     );
 }
