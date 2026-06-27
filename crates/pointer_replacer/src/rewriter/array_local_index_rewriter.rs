@@ -2614,6 +2614,9 @@ fn derive_member_call(
     let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
     let base_ptr = base_offset_expr_for_index(rewrite, base_index);
     let call_str = pprust::expr_to_string(rhs);
+    // every base-preserving call recognized here returns the cursor or null, so
+    // its member is nullable; the non-nullable branch holds only if a future
+    // base-preserving entry guarantees a non-null return.
     let block = if rewrite.nullable {
         utils::expr!(
             "{{ let __crat_call_cursor = {}; if __crat_call_cursor.is_null() {{ None }} else {{ Some((__crat_call_cursor).offset_from({})) }} }}",
