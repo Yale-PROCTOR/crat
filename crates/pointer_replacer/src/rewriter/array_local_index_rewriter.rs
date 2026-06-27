@@ -55,6 +55,9 @@ struct BindingRewrite {
     representation: BindingRepresentation,
     source_name: String,
     has_index_benefit: bool,
+    /// true when the binding is reassigned at least once via pointer arithmetic
+    /// (offset/add) — used to gate call-derived index initialisation.
+    moves: bool,
     base_hir_id: HirId,
     base_name: String,
     base_index_name: Option<String>,
@@ -1178,6 +1181,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 representation: BindingRepresentation::IndexOnly,
                 source_name: source_name.clone(),
                 has_index_benefit: false,
+                moves: false,
                 base_hir_id,
                 base_name: base_name.clone(),
                 base_index_name: base_index_name.clone(),
@@ -1541,6 +1545,7 @@ fn choose_binding_representations(
     for (hir_id, rewrite) in &mut plan.by_hir_id {
         let summary = summaries.remove(hir_id).unwrap_or_default();
         rewrite.has_index_benefit = summary.has_index_benefit();
+        rewrite.moves = summary.movement_count > 0;
         if let Some(kind) = summary.materialization_kind(rewrite.ptr_mut) {
             if rewrite.field_base
                 && summary.inlineable_memory_call_count > 0
@@ -1621,6 +1626,7 @@ fn collect_binding_use_summaries_for_names_for_test(
                     representation: BindingRepresentation::IndexOnly,
                     source_name: name.clone(),
                     has_index_benefit: false,
+                    moves: false,
                     base_hir_id: hir_id,
                     base_name: "base".to_string(),
                     base_index_name: None,
@@ -2610,6 +2616,11 @@ fn derive_member_call(
         || (rewrite.field_base && expr_matches_base_name(arg0, &rewrite.base_name));
     if !arg0_is_base {
         return Some(Derivation::Unsupported("call arg0 is not the group base"));
+    }
+    // only a moving cursor benefits from a call-derived index; a call result
+    // used in place keeps its original initializer (and its base's representation).
+    if !rewrite.moves {
+        return None;
     }
     let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
     let base_ptr = base_offset_expr_for_index(rewrite, base_index);
