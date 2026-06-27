@@ -73,11 +73,9 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     e.kind,
                     hir::ExprKind::Assign(_, _, _) | hir::ExprKind::AssignOp(_, _, _)
                 )
-                && let Some(loc) = self.hir_expr_to_loc(e)
+                && let Some((body_owner, loc)) = self.hir_expr_to_loc(e)
             {
-                !self
-                    .dead_assignments
-                    .contains(&(e.hir_id.owner.def_id, loc))
+                !self.dead_assignments.contains(&(body_owner, loc))
             } else {
                 true
             }
@@ -93,10 +91,8 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             && let Some(hir_let_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, _, _) = hir_let_stmt.pat.kind
             && let Some(init) = hir_let_stmt.init
-            && let Some(loc) = self.hir_expr_to_loc(init)
-            && self
-                .dead_assignments
-                .contains(&(hir_let_stmt.hir_id.owner.def_id, loc))
+            && let Some((body_owner, loc)) = self.hir_expr_to_loc(init)
+            && self.dead_assignments.contains(&(body_owner, loc))
         {
             let typeck = self.tcx.typeck(hir_let_stmt.hir_id.owner);
             let ty = typeck.node_type(hir_id);
@@ -244,16 +240,17 @@ impl<'tcx> AstVisitor<'tcx> {
         self.tcx.parent(variant_def_id).as_local()
     }
 
-    fn hir_expr_to_loc(&self, expr: &hir::Expr<'tcx>) -> Option<Location> {
+    fn hir_expr_to_loc(&self, expr: &hir::Expr<'tcx>) -> Option<(LocalDefId, Location)> {
         let expr = utils::hir::unwrap_drop_temps(expr);
-        let (thir, _) = self.tcx.thir_body(expr.hir_id.owner).unwrap();
+        let body_owner = self.tcx.hir_enclosing_body_owner(expr.hir_id);
+        let (thir, _) = self.tcx.thir_body(body_owner).unwrap();
         let thir = thir.borrow();
         if let Some(expr_id) = self.hir_to_thir.exprs.get(&expr.hir_id)
             && let expr_id = thir_unwrap_use(*expr_id, &thir)
-            && let Some(thir_to_mir) = self.thir_to_mir.get(&expr.hir_id.owner.def_id)
+            && let Some(thir_to_mir) = self.thir_to_mir.get(&body_owner)
             && let Some(locs) = thir_to_mir.expr_to_locs.get(&expr_id)
         {
-            locs.first().copied()
+            locs.first().map(|&loc| (body_owner, loc))
         } else {
             None
         }
@@ -871,6 +868,45 @@ mod tests {
             r#"extern "C" { fn g(); } unsafe fn f() { {} 'a: {} {}; 'b: {}; g(); }"#,
             &["g();"],
             &["{}", "'a", "'b"],
+        )
+    }
+
+    #[test]
+    fn test_unused_init_in_closure() {
+        run_test(
+            r#"
+            struct Map {
+                value: i32,
+            }
+            impl Copy for Map {}
+            impl Clone for Map {
+                fn clone(&self) -> Self {
+                    *self
+                }
+            }
+
+            fn f() {
+                let mut maps = [Map { value: 0 }; 12];
+                (|maps_ref: &mut [Map; 12]| {
+                    *maps_ref = [
+                        { let mut init = Map { value: 1 }; init },
+                        { let mut init = Map { value: 2 }; init },
+                        { let mut init = Map { value: 3 }; init },
+                        { let mut init = Map { value: 4 }; init },
+                        { let mut init = Map { value: 5 }; init },
+                        { let mut init = Map { value: 6 }; init },
+                        { let mut init = Map { value: 7 }; init },
+                        { let mut init = Map { value: 8 }; init },
+                        { let mut init = Map { value: 9 }; init },
+                        { let mut init = Map { value: 10 }; init },
+                        { let mut init = Map { value: 11 }; init },
+                        { let mut init = Map { value: 12 }; init },
+                    ];
+                })(&mut maps);
+            }
+            "#,
+            &["Map { value: 12 }"],
+            &[],
         )
     }
 

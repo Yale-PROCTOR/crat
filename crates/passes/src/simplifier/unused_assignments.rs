@@ -15,10 +15,12 @@ pub fn find_unused_assignments(tcx: TyCtxt<'_>) -> UnusedAssignments {
     let mut dead_assignments = FxHashSet::default();
 
     for def_id in tcx.hir_body_owners() {
-        if tcx.def_kind(def_id) != DefKind::Fn {
+        if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::Closure) {
             continue;
         }
-        if tcx.item_name(def_id.to_def_id()).as_str() == "main" {
+        if tcx.def_kind(def_id) == DefKind::Fn
+            && tcx.item_name(def_id.to_def_id()).as_str() == "main"
+        {
             continue;
         }
         if tcx.def_path_str(def_id).contains("c_lib::") {
