@@ -10088,3 +10088,41 @@ pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
     );
     assert!(s.contains("sink("), "call preserved: {s}");
 }
+
+#[test]
+fn test_array_local_rewriter_rewrites_single_base_strstr_cursor() {
+    // a cursor initialised from strstr(base, needle) becomes a nullable
+    // Option<isize> index initialised via offset_from against the base.
+    // q is a second mutable cursor (base + n) that keeps base live in the loop
+    // so the simultaneous-liveness gate in classify_rewrite_groups admits the
+    // {base, p, q} group.
+    let code = r#"
+unsafe extern "C" { fn strstr(h: *const i8, n: *const i8) -> *mut i8; }
+pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
+    let mut p: *mut i8 = strstr(base, needle);
+    let mut q: *mut i8 = base.offset(n);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        if !p.is_null() {
+            total += *p as i32;
+            p = p.offset(1);
+        }
+        total += *q as i32;
+        q = q.offset(-1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p index-rewritten: {s}");
+    assert!(s.contains("Option<isize>"), "nullable index: {s}");
+    assert!(s.contains("offset_from"), "offset_from init: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i8"),
+        "no kept raw pointer for p: {s}"
+    );
+}

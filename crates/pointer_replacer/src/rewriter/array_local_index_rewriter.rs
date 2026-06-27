@@ -2589,6 +2589,47 @@ fn derive_member_conditional(
     }
 }
 
+/// derives `q = strstr(base, …)` (a base-preserving call whose arg 0 is the
+/// group's base). returns `None` if `rhs` is not such a call (so derivation
+/// falls through); `Some(Unsupported)` if it is the call but arg 0 is not the
+/// base (the member stays raw — sound); `Some(Index(..))` otherwise.
+fn derive_member_call(
+    callee: &Expr,
+    call_args: &[P<Expr>],
+    rhs: &Expr,
+    rewrite: &BindingRewrite,
+    ctx: &DerivationCtx<'_, '_>,
+) -> Option<Derivation> {
+    let name = call_path_last_segment(callee)?;
+    if !analyses::array_local_provenance::is_inlineable_pointer_arg(name, 0) {
+        return None;
+    }
+    let arg0 = call_args.first()?;
+    let arg0_is_base = hir_id_of_ast_expr(ctx.ast_to_hir, ctx.tcx, unwrap_cast_and_paren(arg0).id)
+        == Some(rewrite.base_hir_id)
+        || (rewrite.field_base && expr_matches_base_name(arg0, &rewrite.base_name));
+    if !arg0_is_base {
+        return Some(Derivation::Unsupported("call arg0 is not the group base"));
+    }
+    let base_index = base_current_index_expr(rewrite).unwrap_or("0isize");
+    let base_ptr = base_offset_expr_for_index(rewrite, base_index);
+    let call_str = pprust::expr_to_string(rhs);
+    let block = if rewrite.nullable {
+        utils::expr!(
+            "{{ let __crat_call_cursor = {}; if __crat_call_cursor.is_null() {{ None }} else {{ Some((__crat_call_cursor).offset_from({})) }} }}",
+            call_str,
+            base_ptr
+        )
+    } else {
+        utils::expr!(
+            "{{ let __crat_call_cursor = {}; (__crat_call_cursor).offset_from({}) }}",
+            call_str,
+            base_ptr
+        )
+    };
+    Some(Derivation::Index(IndexExpr::Verbatim(block)))
+}
+
 fn derive_member_index(
     rhs: &Expr,
     rewrite: &BindingRewrite,
@@ -2606,6 +2647,11 @@ fn derive_member_index(
     }
     if let ExprKind::If(..) = &rhs.kind {
         return derive_member_conditional(rhs, rewrite, ctx);
+    }
+    if let ExprKind::Call(callee, call_args) = &rhs.kind
+        && let Some(derivation) = derive_member_call(callee, call_args, rhs, rewrite, ctx)
+    {
+        return derivation;
     }
     let ExprKind::MethodCall(call) = &rhs.kind else {
         return Derivation::Unsupported("member RHS is not base-derived or a method call");
