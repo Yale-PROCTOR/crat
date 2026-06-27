@@ -10781,7 +10781,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let cast_mut = if m && !m1 { " as *mut _" } else { "" };
         if let Some(name) = method_call_name(e)
             && let name = name.as_str()
-            && (name == "offset" || name == "as_mut_ptr" || name == "as_ptr")
+            && (name == "as_mut_ptr" || name == "as_ptr")
         {
             // we assume that the pointer is not null when such methods are called
             if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {

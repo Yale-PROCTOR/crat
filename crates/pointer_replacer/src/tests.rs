@@ -9385,10 +9385,9 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
-// ===== slice_from_raw Branch A tests: method call (offset/as_mut_ptr/as_ptr) =====
+// ===== slice_from_raw method-call tests =====
 
-/// slice_from_raw Branch A1 (no cast): `q = p.offset(2)` where p is Raw, q is Slice.
-/// `method_call_name(p.offset(2))` → "offset" → skip null check, no cast needed.
+/// `q = p.offset(2)` where p is Raw, q is Slice uses the normal null-checked raw bridge.
 #[test]
 fn test_sfr_method_call_no_cast() {
     run_test(
@@ -9405,13 +9404,12 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize);
 }
 "#,
-        &["from_raw_parts_mut", "p.offset"],
-        &["is_null", "let _x"],
+        &["from_raw_parts_mut", "p.offset", "is_null"],
+        &["let _x"],
     );
 }
 
-/// slice_from_raw Branch A2 (with cast): `q = p.offset(2) as *mut c_short` where p is Raw.
-/// `unwrap_cast_and_paren` strips cast → "offset" → Branch A, `need_cast=true` → `as *mut _`.
+/// `q = p.offset(2) as *mut c_short` keeps the cast inside the normal null-checked raw bridge.
 #[test]
 fn test_sfr_method_call_cast() {
     run_test(
@@ -9428,8 +9426,8 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &["from_raw_parts_mut", "as *mut _"],
-        &["is_null", "let _x"],
+        &["from_raw_parts_mut", "as *mut _", "is_null"],
+        &["let _x"],
     );
 }
 
@@ -18138,6 +18136,49 @@ pub unsafe extern "C" fn allocate(len: size_t) -> *mut core::ffi::c_void {
         &config,
         &["expect(\"non-null function pointer\")(len)"],
         &["len as *mut", "(len)."],
+    );
+}
+
+#[test]
+fn test_raw_offset_to_slice_local_checks_null() {
+    let (s, _) = rewrite_with_config(
+        r#"
+#[repr(C)]
+pub struct S {
+    pub x: *mut i32,
+}
+
+pub unsafe fn foo(mut p: *mut S, x: i32, y: i32) -> i32 {
+    let mut q: *mut i32 = ((*p).x).offset(x as isize);
+    if y != 0 {
+        return *q.offset(1);
+    }
+    return 0;
+}
+
+pub unsafe fn bar(mut p: *mut S) {
+    let mut q: *mut i32 = (*p).x;
+    *(*p).x = 1;
+    *q = 1;
+}
+
+pub unsafe fn caller() -> i32 {
+    let mut s = S { x: 0 as *mut i32 };
+    return foo(&mut s, 0, 0);
+}
+"#,
+        &Config::default(),
+    );
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+
+    assert!(s.contains("let mut q: &[i32]"), "{s}");
+    assert!(
+        s.contains("let mut q: &[i32] =\n        if ((p.x).offset(x as isize)).is_null()"),
+        "{s}"
+    );
+    assert!(
+        !s.contains("let mut q: &[i32] =\n        std::slice::from_raw_parts"),
+        "{s}"
     );
 }
 
