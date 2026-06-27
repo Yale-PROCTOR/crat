@@ -2358,6 +2358,14 @@ impl<'tcx> Collector<'_, 'tcx> {
             return;
         }
 
+        if let Some((def_id, name)) = call.as_ref()
+            && let Some(summary) =
+                builtin_summary(self.tcx, *def_id, name, args, *destination, self.body)
+            && self.apply_summary(&summary, args, *destination, location)
+        {
+            return;
+        }
+
         if !call
             .as_ref()
             .is_some_and(|(def_id, name)| call_no_writes(self.tcx, *def_id, name))
@@ -3108,6 +3116,59 @@ fn constant_pointer_reason<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> 
     }
 }
 
+fn builtin_summary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    name: &str,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: Place<'tcx>,
+    body: &Body<'tcx>,
+) -> Option<FunctionSummary> {
+    if !tcx.is_foreign_item(def_id) {
+        return None;
+    }
+    let last = name.rsplit("::").next()?;
+    let arg0_is_ptr = args
+        .first()
+        .is_some_and(|arg| arg.node.ty(body, tcx).is_raw_ptr());
+    let dst_is_ptr = destination.ty(body, tcx).ty.is_raw_ptr();
+    let base_preserving = || FunctionSummary {
+        completeness: SummaryCompleteness::Complete,
+        return_flows: vec![
+            SummaryFlow {
+                dst_return_path: vec![],
+                src: SummarySource::ParamSlot {
+                    arg_index: 0,
+                    path: vec![],
+                },
+            },
+            SummaryFlow {
+                dst_return_path: vec![],
+                src: SummarySource::Unknown(UnknownReason::NullLike),
+            },
+        ],
+        ..FunctionSummary::default()
+    };
+    let empty_complete = || FunctionSummary {
+        completeness: SummaryCompleteness::Complete,
+        ..FunctionSummary::default()
+    };
+    match last {
+        // base-preserving, null-on-miss: returns a cursor into arg0 or null.
+        "strstr" | "strchr" | "strrchr" | "strpbrk"
+            if args.len() == 2 && arg0_is_ptr && dst_is_ptr =>
+        {
+            Some(base_preserving())
+        }
+        "memchr" if args.len() == 3 && arg0_is_ptr && dst_is_ptr => Some(base_preserving()),
+        // read-only: no pointer return, no pointer-changing arg writes.
+        "strlen" if args.len() == 1 && arg0_is_ptr => Some(empty_complete()),
+        "strcmp" if args.len() == 2 && arg0_is_ptr => Some(empty_complete()),
+        "strncmp" | "memcmp" if args.len() == 3 && arg0_is_ptr => Some(empty_complete()),
+        _ => None,
+    }
+}
+
 fn call_propagates_first_arg<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -3116,26 +3177,8 @@ fn call_propagates_first_arg<'tcx>(
     destination: Place<'tcx>,
     body: &Body<'tcx>,
 ) -> bool {
-    is_memchr_call(tcx, def_id, name, args, destination, body)
-        || is_from_raw_parts_mut_call(tcx, def_id, name, args, destination, body)
+    is_from_raw_parts_mut_call(tcx, def_id, name, args, destination, body)
         || is_slice_index_mut_call(tcx, def_id, name, args, destination, body)
-}
-
-fn is_memchr_call<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    name: &str,
-    args: &[Spanned<Operand<'tcx>>],
-    destination: Place<'tcx>,
-    body: &Body<'tcx>,
-) -> bool {
-    matches!(name.rsplit("::").next(), Some("memchr"))
-        && tcx.is_foreign_item(def_id)
-        && args.len() == 3
-        && args
-            .first()
-            .is_some_and(|arg| arg.node.ty(body, tcx).is_raw_ptr())
-        && destination.ty(body, tcx).ty.is_raw_ptr()
 }
 
 fn is_from_raw_parts_mut_call<'tcx>(

@@ -2816,3 +2816,158 @@ fn null_sentinel_reassignment_stays_transparent() {
         "null sentinel must keep a unique non-null Param base: {q:#?}"
     );
 }
+
+// --- builtin_summary tests ---
+
+#[test]
+fn builtin_summary_strstr_foreign_gives_param_and_null_bases() {
+    // strstr returns a cursor into arg0 or null; the result must have
+    // Param(uname) as the unique non-null base and a NullLike base too.
+    let map = run_analysis(
+        r#"
+        unsafe extern "C" {
+            fn strstr(
+                haystack: *const core::ffi::c_char,
+                needle: *const core::ffi::c_char,
+            ) -> *mut core::ffi::c_char;
+        }
+
+        pub unsafe fn f(uname: *const core::ffi::c_char, pat: *const core::ffi::c_char) {
+            let str_tmp: *mut core::ffi::c_char = strstr(uname, pat);
+            let _ = str_tmp;
+        }
+        "#,
+    );
+
+    let str_tmp = facts(&map, "f", "str_tmp");
+    // must carry a Param base (from arg0=uname)
+    assert!(
+        str_tmp
+            .bases
+            .iter()
+            .any(|b| matches!(b, BaseId::Param { .. })),
+        "strstr result must have a Param base: {str_tmp:#?}"
+    );
+    // must carry a NullLike base (null-on-miss)
+    assert!(
+        str_tmp.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
+        "strstr result must have a NullLike base: {str_tmp:#?}"
+    );
+    // unique non-null base must be the Param
+    assert!(
+        matches!(str_tmp.unique_non_null, Some(BaseId::Param { .. })),
+        "strstr unique non-null base must be Param(uname): {str_tmp:#?}"
+    );
+}
+
+#[test]
+fn builtin_summary_strstr_foreign_is_selected_and_nullable() {
+    // strstr result must be selected into a rewrite group together with `cur`
+    // (both derive from `uname`) and the group is nullable.
+    let code = r#"
+        unsafe extern "C" {
+            fn strstr(
+                haystack: *const core::ffi::c_char,
+                needle: *const core::ffi::c_char,
+            ) -> *mut core::ffi::c_char;
+        }
+
+        pub unsafe fn f(mut uname: *const core::ffi::c_char, pat: *const core::ffi::c_char) {
+            let str_tmp: *mut core::ffi::c_char = strstr(uname, pat);
+            let cur: *mut core::ffi::c_char = str_tmp.offset(1);
+            let _ = (*cur, *str_tmp);
+        }
+        "#;
+
+    // selection check
+    let groups = run_rewrite_groups_with_points_to(RewriteGroupFactMode::ReadyOnly, code);
+    let f_groups = groups.get("f").expect("missing facts for f");
+    assert!(
+        f_groups
+            .iter()
+            .any(|group| group.member_names.contains("str_tmp")),
+        "strstr result must be selected into a rewrite group: {f_groups:#?}"
+    );
+
+    // nullability check: str_tmp must carry a NullLike base so the rewriter
+    // emits Option<isize>; dropping the NullLike flow from base_preserving()
+    // would leave the selection assertion above green but break this one.
+    let map = run_analysis(code);
+    let str_tmp = facts(&map, "f", "str_tmp");
+    assert!(
+        str_tmp.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
+        "str_tmp must carry a NullLike base (null-on-miss makes it nullable): {str_tmp:#?}"
+    );
+}
+
+#[test]
+fn builtin_summary_local_strstr_not_treated_as_base_preserving() {
+    // a LOCAL Rust function named strstr must not be treated as base-preserving
+    // by the builtin table; its return gets OpaqueReturn provenance.
+    let map = run_analysis(
+        r#"
+        pub unsafe fn strstr(
+            haystack: *const core::ffi::c_char,
+            needle: *const core::ffi::c_char,
+        ) -> *mut core::ffi::c_char {
+            let _ = (haystack, needle);
+            core::ptr::null_mut()
+        }
+
+        pub unsafe fn f(uname: *const core::ffi::c_char, pat: *const core::ffi::c_char) {
+            let str_tmp: *mut core::ffi::c_char = strstr(uname, pat);
+            let _ = str_tmp;
+        }
+        "#,
+    );
+
+    let str_tmp = facts(&map, "f", "str_tmp");
+    // the local strstr returns null_mut(), so no Param base should flow to str_tmp
+    assert!(
+        !str_tmp
+            .bases
+            .iter()
+            .any(|b| matches!(b, BaseId::Param { .. })),
+        "local strstr must not receive Param base from the builtin table: {str_tmp:#?}"
+    );
+}
+
+#[test]
+fn builtin_summary_mismatched_foreign_strstr_not_base_preserving() {
+    // a foreign strstr whose first two args are non-pointer integers does not
+    // match the builtin signature guard and falls through to unknown-call handling.
+    let map = run_analysis(
+        r#"
+        unsafe extern "C" {
+            fn strstr(a: i32, b: i32) -> *mut core::ffi::c_char;
+        }
+
+        pub unsafe fn f(n: i32, m: i32) {
+            let str_tmp: *mut core::ffi::c_char = strstr(n, m);
+            let _ = str_tmp;
+        }
+        "#,
+    );
+
+    let str_tmp = facts(&map, "f", "str_tmp");
+    // mismatched signature must not produce {Param, NullLike} base set
+    assert!(
+        !str_tmp
+            .bases
+            .iter()
+            .any(|b| matches!(b, BaseId::Param { .. })),
+        "signature-mismatched foreign strstr must not receive a Param base: {str_tmp:#?}"
+    );
+}

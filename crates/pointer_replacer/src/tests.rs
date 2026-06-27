@@ -9608,13 +9608,14 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "expected field-base cursor local to be rewritten:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("ptr_idx"), "{s}");
+    // cursor is now an Option<isize> because memchr may return null
+    assert!(s.contains("ptr_idx: Option<isize>"), "{s}");
     assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
     assert!(!s.contains("let ptr: *mut i8"), "{s}");
+    // memchr arg inlines the nullable cursor via map_or: ...map_or(...null..., |idx| ...offset(idx)...)
     assert!(
-        s.contains("memchr(((*state).buffer).offset(ptr_idx)")
-            || s.contains("memchr((*state).buffer.offset(ptr_idx)"),
-        "expected memchr to inline ptr_idx from the field base:\n{s}"
+        s.contains("ptr_idx.map_or(") && s.contains(".offset(idx)"),
+        "expected memchr to inline nullable ptr_idx via map_or from the field base:\n{s}"
     );
     assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
     assert!(!s.contains("ptr = found.offset(1)"), "{s}");
