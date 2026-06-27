@@ -14383,6 +14383,217 @@ pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
 }
 
 #[test]
+fn test_pointer_output_storage_c_void_raw_mut_address_keeps_slice_local_raw() {
+    run_test(
+        r#"
+pub unsafe fn overwrite_slot(mut payload: *mut core::ffi::c_void, mut value: *mut i32) {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    *slot = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    overwrite_slot(&raw mut p as *mut core::ffi::c_void, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &["let mut p: *mut i32", "return *p.offset(idx as isize);"],
+        &[
+            "let mut p: &mut [i32]",
+            "let mut p: &[i32]",
+            "crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_mut_address_cast_keeps_slice_local_raw() {
+    run_test(
+        r#"
+pub unsafe fn overwrite_slot(mut payload: *mut core::ffi::c_void, mut value: *mut i32) {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    *slot = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    overwrite_slot(&mut p as *mut *mut i32 as *mut core::ffi::c_void, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &["let mut p: *mut i32", "return *p.offset(idx as isize);"],
+        &[
+            "let mut p: &mut [i32]",
+            "let mut p: &[i32]",
+            "crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_raw_mut_address_keeps_cursor_local_raw() {
+    run_test(
+        r#"
+pub unsafe fn overwrite_slot(mut payload: *mut core::ffi::c_void, mut value: *mut i32) {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    *slot = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32) -> i32 {
+    let mut data: [i32; 4] = [1, 2, 3, 4];
+    let mut p: *mut i32 = data.as_mut_ptr().offset(3);
+    overwrite_slot(&raw mut p as *mut core::ffi::c_void, value);
+    return *p.offset(-1);
+}
+"#,
+        &["let mut p: *mut i32", "return *p.offset(-1);"],
+        &[
+            "let mut p: &mut [i32]",
+            "let mut p: &[i32]",
+            "crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_alias_keeps_slice_local_raw() {
+    run_test(
+        r#"
+pub unsafe fn overwrite_slot(mut payload: *mut core::ffi::c_void, mut value: *mut i32) {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    *slot = value;
+}
+
+pub unsafe fn caller(mut value: *mut i32, idx: usize) -> i32 {
+    let mut p: *mut i32 = value;
+    let payload: *mut core::ffi::c_void = &raw mut p as *mut core::ffi::c_void;
+    overwrite_slot(payload, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "let mut p: *mut i32",
+            "payload: *mut",
+            "return *p.offset(idx as isize);",
+        ],
+        &[
+            "let mut p: &mut [i32]",
+            "let mut p: &[i32]",
+            "crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_raw_mut_address_keeps_slice_param_raw() {
+    run_test(
+        r#"
+pub unsafe fn overwrite_slot(mut payload: *mut core::ffi::c_void, mut value: *mut i32) {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    *slot = value;
+}
+
+pub unsafe fn caller(mut p: *mut i32, mut value: *mut i32, idx: usize) -> i32 {
+    overwrite_slot(&raw mut p as *mut core::ffi::c_void, value);
+    return *p.offset(idx as isize);
+}
+"#,
+        &[
+            "pub unsafe fn caller(mut p: *mut i32",
+            "return *p.offset(idx as isize);",
+        ],
+        &[
+            "pub unsafe fn caller(mut p: &mut [i32]",
+            "pub unsafe fn caller(mut p: &[i32]",
+            "crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_address_does_not_demote_scalar_ref_local() {
+    run_test(
+        r#"
+pub unsafe fn read_slot(mut payload: *mut core::ffi::c_void) -> i32 {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    return **slot;
+}
+
+pub unsafe fn caller() -> i32 {
+    let mut value: i32 = 1;
+    let mut p: *mut i32 = &mut value;
+    let seen = read_slot(&raw mut p as *mut core::ffi::c_void);
+    *p = seen + 1;
+    return *p;
+}
+"#,
+        &["let mut p: &mut i32", "read_slot(&raw mut (p)"],
+        &["let mut p: *mut i32", "let mut p: &mut [i32]"],
+    );
+}
+
+#[test]
+fn test_pointer_output_storage_c_void_address_does_not_demote_scalar_opt_ref_local() {
+    run_test(
+        r#"
+pub unsafe fn read_slot(mut payload: *mut core::ffi::c_void) -> i32 {
+    let slot: *mut *mut i32 = payload as *mut *mut i32;
+    if (*slot).is_null() {
+        return 0;
+    }
+    return **slot;
+}
+
+pub unsafe fn caller(mut value: *mut i32) -> i32 {
+    let mut p: *mut i32 = value;
+    let seen = read_slot(&raw mut p as *mut core::ffi::c_void);
+    if p.is_null() {
+        return seen;
+    }
+    *p += seen;
+    return *p;
+}
+"#,
+        &["let mut p: Option<&mut i32>", "read_slot(&raw mut (p)"],
+        &["let mut p: *mut i32", "let mut p: &mut [i32]"],
+    );
+}
+
+#[test]
+fn test_wide_storage_address_taken_does_not_demote_pointee_address() {
+    run_test(
+        r#"
+pub unsafe fn caller(idx: usize) -> i32 {
+    let mut data: [i32; 4] = [1, 2, 3, 4];
+    let mut p: *mut i32 = data.as_mut_ptr();
+    let q: *mut i32 = &mut *p;
+    *p.offset(idx as isize) = *q;
+    return *p.offset(idx as isize);
+}
+"#,
+        &["let mut p: &mut [i32]"],
+        &["let mut p: *mut i32"],
+    );
+}
+
+#[test]
+fn test_wide_storage_address_taken_does_not_demote_raw_pointee_address() {
+    run_test(
+        r#"
+pub unsafe fn caller(idx: usize) -> i32 {
+    let mut data: [i32; 4] = [1, 2, 3, 4];
+    let mut p: *mut i32 = data.as_mut_ptr();
+    let q: *mut i32 = &raw mut *p;
+    *p.offset(idx as isize) = *q;
+    return *p.offset(idx as isize);
+}
+"#,
+        &["let mut p: &mut [i32]"],
+        &["let mut p: *mut i32"],
+    );
+}
+
+#[test]
 fn test_section4_keeps_opaque_foreign_api_handle_raw() {
     run_test(
         r#"
