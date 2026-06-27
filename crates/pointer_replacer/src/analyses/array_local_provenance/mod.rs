@@ -2220,6 +2220,16 @@ impl<'tcx> Collector<'_, 'tcx> {
             return false;
         }
 
+        self.apply_summary(&summary, args, destination, location)
+    }
+
+    fn apply_summary(
+        &mut self,
+        summary: &FunctionSummary,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: Place<'tcx>,
+        location: Location,
+    ) -> bool {
         let mut return_edges = Vec::new();
         let mut arg_write_edges: FxHashMap<(usize, SlotIdx), Vec<PfgNode>> = FxHashMap::default();
         let mut unknown_returns = Vec::new();
