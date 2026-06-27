@@ -3164,6 +3164,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         );
         let shape_demoted = collect_struct_shape_demoted_field_reasons(
             self.tcx,
+            self.analysis,
             &promoted_fields,
             &self.analysis.borrow_promotion_result.mutable_fields,
             &self.analysis.struct_copy_result,
@@ -19439,6 +19440,7 @@ fn collect_demoted_promoted_fields(
     }
     let mut demoted_fields = collect_struct_shape_demoted_fields(
         tcx,
+        analysis,
         &promoted_fields,
         &analysis.borrow_promotion_result.mutable_fields,
         &analysis.struct_copy_result,
@@ -21143,6 +21145,7 @@ fn collect_ownership_field_diagnostics<'tcx>(
 
 fn collect_struct_shape_demoted_fields(
     tcx: TyCtxt<'_>,
+    analysis: &Analysis,
     promoted_fields: &FxHashSet<StructFieldSlot>,
     mutable_fields: &FxHashSet<StructFieldSlot>,
     struct_copy_result: &crate::analyses::struct_copy::StructCopyAnalysisResult,
@@ -21151,6 +21154,7 @@ fn collect_struct_shape_demoted_fields(
 ) -> FxHashSet<StructFieldSlot> {
     collect_struct_shape_demoted_field_reasons(
         tcx,
+        analysis,
         promoted_fields,
         mutable_fields,
         struct_copy_result,
@@ -21163,6 +21167,7 @@ fn collect_struct_shape_demoted_fields(
 
 fn collect_struct_shape_demoted_field_reasons(
     tcx: TyCtxt<'_>,
+    analysis: &Analysis,
     promoted_fields: &FxHashSet<StructFieldSlot>,
     mutable_fields: &FxHashSet<StructFieldSlot>,
     struct_copy_result: &crate::analyses::struct_copy::StructCopyAnalysisResult,
@@ -21220,7 +21225,160 @@ fn collect_struct_shape_demoted_field_reasons(
         }
     }
 
+    for (field, reasons) in
+        collect_prefix_compatibility_demoted_field_reasons(tcx, analysis, promoted_fields)
+    {
+        demoted.entry(field).or_default().extend(reasons);
+    }
+
     demoted
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BorrowFieldPromotionShape {
+    OptRef,
+    Slice,
+    SliceCursor,
+}
+
+fn borrow_field_promotion_shape(
+    analysis: &Analysis,
+    field: StructFieldSlot,
+) -> Option<BorrowFieldPromotionShape> {
+    if !analysis
+        .borrow_promotion_result
+        .mutable_fields
+        .contains(&field)
+        && !analysis
+            .borrow_promotion_result
+            .shared_fields
+            .contains(&field)
+    {
+        return None;
+    }
+
+    if analysis_field_is_array_like(analysis, field) {
+        if analysis
+            .offset_sign_result
+            .field_access_signs
+            .contains(&field)
+        {
+            Some(BorrowFieldPromotionShape::SliceCursor)
+        } else {
+            Some(BorrowFieldPromotionShape::Slice)
+        }
+    } else {
+        Some(BorrowFieldPromotionShape::OptRef)
+    }
+}
+
+fn collect_prefix_compatibility_demoted_field_reasons(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+    promoted_fields: &FxHashSet<StructFieldSlot>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<DecisionReason>> {
+    let mut demoted = FxHashMap::<StructFieldSlot, FxHashSet<DecisionReason>>::default();
+    let edges = collect_prefix_compatible_field_edges(tcx);
+    let mut visited = FxHashSet::default();
+
+    for &start in edges.keys() {
+        if !visited.insert(start) {
+            continue;
+        }
+
+        let mut component = FxHashSet::default();
+        let mut stack = vec![start];
+        while let Some(field) = stack.pop() {
+            component.insert(field);
+            if let Some(neighbors) = edges.get(&field) {
+                for &neighbor in neighbors {
+                    if visited.insert(neighbor) {
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        let shapes = component
+            .iter()
+            .map(|&field| borrow_field_promotion_shape(analysis, field))
+            .collect::<FxHashSet<_>>();
+        if shapes.len() <= 1 {
+            continue;
+        }
+
+        for field in component {
+            if promoted_fields.contains(&field) {
+                demoted
+                    .entry(field)
+                    .or_default()
+                    .insert(DecisionReason::BorrowFieldShapePrefixCompatibility);
+            }
+        }
+    }
+
+    demoted
+}
+
+fn collect_prefix_compatible_field_edges(
+    tcx: TyCtxt<'_>,
+) -> FxHashMap<StructFieldSlot, FxHashSet<StructFieldSlot>> {
+    let structs = local_struct_field_tys(tcx);
+    let mut edges = FxHashMap::<StructFieldSlot, FxHashSet<StructFieldSlot>>::default();
+
+    for (index, (a_did, a_fields)) in structs.iter().enumerate() {
+        for (b_did, b_fields) in structs.iter().skip(index + 1) {
+            for field_index in 0..a_fields.len().min(b_fields.len()) {
+                if !prefix_field_tys_compatible(a_fields[field_index], b_fields[field_index]) {
+                    break;
+                }
+
+                let a = StructFieldSlot {
+                    struct_did: *a_did,
+                    field_index,
+                };
+                let b = StructFieldSlot {
+                    struct_did: *b_did,
+                    field_index,
+                };
+                edges.entry(a).or_default().insert(b);
+                edges.entry(b).or_default().insert(a);
+            }
+        }
+    }
+
+    edges
+}
+
+fn local_struct_field_tys<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<(LocalDefId, Vec<ty::Ty<'tcx>>)> {
+    local_struct_dids(tcx)
+        .into_iter()
+        .filter_map(|did| {
+            let struct_ty = tcx.type_of(did).skip_binder();
+            let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+                return None;
+            };
+            let fields = adt_def
+                .non_enum_variant()
+                .fields
+                .iter()
+                .map(|field| field.ty(tcx, args))
+                .collect();
+            Some((did, fields))
+        })
+        .collect()
+}
+
+fn prefix_field_tys_compatible<'tcx>(a: ty::Ty<'tcx>, b: ty::Ty<'tcx>) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.kind(), b.kind()) {
+        (ty::TyKind::RawPtr(a_inner, _), ty::TyKind::RawPtr(b_inner, _)) => {
+            prefix_field_tys_compatible(*a_inner, *b_inner)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -21237,8 +21395,8 @@ fn field_slot_label(tcx: TyCtxt<'_>, field: StructFieldSlot) -> String {
     format!("{struct_name}.{field_name}")
 }
 
-fn local_struct_fields(tcx: TyCtxt<'_>) -> Vec<StructFieldSlot> {
-    let mut fields = Vec::new();
+fn local_struct_dids(tcx: TyCtxt<'_>) -> Vec<LocalDefId> {
+    let mut structs = Vec::new();
     for maybe_owner in tcx.hir_crate(()).owners.iter() {
         let Some(owner) = maybe_owner.as_owner() else {
             continue;
@@ -21249,7 +21407,14 @@ fn local_struct_fields(tcx: TyCtxt<'_>) -> Vec<StructFieldSlot> {
         if !matches!(item.kind, hir::ItemKind::Struct(..)) {
             continue;
         }
-        let struct_did = item.owner_id.def_id;
+        structs.push(item.owner_id.def_id);
+    }
+    structs
+}
+
+fn local_struct_fields(tcx: TyCtxt<'_>) -> Vec<StructFieldSlot> {
+    let mut fields = Vec::new();
+    for struct_did in local_struct_dids(tcx) {
         let field_count = tcx.adt_def(struct_did).non_enum_variant().fields.len();
         for field_index in 0..field_count {
             fields.push(StructFieldSlot {
@@ -24346,6 +24511,54 @@ pub unsafe fn assign(mut p: *mut core::ffi::c_void, q: *mut core::ffi::c_void) {
         visitor
             .found
             .unwrap_or_else(|| panic!("missing binding {fn_name}::{binding_name}"))
+    }
+
+    #[test]
+    fn pointer_struct_prefix_field_demotes_incompatible_promoted_field() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub x: *const i32,
+    pub y: i32,
+}
+
+#[repr(C)]
+pub struct T {
+    pub x: *mut i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+pub unsafe fn foo(q: *mut core::ffi::c_void) -> i32 {
+    let p: *mut S = q as *mut S;
+    *(*p).x.offset(1) + (*p).y
+}
+
+pub unsafe fn drive() -> i32 {
+    let mut x = [1, 2];
+    let mut v = T {
+        x: x.as_mut_ptr(),
+        y: 3,
+        z: 4,
+    };
+    foo(&mut v as *mut T as *mut core::ffi::c_void)
+}
+"#,
+        );
+
+        assert!(
+            rewritten.contains("pub struct S {"),
+            "S should not gain a lifetime parameter:\n{rewritten}",
+        );
+        assert!(
+            rewritten.contains("pub x: *const i32"),
+            "S::x should stay raw because T::x cannot be promoted compatibly:\n{rewritten}",
+        );
+        assert!(
+            rewritten.contains("pub struct T {") && rewritten.contains("pub x: *mut i32"),
+            "T::x should stay raw:\n{rewritten}",
+        );
     }
 
     #[test]
