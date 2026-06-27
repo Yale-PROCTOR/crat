@@ -2416,6 +2416,57 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if !raw_cast_call_inputs.is_empty() {
                 changed = true;
             }
+            let cursor_source_downgrades = collect_cursor_from_unanchored_raw_source_downgrades(
+                rust_program.tcx,
+                &sig_decs,
+                &ptr_kinds,
+            );
+            record_binding_events_excluding(
+                &mut diagnostics,
+                rust_program.tcx,
+                &ptr_kinds,
+                &cursor_source_downgrades.bindings,
+                &forced_raw_bindings,
+                DecisionReason::CursorFromUnanchoredRawSource,
+            );
+            for &hir_id in &cursor_source_downgrades.signature_inputs {
+                if force_signature_input_original_raw_for_binding(
+                    rust_program.tcx,
+                    &mut sig_decs,
+                    hir_id,
+                ) {
+                    if let Some((did, idx)) = param_index_for_binding(rust_program.tcx, hir_id) {
+                        record_signature_input_event(
+                            &mut diagnostics,
+                            rust_program.tcx,
+                            &sig_decs,
+                            did,
+                            idx,
+                            DecisionReason::CursorFromUnanchoredRawSource,
+                        );
+                    }
+                    changed = true;
+                }
+            }
+            for &did in &cursor_source_downgrades.outputs {
+                if force_signature_output_original_raw(rust_program.tcx, &mut sig_decs, did) {
+                    record_signature_output_event(
+                        &mut diagnostics,
+                        rust_program.tcx,
+                        &sig_decs,
+                        did,
+                        DecisionReason::CursorFromUnanchoredRawSource,
+                    );
+                    changed = true;
+                }
+            }
+            if cursor_source_downgrades
+                .bindings
+                .iter()
+                .any(|hir_id| !forced_raw_bindings.contains(hir_id))
+            {
+                changed = true;
+            }
             let cursor_input_downgrades = downgrade_cursor_inputs_from_unanchored_raw_callers(
                 rust_program.tcx,
                 &mut sig_decs,
@@ -2607,6 +2658,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     &unsupported_box_input_bindings,
                     DecisionReason::UnsupportedBoxInput,
                 ),
+                (
+                    &cursor_source_downgrades.bindings,
+                    DecisionReason::CursorFromUnanchoredRawSource,
+                ),
                 (&raw_call_result_bindings, DecisionReason::RawCallResult),
                 (
                     &fn_ptr_raw_call_arg_bindings,
@@ -2635,6 +2690,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             }
             local_struct_downgrades.extend_forced_raw_bindings(&mut forced_raw_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
+            forced_raw_bindings.extend(cursor_source_downgrades.bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);
             forced_raw_bindings.extend(fn_ptr_raw_call_arg_bindings);
@@ -15314,13 +15370,13 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
     sig_decs: &mut SigDecisions,
     ptr_kinds: &FxHashMap<HirId, PtrKind>,
 ) -> FxHashSet<(LocalDefId, usize)> {
-    let raw_origin_locals = collect_unanchored_raw_pointer_locals(tcx, sig_decs, ptr_kinds);
+    let provenance = collect_raw_pointer_provenance(tcx, sig_decs, ptr_kinds);
 
     struct CursorInputVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         sig_decs: &'a mut SigDecisions,
         ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
-        raw_origin_locals: &'a FxHashSet<HirId>,
+        provenance: &'a RawPointerProvenance,
         changed: FxHashSet<(LocalDefId, usize)>,
     }
 
@@ -15355,13 +15411,14 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
                         if !callee_input_has_syntactic_negative_offset(self.tcx, callee_did, idx) {
                             return None;
                         }
-                        hir_expr_is_unanchored_raw_pointer_arg(
+                        raw_pointer_expr_provenance(
                             self.tcx,
                             self.sig_decs,
                             self.ptr_kinds,
-                            self.raw_origin_locals,
+                            self.provenance,
                             arg,
                         )
+                        .is_some_and(|kind| kind == RawPointerProvenanceKind::Unanchored)
                         .then_some((idx, m))
                     })
                     .collect::<Vec<_>>()
@@ -15401,13 +15458,667 @@ fn downgrade_cursor_inputs_from_unanchored_raw_callers(
             tcx,
             sig_decs,
             ptr_kinds,
-            raw_origin_locals: &raw_origin_locals,
+            provenance: &provenance,
             changed: FxHashSet::default(),
         };
         visitor.visit_body(body);
         changed.extend(visitor.changed);
     }
     changed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawPointerProvenanceKind {
+    Anchored,
+    Unanchored,
+}
+
+#[derive(Default)]
+struct RawPointerProvenance {
+    locals: FxHashMap<HirId, RawPointerProvenanceKind>,
+}
+
+impl RawPointerProvenance {
+    fn insert(&mut self, hir_id: HirId, kind: RawPointerProvenanceKind) -> bool {
+        let merged = match (self.locals.get(&hir_id).copied(), kind) {
+            (Some(RawPointerProvenanceKind::Unanchored), _)
+            | (_, RawPointerProvenanceKind::Unanchored) => RawPointerProvenanceKind::Unanchored,
+            _ => RawPointerProvenanceKind::Anchored,
+        };
+        if self.locals.get(&hir_id).copied() == Some(merged) {
+            false
+        } else {
+            self.locals.insert(hir_id, merged);
+            true
+        }
+    }
+
+    fn get(&self, hir_id: HirId) -> Option<RawPointerProvenanceKind> {
+        self.locals.get(&hir_id).copied()
+    }
+}
+
+#[derive(Default)]
+struct CursorFromUnanchoredRawSourceDowngrades {
+    bindings: FxHashSet<HirId>,
+    signature_inputs: FxHashSet<HirId>,
+    outputs: FxHashSet<LocalDefId>,
+}
+
+impl CursorFromUnanchoredRawSourceDowngrades {
+    fn force_source_cursor_inputs_raw(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        sig_decs: &SigDecisions,
+        ptr_kinds: &FxHashMap<HirId, PtrKind>,
+        provenance: &RawPointerProvenance,
+        expr: &hir::Expr<'_>,
+    ) {
+        for hir_id in hir_local_ids_in_expr(expr) {
+            if !raw_local_pointer_provenance(tcx, sig_decs, ptr_kinds, provenance, hir_id)
+                .is_some_and(|kind| kind == RawPointerProvenanceKind::Unanchored)
+            {
+                continue;
+            }
+            if let Some((did, idx)) = param_index_for_binding(tcx, hir_id) {
+                if sig_decs
+                    .data
+                    .get(&did)
+                    .and_then(|sig_dec| sig_dec.input_decs.get(idx).copied().flatten())
+                    .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_)))
+                {
+                    self.signature_inputs.insert(hir_id);
+                }
+            } else if ptr_kinds
+                .get(&hir_id)
+                .copied()
+                .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_)))
+            {
+                self.bindings.insert(hir_id);
+            }
+        }
+    }
+}
+
+fn collect_cursor_from_unanchored_raw_source_downgrades(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> CursorFromUnanchoredRawSourceDowngrades {
+    let provenance = collect_raw_pointer_provenance(tcx, sig_decs, ptr_kinds);
+
+    struct CursorSourceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        provenance: &'a RawPointerProvenance,
+        current_did: LocalDefId,
+        downgrades: CursorFromUnanchoredRawSourceDowngrades,
+    }
+
+    impl<'tcx> CursorSourceVisitor<'_, 'tcx> {
+        fn record_binding_source(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            if !tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
+                || !self
+                    .ptr_kinds
+                    .get(&hir_id)
+                    .copied()
+                    .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_)))
+                || !raw_pointer_expr_is_bare_unanchored_source(
+                    self.tcx,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    self.provenance,
+                    rhs,
+                )
+            {
+                return;
+            }
+            if param_index_for_binding(self.tcx, hir_id).is_some() {
+                self.downgrades.signature_inputs.insert(hir_id);
+            } else {
+                self.downgrades.bindings.insert(hir_id);
+            }
+            self.downgrades.force_source_cursor_inputs_raw(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                self.provenance,
+                rhs,
+            );
+        }
+
+        fn record_output_source(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            if !self
+                .sig_decs
+                .data
+                .get(&self.current_did)
+                .and_then(|sig_dec| sig_dec.output_dec)
+                .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_)))
+                || !raw_pointer_expr_is_bare_unanchored_source(
+                    self.tcx,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    self.provenance,
+                    expr,
+                )
+            {
+                return;
+            }
+            self.downgrades.outputs.insert(self.current_did);
+            self.downgrades.force_source_cursor_inputs_raw(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                self.provenance,
+                expr,
+            );
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for CursorSourceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_binding_source(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            match expr.kind {
+                hir::ExprKind::Assign(lhs, rhs, _) => {
+                    if let Some(hir_id) = hir_unwrapped_local_id(lhs) {
+                        self.record_binding_source(hir_id, rhs);
+                    }
+                }
+                hir::ExprKind::Call(_, args) => {
+                    if let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
+                        && let Some(sig_dec) = self.sig_decs.data.get(&callee_did)
+                    {
+                        for (idx, arg) in args.iter().enumerate() {
+                            if !sig_dec
+                                .input_decs
+                                .get(idx)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_)))
+                                || !raw_pointer_expr_is_bare_unanchored_source(
+                                    self.tcx,
+                                    self.sig_decs,
+                                    self.ptr_kinds,
+                                    self.provenance,
+                                    arg,
+                                )
+                            {
+                                continue;
+                            }
+                            if let Some(param_hir_id) =
+                                callee_input_param_binding(self.tcx, callee_did, idx)
+                            {
+                                self.downgrades.signature_inputs.insert(param_hir_id);
+                            }
+                            self.downgrades.force_source_cursor_inputs_raw(
+                                self.tcx,
+                                self.sig_decs,
+                                self.ptr_kinds,
+                                self.provenance,
+                                arg,
+                            );
+                        }
+                    }
+                }
+                hir::ExprKind::Ret(Some(ret)) => self.record_output_source(ret),
+                _ => {}
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut downgrades = CursorFromUnanchoredRawSourceDowngrades::default();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        let hir::ItemKind::Fn { body, .. } = item.kind else {
+            continue;
+        };
+        let did = item.owner_id.def_id;
+        let body = tcx.hir_body(body);
+        let mut visitor = CursorSourceVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            provenance: &provenance,
+            current_did: did,
+            downgrades: CursorFromUnanchoredRawSourceDowngrades::default(),
+        };
+        if let hir::ExprKind::Block(block, _) = body.value.kind {
+            if let Some(tail) = block.expr {
+                visitor.record_output_source(tail);
+            }
+        } else {
+            visitor.record_output_source(body.value);
+        }
+        visitor.visit_body(body);
+        downgrades.bindings.extend(visitor.downgrades.bindings);
+        downgrades
+            .signature_inputs
+            .extend(visitor.downgrades.signature_inputs);
+        downgrades.outputs.extend(visitor.downgrades.outputs);
+    }
+    downgrades
+}
+
+fn collect_raw_pointer_provenance(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+) -> RawPointerProvenance {
+    struct ProvenanceVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
+        provenance: &'a mut RawPointerProvenance,
+        changed: bool,
+    }
+
+    impl<'tcx> ProvenanceVisitor<'_, 'tcx> {
+        fn record_assignment(&mut self, hir_id: HirId, rhs: &'tcx hir::Expr<'tcx>) {
+            if !tcx_node_ty_is_raw_ptr(self.tcx, hir_id) {
+                return;
+            }
+            if let Some(kind) = raw_pointer_expr_provenance(
+                self.tcx,
+                self.sig_decs,
+                self.ptr_kinds,
+                self.provenance,
+                rhs,
+            ) {
+                let kind = if self.ptr_kinds.get(&hir_id).copied().is_some_and(|kind| {
+                    matches!(kind, PtrKind::BoxedSlice | PtrKind::OptBoxedSlice)
+                        || is_cursor_anchor_decision(kind)
+                            && raw_pointer_expr_has_representable_cursor_anchor(
+                                self.tcx,
+                                self.sig_decs,
+                                self.ptr_kinds,
+                                self.provenance,
+                                rhs,
+                            )
+                }) {
+                    RawPointerProvenanceKind::Anchored
+                } else {
+                    kind
+                };
+                if self.provenance.insert(hir_id, kind) {
+                    self.changed = true;
+                }
+            }
+        }
+
+        fn record_call_args(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+            let hir::ExprKind::Call(_, args) = hir_unwrap_casts(expr).kind else {
+                return;
+            };
+            let Some(callee_did) = hir_called_local_fn(self.tcx, expr) else {
+                return;
+            };
+            for (idx, arg) in args.iter().enumerate() {
+                let Some(param_hir_id) = callee_input_param_binding(self.tcx, callee_did, idx)
+                else {
+                    continue;
+                };
+                if !tcx_node_ty_is_raw_ptr(self.tcx, param_hir_id) {
+                    continue;
+                }
+                if let Some(kind) = raw_pointer_expr_provenance(
+                    self.tcx,
+                    self.sig_decs,
+                    self.ptr_kinds,
+                    self.provenance,
+                    arg,
+                ) && self.provenance.insert(param_hir_id, kind)
+                {
+                    self.changed = true;
+                }
+            }
+        }
+    }
+
+    impl<'tcx> Visitor<'tcx> for ProvenanceVisitor<'_, 'tcx> {
+        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
+            if let hir::StmtKind::Let(let_stmt) = stmt.kind
+                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
+                && let Some(init) = let_stmt.init
+            {
+                self.record_assignment(hir_id, init);
+            }
+            intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let Some(hir_id) = hir_unwrapped_local_id(lhs)
+            {
+                self.record_assignment(hir_id, rhs);
+            }
+            self.record_call_args(expr);
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let bodies = tcx
+        .hir_crate(())
+        .owners
+        .iter()
+        .filter_map(|maybe_owner| maybe_owner.as_owner())
+        .filter_map(|owner| {
+            let hir::OwnerNode::Item(item) = owner.node() else {
+                return None;
+            };
+            let hir::ItemKind::Fn { body, .. } = item.kind else {
+                return None;
+            };
+            Some(tcx.hir_body(body))
+        })
+        .collect::<Vec<_>>();
+
+    let mut provenance = RawPointerProvenance::default();
+    loop {
+        let mut visitor = ProvenanceVisitor {
+            tcx,
+            sig_decs,
+            ptr_kinds,
+            provenance: &mut provenance,
+            changed: false,
+        };
+        for body in &bodies {
+            visitor.visit_body(body);
+        }
+        if !visitor.changed {
+            break;
+        }
+    }
+
+    provenance
+}
+
+fn raw_pointer_expr_has_representable_cursor_anchor(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    provenance: &RawPointerProvenance,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    if !hir_expr_ty_is_raw_ptr(tcx, expr) || hir_is_null_like_ptr_arg(tcx, expr) {
+        return false;
+    }
+
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => {
+                raw_local_pointer_provenance(tcx, sig_decs, ptr_kinds, provenance, hir_id)
+                    == Some(RawPointerProvenanceKind::Anchored)
+            }
+            _ => false,
+        },
+        hir::ExprKind::Call(..) => hir_callee_output_kind(tcx, sig_decs, ptr_kinds, expr)
+            .is_some_and(is_cursor_anchor_decision),
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
+            "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub" => {
+                raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, receiver)
+                    .is_some()
+            }
+            "cast" | "cast_mut" | "cast_const" => raw_pointer_expr_has_representable_cursor_anchor(
+                tcx, sig_decs, ptr_kinds, provenance, receiver,
+            ),
+            "as_ptr" | "as_mut_ptr" => {
+                let typeck = tcx.typeck(receiver.hir_id.owner);
+                let receiver_ty = typeck.expr_ty(receiver);
+                if slice_like_container_inner_ty(receiver_ty, tcx).is_some() {
+                    true
+                } else {
+                    let receiver_ty = typeck.expr_ty_adjusted(receiver);
+                    if unwrap_ptr_from_mir_ty(receiver_ty).is_some() {
+                        raw_pointer_expr_has_representable_cursor_anchor(
+                            tcx, sig_decs, ptr_kinds, provenance, receiver,
+                        )
+                    } else {
+                        slice_like_container_inner_ty(receiver_ty, tcx).is_some()
+                    }
+                }
+            }
+            _ => false,
+        },
+        hir::ExprKind::AddrOf(_, _, pointee) => hir_expr_ty_is_slice_or_array(tcx, pointee),
+        hir::ExprKind::Block(block, _) => block.expr.is_some_and(|tail| {
+            raw_pointer_expr_has_representable_cursor_anchor(
+                tcx, sig_decs, ptr_kinds, provenance, tail,
+            )
+        }),
+        hir::ExprKind::If(_, then_expr, Some(else_expr)) => {
+            raw_pointer_expr_has_representable_cursor_anchor(
+                tcx, sig_decs, ptr_kinds, provenance, then_expr,
+            ) || raw_pointer_expr_has_representable_cursor_anchor(
+                tcx, sig_decs, ptr_kinds, provenance, else_expr,
+            )
+        }
+        hir::ExprKind::Match(_, arms, _) => arms.iter().any(|arm| {
+            raw_pointer_expr_has_representable_cursor_anchor(
+                tcx, sig_decs, ptr_kinds, provenance, arm.body,
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn raw_pointer_expr_is_bare_unanchored_source(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    provenance: &RawPointerProvenance,
+    expr: &hir::Expr<'_>,
+) -> bool {
+    let expr = hir_unwrap_casts(expr);
+    if !hir_expr_ty_is_raw_ptr(tcx, expr) || hir_is_null_like_ptr_arg(tcx, expr) {
+        return false;
+    }
+
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => {
+                raw_local_pointer_provenance(tcx, sig_decs, ptr_kinds, provenance, hir_id)
+                    .is_some_and(|kind| kind == RawPointerProvenanceKind::Unanchored)
+            }
+            _ => true,
+        },
+        hir::ExprKind::Call(..) => {
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, expr)
+                .is_some_and(|kind| kind == RawPointerProvenanceKind::Unanchored)
+        }
+        hir::ExprKind::MethodCall(seg, receiver, _, _)
+            if matches!(seg.ident.name.as_str(), "cast" | "cast_mut" | "cast_const") =>
+        {
+            raw_pointer_expr_is_bare_unanchored_source(
+                tcx, sig_decs, ptr_kinds, provenance, receiver,
+            )
+        }
+        hir::ExprKind::Block(block, _) => block.expr.is_some_and(|tail| {
+            raw_pointer_expr_is_bare_unanchored_source(tcx, sig_decs, ptr_kinds, provenance, tail)
+        }),
+        hir::ExprKind::If(_, then_expr, Some(else_expr)) => merge_raw_pointer_provenance(
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, then_expr),
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, else_expr),
+        )
+        .is_some_and(|kind| kind == RawPointerProvenanceKind::Unanchored),
+        hir::ExprKind::Match(_, arms, _) => {
+            let mut merged = None;
+            for arm in arms {
+                merged = merge_raw_pointer_provenance(
+                    merged,
+                    raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, arm.body),
+                );
+                if merged == Some(RawPointerProvenanceKind::Unanchored) {
+                    break;
+                }
+            }
+            merged == Some(RawPointerProvenanceKind::Unanchored)
+        }
+        _ => false,
+    }
+}
+
+fn raw_pointer_expr_provenance(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    provenance: &RawPointerProvenance,
+    expr: &hir::Expr<'_>,
+) -> Option<RawPointerProvenanceKind> {
+    let expr = hir_unwrap_casts(expr);
+    if !hir_expr_ty_is_raw_ptr(tcx, expr) {
+        return None;
+    }
+    if hir_is_null_like_ptr_arg(tcx, expr) {
+        return None;
+    }
+
+    match expr.kind {
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir_id) => {
+                raw_local_pointer_provenance(tcx, sig_decs, ptr_kinds, provenance, hir_id)
+            }
+            _ => Some(RawPointerProvenanceKind::Unanchored),
+        },
+        hir::ExprKind::Call(..) => {
+            if hir_callee_output_kind(tcx, sig_decs, ptr_kinds, expr)
+                .is_some_and(is_cursor_anchor_decision)
+            {
+                Some(RawPointerProvenanceKind::Anchored)
+            } else {
+                Some(RawPointerProvenanceKind::Unanchored)
+            }
+        }
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
+            "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub"
+            | "cast" | "cast_mut" | "cast_const" => {
+                raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, receiver)
+            }
+            "as_ptr" | "as_mut_ptr" => {
+                let typeck = tcx.typeck(receiver.hir_id.owner);
+                let receiver_ty = typeck.expr_ty(receiver);
+                if slice_like_container_inner_ty(receiver_ty, tcx).is_some() {
+                    Some(RawPointerProvenanceKind::Anchored)
+                } else {
+                    let receiver_ty = typeck.expr_ty_adjusted(receiver);
+                    if unwrap_ptr_from_mir_ty(receiver_ty).is_some() {
+                        raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, receiver)
+                    } else if slice_like_container_inner_ty(receiver_ty, tcx).is_some() {
+                        Some(RawPointerProvenanceKind::Anchored)
+                    } else {
+                        Some(RawPointerProvenanceKind::Unanchored)
+                    }
+                }
+            }
+            _ => Some(RawPointerProvenanceKind::Unanchored),
+        },
+        hir::ExprKind::AddrOf(_, _, pointee) if hir_expr_ty_is_slice_or_array(tcx, pointee) => {
+            Some(RawPointerProvenanceKind::Anchored)
+        }
+        hir::ExprKind::Block(block, _) => block.expr.and_then(|tail| {
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, tail)
+        }),
+        hir::ExprKind::If(_, then_expr, Some(else_expr)) => merge_raw_pointer_provenance(
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, then_expr),
+            raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, else_expr),
+        ),
+        hir::ExprKind::Match(_, arms, _) => {
+            let mut merged = None;
+            for arm in arms {
+                merged = merge_raw_pointer_provenance(
+                    merged,
+                    raw_pointer_expr_provenance(tcx, sig_decs, ptr_kinds, provenance, arm.body),
+                );
+                if merged == Some(RawPointerProvenanceKind::Unanchored) {
+                    break;
+                }
+            }
+            merged
+        }
+        _ => {
+            let mut saw_anchor = false;
+            for hir_id in hir_local_ids_in_expr(expr) {
+                match raw_local_pointer_provenance(tcx, sig_decs, ptr_kinds, provenance, hir_id) {
+                    Some(RawPointerProvenanceKind::Unanchored) => {
+                        return Some(RawPointerProvenanceKind::Unanchored);
+                    }
+                    Some(RawPointerProvenanceKind::Anchored) => saw_anchor = true,
+                    None => {}
+                }
+            }
+            Some(if saw_anchor {
+                RawPointerProvenanceKind::Anchored
+            } else {
+                RawPointerProvenanceKind::Unanchored
+            })
+        }
+    }
+}
+
+fn merge_raw_pointer_provenance(
+    lhs: Option<RawPointerProvenanceKind>,
+    rhs: Option<RawPointerProvenanceKind>,
+) -> Option<RawPointerProvenanceKind> {
+    match (lhs, rhs) {
+        (Some(RawPointerProvenanceKind::Unanchored), _)
+        | (_, Some(RawPointerProvenanceKind::Unanchored)) => {
+            Some(RawPointerProvenanceKind::Unanchored)
+        }
+        (Some(RawPointerProvenanceKind::Anchored), _)
+        | (_, Some(RawPointerProvenanceKind::Anchored)) => Some(RawPointerProvenanceKind::Anchored),
+        (None, None) => None,
+    }
+}
+
+fn raw_local_pointer_provenance(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    ptr_kinds: &FxHashMap<HirId, PtrKind>,
+    provenance: &RawPointerProvenance,
+    hir_id: HirId,
+) -> Option<RawPointerProvenanceKind> {
+    if !tcx_node_ty_is_raw_ptr(tcx, hir_id) {
+        return None;
+    }
+    if let Some((did, idx)) = param_index_for_binding(tcx, hir_id)
+        && sig_decs
+            .data
+            .get(&did)
+            .and_then(|sig_dec| sig_dec.input_decs.get(idx).copied().flatten())
+            .is_some_and(|kind| matches!(kind, PtrKind::Raw(_)))
+    {
+        return Some(RawPointerProvenanceKind::Unanchored);
+    }
+    if let Some(kind) = provenance.get(hir_id) {
+        return Some(kind);
+    }
+    if param_index_for_binding(tcx, hir_id).is_some() {
+        return Some(RawPointerProvenanceKind::Unanchored);
+    }
+    if ptr_kinds
+        .get(&hir_id)
+        .copied()
+        .is_some_and(is_cursor_anchor_decision)
+    {
+        return Some(RawPointerProvenanceKind::Anchored);
+    }
+    Some(RawPointerProvenanceKind::Unanchored)
 }
 
 fn callee_input_has_syntactic_negative_offset(
@@ -15476,164 +16187,6 @@ fn hir_expr_is_syntactically_negative(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> 
         .is_some_and(|snippet| snippet.trim_start().starts_with('-'))
 }
 
-fn collect_unanchored_raw_pointer_locals(
-    tcx: TyCtxt<'_>,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-) -> FxHashSet<HirId> {
-    struct RawOriginVisitor<'a, 'tcx> {
-        tcx: TyCtxt<'tcx>,
-        sig_decs: &'a SigDecisions,
-        ptr_kinds: &'a FxHashMap<HirId, PtrKind>,
-        locals: FxHashSet<HirId>,
-    }
-
-    impl<'tcx> RawOriginVisitor<'_, 'tcx> {
-        fn record_assignment(&mut self, lhs: &'tcx hir::Expr<'tcx>, rhs: &'tcx hir::Expr<'tcx>) {
-            let Some(hir_id) = hir_unwrapped_local_id(lhs) else {
-                return;
-            };
-            if !tcx_node_ty_is_raw_ptr(self.tcx, hir_id) {
-                return;
-            }
-            if hir_expr_is_unanchored_raw_pointer_source(
-                self.tcx,
-                self.sig_decs,
-                self.ptr_kinds,
-                rhs,
-            ) {
-                self.locals.insert(hir_id);
-            }
-        }
-    }
-
-    impl<'tcx> Visitor<'tcx> for RawOriginVisitor<'_, 'tcx> {
-        fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt<'tcx>) -> Self::Result {
-            if let hir::StmtKind::Let(let_stmt) = stmt.kind
-                && let hir::PatKind::Binding(_, hir_id, _, _) = let_stmt.pat.kind
-                && let Some(init) = let_stmt.init
-                && tcx_node_ty_is_raw_ptr(self.tcx, hir_id)
-                && hir_expr_is_unanchored_raw_pointer_source(
-                    self.tcx,
-                    self.sig_decs,
-                    self.ptr_kinds,
-                    init,
-                )
-            {
-                self.locals.insert(hir_id);
-            }
-            intravisit::walk_stmt(self, stmt);
-        }
-
-        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
-            if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind {
-                self.record_assignment(lhs, rhs);
-            }
-            intravisit::walk_expr(self, expr);
-        }
-    }
-
-    let mut visitor = RawOriginVisitor {
-        tcx,
-        sig_decs,
-        ptr_kinds,
-        locals: FxHashSet::default(),
-    };
-    for maybe_owner in tcx.hir_crate(()).owners.iter() {
-        let Some(owner) = maybe_owner.as_owner() else {
-            continue;
-        };
-        let hir::OwnerNode::Item(item) = owner.node() else {
-            continue;
-        };
-        let hir::ItemKind::Fn { body, .. } = item.kind else {
-            continue;
-        };
-        visitor.visit_body(tcx.hir_body(body));
-    }
-    visitor.locals
-}
-
-fn hir_expr_is_unanchored_raw_pointer_arg(
-    tcx: TyCtxt<'_>,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    raw_origin_locals: &FxHashSet<HirId>,
-    expr: &hir::Expr<'_>,
-) -> bool {
-    if hir_expr_uses_non_pointer_local(tcx, expr)
-        || hir_expr_has_borrowed_slice_pointer_anchor(tcx, expr)
-    {
-        return false;
-    }
-    if let Some(hir_id) = hir_unwrapped_local_id(expr)
-        && raw_origin_locals.contains(&hir_id)
-    {
-        return true;
-    }
-    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, expr)
-}
-
-fn hir_expr_is_unanchored_raw_pointer_source(
-    tcx: TyCtxt<'_>,
-    sig_decs: &SigDecisions,
-    ptr_kinds: &FxHashMap<HirId, PtrKind>,
-    expr: &hir::Expr<'_>,
-) -> bool {
-    let expr = hir_unwrap_casts(expr);
-    if !hir_expr_ty_is_raw_ptr(tcx, expr) {
-        return false;
-    }
-
-    match expr.kind {
-        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
-            let Res::Local(hir_id) = path.res else {
-                return true;
-            };
-            let kind = ptr_kinds.get(&hir_id).copied().or_else(|| {
-                unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id))
-                    .map(|(_, mutability)| PtrKind::Raw(mutability.is_mut()))
-            });
-            !kind.is_some_and(is_cursor_anchor_decision)
-        }
-        hir::ExprKind::Call(..) => hir_callee_output_kind(tcx, sig_decs, ptr_kinds, expr)
-            .is_none_or(|kind| !is_cursor_anchor_decision(kind)),
-        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
-            "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" => {
-                hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
-            }
-            "as_ptr" | "as_mut_ptr" => {
-                if hir_expr_ty_is_raw_ptr(tcx, receiver) {
-                    hir_expr_is_unanchored_raw_pointer_source(tcx, sig_decs, ptr_kinds, receiver)
-                } else {
-                    false
-                }
-            }
-            _ => true,
-        },
-        hir::ExprKind::AddrOf(_, _, pointee) => !hir_expr_ty_is_slice_or_array(tcx, pointee),
-        _ => true,
-    }
-}
-
-fn hir_expr_has_borrowed_slice_pointer_anchor(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
-    let expr = hir_unwrap_casts(expr);
-    match expr.kind {
-        hir::ExprKind::MethodCall(seg, receiver, _, _) => match seg.ident.name.as_str() {
-            "offset" | "add" | "sub" | "wrapping_add" | "wrapping_sub" => {
-                hir_expr_has_borrowed_slice_pointer_anchor(tcx, receiver)
-            }
-            "as_ptr" | "as_mut_ptr" => {
-                let receiver_ty = tcx.typeck(receiver.hir_id.owner).expr_ty_adjusted(receiver);
-                !matches!(receiver_ty.kind(), ty::TyKind::RawPtr(..))
-                    && slice_like_container_inner_ty(receiver_ty, tcx).is_some()
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 fn is_cursor_anchor_decision(kind: PtrKind) -> bool {
     matches!(
         kind,
@@ -15698,12 +16251,6 @@ fn raw_pointer_map_or_closure_body<'a, 'tcx>(
 
 fn tcx_node_ty_is_raw_ptr(tcx: TyCtxt<'_>, hir_id: HirId) -> bool {
     unwrap_ptr_from_mir_ty(tcx.typeck(hir_id.owner).node_type(hir_id)).is_some()
-}
-
-fn hir_expr_uses_non_pointer_local(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
-    hir_local_ids_in_expr(expr)
-        .into_iter()
-        .any(|hir_id| !tcx_node_ty_is_raw_ptr(tcx, hir_id))
 }
 
 fn hir_expr_ty_is_slice_or_array(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> bool {
@@ -24562,6 +25109,304 @@ pub unsafe fn drive() -> i32 {
     }
 
     #[test]
+    fn pointer_raw_param_mut_local_let_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_mut_local_let_negative_offset(p: *mut i32) {
+    let r = p;
+    *r.offset(-1) = 0;
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_let_negative_offset",
+            "p",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_let_negative_offset",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_const_local_let_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_const_local_let_negative_offset(p: *const i32) -> i32 {
+    let r = p;
+    *r.offset(-1)
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_let_negative_offset",
+            "p",
+            false,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_let_negative_offset",
+            "r",
+            false,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_mut_local_method_cast_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_mut_local_method_cast_negative_offset(p: *mut core::ffi::c_void) {
+    let r = p.cast::<i32>();
+    *r.offset(-1) = 0;
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_method_cast_negative_offset",
+            "p",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_method_cast_negative_offset",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_const_local_method_cast_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_const_local_method_cast_negative_offset(p: *const core::ffi::c_void) -> i32 {
+    let r = p.cast::<i32>();
+    *r.offset(-1)
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_method_cast_negative_offset",
+            "p",
+            false,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_method_cast_negative_offset",
+            "r",
+            false,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_mut_local_assignment_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_mut_local_assignment_negative_offset(p: *mut i32) {
+    let mut r = std::ptr::null_mut();
+    r = p;
+    *r.offset(-1) = 0;
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_assignment_negative_offset",
+            "p",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_assignment_negative_offset",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_const_local_assignment_negative_offset_keeps_local_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_const_local_assignment_negative_offset(p: *const i32) -> i32 {
+    let mut r = std::ptr::null();
+    r = p;
+    *r.offset(-1)
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_assignment_negative_offset",
+            "p",
+            false,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_assignment_negative_offset",
+            "r",
+            false,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_mut_local_to_negative_offset_callee_keeps_source_and_param_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_mut_negative_offset_callee(q: *mut i32) -> i32 {
+    *q.offset(-1)
+}
+
+pub unsafe fn raw_param_mut_local_to_negative_offset_callee(p: *mut i32) -> i32 {
+    let r = p;
+    raw_param_mut_negative_offset_callee(r)
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_negative_offset_callee",
+            "q",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_to_negative_offset_callee",
+            "p",
+            true,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_mut_local_to_negative_offset_callee",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_const_local_to_negative_offset_callee_keeps_source_and_param_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_const_negative_offset_callee(q: *const i32) -> i32 {
+    *q.offset(-1)
+}
+
+pub unsafe fn raw_param_const_local_to_negative_offset_callee(p: *const i32) -> i32 {
+    let r = p;
+    raw_param_const_negative_offset_callee(r)
+}
+"#,
+        );
+
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_negative_offset_callee",
+            "q",
+            false,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_to_negative_offset_callee",
+            "p",
+            false,
+        );
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_const_local_to_negative_offset_callee",
+            "r",
+            false,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_returned_mut_negative_offset_keeps_output_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_return_mut(p: *mut i32) -> *mut i32 {
+    let r = p;
+    r
+}
+
+pub unsafe fn raw_param_returned_mut_negative_offset(p: *mut i32) {
+    let r = raw_param_return_mut(p);
+    *r.offset(-1) = 0;
+}
+"#,
+        );
+
+        assert_fn_output_raw_pointer(&rewritten, "raw_param_return_mut", true);
+        assert_binding_raw_pointer(&rewritten, "raw_param_return_mut", "r", true);
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_returned_mut_negative_offset",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_returned_method_cast_negative_offset_keeps_output_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_return_cast_mut(p: *const core::ffi::c_void) -> *mut i32 {
+    p.cast::<i32>().cast_mut()
+}
+
+pub unsafe fn raw_param_returned_method_cast_negative_offset(p: *const core::ffi::c_void) {
+    let r = raw_param_return_cast_mut(p);
+    *r.offset(-1) = 0;
+}
+"#,
+        );
+
+        assert_fn_output_raw_pointer(&rewritten, "raw_param_return_cast_mut", true);
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_returned_method_cast_negative_offset",
+            "r",
+            true,
+        );
+    }
+
+    #[test]
+    fn pointer_raw_param_returned_const_negative_offset_keeps_output_raw() {
+        let rewritten = rewrite_pointer_code(
+            r#"
+pub unsafe fn raw_param_return_const(p: *const i32) -> *const i32 {
+    let r = p;
+    r
+}
+
+pub unsafe fn raw_param_returned_const_negative_offset(p: *const i32) -> i32 {
+    let r = raw_param_return_const(p);
+    *r.offset(-1)
+}
+"#,
+        );
+
+        assert_fn_output_raw_pointer(&rewritten, "raw_param_return_const", false);
+        assert_binding_raw_pointer(&rewritten, "raw_param_return_const", "r", false);
+        assert_binding_raw_pointer(
+            &rewritten,
+            "raw_param_returned_const_negative_offset",
+            "r",
+            false,
+        );
+    }
+
+    #[test]
     fn pointer_field_source_mut_init_negative_offset_keeps_local_raw() {
         let rewritten = rewrite_pointer_code_with_config(
             r#"
@@ -25396,6 +26241,22 @@ pub unsafe fn read(x: i32) -> i32 {
             if downgrade_freed_borrow_outputs(tcx, &mut sig_decs, &free_like_wrappers).changed() {
                 changed = true;
             }
+            let cursor_source_downgrades =
+                collect_cursor_from_unanchored_raw_source_downgrades(tcx, &sig_decs, &ptr_kinds);
+            if cursor_source_downgrades
+                .bindings
+                .iter()
+                .any(|hir_id| !forced_raw_bindings.contains(hir_id))
+            {
+                changed = true;
+            }
+            for hir_id in &cursor_source_downgrades.signature_inputs {
+                changed |=
+                    force_signature_input_original_raw_for_binding(tcx, &mut sig_decs, *hir_id);
+            }
+            for did in &cursor_source_downgrades.outputs {
+                changed |= force_signature_output_original_raw(tcx, &mut sig_decs, *did);
+            }
             if !downgrade_cursor_inputs_from_unanchored_raw_callers(tcx, &mut sig_decs, &ptr_kinds)
                 .is_empty()
             {
@@ -25467,6 +26328,10 @@ pub unsafe fn read(x: i32) -> i32 {
                 "local_struct_foreign_mut_call",
             );
             record_new(&unsupported_box_input_bindings, "unsupported_box_input");
+            record_new(
+                &cursor_source_downgrades.bindings,
+                "cursor_from_unanchored_raw_source",
+            );
             record_new(&raw_call_result_bindings, "raw_call_result");
             record_new(&raw_local_assignment_bindings, "raw_local_assignment");
             record_new(&pointer_output_storage_bindings, "pointer_output_storage");
@@ -25523,6 +26388,10 @@ pub unsafe fn read(x: i32) -> i32 {
                     &unsupported_box_input_bindings,
                     DecisionReason::UnsupportedBoxInput,
                 ),
+                (
+                    &cursor_source_downgrades.bindings,
+                    DecisionReason::CursorFromUnanchoredRawSource,
+                ),
                 (&raw_call_result_bindings, DecisionReason::RawCallResult),
                 (
                     &raw_local_assignment_bindings,
@@ -25551,6 +26420,7 @@ pub unsafe fn read(x: i32) -> i32 {
             }
             local_struct_downgrades.extend_forced_raw_bindings(&mut forced_raw_bindings);
             forced_raw_bindings.extend(unsupported_box_input_bindings);
+            forced_raw_bindings.extend(cursor_source_downgrades.bindings);
             forced_raw_bindings.extend(raw_call_result_bindings);
             forced_raw_bindings.extend(raw_local_assignment_bindings);
             forced_raw_bindings.extend(pointer_output_storage_bindings);

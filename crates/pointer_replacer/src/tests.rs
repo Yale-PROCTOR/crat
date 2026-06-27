@@ -1653,14 +1653,15 @@ pub unsafe fn caller(level: i32) -> i32 {
 "#,
         &[
             "pub unsafe fn open_level(mut out: &mut [*mut i32]",
-            "values: crate::slice_cursor::SliceCursor<'_, i32>",
+            "values: *const i32",
             "let __crat_same_call_0_config = config;",
             "std::slice::from_mut(&mut (config))",
-            "crate::slice_cursor::SliceCursor::from_raw_parts",
+            "open_level(std::slice::from_mut(&mut (config)),\n            __crat_same_call_0_config, level)",
         ],
         &[
             "open_level(std::slice::from_mut(&mut (config)), config, level)",
             "std::slice::from_mut(&mut (config)),\n        if (config).is_null()",
+            "values: crate::slice_cursor::SliceCursor<'_, i32>",
             "pub unsafe fn open_level(mut out: *mut *mut i32",
         ],
     );
@@ -9311,12 +9312,11 @@ pub unsafe extern "C" fn write_before(use_alloc: bool) -> i64 {
     return *ptr.offset(0);
 }
 "#,
+        &["let mut ptr: *mut i64", "*ptr.offset(-1)", "*ptr.offset(0)"],
         &[
             "SliceCursorMut::from_raw_parts_mut",
-            "as *mut",
             "crate::slice_cursor::SliceCursorMut<'_, i64>",
         ],
-        &["from_raw_parts_mut(_x,"],
     );
 }
 
@@ -9339,12 +9339,11 @@ pub unsafe extern "C" fn read_before(use_callback: bool) -> i64 {
     return *ptr.offset(-1) + *ptr.offset(0);
 }
 "#,
+        &["let ptr: *const i64", "*ptr.offset(-1)", "*ptr.offset(0)"],
         &[
             "SliceCursor::from_raw_parts",
-            "as *const",
             "crate::slice_cursor::SliceCursor<'_, i64>",
         ],
-        &["from_raw_parts(_x,"],
     );
 }
 
@@ -17609,12 +17608,14 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32) -> i32 {
 }
 "#,
         &[
+            "pub unsafe fn write_previous(mut words: *mut i32)",
+            "let cursor: *const i32 = words;",
+            "write_previous((cursor as *mut i32) as *mut i32);",
+        ],
+        &[
             "crate::slice_cursor::SliceCursorMut<'_, i32>",
             "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
-            "write_previous(if (cursor).is_empty()",
-            "crate::slice_cursor::SliceCursorMut::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
         ],
-        &["write_previous(cursor)", "write_previous((cursor as"],
     );
 }
 
@@ -17635,13 +17636,13 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
 "#,
         &[
             "fn write_window(mut words: &mut [i32], idx: usize)",
-            "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
-            "write_window(if (cursor).is_empty()",
-            "std::slice::from_raw_parts_mut((cursor).as_ptr().cast_mut()",
+            "let cursor: *const i32 = words;",
+            "write_window(if (cursor).is_null()",
+            "std::slice::from_raw_parts_mut((cursor) as *mut _, 1_000_000)",
         ],
         &[
+            "let cursor: crate::slice_cursor::SliceCursor<'_, i32>",
             "write_window((cursor).as_slice_mut(), idx)",
-            "write_window((cursor as",
         ],
     );
 }
@@ -17668,12 +17669,13 @@ pub unsafe extern "C" fn dispatch(words: &[i32]) -> i32 {
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "pub unsafe fn write_previous(mut words: *mut i32)",
             "fn dispatch(words: &[i32]) -> i32",
-            "write_previous(crate::slice_cursor::SliceCursorMut::from_raw_parts_mut(((words).as_ptr())",
+            "write_previous(((words).as_ptr()).cast_mut())",
         ],
         &[
-            "write_previous(crate::slice_cursor::SliceCursorMut::new(words))",
+            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "write_previous(crate::slice_cursor::SliceCursorMut::from_raw_parts_mut",
             "write_previous((words).as_ptr() as",
         ],
     );
@@ -17695,11 +17697,11 @@ pub unsafe fn root6_param_call_then_index(mut stack: *mut i32) -> i32 {
 "#,
         &[
             "root6_peek_prev",
-            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "pub unsafe fn root6_peek_prev(mut cursor: *const i32)",
             "root6_param_call_then_index",
-            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "pub unsafe fn root6_param_call_then_index(mut stack: *mut i32)",
         ],
-        &[],
+        &["crate::slice_cursor::SliceCursor"],
     );
 }
 
@@ -17729,11 +17731,12 @@ pub unsafe fn root6_loop_calls_then_write(mut stack: *mut i32, mut count: i32) -
         &[
             "root6_peek_prev",
             "root6_peek_two_back",
-            "crate::slice_cursor::SliceCursor<'_, i32>",
+            "pub unsafe fn root6_peek_prev(mut cursor: *const i32)",
+            "pub unsafe fn root6_peek_two_back(mut cursor: *const i32)",
             "root6_loop_calls_then_write",
-            "crate::slice_cursor::SliceCursorMut<'_, i32>",
+            "pub unsafe fn root6_loop_calls_then_write(mut stack: *mut i32",
         ],
-        &[],
+        &["crate::slice_cursor::SliceCursor"],
     );
 }
 
@@ -17750,10 +17753,10 @@ pub unsafe fn root6_local_shared_then_mut_use(mut stack: *mut i32) -> i32 {
 "#,
         &[
             "root6_local_shared_then_mut_use",
-            "crate::slice_cursor::SliceCursorMut<'_, i32>",
-            "let view: crate::slice_cursor::SliceCursor<'_, i32>",
+            "pub unsafe fn root6_local_shared_then_mut_use(mut stack: *mut i32)",
+            "let view: *const i32 = stack as *const i32;",
         ],
-        &[],
+        &["crate::slice_cursor::SliceCursor"],
     );
 }
 
