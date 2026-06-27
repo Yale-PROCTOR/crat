@@ -154,11 +154,6 @@ impl MutVisitor for TransformVisitor<'_> {
         }
         stmts.retain(|stmt| {
             if let StmtKind::Semi(expr) = &stmt.kind
-                && let Some(hir_id) = self.ast_to_hir.local_map.get(&expr.id)
-                && self.errno_calls.assigns.contains(hir_id)
-            {
-                false
-            } else if let StmtKind::Semi(expr) = &stmt.kind
                 && let ExprKind::Call(callee, _) = &unwrap_paren(expr).kind
                 && let ExprKind::Path(_, path) = &unwrap_paren(callee).kind
                 && path.segments.last().unwrap().ident.as_str() == "setlocale"

@@ -13,6 +13,7 @@ use crate::rustc_hir::intravisit::Visitor as _;
 pub struct ErrnoCalls {
     pub checks: FxHashMap<HirId, ErrnoCheck>,
     pub sources: FxHashSet<ForeignCall>,
+    #[allow(unused)]
     pub assigns: FxHashSet<HirId>,
 }
 
