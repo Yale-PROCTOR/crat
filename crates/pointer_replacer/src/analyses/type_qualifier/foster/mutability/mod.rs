@@ -292,6 +292,9 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     &mut rhs_deref,
                 ) else {
                     database.bottom(lhs_ref);
+                    if let Some(rhs_deref) = rhs_deref {
+                        database.guard(lhs_ref, rhs_deref);
+                    }
                     return;
                 };
                 if let Some(rhs_deref) = rhs_deref {

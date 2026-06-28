@@ -11945,6 +11945,60 @@ pub unsafe extern "C" fn foo(mut sp: *mut S) -> *mut i32 {
     assert!(s.contains("-> *mut i32"), "{s}");
 }
 
+#[test]
+fn test_union_field_mut_borrow_marks_outer_pointer_mut() {
+    let code = r#"
+#[repr(C)]
+pub struct Ctx {
+    pub u: U,
+    pub tag: i32,
+}
+#[repr(C)]
+pub union U {
+    pub a: A,
+    pub b: B,
+}
+#[repr(C)]
+pub struct A {
+    pub state: i32,
+}
+impl Copy for A {}
+impl Clone for A {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+#[repr(C)]
+pub struct B {
+    pub state: i32,
+}
+impl Copy for B {}
+impl Clone for B {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+pub unsafe extern "C" fn init_a(mut a: *mut A) {
+    (*a).state = 1;
+}
+pub unsafe extern "C" fn init_ctx(mut ctx: *mut Ctx) {
+    if (*ctx).tag == 1 {
+        init_a(&mut (*ctx).u.a);
+    }
+}
+"#;
+    let (s, _) = rewrite_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("pub unsafe extern \"C\" fn init_ctx(mut ctx: &mut crate::Ctx)"),
+        "Expected mutable outer pointer after mutable borrow through union field:\n{s}",
+    );
+    assert!(
+        !s.contains("pub unsafe extern \"C\" fn init_ctx(mut ctx: &crate::Ctx)"),
+        "init_ctx::ctx must not be rewritten as shared:\n{s}",
+    );
+}
+
 /// Raw pointer mutability cast: `p` is *mut (writes through it), `q` is *const
 /// (only compared). The comparison `p == q` requires matching types, so a cast
 /// is inserted.
