@@ -3198,7 +3198,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 .into_iter()
                 .map(|byte| format!("{byte}u8"))
                 .collect::<Vec<_>>();
-            return format!("&mut [{}]", elems.join(", "));
+            return format!("Box::leak(Box::new([{}]))", elems.join(", "));
         }
 
         assert!(target_ty.is_numeric());
@@ -3209,7 +3209,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 .into_iter()
                 .map(|byte| format!("{byte}u8 as {target_ty}"))
                 .collect::<Vec<_>>();
-            return format!("&mut [{}]", elems.join(", "));
+            return format!("Box::leak(Box::new([{}]))", elems.join(", "));
         }
 
         self.note_byte_str_slice_cast_dependency(target_ty);
@@ -3219,9 +3219,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             .into_iter()
             .map(|byte| format!("{byte}u8"))
             .collect::<Vec<_>>();
-        let bytes = format!("[{}]", elems.join(", "));
+        let bytes = format!("Box::leak(Box::new([{}]))", elems.join(", "));
         if usable_len == elems.len() as u64 {
-            format!("bytemuck::cast_slice_mut::<_, {target_ty}>(&mut {bytes})")
+            format!("bytemuck::cast_slice_mut::<_, {target_ty}>({bytes})")
         } else {
             format!("bytemuck::cast_slice_mut::<_, {target_ty}>(&mut {bytes}[..{usable_len}])")
         }

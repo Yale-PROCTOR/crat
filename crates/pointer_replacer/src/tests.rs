@@ -8766,10 +8766,11 @@ pub unsafe fn caller() {
         &[
             "fn write_prefix(mut ptr: &mut [i8])",
             "fn takes_const(mut ptr: &mut [i8])",
-            "takes_const(&mut [",
+            "takes_const(Box::leak(Box::new([",
         ],
         &[
             "fn takes_const(mut ptr: &[i8]",
+            "takes_const(&mut [",
             "from_raw_parts_mut((ptr).as_ptr().cast_mut()",
             "b\" \\0\" as *const u8 as *const core::ffi::c_char",
         ],
@@ -8791,11 +8792,35 @@ pub unsafe fn caller() {
         &[
             "fn write_word(mut words: &mut [i32])",
             "bytemuck::cast_slice_mut::<_",
-            "i32>(&mut [97u8, 98u8, 99u8, 100u8])",
+            "i32>(Box::leak(Box::new([",
         ],
         &[
             "&mut [97u8 as i32",
+            "i32>(&mut [97u8, 98u8, 99u8, 100u8])",
             "b\"abcd\" as *const u8 as *const i32 as *mut i32",
+        ],
+    );
+}
+
+#[test]
+fn test_bytestr_mut_slice_param_default_type_checks() {
+    run_typecheck_test_after_shape_check(
+        r#"
+pub unsafe fn first_or_default(mut spec: *mut core::ffi::c_char) -> core::ffi::c_char {
+    if spec.is_null() {
+        spec = b"HEAD\0" as *const u8 as *mut core::ffi::c_char;
+    }
+    *spec.offset(0) = *spec.offset(0);
+    return *spec.offset(0);
+}
+"#,
+        &[
+            "fn first_or_default(mut spec: &mut [i8])",
+            "Box::leak(Box::new([",
+        ],
+        &[
+            "spec = &mut [",
+            "b\"HEAD\\0\" as *const u8 as *mut core::ffi::c_char",
         ],
     );
 }
