@@ -10869,8 +10869,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let need_cast = lhs_inner_ty != rhs_inner_ty;
-        let cast_mut = if m && !m1 { " as *mut _" } else { "" };
+        let cast = self.raw_ptr_cast_suffix(m, m1, lhs_inner_ty, rhs_inner_ty);
         if let Some(name) = method_call_name(e)
             && let name = name.as_str()
             && (name == "as_mut_ptr" || name == "as_ptr")
@@ -10879,50 +10878,25 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             if let Some(slice) = self.plain_slice_from_as_ptr_receiver(e, m, lhs_inner_ty) {
                 return slice;
             }
-            if !need_cast {
-                utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "std::slice::from_raw_parts{}(({}){} as *{} _, {FALLBACK_SLICE_LEN})",
-                    if m { "_mut" } else { "" },
-                    pprust::expr_to_string(e),
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
+            utils::expr!(
+                "std::slice::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
+                if m { "_mut" } else { "" },
+                pprust::expr_to_string(e),
+                cast,
+            )
         } else if !utils::ast::has_side_effects(e) {
-            if !need_cast {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        &{1}[]
-                    }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
-                    }}",
-                    pprust::expr_to_string(e),
-                    if m { "mut " } else { "" },
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        &{1}[]
-                    }} else {{
-                        std::slice::from_raw_parts{2}(({0}){3} as *{4} _, {FALLBACK_SLICE_LEN})
-                    }}",
-                    pprust::expr_to_string(e),
-                    if m { "mut " } else { "" },
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
-        } else if !need_cast {
+            utils::expr!(
+                "if ({0}).is_null() {{
+                    &{1}[]
+                }} else {{
+                    std::slice::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
+                }}",
+                pprust::expr_to_string(e),
+                if m { "mut " } else { "" },
+                if m { "_mut" } else { "" },
+                cast,
+            )
+        } else {
             utils::expr!(
                 "{{
                     let _x = {};
@@ -10935,24 +10909,26 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 pprust::expr_to_string(e),
                 if m { "mut " } else { "" },
                 if m { "_mut" } else { "" },
-                cast_mut,
+                cast,
+            )
+        }
+    }
+
+    fn raw_ptr_cast_suffix(
+        &self,
+        target_mutability: bool,
+        source_mutability: bool,
+        target_inner_ty: ty::Ty<'tcx>,
+        source_inner_ty: ty::Ty<'tcx>,
+    ) -> String {
+        if target_inner_ty != source_inner_ty || target_mutability && !source_mutability {
+            format!(
+                " as *{} {}",
+                if target_mutability { "mut" } else { "const" },
+                self.body_ty_name(target_inner_ty),
             )
         } else {
-            utils::expr!(
-                "{{
-                    let _x = {};
-                    if _x.is_null() {{
-                        &{}[]
-                    }} else {{
-                        std::slice::from_raw_parts{}(_x{} as *{} _, {FALLBACK_SLICE_LEN})
-                    }}
-                }}",
-                pprust::expr_to_string(e),
-                if m { "mut " } else { "" },
-                if m { "_mut" } else { "" },
-                cast_mut,
-                if m { "mut" } else { "const" },
-            )
+            String::new()
         }
     }
 
@@ -11046,8 +11022,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let need_cast = lhs_inner_ty != rhs_inner_ty;
-        let cast_mut = if m && !m1 { " as *mut _" } else { "" };
+        let cast = self.raw_ptr_cast_suffix(m, m1, lhs_inner_ty, rhs_inner_ty);
         let cursor_ty = if m {
             "crate::slice_cursor::SliceCursorMut"
         } else {
@@ -11061,33 +11036,18 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             // we assume that the pointer is not null when such methods are called
             self.cursor_from_raw_parts(e, m, m1, lhs_inner_ty, rhs_inner_ty)
         } else if !utils::ast::has_side_effects(e) {
-            if !need_cast {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        {1}::empty()
-                    }} else {{
-                        {1}::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
-                    }}",
-                    pprust::expr_to_string(e),
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                )
-            } else {
-                utils::expr!(
-                    "if ({0}).is_null() {{
-                        {1}::empty()
-                    }} else {{
-                        {1}::from_raw_parts{2}(({0}){3} as *{4} _, {FALLBACK_SLICE_LEN})
-                    }}",
-                    pprust::expr_to_string(e),
-                    cursor_ty,
-                    if m { "_mut" } else { "" },
-                    cast_mut,
-                    if m { "mut" } else { "const" },
-                )
-            }
-        } else if !need_cast {
+            utils::expr!(
+                "if ({0}).is_null() {{
+                    {1}::empty()
+                }} else {{
+                    {1}::from_raw_parts{2}(({0}){3}, {FALLBACK_SLICE_LEN})
+                }}",
+                pprust::expr_to_string(e),
+                cursor_ty,
+                if m { "_mut" } else { "" },
+                cast,
+            )
+        } else {
             utils::expr!(
                 "{{
                     let _x = {};
@@ -11101,24 +11061,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 cursor_ty,
                 cursor_ty,
                 if m { "_mut" } else { "" },
-                cast_mut,
-            )
-        } else {
-            utils::expr!(
-                "{{
-                    let _x = {};
-                    if _x.is_null() {{
-                        {}::empty()
-                    }} else {{
-                        {}::from_raw_parts{}(_x{} as *{} _, {FALLBACK_SLICE_LEN})
-                    }}
-                }}",
-                pprust::expr_to_string(e),
-                cursor_ty,
-                cursor_ty,
-                if m { "_mut" } else { "" },
-                cast_mut,
-                if m { "mut" } else { "const" },
+                cast,
             )
         }
     }
@@ -11131,32 +11074,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         lhs_inner_ty: ty::Ty<'tcx>,
         rhs_inner_ty: ty::Ty<'tcx>,
     ) -> Expr {
-        let need_cast = lhs_inner_ty != rhs_inner_ty;
-        let cast_mut = if m && !m1 { " as *mut _" } else { "" };
+        let cast = self.raw_ptr_cast_suffix(m, m1, lhs_inner_ty, rhs_inner_ty);
         let cursor_ty = if m {
             "crate::slice_cursor::SliceCursorMut"
         } else {
             "crate::slice_cursor::SliceCursor"
         };
 
-        if !need_cast {
-            utils::expr!(
-                "{}::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
-                cursor_ty,
-                if m { "_mut" } else { "" },
-                pprust::expr_to_string(e),
-                cast_mut,
-            )
-        } else {
-            utils::expr!(
-                "{}::from_raw_parts{}(({}){} as *{} _, {FALLBACK_SLICE_LEN})",
-                cursor_ty,
-                if m { "_mut" } else { "" },
-                pprust::expr_to_string(e),
-                cast_mut,
-                if m { "mut" } else { "const" },
-            )
-        }
+        utils::expr!(
+            "{}::from_raw_parts{}(({}){}, {FALLBACK_SLICE_LEN})",
+            cursor_ty,
+            if m { "_mut" } else { "" },
+            pprust::expr_to_string(e),
+            cast,
+        )
     }
 
     fn cursor_from_raw_offset_chain(

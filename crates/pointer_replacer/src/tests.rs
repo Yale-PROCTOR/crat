@@ -6911,7 +6911,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &["from_raw_parts_mut", "as *mut _", "&mut [i16]"],
+        &["from_raw_parts_mut", "as *mut i16", "&mut [i16]"],
         &["bytemuck"],
     );
 }
@@ -9525,8 +9525,37 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &["from_raw_parts_mut", "as *mut _", "is_null"],
+        &["from_raw_parts_mut", "as *mut i16", "is_null"],
         &["let _x"],
+    );
+}
+
+#[test]
+fn test_sfr_const_void_cast_to_mut_slice_has_typed_pointer_cast() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct GitAttrName {
+    pub name_hash: usize,
+}
+
+pub unsafe extern "C" fn sort_by_hash_and_name(
+    mut a_raw: *const core::ffi::c_void,
+    mut b_raw: *const core::ffi::c_void,
+) -> core::ffi::c_int {
+    let mut a: *mut GitAttrName = a_raw as *mut GitAttrName;
+    let mut b: *mut GitAttrName = b_raw as *mut GitAttrName;
+    if (*b.offset(0)).name_hash < (*a.offset(0)).name_hash {
+        return 1;
+    } else if (*b.offset(0)).name_hash > (*a.offset(0)).name_hash {
+        return -1;
+    }
+    (*a.offset(0)).name_hash = (*b.offset(0)).name_hash;
+    return 0;
+}
+"#,
+        &["from_raw_parts_mut", "as *mut crate::GitAttrName"],
+        &["as *mut _ as *mut _"],
     );
 }
 
@@ -9573,7 +9602,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     return *q.offset(0 as isize) as libc::c_int;
 }
 "#,
-        &["let _x", "from_raw_parts_mut", "as *mut _"],
+        &["let _x", "from_raw_parts_mut", "as *mut i16"],
         &[],
     );
 }
@@ -18616,7 +18645,7 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
             "fn write_window(mut words: &mut [i32], idx: usize)",
             "let cursor: *const i32 = words;",
             "write_window(if (cursor).is_null()",
-            "std::slice::from_raw_parts_mut((cursor) as *mut _,",
+            "std::slice::from_raw_parts_mut((cursor) as *mut i32,",
             ::utils::FALLBACK_SLICE_LEN,
         ],
         &[
