@@ -58,7 +58,7 @@ pub fn library_call<'tcx>(
     if let [
         DefPathData::TypeNs(slice),
         _,
-        DefPathData::ValueNs(as_mut_ptr),
+        DefPathData::ValueNs(as_ptr),
         ..,
     ] = &def_path
         .data
@@ -66,17 +66,32 @@ pub fn library_call<'tcx>(
         .map(|data| data.data)
         .collect::<smallvec::SmallVec<[_; 4]>>()[..]
         && slice.as_str() == "slice"
-        && as_mut_ptr.as_str() == "as_mut_ptr"
     {
-        return call_as_mut_ptr(
-            destination,
-            args,
-            local_decls,
-            locals,
-            struct_fields,
-            tcx,
-            database,
-        );
+        match as_ptr.as_str() {
+            "as_ptr" => {
+                return call_as_ptr(
+                    destination,
+                    args,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                );
+            }
+            "as_mut_ptr" => {
+                return call_as_mut_ptr(
+                    destination,
+                    args,
+                    local_decls,
+                    locals,
+                    struct_fields,
+                    tcx,
+                    database,
+                );
+            }
+            _ => {}
+        }
     }
 
     let def_path_str = tcx.def_path_str(callee);
@@ -116,7 +131,7 @@ pub fn library_call<'tcx>(
                         database,
                     );
                 }
-                "offset" => {
+                "add" | "offset" => {
                     return call_offset(
                         destination,
                         args,
@@ -258,6 +273,38 @@ fn call_as_mut_ptr<'tcx>(
 
         if let Some((dest, arg)) = dest_arg.next() {
             database.guard(dest, arg)
+        }
+        for (dest, arg) in dest_arg {
+            database.guard(arg, dest);
+            database.guard(dest, arg);
+        }
+    }
+}
+
+fn call_as_ptr<'tcx>(
+    destination: &Place<'tcx>,
+    args: &[Spanned<Operand<'tcx>>],
+    local_decls: &impl HasLocalDecls<'tcx>,
+    locals: &[Var],
+    struct_fields: &StructFields,
+    tcx: TyCtxt<'tcx>,
+    database: &mut BooleanSystem<Mutability>,
+) {
+    let dest_vars = place_vars::<MutCtxt>(
+        destination,
+        local_decls,
+        locals,
+        struct_fields,
+        tcx,
+        database,
+    );
+    if let Some(arg) = args[0].node.place() {
+        let arg_vars =
+            place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
+        let mut dest_arg = dest_vars.zip(arg_vars);
+
+        if let Some((dest, _)) = dest_arg.next() {
+            database.top(dest)
         }
         for (dest, arg) in dest_arg {
             database.guard(arg, dest);

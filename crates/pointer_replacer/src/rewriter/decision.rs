@@ -6,7 +6,7 @@ use rustc_hir::{
 };
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
-    mir::{Local, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind},
+    mir::{Body, Local, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::{self, TyCtxt},
 };
 use rustc_span::{Symbol, def_id::LocalDefId};
@@ -16,7 +16,10 @@ use super::{
     collector::collect_fn_ptrs,
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
-use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
+use crate::{
+    analyses::{mir_variable_grouping::group_locals_by_source_variable, ownership::Ownership},
+    utils::rustc::RustProgram,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
@@ -93,8 +96,8 @@ pub struct DecisionMaker<'tcx> {
     array_pointers: IndexVec<Local, bool>,
     _owning_pointers: IndexVec<Local, bool>,
     _output_params: DenseBitSet<Local>,
-    promoted_mut_refs: DenseBitSet<Local>,
-    promoted_shared_refs: DenseBitSet<Local>,
+    promoted_refs: DenseBitSet<Local>,
+    offset_from_receivers: DenseBitSet<Local>,
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
     non_null_locals: DenseBitSet<Local>,
@@ -118,9 +121,10 @@ impl<'tcx> DecisionMaker<'tcx> {
     fn preserve_original_pointer_constness(
         &self,
         decision: Option<PtrKind>,
-        is_mut: bool,
+        original_is_mut: bool,
+        analysis_requires_mut: bool,
     ) -> Option<PtrKind> {
-        if is_mut {
+        if original_is_mut || analysis_requires_mut {
             return decision;
         }
         match decision {
@@ -144,12 +148,9 @@ impl<'tcx> DecisionMaker<'tcx> {
             .function_body_facts(did)
             .map(|fatnesses| fatnesses.iter().next().map(|f| f.is_arr()).unwrap_or(false))
             .collect::<IndexVec<Local, _>>();
-        let promoted_mut_refs = analysis.promoted_mut_ref_result.get(&did).unwrap().clone();
-        let promoted_shared_refs = analysis
-            .promoted_shared_ref_result
-            .get(&did)
-            .unwrap()
-            .clone();
+        let promoted_refs = analysis.promoted_ref_result.get(&did).unwrap().clone();
+        let body = &*tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+        let offset_from_receivers = offset_from_receiver_locals(tcx, body);
         let _owning_pointers = if let Some(ownership_schemes) = analysis.ownership_schemes.as_ref()
         {
             let fn_results = ownership_schemes.fn_results(&did.to_def_id());
@@ -190,8 +191,8 @@ impl<'tcx> DecisionMaker<'tcx> {
             mutable_pointers,
             _owning_pointers,
             _output_params,
-            promoted_mut_refs,
-            promoted_shared_refs,
+            promoted_refs,
+            offset_from_receivers,
             needs_cursor,
             non_null_locals,
         }
@@ -278,30 +279,23 @@ impl<'tcx> DecisionMaker<'tcx> {
                 } else {
                     (Some(PtrKind::OptBox), DecisionReason::OwningScalarBox)
                 }
+            } else if self.offset_from_receivers.contains(local) {
+                (
+                    Some(PtrKind::Raw(self.mutable_pointers[local])),
+                    DecisionReason::RawPtrNotBorrowPromoted,
+                )
             } else if self.array_pointers[local] {
-                if self.promoted_shared_refs.contains(local) {
-                    if self.needs_cursor.contains(local) {
-                        (
-                            Some(PtrKind::SliceCursor(false)),
-                            DecisionReason::ArrayBorrowPromotedShared,
-                        )
+                if self.promoted_refs.contains(local) {
+                    let is_mutable = self.mutable_pointers[local];
+                    let reason = if is_mutable {
+                        DecisionReason::ArrayBorrowPromotedMut
                     } else {
-                        (
-                            Some(PtrKind::Slice(false)),
-                            DecisionReason::ArrayBorrowPromotedShared,
-                        )
-                    }
-                } else if self.promoted_mut_refs.contains(local) {
+                        DecisionReason::ArrayBorrowPromotedShared
+                    };
                     if self.needs_cursor.contains(local) {
-                        (
-                            Some(PtrKind::SliceCursor(true)),
-                            DecisionReason::ArrayBorrowPromotedMut,
-                        )
+                        (Some(PtrKind::SliceCursor(is_mutable)), reason)
                     } else {
-                        (
-                            Some(PtrKind::Slice(true)),
-                            DecisionReason::ArrayBorrowPromotedMut,
-                        )
+                        (Some(PtrKind::Slice(is_mutable)), reason)
                     }
                 } else {
                     (
@@ -309,16 +303,14 @@ impl<'tcx> DecisionMaker<'tcx> {
                         DecisionReason::RawPtrNotBorrowPromoted,
                     )
                 }
-            } else if self.promoted_shared_refs.contains(local) {
-                (
-                    Some(PtrKind::OptRef(false)),
-                    DecisionReason::BorrowPromotedShared,
-                )
-            } else if self.promoted_mut_refs.contains(local) {
-                (
-                    Some(PtrKind::OptRef(true)),
-                    DecisionReason::BorrowPromotedMut,
-                )
+            } else if self.promoted_refs.contains(local) {
+                let is_mutable = self.mutable_pointers[local];
+                let reason = if is_mutable {
+                    DecisionReason::BorrowPromotedMut
+                } else {
+                    DecisionReason::BorrowPromotedShared
+                };
+                (Some(PtrKind::OptRef(is_mutable)), reason)
             } else if decl.ty.is_raw_ptr() {
                 (
                     Some(PtrKind::Raw(self.mutable_pointers[local])),
@@ -347,7 +339,12 @@ impl<'tcx> DecisionMaker<'tcx> {
             }
         }
 
-        let const_preserved = self.preserve_original_pointer_constness(decision, m.is_mut());
+        let analysis_requires_mut = matches!(
+            reason,
+            DecisionReason::ArrayBorrowPromotedMut | DecisionReason::BorrowPromotedMut
+        ) && self.mutable_pointers[local];
+        let const_preserved =
+            self.preserve_original_pointer_constness(decision, m.is_mut(), analysis_requires_mut);
         if const_preserved != decision {
             events.push(DecisionInfoEvent {
                 before: decision,
@@ -382,6 +379,45 @@ pub(crate) fn pointee_forces_raw<'tcx>(
     pointee: ty::Ty<'tcx>,
 ) -> bool {
     matches!(pointee.kind(), ty::TyKind::Foreign(_)) || !pointee.is_sized(tcx, typing_env)
+}
+
+fn offset_from_receiver_locals<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> DenseBitSet<Local> {
+    let mut receivers = DenseBitSet::new_empty(body.local_decls.len());
+    for block in body.basic_blocks.iter() {
+        let Some(terminator) = &block.terminator else {
+            continue;
+        };
+        let (func, args) = match &terminator.kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        let Some(func) = func.constant() else {
+            continue;
+        };
+        let ty::TyKind::FnDef(def_id, _) = *func.ty().kind() else {
+            continue;
+        };
+        let def_path = tcx.def_path_str(def_id);
+        if !def_path.ends_with("::offset_from") && !def_path.ends_with("::ptr_offset_from") {
+            continue;
+        }
+        let Some(receiver) = args.first().and_then(|arg| arg.node.place()) else {
+            continue;
+        };
+        if receiver.local.index() > body.arg_count {
+            receivers.insert(receiver.local);
+        }
+    }
+    let groups = group_locals_by_source_variable(body, tcx);
+    for locals in groups.values() {
+        if locals.iter().any(|&local| receivers.contains(local)) {
+            for &local in locals {
+                receivers.insert(local);
+            }
+        }
+    }
+    receivers
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -430,6 +466,13 @@ pub(crate) fn decision_carries_lifetime(decision: Option<PtrKind>) -> bool {
         decision,
         Some(PtrKind::Ref(_) | PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_))
     )
+}
+
+fn ref_decision_mutability(decision: Option<PtrKind>) -> Option<bool> {
+    match decision {
+        Some(PtrKind::Ref(is_mut) | PtrKind::OptRef(is_mut)) => Some(is_mut),
+        _ => None,
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -654,30 +697,21 @@ fn apply_return_borrow_lifetime_plan<'tcx>(
         return;
     };
     let return_local = Local::from_u32(0);
-    let Some((_, output_mutability)) =
-        super::transform::unwrap_ptr_from_mir_ty(body.local_decls[return_local].ty)
-    else {
+    if super::transform::unwrap_ptr_from_mir_ty(body.local_decls[return_local].ty).is_none() {
         return;
-    };
+    }
 
     let mut returned_inputs = Vec::new();
     for (idx, lifetime) in lifetime_plan.input_lifetimes.iter().enumerate() {
         if *lifetime != Some(output_lifetime) {
             continue;
         }
-        if !matches!(
-            sig_dec.input_decs.get(idx).copied().flatten(),
-            Some(PtrKind::Ref(_) | PtrKind::OptRef(_))
-        ) {
-            return;
-        }
-        let local = Local::from_usize(idx + 1);
-        let Some((_, input_mutability)) =
-            super::transform::unwrap_ptr_from_mir_ty(body.local_decls[local].ty)
+        let Some(input_mutability) =
+            ref_decision_mutability(sig_dec.input_decs.get(idx).copied().flatten())
         else {
             return;
         };
-        returned_inputs.push((idx, input_mutability.is_mut()));
+        returned_inputs.push((idx, input_mutability));
     }
     if returned_inputs.is_empty() {
         return;
@@ -685,10 +719,13 @@ fn apply_return_borrow_lifetime_plan<'tcx>(
 
     let return_nullable =
         return_place_may_receive_null_constructor(body, decision_maker.tcx, return_local);
+    let output_mutability = returned_inputs
+        .iter()
+        .all(|(_, input_mutability)| *input_mutability);
     let return_kind = if return_nullable {
-        PtrKind::OptRef(output_mutability.is_mut())
+        PtrKind::OptRef(output_mutability)
     } else {
-        PtrKind::Ref(output_mutability.is_mut())
+        PtrKind::Ref(output_mutability)
     };
     if return_nullable && let Some(diagnostics) = diagnostics.as_deref_mut() {
         diagnostics.record(
@@ -1121,13 +1158,9 @@ mod tests {
         if output {
             output_params.insert(local);
         }
-        let mut promoted_mut_refs = DenseBitSet::new_empty(len);
-        if promoted_mut {
-            promoted_mut_refs.insert(local);
-        }
-        let mut promoted_shared_refs = DenseBitSet::new_empty(len);
-        if promoted_shared {
-            promoted_shared_refs.insert(local);
+        let mut promoted_refs = DenseBitSet::new_empty(len);
+        if promoted_mut || promoted_shared {
+            promoted_refs.insert(local);
         }
         let mut needs_cursor_set = DenseBitSet::new_empty(len);
         if needs_cursor {
@@ -1145,8 +1178,8 @@ mod tests {
             array_pointers,
             _owning_pointers: owning_pointers,
             _output_params: output_params,
-            promoted_mut_refs,
-            promoted_shared_refs,
+            promoted_refs,
+            offset_from_receivers: DenseBitSet::new_empty(len),
             needs_cursor: needs_cursor_set,
             non_null_locals,
         }
@@ -1324,10 +1357,10 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
-    fn const_scalar_pointer_does_not_become_mut_opt_ref() {
+    fn const_scalar_pointer_uses_mutability_analysis_for_opt_ref() {
         assert_eq!(
             decide_for_param_with_ty("*const i32", false, false, false, false, true, false, true),
-            PtrKind::OptRef(false)
+            PtrKind::OptRef(true)
         );
     }
 
@@ -1351,7 +1384,7 @@ pub unsafe fn foo(p: {pointer_ty}) {{
                 true,
                 true,
             ),
-            PtrKind::Ref(false)
+            PtrKind::Ref(true)
         );
     }
 
@@ -1372,10 +1405,50 @@ pub unsafe fn foo(p: {pointer_ty}) {{
     }
 
     #[test]
-    fn const_array_pointer_does_not_become_mut_slice() {
+    fn const_array_pointer_uses_mutability_analysis_for_slice() {
         assert_eq!(
             decide_for_param_with_ty("*const i32", false, false, true, false, true, false, true),
+            PtrKind::Slice(true)
+        );
+    }
+
+    #[test]
+    fn mut_promoted_scalar_uses_shared_mutability_analysis_for_opt_ref() {
+        assert_eq!(
+            decide_for_param_with_ty("*mut i32", false, false, false, false, true, false, false),
+            PtrKind::OptRef(false)
+        );
+    }
+
+    #[test]
+    fn mut_promoted_array_uses_shared_mutability_analysis_for_slice() {
+        assert_eq!(
+            decide_for_param_with_ty("*mut i32", false, false, true, false, true, false, false),
             PtrKind::Slice(false)
+        );
+    }
+
+    #[test]
+    fn shared_promoted_const_scalar_uses_mutability_analysis_for_opt_ref() {
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, false, false, false, true, true),
+            PtrKind::OptRef(true)
+        );
+    }
+
+    #[test]
+    fn shared_promoted_const_array_uses_mutability_analysis_for_slice() {
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, true, false, false, true, true),
+            PtrKind::Slice(true)
+        );
+    }
+
+    #[test]
+    fn shared_promoted_const_array_uses_mutability_analysis_for_cursor() {
+        assert_eq!(
+            decide_for_param_with_ty("*const i32", false, false, true, true, false, true, true),
+            PtrKind::SliceCursor(true)
         );
     }
 
@@ -1404,7 +1477,7 @@ pub unsafe fn foo(p: *mut i32, q: *mut i32) {
     }
 
     #[test]
-    fn decide_with_info_records_constness_adjustment() {
+    fn decide_with_info_keeps_mutable_decision_for_const_pointer() {
         let mut events = Vec::new();
         let code = r#"
 pub unsafe fn foo(p: *const i32) {
@@ -1421,11 +1494,59 @@ pub unsafe fn foo(p: *const i32) {
         });
         assert_eq!(
             events.iter().map(|event| event.reason).collect::<Vec<_>>(),
-            vec![
-                DecisionReason::BorrowPromotedMut,
-                DecisionReason::PreserveOriginalConstness,
-            ],
+            vec![DecisionReason::BorrowPromotedMut],
         );
+    }
+
+    #[test]
+    fn return_lifetime_plan_preserves_promoted_mutability_for_const_input_and_return() {
+        let lifetime = Symbol::new(1);
+        let code = r#"
+pub unsafe fn foo(p: *const i32) -> *const i32 {
+    p
+}
+"#;
+        with_test_fn_body(code, |tcx, did, body| {
+            let mut decision_maker = synthetic_decision_maker_with_non_null(
+                tcx,
+                body,
+                Local::from_u32(1),
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
+            decision_maker.mutable_pointers[Local::from_u32(0)] = true;
+            let lifetime_plan = crate::rewriter::lifetimes::FnLifetimePlan {
+                input_lifetimes: vec![Some(lifetime)],
+                output_lifetime: Some(lifetime),
+            };
+            let mut sig_dec = SigDecision {
+                input_decs: vec![Some(PtrKind::OptRef(true))],
+                input_lifetimes: vec![None],
+                output_dec: Some(PtrKind::OptRef(true)),
+                output_lifetime: Some(lifetime),
+                signature_locked: false,
+            };
+
+            apply_return_borrow_lifetime_plan(
+                did,
+                body,
+                &lifetime_plan,
+                &decision_maker,
+                &mut sig_dec,
+                None,
+            );
+
+            assert_eq!(sig_dec.input_decs, vec![Some(PtrKind::Ref(true))]);
+            assert_eq!(sig_dec.output_dec, Some(PtrKind::Ref(true)));
+            assert_eq!(sig_dec.input_lifetimes, vec![Some(lifetime)]);
+            assert_eq!(sig_dec.output_lifetime, Some(lifetime));
+        });
     }
 
     #[test]

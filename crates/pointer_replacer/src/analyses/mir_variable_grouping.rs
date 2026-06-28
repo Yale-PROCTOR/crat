@@ -40,14 +40,14 @@ impl SourceVarGroups {
         Self { inner }
     }
 
-    pub fn postprocess_promoted_mut_refs(
+    pub fn postprocess_promoted_refs(
         &self,
-        promoted_mut_refs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+        promoted_refs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
     ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
         // a Local is promoted if all locals in its source variable group are promoted
         // otherwise its promotion is removed
         let mut result = FxHashMap::default();
-        for (did, promoted) in promoted_mut_refs {
+        for (did, promoted) in promoted_refs {
             let promoted = if let Some(groups) = self.inner.get(&did) {
                 let mut new_promoted = DenseBitSet::new_empty(promoted.domain_size());
                 for locals in groups.values() {
@@ -65,6 +65,13 @@ impl SourceVarGroups {
             result.insert(did, promoted);
         }
         result
+    }
+
+    pub fn postprocess_promoted_mut_refs(
+        &self,
+        promoted_mut_refs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    ) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+        self.postprocess_promoted_refs(promoted_mut_refs)
     }
 
     pub fn postprocess_mut_res(
@@ -141,7 +148,7 @@ impl SourceVarGroups {
     }
 }
 
-fn group_locals_by_source_variable<'tcx>(
+pub(crate) fn group_locals_by_source_variable<'tcx>(
     body: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> FxHashMap<Local, Vec<Local>> {

@@ -2264,11 +2264,11 @@ pub unsafe fn touch(mut x: i32) -> i32 {
         &[
             "pub struct Holder<'a>",
             "pub p: Option<&'a i32>",
-            "pub unsafe fn id_holder<'a, 'b>(h: &'a mut crate::Holder<'b>)",
-            "-> &'a mut crate::Holder<'b>",
+            "pub unsafe fn id_holder<'a, 'b>(h: &'a crate::Holder<'b>)",
+            "-> &'a crate::Holder<'b>",
             "Holder { p: Some(&x) }",
         ],
-        &["pub p: *const i32", "*(*r).p"],
+        &["pub p: *const i32", "*(*r).p", "&'a mut crate::Holder"],
     );
 }
 
@@ -3547,8 +3547,8 @@ pub unsafe fn make(mut x: i32) -> Holder {
         &[
             "pub struct Holder {",
             "pub p: *mut i32",
-            "pub unsafe fn id<'a>(p: &'a mut i32) -> *mut i32",
-            "Holder { p: id((Some(&mut x)).unwrap()) }",
+            "pub unsafe fn id<'a>(p: &'a i32) -> *const i32",
+            "Holder { p: id((Some(&x)).unwrap()) as *mut i32 }",
         ],
         &["Holder<'_", "-> &'a mut i32", "Option<&'a mut i32>"],
     );
@@ -4415,11 +4415,8 @@ pub unsafe fn id(x: *mut i32) -> *mut i32 {
     return x;
 }
 "#,
-        &[
-            "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32",
-            "return x;",
-        ],
-        &["-> *mut i32", "Option<&'a mut i32>"],
+        &["pub unsafe fn id<'a>(x: &'a i32) -> &'a i32", "return x;"],
+        &["-> *mut i32", "Option<&'a mut i32>", "&'a mut i32"],
     );
 }
 
@@ -4432,10 +4429,10 @@ pub unsafe extern "C" fn id(x: *mut i32) -> *mut i32 {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn id<'a>(x: &'a mut i32) -> &'a mut i32",
+            "pub unsafe extern \"C\" fn id<'a>(x: &'a i32) -> &'a i32",
             "return x;",
         ],
-        &["-> *mut i32", "Option<&'a mut i32>"],
+        &["-> *mut i32", "Option<&'a mut i32>", "&'a mut i32"],
     );
 }
 
@@ -4452,11 +4449,11 @@ pub unsafe fn wrap(y: *mut i32) -> *mut i32 {
 }
 "#,
         &[
-            "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32",
-            "pub unsafe fn wrap<'a>(y: &'a mut i32) -> &'a mut i32",
+            "pub unsafe fn id<'a>(x: &'a i32) -> &'a i32",
+            "pub unsafe fn wrap<'a>(y: &'a i32) -> &'a i32",
             "id(y)",
         ],
-        &["-> *mut i32", "id((y) as *mut"],
+        &["-> *mut i32", "id((y) as *mut", "&'a mut i32"],
     );
 }
 
@@ -4506,11 +4503,11 @@ pub unsafe fn maybe_zero(flag: bool, x: *mut i32) -> *mut i32 {
 }
 "#,
         &[
-            "pub unsafe fn maybe_zero<'a>(flag: bool, mut x: Option<&'a mut i32>)",
-            "-> Option<&'a mut i32>",
+            "pub unsafe fn maybe_zero<'a>(flag: bool, x: Option<&'a i32>)",
+            "-> Option<&'a i32>",
             "if flag { x } else { None }",
         ],
-        &["-> &'a mut i32", "panic!()"],
+        &["-> &'a mut i32", "Option<&'a mut i32>", "panic!()"],
     );
 }
 
@@ -4524,12 +4521,12 @@ pub unsafe fn pick(x: *mut i32, y: *mut i32) -> *mut i32 {
 }
 "#,
         &[
-            "mut x: Option<&'a mut i32>",
+            "x: Option<&'a i32>",
             "y: &'a mut i32",
-            "-> &'a mut i32",
+            "-> &'a i32",
             "if x.is_none()",
         ],
-        &["x: &'a mut i32", "if false"],
+        &["mut x: Option<&'a mut i32>", "x: &'a mut i32", "if false"],
     );
 }
 
@@ -12021,7 +12018,7 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
 }
 
 /// Return type mutability: function returns a pointer that is never written through,
-/// so the return type should become *const.
+/// so the promoted reference should be shared.
 #[test]
 fn test_return_type_mutability() {
     run_test(
@@ -12032,10 +12029,10 @@ pub unsafe extern "C" fn foo(mut x: *mut libc::c_int) -> *mut libc::c_int {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a mut i32)",
-            "-> &'a mut i32",
+            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a i32)",
+            "-> &'a i32",
         ],
-        &["-> *mut libc::c_int", "*const"],
+        &["-> *mut libc::c_int", "&'a mut i32"],
     );
 }
 
@@ -12057,13 +12054,14 @@ pub unsafe extern "C" fn bar() {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a mut i32)",
-            "-> &'a mut i32",
-            "*q = (foo((Some(&mut x)).unwrap())) as *mut i32;",
+            "pub unsafe extern \"C\" fn foo<'a>(mut x: &'a i32)",
+            "-> &'a i32",
+            "*q = (foo((Some(&x)).unwrap())) as *const i32 as *mut i32;",
         ],
         &[
             "pub unsafe extern \"C\" fn foo(mut x: *mut libc::c_int)",
             "-> *mut libc::c_int",
+            "&'a mut i32",
         ],
     );
 }
@@ -18258,11 +18256,13 @@ pub unsafe extern "C" fn dispatch(mut words: *const i32, idx: usize) -> i32 {
 "#,
         &[
             "fn write_word(mut words: &mut [i32], idx: usize)",
-            "fn dispatch(mut words: &[i32], idx: usize) -> i32",
-            "write_word(if (words).is_empty()",
-            "std::slice::from_raw_parts_mut((words).as_ptr().cast_mut()",
+            "fn dispatch(mut words: &mut [i32], idx: usize) -> i32",
+            "write_word((words), idx)",
         ],
-        &["write_word((words), idx)"],
+        &[
+            "fn dispatch(mut words: &[i32]",
+            "from_raw_parts_mut((words).as_ptr().cast_mut()",
+        ],
     );
 }
 
@@ -18283,11 +18283,66 @@ pub unsafe extern "C" fn dispatch(mut slots: *const i16, idx: usize) -> i16 {
 "#,
         &[
             "fn write_slot(mut slots: &mut [i16], idx: usize)",
-            "let local: &[i16]",
-            "write_slot(if (local).is_empty()",
-            "std::slice::from_raw_parts_mut((local).as_ptr().cast_mut()",
+            "fn dispatch(mut slots: &mut [i16], idx: usize) -> i16",
+            "let mut local: &mut [i16]",
+            "write_slot((local), idx)",
         ],
-        &["write_slot((local), idx)", "write_slot(((local"],
+        &[
+            "let local: &[i16]",
+            "from_raw_parts_mut((local).as_ptr().cast_mut()",
+            "write_slot(((local",
+        ],
+    );
+}
+
+#[test]
+fn test_libgit2_commit_dup_const_arg_to_mut_slice() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Commit {
+    pub value: i32,
+}
+
+pub unsafe fn git_commit_dup(mut out: *mut *mut Commit, mut obj: *mut Commit) -> i32 {
+    if out.is_null() || obj.is_null() {
+        return -1;
+    }
+    (*obj.offset(0)).value += 1;
+    *out.offset(0) = obj;
+    return 0;
+}
+
+pub unsafe extern "C" fn git_commit_nth_gen_ancestor(
+    mut ancestor: *mut *mut Commit,
+    mut commit: *const Commit,
+) -> i32 {
+    let mut current: *mut Commit = 0 as *mut Commit;
+    if ancestor.is_null() {
+        return -1;
+    }
+    if commit.is_null() {
+        return -1;
+    }
+    if git_commit_dup(&mut current, commit as *mut Commit) < 0 {
+        return -1;
+    }
+    *ancestor.offset(0) = current;
+    return 0;
+}
+"#,
+        &[
+            "fn git_commit_dup(mut out: &mut [*mut crate::Commit]",
+            "mut obj: &mut [crate::Commit])",
+            "fn git_commit_nth_gen_ancestor(mut ancestor:",
+            "mut commit: &mut [crate::Commit])",
+            "git_commit_dup(std::slice::from_raw_parts_mut(&raw mut (current)",
+            ", (commit))",
+        ],
+        &[
+            "mut commit: &[crate::Commit]",
+            "from_raw_parts_mut((commit).as_ptr().cast_mut()",
+        ],
     );
 }
 

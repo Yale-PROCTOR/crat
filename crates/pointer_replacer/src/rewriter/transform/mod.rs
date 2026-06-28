@@ -24867,10 +24867,8 @@ mod tests {
         let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
         let struct_copy_result =
             analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
-        let promoted_mut_ref_result = source_var_groups
-            .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
-        let promoted_shared_ref_result = source_var_groups
-            .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
+        let promoted_ref_result =
+            source_var_groups.postprocess_promoted_refs(borrow_promotion_result.promoted_locals());
         let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
         let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
         offset_sign_result.access_signs =
@@ -24881,8 +24879,7 @@ mod tests {
         let analysis = super::super::Analysis {
             borrow_promotion_result,
             borrow_lifetime_flows,
-            promoted_mut_ref_result,
-            promoted_shared_ref_result,
+            promoted_ref_result,
             mutability_result,
             fatness_result,
             aliases,
@@ -26666,7 +26663,7 @@ pub unsafe fn anchored_array_cursor() -> i32 {
 "#,
         );
 
-        assert_binding_slice_cursor(&rewritten, "anchored_array_cursor", "q", true);
+        assert_binding_slice_cursor(&rewritten, "anchored_array_cursor", "q", false);
     }
 
     #[test]

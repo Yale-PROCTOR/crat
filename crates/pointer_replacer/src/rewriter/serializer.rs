@@ -42,8 +42,7 @@ pub struct DefIdKey(pub u32, pub u32);
 pub struct SerializableAnalysis {
     pub borrow_promotion_result: SerializableBorrowPromotionResults,
     pub borrow_lifetime_flows: SerializableLifetimeFlowResults,
-    pub promoted_mut_ref_result: SerializableLocalDenseBitSetMap,
-    pub promoted_shared_ref_result: SerializableLocalDenseBitSetMap,
+    pub promoted_ref_result: SerializableLocalDenseBitSetMap,
     pub mutability_result: SerializableLocalTypeQualifiers<SerializableMutability>,
     pub fatness_result: SerializableLocalTypeQualifiers<SerializableFatness>,
     pub aliases: SerializableAliases,
@@ -214,12 +213,7 @@ pub fn serialize_analysis(analysis: &Analysis) -> SerializableAnalysis {
             &analysis.borrow_promotion_result,
         ),
         borrow_lifetime_flows: serialize_lifetime_flow_results(&analysis.borrow_lifetime_flows),
-        promoted_mut_ref_result: serialize_local_dense_bit_set_map(
-            &analysis.promoted_mut_ref_result,
-        ),
-        promoted_shared_ref_result: serialize_local_dense_bit_set_map(
-            &analysis.promoted_shared_ref_result,
-        ),
+        promoted_ref_result: serialize_local_dense_bit_set_map(&analysis.promoted_ref_result),
         mutability_result: serialize_foster_type_qualifiers(
             &analysis.mutability_result,
             SerializableMutability::from,
@@ -260,12 +254,7 @@ pub fn deserialize_analysis(serialized: SerializableAnalysis) -> Analysis {
             serialized.borrow_promotion_result,
         ),
         borrow_lifetime_flows: deserialize_lifetime_flow_results(serialized.borrow_lifetime_flows),
-        promoted_mut_ref_result: deserialize_local_dense_bit_set_map(
-            serialized.promoted_mut_ref_result,
-        ),
-        promoted_shared_ref_result: deserialize_local_dense_bit_set_map(
-            serialized.promoted_shared_ref_result,
-        ),
+        promoted_ref_result: deserialize_local_dense_bit_set_map(serialized.promoted_ref_result),
         mutability_result: deserialize_foster_type_qualifiers(
             serialized.mutability_result,
             Mutability::from,

@@ -66,6 +66,21 @@ pub struct BorrowPromotionResults {
     pub lifetime_flows: LifetimeFlowResults,
 }
 
+impl BorrowPromotionResults {
+    pub fn promoted_locals(&self) -> FxHashMap<LocalDefId, DenseBitSet<Local>> {
+        let mut promoted = self.mutable_locals.clone();
+        for (&did, shared) in &self.shared_locals {
+            promoted
+                .entry(did)
+                .and_modify(|locals| {
+                    locals.union(shared);
+                })
+                .or_insert_with(|| shared.clone());
+        }
+        promoted
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StructFieldSlot {
     pub struct_did: LocalDefId,

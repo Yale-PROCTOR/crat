@@ -2740,10 +2740,8 @@ mod tests {
                 &input,
                 &borrow_promotion_result.mutable_fields,
             );
-            let promoted_mut_ref_result = source_var_groups
-                .postprocess_promoted_mut_refs(borrow_promotion_result.mutable_locals.clone());
-            let promoted_shared_ref_result = source_var_groups
-                .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
+            let promoted_ref_result = source_var_groups
+                .postprocess_promoted_refs(borrow_promotion_result.promoted_locals());
             let fatness_result =
                 crate::analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
             let mut offset_sign_result =
@@ -2756,8 +2754,7 @@ mod tests {
             let analysis = crate::rewriter::Analysis {
                 borrow_promotion_result,
                 borrow_lifetime_flows,
-                promoted_mut_ref_result,
-                promoted_shared_ref_result,
+                promoted_ref_result,
                 mutability_result,
                 fatness_result,
                 aliases,
