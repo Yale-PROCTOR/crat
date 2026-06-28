@@ -214,9 +214,9 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 else {
                     return;
                 };
-                let lhs_ref = lhs.next().unwrap();
+                let _lhs_ref = lhs.next().unwrap();
                 let Some(rhs) = try_place_vars(rhs, local_decls, locals, struct_fields, tcx) else {
-                    database.top(lhs_ref);
+                    // database.top(lhs_ref);
                     return;
                 };
                 for (lhs, rhs) in lhs.zip(rhs) {
@@ -397,10 +397,10 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
     }
 }
 
-fn make_ptr(vars: Range<Var>, database: &mut BooleanSystem<Fatness>) {
-    for var in vars {
-        database.top(var);
-    }
+fn make_ptr(_vars: Range<Var>, _database: &mut BooleanSystem<Fatness>) {
+    // for var in vars {
+    //     database.top(var);
+    // }
 }
 
 fn place_vars<'tcx>(

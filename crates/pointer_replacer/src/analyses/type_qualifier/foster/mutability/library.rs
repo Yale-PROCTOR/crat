@@ -303,8 +303,8 @@ fn call_as_ptr<'tcx>(
             place_vars::<EnsureNoDeref>(&arg, local_decls, locals, struct_fields, tcx, &mut ());
         let mut dest_arg = dest_vars.zip(arg_vars);
 
-        if let Some((dest, _)) = dest_arg.next() {
-            database.top(dest)
+        if let Some((_dest, _)) = dest_arg.next() {
+            // database.top(dest)
         }
         for (dest, arg) in dest_arg {
             database.guard(arg, dest);
