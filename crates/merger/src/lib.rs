@@ -98,14 +98,10 @@ pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String>
     clean_output_dir(&output_dir)?;
 
     let cargo_toml = shared_required_file(&translations, "Cargo.toml")?;
-    let build_rs = shared_optional_file(&translations, "build.rs")?;
     let toolchain = shared_toolchain_file(&translations)?;
 
     write_shared_file(&output_dir, &cargo_toml)?;
     add_features_to_cargo_toml(&output_dir.join("Cargo.toml"), feature_union(&translations))?;
-    if let Some(file) = build_rs.as_ref() {
-        write_shared_file(&output_dir, file)?;
-    }
     if let Some(file) = toolchain.as_ref() {
         write_shared_file(&output_dir, file)?;
     }
@@ -301,32 +297,6 @@ fn shared_required_file(
     })
 }
 
-fn shared_optional_file(
-    translations: &[Translation],
-    name: &'static str,
-) -> Result<Option<SharedFile>, String> {
-    let first_path = translations[0].dir.join(name);
-    let first_contents = if first_path.exists() {
-        Some(fs::read(&first_path).map_err(|e| format!("failed to read {first_path:?}: {e}"))?)
-    } else {
-        None
-    };
-
-    for translation in &translations[1..] {
-        let path = translation.dir.join(name);
-        let contents = if path.exists() {
-            Some(fs::read(&path).map_err(|e| format!("failed to read {path:?}: {e}"))?)
-        } else {
-            None
-        };
-        if contents != first_contents {
-            return Err(format!("{name} differs across translation directories"));
-        }
-    }
-
-    Ok(first_contents.map(|contents| SharedFile { name, contents }))
-}
-
 fn shared_toolchain_file(translations: &[Translation]) -> Result<Option<SharedFile>, String> {
     let first = detect_toolchain_file(&translations[0].dir)?;
     for translation in &translations[1..] {
@@ -462,7 +432,7 @@ fn collect_rs_files(dir: &Path, root: &Path, files: &mut Vec<PathBuf>) -> Result
                 continue;
             }
             collect_rs_files(&path, root, files)?;
-        } else if path.extension() == Some(OsStr::new("rs")) && name != OsStr::new("build.rs") {
+        } else if path.extension() == Some(OsStr::new("rs")) {
             let relative = path
                 .strip_prefix(root)
                 .map_err(|e| format!("failed to compute relative path for {path:?}: {e}"))?;
