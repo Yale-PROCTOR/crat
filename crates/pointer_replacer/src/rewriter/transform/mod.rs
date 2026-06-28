@@ -11440,37 +11440,6 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         utils::ir::ty_size(ty1, def_id, self.tcx) == utils::ir::ty_size(ty2, def_id, self.tcx)
     }
 
-    fn get_mutability_decision(&self, hexpr: &hir::Expr<'tcx>) -> Option<bool> {
-        // find the root of this hir expr and if it's a path, get its decision from ptr_kinds and return its mutability
-        let mut curr_expr = hexpr;
-        loop {
-            match &curr_expr.kind {
-                hir::ExprKind::MethodCall(seg, receiver, ..)
-                    if seg.ident.name.as_str() == "offset" =>
-                {
-                    curr_expr = receiver;
-                }
-                _ => break,
-            }
-        }
-        if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &curr_expr.kind
-            && let Res::Local(hir_id) = path.res
-        {
-            match self.effective_ptr_kind(hir_id) {
-                Some(PtrKind::Ref(m)) => Some(m),
-                Some(PtrKind::OptRef(m)) => Some(m),
-                Some(
-                    PtrKind::Box | PtrKind::OptBox | PtrKind::BoxedSlice | PtrKind::OptBoxedSlice,
-                ) => Some(true),
-                Some(PtrKind::Slice(m)) | Some(PtrKind::SliceCursor(m)) => Some(m),
-                Some(PtrKind::Raw(m)) => Some(m),
-                None => None,
-            }
-        } else {
-            None
-        }
-    }
-
     fn call_arg_param_kind(
         &self,
         harg: &hir::Expr<'tcx>,
@@ -11487,11 +11456,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     .and_then(|decs| decs.get(arg_index).copied())
                     .flatten()
             })
-            .or_else(|| {
-                unwrap_ptr_from_mir_ty(ty).map(|(_, m)| {
-                    PtrKind::Raw(self.get_mutability_decision(harg).unwrap_or(m.is_mut()))
-                })
-            })
+            .or_else(|| unwrap_ptr_from_mir_ty(ty).map(|(_, m)| PtrKind::Raw(m.is_mut())))
     }
 
     fn same_call_temp_plan(

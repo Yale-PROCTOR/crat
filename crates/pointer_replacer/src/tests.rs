@@ -5430,8 +5430,8 @@ pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
             "pub unsafe fn helper(out: &[i8]) -> i32",
             "let mut buf: Box<[i8]>",
             "collect::<Vec<i8>>().into_boxed_slice()",
-            "std::ptr::null_mut::<i8>()",
-            "(_x).as_mut_ptr()",
+            "std::ptr::null::<i8>()",
+            "(_x).as_ptr()",
             "drop(buf);",
         ],
         &[
@@ -5440,6 +5440,8 @@ pub unsafe fn caller(out: *mut core::ffi::c_char) -> i32 {
             "Box::leak(",
             "slice_from_raw_parts_mut",
             "Box::from_raw(",
+            "std::ptr::null_mut::<i8>()",
+            "as_mut_ptr()",
         ],
     );
 }
@@ -7614,6 +7616,42 @@ pub unsafe extern "C" fn main_0() -> i32 {
             "std::ptr::null::<i32>()",
         ],
         &["bar((p).as_mut_ptr(), (p).as_ptr())"],
+    );
+}
+
+#[test]
+fn test_mut_slice_to_foreign_const_raw_bridge_in_index() {
+    run_test(
+        r#"
+extern "C" {
+    fn strlen(s: *const i8) -> usize;
+}
+
+pub unsafe extern "C" fn fill(mut out: *mut i8) {
+    if out.is_null() {
+        return;
+    }
+    *out.offset(0) = 1;
+}
+
+pub unsafe extern "C" fn check_trailing_slash(mut condition: *mut i8) -> i32 {
+    if condition.is_null() {
+        return 0;
+    }
+    fill(condition);
+    if *condition.offset((strlen(condition)).wrapping_sub(1usize) as isize) == 47 {
+        return 1;
+    }
+    return 0;
+}
+"#,
+        &[
+            "mut condition: &mut [i8]",
+            "strlen(if (condition).is_empty()",
+            "std::ptr::null::<i8>()",
+            "(condition).as_ptr()",
+        ],
+        &["std::ptr::null_mut::<i8>()", "(condition).as_mut_ptr()"],
     );
 }
 
