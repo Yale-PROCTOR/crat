@@ -7207,6 +7207,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             hir_rhs,
             field_kind,
             target_inner_ty,
+        ) || self.try_transform_generated_slice_raw_bridge_to_promoted_field(
+            rhs,
+            hir_rhs,
+            field_kind,
+            target_inner_ty,
         ) || self.try_transform_slice_to_promoted_field(
             rhs,
             hir_rhs,
@@ -7217,6 +7222,38 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         } else {
             self.transform_rhs_with_expected_inner(rhs, hir_rhs, field_kind, target_inner_ty)
         }
+    }
+
+    fn try_transform_generated_slice_raw_bridge_to_promoted_field(
+        &self,
+        rhs: &mut Expr,
+        hir_rhs: &hir::Expr<'tcx>,
+        field_kind: PtrKind,
+        target_inner_ty: Option<ty::Ty<'tcx>>,
+    ) -> bool {
+        let PtrKind::Slice(m) = field_kind else {
+            return false;
+        };
+        let Some(receiver) = generated_slice_raw_bridge_receiver(rhs) else {
+            return false;
+        };
+        let hir_e = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_rhs));
+        let Some(pe) = self.ptr_expr(receiver, hir_e) else {
+            return false;
+        };
+        let Some(PtrKind::Slice(source_m)) = self.ptr_source_kind(&pe) else {
+            return false;
+        };
+        if m && !source_m {
+            return false;
+        }
+        let Some(rhs_inner_ty) = unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx) else {
+            return false;
+        };
+        let lhs_inner_ty = target_inner_ty.unwrap_or(rhs_inner_ty);
+        let base = self.projected_expr(&pe, m, false);
+        *rhs = self.plain_slice_from_slice(&base, &pe, m, lhs_inner_ty, rhs_inner_ty);
+        true
     }
 
     fn try_transform_raw_pointer_to_promoted_field(
@@ -12921,6 +12958,44 @@ fn method_call_name(expr: &Expr) -> Option<Symbol> {
     } else {
         None
     }
+}
+
+fn generated_slice_raw_bridge_receiver(expr: &Expr) -> Option<&Expr> {
+    let ExprKind::If(cond, then_block, Some(else_expr)) = &unwrap_cast_and_paren(expr).kind else {
+        return None;
+    };
+    let cond_receiver = method_receiver_named(cond, "is_empty")?;
+    let then_expr = block_tail_expr(then_block)?;
+    if !is_null_ptr_constructor(then_expr) {
+        return None;
+    }
+    let raw_receiver = raw_ptr_method_receiver(block_expr_tail(else_expr))?;
+    (pprust::expr_to_string(cond_receiver) == pprust::expr_to_string(raw_receiver))
+        .then_some(cond_receiver)
+}
+
+fn block_expr_tail(expr: &Expr) -> &Expr {
+    if let ExprKind::Block(block, _) = &unwrap_paren(expr).kind
+        && let Some(tail) = block_tail_expr(block)
+    {
+        tail
+    } else {
+        expr
+    }
+}
+
+fn method_receiver_named<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+    let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind else {
+        return None;
+    };
+    (call.seg.ident.name.as_str() == name && call.args.is_empty()).then_some(&*call.receiver)
+}
+
+fn raw_ptr_method_receiver(expr: &Expr) -> Option<&Expr> {
+    let ExprKind::MethodCall(call) = &unwrap_cast_and_paren(expr).kind else {
+        return None;
+    };
+    matches!(call.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr").then_some(&*call.receiver)
 }
 
 fn is_null_ptr_constructor(expr: &Expr) -> bool {

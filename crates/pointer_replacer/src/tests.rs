@@ -2369,6 +2369,51 @@ pub unsafe fn touch(mut x: i32, mut buf: [i32; 1]) -> i32 {
 }
 
 #[test]
+fn test_rewriter_promotes_slice_field_from_raw_bridge_in_struct_literal() {
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Obj {
+    pub id: i32,
+}
+
+#[repr(C)]
+pub struct Program {
+    pub parents: *mut *const Obj,
+    pub n: usize,
+}
+
+pub unsafe fn prog_fetch(p: *mut Program, out: *mut *const Obj) {
+    *(*p).parents.offset(0) = std::ptr::null();
+    *out = *(*p).parents.offset(1);
+}
+
+pub unsafe fn prog_init(mut parents: *mut *const Obj, n: usize, out: *mut *const Obj) {
+    *parents.offset(1) = std::ptr::null();
+    let mut data = {
+        let mut init = Program {
+            parents: parents as *mut *const Obj,
+            n,
+        };
+        init
+    };
+    prog_fetch(&mut data, out);
+}
+"#,
+        &[
+            "pub struct Program<'a>",
+            "pub parents: &'a mut [*const Obj]",
+            "mut parents: &'a mut [*const crate::Obj]",
+            "parents: (parents)",
+        ],
+        &[
+            "pub parents: *mut *const Obj",
+            "parents: parents as *mut *const Obj",
+        ],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_mutable_struct_field_zero_initializer_to_none() {
     run_test(
         r#"
