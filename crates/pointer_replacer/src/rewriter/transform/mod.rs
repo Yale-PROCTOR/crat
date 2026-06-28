@@ -3181,6 +3181,52 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
     }
 
+    fn mutable_byte_str_slice_expr(
+        &self,
+        byte_str: &Expr,
+        target_ty: ty::Ty<'tcx>,
+        def_id: LocalDefId,
+    ) -> String {
+        let ExprKind::Lit(lit) = &unwrap_cast_and_paren(byte_str).kind else {
+            panic!("{}", pprust::expr_to_string(byte_str));
+        };
+        assert!(matches!(lit.kind, token::LitKind::ByteStr));
+
+        let bytes = utils::unescape_byte_str(lit.symbol.as_str());
+        if target_ty == self.tcx.types.u8 {
+            let elems = bytes
+                .into_iter()
+                .map(|byte| format!("{byte}u8"))
+                .collect::<Vec<_>>();
+            return format!("&mut [{}]", elems.join(", "));
+        }
+
+        assert!(target_ty.is_numeric());
+        let target_size = utils::ir::ty_size(target_ty, def_id, self.tcx);
+        if target_size == 1 {
+            let target_ty = self.body_ty_name(target_ty);
+            let elems = bytes
+                .into_iter()
+                .map(|byte| format!("{byte}u8 as {target_ty}"))
+                .collect::<Vec<_>>();
+            return format!("&mut [{}]", elems.join(", "));
+        }
+
+        self.note_byte_str_slice_cast_dependency(target_ty);
+        let target_ty = self.body_ty_name(target_ty);
+        let usable_len = (bytes.len() as u64 / target_size) * target_size;
+        let elems = bytes
+            .into_iter()
+            .map(|byte| format!("{byte}u8"))
+            .collect::<Vec<_>>();
+        let bytes = format!("[{}]", elems.join(", "));
+        if usable_len == elems.len() as u64 {
+            format!("bytemuck::cast_slice_mut::<_, {target_ty}>(&mut {bytes})")
+        } else {
+            format!("bytemuck::cast_slice_mut::<_, {target_ty}>(&mut {bytes}[..{usable_len}])")
+        }
+    }
+
     fn note_byte_str_slice_cast_dependency(&self, target_ty: ty::Ty<'tcx>) {
         if self.item_initializer_depth > 0 && target_ty == self.tcx.types.i8 {
             self.bytemuck_must_cast.set(true);
@@ -8920,8 +8966,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::Raw(m);
                 }
                 PtrCtx::Rhs(PtrKind::OptRef(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let slice = self.mutable_byte_str_slice_expr(e, lhs_inner_ty, def_id);
+                        *ptr = utils::expr!("({slice}).first_mut()");
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
@@ -8935,9 +8983,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     panic!("unsupported M4A box target for byte string source")
                 }
                 PtrCtx::Rhs(PtrKind::SliceCursor(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
                     self.slice_cursor.set(true);
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let slice = self.mutable_byte_str_slice_expr(e, lhs_inner_ty, def_id);
+                        *ptr = utils::expr!("crate::slice_cursor::SliceCursorMut::new({slice})");
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!(
                             "crate::slice_cursor::SliceCursor::new({})",
                             pprust::expr_to_string(e)
@@ -8951,8 +9001,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::SliceCursor(m);
                 }
                 PtrCtx::Rhs(PtrKind::Slice(m)) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let slice = self.mutable_byte_str_slice_expr(e, lhs_inner_ty, def_id);
+                        *ptr = utils::expr!("{slice}");
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = e.clone();
                     } else {
                         assert!(lhs_inner_ty.is_numeric());
@@ -8963,8 +9015,10 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::Slice(m);
                 }
                 PtrCtx::Deref(m) => {
-                    assert!(!m, "{}", pprust::expr_to_string(ptr));
-                    if lhs_inner_ty == self.tcx.types.u8 {
+                    if m {
+                        let slice = self.mutable_byte_str_slice_expr(e, lhs_inner_ty, def_id);
+                        *ptr = utils::expr!("({slice}).first_mut()");
+                    } else if lhs_inner_ty == self.tcx.types.u8 {
                         *ptr = utils::expr!("{}.first()", pprust::expr_to_string(e));
                     } else {
                         assert!(lhs_inner_ty.is_numeric());

@@ -8664,6 +8664,59 @@ pub unsafe extern "C" fn foo() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_bytestr_mut_slice_from_const_arg_promoted_to_mut_slice() {
+    run_test(
+        r#"
+pub unsafe fn write_prefix(mut ptr: *mut core::ffi::c_char) {
+    *ptr.offset(0) = b'X' as core::ffi::c_char;
+}
+
+pub unsafe fn takes_const(mut ptr: *const core::ffi::c_char) {
+    write_prefix(ptr as *mut core::ffi::c_char);
+}
+
+pub unsafe fn caller() {
+    takes_const(b" \0" as *const u8 as *const core::ffi::c_char);
+}
+"#,
+        &[
+            "fn write_prefix(mut ptr: &mut [i8])",
+            "fn takes_const(mut ptr: &mut [i8])",
+            "takes_const(&mut [",
+        ],
+        &[
+            "fn takes_const(mut ptr: &[i8]",
+            "from_raw_parts_mut((ptr).as_ptr().cast_mut()",
+            "b\" \\0\" as *const u8 as *const core::ffi::c_char",
+        ],
+    );
+}
+
+#[test]
+fn test_bytestr_mut_slice_numeric_cast_uses_mut_byte_array_cast() {
+    run_test(
+        r#"
+pub unsafe fn write_word(mut words: *mut i32) {
+    *words.offset(0) = 0x01020304;
+}
+
+pub unsafe fn caller() {
+    write_word(b"abcd" as *const u8 as *const i32 as *mut i32);
+}
+"#,
+        &[
+            "fn write_word(mut words: &mut [i32])",
+            "bytemuck::cast_slice_mut::<_",
+            "i32>(&mut [97u8, 98u8, 99u8, 100u8])",
+        ],
+        &[
+            "&mut [97u8 as i32",
+            "b\"abcd\" as *const u8 as *const i32 as *mut i32",
+        ],
+    );
+}
+
 // ===== Section 5: static byte-string initializers =====
 
 #[test]
