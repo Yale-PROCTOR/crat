@@ -7578,18 +7578,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         }
 
         if let ExprKind::Block(block, _) = &mut e.kind {
-            let hir::ExprKind::Block(hir_block, _) = hir_e.kind else {
-                if let PtrCtx::Rhs(PtrKind::Raw(m)) | PtrCtx::Deref(m) = ctx {
-                    return PtrKind::Raw(m);
-                }
-                panic!("{}", pprust::expr_to_string(e));
-            };
             let StmtKind::Expr(inner) = &mut block.stmts.last_mut().unwrap().kind else {
                 panic!("{}", pprust::expr_to_string(e));
             };
+            // Some rewrites synthesize an AST-only wrapper block after ast_to_hir is built.
+            // The block's pointer value is still its tail expression.
+            let hir_inner = if let hir::ExprKind::Block(hir_block, _) = hir_e.kind {
+                hir_block.expr.unwrap()
+            } else {
+                hir_e
+            };
             return self.transform_ptr_with_expected_inner(
                 inner,
-                hir_block.expr.unwrap(),
+                hir_inner,
                 ctx,
                 expected_inner_ty,
             );
