@@ -8466,8 +8466,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::Ref(m1)) => {
-                    assert!(pe.projs.is_empty());
-                    *ptr = self.raw_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    if pe.projs.is_empty() {
+                        *ptr = self.raw_from_ref(pe.base, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    } else {
+                        *ptr = self.raw_from_projected_ref(&pe, m, m1, lhs_inner_ty, rhs_inner_ty);
+                    }
                     return PtrKind::Raw(m);
                 }
                 (PtrCtx::Rhs(PtrKind::Raw(m)), PtrKind::OptRef(m1)) => {
@@ -10153,6 +10156,35 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 lhs_ty,
             )
         }
+    }
+
+    fn raw_from_projected_ref(
+        &self,
+        pe: &PtrExpr<'_, 'tcx>,
+        m: bool,
+        m1: bool,
+        lhs_inner_ty: ty::Ty<'tcx>,
+        rhs_inner_ty: ty::Ty<'tcx>,
+    ) -> Expr {
+        let source_inner_ty =
+            unwrap_ptr_or_arr_from_mir_ty(pe.base_ty, self.tcx).unwrap_or(rhs_inner_ty);
+        let source_ty = self.body_ty_name(source_inner_ty);
+        let base = pprust::expr_to_string(pe.base);
+        let base_raw = if m && !m1 {
+            format!("(({base}) as *const {source_ty}).cast_mut()")
+        } else {
+            format!(
+                "({base}) as *{} {source_ty}",
+                if m && m1 { "mut" } else { "const" },
+            )
+        };
+        let (raw, _) =
+            self.raw_pointer_projection_str_and_ty(base_raw, &pe.projs, Some(source_inner_ty));
+        utils::expr!(
+            "({raw}) as *{} {}",
+            if m { "mut" } else { "const" },
+            self.body_ty_name(lhs_inner_ty),
+        )
     }
 
     fn raw_from_box(
