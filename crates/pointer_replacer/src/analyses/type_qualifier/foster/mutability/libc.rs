@@ -90,6 +90,7 @@ pub fn libc_call<'tcx>(
             conservative_call(
                 destination,
                 args,
+                None,
                 local_decls,
                 locals,
                 struct_fields,

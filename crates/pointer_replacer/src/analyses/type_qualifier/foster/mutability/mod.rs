@@ -4,7 +4,7 @@ use libc::libc_call;
 use library::library_call;
 use rustc_middle::mir::{
     AggregateKind, BinOp, HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue,
-    Terminator, visit::Visitor,
+    Terminator, TerminatorKind, visit::Visitor,
 };
 use rustc_span::source_map::Spanned;
 use rustc_type_ir::TyKind;
@@ -49,6 +49,7 @@ pub fn mutability_analysis(rust_program: &RustProgram) -> MutabilityResult {
         let mut analysis = MutabilityAnalysis {
             ctxt,
             database: &mut database,
+            def_name: rust_program.tcx.def_path_str(*r#fn),
         };
 
         analysis.visit_body(body);
@@ -130,6 +131,8 @@ impl BooleanLattice for Mutability {}
 pub struct MutabilityAnalysis<'infer, 'tcx, D> {
     ctxt: InferCtxt<'infer, 'tcx, D>,
     database: &'infer mut BooleanSystem<Mutability>,
+    // TEMP: name of the function currently being analyzed (for CRAT_MUT_TRACE).
+    def_name: String,
 }
 
 impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<'infer, 'tcx, D> {
@@ -144,7 +147,28 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             struct_fields,
             tcx,
         } = self.ctxt;
+        let def_name: &str = &self.def_name;
         let database = &mut *self.database;
+
+        if mut_trace_enabled() {
+            // Log the type of the *pointer being dereferenced* at each Deref on the LHS
+            // (that pointer's pointee qualifier is the one MutCtxt::on_deref bottoms).
+            // This isolates genuine writes THROUGH a `*git_oid` from writes to git_oid
+            // *fields* of some other container pointer.
+            let mut base_ty = local_decls.local_decls()[lhs.local].ty;
+            for elem in lhs.projection.iter() {
+                match elem {
+                    ProjectionElem::Deref => {
+                        trace_mut("WRITE-deref", def_name, "", base_ty);
+                        base_ty = base_ty.builtin_deref(true).unwrap_or(base_ty);
+                    }
+                    ProjectionElem::Field(_, ty) => {
+                        base_ty = ty;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         match rhs {
             Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs)) | Rvalue::CopyForDeref(rhs) => {
@@ -167,6 +191,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     tcx,
                     &mut rhs_deref,
                 ) else {
+                    trace_mut(
+                        "USE-rhs-unresolved",
+                        def_name,
+                        "",
+                        place.ty(local_decls.local_decls(), tcx).ty,
+                    );
                     make_mut(lhs, database);
                     return;
                 };
@@ -214,6 +244,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     tcx,
                     &mut rhs_deref,
                 ) else {
+                    trace_mut(
+                        "CAST-rhs-unresolved",
+                        def_name,
+                        "",
+                        place.ty(local_decls.local_decls(), tcx).ty,
+                    );
                     make_mut(lhs, database);
                     return;
                 };
@@ -256,6 +292,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                         tcx,
                         &mut (),
                     ) else {
+                        trace_mut(
+                            "OFFSET-arg-unresolved",
+                            def_name,
+                            "",
+                            place.ty(local_decls.local_decls(), tcx).ty,
+                        );
                         make_mut(dest_vars, database);
                         return;
                     };
@@ -291,6 +333,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     tcx,
                     &mut rhs_deref,
                 ) else {
+                    trace_mut(
+                        "REF-rhs-unresolved",
+                        def_name,
+                        "",
+                        place.ty(local_decls.local_decls(), tcx).ty,
+                    );
                     database.bottom(lhs_ref);
                     if let Some(rhs_deref) = rhs_deref {
                         database.guard(lhs_ref, rhs_deref);
@@ -389,6 +437,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             struct_fields,
             tcx,
         } = self.ctxt;
+        let def_name: &str = &self.def_name;
         let database = &mut *self.database;
 
         if let Some(mir::MirFunctionCall {
@@ -445,6 +494,15 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                             tcx,
                             &mut (),
                         ) else {
+                            if mut_trace_enabled() {
+                                let callee_name = tcx.def_path_str(callee);
+                                trace_mut(
+                                    "CALL-arg-unresolved->param",
+                                    def_name,
+                                    &callee_name,
+                                    arg.ty(local_decls.local_decls(), tcx).ty,
+                                );
+                            }
                             make_mut(param_vars, database);
                             continue;
                         };
@@ -483,15 +541,38 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                         tcx,
                     );
                 }
-                CallKind::Impl(..) | CallKind::Closure | CallKind::Dynamic => conservative_call(
-                    destination,
-                    args,
-                    local_decls,
-                    locals,
-                    struct_fields,
-                    tcx,
-                    database,
-                ),
+                CallKind::Impl(..) | CallKind::Closure | CallKind::Dynamic => {
+                    // Recover the callee's declared parameter types so that conservative_call
+                    // only bottoms the levels the callee may actually write. A `*const`/`&`
+                    // parameter is a contract that the callee won't write through it, so we
+                    // must not force the caller's argument `*mut`. Closures (rust-call tupled
+                    // args) and anything we can't read a signature from fall back to None,
+                    // which preserves the old fully-conservative behavior.
+                    let param_tys: Option<Vec<rustc_middle::ty::Ty<'tcx>>> =
+                        match &terminator.kind {
+                            TerminatorKind::Call { func, .. }
+                            | TerminatorKind::TailCall { func, .. } => {
+                                let fty = func.ty(local_decls, tcx);
+                                match fty.kind() {
+                                    TyKind::FnDef(..) | TyKind::FnPtr(..) => Some(
+                                        fty.fn_sig(tcx).skip_binder().inputs().to_vec(),
+                                    ),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                    conservative_call(
+                        destination,
+                        args,
+                        param_tys.as_deref(),
+                        local_decls,
+                        locals,
+                        struct_fields,
+                        tcx,
+                        database,
+                    );
+                }
             }
         }
     }
@@ -538,6 +619,24 @@ impl PlaceContext for EnsureNoDeref {
 fn make_mut(vars: Range<Var>, database: &mut BooleanSystem<Mutability>) {
     for var in vars {
         database.bottom(var);
+    }
+}
+
+// TEMP instrumentation (env-gated via CRAT_MUT_TRACE) to trace why `git_oid` pointers
+// get marked Mut. Remove once the over-marking root cause is fixed.
+fn mut_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("CRAT_MUT_TRACE").is_some())
+}
+
+fn trace_mut(site: &str, def_name: &str, extra: &str, ty: rustc_middle::ty::Ty<'_>) {
+    if !mut_trace_enabled() {
+        return;
+    }
+    let s = format!("{ty:?}");
+    if s.contains("git_oid") {
+        eprintln!("[MUTTRACE]\t{site}\t{def_name}\t{extra}\t{s}");
     }
 }
 
@@ -655,6 +754,9 @@ fn try_place_vars<'tcx, Ctxt: PlaceContext>(
 pub(crate) fn conservative_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
+    // The callee's declared parameter types, when available. `None` (e.g. opaque calls,
+    // closures, libc/library fallbacks) means "no contract" -> stay fully conservative.
+    param_tys: Option<&[rustc_middle::ty::Ty<'tcx>]>,
     local_decls: &impl HasLocalDecls<'tcx>,
     locals: &[Var],
     struct_fields: &StructFields,
@@ -674,7 +776,7 @@ pub(crate) fn conservative_call<'tcx>(
         }
     }
 
-    for arg in args {
+    for (i, arg) in args.iter().enumerate() {
         let Some(arg) = arg.node.place() else {
             continue;
         };
@@ -683,8 +785,51 @@ pub(crate) fn conservative_call<'tcx>(
         else {
             continue;
         };
-        for var in arg_vars {
-            database.bottom(var);
+
+        match param_tys.and_then(|ps| ps.get(i)) {
+            // Declared parameter type known: bottom only the pointer levels the callee is
+            // allowed to write (`*mut`/`&mut`); skip `*const`/`&` levels. The argument's
+            // qualifier vars are laid out outermost-first (one var per deref), so peeling
+            // the parameter type in lockstep aligns each level with `arg_vars.start + k`.
+            Some(&param_ty) => {
+                let mut ty = param_ty;
+                let mut var = arg_vars.start;
+                while var < arg_vars.end {
+                    match ty.kind() {
+                        TyKind::RawPtr(inner, mutbl) | TyKind::Ref(_, inner, mutbl) => {
+                            if mutbl.is_mut() {
+                                if mut_trace_enabled() {
+                                    trace_mut("CONSERVATIVE-bottomed", "<conservative_call>", "", ty);
+                                }
+                                database.bottom(var);
+                            }
+                            var += 1;
+                            ty = *inner;
+                        }
+                        // Pointee is an aggregate with its own inner qualifier vars (rare for
+                        // these args): stay conservative for the remainder.
+                        _ => {
+                            for v in var..arg_vars.end {
+                                database.bottom(v);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // No declared type (no signature, or a variadic extra argument): stay fully
+            // conservative, as before.
+            None => {
+                if mut_trace_enabled() {
+                    trace_mut(
+                        "CONSERVATIVE-noinfo",
+                        "<conservative_call>",
+                        "",
+                        arg.ty(local_decls.local_decls(), tcx).ty,
+                    );
+                }
+                make_mut(arg_vars, database);
+            }
         }
     }
 }
