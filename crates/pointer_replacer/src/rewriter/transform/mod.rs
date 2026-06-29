@@ -80,6 +80,9 @@ pub(crate) struct TransformVisitor<'a, 'tcx> {
     pub slice_cursor: Cell<bool>,
     item_initializer_depth: usize,
     same_call_temp_counter: Cell<usize>,
+    // Alias-driven same-call borrow-overlap conflicts (callee -> {(mut_pos, read_pos)}),
+    // computed from the borrow analysis' places_conflict oracle. Drives hoist_field_read.
+    same_call_field_conflicts: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>>,
     diagnostics: DecisionDiagnostics,
 }
 
@@ -2176,6 +2179,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         config: &Config,
         rust_program: &RustProgram<'tcx>,
         analysis: &'analysis Analysis,
+        same_call_field_conflicts: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>>,
         pre_points_to: &andersen::PreAnalysisData<'tcx>,
         points_to_solutions: &andersen::Solutions,
         tss: &TyShapes<'_, 'tcx>,
@@ -2947,6 +2951,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             slice_cursor: Cell::new(false),
             item_initializer_depth: 0,
             same_call_temp_counter: Cell::new(0),
+            same_call_field_conflicts,
             diagnostics,
         };
         visitor.item_lifetime_plans = visitor.build_item_lifetime_plans();
@@ -11565,13 +11570,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                 plan.arg_replacements[later_index].insert(local_hir_id, temp_name);
             }
         }
-        self.add_same_call_hoisted_arg_temps(&mut plan, hargs, arg_param_kinds);
+        let callee_def = hir_called_local_fn(self.tcx, hir_call);
+        self.add_same_call_hoisted_arg_temps(&mut plan, callee_def, hargs, arg_param_kinds);
         plan
     }
 
     fn add_same_call_hoisted_arg_temps(
         &self,
         plan: &mut SameCallTempPlan,
+        callee_def: Option<LocalDefId>,
         hargs: &'tcx [hir::Expr<'tcx>],
         arg_param_kinds: &[Option<PtrKind>],
     ) {
@@ -11595,9 +11602,23 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         && hir_arg_has_hoistable_immediate_closure_local_read(
                             self.tcx, later_arg, root,
                         );
+                    // SP2: a later same-call arg that merely *reads* a place overlapping an
+                    // earlier `&mut (*root).<field>` borrow (e.g. `(*sc).items._cmp`,
+                    // `(*ign).dir.ptr`). Detection is alias-driven: the borrow analysis'
+                    // `places_conflict` oracle decided this (source_index, later_index) pair
+                    // conflicts (see compute_same_call_field_conflicts). Snapshot the read into
+                    // a Copy temp evaluated before the call, gated on:
+                    //   * the later arg does not itself mutably borrow (it only reads),
+                    //   * the later arg's (pre-rewrite) adjusted type is `Copy` (never move).
+                    let hoist_field_read = callee_def
+                        .and_then(|callee| self.same_call_field_conflicts.get(&callee))
+                        .is_some_and(|conflicts| conflicts.contains(&(source_index, later_index)))
+                        && !later_kind.is_some_and(is_mutable_borrow_like_decision)
+                        && self.same_call_expr_is_copy(later_arg);
                     if !hoist_raw_parent
                         && !hoist_nested_mut_borrow
                         && !hoist_immediate_closure_read
+                        && !hoist_field_read
                     {
                         continue;
                     }
@@ -11628,6 +11649,15 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let typing_env = ty::TypingEnv::post_analysis(self.tcx, hir_call.hir_id.owner.def_id);
         let local_ty = self.tcx.typeck(local_hir_id.owner).node_type(local_hir_id);
         self.tcx.type_is_copy_modulo_regions(typing_env, local_ty)
+    }
+
+    /// True when `expr`'s adjusted type is `Copy`. Used to guarantee that a
+    /// hoisted same-call snapshot copies a value rather than moving a non-Copy
+    /// place out from under the original expression.
+    fn same_call_expr_is_copy(&self, expr: &hir::Expr<'tcx>) -> bool {
+        let typing_env = ty::TypingEnv::post_analysis(self.tcx, expr.hir_id.owner.def_id);
+        let ty = self.tcx.typeck(expr.hir_id.owner).expr_ty_adjusted(expr);
+        self.tcx.type_is_copy_modulo_regions(typing_env, ty)
     }
 
     fn rewrite_same_call_temp_args(&self, args: &mut [P<Expr>], plan: &SameCallTempPlan) {
@@ -17690,6 +17720,159 @@ fn collect_double_ptr_out_param_field_slots<'tcx>(
     visitor.slots
 }
 
+/// Alias-analysis-driven detection of same-call borrow overlaps (Bug C / SP2).
+///
+/// For each call `f(.., &mut <borrowed_place>, .., <read_place>, ..)` where a parameter is
+/// promoted to a mutable borrow, ask the borrow analysis' `places_conflict` oracle whether any
+/// other argument READS a place that conflicts with (is contained in / overlaps) the borrowed
+/// place. Such a read overlaps the `&mut` and must be snapshotted before the call. Results are
+/// keyed by callee def + (mutable arg position, reading arg position), conservatively unioned
+/// across call sites; the rewriter consumes this to drive `hoist_field_read`.
+///
+/// This replaces the bespoke syntactic HIR predicate with the real place-conflict oracle, so
+/// it generalizes to overlap shapes the syntactic patterns didn't enumerate.
+pub(super) fn compute_same_call_field_conflicts<'tcx>(
+    rust_program: &RustProgram<'tcx>,
+) -> FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> {
+    let tcx = rust_program.tcx;
+    use crate::analyses::borrow::places_conflict::{
+        AccessDepth, PlaceConflictBias, places_conflict,
+    };
+    use crate::analyses::mir::{CallKind, TerminatorExt};
+    use rustc_middle::mir::{
+        Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind,
+    };
+
+    // Single-definition map: an arg temp `_t = <rvalue>` (assigned exactly once) -> the place it
+    // refers to, plus whether the rvalue was an address-of (`&mut`/`&raw`/`&`) rather than a read.
+    fn build_defs<'tcx>(body: &Body<'tcx>) -> FxHashMap<Local, (Place<'tcx>, bool)> {
+        let mut counts: FxHashMap<Local, u32> = FxHashMap::default();
+        let mut defs: FxHashMap<Local, (Place<'tcx>, bool)> = FxHashMap::default();
+        for bb in body.basic_blocks.iter() {
+            for stmt in &bb.statements {
+                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind
+                    && place.projection.is_empty()
+                {
+                    *counts.entry(place.local).or_default() += 1;
+                    let src = match rvalue {
+                        Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p) => Some((*p, true)),
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                        | Rvalue::CopyForDeref(p)
+                        | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => {
+                            Some((*p, false))
+                        }
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        defs.insert(place.local, src);
+                    }
+                }
+            }
+        }
+        defs.retain(|local, _| counts.get(local) == Some(&1));
+        defs
+    }
+
+    // The place an address-of argument borrows (only `&mut`/`&raw`/`&` of a place qualifies).
+    fn borrowed_place<'tcx>(
+        op: &Operand<'tcx>,
+        defs: &FxHashMap<Local, (Place<'tcx>, bool)>,
+    ) -> Option<Place<'tcx>> {
+        let p = op.place()?;
+        if !p.projection.is_empty() {
+            return None;
+        }
+        match defs.get(&p.local) {
+            Some((place, true)) => Some(*place),
+            _ => None,
+        }
+    }
+
+    // The place an argument reads (peels one temp indirection).
+    fn read_place<'tcx>(
+        op: &Operand<'tcx>,
+        defs: &FxHashMap<Local, (Place<'tcx>, bool)>,
+    ) -> Option<Place<'tcx>> {
+        let p = op.place()?;
+        if p.projection.is_empty()
+            && let Some((place, _)) = defs.get(&p.local)
+        {
+            return Some(*place);
+        }
+        Some(p)
+    }
+
+    // Resolve a place rooted at a single-assigned temp down to a stable root, following
+    // reborrow chains (`_t = &raw mut SRC; (*_t).rest -> SRC.rest`) and copies/casts
+    // (`_t = SRC; _t.rest -> SRC.rest`). c2rust materializes field borrows through such
+    // temps, so without this the borrow and the conflicting read end up rooted at
+    // different temps and never appear to conflict.
+    fn normalize<'tcx>(
+        mut place: Place<'tcx>,
+        defs: &FxHashMap<Local, (Place<'tcx>, bool)>,
+        tcx: TyCtxt<'tcx>,
+    ) -> Place<'tcx> {
+        for _ in 0..64 {
+            let Some(&(src, is_addr)) = defs.get(&place.local) else {
+                break;
+            };
+            place = if is_addr {
+                if matches!(place.projection.first(), Some(ProjectionElem::Deref)) {
+                    src.project_deeper(&place.projection[1..], tcx)
+                } else {
+                    break;
+                }
+            } else {
+                src.project_deeper(&place.projection[..], tcx)
+            };
+        }
+        place
+    }
+
+    let mut result: FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> = FxHashMap::default();
+    // Iterate the analyzed function set (not all body owners): const/static bodies have their
+    // drops-elaborated MIR stolen during const-eval, and borrowing a stolen Steal panics.
+    for &caller in &rust_program.functions {
+        let body_guard = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        let body: &Body = &body_guard;
+        let defs = build_defs(body);
+
+        for bb in body.basic_blocks.iter() {
+            let Some(term) = &bb.terminator else { continue };
+            let Some(call) = term.as_call(tcx) else { continue };
+            let CallKind::FreeStanding(callee) = call.func else {
+                continue;
+            };
+            for (i, arg_i) in call.args.iter().enumerate() {
+                let Some(borrowed) = borrowed_place(&arg_i.node, &defs) else {
+                    continue;
+                };
+                let borrowed = normalize(borrowed, &defs, tcx);
+                for (j, arg_j) in call.args.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    let Some(read) = read_place(&arg_j.node, &defs) else {
+                        continue;
+                    };
+                    let read = normalize(read, &defs, tcx);
+                    if places_conflict(
+                        tcx,
+                        body,
+                        borrowed,
+                        read,
+                        AccessDepth::Deep,
+                        PlaceConflictBias::Overlap,
+                    ) {
+                        result.entry(callee).or_default().insert((i, j));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 fn callback_raw_arg_source_binding(expr: &hir::Expr<'_>) -> Option<HirId> {
     let expr = hir_unwrap_casts(expr);
     match expr.kind {
@@ -18143,7 +18326,7 @@ fn hir_arg_contains_nested_mut_borrow_of_local(expr: &hir::Expr<'_>, target: Hir
 fn hir_arg_is_simple_same_call_reorderable(expr: &hir::Expr<'_>) -> bool {
     let expr = utils::hir::unwrap_drop_temps(expr);
     match hir_unwrap_casts(expr).kind {
-        hir::ExprKind::Path(_) => true,
+        hir::ExprKind::Path(_) | hir::ExprKind::Lit(_) => true,
         hir::ExprKind::Field(base, _) => hir_arg_is_simple_same_call_reorderable(base),
         hir::ExprKind::AddrOf(_, _, inner) | hir::ExprKind::Unary(hir::UnOp::Deref, inner) => {
             hir_arg_is_simple_same_call_reorderable(inner)
@@ -18409,6 +18592,7 @@ fn hir_same_call_top_level_field_projection_uses_in_expr(
     visitor.visit_expr(expr);
     visitor.uses
 }
+
 
 fn hir_same_call_whole_ptr_root(expr: &hir::Expr<'_>) -> Option<HirId> {
     let expr = hir_unwrap_casts(expr);
@@ -25348,6 +25532,7 @@ pub unsafe fn stash_bad(owner: *mut Bad) {
                 &Config::default(),
                 &input,
                 &analysis,
+                FxHashMap::default(),
                 &pre_points_to,
                 &points_to_solutions,
                 &tss,

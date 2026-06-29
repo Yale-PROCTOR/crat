@@ -119,6 +119,10 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
     let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
 
+    // Computed here (analysis phase) while `mir_drops_elaborated_and_const_checked` is still live;
+    // by transform time that MIR is stolen. Drives the alias-driven same-call hoist (Bug C / SP2).
+    let same_call_field_conflicts = transform::compute_same_call_field_conflicts(&input);
+
     let analysis_results = if let Some(path) = &config.load_analysis_from {
         serializer::load_analysis_from_file(path).unwrap_or_else(|err| {
             panic!(
@@ -207,6 +211,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         config,
         &input,
         &analysis_results,
+        same_call_field_conflicts,
         &pre_points_to,
         &points_to_solutions,
         &tss,

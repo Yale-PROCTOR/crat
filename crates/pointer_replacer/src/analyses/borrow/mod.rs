@@ -43,7 +43,7 @@ mod invalidates;
 mod killed;
 pub mod lifetime_flow;
 mod loan_liveness;
-mod places_conflict;
+pub(crate) mod places_conflict;
 mod provenance_liveness;
 mod requires;
 mod subset_closure;
