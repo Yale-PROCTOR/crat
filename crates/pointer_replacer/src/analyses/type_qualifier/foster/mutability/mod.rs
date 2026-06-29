@@ -548,20 +548,20 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     // must not force the caller's argument `*mut`. Closures (rust-call tupled
                     // args) and anything we can't read a signature from fall back to None,
                     // which preserves the old fully-conservative behavior.
-                    let param_tys: Option<Vec<rustc_middle::ty::Ty<'tcx>>> =
-                        match &terminator.kind {
-                            TerminatorKind::Call { func, .. }
-                            | TerminatorKind::TailCall { func, .. } => {
-                                let fty = func.ty(local_decls, tcx);
-                                match fty.kind() {
-                                    TyKind::FnDef(..) | TyKind::FnPtr(..) => Some(
-                                        fty.fn_sig(tcx).skip_binder().inputs().to_vec(),
-                                    ),
-                                    _ => None,
+                    let param_tys: Option<Vec<rustc_middle::ty::Ty<'tcx>>> = match &terminator.kind
+                    {
+                        TerminatorKind::Call { func, .. }
+                        | TerminatorKind::TailCall { func, .. } => {
+                            let fty = func.ty(local_decls, tcx);
+                            match fty.kind() {
+                                TyKind::FnDef(..) | TyKind::FnPtr(..) => {
+                                    Some(fty.fn_sig(tcx).skip_binder().inputs().to_vec())
                                 }
+                                _ => None,
                             }
-                            _ => None,
-                        };
+                        }
+                        _ => None,
+                    };
                     conservative_call(
                         destination,
                         args,
@@ -751,6 +751,7 @@ fn try_place_vars<'tcx, Ctxt: PlaceContext>(
     Some(place_vars)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conservative_call<'tcx>(
     destination: &Place<'tcx>,
     args: &[Spanned<Operand<'tcx>>],
@@ -799,7 +800,12 @@ pub(crate) fn conservative_call<'tcx>(
                         TyKind::RawPtr(inner, mutbl) | TyKind::Ref(_, inner, mutbl) => {
                             if mutbl.is_mut() {
                                 if mut_trace_enabled() {
-                                    trace_mut("CONSERVATIVE-bottomed", "<conservative_call>", "", ty);
+                                    trace_mut(
+                                        "CONSERVATIVE-bottomed",
+                                        "<conservative_call>",
+                                        "",
+                                        ty,
+                                    );
                                 }
                                 database.bottom(var);
                             }

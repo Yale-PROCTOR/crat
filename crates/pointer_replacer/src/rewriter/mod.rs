@@ -62,6 +62,8 @@ pub struct Analysis {
 pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
     #[serde(default)]
+    pub demote: FxHashSet<String>,
+    #[serde(default)]
     pub verbose: bool,
     #[serde(default)]
     pub test_serialization: bool,

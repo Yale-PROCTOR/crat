@@ -115,6 +115,9 @@ impl<'a, 'tcx> FieldPtrKindContext<'a, 'tcx> {
         if struct_field_pointee_forces_raw(self.tcx, field) {
             return None;
         }
+        if self.demoted_fields.contains(&field) {
+            return None;
+        }
         let kind = if struct_field_is_exactly_owning(self.analysis, field) {
             self.ownership_field_kind(field)
         } else {
@@ -213,6 +216,121 @@ impl<'a, 'tcx> FieldPtrKindContext<'a, 'tcx> {
     fn field_is_array_like(&self, field: StructFieldSlot) -> bool {
         analysis_field_is_array_like(self.analysis, field)
     }
+}
+
+#[derive(Clone, Debug)]
+struct PointerDemotionTarget {
+    owner_path: String,
+    local_name: String,
+}
+
+impl PointerDemotionTarget {
+    fn parse(raw: &str) -> Self {
+        let Some((owner_path, local_name)) = raw.rsplit_once("::") else {
+            panic!("invalid pointer demotion target `{raw}`; expected `path::name`");
+        };
+        if owner_path.is_empty() || local_name.is_empty() {
+            panic!("invalid pointer demotion target `{raw}`; expected `path::name`");
+        }
+        PointerDemotionTarget {
+            owner_path: owner_path.to_owned(),
+            local_name: local_name.to_owned(),
+        }
+    }
+
+    fn matches(&self, owner_path: &str, local_name: Symbol) -> bool {
+        self.local_name == local_name.as_str()
+            && def_path_matches_pointer_demotion_target(owner_path, &self.owner_path)
+    }
+}
+
+fn parse_pointer_demotion_targets(raw_targets: &FxHashSet<String>) -> Vec<PointerDemotionTarget> {
+    raw_targets
+        .iter()
+        .map(|target| PointerDemotionTarget::parse(target))
+        .collect()
+}
+
+fn def_path_matches_pointer_demotion_target(def_path: &str, target_owner_path: &str) -> bool {
+    def_path == target_owner_path
+        || def_path
+            .strip_suffix(target_owner_path)
+            .is_some_and(|prefix| prefix.ends_with("::"))
+}
+
+fn collect_pointer_demoted_bindings(
+    tcx: TyCtxt<'_>,
+    targets: &[PointerDemotionTarget],
+) -> FxHashSet<HirId> {
+    if targets.is_empty() {
+        return FxHashSet::default();
+    }
+
+    struct DemotedBindingVisitor<'a, 'tcx> {
+        typeck: &'tcx rustc_middle::ty::TypeckResults<'tcx>,
+        owner_path: String,
+        targets: &'a [PointerDemotionTarget],
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for DemotedBindingVisitor<'_, 'tcx> {
+        fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Self::Result {
+            if let hir::PatKind::Binding(_, hir_id, ident, _) = pat.kind
+                && self
+                    .targets
+                    .iter()
+                    .any(|target| target.matches(&self.owner_path, ident.name))
+                && matches!(self.typeck.node_type(hir_id).kind(), ty::TyKind::RawPtr(..))
+            {
+                self.bindings.insert(hir_id);
+            }
+            intravisit::walk_pat(self, pat);
+        }
+    }
+
+    let mut bindings = FxHashSet::default();
+    for_each_hir_fn_body_with_did(tcx, |did, body, typeck| {
+        let mut visitor = DemotedBindingVisitor {
+            typeck,
+            owner_path: tcx.def_path_str(did),
+            targets,
+            bindings: FxHashSet::default(),
+        };
+        visitor.visit_body(body);
+        bindings.extend(visitor.bindings);
+    });
+    bindings
+}
+
+fn collect_pointer_demoted_fields(
+    tcx: TyCtxt<'_>,
+    targets: &[PointerDemotionTarget],
+) -> FxHashSet<StructFieldSlot> {
+    if targets.is_empty() {
+        return FxHashSet::default();
+    }
+
+    let mut fields = FxHashSet::default();
+    for struct_did in local_struct_dids(tcx) {
+        let owner_path = tcx.def_path_str(struct_did);
+        for (field_index, field) in tcx
+            .adt_def(struct_did)
+            .non_enum_variant()
+            .fields
+            .iter_enumerated()
+        {
+            if targets
+                .iter()
+                .any(|target| target.matches(&owner_path, field.name))
+            {
+                fields.insert(StructFieldSlot {
+                    struct_did,
+                    field_index: field_index.index(),
+                });
+            }
+        }
+    }
+    fields
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2218,6 +2336,9 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             Some(&fn_ptr_rewrite.group_decisions),
             Some(&mut diagnostics),
         );
+        let pointer_demotion_targets = parse_pointer_demotion_targets(&config.demote);
+        let pointer_demoted_bindings =
+            collect_pointer_demoted_bindings(rust_program.tcx, &pointer_demotion_targets);
         let free_like_wrappers = collect_local_free_wrappers(rust_program.tcx);
         let local_raw_free_summaries =
             collect_local_raw_free_summaries(rust_program.tcx, &free_like_wrappers);
@@ -2225,6 +2346,22 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             collect_local_raw_param_summaries(rust_program.tcx, &sig_decs, &free_like_wrappers);
         let mut forced_raw_bindings =
             downgrade_unsupported_allocator_box_kinds(rust_program.tcx, &ptr_kinds);
+        record_binding_events_excluding(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &pointer_demoted_bindings,
+            &forced_raw_bindings,
+            DecisionReason::PointerDemote,
+        );
+        let initial_pointer_demote_input_changed = force_signature_inputs_raw_for_bindings(
+            rust_program.tcx,
+            &mut sig_decs,
+            &pointer_demoted_bindings,
+            Some(&mut diagnostics),
+            DecisionReason::PointerDemote,
+        );
+        forced_raw_bindings.extend(pointer_demoted_bindings);
         let initial_allocator_input_changed = force_signature_inputs_raw_for_bindings(
             rust_program.tcx,
             &mut sig_decs,
@@ -2273,7 +2410,8 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         forced_raw_bindings.extend(double_ptr_arg_bindings);
         let initial_forced_raw_input_changed = initial_allocator_input_changed
             || initial_fn_ptr_input_changed
-            || initial_double_ptr_input_changed;
+            || initial_double_ptr_input_changed
+            || initial_pointer_demote_input_changed;
         if initial_forced_raw_input_changed {
             sync_fn_ptr_contracts(
                 rust_program,
@@ -2801,8 +2939,11 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
         let (c_exposed_abi_fields, c_exposed_thin_abi_fields, c_exposed_cursor_abi_fields) =
             collect_c_exposed_abi_fields(rust_program, &config.c_exposed_fns, &sig_decs);
         let field_cursor_fields = analysis.offset_sign_result.field_access_signs.clone();
-        let demoted_fields =
+        let pointer_demoted_fields =
+            collect_pointer_demoted_fields(rust_program.tcx, &pointer_demotion_targets);
+        let mut demoted_fields =
             collect_demoted_promoted_fields(rust_program.tcx, analysis, &sig_decs, &ptr_kinds);
+        demoted_fields.extend(pointer_demoted_fields);
         let field_ctx = FieldPtrKindContext {
             tcx: rust_program.tcx,
             analysis,
@@ -17735,12 +17876,11 @@ pub(super) fn compute_same_call_field_conflicts<'tcx>(
     rust_program: &RustProgram<'tcx>,
 ) -> FxHashMap<LocalDefId, FxHashSet<(usize, usize)>> {
     let tcx = rust_program.tcx;
-    use crate::analyses::borrow::places_conflict::{
-        AccessDepth, PlaceConflictBias, places_conflict,
-    };
-    use crate::analyses::mir::{CallKind, TerminatorExt};
-    use rustc_middle::mir::{
-        Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind,
+    use rustc_middle::mir::{Body, Local, Operand, Place, ProjectionElem, Rvalue, StatementKind};
+
+    use crate::analyses::{
+        borrow::places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
+        mir::{CallKind, TerminatorExt},
     };
 
     // Single-definition map: an arg temp `_t = <rvalue>` (assigned exactly once) -> the place it
@@ -18592,7 +18732,6 @@ fn hir_same_call_top_level_field_projection_uses_in_expr(
     visitor.visit_expr(expr);
     visitor.uses
 }
-
 
 fn hir_same_call_whole_ptr_root(expr: &hir::Expr<'_>) -> Option<HirId> {
     let expr = hir_unwrap_casts(expr);
