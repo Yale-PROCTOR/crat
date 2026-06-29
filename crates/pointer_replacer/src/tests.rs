@@ -9726,6 +9726,7 @@ mod borrow_ownership_coherence {
                 emit_crate_ownership_constraints,
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
+                sources::collect_malloc_source_slots,
             },
         },
         utils::rustc::RustProgram,
@@ -10796,6 +10797,359 @@ pub unsafe fn dcu() {
                 assert!(
                     clean.get(&f).map_or(true, |e| e.is_empty()),
                     "dead-copy fixpoint must be conflict-free under replay; got {clean:?}"
+                );
+            },
+        );
+    }
+
+    /// BB3-a (`Ref ⇒ loan`, source-based): a malloc result owns heap — it is not a borrow,
+    /// so it must never be classified `Ref` (a reference to owned memory is unsound). Here
+    /// `leak` mallocs and returns `&raw mut p`; the source conflicts with return
+    /// finalization so the relax loop leaks it (¬Owning), and with no enforcement the
+    /// max-ref objective floats the malloc result to `Ref`. `verify_to_fixpoint` must
+    /// demote the **malloc-destination** slot to `Raw` (¬Owning leaked ∧ ¬Ref source).
+    #[test]
+    fn bb3a_leaked_source_forced_raw() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
+    let mut p = unsafe { malloc(8) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "leak");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                // The malloc-destination slot (robust to whether MIR names it `p` or a temp).
+                let src = local_slot(&slots, f, call_destination(tcx, &body, "malloc"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&src),
+                    Some(&SlotKind::Raw),
+                    "leaked malloc source must be Raw (¬Owning leaked ∧ ¬Ref source); got {:?}",
+                    model.get(&src)
+                );
+            },
+        );
+    }
+
+    /// BB3-a regression guard: a reference PARAMETER must STAY `Ref`. Its backing borrow is
+    /// the caller's (no local loan), so the earlier "loanless" predicate wrongly demoted it
+    /// to `Raw`. The source-based predicate must not — a param is never a malloc-call
+    /// destination, so it is never a source slot.
+    #[test]
+    fn bb3a_param_ref_stays_ref() {
+        run_compiler(
+            r#"
+pub unsafe fn foo(p: *mut i32) -> i32 {
+    *p = 1;
+    *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "foo");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let p = local_slot(&slots, f, Local::from_u32(1), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&p),
+                    Some(&SlotKind::Ref),
+                    "reference param `p` must stay Ref (not a malloc source); got {:?}",
+                    model.get(&p)
+                );
+            },
+        );
+    }
+
+    /// BB3-a regression guard (projected-store / `destination.as_local`): in `*out = malloc()`
+    /// the store's base local `out` is a PARAM — `destination.local` would wrongly flag it as
+    /// a source. The scan uses `destination.as_local()` (bare-local only), so `out` is never
+    /// flagged and stays `Ref` (the malloc'd pointee is `Owning`, carried through `*out`).
+    #[test]
+    fn bb3a_store_malloc_through_outparam_keeps_param_ref() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
+    *out = unsafe { malloc(4) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "fill");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                // `out` is param Local 1; its depth-0 slot is borrowed caller storage = Ref.
+                let out = local_slot(&slots, f, Local::from_u32(1), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&out),
+                    Some(&SlotKind::Ref),
+                    "out-param `out` must stay Ref (its base is not a bare-local malloc dest); got {:?}",
+                    model.get(&out)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (cast-following): the canonical C2Rust shape `let p = malloc(n) as *mut T`
+    /// routes the allocation through a CAST (`_tmp = malloc()`, `_p = _tmp as *mut T`). The
+    /// source scan must flag BOTH `_tmp` and the cast target, else a leaked alloc lets the
+    /// cast target `p` float to `Ref` (a reference to owned heap). `p` must be `Raw`.
+    #[test]
+    fn bb3a_leaked_cast_source_forced_raw() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak_cast() -> *mut *mut i32 {
+    let mut p = unsafe { malloc(8) } as *mut i32;
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "leak_cast");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                // `p` is the CAST TARGET (`malloc(...) as *mut i32`), not the call dest.
+                let p = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&p),
+                    Some(&SlotKind::Raw),
+                    "leaked malloc CAST target `p` must be Raw (cast-following); got {:?}",
+                    model.get(&p)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (allocator coverage): a leaked `calloc` source — not just `malloc` — must be
+    /// demoted to `Raw`. Guards the `ALLOCATOR_NAMES` list against silently dropping an entry.
+    #[test]
+    fn bb3a_leaked_calloc_source_forced_raw() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn calloc(nmemb: usize, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak_calloc() -> *mut *mut core::ffi::c_void {
+    let mut p = unsafe { calloc(1, 8) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "leak_calloc");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let src = local_slot(&slots, f, call_destination(tcx, &body, "calloc"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&src),
+                    Some(&SlotKind::Raw),
+                    "leaked calloc source must be Raw; got {:?}",
+                    model.get(&src)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (precision, `¬ref` not `raw`): an UNLEAKED malloc source (allocated then freed,
+    /// no escape) must settle `Owning`, NOT be force-demoted to `Raw`. BB3-a's `== Ref` gate
+    /// only fires on `Ref`-classified sources, so an `Owning` source is left alone.
+    #[test]
+    fn bb3a_unleaked_malloc_stays_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn alloc_free() {
+    let p = unsafe { malloc(8) };
+    unsafe { free(p) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "alloc_free");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let p = local_slot(&slots, f, call_destination(tcx, &body, "malloc"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&p),
+                    Some(&SlotKind::Owning),
+                    "unleaked malloc source must stay Owning (¬ref not raw); got {:?}",
+                    model.get(&p)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (allocator coverage): `realloc` — which also sinks arg0 — must still be a
+    /// source on its RESULT. Guards `ALLOCATOR_NAMES` against dropping `realloc`.
+    #[test]
+    fn bb3a_leaked_realloc_source_forced_raw() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak_realloc() -> *mut *mut core::ffi::c_void {
+    let mut p = unsafe { realloc(core::ptr::null_mut(), 8) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "leak_realloc");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let src = local_slot(&slots, f, call_destination(tcx, &body, "realloc"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&src),
+                    Some(&SlotKind::Raw),
+                    "leaked realloc source must be Raw; got {:?}",
+                    model.get(&src)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (allocator coverage): `strdup`. Guards `ALLOCATOR_NAMES` against dropping it.
+    #[test]
+    fn bb3a_leaked_strdup_source_forced_raw() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn strdup(s: *const i8) -> *mut i8;
+}
+
+pub unsafe fn leak_strdup(s: *const i8) -> *mut *mut i8 {
+    let mut p = unsafe { strdup(s) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "leak_strdup");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("ownership emission");
+                add_coherence(&solver, &slots, f, &body);
+
+                let src = local_slot(&slots, f, call_destination(tcx, &body, "strdup"), 0);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+                assert_eq!(
+                    model.get(&src),
+                    Some(&SlotKind::Raw),
+                    "leaked strdup source must be Raw; got {:?}",
+                    model.get(&src)
+                );
+            },
+        );
+    }
+
+    /// BB3-a (extern gate): a crate-LOCAL fn named `malloc` is NOT an ownership source (the
+    /// boundary only sources extern `ForeignItem` callees), so its call destination must not
+    /// be flagged a malloc source — else its result would be wrongly demoted off `Ref`.
+    #[test]
+    fn bb3a_local_fn_named_malloc_is_not_a_source() {
+        run_compiler(
+            r#"
+unsafe fn malloc(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn use_it(x: *mut i32) {
+    let q = unsafe { malloc(x) };
+    *q = 1;
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let use_it = function_by_name(&program, "use_it");
+                let body = tcx.mir_drops_elaborated_and_const_checked(use_it).borrow();
+                let slots = CrateSlots::build(&program);
+
+                let q = local_slot(&slots, use_it, call_destination(tcx, &body, "malloc"), 0);
+                let sources = collect_malloc_source_slots(&program, &slots);
+                assert!(
+                    !sources.contains(&q),
+                    "a crate-local fn named `malloc` must not be flagged a source; got {sources:?}"
                 );
             },
         );
