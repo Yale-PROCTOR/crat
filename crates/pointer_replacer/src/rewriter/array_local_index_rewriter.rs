@@ -48,8 +48,7 @@ enum MaterializationKind {
     RawPtr,
 }
 
-/// one structural step of a base projection, used to match a base expression by
-/// resolution instead of pretty-printed text.
+/// one structural step of a base projection
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BaseStep {
     Deref,
@@ -57,9 +56,6 @@ enum BaseStep {
 }
 
 /// structural form of a group's base: the root binding plus its projection steps.
-/// matching resolves the root via `HirId` and compares steps, so it is
-/// shadowing-safe and formatting-insensitive (unlike `base_name`, which is for
-/// emitting code only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BasePath {
     root: HirId,
@@ -2990,12 +2986,7 @@ fn unwrap_pointer_producing_expr(expr: &Expr) -> &Expr {
 }
 
 /// resolution-based field-base match: the projection steps must match
-/// structurally and the root must resolve to `base.root`. matches the same
-/// expression shapes a canonical pretty-printed comparison would — the outer
-/// cast/paren layer is stripped and inner parens are transparent, but `AddrOf`
-/// and inner casts are not peeled (they print differently and must not match) —
-/// while resolving the root by `HirId`, which a string comparison cannot do, so
-/// it is shadowing-safe.
+/// structurally and the root must resolve to `base.root`
 fn expr_matches_base_path(
     expr: &Expr,
     ast_to_hir: &AstToHir,
