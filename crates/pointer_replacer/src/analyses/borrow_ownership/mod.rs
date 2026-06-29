@@ -11,6 +11,7 @@ mod infer;
 pub(crate) mod borrow_verify;
 pub mod coherence;
 pub mod crate_slots;
+pub(crate) mod sources;
 pub mod resolve;
 pub mod solver;
 pub mod slots;
