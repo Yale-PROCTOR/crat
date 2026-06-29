@@ -2246,8 +2246,30 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             DecisionReason::RawLocalCallArg,
         );
         forced_raw_bindings.extend(fn_ptr_raw_call_arg_bindings);
-        let initial_forced_raw_input_changed =
-            initial_allocator_input_changed || initial_fn_ptr_input_changed;
+        // Bug B (sub-shape 1): force caller locals raw when their address is passed to a
+        // promoted-outer / raw-inner double-pointer parameter, so the argument matches the
+        // callee's still-raw inner pointer instead of E0308-mismatching.
+        let double_ptr_arg_bindings =
+            collect_double_ptr_out_param_arg_bindings(rust_program.tcx, &sig_decs);
+        record_binding_events_excluding(
+            &mut diagnostics,
+            rust_program.tcx,
+            &ptr_kinds,
+            &double_ptr_arg_bindings,
+            &forced_raw_bindings,
+            DecisionReason::RawLocalCallArg,
+        );
+        let initial_double_ptr_input_changed = force_signature_inputs_raw_for_bindings(
+            rust_program.tcx,
+            &mut sig_decs,
+            &double_ptr_arg_bindings,
+            Some(&mut diagnostics),
+            DecisionReason::RawLocalCallArg,
+        );
+        forced_raw_bindings.extend(double_ptr_arg_bindings);
+        let initial_forced_raw_input_changed = initial_allocator_input_changed
+            || initial_fn_ptr_input_changed
+            || initial_double_ptr_input_changed;
         if initial_forced_raw_input_changed {
             sync_fn_ptr_contracts(
                 rust_program,
@@ -17550,6 +17572,124 @@ fn collect_fn_ptr_raw_call_arg_bindings<'tcx>(
     visitor.bindings
 }
 
+/// True iff callee parameter `idx` is a promoted-OUTER / raw-INNER double pointer (`T**`):
+/// the signature decision promoted the outer level to a borrow-like kind, but the MIR
+/// parameter peels exactly one level to a *raw* pointer (the inner level was never promoted).
+/// Passing the address of a fully-promoted single-level object (a caller local or a struct
+/// field) to such a parameter produces an E0308 representation mismatch, so the caller-side
+/// source must be kept raw to agree with the callee's raw inner pointer.
+fn param_is_double_ptr_raw_inner(
+    tcx: TyCtxt<'_>,
+    sig_decs: &SigDecisions,
+    callee_did: LocalDefId,
+    idx: usize,
+) -> bool {
+    let Some(sig) = sig_decs.data.get(&callee_did) else {
+        return false;
+    };
+    if !matches!(
+        sig.input_decs.get(idx).copied().flatten(),
+        Some(PtrKind::OptRef(_) | PtrKind::Slice(_) | PtrKind::SliceCursor(_) | PtrKind::Ref(_))
+    ) {
+        return false;
+    }
+    let inputs = tcx.fn_sig(callee_did).skip_binder().inputs().skip_binder();
+    let Some(param_ty) = inputs.get(idx) else {
+        return false;
+    };
+    let Some((inner, _)) = unwrap_ptr_from_mir_ty(*param_ty) else {
+        return false;
+    };
+    // Only a genuine T** (the inner level is itself a raw pointer) triggers demotion; a
+    // single pointer to a raw-leaf struct (inner is a struct) must not.
+    inner.is_raw_ptr()
+}
+
+/// Caller LOCALS whose address is passed to a promoted-outer / raw-inner double-pointer
+/// parameter (see [`param_is_double_ptr_raw_inner`]). These must be forced raw so the
+/// `&mut <local>` argument matches the callee's raw inner pointer (Bug B, sub-shape 1).
+fn collect_double_ptr_out_param_arg_bindings<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+) -> FxHashSet<HirId> {
+    struct DoublePtrArgBindingVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        bindings: FxHashSet<HirId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for DoublePtrArgBindingVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Call(_, args) = expr.kind
+                && let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
+            {
+                for (idx, arg) in args.iter().enumerate() {
+                    if param_is_double_ptr_raw_inner(self.tcx, self.sig_decs, callee_did, idx)
+                        && let Some((hir_id, _)) = hir_addr_local(arg)
+                    {
+                        self.bindings.insert(hir_id);
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = DoublePtrArgBindingVisitor {
+        tcx,
+        sig_decs,
+        bindings: FxHashSet::default(),
+    };
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        visitor.visit_body(body);
+    }
+    visitor.bindings
+}
+
+/// Struct FIELDS whose address is passed to a promoted-outer / raw-inner double-pointer
+/// parameter. These must be demoted so the `&mut (*base).field` argument matches the
+/// callee's raw inner pointer (Bug B, sub-shape 2).
+fn collect_double_ptr_out_param_field_slots<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sig_decs: &SigDecisions,
+) -> FxHashSet<StructFieldSlot> {
+    struct DoublePtrArgFieldVisitor<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        sig_decs: &'a SigDecisions,
+        slots: FxHashSet<StructFieldSlot>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for DoublePtrArgFieldVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Call(_, args) = expr.kind
+                && let Some(callee_did) = hir_called_local_fn(self.tcx, expr)
+            {
+                for (idx, arg) in args.iter().enumerate() {
+                    if param_is_double_ptr_raw_inner(self.tcx, self.sig_decs, callee_did, idx)
+                        && let hir::ExprKind::AddrOf(_, _, pointee) = hir_unwrap_casts(arg).kind
+                        && let Some(slot) = hir_struct_field_slot(self.tcx, pointee)
+                    {
+                        self.slots.insert(slot);
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut visitor = DoublePtrArgFieldVisitor {
+        tcx,
+        sig_decs,
+        slots: FxHashSet::default(),
+    };
+    for def_id in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(def_id);
+        visitor.visit_body(body);
+    }
+    visitor.slots
+}
+
 fn callback_raw_arg_source_binding(expr: &hir::Expr<'_>) -> Option<HirId> {
     let expr = hir_unwrap_casts(expr);
     match expr.kind {
@@ -21056,6 +21196,10 @@ fn collect_demoted_promoted_fields(
             .keys()
             .copied(),
     );
+    // Bug B (sub-shape 2): demote fields whose address is passed to a promoted-outer /
+    // raw-inner double-pointer parameter, so `&mut (*base).field` matches the callee's
+    // still-raw inner pointer instead of E0308-mismatching.
+    demoted_fields.extend(collect_double_ptr_out_param_field_slots(tcx, sig_decs));
 
     demoted_fields
 }
