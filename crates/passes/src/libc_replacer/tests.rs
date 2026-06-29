@@ -207,6 +207,36 @@ pub unsafe fn foo(mut src: &[u8], mut dst: &mut [u8]) {
 }
 
 #[test]
+fn test_offset_i8_memory_calls_use_borrowed_byte_slices() {
+    run_test(
+        r#"
+extern "C" {
+    fn memcpy(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+    fn memmove(__dest: *mut core::ffi::c_void, __src: *const core::ffi::c_void, __n: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn foo(src: &[i8], count: usize, start: isize) {
+    let mut dst = [0i8; 64];
+    memmove(dst.as_mut_ptr() as *mut _, dst.as_ptr().offset(start) as *const _, count);
+    memcpy(dst.as_mut_ptr().offset(2) as *mut _, src.as_ptr().offset(1) as *const _, count);
+}
+        "#,
+        &[
+            "bytemuck::cast_slice::<_",
+            "bytemuck::cast_slice_mut::<_",
+            "&(dst)[(start) as",
+            "&mut (dst)[(2) as",
+            "(1) as usize..",
+        ],
+        &[
+            "memcpy(dst.as_mut_ptr",
+            "memmove(dst.as_mut_ptr",
+            "cast_slice::<_, u8>((",
+        ],
+    );
+}
+
+#[test]
 fn test_strncpy_from_short_slice_caps_copy_len() {
     run_test(
         r#"

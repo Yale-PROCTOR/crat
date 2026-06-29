@@ -308,7 +308,7 @@ impl ArrayPtr<'_, '_> {
         let borrow = if mutable { "&mut" } else { "&" };
         if let Some(offset) = self.offset {
             let offset = pprust::expr_to_string(offset);
-            format!("({borrow} ({array}))[({offset}) as usize..]")
+            format!("{borrow} ({array})[({offset}) as usize..]")
         } else {
             format!("({borrow} ({array}))")
         }
