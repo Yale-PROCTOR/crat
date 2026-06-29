@@ -3371,6 +3371,48 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         }
     }
 
+    /// recognizes a deref operand of the form `<local>.offset(a).add(b)...` (one
+    /// or more offset/add calls, no receiver cast) whose innermost receiver is an
+    /// introduced nullable index-rewritten member local, and returns the
+    /// replacement `*((base).offset(<index>) as <ptr_ty>)`. the index starts from
+    /// `idx_read_expr(rewrite)` (`prev_idx.unwrap()`) and folds each offset
+    /// argument with the existing `+` helper path. peeling with `unwrap_paren`
+    /// (not `unwrap_cast_and_paren`) keeps any receiver cast in place so it fails
+    /// the bare-local lookup, leaving cast-bearing projections to the existing
+    /// pointer-value fallback.
+    fn projected_deref_replacement(&self, operand: &Expr) -> Option<Expr> {
+        let mut offsets: Vec<(&str, &Expr)> = Vec::new();
+        let mut cur = unwrap_paren(operand);
+        while let ExprKind::MethodCall(call) = &cur.kind {
+            let name = call.seg.ident.name.as_str();
+            if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+                return None;
+            }
+            offsets.push((name, &call.args[0]));
+            cur = unwrap_paren(&call.receiver);
+        }
+        // the zero-offset `*q` form is handled by the direct deref branch.
+        if offsets.is_empty() {
+            return None;
+        }
+        let hir_id = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, cur.id)?;
+        if !self.introduced_hir_ids.contains(&hir_id) {
+            return None;
+        }
+        let rewrite = self.plan.by_hir_id.get(&hir_id)?;
+        if !rewrite_uses_index_rewrite(rewrite) || !rewrite.nullable {
+            return None;
+        }
+        // fold innermost offset first; additive folding is order-independent.
+        let mut index = idx_read_expr(rewrite);
+        for (name, arg) in offsets.iter().rev() {
+            index = pprust::expr_to_string(&relative_index_expr(&index, name, arg));
+        }
+        let base_offset = base_offset_expr_for_index(rewrite, &index);
+        let ptr = utils::expr!("{} as {}", base_offset, rewrite.ptr_ty);
+        Some(utils::expr!("*({})", pprust::expr_to_string(&ptr)))
+    }
+
     /// builds the index RHS for a conditional cursor update: visits the original
     /// condition (rewriting pointer uses such as `*q`) and assembles
     /// `if <cond'> { then } else { else }`. `rhs` is the original `if` expression.
@@ -3843,6 +3885,14 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
         {
             let ptr = pointer_expr_for_index(rewrite);
             *expr = utils::expr!("*({})", pprust::expr_to_string(&ptr));
+            self.changed = true;
+            return;
+        }
+
+        if let ExprKind::Unary(UnOp::Deref, inner) = &expr.kind
+            && let Some(replacement) = self.projected_deref_replacement(inner)
+        {
+            *expr = replacement;
             self.changed = true;
             return;
         }

@@ -7959,6 +7959,118 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
 }
 
 #[test]
+fn test_array_local_rewriter_lowers_nullable_projected_deref_through_base() {
+    // a nullable index-backed member that is projected-derefed (`*prev.offset(x)`)
+    // lowers directly through the base pointer instead of the map_or bridge.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u8 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *prev.offset(x)
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut prev_idx: Option<isize> = None"), "{s}");
+    assert!(
+        s.contains("*((raw).offset((prev_idx.unwrap()) + (x)) as *mut u8)"),
+        "projected deref lowered through base: {s}"
+    );
+    assert!(
+        !s.contains("prev_idx.map_or"),
+        "no map_or bridge for the deref: {s}"
+    );
+}
+
+#[test]
+fn test_projected_nullable_deref_no_raw_bridge_after_promotion() {
+    // reduced from B02_organic/unfilter_lib: `raw` is a moving base cursor that
+    // borrow-promotes to a slice cursor; `prev` is a nullable member projected-
+    // derefed. the promoted base must not leave a `map_or(...).as_mut_ptr().offset`
+    // bridge.
+    let code = r#"
+pub unsafe extern "C" fn unfilter_like(mut h: i32, mut len: i32, mut raw: *mut u8) {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    let mut x: i32 = 0;
+    let mut y: i32 = 1;
+    while y < h {
+        raw = raw.offset(1);
+        if !prev.is_null() {
+            x = 0;
+            while x < len {
+                *raw.offset(x as isize) = (*raw.offset(x as isize) as i32
+                    + *prev.offset(x as isize) as i32) as u8;
+                x += 1;
+            }
+        }
+        prev = raw;
+        raw = raw.offset(len as isize);
+        y += 1;
+    }
+}
+"#;
+    let config = Config::default();
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !s.contains(".as_mut_ptr()).offset("),
+        "no raw bridge for the projected nullable deref: {s}"
+    );
+    assert!(!s.contains("prev_idx.map_or"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_cast_projected_deref_unchanged() {
+    // a receiver cast in the projection keeps the bare member, which the existing
+    // map_or pointer-value fallback lowers; the projected-deref branch bails.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u16 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *(prev as *mut u16).offset(x)
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("prev_idx.map_or"),
+        "cast receiver bails to map_or: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_non_nullable_projected_deref_to_existing_lowering() {
+    // a non-nullable index-backed member keeps its existing lowering; the
+    // nullable-gated projected-deref branch does not fire.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut i32, mut x: isize) -> i32 {
+    let mut p: *mut i32 = raw.offset(1);
+    raw = raw.offset(2);
+    let v = *p.offset(x);
+    let _ = raw;
+    v
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // `p` is index-backed but non-nullable, so it keeps the existing double-offset
+    // lowering (deferred to item 10) rather than the nullable projected-base form.
+    assert!(s.contains("let mut p_idx: isize"), "{s}");
+    assert!(!s.contains("p_idx.unwrap()"), "{s}");
+    assert!(
+        s.contains("*((raw).offset(p_idx) as *mut i32).offset(x)"),
+        "{s}"
+    );
+}
+
+#[test]
 fn test_array_local_rewriter_keeps_direct_base_write_cursor_index_only() {
     let code = r#"
 pub unsafe fn wcscat_like(mut dst: *mut i32, mut num_elem: usize, mut src: *const i32) -> i32 {
