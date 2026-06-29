@@ -48,6 +48,24 @@ enum MaterializationKind {
     RawPtr,
 }
 
+/// one structural step of a base projection, used to match a base expression by
+/// resolution instead of pretty-printed text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BaseStep {
+    Deref,
+    Field(String),
+}
+
+/// structural form of a group's base: the root binding plus its projection steps.
+/// matching resolves the root via `HirId` and compares steps, so it is
+/// shadowing-safe and formatting-insensitive (unlike `base_name`, which is for
+/// emitting code only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BasePath {
+    root: HirId,
+    steps: Vec<BaseStep>,
+}
+
 #[derive(Clone, Debug)]
 struct BindingRewrite {
     source_hir_id: HirId,
@@ -60,6 +78,7 @@ struct BindingRewrite {
     moves: bool,
     base_hir_id: HirId,
     base_name: String,
+    base_path: BasePath,
     base_index_name: Option<String>,
     base_is_raw_ptr: bool,
     nullable: bool,
@@ -78,6 +97,7 @@ struct BaseCursorRewrite {
     fn_def_id: LocalDefId,
     base_hir_id: HirId,
     base_name: String,
+    base_path: BasePath,
     index_name: String,
     base_is_raw_ptr: bool,
     ptr_ty: String,
@@ -907,106 +927,128 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
         return;
     };
 
-    // Compute (base_name, proxy_hir_ids) depending on whether the base is a
-    // direct local (offset 0) or a field path (offset > 0).
-    // (base_name, proxy_hir_ids, field_base)
-    let (base_name, proxy_hir_ids, field_base): (String, FxHashSet<HirId>, bool) =
-        if group.base_slot_offset == 0 {
-            (
-                context.tcx.hir_name(base_hir_id).to_string(),
-                FxHashSet::default(),
-                false,
-            )
-        } else {
-            let Some(base_slot_info) =
-                analyses::array_local_provenance::base_slot_info(context.provenance, group)
-            else {
-                context.trace.record(
-                    context.def_id,
-                    TraceSubject::Group(base_local_label()),
-                    TraceStage::Plan,
-                    TraceDecision::Dropped,
-                    || "plan: missing base slot info".to_string(),
-                );
-                return;
-            };
-            let local_name = context.tcx.hir_name(base_hir_id).to_string();
-            let base_ty = context.body.local_decls[group.base_local].ty;
-            let Some(field_path_name) =
-                slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
-            else {
-                context.trace.record(
-                    context.def_id,
-                    TraceSubject::Group(base_local_label()),
-                    TraceStage::Plan,
-                    TraceDecision::Dropped,
-                    || "plan: base field path not expressible".to_string(),
-                );
-                return;
-            };
-            // collect raw-pointer members that can serve as proxies for the field base
-            let proxies: FxHashSet<HirId> = group
-                .members
-                .iter()
-                .filter_map(|&slot_idx| {
-                    let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
-                    if !info.path.is_empty() || info.root == group.base_local {
-                        return None;
-                    }
-                    if !matches!(
-                        context.body.local_decls[info.root].ty.kind(),
-                        ty::TyKind::RawPtr(..)
-                    ) {
-                        return None;
-                    }
-                    let &hir_id = context.local_to_hir.get(&info.root)?;
-                    (!group.index_tracked
-                        && (local_is_pure_field_base_proxy(context.body, info.root)
-                            || (local_is_never_mutated(context.body, info.root)
-                                && local_is_simple_copy_from_local(
-                                    context.body,
-                                    info.root,
-                                    group.base_local,
-                                ))))
-                    .then_some(hir_id)
-                })
-                .collect();
-            // a never-mutated member that holds the base pointer at offset 0 can be used as
-            // the effective base name, avoiding rewriting it to an index and allowing members
-            // to use IndexOnly representation (field_base = false).
-            let immutable_copy_name = if !group.index_tracked {
-                group.members.iter().find_map(|&slot_idx| {
-                    let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
-                    if !info.path.is_empty() || info.root == group.base_local {
-                        return None;
-                    }
-                    if !matches!(
-                        context.body.local_decls[info.root].ty.kind(),
-                        ty::TyKind::RawPtr(..)
-                    ) {
-                        return None;
-                    }
-                    if local_is_pure_field_base_proxy(context.body, info.root) {
-                        return None;
-                    }
-                    if !local_is_never_mutated(context.body, info.root) {
-                        return None;
-                    }
-                    // confirm the single init directly copies the field base (not a call result)
-                    if !local_is_simple_copy_from_local(context.body, info.root, group.base_local) {
-                        return None;
-                    }
-                    let &hir_id = context.local_to_hir.get(&info.root)?;
-                    Some(context.tcx.hir_name(hir_id).to_string())
-                })
-            } else {
-                None
-            };
-            match immutable_copy_name {
-                Some(name) => (name, proxies, false),
-                None => (field_path_name, proxies, true),
-            }
+    // Compute (base_name, proxy_hir_ids, field_base, base_steps) depending on
+    // whether the base is a direct local (offset 0) or a field path (offset > 0).
+    // base_steps is the structural projection used for resolution-based matching;
+    // it is empty for a direct-local base (matching keys on the root HirId).
+    let (base_name, proxy_hir_ids, field_base, base_steps): (
+        String,
+        FxHashSet<HirId>,
+        bool,
+        Vec<BaseStep>,
+    ) = if group.base_slot_offset == 0 {
+        (
+            context.tcx.hir_name(base_hir_id).to_string(),
+            FxHashSet::default(),
+            false,
+            Vec::new(),
+        )
+    } else {
+        let Some(base_slot_info) =
+            analyses::array_local_provenance::base_slot_info(context.provenance, group)
+        else {
+            context.trace.record(
+                context.def_id,
+                TraceSubject::Group(base_local_label()),
+                TraceStage::Plan,
+                TraceDecision::Dropped,
+                || "plan: missing base slot info".to_string(),
+            );
+            return;
         };
+        let local_name = context.tcx.hir_name(base_hir_id).to_string();
+        let base_ty = context.body.local_decls[group.base_local].ty;
+        let Some(field_path_name) =
+            slot_path_to_expr_string(&local_name, &base_slot_info.path, base_ty, context.tcx)
+        else {
+            context.trace.record(
+                context.def_id,
+                TraceSubject::Group(base_local_label()),
+                TraceStage::Plan,
+                TraceDecision::Dropped,
+                || "plan: base field path not expressible".to_string(),
+            );
+            return;
+        };
+        let Some(field_base_steps) =
+            slot_path_to_base_steps(&base_slot_info.path, base_ty, context.tcx)
+        else {
+            context.trace.record(
+                context.def_id,
+                TraceSubject::Group(base_local_label()),
+                TraceStage::Plan,
+                TraceDecision::Dropped,
+                || "plan: base field path not structurally resolvable".to_string(),
+            );
+            return;
+        };
+        // collect raw-pointer members that can serve as proxies for the field base
+        let proxies: FxHashSet<HirId> = group
+            .members
+            .iter()
+            .filter_map(|&slot_idx| {
+                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                if !info.path.is_empty() || info.root == group.base_local {
+                    return None;
+                }
+                if !matches!(
+                    context.body.local_decls[info.root].ty.kind(),
+                    ty::TyKind::RawPtr(..)
+                ) {
+                    return None;
+                }
+                let &hir_id = context.local_to_hir.get(&info.root)?;
+                (!group.index_tracked
+                    && (local_is_pure_field_base_proxy(context.body, info.root)
+                        || (local_is_never_mutated(context.body, info.root)
+                            && local_is_simple_copy_from_local(
+                                context.body,
+                                info.root,
+                                group.base_local,
+                            ))))
+                .then_some(hir_id)
+            })
+            .collect();
+        // a never-mutated member that holds the base pointer at offset 0 can be used as
+        // the effective base name, avoiding rewriting it to an index and allowing members
+        // to use IndexOnly representation (field_base = false).
+        let immutable_copy_name = if !group.index_tracked {
+            group.members.iter().find_map(|&slot_idx| {
+                let info = context.provenance.slot_table.slot_infos.get(slot_idx)?;
+                if !info.path.is_empty() || info.root == group.base_local {
+                    return None;
+                }
+                if !matches!(
+                    context.body.local_decls[info.root].ty.kind(),
+                    ty::TyKind::RawPtr(..)
+                ) {
+                    return None;
+                }
+                if local_is_pure_field_base_proxy(context.body, info.root) {
+                    return None;
+                }
+                if !local_is_never_mutated(context.body, info.root) {
+                    return None;
+                }
+                // confirm the single init directly copies the field base (not a call result)
+                if !local_is_simple_copy_from_local(context.body, info.root, group.base_local) {
+                    return None;
+                }
+                let &hir_id = context.local_to_hir.get(&info.root)?;
+                Some(context.tcx.hir_name(hir_id).to_string())
+            })
+        } else {
+            None
+        };
+        match immutable_copy_name {
+            Some(name) => (name, proxies, false, Vec::new()),
+            None => (field_path_name, proxies, true, field_base_steps),
+        }
+    };
+    let base_path = BasePath {
+        root: base_hir_id,
+        steps: base_steps,
+    };
 
     let base_is_raw_ptr = matches!(
         context.body.local_decls[group.base_local].ty.kind(),
@@ -1096,6 +1138,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                     fn_def_id: context.def_id,
                     base_hir_id,
                     base_name: base_name.clone(),
+                    base_path: base_path.clone(),
                     index_name: index_name.clone(),
                     base_is_raw_ptr,
                     ptr_ty,
@@ -1184,6 +1227,7 @@ fn add_group_to_plan(context: &mut GroupPlanContext<'_, '_>, group: &RewriteGrou
                 moves: false,
                 base_hir_id,
                 base_name: base_name.clone(),
+                base_path: base_path.clone(),
                 base_index_name: base_index_name.clone(),
                 base_is_raw_ptr,
                 nullable,
@@ -1298,6 +1342,32 @@ fn slot_path_to_expr_string<'tcx>(
         }
     }
     Some(expr)
+}
+
+/// structural counterpart of `slot_path_to_expr_string`: resolves the same field
+/// names but emits `BaseStep`s for resolution-based matching. shares the failure
+/// conditions (unresolvable deref/field, `Element`).
+fn slot_path_to_base_steps<'tcx>(
+    path: &[SlotPathElem],
+    mut ty: ty::Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<Vec<BaseStep>> {
+    let mut steps = Vec::with_capacity(path.len());
+    for elem in path {
+        match elem {
+            SlotPathElem::Pointee => {
+                ty = ty.builtin_deref(true)?;
+                steps.push(BaseStep::Deref);
+            }
+            SlotPathElem::Field(field) => {
+                let (field_name, field_ty) = named_struct_field(tcx, ty, *field)?;
+                steps.push(BaseStep::Field(field_name));
+                ty = field_ty;
+            }
+            SlotPathElem::Element => return None,
+        }
+    }
+    Some(steps)
 }
 
 fn local_is_pure_field_base_proxy(body: &rustc_middle::mir::Body<'_>, local: Local) -> bool {
@@ -1629,6 +1699,10 @@ fn collect_binding_use_summaries_for_names_for_test(
                     moves: false,
                     base_hir_id: hir_id,
                     base_name: "base".to_string(),
+                    base_path: BasePath {
+                        root: hir_id,
+                        steps: Vec::new(),
+                    },
                     base_index_name: None,
                     base_is_raw_ptr: true,
                     nullable: false,
@@ -2344,11 +2418,11 @@ fn base_assignment_index_arg_contains_planned_local(
             receiver,
             ast_to_hir,
             tcx,
-            base_rewrite.base_hir_id,
-            &base_rewrite.base_name,
+            &base_rewrite.base_path,
             base_rewrite.field_base,
         )
-        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
+        || (base_rewrite.field_base
+            && expr_matches_base_path(receiver, ast_to_hir, tcx, &base_rewrite.base_path));
     if !receiver_is_base
         && !receiver_hir_id.is_some_and(|hir_id| {
             planned_rewrites
@@ -2401,10 +2475,8 @@ fn direct_base_cursor_key(
         return Some(base_key);
     }
     base_rewrites.iter().find_map(|(key, rewrite)| {
-        (rewrite.field_base
-            && expr_matches_base_name(expr, &rewrite.base_name)
-            && expr_is_projection_from_base_hir(expr, ast_to_hir, tcx, rewrite.base_hir_id))
-        .then_some(key.clone())
+        (rewrite.field_base && expr_matches_base_path(expr, ast_to_hir, tcx, &rewrite.base_path))
+            .then_some(key.clone())
     })
 }
 
@@ -2613,7 +2685,8 @@ fn derive_member_call(
     let arg0 = call_args.first()?;
     let arg0_is_base = hir_id_of_ast_expr(ctx.ast_to_hir, ctx.tcx, unwrap_cast_and_paren(arg0).id)
         == Some(rewrite.base_hir_id)
-        || (rewrite.field_base && expr_matches_base_name(arg0, &rewrite.base_name));
+        || (rewrite.field_base
+            && expr_matches_base_path(arg0, ctx.ast_to_hir, ctx.tcx, &rewrite.base_path));
     if !arg0_is_base {
         return Some(Derivation::Unsupported("call arg0 is not the group base"));
     }
@@ -2745,7 +2818,8 @@ fn derive_base_index(
     // base = base / base.as_ptr -> index 0 (the base cursor's own index).
     if (!base_rewrite.field_base
         && hir_id_of_ast_expr(ctx.ast_to_hir, ctx.tcx, rhs_u.id) == Some(base_rewrite.base_hir_id))
-        || (base_rewrite.field_base && expr_matches_base_name(rhs_u, &base_rewrite.base_name))
+        || (base_rewrite.field_base
+            && expr_matches_base_path(rhs_u, ctx.ast_to_hir, ctx.tcx, &base_rewrite.base_path))
     {
         return Derivation::Index(IndexExpr::Plain(utils::expr!(
             "{}",
@@ -2781,11 +2855,11 @@ fn derive_base_index(
             receiver,
             ctx.ast_to_hir,
             ctx.tcx,
-            base_rewrite.base_hir_id,
-            &base_rewrite.base_name,
+            &base_rewrite.base_path,
             base_rewrite.field_base,
         )
-        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
+        || (base_rewrite.field_base
+            && expr_matches_base_path(receiver, ctx.ast_to_hir, ctx.tcx, &base_rewrite.base_path));
     if receiver_is_base {
         let offset = offset_index_arg_expr(name, &call.args[0]);
         return Derivation::Index(IndexExpr::Plain(add_index_expr(
@@ -2915,9 +2989,50 @@ fn unwrap_pointer_producing_expr(expr: &Expr) -> &Expr {
     }
 }
 
-fn expr_matches_base_name(expr: &Expr, base_name: &str) -> bool {
-    pprust::expr_to_string(unwrap_cast_and_paren(expr)).replace(' ', "")
-        == base_name.replace(' ', "")
+/// resolution-based field-base match: the projection steps must match
+/// structurally and the root must resolve to `base.root`. matches the same
+/// expression shapes a canonical pretty-printed comparison would — the outer
+/// cast/paren layer is stripped and inner parens are transparent, but `AddrOf`
+/// and inner casts are not peeled (they print differently and must not match) —
+/// while resolving the root by `HirId`, which a string comparison cannot do, so
+/// it is shadowing-safe.
+fn expr_matches_base_path(
+    expr: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base: &BasePath,
+) -> bool {
+    expr_matches_base_steps(
+        unwrap_cast_and_paren(expr),
+        ast_to_hir,
+        tcx,
+        base.root,
+        &base.steps,
+    )
+}
+
+fn expr_matches_base_steps(
+    expr: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    root: HirId,
+    steps: &[BaseStep],
+) -> bool {
+    let expr = unwrap_paren(expr);
+    let Some((last, rest)) = steps.split_last() else {
+        return hir_id_of_ast_expr(ast_to_hir, tcx, expr.id) == Some(root);
+    };
+    match (last, &expr.kind) {
+        (BaseStep::Field(name), ExprKind::Field(inner, ident))
+            if ident.name.as_str() == name.as_str() =>
+        {
+            expr_matches_base_steps(inner, ast_to_hir, tcx, root, rest)
+        }
+        (BaseStep::Deref, ExprKind::Unary(UnOp::Deref, inner)) => {
+            expr_matches_base_steps(inner, ast_to_hir, tcx, root, rest)
+        }
+        _ => false,
+    }
 }
 
 fn offset_index_arg_expr(name: &str, arg: &Expr) -> Expr {
@@ -2977,7 +3092,12 @@ fn receiver_is_base_as_ptr_hir(
     expr_is_projection_from_base_hir(&call.receiver, ast_to_hir, tcx, base_hir_id)
 }
 
-fn receiver_is_field_base_as_ptr(receiver: &Expr, base_name: &str) -> bool {
+fn receiver_is_field_base_as_ptr(
+    receiver: &Expr,
+    ast_to_hir: &AstToHir,
+    tcx: TyCtxt<'_>,
+    base: &BasePath,
+) -> bool {
     let ExprKind::MethodCall(call) = &receiver.kind else {
         return false;
     };
@@ -2985,21 +3105,20 @@ fn receiver_is_field_base_as_ptr(receiver: &Expr, base_name: &str) -> bool {
     if !matches!(name, "as_ptr" | "as_mut_ptr") || !call.args.is_empty() {
         return false;
     }
-    expr_matches_base_name(&call.receiver, base_name)
+    expr_matches_base_path(&call.receiver, ast_to_hir, tcx, base)
 }
 
 fn receiver_is_base_as_ptr_for_context(
     receiver: &Expr,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
-    base_hir_id: HirId,
-    base_name: &str,
+    base_path: &BasePath,
     field_base: bool,
 ) -> bool {
     if field_base {
-        receiver_is_field_base_as_ptr(receiver, base_name)
+        receiver_is_field_base_as_ptr(receiver, ast_to_hir, tcx, base_path)
     } else {
-        receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_hir_id)
+        receiver_is_base_as_ptr_hir(receiver, ast_to_hir, tcx, base_path.root)
     }
 }
 
@@ -3013,8 +3132,7 @@ fn receiver_is_base_as_ptr(
         receiver,
         ast_to_hir,
         tcx,
-        rewrite.base_hir_id,
-        &rewrite.base_name,
+        &rewrite.base_path,
         rewrite.field_base,
     )
 }
@@ -3071,7 +3189,7 @@ fn pointer_index_from_base_expr(
     rewrite: &BindingRewrite,
 ) -> IndexExpr {
     let base_hir_id = rewrite.base_hir_id;
-    let base_name = rewrite.base_name.as_str();
+    let base_path = &rewrite.base_path;
     let field_base = rewrite.field_base;
     let base_proxy_hir_ids = &rewrite.base_proxy_hir_ids;
     let base_index_name = base_current_index_expr(rewrite);
@@ -3084,15 +3202,8 @@ fn pointer_index_from_base_expr(
     let expr_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, expr.id);
     if (!field_base && expr_hir_id == Some(base_hir_id))
         || expr_hir_id.is_some_and(|id| base_proxy_hir_ids.contains(&id))
-        || (field_base && expr_matches_base_name(expr, base_name))
-        || receiver_is_base_as_ptr_for_context(
-            expr,
-            ast_to_hir,
-            tcx,
-            base_hir_id,
-            base_name,
-            field_base,
-        )
+        || (field_base && expr_matches_base_path(expr, ast_to_hir, tcx, base_path))
+        || receiver_is_base_as_ptr_for_context(expr, ast_to_hir, tcx, base_path, field_base)
     {
         return IndexExpr::Plain(match base_index_name {
             Some(index_name) => utils::expr!("{}", index_name),
@@ -3113,15 +3224,8 @@ fn pointer_index_from_base_expr(
     let receiver = unwrap_cast_and_paren(&call.receiver);
     let receiver_hir_id = hir_id_of_ast_expr(ast_to_hir, tcx, receiver.id);
     let receiver_is_base = (!field_base && receiver_hir_id == Some(base_hir_id))
-        || receiver_is_base_as_ptr_for_context(
-            receiver,
-            ast_to_hir,
-            tcx,
-            base_hir_id,
-            base_name,
-            field_base,
-        )
-        || (field_base && expr_matches_base_name(receiver, base_name))
+        || receiver_is_base_as_ptr_for_context(receiver, ast_to_hir, tcx, base_path, field_base)
+        || (field_base && expr_matches_base_path(receiver, ast_to_hir, tcx, base_path))
         || receiver_hir_id.is_some_and(|id| base_proxy_hir_ids.contains(&id));
     if !receiver_is_base {
         return IndexExpr::Unsupported;
@@ -3161,11 +3265,11 @@ fn live_base_self_advance_counter(
             receiver,
             ast_to_hir,
             tcx,
-            base_rewrite.base_hir_id,
-            &base_rewrite.base_name,
+            &base_rewrite.base_path,
             base_rewrite.field_base,
         )
-        || (base_rewrite.field_base && expr_matches_base_name(receiver, &base_rewrite.base_name));
+        || (base_rewrite.field_base
+            && expr_matches_base_path(receiver, ast_to_hir, tcx, &base_rewrite.base_path));
     if !receiver_is_base {
         return None;
     }

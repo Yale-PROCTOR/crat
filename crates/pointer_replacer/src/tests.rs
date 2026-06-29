@@ -1837,6 +1837,58 @@ pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
 }
 
 #[test]
+fn test_rewriter_field_base_match_is_paren_insensitive() {
+    // the field-base access is written with a redundant paren (`(h).p`), which a
+    // pretty-printed string match rejects (`(h).p` != `h.p`); structural matching
+    // resolves it and still promotes the field.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
+    let mut h = Holder { p: buf.as_mut_ptr() };
+    *(h).p.offset(1) = 9;
+    buf[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "as usize.."],
+        &[
+            "pub p: Option<&'a mut i32>",
+            "pub p: *mut i32",
+            ".offset(1)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_field_base_distinct_fields_do_not_cross_match() {
+    // two pointer fields each form their own base; matching one must never match
+    // the other (the `Field` step name differs), so both promote to their own
+    // slice independently with no cross-contamination.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub q: *mut i32,
+}
+
+pub unsafe fn touch(mut a: [i32; 2], mut b: [i32; 2]) -> i32 {
+    let mut h = Holder { p: a.as_mut_ptr(), q: b.as_mut_ptr() };
+    *h.p.offset(1) = 9;
+    *h.q.offset(1) = 7;
+    a[1] + b[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "pub q: &'b mut [i32]"],
+        &["pub p: *mut i32", "pub q: *mut i32", ".offset(1)"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_array_like_struct_field_to_slice() {
     run_test(
         r#"
