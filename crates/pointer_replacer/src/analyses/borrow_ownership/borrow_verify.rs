@@ -227,7 +227,7 @@ pub(crate) fn verify_to_fixpoint(
             |s| model.get(&s) != Some(&SlotKind::Ref),
             is_mutable,
         );
-        debug_assert!(
+        assert!(
             guard_slots_are_ref(&conflicts, &model),
             "every residual conflict slot must be Ref in the current model"
         );
@@ -290,6 +290,10 @@ fn round_cap(slots: &CrateSlots) -> usize {
 /// `Ref` in the current model. `Raw` slots are replay-demoted (witnessed) and `Owning`
 /// slots are non-candidates, so a residual edge can only name surviving `Ref`
 /// candidates; a violation signals the deferred Owning-issuer / under-report cases.
+/// Release-active (BB3-c): a violation = a model with a live residual conflict whose
+/// owner slot is not `Ref`, so `representative` cannot commit it and the loop would
+/// silently accept an unsound model bound for codegen — it must fail-closed even in
+/// release, not compile out.
 fn guard_slots_are_ref(
     conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
     model: &FxHashMap<SlotRef, SlotKind>,

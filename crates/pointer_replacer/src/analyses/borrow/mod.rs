@@ -958,7 +958,7 @@ fn extract_conflict_edges(
 /// their unions to a fixpoint (each round demotes ≥1 fresh `Raw` local, so ≤|Raw|
 /// rounds), then extract the residual conflicts over the surviving `Ref` candidates.
 ///
-/// Invariant (`debug_assert`ed): every model-`Raw` local that was NOT a demotion witness
+/// Invariant (`assert`ed, release-active since BB3-c): every model-`Raw` local that was NOT a demotion witness
 /// (so it kept its provenance through the fixpoint) is *inert* — it appears in no residual
 /// conflict edge. This is the relaxation of an earlier, too-strong "every `Raw` slot is a
 /// witness" assert. A non-witness `Raw` local can legitimately arise from coherence's
@@ -967,8 +967,10 @@ fn extract_conflict_edges(
 /// never demoted. Such a local cannot be the live issuer/requirer of a residual invalid
 /// loan (else `to_demote` would be non-empty and the loop would not have broken), and
 /// `extract_conflict_edges` draws owners from exactly those live sources — so it is
-/// provably absent from `edges`. The `debug_assert` is a tripwire on that inert-ness; in
-/// release it compiles out and the stray `Raw` (being inert) is harmless.
+/// provably absent from `edges`. The `assert` is a tripwire on that inert-ness; BB3-c made it
+/// release-active so it guards the future BO→codegen path — in the proven-inert valid case it
+/// never fires (a release panic here would mean the inert-ness proof was wrong, i.e. a genuine
+/// soundness bug, not the harmless dead-copy case).
 ///
 /// CAVEAT (adversarial review, 2026-06-24): the inert-ness invariant also absorbs the
 /// Owning-issuer case (a loan whose `issuer` is classed `Owning` vanishes under the replay
@@ -1053,7 +1055,7 @@ where
         // owners from exactly those live sources — so it appears in NO residual edge. We
         // assert that inert-ness (a real tripwire) instead of panicking on the valid case.
         let provenance_set = ctxt.provenances.get(&f).unwrap();
-        debug_assert!(
+        assert!(
             provenance_set
                 .local_data
                 .iter_enumerated()
