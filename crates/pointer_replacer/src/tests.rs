@@ -9817,6 +9817,63 @@ mod borrow_ownership_coherence {
         panic!("no local named `{name}` in {did:?}");
     }
 
+    /// Shared §8 BB3-b assertion for a mixed-role-local fixture (a local conflated to one
+    /// flow-insensitive `Owning` slot that also carries a reference role). `verify_to_fixpoint`
+    /// must accept a model with **no hidden `Ref`-vs-`Ref` aliasing**: the BB3-b under-report was
+    /// an `Owning` slot being EXCLUDED from the replay, hiding its reference role's conflict. The
+    /// complete-by-construction candidacy (every non-`Ref` slot a replay candidate) makes that
+    /// impossible, so we assert it directly — the accepted model is clean under the COMPLETE
+    /// replay (`is_raw = model != Ref`), and the mixed-role local does not survive as an aliasing
+    /// `Ref`. Non-vacuous: the all-`Ref` round-0 shows the shape is genuinely hazardous. (The
+    /// mixed-role local is output `Owning` — an ownership-precision residual deferred to
+    /// flow-sensitivity, NOT a borrow under-report.) A regression that re-excludes `Owning` slots
+    /// from the replay would surface the hidden conflict at the COMPLETE-replay assertion.
+    fn assert_mixed_role_no_hidden_aliasing(tcx: TyCtxt<'_>, fn_name: &str, local: &str) {
+        let program = collect_program(tcx);
+        let f = function_by_name(&program, fn_name);
+        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_s, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("ownership emission");
+        add_coherence(&solver, &slots, f, &body);
+
+        // Non-vacuous: the shape is genuinely hazardous (a round-0 all-Ref aliasing conflict).
+        let round0 = revalidate(&program, &slots, |_| true, true);
+        assert!(
+            round0.get(&f).is_some_and(|e| !e.is_empty()),
+            "[{fn_name}] shape must be hazardous (a round-0 all-Ref conflict)"
+        );
+
+        let model =
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true).expect("CEGAR converges");
+
+        // The mixed-role local must not survive as an aliasing `Ref`.
+        let local_ref = local_slot(&slots, f, local_by_var_name(tcx, f, local), 0);
+        assert_ne!(
+            model.get(&local_ref),
+            Some(&SlotKind::Ref),
+            "[{fn_name}] mixed-role local `{local}` must not survive as a Ref; got {:?}",
+            model.get(&local_ref)
+        );
+
+        // Contract: no hidden Ref-vs-Ref aliasing — clean under the COMPLETE replay (every
+        // non-Ref slot a candidate, matching verify_to_fixpoint's own candidacy).
+        let complete = revalidate_replaying(
+            &program,
+            &slots,
+            |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref),
+            |s: SlotRef| model.get(&s) != Some(&SlotKind::Ref),
+            true,
+        );
+        assert!(
+            complete.get(&f).map_or(true, |e| e.is_empty()),
+            "[{fn_name}] accepted model must have no hidden aliasing under the complete replay; \
+             got {complete:?}"
+        );
+    }
+
     #[test]
     fn alloc_free_emits_ownership_into_kind_solver() {
         run_compiler(
@@ -11152,6 +11209,214 @@ pub unsafe fn use_it(x: *mut i32) {
                     "a crate-local fn named `malloc` must not be flagged a source; got {sources:?}"
                 );
             },
+        );
+    }
+
+    /// BB3-b (Owning under-report — investigated → unreachable). An `Owning` slot is a
+    /// **non-candidate** in the replay (`is_candidate = is_ref ∨ is_raw`), so it issues and
+    /// requires NO loan — it can never be named in a conflict edge. The investigation's
+    /// concern was whether a borrow hazard *caused by* an Owning pointer could thereby be
+    /// MISSED (an under-report ⇒ an unsound accepted model). It cannot: every borrow conflict
+    /// needs ≥1 loan, every loan is issued by a `Ref`/`Raw` candidate, and `invalidates` keys
+    /// on the borrowed `Place`'s base — NOT on that base's candidacy (`invalidates.rs:65-88`:
+    /// a loan is skipped only for *immutable provenance*, which an Owning base, having none,
+    /// lacks) — so a hazard around an Owning base still fires, attributed to the borrowing
+    /// `Ref`. The remaining no-loan cases (`Owning↔Owning` double-free, `Owning↔Raw`) are the
+    /// ownership-linearity layer's concern / sound in real Rust, never a borrow loan.
+    ///
+    /// This pins the load-bearing half empirically with TWO candidacies over a malloc base
+    /// aliased by two conflicting `&mut *p` borrows:
+    ///   (A) base = `Owning` (its source slots non-candidate), aliases = `Ref`;
+    ///   (B) base = `Ref` candidate too (every pointer slot `Ref`).
+    /// In BOTH, the residual is non-empty (the hazard stays visible — the anti-under-report
+    /// guard: were the Owning case blind, (A) would go empty) and NO conflict edge ever names
+    /// the malloc base. The owners are the `&mut *p` loan-issuer temporaries, never the
+    /// dereferenced base: a pointer that is *borrowed through* is a loan TARGET, not a loan
+    /// OWNER (`issuer`/`requirer` come from the `&mut` LHS, `borrow/mod.rs:448-465`). So the
+    /// base is absent from the edges *irrespective of its kind* — which is precisely why the
+    /// under-report cannot occur: classifying a slot `Owning` removes nothing a `Ref` slot
+    /// would have contributed as an owner, because the base was never an owner to begin with.
+    #[test]
+    fn bb3b_owning_base_hazard_surfaces_on_ref_not_owning_slot() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn ob() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let x = &mut *p as *mut i32;
+    let y = &mut *p as *mut i32;
+    *x = 1;
+    *y = 2;
+    unsafe { free(p as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "ob");
+                let slots = CrateSlots::build(&program);
+
+                // The malloc base (call destination + its cast target) = the Owning source set.
+                let sources = collect_malloc_source_slots(&program, &slots);
+                assert!(
+                    !sources.is_empty(),
+                    "the malloc base must be recognized as a source"
+                );
+
+                // Assert, for one replay candidacy, that the hazard is visible AND no edge
+                // names the malloc base. Returns nothing; panics on violation.
+                let assert_hazard_excludes_base = |label: &str, base_is_ref: bool| {
+                    let residual = revalidate_replaying(
+                        &program,
+                        &slots,
+                        // (A) base Owning ⇒ a source slot is NOT a Ref candidate; (B) base Ref.
+                        |s: SlotRef| base_is_ref || !sources.contains(&s),
+                        |_s: SlotRef| false,
+                        true,
+                    );
+                    assert!(
+                        residual.get(&f).is_some_and(|e| !e.is_empty()),
+                        "[{label}] the alias hazard must remain visible under replay (an empty \
+                         residual would BE the under-report); got {residual:?}"
+                    );
+                    for edge in residual.get(&f).into_iter().flatten() {
+                        for owner in edge.issuer.iter().chain(edge.requirers.iter()) {
+                            assert!(
+                                !sources.contains(owner),
+                                "[{label}] the malloc base must never be a conflict OWNER (it is \
+                                 a loan target, not a loan owner); got {owner:?} in {edge:?}"
+                            );
+                        }
+                    }
+                };
+
+                // (A) Base classified Owning: the hazard is still seen, attributed to the Refs.
+                assert_hazard_excludes_base("base=Owning", false);
+                // (B) Base classified Ref too: the base STILL never appears — its exclusion is
+                // structural (borrow target ≠ loan owner), not an artifact of being Owning. This
+                // is the conclusive reason the Owning under-report is unreachable.
+                assert_hazard_excludes_base("base=Ref", true);
+            },
+        );
+    }
+
+    // §8 BB3-b — the mixed-role under-report and its complete-by-construction fix. The four
+    // fixtures below are the four reachable shapes successive adversarial rounds produced; each
+    // is a local conflated to one flow-insensitive `Owning` slot that ALSO carries a reference
+    // role. With the old "exclude `Owning` from the replay" candidacy each hid a real `Ref`-vs-
+    // `Ref` aliasing; under `is_raw = model != Ref` (never exclude a non-`Ref` slot) none can.
+    // All assert the same contract via `assert_mixed_role_no_hidden_aliasing` — see its doc.
+
+    /// round-1: a local reused as a borrow (`p = &mut a`, aliasing `q`) then an allocation
+    /// (`p = malloc()`). The DIRECT mixed-role shape.
+    #[test]
+    fn bb3b_mixed_role_direct_no_hidden_aliasing() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn mixed() {
+    let mut a = 0i32;
+    let mut p = &mut a as *mut i32;
+    let q = &mut a as *mut i32;
+    *p = 1;
+    *q = 2;
+    p = unsafe { malloc(4) } as *mut i32;
+    unsafe { free(p as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| assert_mixed_role_no_hidden_aliasing(tcx, "mixed", "p"),
+        );
+    }
+
+    /// round-2: a caller local made `Owning` by an allocator WRAPPER's owned return
+    /// (`make() { malloc() }`) — `Owning` without being a direct malloc source.
+    #[test]
+    fn bb3b_mixed_role_owned_return_no_hidden_aliasing() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+unsafe fn make() -> *mut i32 {
+    (unsafe { malloc(4) }) as *mut i32
+}
+
+pub unsafe fn mixed() {
+    let mut a = 0i32;
+    let mut p = &mut a as *mut i32;
+    let q = &mut a as *mut i32;
+    *p = 1;
+    *q = 2;
+    p = unsafe { make() };
+    unsafe { free(p as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| assert_mixed_role_no_hidden_aliasing(tcx, "mixed", "p"),
+        );
+    }
+
+    /// round-3: a reborrow (`s = &mut *p`) whose aliasing of `a` is UNION-INDUCED — it only
+    /// materializes after `p` is demoted and `p`~`a` unions, so `s` is not a round-0 conflict
+    /// owner (round-0 all-`Ref` has no `tree_borrow_local` unions).
+    #[test]
+    fn bb3b_mixed_role_union_induced_no_hidden_aliasing() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn unioncase() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    a = 10;
+    let mut s = &mut *p as *mut i32;
+    let t = &mut a as *mut i32;
+    *s = 1;
+    *t = 2;
+    s = (unsafe { malloc(4) }) as *mut i32;
+    unsafe { free(s as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| assert_mixed_role_no_hidden_aliasing(tcx, "unioncase", "s"),
+        );
+    }
+
+    /// round-4: a derived pointer via `offset` (`s = p.offset(0)`) — a reference role the borrow
+    /// replay propagates through a pointer-method call, which a syntactic Ref/RawPtr+cast/copy
+    /// scan does not. The complete-by-construction candidacy needs no such scan.
+    #[test]
+    fn bb3b_mixed_role_offset_no_hidden_aliasing() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn offcase() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    a = 10;
+    let mut s = unsafe { p.offset(0) };
+    let t = &mut a as *mut i32;
+    *s = 1;
+    *t = 2;
+    s = (unsafe { malloc(4) }) as *mut i32;
+    unsafe { free(s as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| assert_mixed_role_no_hidden_aliasing(tcx, "offcase", "s"),
         );
     }
 

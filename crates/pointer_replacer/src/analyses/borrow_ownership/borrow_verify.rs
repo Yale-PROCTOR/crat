@@ -209,7 +209,22 @@ pub(crate) fn verify_to_fixpoint(
             program,
             slots,
             |s| model.get(&s) == Some(&SlotKind::Ref),
-            |s| model.get(&s) == Some(&SlotKind::Raw),
+            // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
+            // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
+            // depth-0 slot can be `Owning` (ownership ORs over versions) yet carry a *reference*
+            // role in another version (`p = &mut a; …; p = malloc()`; or via reborrow/`offset`);
+            // excluding such a slot as a non-candidate would HIDE its aliasing conflict — the
+            // BB3-b under-report. Including every non-`Ref` slot makes "no hidden `Ref`-vs-`Ref`
+            // aliasing" hold by construction, with no need to DETECT mixed-role locals (a tar pit:
+            // any syntactic/conflict predicate must re-derive the borrow analysis's full
+            // provenance flow — Ref/RawPtr, cast/copy, offset/library methods, … — and kept
+            // missing paths over four adversarial rounds). Treating an `Owning` slot as a raw
+            // candidate is strictly MORE conservative (its loans are included, never fewer), so it
+            // cannot under-report. RESIDUAL (deferred to flow-sensitivity): a mixed-role local is
+            // output `Owning` — an ownership-layer imprecision, NOT a borrow-verifier under-report
+            // (the borrow contract = the surviving `Ref` slots do not alias; that holds). The
+            // §8 guardrail (BO unconsumed) makes the imprecision harmless.
+            |s| model.get(&s) != Some(&SlotKind::Ref),
             is_mutable,
         );
         debug_assert!(
@@ -236,7 +251,9 @@ pub(crate) fn verify_to_fixpoint(
         }
         if committed == 0 {
             // No committable residual: a genuine fixpoint, or only `Field`-owner
-            // residuals (the deferred Local-only gap) — accept for this pass.
+            // residuals (the deferred Local-only gap) — accept for this pass. Because every
+            // non-`Ref` slot was a replay candidate above, an empty residual means the surviving
+            // `Ref` slots genuinely do not alias (no `Owning` slot's reference role is hidden).
             return Some(model);
         }
         model = solver.model_kinds_relaxing(selectors)?;
