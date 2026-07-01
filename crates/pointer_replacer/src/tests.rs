@@ -9715,6 +9715,7 @@ mod borrow_ownership_coherence {
 
     use crate::{
         analyses::{
+            borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
                 borrow_verify::{
@@ -11417,6 +11418,339 @@ pub unsafe fn offcase() {
 }
 "#,
             |tcx| assert_mixed_role_no_hidden_aliasing(tcx, "offcase", "s"),
+        );
+    }
+
+    // ===================================================================================
+    // §8 BB-parity-borrow — differential parity of BO's §8 borrow classification against
+    // the production borrow analysis. Criterion (see task/plan docs):
+    //   HA1 (hard, soundness): BO's accepted model is a replaying-borrow fixpoint
+    //     (`revalidate_replaying` finds no residual) — catches BO UNDER-demotion. This is
+    //     BO's own accept condition, so it is a stability/regression guard, NOT an
+    //     independent oracle (the union replay is unavoidable for a partial candidacy).
+    //     Blind to the RESIDUAL Owning-issuer no-loan case (an `Owning` slot issues no loan,
+    //     so a conflict caused by its exclusivity is invisible to the replay AND to the
+    //     production greedy driver) — inherited from BO, guardrail-tolerated. Distinct from
+    //     the exclusion-based mixed-role under-report BB3-b closed by construction.
+    //   Witness-specific non-vacuity (hard, production-only, INDEPENDENT): every local in
+    //     `demoted` must be demoted by the production greedy driver
+    //     (`demote_pointers_iterative_with_fields` from all-Ref, sharing only
+    //     `borrow_inference`) — ties the gate to the fixture's INTENDED conflict witnesses
+    //     (not a decoy demotion elsewhere) and proves HA1 is not vacuously clean.
+    //   Control survivors (hard): every local in `kept_ref` must stay `Ref` in BO's model —
+    //     enforces a control's stated claim (e.g. distinct-base borrows survive), so a
+    //     wholesale all-`Raw` collapse cannot pass silently.
+    //   Precision report (NON-failing): BO non-`Ref` vs production-demoted, attributed.
+    //     Over-demotion (borrow-`Raw` ∉ production, e.g. coherence-drag / all-`Raw` collapse)
+    //     is SAFE (precision, not soundness), so it is reported, never asserted.
+    fn assert_borrow_parity(tcx: TyCtxt<'_>, fn_name: &str, demoted: &[&str], kept_ref: &[&str]) {
+        let program = collect_program(tcx);
+        let f = function_by_name(&program, fn_name);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+            .expect("BB-parity: ownership emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+            .expect("BB-parity: BO CEGAR must converge (Some) on the corpus");
+
+        // HA1 — soundness gate: no residual conflict under the COMPLETE replay (every
+        // non-`Ref` slot a candidate, matching verify_to_fixpoint's own acceptance). A
+        // residual would mean BO left a surviving `Ref` that still aliases (under-demotion).
+        let residual = revalidate_replaying(
+            &program,
+            &slots,
+            |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref),
+            |s: SlotRef| model.get(&s) != Some(&SlotKind::Ref),
+            true,
+        );
+        assert!(
+            residual.values().all(|edges| edges.is_empty()),
+            "BB-parity HA1: BO's accepted model has a residual borrow conflict (under-demotion); \
+             got {residual:?}"
+        );
+
+        // Independent production greedy driver from all-Ref; map its demoted locals to depth-0
+        // slots. Shares only `borrow_inference`, never `borrow_conflicts_replaying`.
+        let mut ctxt = GBorrowInferCtxt::new(&program, |_| |_| true, |_| |_| true);
+        let d_prod = demote_pointers_iterative_with_fields(&program, &mut ctxt);
+        let mut prod_slots: rustc_hash::FxHashSet<SlotRef> = rustc_hash::FxHashSet::default();
+        for (g, dem) in &d_prod.locals {
+            let Some(universe) = slots.fn_local_slots.get(g) else {
+                continue;
+            };
+            for local in dem.iter() {
+                if let Some(sid) = universe.slot_for_local_depth(local, 0) {
+                    prod_slots.insert(SlotRef::Local(*g, sid));
+                }
+            }
+        }
+
+        // Witness-specific NON-VACUITY (Codex HIGH): each named local the INDEPENDENT
+        // production driver MUST demote — ties the gate to the fixture's INTENDED conflict
+        // witnesses, not a decoy demotion elsewhere in the program.
+        for nm in demoted {
+            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+            assert!(
+                prod_slots.contains(&sref),
+                "BB-parity: fixture `{fn_name}` expected the independent production driver to \
+                 demote `{nm}` (its intended conflict witness), but it did not"
+            );
+        }
+
+        // CONTROL survivors (Codex MEDIUM): each named local MUST stay `Ref` in BO's model,
+        // enforcing the control's stated claim so a wholesale all-`Raw` collapse cannot pass.
+        for nm in kept_ref {
+            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+            assert_eq!(
+                model.get(&sref),
+                Some(&SlotKind::Ref),
+                "BB-parity: fixture `{fn_name}` requires `{nm}` to stay `Ref` in BO's model; \
+                 got {:?}",
+                model.get(&sref)
+            );
+        }
+
+        // Precision report (NON-failing). Over-demotion (borrow-`Raw` ∉ production) is SAFE.
+        let sources = collect_malloc_source_slots(&program, &slots);
+        let (mut borrow_raw, mut owning, mut leaked_raw, mut over_demote) = (0usize, 0, 0, 0);
+        for (s, kind) in &model {
+            if !matches!(s, SlotRef::Local(..)) {
+                continue;
+            }
+            match kind {
+                SlotKind::Owning => owning += 1,
+                SlotKind::Raw if sources.contains(s) => leaked_raw += 1,
+                SlotKind::Raw => {
+                    borrow_raw += 1;
+                    if !prod_slots.contains(s) {
+                        over_demote += 1;
+                    }
+                }
+                SlotKind::Ref => {}
+            }
+        }
+        let bo_precision_wins = prod_slots
+            .iter()
+            .filter(|s| model.get(*s) == Some(&SlotKind::Ref))
+            .count();
+        eprintln!(
+            "[BB-parity] borrow_raw={borrow_raw} owning={owning} leaked_raw={leaked_raw} \
+             prod_demoted={} over_demote(safe)={over_demote} bo_precision_wins={bo_precision_wins}",
+            prod_slots.len()
+        );
+    }
+
+    /// Two `&mut` of the SAME local base alias — the canonical demote. BO collapses to
+    /// all-`Raw`; production demotes both. HA1 holds; non-vacuous.
+    #[test]
+    fn bbparity_alias_two_mut_same_base() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let x = &mut a as *mut i32;
+    let y = &mut a as *mut i32;
+    *x = 1;
+    *y = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["x", "y"], &[]),
+        );
+    }
+
+    /// Copy-alias chain: `q = p` copies a borrow of `a` that also has a second `&mut a`.
+    /// Exercises the round-0 (non-replay) conflict path. Non-vacuous.
+    #[test]
+    fn bbparity_alias_copy_chain() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    let q = p;
+    let r = &mut a as *mut i32;
+    *q = 1;
+    *r = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["q", "r"], &[]),
+        );
+    }
+
+    /// Conflicting a-chain (p,q) alongside a DISTINCT-base borrow s that must stay live —
+    /// proves the clean residual reconciles with a surviving candidate, not an all-`Raw`
+    /// cascade. Non-vacuous.
+    #[test]
+    fn bbparity_independent_borrow_amid_conflict() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let mut b = 0i32;
+    let p = &mut a as *mut i32;
+    let q = &mut a as *mut i32;
+    let s = &mut b as *mut i32;
+    *p = 1;
+    *q = 2;
+    *s = 3;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["p", "q"], &["s"]),
+        );
+    }
+
+    /// Reborrow-through-`*p` aliasing: `s`,`t` are both `&mut *p`, so they alias directly.
+    /// Production demotes `s`,`t`; the base `p` stays `Ref` (a loan target, not an owner) —
+    /// a distinct SHAPE from two `&mut` of a local, exercising reborrow provenance.
+    /// NON-vacuous. NOTE round-0 already sees this conflict, so it does NOT isolate the
+    /// union-replay path; a genuine union-only parity fixture (round-0-empty vs
+    /// replay-non-empty) is deferred to the follow-up — `bb2i_*` covers union replay
+    /// differentially today.
+    #[test]
+    fn bbparity_reborrow_deref_aliasing() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    let s = &mut *p as *mut i32;
+    let t = &mut *p as *mut i32;
+    *s = 1;
+    *t = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["s", "t"], &["p"]),
+        );
+    }
+
+    /// Pointer-arithmetic via the WHITELISTED `offset` (is_borrowing_method): `q = p.offset(0)`
+    /// aliases p, so a loan + union form and the conflict surfaces. Non-vacuous. (The `add`
+    /// whitelist-miss contrast needs a no-base-loan shape; deferred to the follow-up.)
+    #[test]
+    fn bbparity_offset_derived_conflict() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    let q = unsafe { p.offset(0) };
+    *p = 1;
+    *q = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["q"], &[]),
+        );
+    }
+
+    /// Mixed ownership + borrow: the malloc base `p` is `Owning` (a source) while its two
+    /// reborrows x,y are borrow-`Raw`. The core reconciliation — production demotes {x,y}
+    /// (blind to p's ownership), BO carries `Owning` on p (filtered from the borrow axis).
+    /// Non-vacuous. Byte-identical to `bb3b_owning_base_hazard`'s `ob`.
+    #[test]
+    fn bbparity_malloc_base_aliased() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn f() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let x = &mut *p as *mut i32;
+    let y = &mut *p as *mut i32;
+    *x = 1;
+    *y = 2;
+    unsafe { free(p as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["x", "y"], &[]),
+        );
+    }
+
+    /// Dead copy `let _r = p`: coherence's flow-insensitive equate drags `_r` to `Raw` that
+    /// production's witness-only collection leaves un-demoted (the confirmed HA2-⊆ breaker).
+    /// HA1 still holds; the report's over-demote counter is non-zero (SAFE precision loss,
+    /// not a soundness bug). Non-vacuous.
+    #[test]
+    fn bbparity_dead_copy() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let p = &mut a as *mut i32;
+    let _r = p;
+    let q = &mut a as *mut i32;
+    *p = 1;
+    *q = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &["p", "q"], &[]),
+        );
+    }
+
+    /// CONTROL: two `&mut` of DISTINCT local bases must both stay `Ref` — production demotes
+    /// nothing. The false-positive guard (multiplicity of `&mut` alone must not demote).
+    #[test]
+    fn bbparity_independent_distinct_bases() {
+        run_compiler(
+            r#"
+pub unsafe fn f() {
+    let mut a = 0i32;
+    let mut b = 0i32;
+    let x = &mut a as *mut i32;
+    let y = &mut b as *mut i32;
+    *x = 1;
+    *y = 2;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &[], &["x", "y"]),
+        );
+    }
+
+    /// CONTROL: pure allocation, no borrow — production demotes {} while BO settles p
+    /// `Owning`. Proves a naive set-equality gate is wrong and the ownership axis is
+    /// separated from borrow. Vacuous on the borrow axis (report shows owning≥1).
+    #[test]
+    fn bbparity_unleaked_malloc() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn f() {
+    let p = unsafe { malloc(4) };
+    unsafe { free(p) };
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "f", &[], &[]),
+        );
+    }
+
+    /// CONTROL: a crate-local fn named `malloc` is NOT an allocator source (the extern gate),
+    /// so `q` stays `Ref`; both drivers demote nothing. The source-detector correctness
+    /// anchor. Vacuous.
+    #[test]
+    fn bbparity_local_fn_named_malloc() {
+        run_compiler(
+            r#"
+unsafe fn malloc(p: *mut i32) -> *mut i32 {
+    p
+}
+
+pub unsafe fn use_it(x: *mut i32) {
+    let q = unsafe { malloc(x) };
+    *q = 1;
+}
+"#,
+            |tcx| assert_borrow_parity(tcx, "use_it", &[], &["q"]),
         );
     }
 
