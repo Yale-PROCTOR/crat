@@ -2846,4 +2846,58 @@ pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
+
+    #[test]
+    fn test_epoch_split_use_kinds() {
+        run_test(
+            r#"
+pub unsafe extern "C" fn use_ptr(p: *mut i8) {}
+pub unsafe extern "C" fn f(mut a: *mut i8) -> i32 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let d: i8 = *x;                 // deref
+    if !x.is_null() {               // null check + pointer method
+        use_ptr(x);                 // call argument
+        let c: *const i8 = x as *const i8; // cast
+    }
+    return d as i32;
+}
+        "#,
+            &["let mut x_0: *mut i8 = a", "*x_0", "x_0.is_null()", "use_ptr(x_0)", "x_0 as *const i8"],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_parse_uname_shape() {
+        run_test(
+            r#"
+extern "C" {
+    fn strstr(_: *const i8, _: *const i8) -> *mut i8;
+    fn get_os_arch(_: *mut i8) -> *mut i8;
+    fn use_c(_: *mut i8);
+}
+pub unsafe extern "C" fn f(mut uname: *mut i8, cond: i32) {
+    let mut str_tmp: *mut i8 = 0 as *mut i8;
+    str_tmp = strstr(uname, uname);
+    if cond != 0 {
+        str_tmp = str_tmp.offset(7 as isize);
+        use_c(str_tmp);
+    } else {
+        str_tmp = get_os_arch(uname);
+        if !str_tmp.is_null() {
+            use_c(str_tmp);
+        }
+    }
+}
+        "#,
+            &[
+                "let mut str_tmp_0: *mut i8 = strstr",
+                "str_tmp_0 = str_tmp_0.offset",
+                "let mut str_tmp_1: *mut i8 = get_os_arch",
+                "str_tmp_1.is_null()",
+            ],
+            &["let mut str_tmp: *mut i8 = 0 as *mut i8"],
+        )
+    }
 }
