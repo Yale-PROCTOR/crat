@@ -2768,4 +2768,41 @@ pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
             &["x_0"],
         )
     }
+
+    #[test]
+    fn test_epoch_split_branch_contained() {
+        // an epoch created and consumed entirely inside one branch splits.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> i32 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    if cond != 0 {
+        x = a;
+        return *x as i32;
+    }
+    return 0;
+}
+        "#,
+            &["let mut x_0: *mut i8 = a", "*x_0 as i32"],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_rejects_cross_join_use() {
+        // one branch assigns; the post-if use may see old-or-new -> reject, preserve write.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    if cond != 0 {
+        x = a;
+    }
+    return x;
+}
+        "#,
+            &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
+            &["x_0"],
+        )
+    }
 }

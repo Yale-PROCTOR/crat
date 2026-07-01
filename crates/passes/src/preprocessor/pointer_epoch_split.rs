@@ -288,10 +288,18 @@ impl<'tcx> FnState<'tcx> {
                 let local = self.assign_target(lhs).unwrap();
                 self.analyze_assign(expr.hir_id, local, lhs, rhs, env)
             }
-            // control flow: conservative in this task — see Tasks 3-4.
-            hir::ExprKind::If(..)
-            | hir::ExprKind::Loop(..)
-            | hir::ExprKind::Match(..) => {
+            // precise if-branch handling: clone env per branch, merge exits.
+            hir::ExprKind::If(cond, then, els) => {
+                let env = self.analyze_expr(cond, env);
+                let then_env = self.analyze_expr(then, env.clone());
+                let else_env = match els {
+                    Some(e) => self.analyze_expr(e, env.clone()),
+                    None => env.clone(),
+                };
+                self.merge(&then_env, &else_env)
+            }
+            // loop and match: conservative — refined in Task 4.
+            hir::ExprKind::Loop(..) | hir::ExprKind::Match(..) => {
                 self.reject_all_live(&env);
                 // still record reads in nested code so we do not miss disqualifiers.
                 self.record_reads(expr, &env);
@@ -398,6 +406,23 @@ impl<'tcx> FnState<'tcx> {
         for local in live {
             self.reject(local);
         }
+    }
+
+    // merge two branch-exit envs per the spec's merge table. equal states survive;
+    // any disagreement becomes Ambiguous; Blocked dominates.
+    fn merge(&self, a: &EpochEnv, b: &EpochEnv) -> EpochEnv {
+        let mut out = EpochEnv::default();
+        for local in self.candidates.keys() {
+            let va = a.get(*local);
+            let vb = b.get(*local);
+            let merged = match (&va, &vb) {
+                _ if va == vb => va.clone(),
+                (EpochValue::Blocked, _) | (_, EpochValue::Blocked) => EpochValue::Blocked,
+                _ => EpochValue::Ambiguous,
+            };
+            out.set(*local, merged);
+        }
+        out
     }
 
     // mark all candidates blocked so any later read rejects them.
