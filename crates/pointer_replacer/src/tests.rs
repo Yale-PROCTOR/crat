@@ -12141,10 +12141,21 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
         );
     }
 
-    /// Build the production ownership oracle's `Owning` set as depth-indexed BO slots, by
-    /// running the SAME production pipeline the `ownership_analysis` tests use
-    /// (`analyze_program` -> `solidify`) and mapping every `is_owning()` (local, depth) to a
-    /// `SlotRef::Local`. BASELINE only — see `assert_ownership_parity`.
+    /// Build the baseline ownership oracle's `Owning` set as depth-indexed BO slots, by
+    /// running the ownership analysis via `analyze_program` -> `solidify` and mapping every
+    /// `is_owning()` (local, depth) to a `SlotRef::Local`. BASELINE only — see
+    /// `assert_ownership_parity`.
+    ///
+    /// PRECISION NOTE (Codex): `analyze_program` runs the ownership analysis with an EMPTY
+    /// param-alias map — the same simplified reference the `ownership_analysis` tests use —
+    /// NOT the Andersen points-to aliases (`find_param_aliases`) the real rewriter pipeline
+    /// (`rewriter::replace_local_borrows`) feeds to `compute_output_params`. The two agree
+    /// except where param aliasing changes output-param classification. The current
+    /// focused-core fixtures are all non-aliasing (empty ≡ Andersen), so this is exact for
+    /// them; an ALIAS-AWARE oracle (thread `find_param_aliases`) + an alias-sensitive
+    /// fixture is DEFERRED with the other follow-ups (interproc / depth>=1 / field / coverage
+    /// counters). Until then, do NOT add an alias-sensitive fixture expecting a faithful
+    /// production comparison.
     fn build_prod_owning(
         tcx: TyCtxt<'_>,
         program: &RustProgram<'_>,
