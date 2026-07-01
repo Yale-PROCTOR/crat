@@ -10616,6 +10616,84 @@ pub unsafe fn stash(owner: *mut Holder) {
         );
     }
 
+    /// NON-REGRESSION (precision-2 depth-chain over-claim, from a Codex adversarial
+    /// review of the BB-escape landing): two aliasing `&mut local as *mut *mut T` outer
+    /// pointers plus the caller-side out-param escape. The hypothesised hazard: the
+    /// escape makes depth1 (`local`) Owning; a borrow conflict on `p`/`q` demotes depth0
+    /// off `Ref`; the coherence invariant `¬(raw(d) ∧ own(d+1))` then forces the outer
+    /// pointer (to STACK `local`) Owning — a UAF-class over-claim outside the fixed
+    /// field⟹parent path.
+    ///
+    /// It does NOT manifest: the escape's Owning source is retractable, so the solver
+    /// LEAKS the deeper allocation (`local` settles `Raw`, making `own(depth1)` false and
+    /// releasing the coherence pressure) rather than over-claiming the stack pointer.
+    /// Verified equal at precision 1 and 2 — precision-2 adds no new over-claim on this
+    /// shape. (The non-retractable `free(local)` variant goes UNSAT and
+    /// `verify_to_fixpoint` DECLINES — a sound conservative fallback, no wrong `Owning`
+    /// — at BOTH precisions, i.e. pre-existing, so it is not encoded here.) This guards
+    /// the outer slots against ever becoming `Owning`.
+    #[test]
+    fn outparam_escape_aliasing_outer_ptr_never_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make(out: *mut *mut core::ffi::c_void) {
+    *out = unsafe { malloc(4) };
+}
+
+pub unsafe fn caller() -> *mut core::ffi::c_void {
+    let mut local: *mut core::ffi::c_void = core::ptr::null_mut();
+    let p = &mut local as *mut *mut core::ffi::c_void;
+    let q = &mut local as *mut *mut core::ffi::c_void;
+    make(p);
+    *q = local;
+    local
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let make = function_by_name(&program, "make");
+                let caller = function_by_name(&program, "caller");
+                let make_body = tcx.mir_drops_elaborated_and_const_checked(make).borrow();
+                let caller_body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        .expect("ownership emission");
+                add_coherence(&solver, &slots, make, &make_body);
+                add_coherence(&solver, &slots, caller, &caller_body);
+
+                // The shape is genuinely hazardous (round-0 aliasing borrow conflicts).
+                let round0 = revalidate(&program, &slots, |_| true, true);
+                assert!(
+                    round0.get(&caller).is_some_and(|e| !e.is_empty()),
+                    "shape must be hazardous (aliasing outer-pointer borrow conflicts)"
+                );
+
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                    .expect("CEGAR converges");
+
+                let p = local_slot(&slots, caller, local_by_var_name(tcx, caller, "p"), 0);
+                let q = local_slot(&slots, caller, local_by_var_name(tcx, caller, "q"), 0);
+                assert_ne!(
+                    model.get(&p),
+                    Some(&SlotKind::Owning),
+                    "outer pointer `p` (to stack `local`) must never be Owning"
+                );
+                assert_ne!(
+                    model.get(&q),
+                    Some(&SlotKind::Owning),
+                    "outer pointer `q` (to stack `local`) must never be Owning"
+                );
+            },
+        );
+    }
+
     /// PROBE (headline-reframing rationale): storing a global address through `*out`
     /// does NOT produce a round-0 *borrow* conflict — `&raw mut G` is a 'static-region
     /// raw borrow of a static, not a reference-aliasing loan. This confirms the
