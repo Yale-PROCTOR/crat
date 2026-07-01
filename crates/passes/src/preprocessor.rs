@@ -2702,7 +2702,7 @@ unsafe fn main_0() -> core::ffi::c_int {
 
     #[test]
     fn test_epoch_split_noop_passthrough() {
-        // with an empty plan nothing is rewritten: the scratch local and its uses survive.
+        // a single base assignment: the scratch init is replaced by an epoch let.
         run_test(
             r#"
 pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
@@ -2711,8 +2711,61 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
     return x;
 }
         "#,
-            &["let mut x: *mut i8 = 0 as *mut i8", "x = a"],
-            &[],
+            &["let mut x_0: *mut i8 = a", "return x_0"],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_sequential_bases() {
+        // two unrelated bases through one scratch local -> two epoch lets.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    return x;
+}
+        "#,
+            &["let mut x_0: *mut i8 = a", "let mut x_1: *mut i8 = b", "_c: i8 = *x_0", "return x_1"],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_same_epoch_movement() {
+        // `.offset` on the same local keeps the epoch and stays an assignment.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    x = x.offset(1 as isize);
+    return x;
+}
+        "#,
+            &["let mut x_0: *mut i8 = a", "x_0 = x_0.offset", "return x_0"],
+            &["let mut x_0: *mut i8 = a;\n    let mut"], // the movement is NOT a second `let`
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_rejects_assign_op() {
+        // `x = x` via AddrOf / AssignOp style writes reject the whole local (unchanged).
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
+    let mut x: *mut u8 = 0 as *mut u8;
+    x = a;
+    x = x.wrapping_add(1 as usize);
+    let p: *mut *mut u8 = &mut x;
+    return x;
+}
+        "#,
+            &["let mut x: *mut u8 = 0 as *mut u8"], // untouched: x is address-taken
+            &["x_0"],
         )
     }
 }
