@@ -2805,4 +2805,45 @@ pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> *mut i8 {
             &["x_0"],
         )
     }
+
+    #[test]
+    fn test_epoch_split_rejects_loop_base_change() {
+        // a base change inside a loop cannot be promoted to a `let` -> reject.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    let mut i: i32 = 0;
+    while i < n {
+        x = a;
+        i += 1;
+    }
+    return x;
+}
+        "#,
+            &["let mut x: *mut i8 = 0 as *mut i8", "x = a"],
+            &["x_0"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_loop_same_epoch_movement() {
+        // incoming epoch, loop only moves it: contained uses rename, no `let` in loop.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let mut i: i32 = 0;
+    while i < n {
+        x = x.offset(1 as isize);
+        i += 1;
+    }
+    return x;
+}
+        "#,
+            &["let mut x_0: *mut i8 = a", "x_0 = x_0.offset", "return x_0"],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
+        )
+    }
 }

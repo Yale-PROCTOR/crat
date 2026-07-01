@@ -298,12 +298,31 @@ impl<'tcx> FnState<'tcx> {
                 };
                 self.merge(&then_env, &else_env)
             }
-            // loop and match: conservative — refined in Task 4.
-            hir::ExprKind::Loop(..) | hir::ExprKind::Match(..) => {
-                self.reject_all_live(&env);
-                // still record reads in nested code so we do not miss disqualifiers.
-                self.record_reads(expr, &env);
-                self.poison(env)
+            hir::ExprKind::Loop(body, _, _, _) => {
+                // reject any candidate base-changed inside the loop (cannot introduce
+                // an epoch `let` in a loop). scan first so we know before renaming.
+                for local in self.loop_base_changed(body) {
+                    self.reject(local);
+                }
+                // analyze the body against the incoming env so incoming epochs and
+                // same-epoch movements rename; the epoch local is declared outside.
+                let _ = self.analyze_block(body, env.clone());
+                // conservatively, candidate state after the loop is unchanged for
+                // reads (same-epoch movement keeps the epoch; base-changed locals are
+                // already rejected). return the incoming env.
+                env
+            }
+            hir::ExprKind::Match(scrutinee, arms, _) => {
+                let env = self.analyze_expr(scrutinee, env);
+                let mut exit: Option<EpochEnv> = None;
+                for arm in arms {
+                    let arm_env = self.analyze_expr(arm.body, env.clone());
+                    exit = Some(match exit {
+                        None => arm_env,
+                        Some(prev) => self.merge(&prev, &arm_env),
+                    });
+                }
+                exit.unwrap_or(env)
             }
             hir::ExprKind::Block(block, _) => self.analyze_block(block, env),
             // opaque scope: do not descend (captured candidates already rejected).
@@ -394,20 +413,6 @@ impl<'tcx> FnState<'tcx> {
         }
     }
 
-    // reject every candidate that currently holds a live epoch (used at control-flow
-    // boundaries in this task; refined away in Tasks 3-4).
-    fn reject_all_live(&mut self, env: &EpochEnv) {
-        let live: Vec<HirId> = env
-            .current
-            .iter()
-            .filter(|(_, v)| matches!(v, EpochValue::Epoch(_)))
-            .map(|(k, _)| *k)
-            .collect();
-        for local in live {
-            self.reject(local);
-        }
-    }
-
     // merge two branch-exit envs per the spec's merge table. equal states survive;
     // any disagreement becomes Ambiguous; Blocked dominates.
     fn merge(&self, a: &EpochEnv, b: &EpochEnv) -> EpochEnv {
@@ -425,20 +430,20 @@ impl<'tcx> FnState<'tcx> {
         out
     }
 
-    // mark all candidates blocked so any later read rejects them.
-    fn poison(&self, mut env: EpochEnv) -> EpochEnv {
-        for local in self.candidates.keys() {
-            env.set(*local, EpochValue::Blocked);
-        }
-        env
-    }
-
     // recurse into `expr`'s subexpressions recording candidate reads in `env`, and
     // rejecting any candidate written by a nested Assign/AssignOp we did not classify.
     fn record_reads(&mut self, expr: &'tcx hir::Expr<'tcx>, env: &EpochEnv) -> EpochEnv {
         let mut v = ReadCollector { state: self, env };
         intravisit::walk_expr(&mut v, expr);
         env.clone()
+    }
+
+    // candidate locals that receive a base-changing assignment anywhere in `block`.
+    fn loop_base_changed(&self, block: &'tcx hir::Block<'tcx>) -> Vec<HirId> {
+        let mut found = Vec::new();
+        let mut v = BaseChangeScanner { state: self, found: &mut found };
+        v.visit_block(block);
+        found
     }
 }
 
@@ -474,6 +479,26 @@ impl<'tcx> Visitor<'tcx> for ReadCollector<'_, 'tcx> {
             && !is_lhs(expr, self.state.tcx)
         {
             self.state.read(local, expr.hir_id, self.env);
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+struct BaseChangeScanner<'a, 'tcx> {
+    state: &'a FnState<'tcx>,
+    found: &'a mut Vec<HirId>,
+}
+impl<'tcx> Visitor<'tcx> for BaseChangeScanner<'_, 'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.state.tcx
+    }
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+            && let Some(local) = self.state.assign_target(lhs)
+            && self.state.same_local_movement(local, rhs).is_none()
+        {
+            self.found.push(local);
         }
         intravisit::walk_expr(self, expr);
     }
