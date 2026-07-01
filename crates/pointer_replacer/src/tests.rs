@@ -8758,7 +8758,9 @@ mod ownership_analysis {
         param_aliases
     }
 
-    fn analyze_program<'tcx>(
+    // `pub(super)` so the BB-parity-own harness (sibling `borrow_ownership_coherence`
+    // module) can reuse the exact production-ownership pipeline as its baseline oracle.
+    pub(super) fn analyze_program<'tcx>(
         program: &RustProgram<'tcx>,
     ) -> crate::analyses::ownership::whole_program::WholeProgramResults<'tcx> {
         let mutability_result = mutability_analysis(program);
@@ -12038,6 +12040,196 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
                 let model = solver.model_kinds().expect("satisfiable model");
                 assert_eq!(model.get(&SlotRef::Field(field_slot)), Some(&SlotKind::Owning));
             },
+        );
+    }
+
+    // ===== BB-parity-own: ownership-slice differential harness (focused core) =====
+
+    /// BB-parity-OWN differential harness (ownership slice), the mirror of
+    /// `assert_borrow_parity`. Production ownership is a BASELINE / REPORTING oracle, NOT
+    /// ground truth: BO may legitimately claim MORE `Owning` than production (relaxed
+    /// monotonicity is an intended improvement), so there is deliberately NO `bo ⊆ prod`
+    /// hard gate. HARD gates: (1) each positive `owning` witness BO MUST classify `Owning`;
+    /// (2) each semantic `kept_non_owning` control BO must NOT over-claim (over-claim =
+    /// `Box`/`free` on borrowed memory = double-free/UAF — the real absolute-soundness
+    /// teeth); (3) non-vacuity — the production oracle bridge agrees on each positive
+    /// witness, proving it is exercised (not silently empty). SOFT report (never fails):
+    /// COVERED / BO_UNDER (safe leak) / BO_EXTRA (triage: expected relaxed-monotonicity
+    /// improvement vs a suspicious over-claim that should earn its own control). Depth-0
+    /// single-indirection only in this slice (BO syntactic depth vs production semantic
+    /// depth can misalign at depth >= 1).
+    fn assert_ownership_parity(
+        tcx: TyCtxt<'_>,
+        fn_name: &str,
+        owning: &[&str],
+        kept_non_owning: &[&str],
+    ) {
+        // BO model (SUT) — identical construction to `assert_borrow_parity`.
+        let program = collect_program(tcx);
+        let f = function_by_name(&program, fn_name);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+            .expect("BB-parity-own: ownership emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+            .expect("BB-parity-own: BO CEGAR must converge (Some) on the corpus");
+
+        // Production ownership oracle — BASELINE only (see doc; NOT a ceiling).
+        let prod_owning = build_prod_owning(tcx, &program, &slots);
+
+        // HARD gate 1 — positive Owning witnesses: BO must classify each `Owning`.
+        // HARD gate 3 — non-vacuity: production ALSO marks it Owning (a both-agree baseline
+        // witness), proving the oracle bridge is exercised and not silently empty.
+        for nm in owning {
+            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+            assert_eq!(
+                model.get(&sref),
+                Some(&SlotKind::Owning),
+                "BB-parity-own: fixture `{fn_name}` requires BO to classify `{nm}` Owning; \
+                 got {:?}",
+                model.get(&sref)
+            );
+            assert!(
+                prod_owning.contains(&sref),
+                "BB-parity-own: non-vacuity — the production oracle must also mark `{nm}` \
+                 Owning (the bridge must be exercised on an agreed baseline witness)"
+            );
+        }
+
+        // HARD gate 2 — semantic non-Owning controls: BO must NOT over-claim. Production is
+        // not ground truth, so soundness lives HERE: over-claiming a read-only param or a
+        // field-transfer parent is a double-free/UAF.
+        for nm in kept_non_owning {
+            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+            assert_ne!(
+                model.get(&sref),
+                Some(&SlotKind::Owning),
+                "BB-parity-own: control `{nm}` must NOT be Owning in BO's model \
+                 (over-claim = double-free/UAF); got {:?}",
+                model.get(&sref)
+            );
+        }
+
+        // SOFT report (NEVER fails). BO_EXTRA (BO-only Owning) is TRIAGED — an expected
+        // relaxed-monotonicity improvement over production, or a suspicious over-claim that
+        // should earn its own semantic control. Depth-0 locals only.
+        let (mut covered, mut bo_extra, mut bo_owning_total) = (0usize, 0usize, 0usize);
+        for (s, kind) in &model {
+            if !matches!(s, SlotRef::Local(..)) || *kind != SlotKind::Owning {
+                continue;
+            }
+            bo_owning_total += 1;
+            if prod_owning.contains(s) {
+                covered += 1;
+            } else {
+                bo_extra += 1;
+            }
+        }
+        let bo_under = prod_owning
+            .iter()
+            .filter(|s| model.get(*s) != Some(&SlotKind::Owning))
+            .count();
+        eprintln!(
+            "[BB-parity-own] {fn_name}: bo_owning={bo_owning_total} prod_owning={} \
+             COVERED={covered} BO_UNDER(safe)={bo_under} BO_EXTRA(triage)={bo_extra}",
+            prod_owning.len()
+        );
+    }
+
+    /// Build the production ownership oracle's `Owning` set as depth-indexed BO slots, by
+    /// running the SAME production pipeline the `ownership_analysis` tests use
+    /// (`analyze_program` -> `solidify`) and mapping every `is_owning()` (local, depth) to a
+    /// `SlotRef::Local`. BASELINE only — see `assert_ownership_parity`.
+    fn build_prod_owning(
+        tcx: TyCtxt<'_>,
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+    ) -> rustc_hash::FxHashSet<SlotRef> {
+        let results = super::ownership_analysis::analyze_program(program);
+        let solidified = results.solidify(program);
+        let mut prod_owning = rustc_hash::FxHashSet::default();
+        for &g in &program.functions {
+            let Some(universe) = slots.fn_local_slots.get(&g) else {
+                continue;
+            };
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            let did = g.to_def_id();
+            let fnr = solidified.fn_results(&did);
+            for local in body.local_decls.indices() {
+                for (depth, own) in fnr.local_result(local).iter().enumerate() {
+                    if own.is_owning()
+                        && let Some(sid) = universe.slot_for_local_depth(local, depth as u8)
+                    {
+                        prod_owning.insert(SlotRef::Local(g, sid));
+                    }
+                }
+            }
+        }
+        prod_owning
+    }
+
+    /// BB-parity-own positive witness: a locally allocated-and-freed pointer is genuinely
+    /// `Owning` in BOTH BO and the production oracle (no relaxed-monotonicity subtlety), so
+    /// it seeds hard gate 1 (BO Owning) and hard gate 3 (production non-vacuity).
+    #[test]
+    fn boparity_alloc_free_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn f() {
+    let p = malloc(4);
+    free(p);
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "f", &["p"], &[]),
+        );
+    }
+
+    /// BB-parity-own semantic non-Owning control: a read-only borrowed pointer param must
+    /// NOT be `Owning` (over-claim = UAF on caller memory). Seeds hard gate 2.
+    #[test]
+    fn boparity_read_only_param_control() {
+        run_compiler(
+            r#"
+pub unsafe fn reader(p: *mut i32) -> i32 {
+    unsafe { *p }
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "reader", &[], &["p"]),
+        );
+    }
+
+    /// BB-parity-own semantic non-Owning control (the §9.8 field-transfer): a borrowed
+    /// struct pointer whose FIELD is malloc'd must NOT make the parent `owner` Owning —
+    /// field-ownership transfer is not parent ownership (the output-param contract). This
+    /// control has real teeth: at precision 2 WITHOUT the `field ⟹ parent` suppression BO
+    /// over-claims `owner` (the reverted §9.8 regression), so a regression there fails here.
+    #[test]
+    fn boparity_field_transfer_parent_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub struct Holder {
+    pub data: *mut core::ffi::c_void,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).data = unsafe { malloc(4) };
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "stash", &[], &["owner"]),
         );
     }
 }
