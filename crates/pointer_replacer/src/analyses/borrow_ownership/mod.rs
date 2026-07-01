@@ -53,6 +53,17 @@ use crate::{
 
 pub type Precision = u8;
 
+/// BO analysis precision (pointer-chain depth modeled). At precision 2 a depth-1
+/// pointer-chain ownership var exists, which the caller-side out-param escape
+/// (`make(&raw mut local){ *out = malloc }`) flows through. The signature
+/// (`INIT_PRECISION`), body (`B1_PRECISION`), and `struct_ctxt` (`max_ptr_chased`,
+/// raised in `CrateCtxt::new`) MUST move in lockstep — the two consts alone are a
+/// no-op against the `max_ptr_chased` cap. The `field ⟹ parent` suppression in
+/// `GlobalAssumptionApplier::apply` is REQUIRED at precision ≥ 2 to avoid
+/// over-claiming borrowed struct pointers whose fields are malloc'd. See task doc
+/// §9.11 (and §9.8 for the over-claim this avoids).
+const BO_PRECISION: Precision = 2;
+
 #[derive(Clone, Debug)]
 enum Param<Var> {
     Output(Consume<Var>),
@@ -196,7 +207,7 @@ fn emit_fn_body_into<'tcx>(
     inter_ctxt: &InterCtxt,
     fn_did: LocalDefId,
 ) {
-    const B1_PRECISION: Precision = 1;
+    const B1_PRECISION: Precision = BO_PRECISION;
 
     let body_ref = crate_ctxt
         .tcx
@@ -291,7 +302,7 @@ fn initial_crate_inter_ctxt<'tcx>(
     var_gen: &mut Gen,
     database: &mut impl Database,
 ) -> InterCtxt {
-    const INIT_PRECISION: Precision = 1;
+    const INIT_PRECISION: Precision = BO_PRECISION;
 
     let mut fn_sigs = FxHashMap::default();
     fn_sigs.reserve(crate_ctxt.fns().len());
@@ -367,10 +378,19 @@ impl<'tcx> CrateCtxt<'tcx> {
             .map(|did| did.to_def_id())
             .collect::<Vec<_>>();
 
+        // Raise `max_ptr_chased` to `BO_PRECISION` so a depth-1 pointer-chain
+        // ownership var is created for the caller-side out-param escape. `new`
+        // already applies one `increase_precision` (→ depth 1), so bump the
+        // remainder; the `INIT_PRECISION`/`B1_PRECISION` consts alone are a no-op
+        // against this cap (see `BO_PRECISION` docs, §9.11).
+        let mut struct_ctxt = struct_ctxt::StructCtxt::new(program.tcx, &structs);
+        for _ in 1..BO_PRECISION {
+            struct_ctxt.increase_precision(program.tcx);
+        }
         CrateCtxt {
             tcx: program.tcx,
             fn_ctxt: call_graph::CallGraph::new(program.tcx, &fns),
-            struct_ctxt: struct_ctxt::StructCtxt::new(program.tcx, &structs),
+            struct_ctxt,
         }
     }
 

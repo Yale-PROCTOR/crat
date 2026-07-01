@@ -409,7 +409,17 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
                     .fields(self.struct_ctxt, &adt_def.did());
                 for (mut field_ctxt, field_def) in itertools::izip!(fields, adt_def.all_fields()) {
                     let field_ty = field_def.ty(self.tcx, subst);
-                    self.apply(field_ty, dom, &mut field_ctxt, input, precision)
+                    // Recurse with `None`, NOT `dom`. Inheriting the enclosing
+                    // struct-pointer's `dom` is the `field ⟹ parent` coupling
+                    // (`push_eq_min` asserts `input ⟹ dom`) that over-claims a
+                    // borrowed `*mut S` as `Owning` when a field is malloc'd
+                    // (`(*owner).data = malloc`) — a field-ownership transfer, NOT
+                    // evidence the parent owns (task doc §9.8/§9.9). A field starts
+                    // fresh and only picks up `dom` from its OWN pointer derefs; this
+                    // is a no-op for by-value structs (already `None`), and the
+                    // caller-side escape's depth-1 var is on the pointer-chain path
+                    // (empty `field_ctxt`), untouched. Required at precision ≥ 2.
+                    self.apply(field_ty, None, &mut field_ctxt, input, precision)
                 }
             }
         }
