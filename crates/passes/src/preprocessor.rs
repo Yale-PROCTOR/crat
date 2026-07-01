@@ -410,6 +410,10 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
             .array_string_literal_static_excludes
             .contains(def_id)
     });
+    // `lets_to_remove` does not need to be added to the exclude set: every
+    // binding removed by the elision rewrites has its HirId in `vars_to_replace`
+    // or `fresh_pointers`, both of which are already in the set below, so epoch
+    // splitting can never claim a binding that another rewrite will remove.
     let mut epoch_split_exclude: FxHashSet<HirId> = vars_to_replace.keys().copied().collect();
     epoch_split_exclude.extend(fresh_pointers.iter().copied());
     let pointer_epoch_split_plan = pointer_epoch_split::analyze(tcx, &epoch_split_exclude);
@@ -2701,8 +2705,8 @@ unsafe fn main_0() -> core::ffi::c_int {
     }
 
     #[test]
-    fn test_epoch_split_noop_passthrough() {
-        // a single base assignment: the scratch init is replaced by an epoch let.
+    fn test_epoch_split_single_base() {
+        // a single-base scratch local is split into one epoch local and the scratch init is removed.
         run_test(
             r#"
 pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
@@ -2752,8 +2756,8 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
     }
 
     #[test]
-    fn test_epoch_split_rejects_assign_op() {
-        // `x = x` via AddrOf / AssignOp style writes reject the whole local (unchanged).
+    fn test_epoch_split_rejects_addr_taken() {
+        // the local is rejected because it is address-taken (`&mut x`), leaving the scratch local unchanged.
         run_test(
             r#"
 pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
