@@ -10503,23 +10503,21 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// PROBE (caller-side out-param escape): a caller passes `&raw mut local` to a
-    /// callee that writes `*out = malloc`. The malloc'd ownership must flow back so the
-    /// caller's `local` (depth-0 slot) becomes `Owning` after the call. This pins the
-    /// before/after caller state the legacy ownership analysis modeled, now meant to be
-    /// carried by the uniform two-version use/def encoding rather than an output-param
-    /// flag.
+    /// Caller-side out-param escape: a caller passes `&raw mut local` to a callee that
+    /// writes `*out = malloc`. The malloc'd ownership flows back so the caller's `local`
+    /// (depth-0 slot) becomes `Owning` after the call — the before/after caller state
+    /// the legacy ownership analysis modeled, now carried by the uniform two-version
+    /// use/def encoding at **precision 2** (the depth-1 signature var the `*out = malloc`
+    /// escape flows through via the already-wired `call_args → call-matcher → exit-zip`
+    /// path), rather than an output-param flag.
     ///
-    /// KNOWN GAP (currently `Ref`, target `Owning`): the escape reaches the arg temp's
-    /// depth-1 *version* via the `call` hook (`arg.def ↔ callee.sig.def`), but
-    /// `link_versions_to_slots` solidifies only **depth 0** version→slot, so the Owning
-    /// at the arg temp's depth-1 (≡ `local`) never lands on a slot and the soft
-    /// objective leaves `local` at `Ref`. This is a B-precision / depth>0 cross-boundary
-    /// solidification item (the canonical C2Rust output-param shape), NOT a BB1 concern;
-    /// the callee-side (`store_through_ptr_is_ref_over_owning`) and return-edge
-    /// (`interproc_alloc_return_flows_owning`) escapes already work. Un-ignore when the
-    /// depth>0 cross-function solidification lands (tracked for BB-parity).
-    #[ignore = "KNOWN GAP: caller-side out-param escape needs depth>0 cross-fn solidification (not BB1)"]
+    /// `local` must be USED (returned) for the assertion to be non-vacuous: an unused
+    /// owning `local` is a leak, which the solver models as non-owning (`Ref`) — the
+    /// `bo-interproc-test-soundness` fixture trap. Closed by the §9.11 landing
+    /// (precision-2 + `field ⟹ parent` suppression for struct-pointer pointees, so the
+    /// escape lands without over-claiming borrowed struct pointers); the callee-side
+    /// (`store_through_ptr_is_ref_over_owning`) and return-edge
+    /// (`interproc_alloc_return_flows_owning`) escapes were already sound.
     #[test]
     fn caller_side_outparam_escape_flows_owning() {
         run_compiler(
@@ -10532,9 +10530,10 @@ pub unsafe fn make(out: *mut *mut core::ffi::c_void) {
     *out = unsafe { malloc(4) };
 }
 
-pub unsafe fn caller() {
+pub unsafe fn caller() -> *mut core::ffi::c_void {
     let mut local: *mut core::ffi::c_void = core::ptr::null_mut();
     unsafe { make(&raw mut local) };
+    local
 }
 "#,
             |tcx| {
@@ -10561,6 +10560,57 @@ pub unsafe fn caller() {
                     model.get(&local),
                     Some(&SlotKind::Owning),
                     "caller's `local` must become Owning after the out-param call"
+                );
+            },
+        );
+    }
+
+    /// NON-REGRESSION (output-param contract, §9.8/§9.9): a borrowed struct pointer
+    /// whose FIELD is malloc'd (`(*owner).data = malloc`) is a **field-ownership
+    /// transfer**, NOT evidence that `owner` owns. Under the precision-2 escape
+    /// support this must NOT over-claim `owner` as `Owning` — the `field ⟹ parent`
+    /// suppression in `GlobalAssumptionApplier::apply` guarantees it. Without that
+    /// suppression, global precision-2 forces `owner` `Owning` (the reverted §9.8
+    /// regression, which the green suite otherwise MISSED — no other test exercises a
+    /// borrowed struct-pointer param). This is the guard that keeps the escape support
+    /// from re-introducing that over-claim.
+    #[test]
+    fn outparam_field_malloc_leaves_parent_ref() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub struct Holder {
+    pub data: *mut core::ffi::c_void,
+}
+
+pub unsafe fn stash(owner: *mut Holder) {
+    (*owner).data = unsafe { malloc(4) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let stash = function_by_name(&program, "stash");
+                let stash_body = tcx.mir_drops_elaborated_and_const_checked(stash).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("stash emission should run");
+                add_coherence(&kind_solver, &slots, stash, &stash_body);
+
+                let owner = local_slot(&slots, stash, local_by_var_name(tcx, stash, "owner"), 0);
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("satisfiable model");
+                assert_ne!(
+                    model.get(&owner),
+                    Some(&SlotKind::Owning),
+                    "borrowed struct-pointer `owner` must NOT be Owning (field malloc is field-ownership transfer, not parent ownership)"
                 );
             },
         );
