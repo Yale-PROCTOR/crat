@@ -332,8 +332,11 @@ use utils::{
     ast::{has_side_effects, unwrap_cast_and_paren, unwrap_paren},
     expr,
     ir::{AstToHir, mir_ty_to_string},
+    stmt,
     ty,
 };
+
+mod pointer_epoch_split;
 
 pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
@@ -407,6 +410,9 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
             .array_string_literal_static_excludes
             .contains(def_id)
     });
+    let mut epoch_split_exclude: FxHashSet<HirId> = vars_to_replace.keys().copied().collect();
+    epoch_split_exclude.extend(fresh_pointers.iter().copied());
+    let pointer_epoch_split_plan = pointer_epoch_split::analyze(tcx, &epoch_split_exclude);
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
@@ -422,6 +428,7 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
         non_pointer_uses: visitor.ctx.non_pointer_uses,
         string_literal_statics: visitor.ctx.string_literal_statics,
         array_string_literal_statics: visitor.ctx.array_string_literal_statics,
+        pointer_epoch_split_plan,
     };
 
     visitor.visit_crate(&mut expanded_ast);
@@ -517,6 +524,7 @@ struct AstVisitor<'tcx> {
     non_pointer_uses: FxHashSet<HirId>,
     string_literal_statics: FxHashSet<LocalDefId>,
     array_string_literal_statics: FxHashSet<LocalDefId>,
+    pointer_epoch_split_plan: pointer_epoch_split::PointerEpochSplitPlan,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -648,10 +656,33 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             }
         }
 
+        // replace base-changing assignments (`x = rhs;`) with epoch `let`s
+        // (`let mut x_N: TY = rhs;`). only accepted locals populate the map.
+        for stmt in &mut b.stmts {
+            let StmtKind::Semi(e) = &stmt.kind else { continue };
+            let Some(hir_expr) = self.ast_to_hir.get_expr(e.id, self.tcx) else { continue };
+            let Some(intro) = self
+                .pointer_epoch_split_plan
+                .assignment_replacements
+                .get(&hir_expr.hir_id)
+            else {
+                continue;
+            };
+            let ExprKind::Assign(_, rhs, _) = &e.kind else { continue };
+            let rhs_str = pprust::expr_to_string(rhs);
+            let new_name = intro.new_name;
+            let ty_string = &intro.ty_string;
+            *stmt = stmt!("let mut {new_name}: {ty_string} = {rhs_str};");
+        }
+
         b.stmts.retain(|stmt| {
             if let StmtKind::Let(local) = &stmt.kind
                 && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-                && self.lets_to_remove.contains(&hir_stmt.hir_id)
+                && (self.lets_to_remove.contains(&hir_stmt.hir_id)
+                    || self
+                        .pointer_epoch_split_plan
+                        .original_inits_to_remove
+                        .contains(&hir_stmt.hir_id))
             {
                 false
             } else {
@@ -701,6 +732,14 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     if let Res::Local(hir_id) = path.res
                         && let Some(name) = self.vars_to_replace.get(&hir_id)
                     {
+                        *expr = expr!("{name}");
+                    } else if let Some(name) = self
+                        .pointer_epoch_split_plan
+                        .path_renames
+                        .get(&hir_expr.hir_id)
+                    {
+                        // per-occurrence rename to the epoch local (keyed by this
+                        // occurrence, unlike `vars_to_replace` which is keyed by binding).
                         *expr = expr!("{name}");
                     } else if let Res::Def(DefKind::Static { .. }, def_id) = path.res
                         && let Some(local_def_id) = def_id.as_local()
@@ -2659,5 +2698,21 @@ unsafe fn main_0() -> core::ffi::c_int {
             &["let __arg_0", "x.i = __arg_0"],
             &["x.i = foo"],
         );
+    }
+
+    #[test]
+    fn test_epoch_split_noop_passthrough() {
+        // with an empty plan nothing is rewritten: the scratch local and its uses survive.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    return x;
+}
+        "#,
+            &["let mut x: *mut i8 = 0 as *mut i8", "x = a"],
+            &[],
+        )
     }
 }
