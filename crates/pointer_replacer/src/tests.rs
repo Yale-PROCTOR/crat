@@ -12043,21 +12043,34 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
         );
     }
 
-    // ===== BB-parity-own: ownership-slice differential harness (focused core) =====
+    // ===== BB-parity-own: ownership-slice semantic-verdict harness =====
+    //
+    // DEFERRED — relaxed-monotonicity IMPROVEMENT fixture (BO correctly `Owning` where
+    // production is not): an empirical search over direct `free(p); return malloc` and the
+    // interprocedural non-monotonic caller (`y = non_mono(x)`, non_mono frees its input and
+    // returns a fresh malloc) found BO and production AGREE on every named local — BO does
+    // not visibly exceed production on these simple shapes (production's monotonicity gating
+    // is correctly scoped for them; some mixed alloc+out-param shapes go UNSAT and decline).
+    // Per the project owner: do NOT fabricate an improvement case. A real divergence likely
+    // needs a cyclic/recursive or deeper interprocedural shape and is deferred to a targeted
+    // follow-up. When one is found, encode it as a gate-1 `owning` witness and confirm the
+    // report shows PROD_MISSES for that witness.
 
-    /// BB-parity-OWN differential harness (ownership slice), the mirror of
-    /// `assert_borrow_parity`. Production ownership is a BASELINE / REPORTING oracle, NOT
-    /// ground truth: BO may legitimately claim MORE `Owning` than production (relaxed
-    /// monotonicity is an intended improvement), so there is deliberately NO `bo ⊆ prod`
-    /// hard gate. HARD gates: (1) each positive `owning` witness BO MUST classify `Owning`;
-    /// (2) each semantic `kept_non_owning` control BO must NOT over-claim (over-claim =
-    /// `Box`/`free` on borrowed memory = double-free/UAF — the real absolute-soundness
-    /// teeth); (3) non-vacuity — the production oracle bridge agrees on each positive
-    /// witness, proving it is exercised (not silently empty). SOFT report (never fails):
-    /// COVERED / BO_UNDER (safe leak) / BO_EXTRA (triage: expected relaxed-monotonicity
-    /// improvement vs a suspicious over-claim that should earn its own control). Depth-0
-    /// single-indirection only in this slice (BO syntactic depth vs production semantic
-    /// depth can misalign at depth >= 1).
+    /// BB-parity-OWN: a SEMANTIC ownership-verdict harness for BO (borrow_ownership). The
+    /// hard gates are pure SEMANTIC verdicts against the INTENDED ownership model (the §9.9
+    /// output-param contract — a caller-visible ownership slot the callee REWRITES), NOT
+    /// agreement with any implementation:
+    ///   (1) each `owning` pointer BO MUST classify `Owning`;
+    ///   (2) each `kept_non_owning` pointer BO must NOT over-claim `Owning` (over-claim =
+    ///       `Box`/`free` on borrowed memory = double-free/UAF — the real soundness teeth).
+    /// Production ownership (and, later, `output_params`) are REPORTED as DIAGNOSTICS ONLY,
+    /// never gates: BO may legitimately claim MORE `Owning` than production (relaxed
+    /// monotonicity is an intended improvement), so a witness production misses is REPORTED
+    /// (PROD_MISSES / BO_EXTRA), not failed. Non-vacuity is intrinsic — gate 1 fails if BO
+    /// does not genuinely compute `Owning`, and control slots are present in the model (so
+    /// gate 2's `!= Owning` is a real verdict, not an absent-slot pass). Depth-0
+    /// single-indirection only in this slice (BO syntactic depth vs production semantic depth
+    /// can misalign at depth >= 1; deferred).
     fn assert_ownership_parity(
         tcx: TyCtxt<'_>,
         fn_name: &str,
@@ -12082,23 +12095,25 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
         // Production ownership oracle — BASELINE only (see doc; NOT a ceiling).
         let prod_owning = build_prod_owning(tcx, &program, &slots);
 
-        // HARD gate 1 — positive Owning witnesses: BO must classify each `Owning`.
-        // HARD gate 3 — non-vacuity: production ALSO marks it Owning (a both-agree baseline
-        // witness), proving the oracle bridge is exercised and not silently empty.
+        // HARD gate 1 — positive Owning witnesses: BO MUST classify each `Owning`. Pure
+        // SEMANTIC verdict; production is NOT a gate. A witness BO owns that production
+        // MISSES is a relaxed-monotonicity IMPROVEMENT (reported below), not a failure.
+        let mut prod_agrees: Vec<&str> = Vec::new();
+        let mut prod_misses: Vec<&str> = Vec::new();
         for nm in owning {
             let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
             assert_eq!(
                 model.get(&sref),
                 Some(&SlotKind::Owning),
-                "BB-parity-own: fixture `{fn_name}` requires BO to classify `{nm}` Owning; \
-                 got {:?}",
+                "BB-parity-own: fixture `{fn_name}` requires BO to classify `{nm}` Owning \
+                 (semantic verdict); got {:?}",
                 model.get(&sref)
             );
-            assert!(
-                prod_owning.contains(&sref),
-                "BB-parity-own: non-vacuity — the production oracle must also mark `{nm}` \
-                 Owning (the bridge must be exercised on an agreed baseline witness)"
-            );
+            if prod_owning.contains(&sref) {
+                prod_agrees.push(nm);
+            } else {
+                prod_misses.push(nm);
+            }
         }
 
         // HARD gate 2 — semantic non-Owning controls: BO must NOT over-claim. Production is
@@ -12136,7 +12151,8 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
             .count();
         eprintln!(
             "[BB-parity-own] {fn_name}: bo_owning={bo_owning_total} prod_owning={} \
-             COVERED={covered} BO_UNDER(safe)={bo_under} BO_EXTRA(triage)={bo_extra}",
+             COVERED={covered} BO_UNDER(safe)={bo_under} BO_EXTRA(triage)={bo_extra} \
+             | witnesses PROD_AGREES={prod_agrees:?} PROD_MISSES(BO-improvement)={prod_misses:?}",
             prod_owning.len()
         );
     }
@@ -12241,6 +12257,51 @@ pub unsafe fn stash(owner: *mut Holder) {
 }
 "#,
             |tcx| assert_ownership_parity(tcx, "stash", &[], &["owner"]),
+        );
+    }
+
+    /// BB-parity-own semantic non-Owning control: a pointer merely PASSED THROUGH to another
+    /// function (no allocation, no free) must NOT be Owning — nothing owns it. Guards against
+    /// BO's every-arg-is-Param::Output modeling over-claiming a pass-through.
+    #[test]
+    fn boparity_pass_through_param_control() {
+        run_compiler(
+            r#"
+pub unsafe fn sink(q: *mut i32) -> i32 {
+    unsafe { *q }
+}
+
+pub unsafe fn pass_through(p: *mut i32) -> i32 {
+    unsafe { sink(p) }
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "pass_through", &[], &["p"]),
+        );
+    }
+
+    /// BB-parity-own positive witness (the BB-escape win as a SEMANTIC verdict): a caller-side
+    /// out-param `make(&raw mut local){ *out = malloc }` rewrites the caller-visible slot, so
+    /// the caller's `local` MUST be Owning — the §9.9 output-param contract. RETURN-`local`
+    /// shape so `local` is USED (an unused owning local leaks -> non-Owning, the fixture trap).
+    #[test]
+    fn boparity_caller_outparam_escape_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn make(out: *mut *mut core::ffi::c_void) {
+    *out = unsafe { malloc(4) };
+}
+
+pub unsafe fn caller() -> *mut core::ffi::c_void {
+    let mut local: *mut core::ffi::c_void = core::ptr::null_mut();
+    unsafe { make(&raw mut local) };
+    local
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "caller", &["local"], &[]),
         );
     }
 }
