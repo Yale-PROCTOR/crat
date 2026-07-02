@@ -1,10 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::HirId;
-use rustc_hir::def::Res;
-use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{self as hir, QPath};
-use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::TyCtxt;
+use rustc_hir::{
+    self as hir, HirId, QPath,
+    def::Res,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::Symbol;
 
 use super::{is_lhs, lhs_base};
@@ -75,6 +75,7 @@ struct CandidateVisitor<'a, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for CandidateVisitor<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
+
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
     }
@@ -196,8 +197,12 @@ struct EpochEnv {
 
 impl EpochEnv {
     fn get(&self, local: HirId) -> EpochValue {
-        self.current.get(&local).cloned().unwrap_or(EpochValue::Original)
+        self.current
+            .get(&local)
+            .cloned()
+            .unwrap_or(EpochValue::Original)
     }
+
     fn set(&mut self, local: HirId, v: EpochValue) {
         self.current.insert(local, v);
     }
@@ -259,11 +264,25 @@ impl<'tcx> FnState<'tcx> {
 
 impl<'tcx> FnState<'tcx> {
     fn analyze_block(&mut self, block: &hir::Block<'tcx>, mut env: EpochEnv) -> EpochEnv {
+        // epochs allocated during this block have their `let` scoped to this block.
+        // snapshot the counter so we can invalidate them on exit: a use in an
+        // enclosing scope must not rename to an out-of-scope epoch `let`.
+        let scope_base = self.next_epoch;
         for stmt in block.stmts {
             env = self.analyze_stmt(stmt, env);
         }
         if let Some(e) = block.expr {
             env = self.analyze_expr(e, env);
+        }
+        // block-local epochs go out of scope here -> mark Blocked so any later read
+        // in a shallower scope rejects the local (the epoch `let` is no longer visible).
+        let locals: Vec<HirId> = self.candidates.keys().copied().collect();
+        for local in locals {
+            if let EpochValue::Epoch(id) = env.get(local)
+                && id.0 >= scope_base
+            {
+                env.set(local, EpochValue::Blocked);
+            }
         }
         env
     }
@@ -402,8 +421,12 @@ impl<'tcx> FnState<'tcx> {
                 if is_local_path(receiver)
                     && matches!(
                         seg.ident.name.as_str(),
-                        "offset" | "add" | "sub" | "wrapping_offset"
-                            | "wrapping_add" | "wrapping_sub"
+                        "offset"
+                            | "add"
+                            | "sub"
+                            | "wrapping_offset"
+                            | "wrapping_add"
+                            | "wrapping_sub"
                     ) =>
             {
                 Some(receiver)
@@ -441,7 +464,10 @@ impl<'tcx> FnState<'tcx> {
     // candidate locals that receive a base-changing assignment anywhere in `block`.
     fn loop_base_changed(&self, block: &'tcx hir::Block<'tcx>) -> Vec<HirId> {
         let mut found = Vec::new();
-        let mut v = BaseChangeScanner { state: self, found: &mut found };
+        let mut v = BaseChangeScanner {
+            state: self,
+            found: &mut found,
+        };
         v.visit_block(block);
         found
     }
@@ -456,9 +482,11 @@ struct ReadCollector<'a, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for ReadCollector<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
+
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.state.tcx
     }
+
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         // do not descend into closures.
         if matches!(expr.kind, hir::ExprKind::Closure(_)) {
@@ -490,9 +518,11 @@ struct BaseChangeScanner<'a, 'tcx> {
 }
 impl<'tcx> Visitor<'tcx> for BaseChangeScanner<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
+
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.state.tcx
     }
+
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         if let hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
             && let Some(local) = self.state.assign_target(lhs)
@@ -510,7 +540,11 @@ impl<'tcx> Visitor<'tcx> for BaseChangeScanner<'_, 'tcx> {
 // preprocessor rewrites. filled in by later tasks; empty for now.
 pub(crate) fn analyze(tcx: TyCtxt<'_>, exclude: &FxHashSet<HirId>) -> PointerEpochSplitPlan {
     let mut plan = PointerEpochSplitPlan::empty();
-    let mut driver = Driver { tcx, exclude, plan: &mut plan };
+    let mut driver = Driver {
+        tcx,
+        exclude,
+        plan: &mut plan,
+    };
     tcx.hir_visit_all_item_likes_in_crate(&mut driver);
     plan
 }
@@ -523,9 +557,11 @@ struct Driver<'a, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for Driver<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
+
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
     }
+
     fn visit_body(&mut self, body: &hir::Body<'tcx>) {
         analyze_body(self.tcx, self.exclude, body, self.plan);
         intravisit::walk_body(self, body);
@@ -583,8 +619,13 @@ fn finalize<'tcx>(
         }
         let name = epoch_names[epoch];
         let ty_string = state.candidates[&local].ty_string.clone();
-        plan.assignment_replacements
-            .insert(*assign_hir_id, EpochLetIntro { new_name: name, ty_string });
+        plan.assignment_replacements.insert(
+            *assign_hir_id,
+            EpochLetIntro {
+                new_name: name,
+                ty_string,
+            },
+        );
     }
     // remove the scratch init of every accepted local.
     for (local, cand) in &state.candidates {
@@ -597,7 +638,10 @@ fn finalize<'tcx>(
 // all local + param names in this body, used as the freshness set.
 fn existing_names<'tcx>(tcx: TyCtxt<'tcx>, body: &hir::Body<'tcx>) -> FxHashSet<String> {
     let mut names = FxHashSet::default();
-    let mut v = NameCollector { tcx, names: &mut names };
+    let mut v = NameCollector {
+        tcx,
+        names: &mut names,
+    };
     v.visit_body(body);
     names
 }
@@ -608,9 +652,11 @@ struct NameCollector<'a, 'tcx> {
 }
 impl<'tcx> Visitor<'tcx> for NameCollector<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
+
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
     }
+
     fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
         if let hir::PatKind::Binding(_, _, ident, _) = pat.kind {
             self.names.insert(ident.name.to_string());

@@ -332,8 +332,7 @@ use utils::{
     ast::{has_side_effects, unwrap_cast_and_paren, unwrap_paren},
     expr,
     ir::{AstToHir, mir_ty_to_string},
-    stmt,
-    ty,
+    stmt, ty,
 };
 
 mod pointer_epoch_split;
@@ -373,6 +372,9 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut fresh_pointers = FxHashSet::default();
     let mut fresh_pointer_renames = FxHashMap::default();
     let mut stmt_swaps: FxHashMap<_, Vec<_>> = FxHashMap::default();
+    // source pointers whose original name the `*fresh = ..` rewrite reintroduces;
+    // epoch splitting must not rename/remove these or the reintroduced use dangles.
+    let mut fresh_pointer_sources: FxHashSet<HirId> = FxHashSet::default();
     for lhs in visitor.ctx.rhs_to_lhs.values() {
         for lhs in lhs {
             if lhs.is_mutable {
@@ -396,6 +398,7 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
                     tcx.hir_name(fresh_let.rhs)
                 };
                 fresh_pointer_renames.insert(lhs.variable, symbol);
+                fresh_pointer_sources.insert(fresh_let.rhs);
             }
         }
     }
@@ -410,12 +413,16 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
             .array_string_literal_static_excludes
             .contains(def_id)
     });
-    // `lets_to_remove` does not need to be added to the exclude set: every
-    // binding removed by the elision rewrites has its HirId in `vars_to_replace`
-    // or `fresh_pointers`, both of which are already in the set below, so epoch
-    // splitting can never claim a binding that another rewrite will remove.
+    // exclude bindings that other preprocessor rewrites will rename or reintroduce:
+    // - `vars_to_replace` keys (param/let elision targets),
+    // - `fresh_pointers` (the fresh vars of the deref rewrite),
+    // - `fresh_pointer_sources` (source pointers whose original name the `*fresh = ..`
+    //   rewrite reintroduces — splitting these leaves a dangling use).
+    // `lets_to_remove` needs no separate entry: those bindings are already in
+    // `vars_to_replace` or `fresh_pointers`.
     let mut epoch_split_exclude: FxHashSet<HirId> = vars_to_replace.keys().copied().collect();
     epoch_split_exclude.extend(fresh_pointers.iter().copied());
+    epoch_split_exclude.extend(fresh_pointer_sources.iter().copied());
     let pointer_epoch_split_plan = pointer_epoch_split::analyze(tcx, &epoch_split_exclude);
     let mut visitor = AstVisitor {
         tcx,
@@ -2733,7 +2740,12 @@ pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
     return x;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "let mut x_1: *mut i8 = b", "_c: i8 = *x_0", "return x_1"],
+            &[
+                "let mut x_0: *mut i8 = a",
+                "let mut x_1: *mut i8 = b",
+                "_c: i8 = *x_0",
+                "return x_1",
+            ],
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
@@ -2867,7 +2879,13 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> i32 {
     return d as i32;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "*x_0", "x_0.is_null()", "use_ptr(x_0)", "x_0 as *const i8"],
+            &[
+                "let mut x_0: *mut i8 = a",
+                "*x_0",
+                "x_0.is_null()",
+                "use_ptr(x_0)",
+                "x_0 as *const i8",
+            ],
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
@@ -2902,6 +2920,46 @@ pub unsafe extern "C" fn f(mut uname: *mut i8, cond: i32) {
                 "str_tmp_1.is_null()",
             ],
             &["let mut str_tmp: *mut i8 = 0 as *mut i8"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_rejects_epoch_escaping_block() {
+        // an epoch created inside a nested block must not be renamed at a use after
+        // the block: the epoch `let` is out of scope there. the local is left unsplit
+        // (rejected) so the output stays valid.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    'c_blk: {
+        x = a;
+    }
+    return x;
+}
+        "#,
+            &["let mut x: *mut i8 = 0 as *mut i8", "return x"],
+            &["x_0"],
+        )
+    }
+
+    #[test]
+    fn test_epoch_split_rejects_fresh_pointer_source() {
+        // `let fresh = p; p = p.offset(1); *fresh = X` is rewritten by the existing
+        // fresh-pointer pass, which reintroduces `p`'s original name. epoch splitting
+        // must not rename/remove `p` (a fresh-pointer source), or `*p` would dangle.
+        run_test(
+            r#"
+pub unsafe extern "C" fn f(mut base: *mut u8) {
+    let mut p: *mut u8 = 0 as *mut u8;
+    p = base;
+    let fresh = p;
+    p = p.offset(1);
+    *fresh = 1 as u8;
+}
+        "#,
+            &["let mut p: *mut u8 = 0 as *mut u8"],
+            &["p_0"],
         )
     }
 }
