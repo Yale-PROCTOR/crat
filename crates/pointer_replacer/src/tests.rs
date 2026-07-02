@@ -12433,12 +12433,15 @@ pub unsafe fn stash_borrow(b: *mut Bag, src: *mut i32) {
     /// deep-chain / union / conditional / interproc-return / global-static / free-through-field
     /// / libc-allocators): empirically confirmed this is the SOLE real over-claim root cause,
     /// and that it GENERALIZES — it triggers for any owning SOURCE (malloc/strdup/calloc) or
-    /// SINK (free) on a scalar OR array-of-pointer struct field that ALSO receives a borrowed
-    /// value elsewhere, and it drags the borrowed value itself Owning. It does NOT extend to:
-    /// deep `*mut *mut` field chains (BO UNDER-claims -> safe leak), unions (unmodeled -> no
-    /// slot), embedded nested structs where the malloc leaks to Raw (safe), or realloc's
-    /// arg-sink (realloc CONSUMES its arg, so Owning is CORRECT, like free — a sweep false
-    /// positive). Several mixed shapes (global/stack-address-into-field, free-through-field,
+    /// SINK (free) on a raw-pointer struct field (scalar `*mut T`, or a multi-level
+    /// `*mut *mut T` field at its depth-0 slot) that ALSO receives a borrowed value elsewhere,
+    /// and it drags the borrowed value itself Owning. It does NOT extend to: the DEEPER
+    /// (depth>=1) levels of `*mut *mut` field chains (BO UNDER-claims -> safe leak); Rust
+    /// array `[*mut T; N]` FIELDS (crate_slots registers a slot only for a directly-`RawPtr`
+    /// field, so array fields are UNMODELED — no slot, resolve_place None — not over-claimed);
+    /// unions (unmodeled -> no slot); embedded nested structs where the malloc leaks to Raw
+    /// (safe); or realloc's arg-sink (realloc CONSUMES its arg, so Owning is CORRECT, like
+    /// free — a sweep false positive). Several mixed shapes (global/stack-address-into-field, free-through-field,
     /// interproc-return, linked-list) go UNSAT and BO DECLINES (sound, no over-claim ships).
     /// So the fix is narrowly scoped to scalar/array struct-field-slot ownership.
     /// Un-ignore when fixed.
