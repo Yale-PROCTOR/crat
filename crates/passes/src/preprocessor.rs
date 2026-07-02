@@ -2712,8 +2712,9 @@ unsafe fn main_0() -> core::ffi::c_int {
     }
 
     #[test]
-    fn test_epoch_split_single_base() {
-        // a single-base scratch local is split into one epoch local and the scratch init is removed.
+    fn test_epoch_split_skips_single_base() {
+        // a single-base scratch local is NOT split: only genuine multi-base reuse is
+        // split, so the original binding and its sole assignment are left untouched.
         run_test(
             r#"
 pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
@@ -2722,8 +2723,8 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
     return x;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "return x_0"],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
+            &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
+            &["x_0"],
         )
     }
 
@@ -2752,18 +2753,26 @@ pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
 
     #[test]
     fn test_epoch_split_same_epoch_movement() {
-        // `.offset` on the same local keeps the epoch and stays an assignment.
+        // `.offset` on the same local keeps the epoch and stays an assignment (not a
+        // `let`); a later distinct base gives the local a second epoch so it splits.
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
     let mut x: *mut i8 = 0 as *mut i8;
     x = a;
     x = x.offset(1 as isize);
+    let _c: i8 = *x;
+    x = b;
     return x;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "x_0 = x_0.offset", "return x_0"],
-            &["let mut x_0: *mut i8 = a;\n    let mut"], // the movement is NOT a second `let`
+            &[
+                "let mut x_0: *mut i8 = a",
+                "x_0 = x_0.offset",
+                "let mut x_1: *mut i8 = b",
+                "return x_1",
+            ],
+            &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
 
@@ -2787,19 +2796,30 @@ pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
 
     #[test]
     fn test_epoch_split_branch_contained() {
-        // an epoch created and consumed entirely inside one branch splits.
+        // two branch-contained epochs (one per arm), each used only inside its arm and
+        // not after the join -> the local has two epochs and splits within each branch.
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> i32 {
+extern "C" {
+    fn foo(_: *mut i8);
+}
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, cond: i32) {
     let mut x: *mut i8 = 0 as *mut i8;
     if cond != 0 {
         x = a;
-        return *x as i32;
+        foo(x);
+    } else {
+        x = b;
+        foo(x);
     }
-    return 0;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "*x_0 as i32"],
+            &[
+                "let mut x_0: *mut i8 = a",
+                "foo(x_0)",
+                "let mut x_1: *mut i8 = b",
+                "foo(x_1)",
+            ],
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
@@ -2844,10 +2864,11 @@ pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
 
     #[test]
     fn test_epoch_split_loop_same_epoch_movement() {
-        // incoming epoch, loop only moves it: contained uses rename, no `let` in loop.
+        // incoming epoch, loop only moves it (renamed, no `let` in loop); a later
+        // distinct base gives the local a second epoch so it splits.
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, n: i32) -> *mut i8 {
     let mut x: *mut i8 = 0 as *mut i8;
     x = a;
     let mut i: i32 = 0;
@@ -2855,20 +2876,28 @@ pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
         x = x.offset(1 as isize);
         i += 1;
     }
+    x = b;
     return x;
 }
         "#,
-            &["let mut x_0: *mut i8 = a", "x_0 = x_0.offset", "return x_0"],
+            &[
+                "let mut x_0: *mut i8 = a",
+                "x_0 = x_0.offset",
+                "let mut x_1: *mut i8 = b",
+                "return x_1",
+            ],
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
     }
 
     #[test]
     fn test_epoch_split_use_kinds() {
+        // deref, null check, call arg, cast, and pointer-method uses all rename to the
+        // epoch local; a second distinct base gives the local two epochs so it splits.
         run_test(
             r#"
 pub unsafe extern "C" fn use_ptr(p: *mut i8) {}
-pub unsafe extern "C" fn f(mut a: *mut i8) -> i32 {
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> i32 {
     let mut x: *mut i8 = 0 as *mut i8;
     x = a;
     let d: i8 = *x;                 // deref
@@ -2876,6 +2905,7 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> i32 {
         use_ptr(x);                 // call argument
         let c: *const i8 = x as *const i8; // cast
     }
+    x = b;
     return d as i32;
 }
         "#,
@@ -2885,6 +2915,7 @@ pub unsafe extern "C" fn f(mut a: *mut i8) -> i32 {
                 "x_0.is_null()",
                 "use_ptr(x_0)",
                 "x_0 as *const i8",
+                "let mut x_1: *mut i8 = b",
             ],
             &["let mut x: *mut i8 = 0 as *mut i8"],
         )
@@ -2925,21 +2956,27 @@ pub unsafe extern "C" fn f(mut uname: *mut i8, cond: i32) {
 
     #[test]
     fn test_epoch_split_rejects_epoch_escaping_block() {
-        // an epoch created inside a nested block must not be renamed at a use after
-        // the block: the epoch `let` is out of scope there. the local is left unsplit
-        // (rejected) so the output stays valid.
+        // two epochs where the second is created inside a nested block and then used
+        // after the block: the block-scoped epoch `let` would be out of scope, so the
+        // whole local is rejected (left unsplit) rather than dangling.
         run_test(
             r#"
-pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
     let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
     'c_blk: {
-        x = a;
+        x = b;
     }
     return x;
 }
         "#,
-            &["let mut x: *mut i8 = 0 as *mut i8", "return x"],
-            &["x_0"],
+            &[
+                "let mut x: *mut i8 = 0 as *mut i8",
+                "x = a",
+                "x = b",
+                "return x",
+            ],
+            &["x_0", "x_1"],
         )
     }
 

@@ -591,13 +591,26 @@ fn finalize<'tcx>(
     plan: &mut PointerEpochSplitPlan,
 ) {
     let mut existing = existing_names(tcx, body);
+
+    // count base-change epochs per local. only split a local with >= 2 epochs
+    // (genuine reuse across distinct bases). a single-base local is left untouched:
+    // removing its null init and promoting the sole reassignment to a `let` adds
+    // noise and breaks downstream passes for no analysis benefit.
+    let mut epoch_count: FxHashMap<HirId, usize> = FxHashMap::default();
+    for local in state.epoch_local.values() {
+        *epoch_count.entry(*local).or_default() += 1;
+    }
+    let should_split = |local: &HirId| {
+        !state.rejected.contains(local) && epoch_count.get(local).copied().unwrap_or(0) >= 2
+    };
+
     // stable order: name epochs by allocation order so suffixes are deterministic.
     let mut epoch_names: FxHashMap<EpochId, Symbol> = FxHashMap::default();
     let mut epochs: Vec<(EpochId, HirId)> =
         state.epoch_local.iter().map(|(e, l)| (*e, *l)).collect();
     epochs.sort_by_key(|(e, _)| e.0);
     for (epoch, local) in epochs {
-        if state.rejected.contains(&local) {
+        if !should_split(&local) {
             continue;
         }
         let stem = tcx.hir_name(local); // original binding name, e.g. `x`
@@ -605,16 +618,16 @@ fn finalize<'tcx>(
         epoch_names.insert(epoch, name);
     }
 
-    // path renames for accepted locals.
+    // path renames for split locals (only epochs that received a name).
     for (occ, epoch) in &state.path_renames {
         if let Some(name) = epoch_names.get(epoch) {
             plan.path_renames.insert(*occ, *name);
         }
     }
-    // assignment -> let intros for accepted locals.
+    // assignment -> let intros for split locals.
     for (assign_hir_id, epoch) in &state.assignment_epochs {
         let local = state.epoch_local[epoch];
-        if state.rejected.contains(&local) {
+        if !should_split(&local) {
             continue;
         }
         let name = epoch_names[epoch];
@@ -627,9 +640,9 @@ fn finalize<'tcx>(
             },
         );
     }
-    // remove the scratch init of every accepted local.
+    // remove the scratch init only of split locals.
     for (local, cand) in &state.candidates {
-        if !state.rejected.contains(local) {
+        if should_split(local) {
             plan.original_inits_to_remove.insert(cand.init_let_stmt);
         }
     }
