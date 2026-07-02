@@ -7,7 +7,6 @@ use super::{
     resolve::{ResolvedSlot, resolve_place},
     solver::{KindSolver, SlotRef},
     slots::StructFieldSlot,
-    sources::collect_malloc_source_slots,
 };
 use crate::utils::rustc::RustProgram;
 
@@ -19,12 +18,13 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
 }
 
 /// Locals whose pointer VALUE originates from a borrowed input — a function parameter
-/// (index `1..=arg_count`; local 0 is the return place) or a copy/cast/reborrow chain from
-/// one. Storing such a value into a struct field means that crate-wide field slot can hold
-/// non-owned memory, so its ownership must be vetoed (§9.10.2). Conservative: a parameter
-/// that is actually an owned transfer is also treated as borrowed here (a safe leak, not an
-/// over-claim). Value-preserving edges only (Use copy/move, ptr Cast, CopyForDeref); a
-/// `Deref`/`Field`/`malloc` result is a fresh value and is NOT propagated.
+/// (index `1..=arg_count`; local 0 is the return place) or a copy/cast/reborrow/load chain
+/// ROOTED at one. The chain follows the ROOT local of the source place, so a load THROUGH a
+/// borrowed pointer (`t = (*param).field`, `t = *param`) is also borrowed — a value pulled
+/// out of borrowed/caller memory is itself borrowed w.r.t. this function. Conservative: a
+/// parameter that is actually an owned transfer is also treated as borrowed here (its field
+/// use only matters when the field is ALSO assigned a non-borrowed value — see
+/// `apply_field_ownership_vetoes` — so a pure transfer is not vetoed).
 fn compute_borrowed_origin(body: &Body<'_>) -> FxHashSet<Local> {
     let mut set: FxHashSet<Local> = (1..=body.arg_count).map(Local::from_usize).collect();
     let mut changed = true;
@@ -39,10 +39,12 @@ fn compute_borrowed_origin(body: &Body<'_>) -> FxHashSet<Local> {
                 if set.contains(&dst) {
                     continue;
                 }
+                // Root local of a value-preserving/loaded source; `p.local` (not
+                // `as_local`) so projected loads through a borrowed root propagate.
                 let src = match rvalue {
                     Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
                     | Rvalue::CopyForDeref(p)
-                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => p.as_local(),
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(p.local),
                     _ => None,
                 };
                 if let Some(srcl) = src
@@ -129,23 +131,33 @@ pub fn add_coherence<'tcx>(
 }
 
 /// §9.10.2 crate-wide field-ownership veto. A struct field slot is ONE crate-wide slot and
-/// `coherence` is flow-insensitive, so a field assigned an owned allocation in one function
-/// and a borrowed (parameter-origin) value in another would be forced `Owning` by the
-/// allocation source yet actually hold borrowed memory in that other context — an unsound
-/// over-claim (the rewriter would `Box`/free borrowed memory -> UAF). This vetoes the `own`
-/// bit of any field slot that is assigned an alloc-origin value in one place AND a
-/// borrowed-origin value in another (crate-wide), backing it off to non-Owning (the
-/// retractable source leaks — a safe leak). A field consistently populated by owned
-/// transfers (only alloc-origin) or consistently borrowed (only borrowed-origin) is NOT
-/// vetoed, so legitimate ownership-transfer-into-a-field stays `Owning`.
+/// `coherence` is flow-insensitive, so it equates that slot to EVERY value assigned to the
+/// field across the crate. If a field is assigned a borrowed value in one place, it can hold
+/// non-owned memory, so it must never be `Owning` (else the rewriter would `Box`/free
+/// borrowed memory -> UAF). This vetoes the `own` bit of any field slot that is assigned
+/// BOTH a borrowed-origin value AND a non-borrowed-origin value across the crate — i.e. a
+/// field that MIGHT be forced `Owning` by the non-borrowed side yet holds borrowed memory in
+/// the borrowed context. Backing it off to non-Owning is a safe leak (the retractable source
+/// leaks, or a hard `free` sink makes it UNSAT and BO declines — both sound).
+///
+/// Using "non-borrowed" (rather than specifically an allocation source) makes the alloc side
+/// robust to interprocedural / wrapper-returned allocations (`let p = make(); (*d).p = p`) —
+/// no allocator-source detection is needed. Crucially it does NOT over-veto: a field
+/// populated ONLY by owned transfers (every assignment borrowed-origin — e.g. a setter
+/// `(*list).head = node` for a param `node`) has no non-borrowed assignment, so it is NOT
+/// vetoed and stays `Owning`; a field assigned ONLY allocations (no borrowed assignment) is
+/// likewise not vetoed. Borrowed-origin follows `compute_borrowed_origin` (params + copy /
+/// cast / load chains rooted at one), so a projected borrowed load (`t = (*src).p`) counts.
+/// RESIDUAL (deferred, rarer): a field assigned an owned param in one fn and a borrowed param
+/// in another (both borrowed-origin) is not vetoed — distinguishing needs interprocedural
+/// param ownership.
 pub(crate) fn apply_field_ownership_vetoes(
     solver: &KindSolver,
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) {
-    let alloc_sources = collect_malloc_source_slots(program, slots);
-    let mut has_alloc: FxHashSet<SlotRef> = FxHashSet::default();
     let mut has_borrowed: FxHashSet<SlotRef> = FxHashSet::default();
+    let mut has_non_borrowed: FxHashSet<SlotRef> = FxHashSet::default();
 
     for &fn_did in &program.functions {
         let body_ref = program
@@ -167,13 +179,10 @@ pub(crate) fn apply_field_ownership_vetoes(
                             resolve_place(slots, fn_did, body, *lhs, 0)
                         {
                             let f = SlotRef::Field(fid);
-                            if let Some(rs) = resolve_place(slots, fn_did, body, *rhs, 0)
-                                && alloc_sources.contains(&to_slot_ref(rs, fn_did))
-                            {
-                                has_alloc.insert(f);
-                            }
                             if borrowed_origin.contains(&rhs.local) {
                                 has_borrowed.insert(f);
+                            } else {
+                                has_non_borrowed.insert(f);
                             }
                         }
                     }
@@ -197,13 +206,10 @@ pub(crate) fn apply_field_ownership_vetoes(
                                 continue;
                             };
                             let f = SlotRef::Field(fid);
-                            if let Some(rs) = resolve_place(slots, fn_did, body, op_place, 0)
-                                && alloc_sources.contains(&to_slot_ref(rs, fn_did))
-                            {
-                                has_alloc.insert(f);
-                            }
                             if borrowed_origin.contains(&op_place.local) {
                                 has_borrowed.insert(f);
+                            } else {
+                                has_non_borrowed.insert(f);
                             }
                         }
                     }
@@ -213,7 +219,7 @@ pub(crate) fn apply_field_ownership_vetoes(
         }
     }
 
-    for field in has_alloc.intersection(&has_borrowed) {
+    for field in has_borrowed.intersection(&has_non_borrowed) {
         solver.veto_owning(*field);
     }
 }
