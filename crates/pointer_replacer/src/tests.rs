@@ -12517,6 +12517,62 @@ pub unsafe fn d_borrow(d: *mut D, src: *mut core::ffi::c_void) {
             |tcx| assert_ownership_parity(tcx, "d_borrow", &[], &[fld("D", 0)]),
         );
     }
+
+    /// BB-parity-own regression control (address-of / non-owned field store — Codex). A field
+    /// with a malloc store (`E::p = malloc as *mut i32`, a Cast the collector follows to the
+    /// owned operand) AND a direct address-of store (`(*e).p = &raw mut x`, a `RawPtr` rvalue)
+    /// must NOT be Owning: it can hold a stack address, so freeing it is a UAF. The address
+    /// store is not resolvable to an owned value, so `constrain_field_ownership` BLOCKS the
+    /// field (`forbid_field_own`) rather than dropping it from the `AND` (which would wrongly
+    /// permit Owning).
+    #[test]
+    fn boparity_addr_of_field_store_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct E {
+    pub p: *mut i32,
+}
+pub unsafe fn e_own(e: *mut E) {
+    (*e).p = unsafe { malloc(4) } as *mut i32;
+}
+pub unsafe fn e_addr(e: *mut E) {
+    let mut x: i32 = 0;
+    (*e).p = &raw mut x;
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "e_addr", &[], &[fld("E", 0)]),
+        );
+    }
+
+    /// BB-parity-own regression control (free-through-a-field projection — Codex). A field
+    /// assigned a borrowed `src` and freed elsewhere via `free((*b).p)` must NOT drag `src`
+    /// (or the field) to Owning: BO's free SINK, like its allocator sources, skips a PROJECTED
+    /// argument, so `free((*b).p)` does not force the field Owning, and the borrowed store
+    /// keeps it non-Owning. Guards that the field-ownership biconditional cannot be
+    /// back-propagated by a field sink.
+    #[test]
+    fn boparity_free_through_field_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub struct F {
+    pub p: *mut core::ffi::c_void,
+}
+pub unsafe fn f_stash(b: *mut F, src: *mut core::ffi::c_void) {
+    (*b).p = src;
+}
+pub unsafe fn f_drop(b: *mut F) {
+    free((*b).p);
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "f_stash", &[], &[fld("F", 0), loc("src")]),
+        );
+    }
 }
 
 mod borrow_ownership_resolve {

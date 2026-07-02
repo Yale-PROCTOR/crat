@@ -120,6 +120,21 @@ impl KindSolver {
         self.solver.assert(&Bool::or(&clause));
     }
 
+    /// §9.10.2 companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
+    /// Used when a field receives a value that is definitely not an owned heap allocation — an
+    /// address-of (`Ref`/`RawPtr`) store, or a store whose RHS cannot be resolved to a slot
+    /// (so its ownership is unknown). Such a store means the field can hold non-owned memory,
+    /// so it must never be `Owning` (freeing it would be UAF). Conservative and sound: an
+    /// unresolved/address store BLOCKS ownership rather than being silently dropped from the
+    /// `AND` (which would wrongly permit `Owning`).
+    pub(crate) fn forbid_field_own(&self, field: SlotRef) {
+        let vars = self
+            .vars
+            .get(&field)
+            .unwrap_or_else(|| panic!("unknown slot: {field:?}"));
+        self.solver.assert(&!&vars.own);
+    }
+
     /// Solidification link: tie a slot's `own` one-hot bit to an external Bool
     /// (the disjunction of the slot's per-version ownership Bools). Mirrors the
     /// biconditional idiom in `equate`.
