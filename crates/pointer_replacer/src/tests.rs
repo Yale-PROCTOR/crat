@@ -12071,12 +12071,49 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
     /// gate 2's `!= Owning` is a real verdict, not an absent-slot pass). Depth-0
     /// single-indirection only in this slice (BO syntactic depth vs production semantic depth
     /// can misalign at depth >= 1; deferred).
-    fn assert_ownership_parity(
+    /// A semantic ownership verdict target: a function `Local(name, depth)` or a struct
+    /// `Field(struct_name, field_index, depth)`, at deref `depth` (0 = the slot's own
+    /// value). Built via `loc` / `loc_at` / `fld`.
+    #[derive(Clone, Copy, Debug)]
+    enum Own<'a> {
+        Local(&'a str, u8),
+        Field(&'a str, usize, u8),
+    }
+    fn loc(name: &str) -> Own<'_> {
+        Own::Local(name, 0)
+    }
+    fn loc_at(name: &str, depth: u8) -> Own<'_> {
+        Own::Local(name, depth)
+    }
+    fn fld(struct_name: &str, field_index: usize) -> Own<'_> {
+        Own::Field(struct_name, field_index, 0)
+    }
+
+    fn resolve_own(
         tcx: TyCtxt<'_>,
-        fn_name: &str,
-        owning: &[&str],
-        kept_non_owning: &[&str],
-    ) {
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+        fn_did: LocalDefId,
+        o: Own,
+    ) -> SlotRef {
+        match o {
+            Own::Local(name, depth) => {
+                local_slot(slots, fn_did, local_by_var_name(tcx, fn_did, name), depth)
+            }
+            Own::Field(struct_name, field_index, depth) => {
+                let struct_did = struct_by_name(program, struct_name);
+                let fsid = slots
+                    .field_slots
+                    .slot_for_field_depth(StructFieldSlot { struct_did, field_index }, depth)
+                    .unwrap_or_else(|| {
+                        panic!("no field slot for `{struct_name}`.{field_index} depth {depth}")
+                    });
+                SlotRef::Field(fsid)
+            }
+        }
+    }
+
+    fn assert_ownership_parity(tcx: TyCtxt<'_>, fn_name: &str, owning: &[Own], non_owning: &[Own]) {
         // BO model (SUT) — identical construction to `assert_borrow_parity`.
         let program = collect_program(tcx);
         let f = function_by_name(&program, fn_name);
@@ -12092,47 +12129,53 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
         let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
             .expect("BB-parity-own: BO CEGAR must converge (Some) on the corpus");
 
-        // Production ownership oracle — BASELINE only (see doc; NOT a ceiling).
+        // Production ownership oracle — DIAGNOSTIC baseline only (NOT a gate/ceiling).
         let prod_owning = build_prod_owning(tcx, &program, &slots);
 
-        // HARD gate 1 — positive Owning witnesses: BO MUST classify each `Owning`. Pure
-        // SEMANTIC verdict; production is NOT a gate. A witness BO owns that production
-        // MISSES is a relaxed-monotonicity IMPROVEMENT (reported below), not a failure.
-        let mut prod_agrees: Vec<&str> = Vec::new();
-        let mut prod_misses: Vec<&str> = Vec::new();
-        for nm in owning {
-            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+        // HARD gate 1 — positive Owning verdicts (Local OR Field, any depth): BO MUST classify
+        // each `Owning`. Pure SEMANTIC verdict; production is NOT a gate. A verdict BO owns
+        // that production MISSES is a relaxed-monotonicity IMPROVEMENT (reported), not a fail.
+        let mut prod_agrees: Vec<Own> = Vec::new();
+        let mut prod_misses: Vec<Own> = Vec::new();
+        for &o in owning {
+            let sref = resolve_own(tcx, &program, &slots, f, o);
             assert_eq!(
                 model.get(&sref),
                 Some(&SlotKind::Owning),
-                "BB-parity-own: fixture `{fn_name}` requires BO to classify `{nm}` Owning \
+                "BB-parity-own: fixture `{fn_name}` requires BO to classify {o:?} Owning \
                  (semantic verdict); got {:?}",
                 model.get(&sref)
             );
-            if prod_owning.contains(&sref) {
-                prod_agrees.push(nm);
-            } else {
-                prod_misses.push(nm);
+            // Production comparison applies to LOCAL verdicts only: `build_prod_owning` maps
+            // production LOCAL ownership, not field ownership (deferred), so a `Field` verdict
+            // is not a meaningful PROD_AGREES/MISSES signal.
+            if matches!(o, Own::Local(..)) {
+                if prod_owning.contains(&sref) {
+                    prod_agrees.push(o);
+                } else {
+                    prod_misses.push(o);
+                }
             }
         }
 
-        // HARD gate 2 — semantic non-Owning controls: BO must NOT over-claim. Production is
-        // not ground truth, so soundness lives HERE: over-claiming a read-only param or a
-        // field-transfer parent is a double-free/UAF.
-        for nm in kept_non_owning {
-            let sref = local_slot(&slots, f, local_by_var_name(tcx, f, nm), 0);
+        // HARD gate 2 — semantic non-Owning verdicts: BO must NOT over-claim. Production is
+        // not ground truth, so soundness lives HERE: over-claiming a read-only param, a
+        // field-transfer parent, or a BORROWED field is a double-free/UAF.
+        for &o in non_owning {
+            let sref = resolve_own(tcx, &program, &slots, f, o);
             assert_ne!(
                 model.get(&sref),
                 Some(&SlotKind::Owning),
-                "BB-parity-own: control `{nm}` must NOT be Owning in BO's model \
+                "BB-parity-own: control {o:?} must NOT be Owning in BO's model \
                  (over-claim = double-free/UAF); got {:?}",
                 model.get(&sref)
             );
         }
 
-        // SOFT report (NEVER fails). BO_EXTRA (BO-only Owning) is TRIAGED — an expected
-        // relaxed-monotonicity improvement over production, or a suspicious over-claim that
-        // should earn its own semantic control. Depth-0 locals only.
+        // SOFT report (NEVER fails), over LOCAL slots (production field-granularity mapping is
+        // deferred — field verdicts are hard-gated above, not compared to production here).
+        // BO_EXTRA (BO-only Owning) is TRIAGED: expected relaxed-monotonicity improvement vs a
+        // suspicious over-claim that should earn its own semantic control.
         let (mut covered, mut bo_extra, mut bo_owning_total) = (0usize, 0usize, 0usize);
         for (s, kind) in &model {
             if !matches!(s, SlotRef::Local(..)) || *kind != SlotKind::Owning {
@@ -12150,7 +12193,7 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
             .filter(|s| model.get(*s) != Some(&SlotKind::Owning))
             .count();
         eprintln!(
-            "[BB-parity-own] {fn_name}: bo_owning={bo_owning_total} prod_owning={} \
+            "[BB-parity-own] {fn_name}: bo_owning(local)={bo_owning_total} prod_owning={} \
              COVERED={covered} BO_UNDER(safe)={bo_under} BO_EXTRA(triage)={bo_extra} \
              | witnesses PROD_AGREES={prod_agrees:?} PROD_MISSES(BO-improvement)={prod_misses:?}",
             prod_owning.len()
@@ -12217,7 +12260,7 @@ pub unsafe fn f() {
     free(p);
 }
 "#,
-            |tcx| assert_ownership_parity(tcx, "f", &["p"], &[]),
+            |tcx| assert_ownership_parity(tcx, "f", &[loc("p")], &[]),
         );
     }
 
@@ -12231,7 +12274,7 @@ pub unsafe fn reader(p: *mut i32) -> i32 {
     unsafe { *p }
 }
 "#,
-            |tcx| assert_ownership_parity(tcx, "reader", &[], &["p"]),
+            |tcx| assert_ownership_parity(tcx, "reader", &[], &[loc("p")]),
         );
     }
 
@@ -12256,7 +12299,7 @@ pub unsafe fn stash(owner: *mut Holder) {
     (*owner).data = unsafe { malloc(4) };
 }
 "#,
-            |tcx| assert_ownership_parity(tcx, "stash", &[], &["owner"]),
+            |tcx| assert_ownership_parity(tcx, "stash", &[fld("Holder", 0)], &[loc("owner")]),
         );
     }
 
@@ -12275,7 +12318,7 @@ pub unsafe fn pass_through(p: *mut i32) -> i32 {
     unsafe { sink(p) }
 }
 "#,
-            |tcx| assert_ownership_parity(tcx, "pass_through", &[], &["p"]),
+            |tcx| assert_ownership_parity(tcx, "pass_through", &[], &[loc("p")]),
         );
     }
 
@@ -12301,7 +12344,109 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
     local
 }
 "#,
-            |tcx| assert_ownership_parity(tcx, "caller", &["local"], &[]),
+            |tcx| assert_ownership_parity(tcx, "caller", &[loc("local")], &[]),
+        );
+    }
+
+    /// BB-parity-own positive witness (the deferred by-value depth-1 case, now working): a
+    /// by-value double-pointer out-param `make_byval(pp){ *pp = malloc }` makes pp's depth-1
+    /// pointee Owning while the outer pointer stays non-Owning — the depth>=1 ownership that
+    /// coherence carries even though `link_versions_to_slots` is depth-0-only.
+    #[test]
+    fn boparity_byval_double_ptr_pointee_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub unsafe fn make_byval(pp: *mut *mut core::ffi::c_void) {
+    *pp = unsafe { malloc(4) };
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "make_byval", &[loc_at("pp", 1)], &[loc("pp")]),
+        );
+    }
+
+    /// BB-parity-own positive witness (struct-field out-param transfer): a callee that mallocs
+    /// into a struct field makes the FIELD slot Owning (routed to the StructFieldSlot), while
+    /// the parent pointer stays non-Owning — the §9.10.2 goal, both sides.
+    #[test]
+    fn boparity_struct_field_outparam_owning() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct Node {
+    pub next: *mut core::ffi::c_void,
+}
+pub unsafe fn set_next(n: *mut Node) {
+    (*n).next = unsafe { malloc(4) };
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "set_next", &[fld("Node", 0)], &[loc("n")]),
+        );
+    }
+
+    /// BB-parity-own semantic non-Owning control (borrowed field): a struct field that only
+    /// ever receives a BORROWED pointer (a param, never malloc) must NOT be Owning — freeing
+    /// it would be a UAF on caller memory.
+    #[test]
+    fn boparity_borrowed_field_control() {
+        run_compiler(
+            r#"
+pub struct Bag {
+    pub p: *mut i32,
+}
+pub unsafe fn stash_borrow(b: *mut Bag, src: *mut i32) {
+    (*b).p = src;
+}
+"#,
+            |tcx| {
+                assert_ownership_parity(
+                    tcx,
+                    "stash_borrow",
+                    &[],
+                    &[fld("Bag", 0), loc("b"), loc("src")],
+                )
+            },
+        );
+    }
+
+    /// BB-parity-own ADVERSARIAL control (flow-insensitive global-field over-claim).
+    ///
+    /// KNOWN GAP (currently `Owning`, target NON-Owning) — a CONFIRMED unsound over-claim
+    /// found by this milestone's adversarial pass. A struct field slot is a SINGLE crate-wide
+    /// slot per struct field, and `coherence` is flow-insensitive, so it equates that one slot
+    /// to EVERY value assigned to the field anywhere in the crate. Here `cell_own` mallocs
+    /// into `Cell::p` (an Owning source) and `cell_borrow` assigns a borrowed `src` into the
+    /// SAME field; coherence equates `Cell::p == malloc == src`, and the Owning source forces
+    /// the whole class Owning. So `cell_borrow` sees `Cell::p` Owning and would `Box`/free the
+    /// borrowed `src` -> UAF. The sound conservative verdict is NON-Owning (leak, not UAF).
+    /// The clean borrowed-ONLY field (`boparity_borrowed_field_control`) is correct; the gap
+    /// is specifically the global field shared across owned+borrowed uses. Fixing it needs
+    /// field ownership that backs off to non-Owning when the field can hold a non-owned value
+    /// (per-context or a "field is ever borrowed" veto) — a machinery change, tracked for a
+    /// follow-up. Un-ignore when fixed.
+    #[ignore = "KNOWN GAP: flow-insensitive global field slot over-claims a field malloc'd in one fn and borrowed in another (unsound); needs field-ownership machinery fix"]
+    #[test]
+    fn boparity_mixed_owned_borrowed_field_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct Cell {
+    pub p: *mut core::ffi::c_void,
+}
+pub unsafe fn cell_own(c: *mut Cell) {
+    (*c).p = unsafe { malloc(4) };
+}
+pub unsafe fn cell_borrow(c: *mut Cell, src: *mut core::ffi::c_void) {
+    (*c).p = src;
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "cell_borrow", &[], &[fld("Cell", 0)]),
         );
     }
 }
