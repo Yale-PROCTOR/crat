@@ -9,8 +9,7 @@ use rustc_span::Symbol;
 
 use super::{is_lhs, lhs_base};
 
-// the finished plan consumed by `AstVisitor`. see the design spec's
-// "Soundness Invariant" section for what may appear here.
+// the finished plan consumed by `AstVisitor`
 pub(crate) struct PointerEpochSplitPlan {
     // per-occurrence rename: HIR id of a path expr -> epoch local name.
     pub path_renames: FxHashMap<HirId, Symbol>,

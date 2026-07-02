@@ -3469,12 +3469,7 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
     /// recognizes a deref operand of the form `<local>.offset(a).add(b)...` (one
     /// or more offset/add calls, no receiver cast) whose innermost receiver is an
     /// introduced nullable index-rewritten member local, and returns the
-    /// replacement `*((base).offset(<index>) as <ptr_ty>)`. the index starts from
-    /// `idx_read_expr(rewrite)` (`prev_idx.unwrap()`) and folds each offset
-    /// argument with the existing `+` helper path. peeling with `unwrap_paren`
-    /// (not `unwrap_cast_and_paren`) keeps any receiver cast in place so it fails
-    /// the bare-local lookup, leaving cast-bearing projections to the existing
-    /// pointer-value fallback.
+    /// replacement `*((base).offset(<index>) as <ptr_ty>)`.
     fn projected_deref_replacement(&mut self, operand: &Expr) -> Option<Expr> {
         let mut offsets: Vec<(&str, &Expr)> = Vec::new();
         let mut cur = unwrap_paren(operand);
@@ -3494,12 +3489,10 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         if !self.introduced_hir_ids.contains(&hir_id) {
             return None;
         }
-        // rewrite planned-local uses nested in each offset argument (e.g. the `p` in
-        // `p.offset(strlen(p))`) before embedding its source text. the deref branch
-        // that calls this returns early, skipping the normal recursive walk, so an
-        // index-rewritten local used by value inside the argument would otherwise be
-        // printed under its removed original name. done here, before borrowing the
-        // plan below, so the `&mut self` visit does not overlap the plan borrow.
+        // rewrite each offset argument before stringifying it: the caller returns early
+        // without the normal recursive walk, so a rewritten local used by value inside
+        // the argument (e.g. `p` in `p.offset(strlen(p))`) would otherwise print under
+        // its removed name.
         let rewritten: Vec<(&str, Expr)> = offsets
             .iter()
             .map(|(name, arg)| {
