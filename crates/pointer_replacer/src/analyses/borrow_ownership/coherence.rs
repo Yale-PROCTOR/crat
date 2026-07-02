@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{AggregateKind, Body, Operand, Rvalue, StatementKind};
 use rustc_span::def_id::LocalDefId;
 
@@ -112,12 +112,20 @@ pub fn add_coherence<'tcx>(
 /// interprocedural / wrapper-returned allocations, borrowed returns, and projected loads are
 /// all handled with NO syntactic detection — a field mixing an owned source and a borrowed
 /// value settles non-Owning; a field populated only by owned transfers stays `Owning`.
+///
+/// A field write whose value is definitely NOT an owned heap allocation — an address-of
+/// (`Ref`/`RawPtr`) or any store whose RHS cannot be resolved to a slot — BLOCKS the field's
+/// ownership (`forbid_field_own`) rather than being dropped from the `AND` (which would
+/// wrongly permit `Owning`). Value-preserving `Cast` (`malloc() as *mut T`) is followed to its
+/// operand so a typed field's allocation still counts as owned. Constant stores (`null`) are
+/// free-safe and skipped.
 pub(crate) fn constrain_field_ownership(
     solver: &KindSolver,
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) {
-    let mut stores: FxHashMap<SlotRef, Vec<SlotRef>> = FxHashMap::default();
+    let mut owned_stores: FxHashMap<SlotRef, Vec<SlotRef>> = FxHashMap::default();
+    let mut blocked: FxHashSet<SlotRef> = FxHashSet::default();
 
     for &fn_did in &program.functions {
         let body_ref = program
@@ -131,52 +139,72 @@ pub(crate) fn constrain_field_ownership(
                 let StatementKind::Assign(box (lhs, rvalue)) = &stmt.kind else {
                     continue;
                 };
-                match rvalue {
-                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
-                    | Rvalue::CopyForDeref(rhs) => {
-                        if let Some(ResolvedSlot::Field(fid)) =
-                            resolve_place(slots, fn_did, body, *lhs, 0)
-                            && let Some(rs) = resolve_place(slots, fn_did, body, *rhs, 0)
-                        {
-                            stores
-                                .entry(SlotRef::Field(fid))
-                                .or_default()
-                                .push(to_slot_ref(rs, fn_did));
-                        }
-                    }
-                    Rvalue::Aggregate(kind, operands) => {
-                        let AggregateKind::Adt(def_id, _, _, _, _) = kind.as_ref() else {
+
+                // Aggregate: each operand initializes a field slot.
+                if let Rvalue::Aggregate(kind, operands) = rvalue
+                    && let AggregateKind::Adt(def_id, _, _, _, _) = kind.as_ref()
+                    && let Some(struct_did) = def_id.as_local()
+                {
+                    for (field_idx, operand) in operands.iter_enumerated() {
+                        let Some(fid) = slots.field_slots.slot_for_field_depth(
+                            StructFieldSlot { struct_did, field_index: field_idx.index() },
+                            0,
+                        ) else {
                             continue;
                         };
-                        let Some(struct_did) = def_id.as_local() else {
-                            continue;
-                        };
-                        for (field_idx, operand) in operands.iter_enumerated() {
-                            let op_place = match operand {
-                                Operand::Copy(p) | Operand::Move(p) => *p,
-                                Operand::Constant(_) => continue,
-                            };
-                            let field = StructFieldSlot {
-                                struct_did,
-                                field_index: field_idx.index(),
-                            };
-                            if let Some(fid) = slots.field_slots.slot_for_field_depth(field, 0)
-                                && let Some(rs) = resolve_place(slots, fn_did, body, op_place, 0)
-                            {
-                                stores
-                                    .entry(SlotRef::Field(fid))
-                                    .or_default()
-                                    .push(to_slot_ref(rs, fn_did));
+                        let f = SlotRef::Field(fid);
+                        match operand {
+                            Operand::Copy(p) | Operand::Move(p) => {
+                                match resolve_place(slots, fn_did, body, *p, 0) {
+                                    Some(r) => {
+                                        owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did))
+                                    }
+                                    None => {
+                                        blocked.insert(f);
+                                    }
+                                }
                             }
+                            Operand::Constant(_) => {} // null/const: free-safe, skip
                         }
                     }
-                    _ => {}
+                    continue;
+                }
+
+                // Non-aggregate: is `lhs` a struct-field store?
+                let Some(ResolvedSlot::Field(fid)) = resolve_place(slots, fn_did, body, *lhs, 0)
+                else {
+                    continue;
+                };
+                let f = SlotRef::Field(fid);
+                // Value-preserving stores expose an owned-capable RHS place (follow `Cast` to
+                // its operand so `malloc() as *mut T` still counts as owned). A constant
+                // (`null`) is free-safe and skipped; any other rvalue (address-of / computed)
+                // is not an owned heap value and BLOCKS ownership.
+                let rhs_place = match rvalue {
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                    | Rvalue::CopyForDeref(p)
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(*p),
+                    Rvalue::Use(Operand::Constant(_)) | Rvalue::Cast(_, Operand::Constant(_), _) => {
+                        continue;
+                    }
+                    _ => None,
+                };
+                match rhs_place.and_then(|p| resolve_place(slots, fn_did, body, p, 0)) {
+                    Some(r) => owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did)),
+                    None => {
+                        blocked.insert(f);
+                    }
                 }
             }
         }
     }
 
-    for (field, rhs) in &stores {
-        solver.constrain_field_own(*field, rhs);
+    for (field, rhs) in &owned_stores {
+        if !blocked.contains(field) {
+            solver.constrain_field_own(*field, rhs);
+        }
+    }
+    for &field in &blocked {
+        solver.forbid_field_own(field);
     }
 }
