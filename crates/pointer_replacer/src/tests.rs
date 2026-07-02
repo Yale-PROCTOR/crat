@@ -9724,7 +9724,7 @@ mod borrow_ownership_coherence {
                     SlotConflict, materialize_guards, revalidate, revalidate_replaying,
                     verify_to_fixpoint,
                 },
-                coherence::add_coherence,
+                coherence::{add_coherence, constrain_field_ownership},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
                 slots::StructFieldSlot,
@@ -12022,6 +12022,10 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
                 let solver = KindSolver::new(&slots);
 
                 add_coherence(&solver, &slots, agg_fn, &body);
+                // §9.10.2: aggregate field ownership is now linked by the crate-wide
+                // `constrain_field_ownership` (`S::p.own <=> ptr.own`), not the per-store
+                // equate; add it so assuming `ptr` Owning makes `S::p` Owning.
+                constrain_field_ownership(&solver, &slots, &program);
 
                 let ptr = local_slot(&slots, agg_fn, Local::from_u32(1), 0);
                 solver.assume(ptr, SlotKind::Owning);
