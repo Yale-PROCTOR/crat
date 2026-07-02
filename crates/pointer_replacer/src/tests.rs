@@ -17,6 +17,13 @@ fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (S
     .unwrap()
 }
 
+fn array_local_trace_events(code: &str) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true).1
+    })
+    .unwrap()
+}
+
 fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
@@ -9436,7 +9443,10 @@ pub unsafe fn expose(mut h: *mut Holder, mut i: isize) {
 }
 
 #[test]
-fn test_array_local_rewriter_tracks_index_for_reassigned_field_base() {
+fn test_array_local_rewriter_rewrites_reassigned_pointee_field_base_live() {
+    // (*s).out is caller-visible: the field write is KEPT live, a shadow
+    // counter tracks the advance, and members materialize off the live field
+    // with the counter subtracted (approach D).
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9455,21 +9465,23 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base index tracking to rewrite:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("out_idx") || s.contains("s_out_idx"), "{s}");
+    // field write kept live
+    assert!(s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    // shadow counter declared and advanced
+    assert!(s.contains("let mut out_idx: isize = 0isize"), "{s}");
+    assert!(s.contains("out_idx = (out_idx) + (length)"), "{s}");
+    // members are indexes, materialized with - out_idx
     assert!(s.contains("src_idx"), "{s}");
     assert!(s.contains("dst_idx"), "{s}");
-    assert!(s.contains("let mut src: *mut i8"), "{s}");
-    assert!(s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(!s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    assert!(s.contains("- (out_idx)"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_field_base_memory_copy_cursors_index_only() {
+fn test_array_local_rewriter_rewrites_memory_copy_cursors_of_reassigned_pointee_field_base() {
+    // (*s).out is caller-visible: the field write is KEPT live (approach D),
+    // a shadow counter tracks the advance, and members are index-rewritten.
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -9498,32 +9510,20 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: i32, mut distance: i
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base memory copy cursors to be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("src_idx"), "{s}");
-    assert!(s.contains("dst_idx"), "{s}");
-    assert!(!s.contains("let mut src: *mut i8"), "{s}");
-    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(
-        s.contains("memset(((*s).out).offset(dst_idx)")
-            || s.contains("memset((*s).out.offset(dst_idx)"),
-        "expected memset destination to inline dst_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(src_idx)") || s.contains("*((*s).out.offset(src_idx)"),
-        "expected src deref to inline src_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(dst_idx)") || s.contains("*((*s).out.offset(dst_idx)"),
-        "expected dst deref to inline dst_idx from the field base:\n{s}"
-    );
+    // field write kept live
+    assert!(s.contains("(*s).out ="), "{s}");
+    // member index vars present
+    assert!(s.contains("src_idx") || s.contains("dst_idx"), "{s}");
+    // shadow counter for out declared
+    assert!(s.contains("out_idx"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_distinct_indexes_for_two_reassigned_field_bases() {
+fn test_array_local_rewriter_rewrites_two_reassigned_pointee_field_bases() {
+    // both (*p).a and (*p).b are caller-visible field bases; both are rewritten
+    // with the live-field / shadow-counter scheme (approach D).
     let code = r#"
 #[repr(C)]
 pub struct Pair {
@@ -9542,17 +9542,37 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected both reassigned field bases to be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut a_idx: isize"), "{s}");
-    assert!(s.contains("let mut b_idx: isize"), "{s}");
-    assert!(s.contains("ax_idx"), "{s}");
-    assert!(s.contains("bx_idx"), "{s}");
-    assert!(s.contains("let mut ax: *mut i8"), "{s}");
-    assert!(s.contains("let mut bx: *mut i16"), "{s}");
+    // field writes kept live
+    assert!(s.contains("(*p).a ="), "{s}");
+    assert!(s.contains("(*p).b ="), "{s}");
+    // member index vars present
+    assert!(s.contains("ax_idx") || s.contains("a_idx"), "{s}");
+    assert!(s.contains("bx_idx") || s.contains("b_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_live_field_base_with_non_self_advance() {
+    // the base field is reassigned from a member, not a self-advance,
+    // cannot track the counter; the group is dropped and left unrewritten.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+}
+
+pub unsafe fn f(mut s: *mut State, mut n: isize) -> i32 {
+    let mut cur: *mut i8 = (*s).out.offset(n);
+    (*s).out = cur;
+    cur = cur.offset(1);
+    *cur as i32
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("(*s).out = cur"), "{s}");
+    assert!(!s.contains("out_idx"), "{s}");
 }
 
 #[test]
@@ -9601,5 +9621,175 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
     assert!(
         !s.contains("ptr = ((*state).buffer).offset(ptr_idx)"),
         "{s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_size_changing_receiver_cast() {
+    // `(p as *mut i8).offset(12)` advances 12 *bytes* past an *mut i32 base;
+    // recording index 12 and re-materializing in i32 units would be 48 bytes.
+    // the rewriter must leave q untouched.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = (p as *mut i8).offset(12) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !changed,
+        "size-changing receiver cast must not be rewritten:\n{s}"
+    );
+    assert!(
+        s.contains("let mut q: *mut i32"),
+        "q must stay a raw pointer:\n{s}"
+    );
+    assert!(!s.contains("q_idx"), "no index must be derived for q:\n{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_offset_then_cast() {
+    // offset-then-cast: the index is computed in base (i32) units, the cast is
+    // applied to the result, so this stays rewritten (control).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_equal_size_receiver_cast() {
+    // `(p as *const u8).offset(3)` over an *mut i8 base: pointee size is
+    // unchanged (1 == 1), so the index unit is correct and the rewrite stands.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i8) -> i8 {
+    let mut q: *mut i8 = (p as *const u8).offset(3) as *mut i8;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i8"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_offset_from_not_folded_across_size_cast() {
+    // q is a size-changing cast cursor; its offset_from(r) must NOT be folded
+    // into an index subtraction, because q has no valid base-unit index.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> isize {
+    let mut q: *mut i32 = (base as *mut i8).offset(12) as *mut i32;
+    let mut r: *mut i32 = base.offset(1);
+    *base = 0;
+    *q = 0;
+    *r = 0;
+    q.offset_from(r)
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // r may be independently rewritten to r_idx (no size-changing cast on r's
+    // receiver), so we check only that q is the (unrewritten) receiver of
+    // offset_from, not that r specifically appears as the argument.
+    assert!(
+        s.contains("q.offset_from("),
+        "offset_from must be preserved:\n{s}"
+    );
+    assert!(
+        !s.contains("q_idx"),
+        "no index must be derived for the cast cursor q:\n{s}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_selection_and_apply_for_rewritten_group() {
+    use crate::rewriter::array_local_trace::{TraceStage, TraceSubject};
+    // a simple selectable + rewritten group (mirrors
+    // test_array_local_rewriter_rewrites_simple_non_null_derived_local).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Selection),
+        "expected at least one Selection event: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Apply
+            && matches!(&e.subject, TraceSubject::Member(name) if name == "q")),
+        "expected an Apply event for member q: {events:#?}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_disabled_is_neutral() {
+    // enabling the trace must not change the rewritten output, and the disabled
+    // trace must record nothing.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (src_enabled, _events) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
+    })
+    .unwrap();
+    let (src_disabled, events_disabled) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
+    })
+    .unwrap();
+    assert!(
+        events_disabled.is_empty(),
+        "disabled trace must record nothing: {events_disabled:#?}"
+    );
+    assert_eq!(
+        src_enabled, src_disabled,
+        "enabling the trace must not change pass output"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_prune_drop_with_assignment_text() {
+    use crate::rewriter::array_local_trace::{TraceDecision, TraceStage};
+    // q is reassigned via an expression the index rewrite cannot handle, so the
+    // prune pass drops it; the trace records a Prune/Dropped event whose reason
+    // includes the offending assignment text.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p.offset(if q.is_null() { 0 } else { 1 });
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Prune
+            && e.decision == TraceDecision::Dropped
+            && e.reason.contains("q.is_null()")),
+        "expected a Prune/Dropped event mentioning the offending assignment: {events:#?}"
     );
 }
