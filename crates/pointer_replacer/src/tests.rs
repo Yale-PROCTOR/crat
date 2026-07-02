@@ -12454,6 +12454,65 @@ pub unsafe fn cell_borrow(c: *mut Cell, src: *mut core::ffi::c_void) {
             |tcx| assert_ownership_parity(tcx, "cell_borrow", &[], &[fld("Cell", 0)]),
         );
     }
+
+    /// BB-parity-own regression control (mixed field via a PROJECTED borrowed load — Codex).
+    /// The borrowed value reaches the field through `t = (*src).p` (a load through a borrowed
+    /// param), not a direct param copy. `compute_borrowed_origin` propagates through the
+    /// borrowed root so `t` counts as borrowed-origin; combined with `c_own`'s malloc into the
+    /// same field, `C::p` is a mixed field and is vetoed to non-Owning. Without the
+    /// projected-load propagation the over-claim survived (Owning).
+    #[test]
+    fn boparity_mixed_field_projected_borrow_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct C {
+    pub p: *mut core::ffi::c_void,
+}
+pub unsafe fn c_own(c: *mut C) {
+    (*c).p = unsafe { malloc(4) };
+}
+pub unsafe fn c_borrow_proj(dst: *mut C, src: *mut C) {
+    let t = (*src).p;
+    (*dst).p = t;
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "c_borrow_proj", &[], &[fld("C", 0)]),
+        );
+    }
+
+    /// BB-parity-own regression control (mixed field via an INTERPROC-return allocation —
+    /// Codex). The owned side reaches the field via a local wrapper call `let p = d_make();
+    /// (*d).p = p` (d_make returns malloc), which allocator-SOURCE detection does NOT flag.
+    /// The veto uses "non-borrowed" evidence rather than allocation evidence, so the interproc
+    /// alloc still counts: `D::p` is assigned a non-borrowed (`p`) value AND a borrowed (`src`)
+    /// value, so it is vetoed to non-Owning. Without this the over-claim survived (Owning).
+    #[test]
+    fn boparity_mixed_field_interproc_alloc_control() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct D {
+    pub p: *mut core::ffi::c_void,
+}
+pub unsafe fn d_make() -> *mut core::ffi::c_void {
+    unsafe { malloc(4) }
+}
+pub unsafe fn d_own(d: *mut D) {
+    let p = d_make();
+    (*d).p = p;
+}
+pub unsafe fn d_borrow(d: *mut D, src: *mut core::ffi::c_void) {
+    (*d).p = src;
+}
+"#,
+            |tcx| assert_ownership_parity(tcx, "d_borrow", &[], &[fld("D", 0)]),
+        );
+    }
 }
 
 mod borrow_ownership_resolve {
