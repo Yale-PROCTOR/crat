@@ -117,8 +117,14 @@ pub fn add_coherence<'tcx>(
 /// (`Ref`/`RawPtr`) or any store whose RHS cannot be resolved to a slot — BLOCKS the field's
 /// ownership (`forbid_field_own`) rather than being dropped from the `AND` (which would
 /// wrongly permit `Owning`). Value-preserving `Cast` (`malloc() as *mut T`) is followed to its
-/// operand so a typed field's allocation still counts as owned. Constant stores (`null`) are
-/// free-safe and skipped.
+/// operand so a typed field's allocation still counts as owned.
+///
+/// RESIDUAL (documented, accepted): constant stores are skipped as null (`(*p).f = null` is
+/// free-safe). A NON-null pointer constant (`(*p).f = 0x1000 as *mut T`) is also skipped but
+/// is NOT owned, so a field mixing such a constant with a malloc elsewhere could over-claim.
+/// This is exceedingly rare in C2Rust output and BO is behind the codegen guardrail; closing
+/// it needs null-vs-non-null constant classification. Call-return-into-field is NOT a gap —
+/// MIR routes calls through a temp, caught as a normal `Use` store.
 pub(crate) fn constrain_field_ownership(
     solver: &KindSolver,
     slots: &CrateSlots,
