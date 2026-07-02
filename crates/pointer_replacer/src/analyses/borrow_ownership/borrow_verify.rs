@@ -203,10 +203,10 @@ pub(crate) fn verify_to_fixpoint(
     // §8 BB3-a — malloc-source slots (static; computed once). A source owns heap and is
     // not a borrow, so it may not be `Ref`.
     let malloc_sources = super::sources::collect_malloc_source_slots(program, slots);
-    // §9.10.2 — veto ownership of any struct-field slot that is assigned an owned allocation
-    // in one function AND a borrowed (parameter-origin) value in another (the flow-insensitive
-    // global-field over-claim). Must precede the first solve so the vetoes shape the model.
-    super::coherence::apply_field_ownership_vetoes(solver, slots, program);
+    // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
+    // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
+    // flow-insensitive global-field over-claim). Must precede the first solve.
+    super::coherence::constrain_field_ownership(solver, slots, program);
     let mut model = solver.model_kinds_relaxing(selectors)?;
     for _ in 0..cap {
         let conflicts = revalidate_replaying(

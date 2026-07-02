@@ -78,20 +78,46 @@ impl KindSolver {
         self.solver.assert(&!va.own.xor(&vb.own));
     }
 
-    /// Conservative ownership veto: hard-assert a slot's `own` bit is FALSE (the slot is
-    /// never `Owning`; it settles `Raw` or `Ref`). Touches only the ownership dimension, not
-    /// the borrow (`raw`/`ref_`) reading. Used for the §9.10.2 field-ownership fix: a global
-    /// struct-field slot that can hold a borrowed value must not be `Owning`, else the
-    /// rewriter would `Box`/free borrowed memory. Combined with an owning `malloc` source
-    /// equated to the same field elsewhere, this forces the (retractable) source to LEAK
-    /// (sound), or — if the field is also a hard `free` sink — UNSAT, so the analysis
-    /// DECLINES rather than over-claims. Both outcomes are sound.
-    pub(crate) fn veto_owning(&self, slot: SlotRef) {
-        let vars = self
+    /// §9.10.2 field-ownership constraint: a struct field slot is one crate-wide slot that
+    /// (flow-insensitively) holds EVERY value stored into the field. It may be `Owning` — the
+    /// rewriter would `Box`/free it — ONLY if every stored value is itself owned; if any store
+    /// is a borrowed value the field must not be `Owning` (else it would free borrowed memory
+    /// -> UAF). This asserts `field.own <=> AND(rhs.own)` over the field's stores, using BO's
+    /// OWN ownership verdict for each `rhs` (so interprocedural / wrapper-returned allocations
+    /// and borrowed returns are handled with no syntactic detection). Unlike a plain `equate`
+    /// per store, it does NOT transitively equate the stored values to each other, so an owned
+    /// source stored in one function does not drag a borrowed value stored in another to
+    /// `Owning`. Empty `rhs` is a no-op (an AND over no stores is vacuously true and must not
+    /// force `Owning`). Touches only the ownership bit; the borrow reading is left to the
+    /// borrow constraints.
+    pub(crate) fn constrain_field_own(&self, field: SlotRef, rhs: &[SlotRef]) {
+        if rhs.is_empty() {
+            return;
+        }
+        let field_own = &self
             .vars
-            .get(&slot)
-            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
-        self.solver.assert(&!&vars.own);
+            .get(&field)
+            .unwrap_or_else(|| panic!("unknown slot: {field:?}"))
+            .own;
+        let rhs_own: Vec<&Bool> = rhs
+            .iter()
+            .map(|r| {
+                &self
+                    .vars
+                    .get(r)
+                    .unwrap_or_else(|| panic!("unknown slot: {r:?}"))
+                    .own
+            })
+            .collect();
+        // field.own => rhs_i.own for each store (freeing requires every stored value owned).
+        for &r in &rhs_own {
+            self.solver.assert(&Bool::or(&[&!field_own, r]));
+        }
+        // AND(rhs.own) => field.own : `field.own OR (OR ¬rhs_i.own)`.
+        let negs: Vec<Bool> = rhs_own.iter().map(|&r| !r).collect();
+        let mut clause: Vec<&Bool> = vec![field_own];
+        clause.extend(negs.iter());
+        self.solver.assert(&Bool::or(&clause));
     }
 
     /// Solidification link: tie a slot's `own` one-hot bit to an external Bool
