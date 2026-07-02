@@ -12427,7 +12427,21 @@ pub unsafe fn stash_borrow(b: *mut Bag, src: *mut i32) {
     /// is specifically the global field shared across owned+borrowed uses. Fixing it needs
     /// field ownership that backs off to non-Owning when the field can hold a non-owned value
     /// (per-context or a "field is ever borrowed" veto) — a machinery change, tracked for a
-    /// follow-up. Un-ignore when fixed.
+    /// follow-up.
+    ///
+    /// ADVERSARIAL SWEEP (2026-07-02, 10-family workflow probe: nested / recursive / array /
+    /// deep-chain / union / conditional / interproc-return / global-static / free-through-field
+    /// / libc-allocators): empirically confirmed this is the SOLE real over-claim root cause,
+    /// and that it GENERALIZES — it triggers for any owning SOURCE (malloc/strdup/calloc) or
+    /// SINK (free) on a scalar OR array-of-pointer struct field that ALSO receives a borrowed
+    /// value elsewhere, and it drags the borrowed value itself Owning. It does NOT extend to:
+    /// deep `*mut *mut` field chains (BO UNDER-claims -> safe leak), unions (unmodeled -> no
+    /// slot), embedded nested structs where the malloc leaks to Raw (safe), or realloc's
+    /// arg-sink (realloc CONSUMES its arg, so Owning is CORRECT, like free — a sweep false
+    /// positive). Several mixed shapes (global/stack-address-into-field, free-through-field,
+    /// interproc-return, linked-list) go UNSAT and BO DECLINES (sound, no over-claim ships).
+    /// So the fix is narrowly scoped to scalar/array struct-field-slot ownership.
+    /// Un-ignore when fixed.
     #[ignore = "KNOWN GAP: flow-insensitive global field slot over-claims a field malloc'd in one fn and borrowed in another (unsound); needs field-ownership machinery fix"]
     #[test]
     fn boparity_mixed_owned_borrowed_field_control() {
