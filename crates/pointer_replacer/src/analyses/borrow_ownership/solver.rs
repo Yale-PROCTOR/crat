@@ -78,6 +78,22 @@ impl KindSolver {
         self.solver.assert(&!va.own.xor(&vb.own));
     }
 
+    /// Conservative ownership veto: hard-assert a slot's `own` bit is FALSE (the slot is
+    /// never `Owning`; it settles `Raw` or `Ref`). Touches only the ownership dimension, not
+    /// the borrow (`raw`/`ref_`) reading. Used for the §9.10.2 field-ownership fix: a global
+    /// struct-field slot that can hold a borrowed value must not be `Owning`, else the
+    /// rewriter would `Box`/free borrowed memory. Combined with an owning `malloc` source
+    /// equated to the same field elsewhere, this forces the (retractable) source to LEAK
+    /// (sound), or — if the field is also a hard `free` sink — UNSAT, so the analysis
+    /// DECLINES rather than over-claims. Both outcomes are sound.
+    pub(crate) fn veto_owning(&self, slot: SlotRef) {
+        let vars = self
+            .vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+        self.solver.assert(&!&vars.own);
+    }
+
     /// Solidification link: tie a slot's `own` one-hot bit to an external Bool
     /// (the disjunction of the slot's per-version ownership Bools). Mirrors the
     /// biconditional idiom in `equate`.
