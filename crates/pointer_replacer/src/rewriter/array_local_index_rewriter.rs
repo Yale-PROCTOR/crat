@@ -3475,7 +3475,7 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
     /// (not `unwrap_cast_and_paren`) keeps any receiver cast in place so it fails
     /// the bare-local lookup, leaving cast-bearing projections to the existing
     /// pointer-value fallback.
-    fn projected_deref_replacement(&self, operand: &Expr) -> Option<Expr> {
+    fn projected_deref_replacement(&mut self, operand: &Expr) -> Option<Expr> {
         let mut offsets: Vec<(&str, &Expr)> = Vec::new();
         let mut cur = unwrap_paren(operand);
         while let ExprKind::MethodCall(call) = &cur.kind {
@@ -3494,13 +3494,27 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         if !self.introduced_hir_ids.contains(&hir_id) {
             return None;
         }
+        // rewrite planned-local uses nested in each offset argument (e.g. the `p` in
+        // `p.offset(strlen(p))`) before embedding its source text. the deref branch
+        // that calls this returns early, skipping the normal recursive walk, so an
+        // index-rewritten local used by value inside the argument would otherwise be
+        // printed under its removed original name. done here, before borrowing the
+        // plan below, so the `&mut self` visit does not overlap the plan borrow.
+        let rewritten: Vec<(&str, Expr)> = offsets
+            .iter()
+            .map(|(name, arg)| {
+                let mut arg = (**arg).clone();
+                self.visit_expr(&mut arg);
+                (*name, arg)
+            })
+            .collect();
         let rewrite = self.plan.by_hir_id.get(&hir_id)?;
         if !rewrite_uses_index_rewrite(rewrite) || !rewrite.nullable {
             return None;
         }
         // fold innermost offset first; additive folding is order-independent.
         let mut index = idx_read_expr(rewrite);
-        for (name, arg) in offsets.iter().rev() {
+        for (name, arg) in rewritten.iter().rev() {
             index = pprust::expr_to_string(&relative_index_expr(&index, name, arg));
         }
         let base_offset = base_offset_expr_for_index(rewrite, &index);
