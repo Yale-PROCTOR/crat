@@ -12413,39 +12413,27 @@ pub unsafe fn stash_borrow(b: *mut Bag, src: *mut i32) {
         );
     }
 
-    /// BB-parity-own ADVERSARIAL control (flow-insensitive global-field over-claim).
+    /// BB-parity-own regression control (flow-insensitive global-field over-claim — FIXED §9.10.2).
     ///
-    /// KNOWN GAP (currently `Owning`, target NON-Owning) — a CONFIRMED unsound over-claim
-    /// found by this milestone's adversarial pass. A struct field slot is a SINGLE crate-wide
-    /// slot per struct field, and `coherence` is flow-insensitive, so it equates that one slot
-    /// to EVERY value assigned to the field anywhere in the crate. Here `cell_own` mallocs
-    /// into `Cell::p` (an Owning source) and `cell_borrow` assigns a borrowed `src` into the
-    /// SAME field; coherence equates `Cell::p == malloc == src`, and the Owning source forces
-    /// the whole class Owning. So `cell_borrow` sees `Cell::p` Owning and would `Box`/free the
-    /// borrowed `src` -> UAF. The sound conservative verdict is NON-Owning (leak, not UAF).
-    /// The clean borrowed-ONLY field (`boparity_borrowed_field_control`) is correct; the gap
-    /// is specifically the global field shared across owned+borrowed uses. Fixing it needs
-    /// field ownership that backs off to non-Owning when the field can hold a non-owned value
-    /// (per-context or a "field is ever borrowed" veto) — a machinery change, tracked for a
-    /// follow-up.
+    /// A struct field slot is a SINGLE crate-wide slot; `coherence` is flow-insensitive, so it
+    /// equates that one slot to EVERY value assigned to the field. Here `cell_own` mallocs into
+    /// `Cell::p` (an Owning source) and `cell_borrow` assigns a borrowed `src` into the SAME
+    /// field. BEFORE the fix the malloc source forced the shared slot Owning, so `cell_borrow`
+    /// over-claimed `Cell::p` and the rewriter would `Box`/free the borrowed `src` -> UAF.
+    /// FIXED by the conservative field-ownership veto (`coherence::compute_borrowed_origin` +
+    /// `KindSolver::veto_owning`): storing a borrowed-origin (a parameter, or a copy/cast/reborrow
+    /// chain from one) value into a struct field HARD-vetoes that field slot's `own`, so it backs
+    /// off to non-Owning (the retractable malloc source leaks — a safe leak, not a UAF). Guards
+    /// that `Cell::p` stays non-Owning. Conservative: a field that only ever receives OWNED param
+    /// transfers is also vetoed (a safe precision loss, not an over-claim).
     ///
-    /// ADVERSARIAL SWEEP (2026-07-02, 10-family workflow probe: nested / recursive / array /
-    /// deep-chain / union / conditional / interproc-return / global-static / free-through-field
-    /// / libc-allocators): empirically confirmed this is the SOLE real over-claim root cause,
-    /// and that it GENERALIZES — it triggers for any owning SOURCE (malloc/strdup/calloc) or
-    /// SINK (free) on a raw-pointer struct field (scalar `*mut T`, or a multi-level
-    /// `*mut *mut T` field at its depth-0 slot) that ALSO receives a borrowed value elsewhere,
-    /// and it drags the borrowed value itself Owning. It does NOT extend to: the DEEPER
-    /// (depth>=1) levels of `*mut *mut` field chains (BO UNDER-claims -> safe leak); Rust
-    /// array `[*mut T; N]` FIELDS (crate_slots registers a slot only for a directly-`RawPtr`
-    /// field, so array fields are UNMODELED — no slot, resolve_place None — not over-claimed);
-    /// unions (unmodeled -> no slot); embedded nested structs where the malloc leaks to Raw
-    /// (safe); or realloc's arg-sink (realloc CONSUMES its arg, so Owning is CORRECT, like
-    /// free — a sweep false positive). Several mixed shapes (global/stack-address-into-field, free-through-field,
-    /// interproc-return, linked-list) go UNSAT and BO DECLINES (sound, no over-claim ships).
-    /// So the fix is narrowly scoped to scalar/array struct-field-slot ownership.
-    /// Un-ignore when fixed.
-    #[ignore = "KNOWN GAP: flow-insensitive global field slot over-claims a field malloc'd in one fn and borrowed in another (unsound); needs field-ownership machinery fix"]
+    /// The adversarial sweep (2026-07-02, 10-family workflow probe) confirmed this was the SOLE
+    /// real over-claim root cause and characterized its scope — a raw-pointer struct field
+    /// (scalar `*mut T` or a multi-level `*mut *mut T` at its depth-0 slot) owned by a source
+    /// (malloc/strdup/calloc) or sink (free) in one fn AND assigned a borrowed value in another;
+    /// the param-origin veto covers all of them. NON-gaps (unchanged): deeper (depth>=1) chain
+    /// levels UNDER-claim (safe leak); Rust array `[*mut T; N]` fields are unmodeled (no slot);
+    /// unions unmodeled; realloc's arg-sink is CORRECT (realloc consumes its arg, like free).
     #[test]
     fn boparity_mixed_owned_borrowed_field_control() {
         run_compiler(
