@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+pub(crate) mod boundary_table;
 mod domain;
 mod infer;
 pub(crate) mod borrow_verify;
