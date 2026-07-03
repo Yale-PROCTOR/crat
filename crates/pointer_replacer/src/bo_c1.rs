@@ -234,7 +234,6 @@ mod mirror {
         coherence::constrain_field_ownership,
         crate_slots::CrateSlots,
         solver::{KindSolver, SlotRef},
-        sources::collect_malloc_source_slots,
     };
     use crate::utils::rustc::RustProgram;
 
@@ -243,7 +242,8 @@ mod mirror {
         /// Validate rounds run, INCLUDING the accepting round (a fixture that
         /// accepts its first model has `rounds == 1`).
         pub rounds: usize,
-        pub commits_source: usize,
+        /// §NB0: source commits no longer exist — the BB3-a `¬ref(source)`
+        /// invariant is emitted eagerly, so every commit is a conflict commit.
         pub commits_conflict: usize,
         pub commits_per_round: Vec<usize>,
     }
@@ -260,7 +260,6 @@ mod mirror {
     ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
         let mut stats = RoundStats::default();
         let cap = round_cap(slots);
-        let malloc_sources = collect_malloc_source_slots(program, slots);
         constrain_field_ownership(solver, slots, program);
         let Some(mut model) = solver.model_kinds_relaxing(selectors) else {
             return (None, stats);
@@ -279,13 +278,6 @@ mod mirror {
                 "every residual conflict slot must be Ref in the current model"
             );
             let mut committed = 0;
-            for &slot in &malloc_sources {
-                if model.get(&slot) == Some(&SlotKind::Ref) {
-                    solver.add_borrow_exclusion(Some(slot), &[]);
-                    committed += 1;
-                    stats.commits_source += 1;
-                }
-            }
             for conflict in conflicts.values().flatten() {
                 if let Some(slot) = representative(conflict, &model) {
                     solver.add_borrow_exclusion(Some(slot), &[]);
@@ -431,7 +423,6 @@ mod run {
         phase("fixpoint_done", t0);
 
         row.set("rounds", rstats.rounds);
-        row.set("commits_source", rstats.commits_source);
         row.set("commits_conflict", rstats.commits_conflict);
         row.set(
             "commits_per_round",
@@ -443,7 +434,7 @@ mod run {
                 .join("/"),
         );
 
-        let sources = collect_malloc_source_slots(&program, &slots);
+        let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
         row.set("sources_total", sources.len());
 
         match &model {
@@ -617,11 +608,26 @@ mod run {
 // Mirror-fidelity guards (non-ignored: they run in every `cargo test`).
 // ---------------------------------------------------------------------------
 
+/// What `assert_mirror_matches` observed, for fixture-specific assertions.
+#[cfg(test)]
+struct MirrorOutcome {
+    accepted: bool,
+    stats: mirror::RoundStats,
+    /// Malloc-source slots (propagation-closed count).
+    sources: usize,
+    /// Source slots whose final kind is not `Owning`.
+    leaked: usize,
+    /// Source slots whose final kind is `Ref` — must be 0 in every accepted
+    /// model (§NB0 eager `¬ref`); combined with `leaked`, proves a leaked
+    /// source settled `Raw`.
+    sources_ref: usize,
+}
+
 /// Runs both the REAL `verify_to_fixpoint` and the mirror on independent fresh
 /// constructions over one compiled snippet; asserts model equality; returns the
-/// mirror's stats + leak count for fixture-specific assertions.
+/// mirror's stats + source/leak accounting for fixture-specific assertions.
 #[cfg(test)]
-fn assert_mirror_matches(code: &str) -> (bool, mirror::RoundStats, usize, usize) {
+fn assert_mirror_matches(code: &str) -> MirrorOutcome {
     use crate::analyses::borrow_ownership::{
         CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
         crate_slots::CrateSlots, emit_crate_ownership_constraints, solver::KindSolver,
@@ -677,17 +683,20 @@ fn assert_mirror_matches(code: &str) -> (bool, mirror::RoundStats, usize, usize)
             ),
         }
 
-        let sources = collect_malloc_source_slots(&program, &slots);
-        let leaked = mirrored
-            .as_ref()
-            .map(|m| {
-                sources
-                    .iter()
-                    .filter(|s| m.get(s) != Some(&SlotKind::Owning))
-                    .count()
-            })
-            .unwrap_or(0);
-        (mirrored.is_some(), stats, sources.len(), leaked)
+        let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
+        let count_kind = |pred: &dyn Fn(Option<&SlotKind>) -> bool| {
+            mirrored
+                .as_ref()
+                .map(|m| sources.iter().filter(|s| pred(m.get(s))).count())
+                .unwrap_or(0)
+        };
+        MirrorOutcome {
+            accepted: mirrored.is_some(),
+            stats,
+            sources: sources.len(),
+            leaked: count_kind(&|k| k != Some(&SlotKind::Owning)),
+            sources_ref: count_kind(&|k| k == Some(&SlotKind::Ref)),
+        }
     })
     .unwrap_or_else(|e| e.raise())
 }
@@ -695,7 +704,7 @@ fn assert_mirror_matches(code: &str) -> (bool, mirror::RoundStats, usize, usize)
 /// (a) Accept-first-model path: alloc+free settles Owning with no commits.
 #[test]
 fn boc1_mirror_matches_real_alloc_free() {
-    let (accepted, stats, sources, leaked) = assert_mirror_matches(
+    let o = assert_mirror_matches(
         r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -708,18 +717,18 @@ pub unsafe fn f() {
 }
 "#,
     );
-    assert!(accepted);
-    assert_eq!(stats.rounds, 1, "first model accepted: exactly one validate round");
-    assert_eq!(stats.commits_source + stats.commits_conflict, 0);
+    assert!(o.accepted);
+    assert_eq!(o.stats.rounds, 1, "first model accepted: exactly one validate round");
+    assert_eq!(o.stats.commits_conflict, 0);
     // `sources_total` counts source SLOTS (propagation-closed), not allocations:
     // the one malloc yields its destination `p` PLUS the `free(p)` call-arg temp.
-    assert_eq!((sources, leaked), (2, 0), "the freed alloc is retained, not leaked");
+    assert_eq!((o.sources, o.leaked), (2, 0), "the freed alloc is retained, not leaked");
 }
 
 /// (b) Conflict-commit cascade: two `&mut` of one base force iterated commits.
 #[test]
 fn boc1_mirror_matches_real_conflict_cascade() {
-    let (accepted, stats, _sources, _leaked) = assert_mirror_matches(
+    let o = assert_mirror_matches(
         r#"
 pub unsafe fn f() {
     let mut local = 0i32;
@@ -730,18 +739,25 @@ pub unsafe fn f() {
 }
 "#,
     );
-    assert!(accepted);
-    assert!(stats.rounds >= 2, "cascade must iterate; got {} rounds", stats.rounds);
-    assert!(stats.commits_conflict >= 1, "at least one conflict commit");
+    assert!(o.accepted);
+    assert!(o.stats.rounds >= 2, "cascade must iterate; got {} rounds", o.stats.rounds);
+    assert!(o.stats.commits_conflict >= 1, "at least one conflict commit");
 }
 
-/// (c) Selector-drop (leak) + BB3-a source-commit path: the leaked malloc's
-/// selector is dropped by `model_kinds_relaxing` AND the max-ref objective's
-/// float to `Ref` is committed away (`Ref ⇒ loan`). Guards the headline
-/// `sources_leaked` accounting.
+/// (c) Selector-drop (leak) path under §NB0's EAGER `¬ref(source)`: the leaked
+/// malloc's selector is dropped by `model_kinds_relaxing`, and — because the
+/// hoisted BB3-a constraint is present from emission — the source can never
+/// float to `Ref`: it is `Raw` from the very first model. That first model's
+/// union replay (source now a raw candidate in round 1, where the old
+/// trajectory only reached this state after its round-1 source commit)
+/// surfaces ONE borrow conflict, whose commit yields the accepted round-2
+/// model: rounds == 2, commits_conflict == 1, no source commits (the field is
+/// gone). Guards the headline `sources_leaked` accounting end-to-end.
+/// (Final-kind `Raw` on the real path is independently pinned by
+/// tests.rs::bb3a_leaked_source_forced_raw.)
 #[test]
 fn boc1_mirror_matches_real_leaked_source() {
-    let (accepted, stats, sources, leaked) = assert_mirror_matches(
+    let o = assert_mirror_matches(
         r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -753,16 +769,22 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
 }
 "#,
     );
-    assert!(accepted);
-    assert!(stats.commits_source >= 1, "BB3-a must commit the floated source");
-    assert_eq!((sources, leaked), (1, 1), "the leaked alloc must be counted leaked");
+    assert!(o.accepted);
+    assert_eq!(
+        (o.stats.rounds, o.stats.commits_conflict),
+        (2, 1),
+        "eager ¬ref: round-1 model has the source Raw; its union replay surfaces \
+         one conflict, committed into the accepted round-2 model"
+    );
+    assert_eq!((o.sources, o.leaked), (1, 1), "the leaked alloc must be counted leaked");
+    assert_eq!(o.sources_ref, 0, "a source may never end Ref (leaked ⇒ Raw)");
 }
 
 /// (d) Maximal-source-retention: of two allocations only the conflicting one
 /// leaks (1-of-2 accounting).
 #[test]
 fn boc1_mirror_matches_real_two_allocs_one_leak() {
-    let (accepted, _stats, sources, leaked) = assert_mirror_matches(
+    let o = assert_mirror_matches(
         r#"
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
@@ -777,10 +799,11 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
 }
 "#,
     );
-    assert!(accepted);
+    assert!(o.accepted);
     // Slot-level source accounting: `a` + its `free(a)` call-arg temp + `b` = 3
     // source slots for 2 allocations; only `b`'s slot leaks (kind != Owning).
-    assert_eq!((sources, leaked), (3, 1), "exactly the conflicting alloc leaks");
+    assert_eq!((o.sources, o.leaked), (3, 1), "exactly the conflicting alloc leaks");
+    assert_eq!(o.sources_ref, 0, "no source may end Ref");
 }
 
 /// Decline path end-to-end, on the smallest confirmed real-corpus decliner:
@@ -837,10 +860,10 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
     return root;
 }
 "#;
-    let (accepted, stats, sources, _leaked) = assert_mirror_matches(code);
-    assert!(!accepted, "the deleteNode shape must decline (non-source UNSAT)");
-    assert_eq!(stats.rounds, 0, "decline at the first solve, before any round");
-    assert_eq!(sources, 0, "no malloc: the UNSAT cannot be source-retractable");
+    let o = assert_mirror_matches(code);
+    assert!(!o.accepted, "the deleteNode shape must decline (non-source UNSAT)");
+    assert_eq!(o.stats.rounds, 0, "decline at the first solve, before any round");
+    assert_eq!(o.sources, 0, "no malloc: the UNSAT cannot be source-retractable");
 
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = collect_program(tcx);
@@ -1194,7 +1217,6 @@ fn render_report(merged: &[report::Row]) -> String {
         "wall_s",
         "t_fixpoint_s",
         "rounds",
-        "commits_source",
         "commits_conflict",
         "slots_total",
         "n_ref",
@@ -1221,7 +1243,7 @@ fn render_report(merged: &[report::Row]) -> String {
          phase-1 replay). `sources_total`/`sources_leaked` count malloc-source SLOTS \
          (propagation-closed over copies/moves/casts, so one allocation can contribute \
          several slots, e.g. its `free` call-arg temp); a slot is leaked when its final \
-         kind is not Owning. `commits_*` count exclusion assertions exactly as the real \
+         kind is not Owning. `commits_conflict` counts exclusion assertions exactly as the real \
          loop's `committed` does — the same slot can be committed by several conflicts \
          in one round, so this is commit OPERATIONS, not unique slots. `d_ref_d0` is a \
          Ref-count delta, not a pure borrow-precision delta: BO's non-Ref includes \

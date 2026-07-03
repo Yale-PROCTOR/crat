@@ -6,8 +6,9 @@
 //! function's MIR for allocator `Call`s with a **bare-local** destination, then propagating
 //! through kind-preserving rvalues (cast / copy / move) so the canonical C2Rust shape
 //! `let p = malloc(n) as *mut T` (`_tmp = malloc()`, `_p = _tmp as *mut T`) flags BOTH the
-//! call destination AND the cast target. `verify_to_fixpoint` then commits `¬ref` on any
-//! source slot the model still marks `Ref`.
+//! call destination AND the cast target. §NB0: `emit_crate_ownership_constraints` asserts
+//! `¬ref` on every source slot EAGERLY at emission time (the hoisted BB3-a invariant), so
+//! no model at any stage can mark a source `Ref`.
 //!
 //! Allocator recognition mirrors the ownership boundary EXACTLY: a callee is a source only
 //! if it is an extern `Node::ForeignItem` whose `ident` is a `boundary_table` ForeignC source
@@ -40,7 +41,6 @@ use rustc_middle::{
 };
 
 use super::{boundary_table, crate_slots::CrateSlots, solver::SlotRef};
-use crate::utils::rustc::RustProgram;
 
 /// Whether `func` resolves to an extern allocator declaration — gated on `Node::ForeignItem`
 /// exactly like the ownership boundary (`infer.rs`), so a crate-local fn merely *named*
@@ -63,19 +63,21 @@ fn is_allocator_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
 /// Depth-0 slots of locals that hold a heap allocation: bare-local allocator-call
 /// destinations, plus everything reachable from them through kind-preserving rvalues
 /// (cast / copy / move). See the module docs for the (sound) scope limits.
+///
+/// §NB0: takes `(tcx, functions)` instead of `&RustProgram` so the emission path
+/// (which holds a `CrateCtxt`, not a `RustProgram`) can compute the set for the
+/// hoisted eager `¬ref(source)` constraints.
 pub(crate) fn collect_malloc_source_slots(
-    program: &RustProgram<'_>,
+    tcx: TyCtxt<'_>,
+    functions: &[rustc_span::def_id::LocalDefId],
     slots: &CrateSlots,
 ) -> FxHashSet<SlotRef> {
     let mut sources = FxHashSet::default();
-    for &fn_did in &program.functions {
+    for &fn_did in functions {
         let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
             continue;
         };
-        let body = program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(fn_did)
-            .borrow();
+        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
 
         // Seed: bare-local allocator-call destinations.
         let mut source_locals: FxHashSet<Local> = FxHashSet::default();
@@ -84,7 +86,7 @@ pub(crate) fn collect_malloc_source_slots(
                 && let TerminatorKind::Call {
                     func, destination, ..
                 } = &term.kind
-                && is_allocator_call(program.tcx, func)
+                && is_allocator_call(tcx, func)
                 && let Some(local) = destination.as_local()
             {
                 source_locals.insert(local);

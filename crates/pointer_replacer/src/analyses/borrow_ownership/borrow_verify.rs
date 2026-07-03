@@ -149,17 +149,19 @@ pub(crate) fn materialize_guards(
     }
 }
 
-/// §8 BB2-ii + BB3-a — drive the CEGAR validate/re-solve loop to a fixpoint (Mode A).
+/// §8 BB2-ii — drive the CEGAR validate/re-solve loop to a fixpoint (Mode A).
 ///
 /// The solver must arrive with ownership constraints + per-fn coherence already
-/// emitted (so `selectors` are its retractable malloc sources). Each round: solve →
+/// emitted (so `selectors` are its retractable malloc sources). §NB0: the BB3-a
+/// invariant (`¬ref` on every malloc-source slot — a malloc result owns heap and is
+/// not a borrow; see `sources::collect_malloc_source_slots`) is now emitted EAGERLY
+/// by `emit_crate_ownership_constraints`, so no model this loop ever sees can mark a
+/// source `Ref` and the old lazy per-round source commit is gone. Each round: solve →
 /// derive the candidacy from the model's *actual* Raw/Ref/Owning kinds → commit `¬ref`
-/// on (a) every **malloc-source slot the model still marks `Ref`** (BB3-a `Ref ⇒ loan`
-/// — a malloc result owns heap and is not a borrow, so it may not be a reference; see
-/// `sources::collect_malloc_source_slots`) and (b) **one representative slot per
-/// residual borrow conflict** (BB2-ii — issuer if present, else a requirer, see
-/// `representative`; conflicts come from `revalidate_replaying`'s `tree_borrow_local`
-/// union replay) → re-solve. Accept when no committable (currently-`Ref`) slot remains.
+/// on **one representative slot per residual borrow conflict** (BB2-ii — issuer if
+/// present, else a requirer, see `representative`; conflicts come from
+/// `revalidate_replaying`'s `tree_borrow_local` union replay) → re-solve. Accept when
+/// no committable (currently-`Ref`) slot remains.
 ///
 /// Mode A = *monotone single-slot commitment*, deliberately NOT BB1's disjunctive
 /// `materialize_guards`. Committing one currently-`Ref` slot forces exactly that slot off
@@ -200,9 +202,6 @@ pub(crate) fn verify_to_fixpoint(
     is_mutable: bool,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     let cap = round_cap(slots);
-    // §8 BB3-a — malloc-source slots (static; computed once). A source owns heap and is
-    // not a borrow, so it may not be `Ref`.
-    let malloc_sources = super::sources::collect_malloc_source_slots(program, slots);
     // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
@@ -236,16 +235,6 @@ pub(crate) fn verify_to_fixpoint(
             "every residual conflict slot must be Ref in the current model"
         );
         let mut committed = 0;
-        // §8 BB3-a `Ref ⇒ loan`: demote any malloc-source slot the model still marks
-        // `Ref` (a reference to owned heap). `¬ref`, not `raw` — an unleaked source still
-        // settles `Owning`; only the unbacked-`Ref` reading is forbidden. Monotone (the
-        // `== Ref` gate means a committed source is never re-committed).
-        for &slot in &malloc_sources {
-            if model.get(&slot) == Some(&SlotKind::Ref) {
-                solver.add_borrow_exclusion(Some(slot), &[]);
-                committed += 1;
-            }
-        }
         for conflict in conflicts.values().flatten() {
             if let Some(slot) = representative(conflict, &model) {
                 // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
