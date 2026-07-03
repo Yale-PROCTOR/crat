@@ -331,6 +331,7 @@ use thin_vec::ThinVec;
 use utils::{
     ast::{has_side_effects, unwrap_cast_and_paren, unwrap_paren},
     expr,
+    hir::{is_lhs, lhs_base},
     ir::{AstToHir, mir_ty_to_string},
     stmt, ty,
 };
@@ -1744,32 +1745,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             }
         }
     }
-}
-
-fn lhs_base<'a, 'tcx>(expr: &'a hir::Expr<'tcx>) -> &'a hir::Expr<'tcx> {
-    if let hir::ExprKind::Field(l, _) | hir::ExprKind::Index(l, _, _) = expr.kind {
-        lhs_base(l)
-    } else {
-        expr
-    }
-}
-
-fn is_lhs<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
-    for (_, parent) in tcx.hir_parent_iter(expr.hir_id) {
-        let hir::Node::Expr(parent) = parent else { return false };
-        match parent.kind {
-            hir::ExprKind::Assign(l, _, _) | hir::ExprKind::AssignOp(_, l, _)
-                if l.hir_id == expr.hir_id =>
-            {
-                return true;
-            }
-            hir::ExprKind::Field(_, _) => {}
-            hir::ExprKind::Index(l, _, _) if l.hir_id == expr.hir_id => {}
-            _ => return false,
-        }
-        expr = parent;
-    }
-    panic!()
 }
 
 fn is_lhs_or_addr_of<'tcx>(mut expr: &hir::Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
