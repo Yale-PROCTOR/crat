@@ -11334,10 +11334,94 @@ pub unsafe fn use_it(x: *mut i32) {
                 let slots = CrateSlots::build(&program);
 
                 let q = local_slot(&slots, use_it, call_destination(tcx, &body, "malloc"), 0);
-                let sources = collect_malloc_source_slots(&program, &slots);
+                let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
                 assert!(
                     !sources.contains(&q),
                     "a crate-local fn named `malloc` must not be flagged a source; got {sources:?}"
+                );
+            },
+        );
+    }
+
+    /// §NB0 guard — pins the uthash tripwire (C1-lite corpus finding; minimized from
+    /// uthash tests/test68.rs by module- then shape-bisect). The release-active
+    /// `assert!(!is_ref)` in `infer/boundary/library.rs` (`call_is_null`) fires when
+    /// `is_null` is called on a pointer whose pointee is a STRUCT WITH POINTER FIELDS
+    /// obtained via `&mut local as *mut S` — c2rust's `assert(&els[i] != NULL)` shape:
+    /// the pointer-measure decomposition of `*mut S` marks the reference-typed base
+    /// `is_ref`, which the hook asserts impossible. Pointer-free pointees (`*mut i32`,
+    /// field-less structs) do NOT trip (verified during the NB0 bisect).
+    ///
+    /// The FIX is out of NB0 scope — deferred, in writing, to the feasibility
+    /// root-cause phase (see docs/agents/tasks/2026-07-04-nb0-boundary-table.md).
+    /// When it lands, flip this into a positive fixture asserting the call is
+    /// handled (this `should_panic` will fail loudly to force that).
+    #[test]
+    #[should_panic(expected = "!is_ref")]
+    fn nb0_uthash_isnull_ref_arg_tripwire() {
+        run_compiler(
+            r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct el {
+    pub id: i32,
+    pub next: *mut el,
+}
+
+pub unsafe fn f() {
+    let mut e = el { id: 0, next: 0 as *mut el };
+    if !(&mut e as *mut el).is_null() {}
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let _ = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver);
+            },
+        );
+    }
+
+    /// §NB0 (hoisted BB3-a): `¬ref(source)` is a candidacy-independent domain invariant
+    /// emitted EAGERLY — no model, however early, may classify a malloc-source slot
+    /// `Ref`. Uses the leaked-alloc shape whose source previously FLOATED to `Ref`
+    /// under the max-ref objective on the raw relax-solve (the lazy loop only demoted
+    /// it in a later round; post-hoist there is no such window).
+    #[test]
+    fn nb0_emission_source_never_ref() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
+    let mut p = unsafe { malloc(8) };
+    &raw mut p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let leak = function_by_name(&program, "leak");
+                let body = tcx.mir_drops_elaborated_and_const_checked(leak).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("NB0 emission");
+
+                let model = kind_solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("relax loop resolves the leak");
+                let p = local_slot(&slots, leak, call_destination(tcx, &body, "malloc"), 0);
+                assert_ne!(
+                    model.get(&p),
+                    Some(&SlotKind::Ref),
+                    "a malloc-source slot may never be Ref, even on the first relax-solve \
+                     (eager ¬ref); got {:?}",
+                    model.get(&p)
                 );
             },
         );
@@ -11391,7 +11475,7 @@ pub unsafe fn ob() {
                 let slots = CrateSlots::build(&program);
 
                 // The malloc base (call destination + its cast target) = the Owning source set.
-                let sources = collect_malloc_source_slots(&program, &slots);
+                let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
                 assert!(
                     !sources.is_empty(),
                     "the malloc base must be recognized as a source"
@@ -11646,7 +11730,7 @@ pub unsafe fn offcase() {
         }
 
         // Precision report (NON-failing). Over-demotion (borrow-`Raw` ∉ production) is SAFE.
-        let sources = collect_malloc_source_slots(&program, &slots);
+        let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
         let (mut borrow_raw, mut owning, mut leaked_raw, mut over_demote) = (0usize, 0, 0, 0);
         for (s, kind) in &model {
             if !matches!(s, SlotRef::Local(..)) {

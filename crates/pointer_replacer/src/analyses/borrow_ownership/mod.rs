@@ -186,6 +186,19 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
         );
     }
 
+    // §NB0 (hoisted BB3-a): `¬ref(slot)` for every malloc-source slot, emitted
+    // EAGERLY as a candidacy-independent domain invariant — a heap allocation is
+    // owned memory, never a borrow, so no model (however early) may classify it
+    // `Ref`. `Owning` and `Raw` both satisfy the clause: an unleaked source still
+    // settles `Owning`, a leaked one `Raw`. Routed through `add_borrow_exclusion`
+    // (NOT the BoOwnDatabase source/sink path), so `source_sink_emissions` and
+    // the selector set are untouched. Replaces `verify_to_fixpoint`'s lazy
+    // per-round BB3-a commit.
+    let fns: Vec<_> = crate_ctxt.fns().iter().map(|d| d.expect_local()).collect();
+    for slot in sources::collect_malloc_source_slots(crate_ctxt.tcx, &fns, slots) {
+        kind_solver.add_borrow_exclusion(Some(slot), &[]);
+    }
+
     let source_selectors = database.source_selectors().to_vec();
     let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
