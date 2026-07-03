@@ -34,4 +34,6 @@ pub use rewriter::{
 };
 
 #[cfg(test)]
+mod bo_c1;
+#[cfg(test)]
 mod tests;
