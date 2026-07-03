@@ -333,10 +333,8 @@ use utils::{
     expr,
     hir::{is_lhs, lhs_base},
     ir::{AstToHir, mir_ty_to_string},
-    stmt, ty,
+    ty,
 };
-
-mod pointer_epoch_split;
 
 pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut expanded_ast = utils::ast::expanded_ast(tcx);
@@ -373,9 +371,6 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
     let mut fresh_pointers = FxHashSet::default();
     let mut fresh_pointer_renames = FxHashMap::default();
     let mut stmt_swaps: FxHashMap<_, Vec<_>> = FxHashMap::default();
-    // source pointers whose original name the `*fresh = ..` rewrite reintroduces;
-    // epoch splitting must not rename/remove these or the reintroduced use dangles.
-    let mut fresh_pointer_sources: FxHashSet<HirId> = FxHashSet::default();
     for lhs in visitor.ctx.rhs_to_lhs.values() {
         for lhs in lhs {
             if lhs.is_mutable {
@@ -399,7 +394,6 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
                     tcx.hir_name(fresh_let.rhs)
                 };
                 fresh_pointer_renames.insert(lhs.variable, symbol);
-                fresh_pointer_sources.insert(fresh_let.rhs);
             }
         }
     }
@@ -414,17 +408,6 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
             .array_string_literal_static_excludes
             .contains(def_id)
     });
-    // exclude bindings that other preprocessor rewrites will rename or reintroduce:
-    // - `vars_to_replace` keys (param/let elision targets),
-    // - `fresh_pointers` (the fresh vars of the deref rewrite),
-    // - `fresh_pointer_sources` (source pointers whose original name the `*fresh = ..`
-    //   rewrite reintroduces — splitting these leaves a dangling use).
-    // `lets_to_remove` needs no separate entry: those bindings are already in
-    // `vars_to_replace` or `fresh_pointers`.
-    let mut epoch_split_exclude: FxHashSet<HirId> = vars_to_replace.keys().copied().collect();
-    epoch_split_exclude.extend(fresh_pointers.iter().copied());
-    epoch_split_exclude.extend(fresh_pointer_sources.iter().copied());
-    let pointer_epoch_split_plan = pointer_epoch_split::analyze(tcx, &epoch_split_exclude);
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
@@ -440,7 +423,6 @@ pub fn preprocess(tcx: TyCtxt<'_>) -> String {
         non_pointer_uses: visitor.ctx.non_pointer_uses,
         string_literal_statics: visitor.ctx.string_literal_statics,
         array_string_literal_statics: visitor.ctx.array_string_literal_statics,
-        pointer_epoch_split_plan,
     };
 
     visitor.visit_crate(&mut expanded_ast);
@@ -536,7 +518,6 @@ struct AstVisitor<'tcx> {
     non_pointer_uses: FxHashSet<HirId>,
     string_literal_statics: FxHashSet<LocalDefId>,
     array_string_literal_statics: FxHashSet<LocalDefId>,
-    pointer_epoch_split_plan: pointer_epoch_split::PointerEpochSplitPlan,
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
@@ -668,33 +649,10 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             }
         }
 
-        // replace base-changing assignments (`x = rhs;`) with epoch `let`s
-        // (`let mut x_N: TY = rhs;`). only accepted locals populate the map.
-        for stmt in &mut b.stmts {
-            let StmtKind::Semi(e) = &stmt.kind else { continue };
-            let Some(hir_expr) = self.ast_to_hir.get_expr(e.id, self.tcx) else { continue };
-            let Some(intro) = self
-                .pointer_epoch_split_plan
-                .assignment_replacements
-                .get(&hir_expr.hir_id)
-            else {
-                continue;
-            };
-            let ExprKind::Assign(_, rhs, _) = &e.kind else { continue };
-            let rhs_str = pprust::expr_to_string(rhs);
-            let new_name = intro.new_name;
-            let ty_string = &intro.ty_string;
-            *stmt = stmt!("let mut {new_name}: {ty_string} = {rhs_str};");
-        }
-
         b.stmts.retain(|stmt| {
             if let StmtKind::Let(local) = &stmt.kind
                 && let Some(hir_stmt) = self.ast_to_hir.get_let_stmt(local.id, self.tcx)
-                && (self.lets_to_remove.contains(&hir_stmt.hir_id)
-                    || self
-                        .pointer_epoch_split_plan
-                        .original_inits_to_remove
-                        .contains(&hir_stmt.hir_id))
+                && self.lets_to_remove.contains(&hir_stmt.hir_id)
             {
                 false
             } else {
@@ -744,14 +702,6 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     if let Res::Local(hir_id) = path.res
                         && let Some(name) = self.vars_to_replace.get(&hir_id)
                     {
-                        *expr = expr!("{name}");
-                    } else if let Some(name) = self
-                        .pointer_epoch_split_plan
-                        .path_renames
-                        .get(&hir_expr.hir_id)
-                    {
-                        // per-occurrence rename to the epoch local (keyed by this
-                        // occurrence, unlike `vars_to_replace` which is keyed by binding).
                         *expr = expr!("{name}");
                     } else if let Res::Def(DefKind::Static { .. }, def_id) = path.res
                         && let Some(local_def_id) = def_id.as_local()
@@ -2684,294 +2634,5 @@ unsafe fn main_0() -> core::ffi::c_int {
             &["let __arg_0", "x.i = __arg_0"],
             &["x.i = foo"],
         );
-    }
-
-    #[test]
-    fn test_epoch_split_skips_single_base() {
-        // a single-base scratch local is NOT split: only genuine multi-base reuse is
-        // split, so the original binding and its sole assignment are left untouched.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    return x;
-}
-        "#,
-            &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
-            &["x_0"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_sequential_bases() {
-        // two unrelated bases through one scratch local -> two epoch lets.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    let _c: i8 = *x;
-    x = b;
-    return x;
-}
-        "#,
-            &[
-                "let mut x_0: *mut i8 = a",
-                "let mut x_1: *mut i8 = b",
-                "_c: i8 = *x_0",
-                "return x_1",
-            ],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_same_epoch_movement() {
-        // `.offset` on the same local keeps the epoch and stays an assignment (not a
-        // `let`); a later distinct base gives the local a second epoch so it splits.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    x = x.offset(1 as isize);
-    let _c: i8 = *x;
-    x = b;
-    return x;
-}
-        "#,
-            &[
-                "let mut x_0: *mut i8 = a",
-                "x_0 = x_0.offset",
-                "let mut x_1: *mut i8 = b",
-                "return x_1",
-            ],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_rejects_addr_taken() {
-        // the local is rejected because it is address-taken (`&mut x`), leaving the scratch local unchanged.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
-    let mut x: *mut u8 = 0 as *mut u8;
-    x = a;
-    x = x.wrapping_add(1 as usize);
-    let p: *mut *mut u8 = &mut x;
-    return x;
-}
-        "#,
-            &["let mut x: *mut u8 = 0 as *mut u8"], // untouched: x is address-taken
-            &["x_0"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_branch_contained() {
-        // two branch-contained epochs (one per arm), each used only inside its arm and
-        // not after the join -> the local has two epochs and splits within each branch.
-        run_test(
-            r#"
-extern "C" {
-    fn foo(_: *mut i8);
-}
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, cond: i32) {
-    let mut x: *mut i8 = 0 as *mut i8;
-    if cond != 0 {
-        x = a;
-        foo(x);
-    } else {
-        x = b;
-        foo(x);
-    }
-}
-        "#,
-            &[
-                "let mut x_0: *mut i8 = a",
-                "foo(x_0)",
-                "let mut x_1: *mut i8 = b",
-                "foo(x_1)",
-            ],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_rejects_cross_join_use() {
-        // one branch assigns; the post-if use may see old-or-new -> reject, preserve write.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    if cond != 0 {
-        x = a;
-    }
-    return x;
-}
-        "#,
-            &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
-            &["x_0"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_rejects_loop_base_change() {
-        // a base change inside a loop cannot be promoted to a `let` -> reject.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    let mut i: i32 = 0;
-    while i < n {
-        x = a;
-        i += 1;
-    }
-    return x;
-}
-        "#,
-            &["let mut x: *mut i8 = 0 as *mut i8", "x = a"],
-            &["x_0"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_loop_same_epoch_movement() {
-        // incoming epoch, loop only moves it (renamed, no `let` in loop); a later
-        // distinct base gives the local a second epoch so it splits.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, n: i32) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    let mut i: i32 = 0;
-    while i < n {
-        x = x.offset(1 as isize);
-        i += 1;
-    }
-    x = b;
-    return x;
-}
-        "#,
-            &[
-                "let mut x_0: *mut i8 = a",
-                "x_0 = x_0.offset",
-                "let mut x_1: *mut i8 = b",
-                "return x_1",
-            ],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_use_kinds() {
-        // deref, null check, call arg, cast, and pointer-method uses all rename to the
-        // epoch local; a second distinct base gives the local two epochs so it splits.
-        run_test(
-            r#"
-pub unsafe extern "C" fn use_ptr(p: *mut i8) {}
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> i32 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    let d: i8 = *x;                 // deref
-    if !x.is_null() {               // null check + pointer method
-        use_ptr(x);                 // call argument
-        let c: *const i8 = x as *const i8; // cast
-    }
-    x = b;
-    return d as i32;
-}
-        "#,
-            &[
-                "let mut x_0: *mut i8 = a",
-                "*x_0",
-                "x_0.is_null()",
-                "use_ptr(x_0)",
-                "x_0 as *const i8",
-                "let mut x_1: *mut i8 = b",
-            ],
-            &["let mut x: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_parse_uname_shape() {
-        run_test(
-            r#"
-extern "C" {
-    fn strstr(_: *const i8, _: *const i8) -> *mut i8;
-    fn get_os_arch(_: *mut i8) -> *mut i8;
-    fn use_c(_: *mut i8);
-}
-pub unsafe extern "C" fn f(mut uname: *mut i8, cond: i32) {
-    let mut str_tmp: *mut i8 = 0 as *mut i8;
-    str_tmp = strstr(uname, uname);
-    if cond != 0 {
-        str_tmp = str_tmp.offset(7 as isize);
-        use_c(str_tmp);
-    } else {
-        str_tmp = get_os_arch(uname);
-        if !str_tmp.is_null() {
-            use_c(str_tmp);
-        }
-    }
-}
-        "#,
-            &[
-                "let mut str_tmp_0: *mut i8 = strstr",
-                "str_tmp_0 = str_tmp_0.offset",
-                "let mut str_tmp_1: *mut i8 = get_os_arch",
-                "str_tmp_1.is_null()",
-            ],
-            &["let mut str_tmp: *mut i8 = 0 as *mut i8"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_rejects_epoch_escaping_block() {
-        // two epochs where the second is created inside a nested block and then used
-        // after the block: the block-scoped epoch `let` would be out of scope, so the
-        // whole local is rejected (left unsplit) rather than dangling.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
-    let mut x: *mut i8 = 0 as *mut i8;
-    x = a;
-    'c_blk: {
-        x = b;
-    }
-    return x;
-}
-        "#,
-            &[
-                "let mut x: *mut i8 = 0 as *mut i8",
-                "x = a",
-                "x = b",
-                "return x",
-            ],
-            &["x_0", "x_1"],
-        )
-    }
-
-    #[test]
-    fn test_epoch_split_rejects_fresh_pointer_source() {
-        // `let fresh = p; p = p.offset(1); *fresh = X` is rewritten by the existing
-        // fresh-pointer pass, which reintroduces `p`'s original name. epoch splitting
-        // must not rename/remove `p` (a fresh-pointer source), or `*p` would dangle.
-        run_test(
-            r#"
-pub unsafe extern "C" fn f(mut base: *mut u8) {
-    let mut p: *mut u8 = 0 as *mut u8;
-    p = base;
-    let fresh = p;
-    p = p.offset(1);
-    *fresh = 1 as u8;
-}
-        "#,
-            &["let mut p: *mut u8 = 0 as *mut u8"],
-            &["p_0"],
-        )
     }
 }
