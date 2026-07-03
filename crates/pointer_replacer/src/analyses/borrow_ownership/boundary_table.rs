@@ -39,6 +39,14 @@ pub(crate) enum Role {
     LoanCreating,
     /// Flows arg0's provenance to the return value (pointer arithmetic,
     /// slice views/indexing, C-string search).
+    ///
+    /// ⚠ NB3/NB4 consumers: several rows carrying this role are TYPE-GUARDED
+    /// in production (slice views require a slice-like-ref destination;
+    /// slice indexing and `memchr` require a slice-like-ref arg0 — see each
+    /// row's `note`). Consuming the role WITHOUT re-implementing the guard
+    /// over-matches production semantics. The guards live only in `note`
+    /// because NB0 is data-only; they MUST become code when roles become
+    /// behavior.
     ProvenanceFlow,
     /// Recognized only to SUPPRESS unknown-target poisoning; adds no flow
     /// edge (production slice-split handling).
@@ -69,8 +77,11 @@ pub(crate) enum Matcher {
     /// Bare name across every callee kind — local fns, impl methods,
     /// stdlib, and extern decls alike (production C-string/memchr lists).
     AnyName,
-    /// Non-local `DefId` whose `def_path` starts at `TypeNs("ptr")`
-    /// (BO's `library_call` dispatch in `infer/boundary/library.rs`).
+    /// Non-local `DefId` whose `def_path` starts at `TypeNs("ptr")` AND whose
+    /// 4th path element (`def_path.data.get(3)`) is a `ValueNs` with this
+    /// name — the exact discipline of BO's `library_call` dispatch in
+    /// `infer/boundary/library.rs:20-59`; anything else there falls through
+    /// to `unknown_call`. Do not loosen to "starts at `ptr` + bare name".
     RustPtrPath,
 }
 

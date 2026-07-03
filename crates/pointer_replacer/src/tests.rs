@@ -11356,6 +11356,12 @@ pub unsafe fn use_it(x: *mut i32) {
     /// root-cause phase (see docs/agents/tasks/2026-07-04-nb0-boundary-table.md).
     /// When it lands, flip this into a positive fixture asserting the call is
     /// handled (this `should_panic` will fail loudly to force that).
+    ///
+    /// NOTE on `expected`: several boundary asserts share the "!is_ref" message
+    /// (free/memset/addr/offset hooks) — the substring alone does not select
+    /// `call_is_null`. Disambiguation comes from the SNIPPET: `is_null` is the
+    /// only boundary-hook call it contains, so no other `!is_ref` assert is
+    /// reachable.
     #[test]
     #[should_panic(expected = "!is_ref")]
     fn nb0_uthash_isnull_ref_arg_tripwire() {
