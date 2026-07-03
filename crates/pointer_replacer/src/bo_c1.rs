@@ -344,6 +344,7 @@ mod run {
 
     use rustc_hash::FxHashSet;
     use rustc_middle::ty::TyCtxt;
+    use z3::{SatResult, ast::Bool};
 
     use super::{collect_program, mirror, report::Row};
     use crate::analyses::{
@@ -446,7 +447,10 @@ mod run {
         row.set("sources_total", sources.len());
 
         match &model {
-            None => row.set("status", "decline"),
+            None => {
+                row.set("status", "decline");
+                row.set("decline_reason", decline_reason(&solver, &selectors));
+            }
             Some(m) => {
                 let (mut n_ref, mut n_raw, mut n_own) = (0usize, 0usize, 0usize);
                 let (mut n_ref_d0, mut n_raw_d0, mut n_own_d0) = (0usize, 0usize, 0usize);
@@ -524,6 +528,33 @@ mod run {
 
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
         row
+    }
+
+    /// Harness-side diagnostic for a `decline` (Codex review F7): distinguish
+    /// "the constraint system is UNSAT for non-source reasons" from "z3 gave
+    /// up (Unknown)" by replaying `model_kinds_relaxing`'s phase-1 selector
+    /// dropping read-only (`check` with assumptions asserts nothing). Runs on
+    /// the solver state at the moment of decline, so for a round-0 decline it
+    /// replays exactly the failing first solve.
+    pub(super) fn decline_reason(solver: &KindSolver, selectors: &[Bool]) -> &'static str {
+        let mut assumptions: Vec<Bool> = selectors.to_vec();
+        loop {
+            match solver.optimize().check(&assumptions) {
+                // Should not happen (relaxing declined); a nondeterministic
+                // Unknown->Sat flip lands here rather than lying.
+                SatResult::Sat => return "sat-in-replay",
+                SatResult::Unknown => return "z3-unknown",
+                SatResult::Unsat => {
+                    let core = solver.optimize().get_unsat_core();
+                    match assumptions.iter().position(|s| core.iter().any(|c| c == s)) {
+                        Some(i) => {
+                            assumptions.swap_remove(i);
+                        }
+                        None => return "unsat-nonsource",
+                    }
+                }
+            }
+        }
     }
 
     /// Production baseline: the independent greedy driver `assert_borrow_parity`
@@ -752,6 +783,84 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
     assert_eq!((sources, leaked), (3, 1), "exactly the conflicting alloc leaks");
 }
 
+/// Decline path end-to-end, on the smallest confirmed real-corpus decliner:
+/// bst's `deleteNode` with the `minValueNode` call inlined to a field load
+/// (bisect result — `free(param)` alone, `free(cast)` alone, and the
+/// single-free non-recursive variant all ACCEPT; the recursive
+/// `root->left = f(root->left)` flow-through plus conditional frees is what
+/// contradicts). There is NO malloc in this shape, so the UNSAT has zero
+/// retractable source selectors — non-source UNSAT by construction. The
+/// mirror must (a) agree with the real `verify_to_fixpoint`'s `None` and
+/// (b) diagnose `unsat-nonsource`, not `z3-unknown`.
+#[test]
+fn boc1_mirror_matches_real_delete_node_decline() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, coherence::add_coherence, crate_slots::CrateSlots,
+        emit_crate_ownership_constraints, solver::KindSolver,
+    };
+
+    let code = r#"
+unsafe extern "C" {
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct node {
+    pub key: i32,
+    pub left: *mut node,
+    pub right: *mut node,
+}
+
+pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
+    if root.is_null() {
+        return root;
+    }
+    if key < (*root).key {
+        (*root).left = delete_node((*root).left, key);
+    } else if key > (*root).key {
+        (*root).right = delete_node((*root).right, key);
+    } else {
+        if ((*root).left).is_null() {
+            let mut temp: *mut node = (*root).right;
+            free(root as *mut core::ffi::c_void);
+            return temp;
+        } else if ((*root).right).is_null() {
+            let mut temp_0: *mut node = (*root).left;
+            free(root as *mut core::ffi::c_void);
+            return temp_0;
+        }
+        let mut temp_1: *mut node = (*root).right;
+        (*root).key = (*temp_1).key;
+        (*root).right = delete_node((*root).right, (*temp_1).key);
+    }
+    return root;
+}
+"#;
+    let (accepted, stats, sources, _leaked) = assert_mirror_matches(code);
+    assert!(!accepted, "the deleteNode shape must decline (non-source UNSAT)");
+    assert_eq!(stats.rounds, 0, "decline at the first solve, before any round");
+    assert_eq!(sources, 0, "no malloc: the UNSAT cannot be source-retractable");
+
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_s, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let (model, _stats) =
+            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true);
+        assert!(model.is_none());
+        assert_eq!(run::decline_reason(&solver, &selectors), "unsat-nonsource");
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
 // ---------------------------------------------------------------------------
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
@@ -929,7 +1038,15 @@ mod orchestrate {
             .unwrap_or("BOC1PHASE none")
             .to_string();
 
-        let classification = if let Some(reason) = killed_for {
+        // A child that completed (exit 0 + sentinel) beats a raced kill: the
+        // deadline/RSS branch can fire in the same poll window in which the
+        // child exits, leaving `killed_for` set on an already-dead process.
+        let classification = if status.code() == Some(0) && row.is_some() {
+            row.as_ref()
+                .and_then(|r| r.get("status"))
+                .unwrap_or("no-status")
+                .to_string()
+        } else if let Some(reason) = killed_for {
             reason.to_string()
         } else if let Some(row) = &row {
             row.get("status").unwrap_or("no-status").to_string()
@@ -1088,6 +1205,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "d_ref_d0",
         "sources_total",
         "sources_leaked",
+        "decline_reason",
         "prod_status",
     ];
     let mut out = String::from("# C1-lite BO corpus report\n\n");
@@ -1099,10 +1217,17 @@ fn render_report(merged: &[report::Row]) -> String {
          where CROWN lost to Laertes — key for the C3 head-to-head.\n\n\
          `d_ref_d0` = BO depth-0 local Ref count minus the production baseline's \
          (`demote_pointers_iterative_with_fields` from all-Ref, same accounting). \
-         `decline` lumps z3 UNSAT with Unknown. `sources_total`/`sources_leaked` count \
-         malloc-source SLOTS (propagation-closed over copies/moves/casts, so one \
-         allocation can contribute several slots, e.g. its `free` call-arg temp); \
-         a slot is leaked when its final kind is not Owning.\n\n",
+         `decline_reason` separates non-source UNSAT from z3 Unknown (harness-side \
+         phase-1 replay). `sources_total`/`sources_leaked` count malloc-source SLOTS \
+         (propagation-closed over copies/moves/casts, so one allocation can contribute \
+         several slots, e.g. its `free` call-arg temp); a slot is leaked when its final \
+         kind is not Owning. `commits_*` count exclusion assertions exactly as the real \
+         loop's `committed` does — the same slot can be committed by several conflicts \
+         in one round, so this is commit OPERATIONS, not unique slots. `d_ref_d0` is a \
+         Ref-count delta, not a pure borrow-precision delta: BO's non-Ref includes \
+         Owning (a win) and leaked-source Raw — read it together with `n_own`. \
+         `wall_s` is supervision-level (includes up to ~200ms poll latency); \
+         `t_total_s` in the CSV/JSONL is the child-measured time.\n\n",
     );
     out.push_str(&report::render_markdown(merged, &cols));
     out
