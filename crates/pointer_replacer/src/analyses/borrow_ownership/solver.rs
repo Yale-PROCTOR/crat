@@ -352,6 +352,13 @@ impl KindSolver {
     }
 
     pub fn check(&self) -> SatResult {
+        // §NB-R guard: a no-assumption check on a tracked solver is vacuously
+        // SAT (all hard constraints are track-gated) — refuse, like the other
+        // production solve paths.
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter check() (constraints are track-gated)"
+        );
         self.solver.check(&[])
     }
 

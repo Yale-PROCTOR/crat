@@ -561,6 +561,13 @@ mod run {
     /// the solver state at the moment of decline, so for a round-0 decline it
     /// replays exactly the failing first solve.
     pub(super) fn decline_reason(solver: &KindSolver, selectors: &[Bool]) -> &'static str {
+        // §NB-R guard (Codex F1): this replay assumes ONLY selectors; under a
+        // tracked solver the hard constraints would be disabled and the reply
+        // would be a bogus "sat-in-replay".
+        assert!(
+            solver.tracker().is_none(),
+            "tracked KindSolver must not enter decline_reason (constraints are track-gated)"
+        );
         let mut assumptions: Vec<Bool> = selectors.to_vec();
         loop {
             match solver.optimize().check(&assumptions) {
@@ -998,16 +1005,24 @@ mod explain {
                     // only if removing it makes the rest SAT (i.e. it is
                     // load-bearing). z3 cores are NOT minimal (the in-repo
                     // relaxing loop documents this) — an unminimized set
-                    // would over-report the contradiction.
+                    // would over-report the contradiction. Codex F3: an
+                    // Unknown on a candidate keeps the literal but forfeits
+                    // the 1-minimality claim (`minimized` = false then).
+                    let mut saw_unknown = false;
                     let mut i = 0;
                     while i < core.len() {
                         let mut candidate = core.clone();
                         candidate.swap_remove(i);
-                        if solver.optimize().check(&candidate) == SatResult::Unsat {
-                            core = candidate; // literal was redundant; slot i now
-                            // holds the (unvisited) former last element.
-                        } else {
-                            i += 1;
+                        match solver.optimize().check(&candidate) {
+                            SatResult::Unsat => {
+                                core = candidate; // literal was redundant; slot i
+                                // now holds the (unvisited) former last element.
+                            }
+                            SatResult::Sat => i += 1,
+                            SatResult::Unknown => {
+                                saw_unknown = true;
+                                i += 1;
+                            }
                         }
                     }
                     assert_eq!(
@@ -1015,7 +1030,7 @@ mod explain {
                         SatResult::Unsat,
                         "minimized core must re-check UNSAT on its own"
                     );
-                    true
+                    !saw_unknown
                 } else {
                     false
                 };
@@ -1532,6 +1547,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "sources_leaked",
         "decline_reason",
         "core_families",
+        "core_minimized",
         "prod_status",
     ];
     let mut out = String::from("# C1-lite BO corpus report\n\n");
