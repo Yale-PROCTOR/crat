@@ -653,13 +653,13 @@ where
     fn sink(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
         infer_cx.database.record_source_sink();
         if let Some(sig) = result.r#use.clone().next() {
-            infer_cx
-                .database
-                .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                    (),
-                    sig,
-                    true,
-                )
+            // §NB-F retractable owning (option (a) of the NB-R gate): hard by
+            // default, selector-gated for BO — the sink twin of `source` above.
+            // The relax loop may drop the selector to LEAK THE FREE (an
+            // unprovable free stays a raw-pointer free) instead of declining;
+            // NB-R showed the hard sink was the forced-owning pole of every
+            // Family-A corpus UNSAT.
+            infer_cx.database.push_sink_owning(sig)
         }
         Self::assume(infer_cx, result.def, false);
     }

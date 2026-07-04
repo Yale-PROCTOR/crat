@@ -69,8 +69,19 @@ where
 
     pub fn call_is_null(&mut self, args: &CallArgs) {
         assert_eq!(args.len(), 1);
-        if let Some((arg, is_ref)) = args[0].clone() {
-            assert!(!is_ref);
+        if let Some((mut arg, is_ref)) = args[0].clone() {
+            if is_ref {
+                // §NB-F (the NB-R uthash tripwire, fixed): the argument is
+                // `&mut place`/`&raw mut place`, so the range's LEADING slot is
+                // the outer reference level and the null-checked pointer sits
+                // one level deeper — peel one slot before lending, the same
+                // realignment `Boundary::entry`'s is_ref path performs
+                // (boundary.rs `output_param.next()` + `builtin_deref`).
+                // Empty-after-peel lends nothing (a no-op), which is safe:
+                // `is_null` is a non-consuming read.
+                arg.r#use = (arg.r#use.start + 1u32)..arg.r#use.end;
+                arg.def = (arg.def.start + 1u32)..arg.def.end;
+            }
             <Analysis as InferMode>::lend(self, arg)
         }
     }

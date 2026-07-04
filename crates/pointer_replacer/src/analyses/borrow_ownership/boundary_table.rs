@@ -129,9 +129,16 @@ pub(crate) const TABLE: &[Entry] = &[
         "realloc",
         Matcher::ForeignC,
         &[Role::Source, Role::Sink],
-        "libc.rs call_realloc: source(destination) + sink(arg0); sources.rs; call_graph Alloc",
+        "libc.rs call_realloc: source(destination) + sink(arg0); sources.rs; call_graph Alloc. \
+         Sink owning selector-retractable since NB-F.",
     ),
-    entry("free", Matcher::ForeignC, &[Role::Sink], "libc.rs call_free: sink(arg0); call_graph Dealloc"),
+    entry(
+        "free",
+        Matcher::ForeignC,
+        &[Role::Sink],
+        "libc.rs call_free: sink(arg0); call_graph Dealloc. \
+         Sink owning selector-retractable since NB-F (leak-the-free).",
+    ),
     entry("memset", Matcher::ForeignC, &[Role::FlowTransfer], "libc.rs call_memset: transfer(dest, arg)"),
     // --- BO library hooks (RustPtrPath: def_path starts at TypeNs("ptr")).
     entry(
