@@ -151,7 +151,9 @@ pub(crate) const TABLE: &[Entry] = &[
         "is_null",
         Matcher::RustPtrPath,
         &[Role::Lend],
-        "library.rs call_is_null: lend(arg); release-active assert!(!is_ref) — the uthash tripwire",
+        "library.rs call_is_null: lend(arg); §NB-F an is_ref arg has its leading \
+         outer-reference slot peeled before the lend (the former uthash tripwire \
+         assert!(!is_ref) is gone)",
     ),
     entry("addr", Matcher::RustPtrPath, &[Role::Ignore], "library.rs call_addr: arg ignored"),
     // --- production is_borrowing_method (borrow/mod.rs:779-785): reborrow of

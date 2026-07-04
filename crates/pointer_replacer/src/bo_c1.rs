@@ -1230,13 +1230,17 @@ fn nbr_core_extraction_delete_node() {
 /// §NB-R R2a REGRESSION fixture (frozen AFTER the diagnosis was confirmed —
 /// deliberately separate from the mechanism-only test above). Pins the
 /// verified family composition of the witness's minimal core: the free
-/// sink's owning (`own-assume(=true)`) reaches a never-owning temp's
-/// version-zero (`own-assume(=false)`) through kind-coherence over the
-/// `node.right` field slot and both `link-own` biconditionals. If an
-/// emission change alters this contradiction surface, this fails loudly and
-/// the diagnosis in docs/agents/tasks/2026-07-04-nbr-unsat-root-cause.md
-/// must be re-derived. (Family HISTOGRAM only — var indices shift with MIR
-/// details and are deliberately not pinned.)
+/// sink's owning — since §NB-F a RETRACTABLE `sink-selector` literal, no
+/// longer a hard `own-assume(=true)` — reaches a never-owning temp's
+/// version-zero (`own-assume(=false)`, still the sole hard pole) through
+/// kind-coherence over the `node.right` field slot and both `link-own`
+/// biconditionals. Explain assumes ALL selectors, so the core is still UNSAT
+/// (master lemma) even though the production relax path now accepts this
+/// witness by dropping the sinks. If an emission change alters this
+/// contradiction surface, this fails loudly and the diagnosis in
+/// docs/agents/tasks/2026-07-04-nbr-unsat-root-cause.md must be re-derived.
+/// (Family HISTOGRAM only — var indices shift with MIR details and are
+/// deliberately not pinned.)
 #[test]
 fn nbr_witness_core_family_regression() {
     ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
