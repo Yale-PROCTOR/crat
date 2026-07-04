@@ -163,7 +163,12 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     kind_solver: &KindSolver,
 ) -> anyhow::Result<(BoOwnEmissionStats, Vec<Bool>)> {
     let mut var_gen = Gen::new();
-    let mut database = BoOwnDatabase::new(kind_solver.optimize());
+    // §NB-R: hand the KindSolver's tracker (if any) to the database so the
+    // ownership-version constraints are track-gated in tracked mode too.
+    let mut database = BoOwnDatabase::new(kind_solver.optimize(), kind_solver.tracker());
+    if let Some(tracker) = kind_solver.tracker() {
+        tracker.set_context("global-assumptions");
+    }
     let global_assumptions = GlobalAssumptions::new(crate_ctxt, &mut var_gen, &mut database);
 
     // The full InterCtxt must be built (all signature vars allocated) before any
@@ -174,6 +179,9 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     // z3 resolves cross-function (and recursive) flow when the joint system is
     // solved. No SCC iteration is needed at fixed precision 1.
     for &did in crate_ctxt.fns() {
+        if let Some(tracker) = kind_solver.tracker() {
+            tracker.set_context(&crate_ctxt.tcx.def_path_str(did));
+        }
         emit_fn_body_into(
             crate_ctxt,
             slots,
@@ -184,6 +192,9 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
             &inter_ctxt,
             did.expect_local(),
         );
+    }
+    if let Some(tracker) = kind_solver.tracker() {
+        tracker.set_context("nb0-eager-source");
     }
 
     // §NB0 (hoisted BB3-a): `¬ref(slot)` for every malloc-source slot, emitted

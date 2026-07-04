@@ -201,6 +201,13 @@ pub(crate) fn verify_to_fixpoint(
     selectors: &[Bool],
     is_mutable: bool,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    // §NB-R guard (release-active): a tracked solver's hard constraints are
+    // track-gated; every solve in this loop would be vacuously SAT and the
+    // accepted model meaningless. Tracked instances belong to the explain path.
+    assert!(
+        solver.tracker().is_none(),
+        "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
+    );
     let cap = round_cap(slots);
     // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the

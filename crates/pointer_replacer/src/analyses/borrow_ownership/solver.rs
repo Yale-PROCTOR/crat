@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ops::Range;
 
 use rustc_hash::FxHashMap;
@@ -25,19 +26,125 @@ struct KindVars {
     own: Bool,
 }
 
+/// §NB-R — opt-in tracked-core diagnostic. When a `KindSolver` is built via
+/// `new_tracked`, every HARD constraint is asserted as `track ⇒ constraint`
+/// with a fresh track literal recorded here alongside a human-readable label
+/// (`{context}::{family}(…)`). Solving `check(&[tracks ∪ source selectors])`
+/// then yields, on UNSAT, a core whose literals map back to labeled emission
+/// sites — the tool that turns the corpus's opaque `unsat-nonsource` declines
+/// into a named contradicting constraint set. Soft asserts (the Ref≻Raw
+/// objective) are never tracked; `push_source_owning`'s selectors stay their
+/// own (retractable) assumption class and are never double-gated.
+///
+/// A tracked solver is meaningful ONLY under assumption-solving: its hard
+/// constraints are vacuously satisfiable without the tracks. The production
+/// solve paths (`model_kinds`, `model_kinds_relaxing`, `verify_to_fixpoint`)
+/// carry release-active guards refusing tracked instances.
+pub(crate) struct CoreTracker {
+    entries: RefCell<Vec<(Bool, String)>>,
+    context: RefCell<String>,
+}
+
+impl CoreTracker {
+    fn new() -> Self {
+        CoreTracker {
+            entries: RefCell::new(Vec::new()),
+            context: RefCell::new(String::from("init")),
+        }
+    }
+
+    /// Set the provenance context (e.g. the fn being emitted, or the
+    /// construction phase) prefixed onto subsequent labels.
+    pub(crate) fn set_context(&self, context: &str) {
+        *self.context.borrow_mut() = context.to_string();
+    }
+
+    /// Mint a fresh track literal for one hard constraint and record its label.
+    fn record(&self, label: String) -> Bool {
+        let track = Bool::fresh_const("nbr_track");
+        self.entries
+            .borrow_mut()
+            .push((track.clone(), format!("{}::{}", self.context.borrow(), label)));
+        track
+    }
+
+    /// All track literals, for `check(&assumptions)`.
+    pub(crate) fn tracks(&self) -> Vec<Bool> {
+        self.entries
+            .borrow()
+            .iter()
+            .map(|(track, _)| track.clone())
+            .collect()
+    }
+
+    /// Label of a core literal (z3 node identity, valid on the shared
+    /// thread-local context — same basis as `model_kinds_relaxing`'s
+    /// selector matching).
+    pub(crate) fn label_of(&self, literal: &Bool) -> Option<String> {
+        self.entries
+            .borrow()
+            .iter()
+            .find(|(track, _)| track == literal)
+            .map(|(_, label)| label.clone())
+    }
+}
+
+/// The label families `CoreTracker` emits — the parse contract for the
+/// mechanism test and the corpus histogram. Kept in one place so a new
+/// emission site cannot invent an unlisted family silently.
+pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
+    "kind-pin",
+    "kind-equate",
+    "field-and",
+    "field-and-rev",
+    "field-forbid",
+    "link-own",
+    "borrow-exclusion",
+    "one-hot",
+    "i1-adjacency",
+    "own-linear",
+    "own-assume",
+    "own-equal",
+    "own-le",
+    "own-eqmin",
+    "source-selector",
+];
+
 pub struct KindSolver {
     solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
+    tracker: Option<CoreTracker>,
 }
 
 impl KindSolver {
     pub fn new(slots: &CrateSlots) -> Self {
+        Self::build(slots, None)
+    }
+
+    /// §NB-R diagnostic constructor: every hard constraint is track-gated.
+    /// The result must ONLY be driven via assumption solving (see
+    /// `CoreTracker`); production solve paths refuse it.
+    pub(crate) fn new_tracked(slots: &CrateSlots) -> Self {
+        Self::build(slots, Some(CoreTracker::new()))
+    }
+
+    pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
+        self.tracker.as_ref()
+    }
+
+    fn build(slots: &CrateSlots, tracker: Option<CoreTracker>) -> Self {
         let solver = Optimize::new();
         let mut vars = FxHashMap::default();
 
-        add_universe(&solver, &mut vars, &slots.field_slots, SlotRef::Field);
+        add_universe(
+            &solver,
+            tracker.as_ref(),
+            &mut vars,
+            &slots.field_slots,
+            SlotRef::Field,
+        );
         for (&fn_did, universe) in &slots.fn_local_slots {
-            add_universe(&solver, &mut vars, universe, |slot| {
+            add_universe(&solver, tracker.as_ref(), &mut vars, universe, |slot| {
                 SlotRef::Local(fn_did, slot)
             });
         }
@@ -49,7 +156,11 @@ impl KindSolver {
             solver.assert_soft(&kind_vars.raw, 1u64, None);
         }
 
-        KindSolver { solver, vars }
+        KindSolver {
+            solver,
+            vars,
+            tracker,
+        }
     }
 
     pub fn assume(&self, slot: SlotRef, kind: SlotKind) {
@@ -57,11 +168,17 @@ impl KindSolver {
             .vars
             .get(&slot)
             .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
-        match kind {
-            SlotKind::Raw => self.solver.assert(&vars.raw),
-            SlotKind::Ref => self.solver.assert(&vars.ref_),
-            SlotKind::Owning => self.solver.assert(&vars.own),
-        }
+        let bit = match kind {
+            SlotKind::Raw => &vars.raw,
+            SlotKind::Ref => &vars.ref_,
+            SlotKind::Owning => &vars.own,
+        };
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("kind-pin({slot:?},{kind:?})"),
+            bit,
+        );
     }
 
     pub fn equate(&self, a: SlotRef, b: SlotRef) {
@@ -73,9 +190,25 @@ impl KindSolver {
             .vars
             .get(&b)
             .unwrap_or_else(|| panic!("unknown slot: {b:?}"));
-        self.solver.assert(&!va.raw.xor(&vb.raw));
-        self.solver.assert(&!va.ref_.xor(&vb.ref_));
-        self.solver.assert(&!va.own.xor(&vb.own));
+        let tracker = self.tracker.as_ref();
+        assert_hard(
+            &self.solver,
+            tracker,
+            || format!("kind-equate({a:?},{b:?},raw)"),
+            &!va.raw.xor(&vb.raw),
+        );
+        assert_hard(
+            &self.solver,
+            tracker,
+            || format!("kind-equate({a:?},{b:?},ref)"),
+            &!va.ref_.xor(&vb.ref_),
+        );
+        assert_hard(
+            &self.solver,
+            tracker,
+            || format!("kind-equate({a:?},{b:?},own)"),
+            &!va.own.xor(&vb.own),
+        );
     }
 
     /// §9.10.2 field-ownership constraint: a struct field slot is one crate-wide slot that
@@ -110,14 +243,24 @@ impl KindSolver {
             })
             .collect();
         // field.own => rhs_i.own for each store (freeing requires every stored value owned).
-        for &r in &rhs_own {
-            self.solver.assert(&Bool::or(&[&!field_own, r]));
+        for (slot, r) in rhs.iter().zip(&rhs_own) {
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("field-and({field:?}=>{slot:?})"),
+                &Bool::or(&[&!field_own, r]),
+            );
         }
         // AND(rhs.own) => field.own : `field.own OR (OR ¬rhs_i.own)`.
         let negs: Vec<Bool> = rhs_own.iter().map(|&r| !r).collect();
         let mut clause: Vec<&Bool> = vec![field_own];
         clause.extend(negs.iter());
-        self.solver.assert(&Bool::or(&clause));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("field-and-rev({field:?})"),
+            &Bool::or(&clause),
+        );
     }
 
     /// §9.10.2 companion to `constrain_field_own`: hard-assert a field slot is NOT `Owning`.
@@ -132,7 +275,12 @@ impl KindSolver {
             .vars
             .get(&field)
             .unwrap_or_else(|| panic!("unknown slot: {field:?}"));
-        self.solver.assert(&!&vars.own);
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("field-forbid({field:?})"),
+            &!&vars.own,
+        );
     }
 
     /// Solidification link: tie a slot's `own` one-hot bit to an external Bool
@@ -143,7 +291,12 @@ impl KindSolver {
             .vars
             .get(&slot)
             .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
-        self.solver.assert(&!vars.own.xor(external));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("link-own({slot:?})"),
+            &!vars.own.xor(external),
+        );
     }
 
     /// §8 BB1 — assert a borrow-exclusion guard for one conflict edge: at least one
@@ -188,7 +341,12 @@ impl KindSolver {
             return;
         }
         let refs: Vec<&Bool> = literals.iter().collect();
-        self.solver.assert(&Bool::or(&refs));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("borrow-exclusion({issuer:?},{requirers:?})"),
+            &Bool::or(&refs),
+        );
     }
 
     pub fn check(&self) -> SatResult {
@@ -200,6 +358,14 @@ impl KindSolver {
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
+        // constraints are `track ⇒ c` — without the tracks assumed they are
+        // vacuously satisfiable, so this path would return a silently wrong
+        // model instead of an error.
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter model_kinds (constraints are track-gated)"
+        );
         if self.check() != SatResult::Sat {
             return None;
         }
@@ -224,6 +390,14 @@ impl KindSolver {
         &self,
         source_selectors: &[Bool],
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        // §NB-R guard (release-active): under tracking, this loop's unsat-core
+        // search would see foreign track literals in cores and its selector
+        // matching would silently misbehave. Tracked instances are driven only
+        // by the explain path.
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
+        );
         let mut assumptions: Vec<Bool> = source_selectors.to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
 
@@ -281,6 +455,7 @@ impl KindSolver {
 
 fn add_universe<F>(
     solver: &Optimize,
+    tracker: Option<&CoreTracker>,
     vars: &mut FxHashMap<SlotRef, KindVars>,
     universe: &SlotUniverse,
     mut slot_ref: F,
@@ -295,34 +470,95 @@ fn add_universe<F>(
             own: Bool::fresh_const("own"),
         };
 
-        assert_exactly_one(solver, &kind_vars);
-        vars.insert(slot_ref(id), kind_vars);
+        let sref = slot_ref(id);
+        assert_exactly_one(solver, tracker, sref, &kind_vars);
+        vars.insert(sref, kind_vars);
     }
 
     for i in 0..universe.len().saturating_sub(1) {
         let a = SlotId::from_usize(i);
         let b = SlotId::from_usize(i + 1);
         if universe.slot(a).owner == universe.slot(b).owner {
+            let sref_a = slot_ref(a);
+            let sref_b = slot_ref(b);
             let a_vars = vars
-                .get(&slot_ref(a))
+                .get(&sref_a)
                 .unwrap_or_else(|| panic!("missing solver vars for slot {a:?}"));
             let b_vars = vars
-                .get(&slot_ref(b))
+                .get(&sref_b)
                 .unwrap_or_else(|| panic!("missing solver vars for slot {b:?}"));
-            assert_not_both(solver, &a_vars.raw, &b_vars.own);
+            assert_not_both(
+                solver,
+                tracker,
+                || format!("i1-adjacency({sref_a:?},{sref_b:?})"),
+                &a_vars.raw,
+                &b_vars.own,
+            );
         }
     }
 }
 
-fn assert_exactly_one(solver: &Optimize, vars: &KindVars) {
-    solver.assert(&Bool::or(&[&vars.raw, &vars.ref_, &vars.own]));
-    assert_not_both(solver, &vars.raw, &vars.ref_);
-    assert_not_both(solver, &vars.raw, &vars.own);
-    assert_not_both(solver, &vars.ref_, &vars.own);
+fn assert_exactly_one(
+    solver: &Optimize,
+    tracker: Option<&CoreTracker>,
+    slot: SlotRef,
+    vars: &KindVars,
+) {
+    assert_hard(
+        solver,
+        tracker,
+        || format!("one-hot({slot:?},exists)"),
+        &Bool::or(&[&vars.raw, &vars.ref_, &vars.own]),
+    );
+    assert_not_both(
+        solver,
+        tracker,
+        || format!("one-hot({slot:?},raw-ref)"),
+        &vars.raw,
+        &vars.ref_,
+    );
+    assert_not_both(
+        solver,
+        tracker,
+        || format!("one-hot({slot:?},raw-own)"),
+        &vars.raw,
+        &vars.own,
+    );
+    assert_not_both(
+        solver,
+        tracker,
+        || format!("one-hot({slot:?},ref-own)"),
+        &vars.ref_,
+        &vars.own,
+    );
 }
 
-fn assert_not_both(solver: &Optimize, a: &Bool, b: &Bool) {
-    solver.assert(&Bool::or(&[&!a, &!b]));
+fn assert_not_both(
+    solver: &Optimize,
+    tracker: Option<&CoreTracker>,
+    label: impl FnOnce() -> String,
+    a: &Bool,
+    b: &Bool,
+) {
+    assert_hard(solver, tracker, label, &Bool::or(&[&!a, &!b]));
+}
+
+/// §NB-R — the single hard-assert choke point. Untracked: byte-identical to a
+/// plain `assert` (the label closure is never evaluated). Tracked: assert
+/// `track ⇒ constraint` and record the labeled track literal.
+fn assert_hard(
+    solver: &Optimize,
+    tracker: Option<&CoreTracker>,
+    label: impl FnOnce() -> String,
+    constraint: &Bool,
+) {
+    match tracker {
+        None => solver.assert(constraint),
+        Some(tracker) => {
+            let track = tracker.record(label());
+            solver.assert(&Bool::or(&[&!&track, constraint]));
+        }
+    }
 }
 
 fn is_true(model: &Model, b: &Bool) -> bool {
@@ -334,6 +570,11 @@ fn is_true(model: &Model, b: &Bool) -> bool {
 
 pub(crate) struct BoOwnDatabase<'opt> {
     optimize: &'opt Optimize,
+    /// §NB-R: present iff the owning `KindSolver` is tracked; every hard
+    /// constraint pushed here is then track-gated with an `own-*` family
+    /// label (`push_source_owning` excepted — its selectors are already
+    /// their own retractable assumption class).
+    tracker: Option<&'opt CoreTracker>,
     z3_ast: IndexVec<Var, Bool>,
     source_sink_emissions: usize,
     /// One selector literal per `source` (malloc) ownership assertion. The owning
@@ -343,11 +584,12 @@ pub(crate) struct BoOwnDatabase<'opt> {
 }
 
 impl<'opt> BoOwnDatabase<'opt> {
-    pub(crate) fn new(optimize: &'opt Optimize) -> Self {
+    pub(crate) fn new(optimize: &'opt Optimize, tracker: Option<&'opt CoreTracker>) -> Self {
         let mut z3_ast = IndexVec::with_capacity(100);
         z3_ast.push(Bool::fresh_const("own_dummy"));
         BoOwnDatabase {
             optimize,
+            tracker,
             z3_ast,
             source_sink_emissions: 0,
             source_selectors: Vec::new(),
@@ -384,44 +626,39 @@ impl Database for BoOwnDatabase<'_> {
     }
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
+        let label = || format!("own-linear({x:?}+{y:?}={z:?})");
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        let clause = Bool::or(&[&!x, &!y]);
-        self.optimize.assert(&clause);
-        let clause = Bool::or(&[&!x, z]);
-        self.optimize.assert(&clause);
-        let clause = Bool::or(&[x, y, &!z]);
-        self.optimize.assert(&clause);
-        let clause = Bool::or(&[&!y, z]);
-        self.optimize.assert(&clause);
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, &!y]));
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, z]));
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[x, y, &!z]));
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!y, z]));
     }
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        let label = || format!("own-assume({x:?}={sign})");
         let x = &self.z3_ast[x];
         let value = Bool::from_bool(sign);
-        let clause = !(x.xor(&value));
-        self.optimize.assert(&clause);
+        assert_hard(self.optimize, self.tracker, label, &!(x.xor(&value)));
     }
 
     fn push_equal_impl(&mut self, x: Var, y: Var) {
+        let label = || format!("own-equal({x:?},{y:?})");
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
-        let clause = !(x.xor(y));
-        self.optimize.assert(&clause);
+        assert_hard(self.optimize, self.tracker, label, &!(x.xor(y)));
     }
 
     fn push_less_equal_impl(&mut self, x: Var, y: Var) {
+        let label = || format!("own-le({x:?}<={y:?})");
         let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
-        let clause = Bool::or(&[&!x, y]);
-        self.optimize.assert(&clause);
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
     }
 
     fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
+        let label = || format!("own-eqmin({x:?}=min({y:?},{z:?}))");
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        let clause = Bool::or(&[&!x, y]);
-        self.optimize.assert(&clause);
-        let clause = Bool::or(&[&!x, z]);
-        self.optimize.assert(&clause);
-        let clause = Bool::or(&[x, &!y, &!z]);
-        self.optimize.assert(&clause);
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, z]));
+        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[x, &!y, &!z]));
     }
 
     fn record_source_sink(&mut self) {

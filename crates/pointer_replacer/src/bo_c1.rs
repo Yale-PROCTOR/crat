@@ -258,6 +258,12 @@ mod mirror {
         selectors: &[Bool],
         is_mutable: bool,
     ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+        // §NB-R guard — mirrors the real loop's release-active refusal of
+        // tracked solvers (kept in lockstep with borrow_verify.rs).
+        assert!(
+            solver.tracker().is_none(),
+            "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
+        );
         let mut stats = RoundStats::default();
         let cap = round_cap(slots);
         constrain_field_ownership(solver, slots, program);
@@ -441,6 +447,33 @@ mod run {
             None => {
                 row.set("status", "decline");
                 row.set("decline_reason", decline_reason(&solver, &selectors));
+                // §NB-R (opt-in): explain the decline via a second, TRACKED
+                // construction — labeled minimal core (or family histogram at
+                // scale). Never on the default path: doubles solve cost.
+                if std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
+                    let t = Instant::now();
+                    match super::explain::explain_unsat(tcx) {
+                        super::explain::Explained::Unsat { core, minimized } => {
+                            row.set("core_size", core.len());
+                            row.set("core_minimized", minimized);
+                            row.set(
+                                "core_families",
+                                super::explain::family_histogram(&core),
+                            );
+                            for label in &core {
+                                eprintln!("NBRCORE {label}");
+                            }
+                        }
+                        super::explain::Explained::Sat => {
+                            row.set("core_families", "sat-in-tracked-replay");
+                        }
+                        super::explain::Explained::Unknown => {
+                            row.set("core_families", "z3-unknown-in-tracked-replay");
+                        }
+                    }
+                    row.set("t_explain_s", secs(t.elapsed()));
+                    phase("explain_done", t0);
+                }
             }
             Some(m) => {
                 let (mut n_ref, mut n_raw, mut n_own) = (0usize, 0usize, 0usize);
@@ -806,23 +839,10 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
     assert_eq!(o.sources_ref, 0, "no source may end Ref");
 }
 
-/// Decline path end-to-end, on the smallest confirmed real-corpus decliner:
-/// bst's `deleteNode` with the `minValueNode` call inlined to a field load
-/// (bisect result — `free(param)` alone, `free(cast)` alone, and the
-/// single-free non-recursive variant all ACCEPT; the recursive
-/// `root->left = f(root->left)` flow-through plus conditional frees is what
-/// contradicts). There is NO malloc in this shape, so the UNSAT has zero
-/// retractable source selectors — non-source UNSAT by construction. The
-/// mirror must (a) agree with the real `verify_to_fixpoint`'s `None` and
-/// (b) diagnose `unsat-nonsource`, not `z3-unknown`.
-#[test]
-fn boc1_mirror_matches_real_delete_node_decline() {
-    use crate::analyses::borrow_ownership::{
-        CrateCtxt, coherence::add_coherence, crate_slots::CrateSlots,
-        emit_crate_ownership_constraints, solver::KindSolver,
-    };
-
-    let code = r#"
+/// The smallest confirmed real-corpus decliner (bst `deleteNode`, bisect-
+/// minimized) — shared by the decline fixture and the §NB-R explain tests.
+#[cfg(test)]
+const DELETE_NODE_WITNESS: &str = r#"
 unsafe extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
@@ -860,12 +880,29 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
     return root;
 }
 "#;
-    let o = assert_mirror_matches(code);
+
+/// Decline path end-to-end, on the smallest confirmed real-corpus decliner:
+/// bst's `deleteNode` with the `minValueNode` call inlined to a field load
+/// (bisect result — `free(param)` alone, `free(cast)` alone, and the
+/// single-free non-recursive variant all ACCEPT; the recursive
+/// `root->left = f(root->left)` flow-through plus conditional frees is what
+/// contradicts). There is NO malloc in this shape, so the UNSAT has zero
+/// retractable source selectors — non-source UNSAT by construction. The
+/// mirror must (a) agree with the real `verify_to_fixpoint`'s `None` and
+/// (b) diagnose `unsat-nonsource`, not `z3-unknown`.
+#[test]
+fn boc1_mirror_matches_real_delete_node_decline() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, coherence::add_coherence, crate_slots::CrateSlots,
+        emit_crate_ownership_constraints, solver::KindSolver,
+    };
+
+    let o = assert_mirror_matches(DELETE_NODE_WITNESS);
     assert!(!o.accepted, "the deleteNode shape must decline (non-source UNSAT)");
     assert_eq!(o.stats.rounds, 0, "decline at the first solve, before any round");
     assert_eq!(o.sources, 0, "no malloc: the UNSAT cannot be source-retractable");
 
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
@@ -881,6 +918,239 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
         assert!(model.is_none());
         assert_eq!(run::decline_reason(&solver, &selectors), "unsat-nonsource");
     })
+    .unwrap_or_else(|e| e.raise());
+}
+
+// ---------------------------------------------------------------------------
+// §NB-R — tracked-core explain driver (diagnosis only; no analysis change).
+// ---------------------------------------------------------------------------
+
+/// Explains why the BO system is infeasible on a crate, using a TRACKED
+/// `KindSolver` (`new_tracked`): every hard constraint is `track ⇒ c`, the
+/// solve is `check(&[tracks ∪ source selectors])`, and on UNSAT the core's
+/// track literals map back to labeled emission sites.
+mod explain {
+    use rustc_middle::ty::TyCtxt;
+    use z3::{SatResult, ast::Bool};
+
+    use super::collect_program;
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        coherence::{add_coherence, constrain_field_ownership},
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        solver::{CORE_LABEL_FAMILIES, KindSolver},
+    };
+
+    pub enum Explained {
+        Sat,
+        Unknown,
+        Unsat {
+            /// Labeled core (`{context}::{family}(…)` strings). When
+            /// `minimized`, this set has been drop-restore minimized AND
+            /// re-checked UNSAT on its own (a raw z3 core is not minimal;
+            /// an unverified "minimal" core would poison the diagnosis).
+            core: Vec<String>,
+            /// False only when the size cap was hit (histogram-scale core);
+            /// the labels are then the RAW core.
+            minimized: bool,
+        },
+    }
+
+    /// Cap above which minimization is skipped (brotli-scale safety) and the
+    /// raw core is returned for histogram use only.
+    pub const MINIMIZE_CAP: usize = 50;
+
+    /// Build the full tracked BO system over the crate (emission + coherence +
+    /// the §9.10.2 field law — exactly what the real pipeline has asserted by
+    /// the time of its FIRST solve inside `verify_to_fixpoint`, which is where
+    /// every round-0 corpus decline happens) and explain that first solve.
+    pub fn explain_unsat(tcx: TyCtxt<'_>) -> Explained {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new_tracked(&slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                .expect("NB-R: tracked emission");
+        let tracker = solver.tracker().expect("new_tracked");
+        tracker.set_context("coherence");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        tracker.set_context("field-law");
+        constrain_field_ownership(&solver, &slots, &program);
+
+        // Solve with EVERY track assumed (⇔ the untracked hard system) plus
+        // the source selectors (the hard-source reading, as in the real
+        // pipeline's first solve).
+        let tracks = tracker.tracks();
+        let mut assumptions: Vec<Bool> = tracks;
+        assumptions.extend(selectors.iter().cloned());
+        match solver.optimize().check(&assumptions) {
+            SatResult::Sat => Explained::Sat,
+            SatResult::Unknown => Explained::Unknown,
+            SatResult::Unsat => {
+                let mut core: Vec<Bool> = solver.optimize().get_unsat_core();
+                let minimized = if core.len() <= MINIMIZE_CAP {
+                    // Destructive drop-restore minimization: keep a literal
+                    // only if removing it makes the rest SAT (i.e. it is
+                    // load-bearing). z3 cores are NOT minimal (the in-repo
+                    // relaxing loop documents this) — an unminimized set
+                    // would over-report the contradiction.
+                    let mut i = 0;
+                    while i < core.len() {
+                        let mut candidate = core.clone();
+                        candidate.swap_remove(i);
+                        if solver.optimize().check(&candidate) == SatResult::Unsat {
+                            core = candidate; // literal was redundant; slot i now
+                            // holds the (unvisited) former last element.
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    assert_eq!(
+                        solver.optimize().check(&core),
+                        SatResult::Unsat,
+                        "minimized core must re-check UNSAT on its own"
+                    );
+                    true
+                } else {
+                    false
+                };
+                let labels = core
+                    .iter()
+                    .map(|literal| {
+                        tracker
+                            .label_of(literal)
+                            // Non-track core literals are source selectors.
+                            .unwrap_or_else(|| "source-selector".to_string())
+                    })
+                    .collect();
+                Explained::Unsat {
+                    core: labels,
+                    minimized,
+                }
+            }
+        }
+    }
+
+    /// The family a label belongs to, if any (the parse contract: every label
+    /// the tracker emits must contain exactly one known family tag).
+    pub fn family_of(label: &str) -> Option<&'static str> {
+        CORE_LABEL_FAMILIES
+            .iter()
+            .copied()
+            .find(|family| label.contains(family))
+    }
+
+    /// KV-safe family histogram of a labeled core: `fam:count/fam:count`,
+    /// ordered by count desc then name asc (deterministic).
+    pub fn family_histogram(core: &[String]) -> String {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for label in core {
+            let family = family_of(label).unwrap_or("unknown");
+            match counts.iter_mut().find(|(f, _)| *f == family) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((family, 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        counts
+            .iter()
+            .map(|(f, n)| format!("{f}:{n}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// §NB-R histogram format contract (pure; mechanism-only).
+#[test]
+fn nbr_family_histogram_format() {
+    let labels: Vec<String> = vec![
+        "f::own-assume(1=true)".into(),
+        "g::kind-equate(x,y,own)".into(),
+        "f::own-assume(2=false)".into(),
+        "weird label".into(),
+    ];
+    assert_eq!(
+        explain::family_histogram(&labels),
+        "own-assume:2/kind-equate:1/unknown:1"
+    );
+}
+
+/// §NB-R MECHANISM-ONLY guard on the explain driver (deliberately no
+/// family-content assertions: which families appear in the witness core is
+/// R2a's FINDING, recorded in the task doc — baking the pre-registered
+/// hypothesis into CI would turn the most interesting outcome into a red
+/// build. After R2a confirms the diagnosis, a SEPARATE regression fixture
+/// pins it).
+#[test]
+fn nbr_core_extraction_delete_node() {
+    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
+        match explain::explain_unsat(tcx) {
+            explain::Explained::Unsat { core, minimized } => {
+                assert!(!core.is_empty(), "an UNSAT explanation must name constraints");
+                assert!(
+                    minimized,
+                    "the witness-scale core must go through drop-restore minimization \
+                     (with its UNSAT re-check)"
+                );
+                for label in &core {
+                    assert!(
+                        explain::family_of(label).is_some(),
+                        "core label does not parse to a known family: {label}"
+                    );
+                }
+            }
+            _ => panic!("the deleteNode witness must be UNSAT under tracks ∪ selectors"),
+        }
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// §NB-R R2a — manual core printer for the deleteNode witness. `#[ignore]`d:
+/// run explicitly to (re)produce the diagnosis recorded in the task doc.
+#[test]
+#[ignore = "NB-R diagnosis printer: run with --exact bo_c1::nbr_print_witness_core --ignored --nocapture"]
+fn nbr_print_witness_core() {
+    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
+        match explain::explain_unsat(tcx) {
+            explain::Explained::Unsat { core, minimized } => {
+                eprintln!(
+                    "NBRCORE witness delete_node: {} literals (minimized={minimized})",
+                    core.len()
+                );
+                let mut sorted = core.clone();
+                sorted.sort();
+                for label in &sorted {
+                    eprintln!("NBRCORE   {label}");
+                }
+            }
+            explain::Explained::Sat => eprintln!("NBRCORE witness: SAT?!"),
+            explain::Explained::Unknown => eprintln!("NBRCORE witness: UNKNOWN"),
+        }
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// §NB-R tracked-instance guard: a tracked solver reaching a production solve
+/// path is a hard error, not a silently-vacuous solve.
+#[test]
+#[should_panic(expected = "tracked KindSolver must not enter model_kinds_relaxing")]
+fn nbr_tracked_solver_guard_panics() {
+    use crate::analyses::borrow_ownership::{crate_slots::CrateSlots, solver::KindSolver};
+
+    ::utils::compilation::run_compiler_on_str(
+        "pub unsafe fn f(p: *mut i32) { *p = 1; }",
+        |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let solver = KindSolver::new_tracked(&slots);
+            let _ = solver.model_kinds_relaxing(&[]);
+        },
+    )
     .unwrap_or_else(|e| e.raise());
 }
 
@@ -1228,6 +1498,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "sources_total",
         "sources_leaked",
         "decline_reason",
+        "core_families",
         "prod_status",
     ];
     let mut out = String::from("# C1-lite BO corpus report\n\n");
