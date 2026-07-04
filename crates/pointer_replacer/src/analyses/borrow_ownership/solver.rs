@@ -95,8 +95,10 @@ impl CoreTracker {
 pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "kind-pin",
     "kind-equate",
-    "field-and",
+    // NOTE: matching is first-containment (`family_of`), so the longer
+    // "field-and-rev" MUST precede its prefix "field-and".
     "field-and-rev",
+    "field-and",
     "field-forbid",
     "link-own",
     "borrow-exclusion",
