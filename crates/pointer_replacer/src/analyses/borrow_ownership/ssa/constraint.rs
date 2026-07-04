@@ -304,6 +304,15 @@ pub trait Database {
     fn push_source_owning(&mut self, var: Var) {
         self.push_assume_impl(var, true);
     }
+
+    /// §NB-F: force a consumed (`sink`: free/realloc arg) value's ownership to
+    /// `true`. Default: a hard `assume(var = true)`, faithful to production.
+    /// Retractable backends override this to gate the owning behind a selector
+    /// so the relax loop can LEAK THE FREE instead of declining the crate (an
+    /// unprovable free stays a raw-pointer free; option (a) of the NB-R gate).
+    fn push_sink_owning(&mut self, var: Var) {
+        self.push_assume_impl(var, true);
+    }
 }
 
 impl Database for () {

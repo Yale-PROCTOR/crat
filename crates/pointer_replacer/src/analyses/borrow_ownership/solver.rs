@@ -110,6 +110,9 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "own-le",
     "own-eqmin",
     "source-selector",
+    // §NB-F: free/realloc sink selectors (no substring overlap with
+    // "source-selector" — first-containment matching stays unambiguous).
+    "sink-selector",
 ];
 
 pub struct KindSolver {
@@ -399,6 +402,17 @@ impl KindSolver {
         &self,
         source_selectors: &[Bool],
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        self.model_kinds_relaxing_reporting(source_selectors)
+            .map(|(kinds, _dropped)| kinds)
+    }
+
+    /// §NB-F reporting twin of `model_kinds_relaxing`: also returns WHICH
+    /// selectors were dropped (leaked sources and/or leaked sinks — classify
+    /// via `Selectors`). Same semantics; the plain fn delegates here.
+    pub(crate) fn model_kinds_relaxing_reporting(
+        &self,
+        source_selectors: &[Bool],
+    ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
         // §NB-R guard (release-active): under tracking, this loop's unsat-core
         // search would see foreign track literals in cores and its selector
         // matching would silently misbehave. Tracked instances are driven only
@@ -410,7 +424,7 @@ impl KindSolver {
         let mut assumptions: Vec<Bool> = source_selectors.to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
 
-        // Phase 1: drop conflicting source selectors until SAT (or give up).
+        // Phase 1: drop conflicting selectors until SAT (or give up).
         loop {
             match self.solver.check(&assumptions) {
                 SatResult::Sat => break,
@@ -440,7 +454,7 @@ impl KindSolver {
 
         // Final SAT model under the maximal-retention assumption set.
         match self.solver.check(&assumptions) {
-            SatResult::Sat => Some(self.read_kinds(&self.solver.get_model()?)),
+            SatResult::Sat => Some((self.read_kinds(&self.solver.get_model()?), leaked)),
             _ => None,
         }
     }
@@ -590,6 +604,10 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
     /// hard source, while the relax loop can drop a selector to leak that source.
     source_selectors: Vec<Bool>,
+    /// §NB-F: one selector per `sink` (free/realloc arg) ownership assertion —
+    /// the sink twin of `source_selectors`. Dropping one LEAKS THE FREE (the
+    /// freed value's owning is no longer forced; nothing asserts ¬own/¬ref).
+    sink_selectors: Vec<Bool>,
 }
 
 impl<'opt> BoOwnDatabase<'opt> {
@@ -602,6 +620,7 @@ impl<'opt> BoOwnDatabase<'opt> {
             z3_ast,
             source_sink_emissions: 0,
             source_selectors: Vec::new(),
+            sink_selectors: Vec::new(),
         }
     }
 
@@ -622,6 +641,47 @@ impl<'opt> BoOwnDatabase<'opt> {
     /// to reproduce the hard source; the relax loop drops some on UNSAT.
     pub(crate) fn source_selectors(&self) -> &[Bool] {
         &self.source_selectors
+    }
+
+    /// §NB-F: selector literals for the emitted `sink` ownerships.
+    pub(crate) fn sink_selectors(&self) -> &[Bool] {
+        &self.sink_selectors
+    }
+}
+
+/// §NB-F: the retractable-assumption set emission returns — malloc SOURCE
+/// selectors plus free/realloc SINK selectors. Stored combined (`all` is what
+/// `verify_to_fixpoint`/`model_kinds_relaxing` consume) with a typed split so
+/// no caller has to remember an ordering convention.
+pub(crate) struct Selectors {
+    all: Vec<Bool>,
+    n_sources: usize,
+}
+
+impl Selectors {
+    pub(crate) fn new(sources: Vec<Bool>, sinks: Vec<Bool>) -> Self {
+        let n_sources = sources.len();
+        let mut all = sources;
+        all.extend(sinks);
+        Selectors { all, n_sources }
+    }
+
+    pub(crate) fn all(&self) -> &[Bool] {
+        &self.all
+    }
+
+    pub(crate) fn sources(&self) -> &[Bool] {
+        &self.all[..self.n_sources]
+    }
+
+    pub(crate) fn sinks(&self) -> &[Bool] {
+        &self.all[self.n_sources..]
+    }
+
+    /// Whether a (core/dropped) literal is a sink selector — z3 node identity,
+    /// same basis as the relax loop's selector matching.
+    pub(crate) fn is_sink(&self, literal: &Bool) -> bool {
+        self.sinks().iter().any(|s| s == literal)
     }
 }
 
@@ -685,5 +745,19 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
+    }
+
+    fn push_sink_owning(&mut self, var: Var) {
+        // §NB-F: `selector ⇒ owning`, the sink twin of `push_source_owning` —
+        // the relax loop may drop the selector to LEAK THE FREE (decline
+        // becomes leak; the freed value's owning is then unconstrained: no
+        // ¬own/¬ref is asserted — there is deliberately no sink analogue of
+        // NB0's eager ¬ref(source)). Like source selectors, never track-gated
+        // (selectors are their own assumption class).
+        let selector = Bool::fresh_const("sink_sel");
+        let not_sel = !&selector;
+        let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
+        self.optimize.assert(&clause);
+        self.sink_selectors.push(selector);
     }
 }

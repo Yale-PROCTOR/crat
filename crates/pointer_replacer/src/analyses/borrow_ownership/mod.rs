@@ -39,7 +39,7 @@ use crate::{
             call_graph::FnSig,
             crate_slots::CrateSlots,
             infer::{FnSummary, InferCtxt},
-            solver::{BoOwnDatabase, KindSolver, SlotRef},
+            solver::{BoOwnDatabase, KindSolver, Selectors, SlotRef},
             ssa::{
                 FnResults,
                 constraint::{Database, Gen, GlobalAssumptions, Var, initialize_local},
@@ -155,13 +155,14 @@ pub(crate) struct BoOwnEmissionStats {
 /// emits every function body's constraints into that shared `KindSolver`. The
 /// shared signature vars are the interprocedural linkage — z3 resolves
 /// cross-function (and recursive) ownership flow when the joint system is solved
-/// via `model_kinds_relaxing`. Stats and source selectors aggregate across all
-/// functions.
+/// via `model_kinds_relaxing`. Stats and the retractable selectors (§NB-F:
+/// malloc SOURCES and free/realloc SINKS, typed-split in `Selectors`)
+/// aggregate across all functions.
 pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     slots: &CrateSlots,
     kind_solver: &KindSolver,
-) -> anyhow::Result<(BoOwnEmissionStats, Vec<Bool>)> {
+) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
     let mut var_gen = Gen::new();
     // §NB-R: hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
@@ -210,12 +211,15 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
     }
 
-    let source_selectors = database.source_selectors().to_vec();
+    let selectors = Selectors::new(
+        database.source_selectors().to_vec(),
+        database.sink_selectors().to_vec(),
+    );
     let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),
         source_sink_emissions: database.source_sink_emissions(),
     };
-    Ok((stats, source_selectors))
+    Ok((stats, selectors))
 }
 
 /// Emit one function body's BO constraints into the shared `database`/`KindSolver`

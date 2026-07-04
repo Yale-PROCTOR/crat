@@ -9850,7 +9850,7 @@ mod borrow_ownership_coherence {
         );
 
         let model =
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, true).expect("CEGAR converges");
+            verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true).expect("CEGAR converges");
 
         // The mixed-role local must not survive as an aliasing `Ref`.
         let local_ref = local_slot(&slots, f, local_by_var_name(tcx, f, local), 0);
@@ -9907,9 +9907,12 @@ pub unsafe fn alloc_free() {
                 );
                 // 1 source from malloc + 1 sink from free.
                 assert_eq!(stats.source_sink_emissions, 2);
-                // 1 retractable source selector (the malloc).
-                assert_eq!(selectors.len(), 1);
-                assert!(kind_solver.model_kinds_relaxing(&selectors).is_some());
+                // §NB-F: BOTH are retractable now — 1 source selector (malloc)
+                // + 1 sink selector (free).
+                assert_eq!(selectors.sources().len(), 1);
+                assert_eq!(selectors.sinks().len(), 1);
+                assert_eq!(selectors.all().len(), 2);
+                assert!(kind_solver.model_kinds_relaxing(selectors.all()).is_some());
             },
         );
     }
@@ -9986,7 +9989,7 @@ pub unsafe fn alloc_free() {
                 let p = local_slot(&slots, alloc_free, p_local, 0);
 
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_eq!(model.get(&p), Some(&SlotKind::Owning));
             },
@@ -10031,7 +10034,7 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let out_inner = local_slot(&slots, fill, Local::from_u32(1), 1);
 
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_eq!(
                     model.get(&out_inner),
@@ -10082,16 +10085,16 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 // Prove the relax path is genuinely exercised: exactly one source
                 // selector, and the un-relaxed solve (assuming it) is UNSAT — so a
                 // broken impl that ignored selectors could not pass.
-                assert_eq!(selectors.len(), 1);
+                assert_eq!(selectors.all().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(&selectors),
+                    kind_solver.optimize().check(selectors.all()),
                     SatResult::Unsat,
                     "the source-owning constraint must make the single solve UNSAT"
                 );
 
                 // The relax loop must leak the source and return a model.
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("relax loop should resolve the UNSAT by leaking the source");
 
                 let p_local = call_destination(tcx, &body, "malloc");
@@ -10139,15 +10142,17 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                     emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
                 .expect("B3a ownership emission should run");
 
-                // Two sources; assuming both is UNSAT (b conflicts with finalize).
-                assert_eq!(selectors.len(), 2);
+                // Two sources + (§NB-F) one free-sink selector; assuming all is
+                // UNSAT (b conflicts with finalize — assuming more preserves it).
+                assert_eq!(selectors.sources().len(), 2);
+                assert_eq!(selectors.sinks().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(&selectors),
+                    kind_solver.optimize().check(selectors.all()),
                     SatResult::Unsat
                 );
 
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("relax loop should leak only b");
 
                 // `a` (freed) must remain Owning; `b` (leaked) must not.
@@ -10177,7 +10182,7 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
     /// body to have been emitted). If that cross-function edge were absent,
     /// `forward`'s return would be soft-objective non-owning — so the assertion
     /// is non-vacuous (a local sink cannot satisfy it, unlike a `free(p)` shape).
-    /// `selectors.len() == 1` independently proves `make`'s source was emitted by
+    /// `selectors.all().len() == 1` independently proves `make`'s source was emitted by
     /// the crate driver; single-fn emission of `forward` alone would instead
     /// panic on the local call to `make` (absent from a self-entry `InterCtxt`).
     #[test]
@@ -10211,14 +10216,14 @@ pub unsafe fn forward() -> *mut core::ffi::c_void {
                 // The only malloc is in `make`; a selector here proves `make`'s
                 // body was emitted by the crate driver (emitting `forward` alone
                 // would see zero sources).
-                assert_eq!(selectors.len(), 1);
+                assert_eq!(selectors.all().len(), 1);
 
                 // Return locals (Local 0) at depth 0.
                 let make_ret = local_slot(&slots, make, Local::from_u32(0), 0);
                 let forward_ret = local_slot(&slots, forward, Local::from_u32(0), 0);
 
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 // Diagnostic: `make_ret` owning proves `make` was emitted owning;
                 // `forward_ret` owning proves the cross-function return edge carried
@@ -10265,7 +10270,7 @@ pub unsafe fn reader(p: *mut i32) -> i32 {
                 // `p` is param Local 1; read-only, so its depth-0 slot must be Ref.
                 let p = local_slot(&slots, reader, Local::from_u32(1), 0);
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_eq!(
                     model.get(&p),
@@ -10306,7 +10311,7 @@ pub unsafe fn caller(pp: *mut *mut i32) {
                         .expect("B4b: c_void local-call emission should run without panicking");
 
                 assert!(
-                    kind_solver.model_kinds_relaxing(&selectors).is_some(),
+                    kind_solver.model_kinds_relaxing(selectors.all()).is_some(),
                     "the joint system stays satisfiable with a c_void local-call arg"
                 );
             },
@@ -10345,7 +10350,7 @@ pub unsafe fn passes_through(p: *mut i32) {
                 let p = local_slot(&slots, passes_through, Local::from_u32(1), 0);
                 let q = local_slot(&slots, sink_it, Local::from_u32(1), 0);
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_eq!(
                     model.get(&p),
@@ -10469,7 +10474,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                         .expect("BB1 baseline emission");
                 add_coherence(&solver_a, &slots, f, &body);
                 let model_a = solver_a
-                    .model_kinds_relaxing(&selectors_a)
+                    .model_kinds_relaxing(selectors_a.all())
                     .expect("baseline satisfiable");
                 for name in involved {
                     assert_eq!(
@@ -10491,7 +10496,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 materialize_guards(&solver_b, &conflicts);
 
                 let model_b = solver_b
-                    .model_kinds_relaxing(&selectors_b)
+                    .model_kinds_relaxing(selectors_b.all())
                     .expect("guarded satisfiable");
                 let non_ref = involved
                     .iter()
@@ -10556,7 +10561,7 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
 
                 let local = local_slot(&slots, caller, local_by_var_name(tcx, caller, "local"), 0);
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_eq!(
                     model.get(&local),
@@ -10607,7 +10612,7 @@ pub unsafe fn stash(owner: *mut Holder) {
 
                 let owner = local_slot(&slots, stash, local_by_var_name(tcx, stash, "owner"), 0);
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("satisfiable model");
                 assert_ne!(
                     model.get(&owner),
@@ -10677,7 +10682,7 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
                     "shape must be hazardous (aliasing outer-pointer borrow conflicts)"
                 );
 
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
 
                 let p = local_slot(&slots, caller, local_by_var_name(tcx, caller, "p"), 0);
@@ -10845,7 +10850,7 @@ pub unsafe fn f() {
                 let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges to a SAT model");
 
                 // Non-trivial: the conflict forced a real demotion — ≥1 pointer slot is
@@ -10914,7 +10919,7 @@ pub unsafe fn g() {
                 let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
 
                 // The independent borrow `s` (distinct base `b`) is never committed → Ref.
@@ -10972,7 +10977,7 @@ pub unsafe fn dcu() {
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("dead copy must not panic; loop converges");
 
                 let clean = revalidate_replaying(
@@ -11022,7 +11027,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
 
                 // The malloc-destination slot (robust to whether MIR names it `p` or a temp).
                 let src = local_slot(&slots, f, call_destination(tcx, &body, "malloc"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&src),
@@ -11059,7 +11064,7 @@ pub unsafe fn foo(p: *mut i32) -> i32 {
                 add_coherence(&solver, &slots, f, &body);
 
                 let p = local_slot(&slots, f, Local::from_u32(1), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&p),
@@ -11100,7 +11105,7 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
 
                 // `out` is param Local 1; its depth-0 slot is borrowed caller storage = Ref.
                 let out = local_slot(&slots, f, Local::from_u32(1), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&out),
@@ -11142,7 +11147,7 @@ pub unsafe fn leak_cast() -> *mut *mut i32 {
 
                 // `p` is the CAST TARGET (`malloc(...) as *mut i32`), not the call dest.
                 let p = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&p),
@@ -11181,7 +11186,7 @@ pub unsafe fn leak_calloc() -> *mut *mut core::ffi::c_void {
                 add_coherence(&solver, &slots, f, &body);
 
                 let src = local_slot(&slots, f, call_destination(tcx, &body, "calloc"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&src),
@@ -11222,7 +11227,7 @@ pub unsafe fn alloc_free() {
                 add_coherence(&solver, &slots, f, &body);
 
                 let p = local_slot(&slots, f, call_destination(tcx, &body, "malloc"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&p),
@@ -11261,7 +11266,7 @@ pub unsafe fn leak_realloc() -> *mut *mut core::ffi::c_void {
                 add_coherence(&solver, &slots, f, &body);
 
                 let src = local_slot(&slots, f, call_destination(tcx, &body, "realloc"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&src),
@@ -11299,7 +11304,7 @@ pub unsafe fn leak_strdup(s: *const i8) -> *mut *mut i8 {
                 add_coherence(&solver, &slots, f, &body);
 
                 let src = local_slot(&slots, f, call_destination(tcx, &body, "strdup"), 0);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
                     .expect("CEGAR converges");
                 assert_eq!(
                     model.get(&src),
@@ -11343,28 +11348,16 @@ pub unsafe fn use_it(x: *mut i32) {
         );
     }
 
-    /// §NB0 guard — pins the uthash tripwire (C1-lite corpus finding; minimized from
-    /// uthash tests/test68.rs by module- then shape-bisect). The release-active
-    /// `assert!(!is_ref)` in `infer/boundary/library.rs` (`call_is_null`) fires when
-    /// `is_null` is called on a pointer whose pointee is a STRUCT WITH POINTER FIELDS
-    /// obtained via `&mut local as *mut S` — c2rust's `assert(&els[i] != NULL)` shape:
-    /// the pointer-measure decomposition of `*mut S` marks the reference-typed base
-    /// `is_ref`, which the hook asserts impossible. Pointer-free pointees (`*mut i32`,
-    /// field-less structs) do NOT trip (verified during the NB0 bisect).
-    ///
-    /// The FIX is out of NB0 scope — deferred, in writing, to the feasibility
-    /// root-cause phase (see docs/agents/tasks/2026-07-04-nb0-boundary-table.md).
-    /// When it lands, flip this into a positive fixture asserting the call is
-    /// handled (this `should_panic` will fail loudly to force that).
-    ///
-    /// NOTE on `expected`: several boundary asserts share the "!is_ref" message
-    /// (free/memset/addr/offset hooks) — the substring alone does not select
-    /// `call_is_null`. Disambiguation comes from the SNIPPET: `is_null` is the
-    /// only boundary-hook call it contains, so no other `!is_ref` assert is
-    /// reachable.
+    /// §NB-F (flipped from NB0's `should_panic` tripwire pin, per that fixture's
+    /// own flip-loudly note): the minimized uthash shape — `is_null` on
+    /// `&mut local as *mut S` where S has pointer fields, c2rust's
+    /// `assert(&els[i] != NULL)` — must EMIT CLEANLY and solve. `call_is_null`
+    /// now peels the leading outer-reference slot of an `is_ref` arg (the
+    /// established boundary/memset peel idiom) instead of asserting it
+    /// impossible. History: minimized from uthash tests/test68.rs during NB-R's
+    /// bisect; fix approved with option (a) at the NB-R gate.
     #[test]
-    #[should_panic(expected = "!is_ref")]
-    fn nb0_uthash_isnull_ref_arg_tripwire() {
+    fn nbf_uthash_isnull_ref_arg_emits() {
         run_compiler(
             r#"
 #[derive(Copy, Clone)]
@@ -11384,7 +11377,13 @@ pub unsafe fn f() {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let _ = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver);
+                let (_s, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        .expect("the uthash is_ref shape must emit cleanly");
+                assert!(
+                    solver.model_kinds_relaxing(selectors.all()).is_some(),
+                    "the shape must also solve (no hidden contradiction from the peel)"
+                );
             },
         );
     }
@@ -11419,7 +11418,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                         .expect("NB0 emission");
 
                 let model = kind_solver
-                    .model_kinds_relaxing(&selectors)
+                    .model_kinds_relaxing(selectors.all())
                     .expect("relax loop resolves the leak");
                 let p = local_slot(&slots, leak, call_destination(tcx, &body, "malloc"), 0);
                 assert_ne!(
@@ -11675,7 +11674,7 @@ pub unsafe fn offcase() {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
         }
-        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
             .expect("BB-parity: BO CEGAR must converge (Some) on the corpus");
 
         // HA1 — soundness gate: no residual conflict under the COMPLETE replay (every
@@ -12220,7 +12219,7 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
         }
-        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
             .expect("BB-parity-own: BO CEGAR must converge (Some) on the corpus");
 
         // Production ownership oracle — DIAGNOSTIC baseline only (NOT a gate/ceiling).

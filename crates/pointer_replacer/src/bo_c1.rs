@@ -233,7 +233,7 @@ mod mirror {
         borrow_verify::{SlotConflict, revalidate_replaying},
         coherence::constrain_field_ownership,
         crate_slots::CrateSlots,
-        solver::{KindSolver, SlotRef},
+        solver::{KindSolver, Selectors, SlotRef},
     };
     use crate::utils::rustc::RustProgram;
 
@@ -246,6 +246,13 @@ mod mirror {
         /// invariant is emitted eagerly, so every commit is a conflict commit.
         pub commits_conflict: usize,
         pub commits_per_round: Vec<usize>,
+        /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
+        /// Observation-only, from `model_kinds_relaxing_reporting` (whose
+        /// plain twin the real loop uses with identical semantics); stored as
+        /// counts, not `Bool`s, so results stay `Send` across `run_compiler`.
+        pub dropped_sinks: usize,
+        /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
+        pub dropped_sources: usize,
     }
 
     /// Mirror of `borrow_verify::verify_to_fixpoint`. Differences: the round
@@ -255,7 +262,7 @@ mod mirror {
         program: &RustProgram<'_>,
         slots: &CrateSlots,
         solver: &KindSolver,
-        selectors: &[Bool],
+        selectors: &Selectors,
         is_mutable: bool,
     ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
         // §NB-R guard — mirrors the real loop's release-active refusal of
@@ -264,12 +271,20 @@ mod mirror {
             solver.tracker().is_none(),
             "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
         );
+        // §NB-F: classify a dropped-selector set into leak counts.
+        let record_dropped = |stats: &mut RoundStats, dropped: &[Bool]| {
+            stats.dropped_sinks = dropped.iter().filter(|d| selectors.is_sink(d)).count();
+            stats.dropped_sources = dropped.len() - stats.dropped_sinks;
+        };
         let mut stats = RoundStats::default();
         let cap = round_cap(slots);
         constrain_field_ownership(solver, slots, program);
-        let Some(mut model) = solver.model_kinds_relaxing(selectors) else {
+        let Some((mut model, dropped)) =
+            solver.model_kinds_relaxing_reporting(selectors.all())
+        else {
             return (None, stats);
         };
+        record_dropped(&mut stats, &dropped);
         for _ in 0..cap {
             stats.rounds += 1;
             let conflicts = revalidate_replaying(
@@ -295,8 +310,11 @@ mod mirror {
             if committed == 0 {
                 return (Some(model), stats);
             }
-            model = match solver.model_kinds_relaxing(selectors) {
-                Some(m) => m,
+            model = match solver.model_kinds_relaxing_reporting(selectors.all()) {
+                Some((m, dropped)) => {
+                    record_dropped(&mut stats, &dropped);
+                    m
+                }
                 None => return (None, stats),
             };
         }
@@ -354,7 +372,7 @@ mod run {
             crate_slots::CrateSlots,
             emit_crate_ownership_constraints,
             slots::{SlotId, SlotOwner},
-            solver::{KindSolver, SlotRef},
+            solver::{KindSolver, Selectors, SlotRef},
             sources::collect_malloc_source_slots,
         },
     };
@@ -411,7 +429,7 @@ mod run {
         row.set("t_emit_s", secs(t.elapsed()));
         row.set("z3_ast_len", stats.z3_ast_len);
         row.set("source_sink_emissions", stats.source_sink_emissions);
-        row.set("selectors", selectors.len());
+        row.set("selectors", selectors.all().len());
         phase("emit_done", t0);
 
         let t = Instant::now();
@@ -443,10 +461,17 @@ mod run {
         let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
         row.set("sources_total", sources.len());
 
+        // §NB-F: selector-level leak accounting (SLOT-level `sources_leaked`
+        // below is unchanged). `sinks_leaked` counts frees the relax loop
+        // dropped — leak-the-free semantics, the stage-1 headline metric.
+        row.set("sinks_total", selectors.sinks().len());
+        row.set("sinks_leaked", rstats.dropped_sinks);
+        row.set("sources_leaked_sel", rstats.dropped_sources);
+
         match &model {
             None => {
                 row.set("status", "decline");
-                row.set("decline_reason", decline_reason(&solver, &selectors));
+                row.set("decline_reason", decline_reason(&solver, selectors.all()));
                 // §NB-R (opt-in): explain the decline via a second, TRACKED
                 // construction — labeled minimal core (or family histogram at
                 // scale). Never on the default path: doubles solve cost.
@@ -528,7 +553,7 @@ mod run {
                             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                             add_coherence(&solver, &slots, g, &body);
                         }
-                        Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, true))
+                        Some(verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true))
                     }
                     Err(_) => None,
                 }
@@ -661,6 +686,10 @@ struct MirrorOutcome {
     /// model (§NB0 eager `¬ref`); combined with `leaked`, proves a leaked
     /// source settled `Raw`.
     sources_ref: usize,
+    /// §NB-F: sink selectors the final solve dropped (leaked frees).
+    dropped_sinks: usize,
+    /// §NB-F: source selectors the final solve dropped (leaked allocs).
+    dropped_sources: usize,
 }
 
 /// Runs both the REAL `verify_to_fixpoint` and the mirror on independent fresh
@@ -689,7 +718,7 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                 add_coherence(&solver, &slots, g, &body);
             }
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+            verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
         };
 
         let (mirrored, stats) = {
@@ -730,12 +759,15 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
                 .map(|m| sources.iter().filter(|s| pred(m.get(s))).count())
                 .unwrap_or(0)
         };
+        let (dropped_sinks, dropped_sources) = (stats.dropped_sinks, stats.dropped_sources);
         MirrorOutcome {
             accepted: mirrored.is_some(),
             stats,
             sources: sources.len(),
             leaked: count_kind(&|k| k != Some(&SlotKind::Owning)),
             sources_ref: count_kind(&|k| k == Some(&SlotKind::Ref)),
+            dropped_sinks,
+            dropped_sources,
         }
     })
     .unwrap_or_else(|e| e.raise())
@@ -888,26 +920,88 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
 }
 "#;
 
-/// Decline path end-to-end, on the smallest confirmed real-corpus decliner:
-/// bst's `deleteNode` with the `minValueNode` call inlined to a field load
-/// (bisect result — `free(param)` alone, `free(cast)` alone, and the
-/// single-free non-recursive variant all ACCEPT; the recursive
-/// `root->left = f(root->left)` flow-through plus conditional frees is what
-/// contradicts). There is NO malloc in this shape, so the UNSAT has zero
-/// retractable source selectors — non-source UNSAT by construction. The
-/// mirror must (a) agree with the real `verify_to_fixpoint`'s `None` and
-/// (b) diagnose `unsat-nonsource`, not `z3-unknown`.
+/// §NB-F stage 1 — the deleteNode witness under LEAK-THE-FREES semantics.
+/// (Flipped from NB-R's decline fixture when sinks became retractable —
+/// option (a), approved at the NB-R gate. History: this shape was the
+/// bisect-minimized Family-A witness; NB-R's core showed its ONLY forced
+/// owning was the free sink, so retraction dissolves the UNSAT.)
+/// The relax loop drops both free-sink selectors (an unprovable free stays a
+/// raw free); with no malloc there are no source selectors; mirror and real
+/// loop must agree and ACCEPT. The freed value's final kind is an OBSERVED
+/// pin (see the assertion comment), not a design guarantee: dropping a sink
+/// selector asserts neither ¬own nor ¬ref.
 #[test]
-fn boc1_mirror_matches_real_delete_node_decline() {
+fn boc1_mirror_matches_real_delete_node_leaked_frees() {
+    use rustc_middle::mir::Local;
+
     use crate::analyses::borrow_ownership::{
-        CrateCtxt, coherence::add_coherence, crate_slots::CrateSlots,
-        emit_crate_ownership_constraints, solver::KindSolver,
+        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        crate_slots::CrateSlots, emit_crate_ownership_constraints,
+        solver::{KindSolver, SlotRef},
     };
 
     let o = assert_mirror_matches(DELETE_NODE_WITNESS);
-    assert!(!o.accepted, "the deleteNode shape must decline (non-source UNSAT)");
-    assert_eq!(o.stats.rounds, 0, "decline at the first solve, before any round");
-    assert_eq!(o.sources, 0, "no malloc: the UNSAT cannot be source-retractable");
+    assert!(o.accepted, "retractable sinks: the witness must accept");
+    assert_eq!(
+        (o.dropped_sinks, o.dropped_sources),
+        (2, 0),
+        "exactly the two frees leak; there are no sources to leak"
+    );
+    assert_eq!(o.sources, 0, "no malloc in the shape");
+
+    // The freed-value observation (stage-2 residual, recorded not fixed): what
+    // does leaked-free `root` settle to under the max-ref objective?
+    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_s, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
+            .expect("accepts under retractable sinks");
+        let f = program.functions[0];
+        let root = SlotRef::Local(
+            f,
+            slots.fn_local_slots[&f]
+                .slot_for_local_depth(Local::from_u32(1), 0)
+                .expect("root (_1) has a depth-0 slot"),
+        );
+        // OBSERVED pin (2026-07-04, not a design guarantee): leaked-free
+        // `root` settles `Raw` — the CEGAR replay polices the `Ref` reading
+        // even with the sink retracted (root-as-Ref surfaces aliasing
+        // conflicts through the recursion). A leaked free CAN in principle
+        // settle `Ref` where no conflict surfaces — the named stage-2
+        // residual; the corpus sweep counts freed-`Ref` occurrences before
+        // codegen may trust this.
+        assert_eq!(
+            model.get(&root),
+            Some(&SlotKind::Raw),
+            "observed leaked-free kind changed — revisit the stage-2 residual note"
+        );
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// §NB-F stage 1 (option (a), approved at the NB-R gate) — the CAUSAL flip:
+/// with `free`/`realloc` sink owning selector-gated, the deleteNode witness
+/// must ACCEPT under the REAL `verify_to_fixpoint` — the relax loop drops the
+/// two free-sink selectors (leak-the-frees: an unprovable free stays a raw
+/// free) and, with no malloc in the shape, nothing else forces owning.
+/// Deliberately NO assertion on the freed values' final kinds: dropping a sink
+/// selector removes forced owning but asserts neither ¬own nor ¬ref (there is
+/// no sink analogue of NB0's eager ¬ref(source), by design) — the observed
+/// final kind is recorded in the task doc, not pinned here.
+#[test]
+fn nbf_sink_retractable_delete_node() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        crate_slots::CrateSlots, emit_crate_ownership_constraints, solver::KindSolver,
+    };
 
     ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
         let program = collect_program(tcx);
@@ -920,10 +1014,12 @@ fn boc1_mirror_matches_real_delete_node_decline() {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
         }
-        let (model, _stats) =
-            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true);
-        assert!(model.is_none());
-        assert_eq!(run::decline_reason(&solver, &selectors), "unsat-nonsource");
+        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true);
+        assert!(
+            model.is_some(),
+            "retractable sinks: the witness must ACCEPT (its only forced owning \
+             was the free sink, now selector-dropped)"
+        );
     })
     .unwrap_or_else(|e| e.raise());
 }
@@ -994,7 +1090,7 @@ mod explain {
         // pipeline's first solve).
         let tracks = tracker.tracks();
         let mut assumptions: Vec<Bool> = tracks;
-        assumptions.extend(selectors.iter().cloned());
+        assumptions.extend(selectors.all().iter().cloned());
         match solver.optimize().check(&assumptions) {
             SatResult::Sat => Explained::Sat,
             SatResult::Unknown => Explained::Unknown,
@@ -1037,10 +1133,16 @@ mod explain {
                 let labels = core
                     .iter()
                     .map(|literal| {
-                        tracker
-                            .label_of(literal)
-                            // Non-track core literals are source selectors.
-                            .unwrap_or_else(|| "source-selector".to_string())
+                        tracker.label_of(literal).unwrap_or_else(|| {
+                            // Non-track core literals are selectors; §NB-F
+                            // splits them by identity so a leaked-free MUS
+                            // reads differently from a leaked-alloc MUS.
+                            if selectors.is_sink(literal) {
+                                "sink-selector".to_string()
+                            } else {
+                                "source-selector".to_string()
+                            }
+                        })
                     })
                     .collect();
                 Explained::Unsat {
@@ -1142,17 +1244,21 @@ fn nbr_witness_core_family_regression() {
             panic!("witness must be UNSAT");
         };
         assert!(minimized);
+        eprintln!("NBFOBS regression histogram: {}", explain::family_histogram(&core));
         assert_eq!(
             explain::family_histogram(&core),
-            "kind-equate:4/link-own:2/own-assume:2/own-equal:2/own-linear:1",
+            "kind-equate:4/link-own:2/own-equal:2/own-assume:1/own-linear:1/sink-selector:1",
             "the witness diagnosis changed — re-derive the root-cause analysis"
         );
         let trues = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=true)")).count();
         let falses = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=false)")).count();
+        // §NB-F re-derivation: the sink-owning pole is now the retractable
+        // `sink-selector` literal (asserted in the histogram above), so the
+        // remaining hard own-assume is the version-zero alone.
         assert_eq!(
             (trues, falses),
-            (1, 1),
-            "the sink-owning/version-zero pair is the semantic heart of the diagnosis"
+            (0, 1),
+            "the version-zero remains the hard pole; the sink pole is the sink-selector"
         );
     })
     .unwrap_or_else(|e| e.raise());
@@ -1545,6 +1651,8 @@ fn render_report(merged: &[report::Row]) -> String {
         "d_ref_d0",
         "sources_total",
         "sources_leaked",
+        "sinks_total",
+        "sinks_leaked",
         "decline_reason",
         "core_families",
         "core_minimized",

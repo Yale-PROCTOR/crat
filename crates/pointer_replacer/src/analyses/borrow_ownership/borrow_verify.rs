@@ -152,7 +152,9 @@ pub(crate) fn materialize_guards(
 /// §8 BB2-ii — drive the CEGAR validate/re-solve loop to a fixpoint (Mode A).
 ///
 /// The solver must arrive with ownership constraints + per-fn coherence already
-/// emitted (so `selectors` are its retractable malloc sources). §NB0: the BB3-a
+/// emitted (so `selectors` are its retractable owning assumptions — §NB-F:
+/// malloc SOURCES and free/realloc SINKS alike; dropping a sink LEAKS THE
+/// FREE, an unprovable free staying a raw-pointer free). §NB0: the BB3-a
 /// invariant (`¬ref` on every malloc-source slot — a malloc result owns heap and is
 /// not a borrow; see `sources::collect_malloc_source_slots`) is now emitted EAGERLY
 /// by `emit_crate_ownership_constraints`, so no model this loop ever sees can mark a
