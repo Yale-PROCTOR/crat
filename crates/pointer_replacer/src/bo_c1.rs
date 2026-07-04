@@ -1110,6 +1110,39 @@ fn nbr_core_extraction_delete_node() {
     .unwrap_or_else(|e| e.raise());
 }
 
+/// §NB-R R2a REGRESSION fixture (frozen AFTER the diagnosis was confirmed —
+/// deliberately separate from the mechanism-only test above). Pins the
+/// verified family composition of the witness's minimal core: the free
+/// sink's owning (`own-assume(=true)`) reaches a never-owning temp's
+/// version-zero (`own-assume(=false)`) through kind-coherence over the
+/// `node.right` field slot and both `link-own` biconditionals. If an
+/// emission change alters this contradiction surface, this fails loudly and
+/// the diagnosis in docs/agents/tasks/2026-07-04-nbr-unsat-root-cause.md
+/// must be re-derived. (Family HISTOGRAM only — var indices shift with MIR
+/// details and are deliberately not pinned.)
+#[test]
+fn nbr_witness_core_family_regression() {
+    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
+        let explain::Explained::Unsat { core, minimized } = explain::explain_unsat(tcx) else {
+            panic!("witness must be UNSAT");
+        };
+        assert!(minimized);
+        assert_eq!(
+            explain::family_histogram(&core),
+            "kind-equate:4/link-own:2/own-assume:2/own-equal:2/own-linear:1",
+            "the witness diagnosis changed — re-derive the root-cause analysis"
+        );
+        let trues = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=true)")).count();
+        let falses = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=false)")).count();
+        assert_eq!(
+            (trues, falses),
+            (1, 1),
+            "the sink-owning/version-zero pair is the semantic heart of the diagnosis"
+        );
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
 /// §NB-R R2a — manual core printer for the deleteNode witness. `#[ignore]`d:
 /// run explicitly to (re)produce the diagnosis recorded in the task doc.
 #[test]
