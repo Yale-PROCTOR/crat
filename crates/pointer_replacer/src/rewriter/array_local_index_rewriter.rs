@@ -124,6 +124,10 @@ struct BindingUseSummary {
     address_taken_count: usize,
     unsupported_escape: bool,
     writes_through_pointer: bool,
+    /// number of write sites through the pointer (`*p = ..`, `*p.offset(a) = ..`);
+    /// each one keeps a raw deref and gains one materialized offset under an
+    /// index rewrite, so the cost model needs the count, not just the flag.
+    write_through_pointer_count: usize,
     multi_cursor_deref_expr_count: usize,
 }
 
@@ -1608,6 +1612,58 @@ fn choose_binding_representations(
     visitor.visit_crate(krate);
     let mut summaries = std::mem::take(&mut visitor.summaries);
     drop(visitor);
+    // cost model: a nullable member of a raw base pays one raw `offset` per
+    // materialized use (value use, call argument, deref, write through the
+    // pointer) and only removes offsets for movements and existing
+    // `offset_from` uses. the decision is aggregated per group over its
+    // nullable raw-base members and applied to them as a unit: same-group
+    // copies make per-member drops inconsistent (a dropped copy target turns
+    // the free index copy into a fresh materialization on the kept member).
+    let mut group_costs: FxHashMap<BaseCursorKey, (usize, usize, Vec<HirId>)> =
+        FxHashMap::default();
+    for (hir_id, rewrite) in &plan.by_hir_id {
+        if !rewrite.nullable || !rewrite.base_is_raw_ptr {
+            continue;
+        }
+        let Some(summary) = summaries.get(hir_id) else { continue };
+        let added = summary.pointer_value_count
+            + summary.call_arg_count
+            + summary.deref_count
+            + summary.field_or_index_count
+            + summary.write_through_pointer_count;
+        let removed = summary.movement_count + summary.offset_from_count;
+        let entry = group_costs
+            .entry(base_cursor_key(rewrite.base_hir_id, &rewrite.base_name))
+            .or_default();
+        entry.0 += added;
+        entry.1 += removed;
+        entry.2.push(*hir_id);
+    }
+    let mut unprofitable: Vec<HirId> = Vec::new();
+    for (added, removed, members) in group_costs.into_values() {
+        if added > removed {
+            unprofitable.extend(members);
+        }
+    }
+    for hir_id in &unprofitable {
+        if let Some(rewrite) = plan.by_hir_id.get(hir_id) {
+            let source_name = rewrite.source_name.clone();
+            trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(source_name),
+                TraceStage::Representation,
+                TraceDecision::Dropped,
+                || {
+                    "cost: index rewrite would add more unsafe operations than it removes"
+                        .to_string()
+                },
+            );
+        }
+        plan.by_hir_id.remove(hir_id);
+    }
+    if !unprofitable.is_empty() {
+        prune_orphan_base_cursors(plan);
+    }
     for (hir_id, rewrite) in &mut plan.by_hir_id {
         let summary = summaries.remove(hir_id).unwrap_or_default();
         rewrite.has_index_benefit = summary.has_index_benefit();
@@ -2072,10 +2128,9 @@ impl BindingUseClassifier<'_, '_> {
 
     fn record_write_through_pointer(&mut self, expr: &Expr) {
         for hir_id in self.direct_pointer_deref_hir_ids(expr) {
-            self.summaries
-                .entry(hir_id)
-                .or_default()
-                .writes_through_pointer = true;
+            let summary = self.summaries.entry(hir_id).or_default();
+            summary.writes_through_pointer = true;
+            summary.write_through_pointer_count += 1;
         }
     }
 

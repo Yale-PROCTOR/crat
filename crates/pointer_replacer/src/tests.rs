@@ -7969,6 +7969,7 @@ pub unsafe fn foo(mut p: *mut i32, mut k: isize) -> i32 {
         q = p.offset(k);
     }
     *q = 7;
+    q = q.offset(1);
     *q
 }
 "#;
@@ -10631,12 +10632,14 @@ pub unsafe fn f(mut uname: *mut i8, k: isize) -> *mut i8 {
     if !p0.is_null() {
         *p0 = 0;
         p0 = p0.offset(2);
+        p0 = p0.offset(1);
         consume(p0.offset(k));
         out = strdup(p0);
     } else {
         let mut p1: *mut i8 = strstr(uname, b"y\0" as *const u8 as *const i8);
         if !p1.is_null() {
             *p1 = 0;
+            p1 = p1.offset(1);
             out = strdup(p1);
         }
     }
@@ -10653,4 +10656,37 @@ pub unsafe fn f(mut uname: *mut i8, k: isize) -> *mut i8 {
     assert!(s.contains(".offset((idx) + (k))"), "{s}");
     // ...instead of stacking a second raw offset on the materialized pointer.
     assert!(!s.contains(".offset(k)"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_unprofitable_nullable_raw_base_group() {
+    // value-heavy nullable cursors of a raw base: every call argument, deref
+    // write, and value use would keep one raw offset per site after an index
+    // rewrite, while only one self-advance per cursor goes away. the cost
+    // model keeps the raw locals instead of net-increasing unsafe operations.
+    let code = r#"
+unsafe extern "C" {
+    fn strstr(a: *const i8, b: *const i8) -> *mut i8;
+    fn strdup(a: *const i8) -> *mut i8;
+    fn consume(p: *mut i8);
+}
+
+pub unsafe fn f(mut uname: *mut i8) -> *mut i8 {
+    let mut out: *mut i8 = std::ptr::null_mut();
+    let mut p0: *mut i8 = strstr(uname, b"x\0" as *const u8 as *const i8);
+    if !p0.is_null() {
+        *p0 = 0;
+        p0 = p0.offset(2);
+        consume(p0);
+        consume(p0);
+        out = strdup(p0);
+    }
+    return out;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    let _ = changed;
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut p0: *mut i8"), "{s}");
+    assert!(!s.contains("p0_idx"), "{s}");
 }
