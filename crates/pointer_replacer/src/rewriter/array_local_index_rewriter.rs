@@ -480,6 +480,7 @@ pub unsafe fn foo(mut p: *mut Item) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     krate: &mut Crate,
     input: &RustProgram<'tcx>,
@@ -488,6 +489,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
 ) -> bool {
     let mut trace = RewriteTrace::from_env();
     let changed = apply_array_local_index_rewrite_inner(
@@ -498,6 +500,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
         nullity_result,
         points_to,
         ast_to_hir,
+        c_exposed_fns,
         &mut trace,
     );
     trace.emit(input.tcx);
@@ -513,6 +516,7 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
     trace: &mut RewriteTrace,
 ) -> bool {
     let mut plan = build_rewrite_plan(
@@ -525,7 +529,14 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
     prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan, trace);
-    choose_binding_representations(krate, ast_to_hir, input.tcx, &mut plan, trace);
+    choose_binding_representations(
+        krate,
+        ast_to_hir,
+        input.tcx,
+        c_exposed_fns,
+        &mut plan,
+        trace,
+    );
     if plan.by_hir_id.is_empty() {
         return false;
     }
@@ -552,6 +563,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
     enabled: bool,
 ) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
     let mut trace = RewriteTrace::for_test(enabled);
@@ -563,6 +575,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
         nullity_result,
         points_to,
         ast_to_hir,
+        c_exposed_fns,
         &mut trace,
     );
     trace.into_events()
@@ -1582,6 +1595,18 @@ fn prune_unsupported_direct_place_uses(
     }
 }
 
+// whether a group-base binding is a function parameter (as opposed to a local).
+fn base_is_fn_param(tcx: TyCtxt<'_>, base_hir_id: HirId) -> bool {
+    for (_, node) in tcx.hir_parent_iter(base_hir_id) {
+        match node {
+            hir::Node::Param(_) => return true,
+            hir::Node::Pat(_) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
     let live_base_keys = plan
         .by_hir_id
@@ -1597,6 +1622,7 @@ fn choose_binding_representations(
     krate: &Crate,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
+    c_exposed_fns: &FxHashSet<String>,
     plan: &mut RewritePlan,
     trace: &mut RewriteTrace,
 ) {
@@ -1622,7 +1648,20 @@ fn choose_binding_representations(
     let mut group_costs: FxHashMap<BaseCursorKey, (usize, usize, Vec<HirId>)> =
         FxHashMap::default();
     for (hir_id, rewrite) in &plan.by_hir_id {
-        if !rewrite.nullable || !rewrite.base_is_raw_ptr {
+        if !rewrite.nullable || !rewrite.base_is_raw_ptr || rewrite.field_base {
+            continue;
+        }
+        // only bail when the base is pinned raw for good: a parameter of a
+        // c-exposed function keeps its ABI type, so the materialized uses stay
+        // unsafe. any other base may still be upgraded to a slice by later
+        // stages, turning the same materializations into safe indexing.
+        if !base_is_fn_param(tcx, rewrite.base_hir_id)
+            || !super::transform::is_c_exposed_fn(
+                tcx,
+                rewrite.base_hir_id.owner.def_id,
+                c_exposed_fns,
+            )
+        {
             continue;
         }
         let Some(summary) = summaries.get(hir_id) else { continue };

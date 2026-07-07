@@ -10684,7 +10684,11 @@ pub unsafe fn f(mut uname: *mut i8) -> *mut i8 {
     return out;
 }
 "#;
-    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    // the guard applies to raw parameter bases of c-exposed functions only:
+    // any other base may still be upgraded to a slice by later stages.
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("f".to_string());
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &config);
     let _ = changed;
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("let mut p0: *mut i8"), "{s}");

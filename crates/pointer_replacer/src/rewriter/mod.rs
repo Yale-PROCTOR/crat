@@ -263,6 +263,7 @@ pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (Stri
         &nullity_result,
         &points_to,
         &ast_to_hir,
+        &config.c_exposed_fns,
     );
 
     (pprust::crate_to_string_for_macros(&krate), changed)
@@ -317,6 +318,7 @@ pub(crate) fn rewrite_array_local_provenance_trace(
         &nullity_result,
         &points_to,
         &ast_to_hir,
+        &config.c_exposed_fns,
         enabled,
     );
     (pprust::crate_to_string_for_macros(&krate), events)
