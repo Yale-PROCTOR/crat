@@ -23,9 +23,7 @@ pub fn is_lhs<'tcx>(mut expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     for (_, parent) in tcx.hir_parent_iter(expr.hir_id) {
         let Node::Expr(parent) = parent else { return false };
         match parent.kind {
-            ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _)
-                if l.hir_id == expr.hir_id =>
-            {
+            ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) if l.hir_id == expr.hir_id => {
                 return true;
             }
             ExprKind::Field(_, _) => {}
