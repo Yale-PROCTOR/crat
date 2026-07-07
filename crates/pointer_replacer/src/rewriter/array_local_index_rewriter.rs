@@ -3329,9 +3329,18 @@ mod base_offset_expr_tests {
 
     #[test]
     fn literal_zero_index_folds_to_bare_base() {
-        assert_eq!(base_offset_expr_for_parts("uname", true, "0isize"), "(uname)");
-        assert_eq!(base_offset_expr_for_parts("buf", false, "0isize"), "(buf).as_ptr()");
-        assert_eq!(base_offset_expr_for_parts("buf", false, "0"), "(buf).as_ptr()");
+        assert_eq!(
+            base_offset_expr_for_parts("uname", true, "0isize"),
+            "(uname)"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "0isize"),
+            "(buf).as_ptr()"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "0"),
+            "(buf).as_ptr()"
+        );
     }
 
     #[test]
@@ -3541,6 +3550,67 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         let base_offset = base_offset_expr_for_index(rewrite, &index);
         let ptr = utils::expr!("{} as {}", base_offset, rewrite.ptr_ty);
         Some(utils::expr!("*({})", pprust::expr_to_string(&ptr)))
+    }
+
+    /// the value-position sibling of `projected_deref_replacement`: recognizes a
+    /// `<local>.offset(a).add(b)...` chain used as a pointer VALUE (call argument,
+    /// initializer, cast operand) whose innermost receiver is an introduced
+    /// nullable index-rewritten member local, and folds every offset into the
+    /// index inside the nullable closure:
+    /// `p.offset(k)` -> `p_idx.map_or(null, |idx| (base).offset((idx) + (k)) as ty)`.
+    /// without this, the bare local materializes via `pointer_value_expr` and the
+    /// chain stacks a second raw `.offset` on top of the materialized pointer.
+    fn projected_value_replacement(&mut self, operand: &Expr) -> Option<Expr> {
+        let mut offsets: Vec<(&str, &Expr)> = Vec::new();
+        let mut cur = unwrap_paren(operand);
+        while let ExprKind::MethodCall(call) = &cur.kind {
+            let name = call.seg.ident.name.as_str();
+            if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+                return None;
+            }
+            offsets.push((name, &call.args[0]));
+            cur = unwrap_paren(&call.receiver);
+        }
+        // the zero-offset bare local is handled by the pointer-value fallback.
+        if offsets.is_empty() {
+            return None;
+        }
+        let hir_id = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, cur.id)?;
+        if !self.introduced_hir_ids.contains(&hir_id) {
+            return None;
+        }
+        // rewrite each offset argument before stringifying it (same reason as in
+        // projected_deref_replacement), before borrowing the plan below.
+        let rewritten: Vec<(&str, Expr)> = offsets
+            .iter()
+            .map(|(name, arg)| {
+                let mut arg = (**arg).clone();
+                self.visit_expr(&mut arg);
+                (*name, arg)
+            })
+            .collect();
+        let rewrite = self.plan.by_hir_id.get(&hir_id)?;
+        if !rewrite_uses_index_rewrite(rewrite) || !rewrite.nullable {
+            return None;
+        }
+        // fold innermost offset first, starting from the closure-bound index.
+        let mut index = "idx".to_string();
+        for (name, arg) in rewritten.iter().rev() {
+            index = pprust::expr_to_string(&relative_index_expr(&index, name, arg));
+        }
+        let null_fn = if rewrite.ptr_mut {
+            "std::ptr::null_mut()"
+        } else {
+            "std::ptr::null()"
+        };
+        Some(utils::expr!(
+            "{}.map_or({} as {}, |idx| ({}) as {})",
+            rewrite.index_name,
+            null_fn,
+            rewrite.ptr_ty,
+            base_offset_expr_for_index(rewrite, &index),
+            rewrite.ptr_ty
+        ))
     }
 
     /// builds the index RHS for a conditional cursor update: visits the original
@@ -4053,6 +4123,14 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 self.changed = true;
                 return;
             }
+        }
+
+        if let ExprKind::MethodCall(_) = &expr.kind
+            && let Some(replacement) = self.projected_value_replacement(expr)
+        {
+            *expr = replacement;
+            self.changed = true;
+            return;
         }
 
         mut_visit::walk_expr(self, expr);

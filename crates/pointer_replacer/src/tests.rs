@@ -10612,3 +10612,45 @@ pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
     assert!(s.contains("*((r).offset(q_1_idx) as *mut i32) = 5"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
 }
+
+#[test]
+fn test_array_local_rewriter_folds_value_position_offset_chain() {
+    // a projection chain used as a pointer VALUE (call argument) must fold its
+    // offsets into the nullable index closure instead of stacking a raw
+    // `.offset` on top of the materialized pointer.
+    let code = r#"
+unsafe extern "C" {
+    fn strstr(a: *const i8, b: *const i8) -> *mut i8;
+    fn strdup(a: *const i8) -> *mut i8;
+    fn consume(p: *mut i8);
+}
+
+pub unsafe fn f(mut uname: *mut i8, k: isize) -> *mut i8 {
+    let mut out: *mut i8 = std::ptr::null_mut();
+    let mut p0: *mut i8 = strstr(uname, b"x\0" as *const u8 as *const i8);
+    if !p0.is_null() {
+        *p0 = 0;
+        p0 = p0.offset(2);
+        consume(p0.offset(k));
+        out = strdup(p0);
+    } else {
+        let mut p1: *mut i8 = strstr(uname, b"y\0" as *const u8 as *const i8);
+        if !p1.is_null() {
+            *p1 = 0;
+            out = strdup(p1);
+        }
+    }
+    return out;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "expected cursors to be index-rewritten:\n{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the call-derived index seeds from the bare base, not `base.offset(0isize)`.
+    assert!(s.contains("offset_from((uname))"), "{s}");
+    assert!(!s.contains("offset(0isize)"), "{s}");
+    // the chained value use folds its offset into the closure index...
+    assert!(s.contains(".offset((idx) + (k))"), "{s}");
+    // ...instead of stacking a second raw offset on the materialized pointer.
+    assert!(!s.contains(".offset(k)"), "{s}");
+}
