@@ -3303,10 +3303,14 @@ fn member_offset_expr(base_live: bool, base_index_name: Option<&str>, index_expr
 }
 
 fn base_offset_expr_for_parts(base_name: &str, base_is_raw_ptr: bool, index_expr: &str) -> String {
-    if base_is_raw_ptr {
-        format!("({base_name}).offset({index_expr})")
-    } else {
-        format!("({base_name}).as_ptr().offset({index_expr})")
+    // a literal-zero index is the base itself; folding it away keeps one
+    // unsafe `offset` out of every materialization built on the group start.
+    let zero_index = matches!(index_expr, "0" | "0isize");
+    match (base_is_raw_ptr, zero_index) {
+        (true, true) => format!("({base_name})"),
+        (true, false) => format!("({base_name}).offset({index_expr})"),
+        (false, true) => format!("({base_name}).as_ptr()"),
+        (false, false) => format!("({base_name}).as_ptr().offset({index_expr})"),
     }
 }
 
@@ -3317,6 +3321,30 @@ fn base_offset_expr_for_index(rewrite: &BindingRewrite, index_expr: &str) -> Str
         index_expr,
     );
     base_offset_expr_for_parts(&rewrite.base_name, rewrite.base_is_raw_ptr, &offset)
+}
+
+#[cfg(test)]
+mod base_offset_expr_tests {
+    use super::base_offset_expr_for_parts;
+
+    #[test]
+    fn literal_zero_index_folds_to_bare_base() {
+        assert_eq!(base_offset_expr_for_parts("uname", true, "0isize"), "(uname)");
+        assert_eq!(base_offset_expr_for_parts("buf", false, "0isize"), "(buf).as_ptr()");
+        assert_eq!(base_offset_expr_for_parts("buf", false, "0"), "(buf).as_ptr()");
+    }
+
+    #[test]
+    fn non_zero_index_keeps_offset() {
+        assert_eq!(
+            base_offset_expr_for_parts("uname", true, "idx"),
+            "(uname).offset(idx)"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "i + 1"),
+            "(buf).as_ptr().offset(i + 1)"
+        );
+    }
 }
 
 fn pointer_expr_for_index(rewrite: &BindingRewrite) -> Expr {
