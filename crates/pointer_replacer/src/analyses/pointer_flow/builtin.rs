@@ -80,7 +80,10 @@ pub(crate) fn is_zero_int_operand<'tcx>(operand: &Operand<'tcx>, _tcx: TyCtxt<'t
     int_val.to_bits(int_val.size()) == 0
 }
 
-pub(crate) fn constant_pointer_reason<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> UnknownReason {
+pub(crate) fn constant_pointer_reason<'tcx>(
+    operand: &Operand<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> UnknownReason {
     if is_zero_int_operand(operand, tcx) {
         UnknownReason::NullLike
     } else {
@@ -186,14 +189,22 @@ pub(crate) fn is_slice_index_mut_call<'tcx>(
         && is_mut_slice_ref_ty(destination.ty(body, tcx).ty)
 }
 
-pub(crate) fn is_core_or_std_from_raw_parts_mut_path(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+pub(crate) fn is_core_or_std_from_raw_parts_mut_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    name: &str,
+) -> bool {
     let crate_name = tcx.crate_name(def_id.krate);
     matches!(crate_name.as_str(), "core" | "std")
         && name.contains("::slice::")
         && name.ends_with("::from_raw_parts_mut")
 }
 
-pub(crate) fn is_core_or_std_slice_index_mut_path(tcx: TyCtxt<'_>, def_id: DefId, name: &str) -> bool {
+pub(crate) fn is_core_or_std_slice_index_mut_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    name: &str,
+) -> bool {
     let crate_name = tcx.crate_name(def_id.krate);
     matches!(crate_name.as_str(), "core" | "std") && name.ends_with("::ops::IndexMut::index_mut")
 }
@@ -219,7 +230,11 @@ pub(crate) fn is_empty_array_ref_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bo
 /// Returns true for allocator shims found by Andersen pre-analysis and for
 /// the foreign libc allocators. A local Rust function that merely shares an
 /// allocator name gets no heap-alloc provenance.
-pub(crate) fn is_heap_alloc_call(tcx: TyCtxt<'_>, def_id: DefId, alloc_fns: &FxHashSet<LocalDefId>) -> bool {
+pub(crate) fn is_heap_alloc_call(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    alloc_fns: &FxHashSet<LocalDefId>,
+) -> bool {
     def_id
         .as_local()
         .is_some_and(|local_def_id| alloc_fns.contains(&local_def_id))
