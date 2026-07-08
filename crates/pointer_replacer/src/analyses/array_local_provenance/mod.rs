@@ -21,6 +21,7 @@ use rustc_middle::{
 use rustc_mir_dataflow::Analysis;
 use rustc_span::{def_id::DefId, source_map::Spanned};
 
+pub(crate) use crate::analyses::pointer_flow::summary::CallEffects;
 pub use crate::analyses::pointer_flow::{
     graph::{BaseId, PfgNode, PointerFlowGraph, ProvenanceResult, UnknownReason},
     slots::{QualifierKey, SlotIdx, SlotInfo, SlotPathElem, SlotTable},
@@ -33,6 +34,10 @@ use crate::{
         pointer_flow::{
             graph::{base_local_of_base, solve_reachable_bases},
             slots::{count_slots, slot_path_from_place, slot_path_from_projection, slot_ty},
+            summary::{
+                ArgWriteFlow, ArgWriteTarget, FunctionSummary, InstantiatedArgWrite,
+                InstantiatedUnknownArgWrite, SummaryCompleteness, SummaryFlow, SummarySource,
+            },
         },
         type_qualifier::foster::mutability::{Mutability as PtrMut, MutabilityResult},
     },
@@ -54,52 +59,6 @@ pub struct BaseClassification {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct FunctionSummary {
-    completeness: SummaryCompleteness,
-    return_flows: Vec<SummaryFlow>,
-    arg_write_flows: Vec<ArgWriteFlow>,
-    unknown_return_slots: Vec<Vec<SlotPathElem>>,
-    unknown_arg_writes: Vec<ArgWriteTarget>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SummaryCompleteness {
-    Complete,
-    #[default]
-    Incomplete,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SummaryFlow {
-    dst_return_path: Vec<SlotPathElem>,
-    src: SummarySource,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ArgWriteFlow {
-    dst_arg_index: usize,
-    dst_path: Vec<SlotPathElem>,
-    src: SummarySource,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ArgWriteTarget {
-    arg_index: usize,
-    path: Vec<SlotPathElem>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum SummarySource {
-    ParamSlot {
-        arg_index: usize,
-        path: Vec<SlotPathElem>,
-    },
-    Unknown(UnknownReason),
-    OpaqueReturn,
-    HeapAlloc,
-}
-
 #[derive(Clone, Debug)]
 pub struct ArrayLocalProvenance {
     pub slot_table: SlotTable,
@@ -108,26 +67,6 @@ pub struct ArrayLocalProvenance {
     pub provenance: ProvenanceResult,
     pub base_classifications: FxHashMap<BaseId, BaseClassification>,
     pub(crate) call_effects: FxHashMap<Location, CallEffects>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InstantiatedArgWrite {
-    pub(crate) dst_arg_index: usize,
-    pub(crate) destination: SlotIdx,
-    pub(crate) sources: Vec<PfgNode>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InstantiatedUnknownArgWrite {
-    pub(crate) dst_arg_index: usize,
-    pub(crate) destination: SlotIdx,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CallEffects {
-    pub(crate) complete: bool,
-    pub(crate) writes: Vec<InstantiatedArgWrite>,
-    pub(crate) unknown_writes: Vec<InstantiatedUnknownArgWrite>,
 }
 
 pub struct RewriteGroup {
@@ -167,23 +106,6 @@ enum AssignRhs<'tcx> {
     ArrayBorrow(Place<'tcx>),
     // rvalue is Use/Cast/CopyForDeref of this local; follow it recursively
     Follow(Local),
-}
-
-impl FunctionSummary {
-    fn is_complete(&self) -> bool {
-        self.completeness == SummaryCompleteness::Complete
-    }
-
-    fn normalize(&mut self) {
-        self.return_flows.sort();
-        self.return_flows.dedup();
-        self.arg_write_flows.sort();
-        self.arg_write_flows.dedup();
-        self.unknown_return_slots.sort();
-        self.unknown_return_slots.dedup();
-        self.unknown_arg_writes.sort();
-        self.unknown_arg_writes.dedup();
-    }
 }
 
 #[allow(dead_code)]
