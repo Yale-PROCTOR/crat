@@ -28,17 +28,12 @@ pub use crate::analyses::pointer_flow::{
 use crate::{
     analyses::{
         liveness::MaybeLiveLocals,
-        mir::CallGraphPostOrder,
         mir_variable_grouping::SourceVarGroups,
         pointer_flow::{
             builtin::{call_name, call_no_writes, is_as_ptr, is_pointer_arithmetic},
-            collector::{Collector, build_rhs_map, operand_place},
-            graph::{base_local_of_base, solve_reachable_bases},
-            slots::{count_slots, slot_path_from_place, slot_path_from_projection, slot_ty},
-            summary::{
-                ArgWriteFlow, ArgWriteTarget, FunctionSummary, SummaryCompleteness, SummaryFlow,
-                SummarySource,
-            },
+            collector::operand_place,
+            graph::base_local_of_base,
+            slots::{count_slots, slot_path_from_place, slot_ty},
         },
         type_qualifier::foster::mutability::{Mutability as PtrMut, MutabilityResult},
     },
@@ -174,74 +169,10 @@ pub fn array_local_provenance_analysis(
     input: &RustProgram<'_>,
     alloc_fns: &FxHashSet<LocalDefId>,
 ) -> FxHashMap<LocalDefId, ArrayLocalProvenance> {
-    let call_graph = CallGraphPostOrder::new(input);
-    let function_set: FxHashSet<LocalDefId> = input.functions.iter().copied().collect();
-    let mut summaries: FxHashMap<LocalDefId, FunctionSummary> = FxHashMap::default();
-    let mut results: FxHashMap<LocalDefId, ArrayLocalProvenance> = FxHashMap::default();
-
-    for scc in call_graph.sccs() {
-        let local_scc: Vec<LocalDefId> = scc
-            .iter()
-            .filter_map(|def_id| def_id.as_local())
-            .filter(|def_id| function_set.contains(def_id))
-            .collect();
-        if local_scc.is_empty() {
-            continue;
-        }
-
-        for &def_id in &local_scc {
-            summaries.entry(def_id).or_default();
-        }
-
-        let mut stabilized = false;
-        for _ in 0..32 {
-            let mut changed = false;
-            for &def_id in &local_scc {
-                let body = input
-                    .tcx
-                    .mir_drops_elaborated_and_const_checked(def_id)
-                    .borrow();
-                let result = analyze_body_with_summaries(
-                    input.tcx,
-                    def_id,
-                    &body,
-                    alloc_fns,
-                    Some(&summaries),
-                );
-                let mut summary = build_function_summary(input.tcx, def_id, &body, &result);
-                summary.normalize();
-                changed |= summaries.get(&def_id) != Some(&summary);
-                summaries.insert(def_id, summary);
-                results.insert(def_id, result);
-            }
-            if !changed {
-                stabilized = true;
-                break;
-            }
-        }
-
-        if !stabilized {
-            for &def_id in &local_scc {
-                summaries.remove(&def_id);
-            }
-            for &def_id in &local_scc {
-                let body = input
-                    .tcx
-                    .mir_drops_elaborated_and_const_checked(def_id)
-                    .borrow();
-                let result = analyze_body_with_summaries(
-                    input.tcx,
-                    def_id,
-                    &body,
-                    alloc_fns,
-                    Some(&summaries),
-                );
-                results.insert(def_id, result);
-            }
-        }
-    }
-
-    results
+    crate::analyses::pointer_flow::pointer_flow_analysis(input, alloc_fns)
+        .into_iter()
+        .map(|(def_id, flow)| (def_id, wrap_flow(flow)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -251,45 +182,25 @@ pub fn analyze_body<'tcx>(
     body: &Body<'tcx>,
     alloc_fns: &FxHashSet<LocalDefId>,
 ) -> ArrayLocalProvenance {
-    analyze_body_with_summaries(tcx, def_id, body, alloc_fns, None)
+    let flow = crate::analyses::pointer_flow::collector::analyze_body_with_summaries(
+        tcx, def_id, body, alloc_fns, None,
+    );
+    wrap_flow(flow)
 }
 
-fn analyze_body_with_summaries<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    _def_id: LocalDefId,
-    body: &Body<'tcx>,
-    alloc_fns: &FxHashSet<LocalDefId>,
-    callee_summaries: Option<&FxHashMap<LocalDefId, FunctionSummary>>,
-) -> ArrayLocalProvenance {
-    let slot_table = SlotTable::new(body, tcx);
-    let rhs_map = build_rhs_map(body, tcx);
-    let mut collector = Collector {
-        tcx,
-        body,
-        alloc_fns,
-        callee_summaries,
-        slot_table: &slot_table,
-        graph: PointerFlowGraph::default(),
-        rhs_map,
-        direct_param_slots: FxHashSet::default(),
-        call_effects: FxHashMap::default(),
-    };
-    collector.collect();
-    let graph = collector.graph;
-    let call_effects = collector.call_effects;
-    let provenance = solve_reachable_bases(&graph);
-    let base_classifications = graph
+fn wrap_flow(flow: crate::analyses::pointer_flow::PointerFlowResult) -> ArrayLocalProvenance {
+    let base_classifications = flow
+        .graph
         .bases
         .iter()
         .map(|base| (base.clone(), classify_base(base)))
         .collect();
-
     ArrayLocalProvenance {
-        slot_table,
-        graph,
-        provenance,
+        slot_table: flow.slot_table,
+        graph: flow.graph,
+        provenance: flow.provenance,
         base_classifications,
-        call_effects,
+        call_effects: flow.call_effects,
     }
 }
 
@@ -1587,394 +1498,6 @@ pub fn debug_rewrite_groups<'tcx>(
         }
     }
     out
-}
-
-fn summary_source_for_base(base: &BaseId, result: &ArrayLocalProvenance) -> SummarySource {
-    match base {
-        BaseId::Param { local, slot } => {
-            let arg_index = param_index_for_local(*local).unwrap_or(0);
-            let path = result
-                .slot_table
-                .slot_infos
-                .get(*slot)
-                .map(|info| info.path.clone())
-                .unwrap_or_default();
-            SummarySource::ParamSlot { arg_index, path }
-        }
-        BaseId::HeapAlloc { .. } => SummarySource::HeapAlloc,
-        BaseId::OpaqueReturn { .. } => SummarySource::OpaqueReturn,
-        BaseId::Unknown { reason, .. } => SummarySource::Unknown(reason.clone()),
-        BaseId::IntToPtr { .. } => SummarySource::Unknown(UnknownReason::ConstantPointer),
-        BaseId::LocalArray { .. } | BaseId::LocalScalar { .. } | BaseId::RawBorrow { .. } => {
-            SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad)
-        }
-    }
-}
-
-fn param_index_for_local(local: Local) -> Option<usize> {
-    let index = local.index();
-    (index > 0).then_some(index - 1)
-}
-
-fn is_arg_target_initial_base(
-    base: &BaseId,
-    target: &ArgWriteTarget,
-    result: &ArrayLocalProvenance,
-) -> bool {
-    matches!(
-        base,
-        BaseId::Param {
-            local,
-            slot,
-        } if param_index_for_local(*local) == Some(target.arg_index)
-            && result
-                .slot_table
-                .slot_infos
-                .get(*slot)
-                .is_some_and(|info| info.path == target.path)
-    )
-}
-
-fn return_slot_paths<'tcx>(
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> Vec<(SlotIdx, Vec<SlotPathElem>)> {
-    result
-        .slot_table
-        .place_slots(Place::return_place(), body, tcx)
-        .map(|slots| {
-            slots
-                .filter_map(|slot| {
-                    result
-                        .slot_table
-                        .slot_infos
-                        .get(slot)
-                        .map(|info| (slot, info.path.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-enum BoundaryWriteDiscovery {
-    NotBoundary,
-    Complete(Vec<(ArgWriteTarget, SlotIdx)>),
-    Incomplete,
-}
-
-struct BoundaryArgWrites {
-    targets: Vec<(ArgWriteTarget, SlotIdx)>,
-    complete: bool,
-}
-
-fn boundary_arg_write_targets_for_place<'tcx>(
-    place: Place<'tcx>,
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> BoundaryWriteDiscovery {
-    let Some(deref_index) = place
-        .projection
-        .iter()
-        .position(|elem| matches!(elem, ProjectionElem::Deref))
-    else {
-        return BoundaryWriteDiscovery::NotBoundary;
-    };
-
-    let prefix_projection = &place.projection[..deref_index];
-    if slot_path_from_projection(prefix_projection).is_none() {
-        return BoundaryWriteDiscovery::Incomplete;
-    }
-
-    let prefix_place = Place::from(place.local).project_deeper(prefix_projection, tcx);
-    let Some(prefix_slot) = result
-        .slot_table
-        .place_slots(prefix_place, body, tcx)
-        .and_then(|mut slots| slots.next())
-    else {
-        return BoundaryWriteDiscovery::Incomplete;
-    };
-
-    let Some(written_slots) = result.slot_table.place_slots(place, body, tcx) else {
-        return BoundaryWriteDiscovery::Incomplete;
-    };
-
-    let writes = boundary_param_write_targets_for_slots(prefix_slot, written_slots, result);
-    if !writes.complete {
-        BoundaryWriteDiscovery::Incomplete
-    } else if writes.targets.is_empty() {
-        BoundaryWriteDiscovery::NotBoundary
-    } else {
-        BoundaryWriteDiscovery::Complete(writes.targets)
-    }
-}
-
-fn boundary_param_write_targets_for_slots(
-    prefix_slot: SlotIdx,
-    written_slots: impl IntoIterator<Item = SlotIdx>,
-    result: &ArrayLocalProvenance,
-) -> BoundaryArgWrites {
-    let Some(prefix_path) = result
-        .slot_table
-        .slot_infos
-        .get(prefix_slot)
-        .map(|info| info.path.clone())
-    else {
-        return BoundaryArgWrites {
-            targets: vec![],
-            complete: false,
-        };
-    };
-    let Some(bases) = result
-        .provenance
-        .reachable_bases
-        .get(&PfgNode::Slot(prefix_slot))
-    else {
-        return BoundaryArgWrites {
-            targets: vec![],
-            complete: false,
-        };
-    };
-
-    let param_bases: Vec<_> = bases
-        .iter()
-        .filter_map(|base| {
-            let BaseId::Param { local, slot } = base else {
-                return None;
-            };
-            Some((*local, *slot))
-        })
-        .collect();
-    if param_bases.is_empty() {
-        return BoundaryArgWrites {
-            targets: vec![],
-            complete: true,
-        };
-    }
-
-    let mut targets = vec![];
-    for slot in written_slots {
-        let Some(info) = result.slot_table.slot_infos.get(slot) else {
-            return BoundaryArgWrites {
-                targets,
-                complete: false,
-            };
-        };
-        let Some(relative_path) = info.path.as_slice().strip_prefix(prefix_path.as_slice()) else {
-            return BoundaryArgWrites {
-                targets,
-                complete: false,
-            };
-        };
-        if relative_path.is_empty() {
-            return BoundaryArgWrites {
-                targets,
-                complete: false,
-            };
-        }
-        for (local, base_slot) in &param_bases {
-            let Some(arg_index) = param_index_for_local(*local) else {
-                return BoundaryArgWrites {
-                    targets,
-                    complete: false,
-                };
-            };
-            let Some(base_path) = result
-                .slot_table
-                .slot_infos
-                .get(*base_slot)
-                .map(|info| info.path.clone())
-            else {
-                return BoundaryArgWrites {
-                    targets,
-                    complete: false,
-                };
-            };
-            let mut target_path = base_path;
-            target_path.extend(relative_path.iter().cloned());
-            targets.push((
-                ArgWriteTarget {
-                    arg_index,
-                    path: target_path,
-                },
-                slot,
-            ));
-        }
-    }
-
-    BoundaryArgWrites {
-        targets,
-        complete: true,
-    }
-}
-
-fn boundary_unknown_call_arg_write_targets_for_place<'tcx>(
-    place: Place<'tcx>,
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> Vec<ArgWriteTarget> {
-    let Some(place_slots) = result.slot_table.place_slots(place, body, tcx) else {
-        return vec![];
-    };
-    let Some(prefix_slot) = place_slots.clone().next() else {
-        return vec![];
-    };
-
-    boundary_param_write_targets_for_slots(
-        prefix_slot,
-        place_slots.skip(1).filter(|slot| {
-            result
-                .slot_table
-                .slot_infos
-                .get(*slot)
-                .is_some_and(|info| info.depth > 0)
-        }),
-        result,
-    )
-    .targets
-    .into_iter()
-    .map(|(target, _slot)| target)
-    .collect()
-}
-
-fn boundary_arg_write_targets<'tcx>(
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> BoundaryArgWrites {
-    let mut targets = vec![];
-    let mut complete = true;
-
-    for (_block, block_data) in body.basic_blocks.iter_enumerated() {
-        for statement in &block_data.statements {
-            let StatementKind::Assign(box (place, _)) = &statement.kind else {
-                continue;
-            };
-            match boundary_arg_write_targets_for_place(*place, body, tcx, result) {
-                BoundaryWriteDiscovery::NotBoundary => {}
-                BoundaryWriteDiscovery::Complete(discovered) => targets.extend(discovered),
-                BoundaryWriteDiscovery::Incomplete => complete = false,
-            }
-        }
-    }
-
-    BoundaryArgWrites { targets, complete }
-}
-
-fn boundary_unknown_arg_write_targets<'tcx>(
-    body: &Body<'tcx>,
-    tcx: TyCtxt<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> Vec<ArgWriteTarget> {
-    let mut targets = vec![];
-
-    for (_block, block_data) in body.basic_blocks.iter_enumerated() {
-        let Some(terminator) = &block_data.terminator else {
-            continue;
-        };
-        let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
-            continue;
-        };
-        if call_name(tcx, func)
-            .as_ref()
-            .is_some_and(|(def_id, name)| call_no_writes(tcx, *def_id, name))
-        {
-            continue;
-        }
-
-        for arg in args {
-            let Some(place) = operand_place(&arg.node) else {
-                continue;
-            };
-            let arg_ty = place.ty(body, tcx).ty;
-            if let Some(inner) = arg_ty.builtin_deref(true)
-                && count_slots(inner, tcx, &mut FxHashSet::default()) > 0
-            {
-                targets.extend(boundary_unknown_call_arg_write_targets_for_place(
-                    place, body, tcx, result,
-                ));
-            }
-        }
-    }
-
-    targets
-}
-
-fn build_function_summary<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    _def_id: LocalDefId,
-    body: &Body<'tcx>,
-    result: &ArrayLocalProvenance,
-) -> FunctionSummary {
-    let mut summary = FunctionSummary {
-        completeness: SummaryCompleteness::Complete,
-        ..FunctionSummary::default()
-    };
-
-    for (slot, path) in return_slot_paths(body, tcx, result) {
-        let node = PfgNode::Slot(slot);
-        let Some(bases) = result.provenance.reachable_bases.get(&node) else {
-            summary.unknown_return_slots.push(path);
-            continue;
-        };
-        let mut emitted = false;
-        for base in bases {
-            let src = summary_source_for_base(base, result);
-            summary.return_flows.push(SummaryFlow {
-                dst_return_path: path.clone(),
-                src,
-            });
-            emitted = true;
-        }
-        if !emitted {
-            summary.unknown_return_slots.push(path);
-        }
-    }
-
-    let boundary_writes = boundary_arg_write_targets(body, tcx, result);
-    if !boundary_writes.complete {
-        summary.completeness = SummaryCompleteness::Incomplete;
-    }
-    for (target, written_slot) in boundary_writes.targets {
-        let Some(bases) = result
-            .provenance
-            .reachable_bases
-            .get(&PfgNode::Slot(written_slot))
-        else {
-            summary.unknown_arg_writes.push(target);
-            continue;
-        };
-
-        let mut emitted = false;
-        let has_non_initial_base = bases
-            .iter()
-            .any(|base| !is_arg_target_initial_base(base, &target, result));
-        for base in bases {
-            if has_non_initial_base && is_arg_target_initial_base(base, &target, result) {
-                continue;
-            }
-            let src = summary_source_for_base(base, result);
-            summary.arg_write_flows.push(ArgWriteFlow {
-                dst_arg_index: target.arg_index,
-                dst_path: target.path.clone(),
-                src,
-            });
-            emitted = true;
-        }
-
-        if !emitted {
-            summary.unknown_arg_writes.push(target);
-        }
-    }
-
-    for target in boundary_unknown_arg_write_targets(body, tcx, result) {
-        summary.unknown_arg_writes.push(target);
-    }
-
-    summary.normalize();
-    summary
 }
 
 fn classify_base(base: &BaseId) -> BaseClassification {

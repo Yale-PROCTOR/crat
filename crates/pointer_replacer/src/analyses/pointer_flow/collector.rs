@@ -14,18 +14,25 @@ use rustc_middle::{
 };
 use rustc_span::source_map::Spanned;
 
-use crate::analyses::pointer_flow::{
-    builtin::{
-        builtin_summary, call_name, call_no_writes, call_propagates_first_arg,
-        constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
-        is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
+use crate::{
+    analyses::{
+        mir::CallGraphPostOrder,
+        pointer_flow::{
+            PointerFlowResult,
+            builtin::{
+                builtin_summary, call_name, call_no_writes, call_propagates_first_arg,
+                constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
+                is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
+            },
+            graph::{BaseId, PfgNode, PointerFlowGraph, UnknownReason, solve_reachable_bases},
+            slots::{SlotIdx, SlotPathElem, SlotTable, count_slots},
+            summary::{
+                CallEffects, FunctionSummary, InstantiatedArgWrite, InstantiatedUnknownArgWrite,
+                SummarySource, build_function_summary,
+            },
+        },
     },
-    graph::{BaseId, PfgNode, PointerFlowGraph, UnknownReason},
-    slots::{SlotIdx, SlotPathElem, SlotTable, count_slots},
-    summary::{
-        CallEffects, FunctionSummary, InstantiatedArgWrite, InstantiatedUnknownArgWrite,
-        SummarySource,
-    },
+    utils::rustc::RustProgram,
 };
 
 // pre-computed assignment right-hand sides used by `array_source_for_local`
@@ -944,5 +951,112 @@ pub(crate) fn operand_place<'tcx>(operand: &Operand<'tcx>) -> Option<Place<'tcx>
     match operand {
         Operand::Copy(place) | Operand::Move(place) => Some(*place),
         Operand::Constant(_) => None,
+    }
+}
+
+pub fn pointer_flow_analysis(
+    input: &RustProgram<'_>,
+    alloc_fns: &FxHashSet<LocalDefId>,
+) -> FxHashMap<LocalDefId, PointerFlowResult> {
+    let call_graph = CallGraphPostOrder::new(input);
+    let function_set: FxHashSet<LocalDefId> = input.functions.iter().copied().collect();
+    let mut summaries: FxHashMap<LocalDefId, FunctionSummary> = FxHashMap::default();
+    let mut results: FxHashMap<LocalDefId, PointerFlowResult> = FxHashMap::default();
+
+    for scc in call_graph.sccs() {
+        let local_scc: Vec<LocalDefId> = scc
+            .iter()
+            .filter_map(|def_id| def_id.as_local())
+            .filter(|def_id| function_set.contains(def_id))
+            .collect();
+        if local_scc.is_empty() {
+            continue;
+        }
+
+        for &def_id in &local_scc {
+            summaries.entry(def_id).or_default();
+        }
+
+        let mut stabilized = false;
+        for _ in 0..32 {
+            let mut changed = false;
+            for &def_id in &local_scc {
+                let body = input
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(def_id)
+                    .borrow();
+                let result = analyze_body_with_summaries(
+                    input.tcx,
+                    def_id,
+                    &body,
+                    alloc_fns,
+                    Some(&summaries),
+                );
+                let mut summary = build_function_summary(input.tcx, def_id, &body, &result);
+                summary.normalize();
+                changed |= summaries.get(&def_id) != Some(&summary);
+                summaries.insert(def_id, summary);
+                results.insert(def_id, result);
+            }
+            if !changed {
+                stabilized = true;
+                break;
+            }
+        }
+
+        if !stabilized {
+            for &def_id in &local_scc {
+                summaries.remove(&def_id);
+            }
+            for &def_id in &local_scc {
+                let body = input
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(def_id)
+                    .borrow();
+                let result = analyze_body_with_summaries(
+                    input.tcx,
+                    def_id,
+                    &body,
+                    alloc_fns,
+                    Some(&summaries),
+                );
+                results.insert(def_id, result);
+            }
+        }
+    }
+
+    results
+}
+
+pub(crate) fn analyze_body_with_summaries<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    _def_id: LocalDefId,
+    body: &Body<'tcx>,
+    alloc_fns: &FxHashSet<LocalDefId>,
+    callee_summaries: Option<&FxHashMap<LocalDefId, FunctionSummary>>,
+) -> PointerFlowResult {
+    let slot_table = SlotTable::new(body, tcx);
+    let rhs_map = build_rhs_map(body, tcx);
+    let mut collector = Collector {
+        tcx,
+        body,
+        alloc_fns,
+        callee_summaries,
+        slot_table: &slot_table,
+        graph: PointerFlowGraph::default(),
+        rhs_map,
+        direct_param_slots: FxHashSet::default(),
+        call_effects: FxHashMap::default(),
+    };
+    collector.collect();
+    let graph = collector.graph;
+    let call_effects = collector.call_effects;
+    let provenance = solve_reachable_bases(&graph);
+
+    PointerFlowResult {
+        slot_table,
+        graph,
+        provenance,
+        call_effects,
     }
 }
