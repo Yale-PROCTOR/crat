@@ -6,12 +6,10 @@ use rustc_middle::{
 };
 use rustc_span::{def_id::DefId, source_map::Spanned};
 
-use crate::analyses::{
-    array_local_provenance::operand_place,
-    pointer_flow::{
-        graph::UnknownReason,
-        summary::{FunctionSummary, SummaryCompleteness, SummaryFlow, SummarySource},
-    },
+use crate::analyses::pointer_flow::{
+    collector::operand_place,
+    graph::UnknownReason,
+    summary::{FunctionSummary, SummaryCompleteness, SummaryFlow, SummarySource},
 };
 
 pub(crate) fn call_name(tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<(DefId, String)> {
