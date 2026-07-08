@@ -1837,6 +1837,58 @@ pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
 }
 
 #[test]
+fn test_rewriter_field_base_match_is_paren_insensitive() {
+    // the field-base access is written with a redundant paren (`(h).p`), which a
+    // pretty-printed string match rejects (`(h).p` != `h.p`); structural matching
+    // resolves it and still promotes the field.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
+    let mut h = Holder { p: buf.as_mut_ptr() };
+    *(h).p.offset(1) = 9;
+    buf[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "as usize.."],
+        &[
+            "pub p: Option<&'a mut i32>",
+            "pub p: *mut i32",
+            ".offset(1)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_field_base_distinct_fields_do_not_cross_match() {
+    // two pointer fields each form their own base; matching one must never match
+    // the other (the `Field` step name differs), so both promote to their own
+    // slice independently with no cross-contamination.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub q: *mut i32,
+}
+
+pub unsafe fn touch(mut a: [i32; 2], mut b: [i32; 2]) -> i32 {
+    let mut h = Holder { p: a.as_mut_ptr(), q: b.as_mut_ptr() };
+    *h.p.offset(1) = 9;
+    *h.q.offset(1) = 7;
+    a[1] + b[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "pub q: &'b mut [i32]"],
+        &["pub p: *mut i32", "pub q: *mut i32", ".offset(1)"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_array_like_struct_field_to_slice() {
     run_test(
         r#"
@@ -7959,6 +8011,118 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
 }
 
 #[test]
+fn test_array_local_rewriter_lowers_nullable_projected_deref_through_base() {
+    // a nullable index-backed member that is projected-derefed (`*prev.offset(x)`)
+    // lowers directly through the base pointer instead of the map_or bridge.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u8 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *prev.offset(x)
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut prev_idx: Option<isize> = None"), "{s}");
+    assert!(
+        s.contains("*((raw).offset((prev_idx.unwrap()) + (x)) as *mut u8)"),
+        "projected deref lowered through base: {s}"
+    );
+    assert!(
+        !s.contains("prev_idx.map_or"),
+        "no map_or bridge for the deref: {s}"
+    );
+}
+
+#[test]
+fn test_projected_nullable_deref_no_raw_bridge_after_promotion() {
+    // reduced from B02_organic/unfilter_lib: `raw` is a moving base cursor that
+    // borrow-promotes to a slice cursor; `prev` is a nullable member projected-
+    // derefed. the promoted base must not leave a `map_or(...).as_mut_ptr().offset`
+    // bridge.
+    let code = r#"
+pub unsafe extern "C" fn unfilter_like(mut h: i32, mut len: i32, mut raw: *mut u8) {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    let mut x: i32 = 0;
+    let mut y: i32 = 1;
+    while y < h {
+        raw = raw.offset(1);
+        if !prev.is_null() {
+            x = 0;
+            while x < len {
+                *raw.offset(x as isize) = (*raw.offset(x as isize) as i32
+                    + *prev.offset(x as isize) as i32) as u8;
+                x += 1;
+            }
+        }
+        prev = raw;
+        raw = raw.offset(len as isize);
+        y += 1;
+    }
+}
+"#;
+    let config = Config::default();
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !s.contains(".as_mut_ptr()).offset("),
+        "no raw bridge for the projected nullable deref: {s}"
+    );
+    assert!(!s.contains("prev_idx.map_or"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_cast_projected_deref_unchanged() {
+    // a receiver cast in the projection keeps the bare member, which the existing
+    // map_or pointer-value fallback lowers; the projected-deref branch bails.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u16 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *(prev as *mut u16).offset(x)
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("prev_idx.map_or"),
+        "cast receiver bails to map_or: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_non_nullable_projected_deref_to_existing_lowering() {
+    // a non-nullable index-backed member keeps its existing lowering; the
+    // nullable-gated projected-deref branch does not fire.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut i32, mut x: isize) -> i32 {
+    let mut p: *mut i32 = raw.offset(1);
+    raw = raw.offset(2);
+    let v = *p.offset(x);
+    let _ = raw;
+    v
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // `p` is index-backed but non-nullable, so it keeps the existing double-offset
+    // lowering (deferred to item 10) rather than the nullable projected-base form.
+    assert!(s.contains("let mut p_idx: isize"), "{s}");
+    assert!(!s.contains("p_idx.unwrap()"), "{s}");
+    assert!(
+        s.contains("*((raw).offset(p_idx) as *mut i32).offset(x)"),
+        "{s}"
+    );
+}
+
+#[test]
 fn test_array_local_rewriter_keeps_direct_base_write_cursor_index_only() {
     let code = r#"
 pub unsafe fn wcscat_like(mut dst: *mut i32, mut num_elem: usize, mut src: *const i32) -> i32 {
@@ -9608,13 +9772,14 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "expected field-base cursor local to be rewritten:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("ptr_idx"), "{s}");
+    // cursor is now an Option<isize> because memchr may return null
+    assert!(s.contains("ptr_idx: Option<isize>"), "{s}");
     assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
     assert!(!s.contains("let ptr: *mut i8"), "{s}");
+    // memchr arg inlines the nullable cursor via map_or: ...map_or(...null..., |idx| ...offset(idx)...)
     assert!(
-        s.contains("memchr(((*state).buffer).offset(ptr_idx)")
-            || s.contains("memchr((*state).buffer.offset(ptr_idx)"),
-        "expected memchr to inline ptr_idx from the field base:\n{s}"
+        s.contains("ptr_idx.map_or(") && s.contains(".offset(idx)"),
+        "expected memchr to inline nullable ptr_idx via map_or from the field base:\n{s}"
     );
     assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
     assert!(!s.contains("ptr = found.offset(1)"), "{s}");
@@ -9791,5 +9956,337 @@ pub unsafe fn foo(mut p: *mut i32) -> i32 {
             && e.decision == TraceDecision::Dropped
             && e.reason.contains("q.is_null()")),
         "expected a Prune/Dropped event mentioning the offending assignment: {events:#?}"
+    );
+}
+
+#[test]
+fn test_array_local_partial_group_characterization() {
+    // characterization of the spec's partial_group() shape. with conditional
+    // cursor support (task 2), q's `if`-RHS is now derivable: both branches
+    // express as index values relative to `p_idx`, so q is fully index-rewritten.
+    let code = r#"
+pub unsafe fn partial_group() -> i32 {
+    let mut buf = [0i32; 4];
+    let mut p = buf.as_mut_ptr();
+    let mut q = p.offset(1);
+    q = if *p == 0 { p.offset(2) } else { p };
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    // the rewritten source must always compile (no undeclared *_idx).
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // both p and q are now index-rewritten.
+    assert!(changed, "p and q should be rewritten: {s}");
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(
+        s.contains("let mut p_idx: isize = 0isize"),
+        "p_idx initialized: {s}"
+    );
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    assert!(
+        s.contains("(buf).as_ptr().offset(p_idx) as *mut i32"),
+        "p accesses use buf base with p_idx: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_copies_group_member_in_init_and_assignment() {
+    // q is initialized and re-assigned by directly copying p (another member of
+    // the same {base, p, q} group). both must lower to an index copy q_idx = p_idx.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    *q = 1;
+    q = p;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten: {s}");
+    assert!(s.contains("q_idx"), "q rewritten: {s}");
+    // both the init and the assignment copy the index.
+    assert!(s.matches("q_idx").count() >= 2, "q copied from p_idx: {s}");
+    assert!(
+        !s.contains("let mut q: *mut i32 = p"),
+        "raw copy removed: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_cross_group_copy() {
+    // q is copied from `other`, a raw pointer that is NOT in q's group. q must
+    // stay raw (item-6 model) and the output must still compile.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, other: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = other;
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("let mut q: *mut i32 = other"),
+        "cross-group copy stays raw: {s}"
+    );
+    assert!(!s.contains("q_idx"), "q not index-rewritten: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_member_relative_conditional() {
+    // p is updated by a conditional whose branches are q.offset(1) and q (a
+    // sibling member). it must lower to an index-valued conditional.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    q = q.offset(1);
+    p = if *q != 0 { q.offset(1) } else { q };
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the emitted form splits `p_idx =` and `if` across a line break, so check
+    // both parts independently.
+    assert!(
+        s.contains("p_idx ="),
+        "p updated via an index assignment: {s}"
+    );
+    assert!(
+        s.contains("if *((base).offset(q_idx)"),
+        "condition rewrites *q to base-indexed deref: {s}"
+    );
+    assert!(
+        s.contains("(q_idx) + ((1) as isize)"),
+        "then branch is q_idx+1: {s}"
+    );
+    assert!(s.contains("else { q_idx }"), "else branch is q_idx: {s}");
+    assert!(
+        !s.contains("p = if"),
+        "no raw pointer conditional for p: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_base_relative_conditional() {
+    // both branches derive from the base; indices 2 and 0. a second member `p`
+    // ensures the planner forms a group (a lone `q = base` with no offset may
+    // not trigger planning).
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, c: bool) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base;
+    q = if c { base.offset(2) } else { base };
+    *q + *p
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx"), "q rewritten with index: {s}");
+    assert!(!s.contains("q = if"), "no raw pointer conditional: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_conditional_without_else() {
+    // a conditional missing an else branch is unsupported; q stays raw.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut q: *mut i32 = base.offset(n);
+    if c { q = q.offset(1); }
+    *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // an `if` statement (no else, not an assignment RHS) is not a conditional
+    // cursor update; q's self-advance inside it stays handled as today.
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_tu_linkage_read_stdin_shape() {
+    // mirrors B02_synthetic/tu_linkage::read_stdin: a local array base with two
+    // cursors where q is copied from p (let mut q = p) and p is updated by a
+    // conditional (p = if *q != 0 { q.offset(1) } else { q }).  both must rewrite
+    // to indices.
+    //
+    // `total += *q + *p` keeps p live at the same MIR location as q so that the
+    // simultaneous-liveness gate in classify_rewrite_groups admits the {buf,p,q}
+    // group.  the real B02_synthetic/tu_linkage corpus case also passes the gate
+    // (p is materialized and read in the body).
+    let code = r#"
+pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
+    let mut total: i32 = 0;
+    let mut p: *mut i32 = buf.as_mut_ptr();
+    while *p != 0 {
+        let mut q: *mut i32 = p;
+        while *q != 0 && *q != 32 {
+            q = q.offset(1);
+        }
+        total += *q + *p;
+        p = if *q != 0 { q.offset(1) } else { q };
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    // q is initialized by copying p — let mut q_idx: isize = p_idx.
+    assert!(
+        s.contains("let mut q_idx: isize = p_idx"),
+        "q copy lowered to index copy: {s}"
+    );
+    // the emitted form splits `p_idx =` and `if` across a line break — check parts.
+    assert!(s.contains("p_idx ="), "p updated via index assignment: {s}");
+    // no raw pointer offset operations remain for the two cursors.
+    assert!(!s.contains("q = q.offset(1)"), "q advance lowered: {s}");
+    assert!(!s.contains("p = if *q"), "p conditional lowered: {s}");
+    // p is fully index-only: no kept raw pointer or reference binding.
+    assert!(
+        !s.contains("let mut p: *mut i32") && !s.contains("let mut p: &i32"),
+        "p is index-only: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_copies_nullable_group_member() {
+    // q starts null (Option<isize>) and is later copied from p; the copy must
+    // preserve the Option value (q_idx = p_idx), not re-wrap it.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut p: *mut i32 = std::ptr::null_mut();
+    if c { p = base.offset(n); }
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p;
+    if !q.is_null() { *q = 7; }
+    0
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // p and q are Option<isize>; the copy is a plain Option assignment.
+    assert!(
+        s.contains("q_idx = p_idx"),
+        "nullable copy preserves the Option: {s}"
+    );
+    assert!(
+        !s.contains("q_idx = Some(p_idx)"),
+        "no re-wrap of the Option: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_moving_deref_cursor_index_only() {
+    // two cursors that both move and deref (never passed to a call, never stored
+    // as a pointer value) stay index-only instead of kept &T references.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += *p + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("p_idx") && s.contains("q_idx"),
+        "cursors index-rewritten: {s}"
+    );
+    assert!(
+        !s.contains("let mut p: &i32") && !s.contains("let mut q: &i32"),
+        "moving deref cursors are index-only, not kept references: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_inline_materializes_call_argument_cursor() {
+    // a moving cursor passed to a foreign function stays index-only; the raw
+    // pointer is reconstructed inline at the call, with no kept binding.
+    let code = r#"
+unsafe extern "C" { fn sink(p: *const i32) -> i32; }
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += sink(p) + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p is index-only: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i32"),
+        "no kept raw pointer for p: {s}"
+    );
+    assert!(s.contains("sink("), "call preserved: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_single_base_strstr_cursor() {
+    // a cursor initialised from strstr(base, needle) becomes a nullable
+    // Option<isize> index initialised via offset_from against the base.
+    // q is a second mutable cursor (base + n) that keeps base live in the loop
+    // so the simultaneous-liveness gate in classify_rewrite_groups admits the
+    // {base, p, q} group.
+    let code = r#"
+unsafe extern "C" { fn strstr(h: *const i8, n: *const i8) -> *mut i8; }
+pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
+    let mut p: *mut i8 = strstr(base, needle);
+    let mut q: *mut i8 = base.offset(n);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        if !p.is_null() {
+            total += *p as i32;
+            p = p.offset(1);
+        }
+        total += *q as i32;
+        q = q.offset(-1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p index-rewritten: {s}");
+    assert!(s.contains("Option<isize>"), "nullable index: {s}");
+    assert!(s.contains("offset_from"), "offset_from init: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i8"),
+        "no kept raw pointer for p: {s}"
     );
 }

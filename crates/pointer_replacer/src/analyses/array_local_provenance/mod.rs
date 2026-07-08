@@ -1690,6 +1690,20 @@ pub(crate) fn base_slot_info<'a>(
     provenance.slot_table.slot_infos.get(base_slot)
 }
 
+/// last-segment names of external calls whose arg 0 is a base-preserving
+/// pointer cursor that can be inline-materialised at the call site.
+pub(crate) fn is_inlineable_pointer_arg(name: &str, arg_index: usize) -> bool {
+    matches!(
+        name,
+        "memchr" | "memset" | "strstr" | "strchr" | "strrchr" | "strpbrk"
+    ) && arg_index == 0
+}
+
+pub(crate) fn is_inlineable_call(name: &str) -> bool {
+    // every inlineable call's pointer arg is arg 0, so reuse the single list.
+    is_inlineable_pointer_arg(name, 0)
+}
+
 #[allow(dead_code)]
 pub fn debug_rewrite_groups<'tcx>(
     groups: &[RewriteGroup],
@@ -2220,6 +2234,16 @@ impl<'tcx> Collector<'_, 'tcx> {
             return false;
         }
 
+        self.apply_summary(&summary, args, destination, location)
+    }
+
+    fn apply_summary(
+        &mut self,
+        summary: &FunctionSummary,
+        args: &[Spanned<Operand<'tcx>>],
+        destination: Place<'tcx>,
+        location: Location,
+    ) -> bool {
         let mut return_edges = Vec::new();
         let mut arg_write_edges: FxHashMap<(usize, SlotIdx), Vec<PfgNode>> = FxHashMap::default();
         let mut unknown_returns = Vec::new();
@@ -2344,6 +2368,14 @@ impl<'tcx> Collector<'_, 'tcx> {
         if let Some((def_id, _name)) = call.as_ref()
             && let Some(local_def_id) = def_id.as_local()
             && self.collect_summary_call(local_def_id, args, *destination, location)
+        {
+            return;
+        }
+
+        if let Some((def_id, name)) = call.as_ref()
+            && let Some(summary) =
+                builtin_summary(self.tcx, *def_id, name, args, *destination, self.body)
+            && self.apply_summary(&summary, args, *destination, location)
         {
             return;
         }
@@ -3098,6 +3130,59 @@ fn constant_pointer_reason<'tcx>(operand: &Operand<'tcx>, tcx: TyCtxt<'tcx>) -> 
     }
 }
 
+fn builtin_summary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    name: &str,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: Place<'tcx>,
+    body: &Body<'tcx>,
+) -> Option<FunctionSummary> {
+    if !tcx.is_foreign_item(def_id) {
+        return None;
+    }
+    let last = name.rsplit("::").next()?;
+    let arg0_is_ptr = args
+        .first()
+        .is_some_and(|arg| arg.node.ty(body, tcx).is_raw_ptr());
+    let dst_is_ptr = destination.ty(body, tcx).ty.is_raw_ptr();
+    let base_preserving = || FunctionSummary {
+        completeness: SummaryCompleteness::Complete,
+        return_flows: vec![
+            SummaryFlow {
+                dst_return_path: vec![],
+                src: SummarySource::ParamSlot {
+                    arg_index: 0,
+                    path: vec![],
+                },
+            },
+            SummaryFlow {
+                dst_return_path: vec![],
+                src: SummarySource::Unknown(UnknownReason::NullLike),
+            },
+        ],
+        ..FunctionSummary::default()
+    };
+    let empty_complete = || FunctionSummary {
+        completeness: SummaryCompleteness::Complete,
+        ..FunctionSummary::default()
+    };
+    match last {
+        // base-preserving, null-on-miss: returns a cursor into arg0 or null.
+        "strstr" | "strchr" | "strrchr" | "strpbrk"
+            if args.len() == 2 && arg0_is_ptr && dst_is_ptr =>
+        {
+            Some(base_preserving())
+        }
+        "memchr" if args.len() == 3 && arg0_is_ptr && dst_is_ptr => Some(base_preserving()),
+        // read-only: no pointer return, no pointer-changing arg writes.
+        "strlen" if args.len() == 1 && arg0_is_ptr => Some(empty_complete()),
+        "strcmp" if args.len() == 2 && arg0_is_ptr => Some(empty_complete()),
+        "strncmp" | "memcmp" if args.len() == 3 && arg0_is_ptr => Some(empty_complete()),
+        _ => None,
+    }
+}
+
 fn call_propagates_first_arg<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -3106,26 +3191,8 @@ fn call_propagates_first_arg<'tcx>(
     destination: Place<'tcx>,
     body: &Body<'tcx>,
 ) -> bool {
-    is_memchr_call(tcx, def_id, name, args, destination, body)
-        || is_from_raw_parts_mut_call(tcx, def_id, name, args, destination, body)
+    is_from_raw_parts_mut_call(tcx, def_id, name, args, destination, body)
         || is_slice_index_mut_call(tcx, def_id, name, args, destination, body)
-}
-
-fn is_memchr_call<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    name: &str,
-    args: &[Spanned<Operand<'tcx>>],
-    destination: Place<'tcx>,
-    body: &Body<'tcx>,
-) -> bool {
-    matches!(name.rsplit("::").next(), Some("memchr"))
-        && tcx.is_foreign_item(def_id)
-        && args.len() == 3
-        && args
-            .first()
-            .is_some_and(|arg| arg.node.ty(body, tcx).is_raw_ptr())
-        && destination.ty(body, tcx).ty.is_raw_ptr()
 }
 
 fn is_from_raw_parts_mut_call<'tcx>(
