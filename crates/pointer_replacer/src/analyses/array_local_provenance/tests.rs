@@ -83,21 +83,26 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
                     continue;
                 };
                 let bases = result
-                    .slot_table
+                    .slot_table()
                     .local_head_slot(*local)
                     .and_then(|slot| {
                         result
-                            .provenance
+                            .provenance()
                             .reachable_bases
                             .get(&PfgNode::Slot(slot))
                             .cloned()
                     })
                     .unwrap_or_default();
                 let unique = result.unique_base_of_local(*local);
-                let unique_non_null = result
-                    .slot_table
-                    .local_head_slot(*local)
-                    .and_then(|slot| result.provenance.unique_non_null_base(&PfgNode::Slot(slot)));
+                let unique_non_null =
+                    result
+                        .slot_table()
+                        .local_head_slot(*local)
+                        .and_then(|slot| {
+                            result
+                                .provenance()
+                                .unique_non_null_base(&PfgNode::Slot(slot))
+                        });
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
@@ -140,21 +145,26 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
                     continue;
                 };
                 let bases = result
-                    .slot_table
+                    .slot_table()
                     .local_head_slot(*local)
                     .and_then(|slot| {
                         result
-                            .provenance
+                            .provenance()
                             .reachable_bases
                             .get(&PfgNode::Slot(slot))
                             .cloned()
                     })
                     .unwrap_or_default();
                 let unique = result.unique_base_of_local(*local);
-                let unique_non_null = result
-                    .slot_table
-                    .local_head_slot(*local)
-                    .and_then(|slot| result.provenance.unique_non_null_base(&PfgNode::Slot(slot)));
+                let unique_non_null =
+                    result
+                        .slot_table()
+                        .local_head_slot(*local)
+                        .and_then(|slot| {
+                            result
+                                .provenance()
+                                .unique_non_null_base(&PfgNode::Slot(slot))
+                        });
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
@@ -265,7 +275,7 @@ fn run_rewrite_groups_with_points_to(
                         .members
                         .iter()
                         .filter_map(|slot| {
-                            let info = &result.slot_table.slot_infos[*slot];
+                            let info = &result.slot_table().slot_infos[*slot];
                             super::source_var_identity_for_slot(tcx, &body, &local_names, info)
                         })
                         .collect();
@@ -273,7 +283,7 @@ fn run_rewrite_groups_with_points_to(
                         .members
                         .iter()
                         .filter_map(|slot| {
-                            let info = &result.slot_table.slot_infos[*slot];
+                            let info = &result.slot_table().slot_infos[*slot];
                             local_names.get(&info.root).cloned()
                         })
                         .collect();

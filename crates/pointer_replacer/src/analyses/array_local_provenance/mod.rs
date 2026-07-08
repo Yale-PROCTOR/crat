@@ -22,6 +22,7 @@ use rustc_mir_dataflow::Analysis;
 
 pub(crate) use crate::analyses::pointer_flow::summary::CallEffects;
 pub use crate::analyses::pointer_flow::{
+    PointerFlowResult,
     graph::{BaseId, PfgNode, PointerFlowGraph, ProvenanceResult, UnknownReason},
     slots::{QualifierKey, SlotIdx, SlotInfo, SlotPathElem, SlotTable},
 };
@@ -57,12 +58,27 @@ pub struct BaseClassification {
 
 #[derive(Clone, Debug)]
 pub struct ArrayLocalProvenance {
-    pub slot_table: SlotTable,
-    #[allow(dead_code)]
-    pub graph: PointerFlowGraph,
-    pub provenance: ProvenanceResult,
+    pub flow: PointerFlowResult,
     pub base_classifications: FxHashMap<BaseId, BaseClassification>,
-    pub(crate) call_effects: FxHashMap<Location, CallEffects>,
+}
+
+impl ArrayLocalProvenance {
+    pub fn slot_table(&self) -> &SlotTable {
+        &self.flow.slot_table
+    }
+
+    #[allow(dead_code)]
+    pub fn graph(&self) -> &PointerFlowGraph {
+        &self.flow.graph
+    }
+
+    pub fn provenance(&self) -> &ProvenanceResult {
+        &self.flow.provenance
+    }
+
+    pub(crate) fn call_effects(&self) -> &FxHashMap<Location, CallEffects> {
+        &self.flow.call_effects
+    }
 }
 
 pub struct RewriteGroup {
@@ -98,11 +114,11 @@ pub(crate) enum RewriteGroupStatus {
 #[allow(dead_code)]
 impl ArrayLocalProvenance {
     pub fn unique_base(&self, node: &PfgNode) -> Option<BaseId> {
-        self.provenance.unique_base(node)
+        self.provenance().unique_base(node)
     }
 
     pub fn unique_base_of_local(&self, local: Local) -> Option<BaseId> {
-        let slot = self.slot_table.local_head_slot(local)?;
+        let slot = self.slot_table().local_head_slot(local)?;
         self.unique_base(&PfgNode::Slot(slot))
     }
 
@@ -130,12 +146,12 @@ impl ArrayLocalProvenance {
         );
 
         for (local, decl) in body.local_decls.iter_enumerated() {
-            let Some(slot) = self.slot_table.local_head_slot(local) else {
+            let Some(slot) = self.slot_table().local_head_slot(local) else {
                 continue;
             };
             let node = PfgNode::Slot(slot);
             let bases = self
-                .provenance
+                .provenance()
                 .reachable_bases
                 .get(&node)
                 .cloned()
@@ -196,11 +212,8 @@ fn wrap_flow(flow: crate::analyses::pointer_flow::PointerFlowResult) -> ArrayLoc
         .map(|base| (base.clone(), classify_base(base)))
         .collect();
     ArrayLocalProvenance {
-        slot_table: flow.slot_table,
-        graph: flow.graph,
-        provenance: flow.provenance,
+        flow,
         base_classifications,
-        call_effects: flow.call_effects,
     }
 }
 
@@ -363,20 +376,21 @@ pub(crate) fn classify_rewrite_groups<'a, 'tcx>(
             continue;
         }
 
-        let Some((base_local, base_slot_offset)) = base_local_of_base(base, &provenance.slot_table)
+        let Some((base_local, base_slot_offset)) =
+            base_local_of_base(base, provenance.slot_table())
         else {
             continue;
         };
 
         // collect all slots whose unique reachable base is this base
         let members: Vec<SlotIdx> = provenance
-            .slot_table
+            .slot_table()
             .slot_infos
             .iter()
             .enumerate()
             .filter_map(|(slot_idx, _)| {
                 let node = PfgNode::Slot(slot_idx);
-                if provenance.provenance.unique_non_null_base(&node).as_ref() == Some(base) {
+                if provenance.provenance().unique_non_null_base(&node).as_ref() == Some(base) {
                     Some(slot_idx)
                 } else {
                     None
@@ -394,7 +408,7 @@ pub(crate) fn classify_rewrite_groups<'a, 'tcx>(
         let mut local_mut_roots: FxHashSet<Local> = FxHashSet::default();
         let mut local_imm_roots: FxHashSet<Local> = FxHashSet::default();
         for &slot_idx in &members {
-            let info = &provenance.slot_table.slot_infos[slot_idx];
+            let info = &provenance.slot_table().slot_infos[slot_idx];
             if local_name.contains_key(&info.root) {
                 member_roots.insert(info.root);
             }
@@ -510,7 +524,7 @@ fn member_pointer_elements_match_base_element<'tcx>(
         return true;
     };
     members.iter().all(|&slot_idx| {
-        let Some(info) = provenance.slot_table.slot_infos.get(slot_idx) else {
+        let Some(info) = provenance.slot_table().slot_infos.get(slot_idx) else {
             return true;
         };
         if info.root == base_local || !info.path.is_empty() {
@@ -656,9 +670,9 @@ fn slot_element_ty<'tcx>(
     local: Local,
     slot_offset: usize,
 ) -> Option<Ty<'tcx>> {
-    let slots = provenance.slot_table.local_slots(local);
+    let slots = provenance.slot_table().local_slots(local);
     let slot = slots.start.checked_add(slot_offset)?;
-    let info = provenance.slot_table.slot_infos.get(slot)?;
+    let info = provenance.slot_table().slot_infos.get(slot)?;
     slot_ty(body, tcx, info).and_then(cursor_element_ty)
 }
 
@@ -786,7 +800,7 @@ fn preserved_base_call<'tcx>(
     body: &Body<'tcx>,
     provenance: &ArrayLocalProvenance,
 ) -> Option<Option<PreservedBaseCall>> {
-    let effects = provenance.call_effects.get(&location)?;
+    let effects = provenance.call_effects().get(&location)?;
     if !effects.complete {
         return None;
     }
@@ -802,11 +816,11 @@ fn preserved_base_call<'tcx>(
     let target_root = |arg_index: usize| -> Option<Local> {
         let place = operand_place(&args.get(arg_index)?.node)?;
         let head_slot = provenance
-            .slot_table
+            .slot_table()
             .place_slots(place, body, tcx)?
             .next()?;
         let bases = provenance
-            .provenance
+            .provenance()
             .reachable_bases
             .get(&PfgNode::Slot(head_slot))?;
         let mut roots = FxHashSet::default();
@@ -818,7 +832,7 @@ fn preserved_base_call<'tcx>(
             else {
                 return None;
             };
-            roots.insert(provenance.slot_table.slot_infos.get(*target)?.root);
+            roots.insert(provenance.slot_table().slot_infos.get(*target)?.root);
         }
         (roots.len() == 1)
             .then(|| roots.into_iter().next())
@@ -837,7 +851,7 @@ fn preserved_base_call<'tcx>(
             || write.sources.iter().any(|source| {
                 let source_base = match source {
                     PfgNode::Base(source_base) => Some(source_base.clone()),
-                    _ => provenance.provenance.unique_non_null_base(source),
+                    _ => provenance.provenance().unique_non_null_base(source),
                 };
                 source_base.as_ref() != Some(base)
             })
@@ -882,7 +896,7 @@ fn is_param_base_stable_for_selection(
     }
     let all_member_roots: FxHashSet<Local> = members
         .iter()
-        .filter_map(|slot| context.provenance.slot_table.slot_infos.get(*slot))
+        .filter_map(|slot| context.provenance.slot_table().slot_infos.get(*slot))
         .map(|info| info.root)
         .collect();
 
@@ -935,7 +949,7 @@ fn is_param_base_stable_for_selection(
                 ) {
                     continue;
                 } else {
-                    if context.provenance.call_effects.contains_key(&location) {
+                    if context.provenance.call_effects().contains_key(&location) {
                         match preserved_base_call(
                             context.tcx,
                             location,
@@ -997,7 +1011,7 @@ fn is_param_base_stable_for_selection(
 
 fn slot_path_contains_pointee(provenance: &ArrayLocalProvenance, slot: SlotIdx) -> bool {
     provenance
-        .slot_table
+        .slot_table()
         .slot_infos
         .get(slot)
         .is_some_and(|info| info.path.contains(&SlotPathElem::Pointee))
@@ -1010,7 +1024,7 @@ fn param_base_storage_locs(
     slot: SlotIdx,
     provenance: &ArrayLocalProvenance,
 ) -> Option<FxHashSet<andersen::Loc>> {
-    let info = provenance.slot_table.slot_infos.get(slot)?;
+    let info = provenance.slot_table().slot_infos.get(slot)?;
     let mut nodes = FxHashSet::default();
     nodes.insert(*points_to.var_nodes.get(&(def_id, local))?);
 
@@ -1130,12 +1144,12 @@ fn aggregate_arg_may_write_base_storage<'tcx>(
     let Some(place_path) = slot_path_from_place(place) else {
         return true;
     };
-    let Some(slots) = provenance.slot_table.place_slots(place, body, tcx) else {
+    let Some(slots) = provenance.slot_table().place_slots(place, body, tcx) else {
         return true;
     };
 
     for slot in slots {
-        let Some(info) = provenance.slot_table.slot_infos.get(slot) else {
+        let Some(info) = provenance.slot_table().slot_infos.get(slot) else {
             return true;
         };
         let Some(relative_path) = info.path.strip_prefix(place_path.as_slice()) else {
@@ -1297,7 +1311,7 @@ fn direct_write_overlaps_slot<'tcx>(
         return false;
     };
     provenance
-        .slot_table
+        .slot_table()
         .place_slots(place, body, tcx)
         .is_some_and(|slots| slots.contains(&base_slot))
 }
@@ -1310,7 +1324,7 @@ fn dependent_member_locals(
 ) -> FxHashSet<Local> {
     members
         .iter()
-        .filter_map(|slot| provenance.slot_table.slot_infos.get(*slot))
+        .filter_map(|slot| provenance.slot_table().slot_infos.get(*slot))
         .map(|info| info.root)
         .filter(|local| member_roots.contains(local))
         .filter(|local| *local != base_local)
@@ -1321,12 +1335,12 @@ pub(crate) fn base_slot_info<'a>(
     provenance: &'a ArrayLocalProvenance,
     group: &RewriteGroup,
 ) -> Option<&'a SlotInfo> {
-    let slots = provenance.slot_table.local_slots(group.base_local);
+    let slots = provenance.slot_table().local_slots(group.base_local);
     let base_slot = slots.start.checked_add(group.base_slot_offset)?;
     if base_slot >= slots.end {
         return None;
     }
-    provenance.slot_table.slot_infos.get(base_slot)
+    provenance.slot_table().slot_infos.get(base_slot)
 }
 
 /// last-segment names of external calls whose arg 0 is a base-preserving
@@ -1365,7 +1379,7 @@ pub fn debug_rewrite_groups<'tcx>(
 
     // build a reverse map (root, path) → slot_idx for projection-based name lookup
     let mut slot_by_place: FxHashMap<(Local, Vec<SlotPathElem>), SlotIdx> = FxHashMap::default();
-    for (slot_idx, info) in provenance.slot_table.slot_infos.iter().enumerate() {
+    for (slot_idx, info) in provenance.slot_table().slot_infos.iter().enumerate() {
         slot_by_place
             .entry((info.root, info.path.clone()))
             .or_insert(slot_idx);
@@ -1433,7 +1447,7 @@ pub fn debug_rewrite_groups<'tcx>(
         if let Some(name) = slot_names.get(&slot_idx) {
             return format!("{local:?} \"{name}\"");
         }
-        let info = &provenance.slot_table.slot_infos[slot_idx];
+        let info = &provenance.slot_table().slot_infos[slot_idx];
         if let Some(name) = source_var_identity_for_slot(tcx, body, &local_names, info) {
             return format!("{local:?} \"{name}\"");
         }
@@ -1449,7 +1463,7 @@ pub fn debug_rewrite_groups<'tcx>(
     };
 
     let path_label = |slot_idx: SlotIdx| -> String {
-        let info = &provenance.slot_table.slot_infos[slot_idx];
+        let info = &provenance.slot_table().slot_infos[slot_idx];
         if info.path.is_empty() {
             return String::new();
         }
@@ -1483,7 +1497,7 @@ pub fn debug_rewrite_groups<'tcx>(
             base_label, group.base_slot_offset, group.base,
         );
         for &slot_idx in &group.members {
-            let info = &provenance.slot_table.slot_infos[slot_idx];
+            let info = &provenance.slot_table().slot_infos[slot_idx];
             let pm = match qualifier_at_slot(mutability_result, def_id, info) {
                 Some(PtrMut::Mut) => "*mut",
                 Some(PtrMut::Imm) => "*const",
