@@ -123,3 +123,162 @@ pub unsafe fn passthrough(p: *mut i32) -> *mut i32 {
     assert!(result.field_accesses.is_empty());
     assert!(result.field_rejects.is_empty());
 }
+
+#[test]
+fn direct_field_read() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+    pub b: i32,
+}
+pub unsafe fn read_a(ctx: *mut Ctx) -> i32 {
+    (*ctx).a
+}
+"#,
+        "read_a",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 0);
+    assert_eq!(accesses[0].kind, FieldAccessKind::Read);
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+}
+
+#[test]
+fn direct_field_write() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn write_a(ctx: *mut Ctx) {
+    (*ctx).a = 1;
+}
+"#,
+        "write_a",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].kind, FieldAccessKind::Write);
+}
+
+#[test]
+fn field_address_is_address_kind() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn addr_a(ctx: *mut Ctx) -> *mut i32 {
+    &raw mut (*ctx).a
+}
+"#,
+        "addr_a",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert!(
+        accesses
+            .iter()
+            .any(|a| a.kind == FieldAccessKind::Address && a.field.index() == 0)
+    );
+}
+
+#[test]
+fn access_through_local_alias() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn via_alias(ctx: *mut Ctx) -> i32 {
+    let q = ctx;
+    (*q).a
+}
+"#,
+        "via_alias",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 0);
+}
+
+#[test]
+fn two_fields_both_reported() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+    pub b: i32,
+}
+pub unsafe fn both(ctx: *mut Ctx) -> i32 {
+    (*ctx).b = 2;
+    (*ctx).a
+}
+"#,
+        "both",
+    );
+    let fields: rustc_hash::FxHashSet<usize> = accesses_reaching_param(&result, 0)
+        .iter()
+        .map(|a| a.field.index())
+        .collect();
+    assert_eq!(fields.len(), 2);
+}
+
+#[test]
+fn integer_array_field_is_reported() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub tweaked: [u64; 8],
+}
+pub unsafe fn read_elem(ctx: *mut Ctx, i: usize) -> u64 {
+    (*ctx).tweaked[i]
+}
+"#,
+        "read_elem",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 0);
+}
+
+#[test]
+fn nested_deref_attributes_inner_access_to_inner_pointer() {
+    let result = analyze_single(
+        r#"
+pub struct Node {
+    pub val: i32,
+    pub next: *mut Node,
+}
+pub unsafe fn chase(n: *mut Node) -> i32 {
+    (*(*n).next).val
+}
+"#,
+        "chase",
+    );
+    // only the `next` read is attributed to the parameter; the inner `val`
+    // access belongs to the loaded pointer's own (unknown) provenance
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 1);
+    assert_eq!(accesses[0].kind, FieldAccessKind::Read);
+}
+
+#[test]
+fn non_pointer_struct_local_produces_no_events() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub fn on_stack() -> i32 {
+    let s = Ctx { a: 3 };
+    s.a
+}
+"#,
+        "on_stack",
+    );
+    assert!(result.field_accesses.is_empty());
+    assert!(result.field_rejects.is_empty());
+}
