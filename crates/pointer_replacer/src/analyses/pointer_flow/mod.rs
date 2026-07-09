@@ -7,11 +7,15 @@ use rustc_middle::mir::Location;
 
 pub mod builtin;
 pub mod collector;
+pub mod field_access;
 pub mod graph;
 pub mod slots;
 pub mod summary;
+#[cfg(test)]
+mod tests;
 
 pub use collector::pointer_flow_analysis;
+use field_access::{FieldAccess, FieldAccessReject};
 use graph::{PointerFlowGraph, ProvenanceResult};
 use slots::SlotTable;
 use summary::CallEffects;
@@ -22,4 +26,6 @@ pub struct PointerFlowResult {
     pub graph: PointerFlowGraph,
     pub provenance: ProvenanceResult,
     pub(crate) call_effects: FxHashMap<Location, CallEffects>,
+    pub field_accesses: Vec<FieldAccess>,
+    pub field_rejects: Vec<FieldAccessReject>,
 }

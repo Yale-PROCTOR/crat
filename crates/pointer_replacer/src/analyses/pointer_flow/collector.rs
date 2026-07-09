@@ -24,6 +24,7 @@ use crate::{
                 constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
                 is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
             },
+            field_access::{FieldAccess, FieldAccessReject},
             graph::{BaseId, PfgNode, PointerFlowGraph, UnknownReason, solve_reachable_bases},
             slots::{SlotIdx, SlotPathElem, SlotTable, count_slots},
             summary::{
@@ -113,6 +114,8 @@ pub(crate) struct Collector<'a, 'tcx> {
     pub(crate) rhs_map: FxHashMap<Local, Vec<AssignRhs<'tcx>>>,
     pub(crate) direct_param_slots: FxHashSet<SlotIdx>,
     pub(crate) call_effects: FxHashMap<Location, CallEffects>,
+    pub(crate) field_accesses: Vec<FieldAccess>,
+    pub(crate) field_rejects: Vec<FieldAccessReject>,
 }
 
 impl<'tcx> Collector<'_, 'tcx> {
@@ -1047,10 +1050,14 @@ pub(crate) fn analyze_body_with_summaries<'tcx>(
         rhs_map,
         direct_param_slots: FxHashSet::default(),
         call_effects: FxHashMap::default(),
+        field_accesses: vec![],
+        field_rejects: vec![],
     };
     collector.collect();
     let graph = collector.graph;
     let call_effects = collector.call_effects;
+    let field_accesses = collector.field_accesses;
+    let field_rejects = collector.field_rejects;
     let provenance = solve_reachable_bases(&graph);
 
     PointerFlowResult {
@@ -1058,5 +1065,7 @@ pub(crate) fn analyze_body_with_summaries<'tcx>(
         graph,
         provenance,
         call_effects,
+        field_accesses,
+        field_rejects,
     }
 }
