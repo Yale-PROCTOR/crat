@@ -5,7 +5,10 @@ use rustc_middle::mir::Local;
 use super::{
     PointerFlowResult,
     collector::analyze_body_with_summaries,
-    field_access::{FieldAccess, FieldAccessKind, FieldAccessReject, FieldAccessRejectKind},
+    field_access::{
+        FieldAccess, FieldAccessKind, FieldAccessReject, FieldAccessRejectKind,
+        field_accesses_reachable_from_param,
+    },
     graph::BaseId,
     pointer_flow_analysis,
 };
@@ -656,4 +659,107 @@ pub unsafe fn caller(ctx: *mut Ctx) {
             .iter()
             .any(|r| r.kind == FieldAccessRejectKind::PointerArithmetic)
     );
+}
+
+fn param_query(
+    result: &PointerFlowResult,
+    param_index: usize,
+) -> super::field_access::ParamFieldAccessSummary {
+    field_accesses_reachable_from_param(result, Local::from_usize(param_index + 1))
+        .expect("param should have a head slot")
+}
+
+#[test]
+fn query_reports_single_field_clean_param() {
+    let result = analyze_interprocedural(
+        r#"
+pub struct Ctx {
+    pub tweaked: [u64; 8],
+    pub other: i32,
+}
+pub unsafe fn perm(ctx: *mut Ctx) -> u64 {
+    (*ctx).tweaked[0]
+}
+pub unsafe fn haraka(ctx: *mut Ctx) {
+    perm(ctx);
+}
+"#,
+        "haraka",
+    );
+    let summary = param_query(&result, 0);
+    assert!(summary.rejects.is_empty());
+    assert!(summary.multi_base_nodes.is_empty());
+    assert_eq!(summary.fields.len(), 1);
+}
+
+#[test]
+fn query_ignores_null_initialization() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn null_then_param(ctx: *mut Ctx) -> i32 {
+    let mut q: *mut Ctx = std::ptr::null_mut();
+    q = ctx;
+    (*q).a
+}
+"#,
+        "null_then_param",
+    );
+    let summary = param_query(&result, 0);
+    assert!(summary.multi_base_nodes.is_empty());
+    assert_eq!(summary.fields.len(), 1);
+}
+
+#[test]
+fn query_lists_multi_base_nodes() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn pick(ctx: *mut Ctx, other: *mut Ctx, flag: bool) -> i32 {
+    let q = if flag { ctx } else { other };
+    (*q).a
+}
+"#,
+        "pick",
+    );
+    let summary = param_query(&result, 0);
+    assert!(!summary.multi_base_nodes.is_empty());
+    // the access is still reported (may-base semantics)
+    assert_eq!(summary.fields.len(), 1);
+}
+
+#[test]
+fn query_returns_none_for_non_pointer_param() {
+    let result = analyze_single(
+        r#"
+pub fn scalar(x: i32) -> i32 {
+    x
+}
+"#,
+        "scalar",
+    );
+    assert!(field_accesses_reachable_from_param(&result, Local::from_usize(1)).is_none());
+}
+
+#[test]
+fn nested_deref_query_reports_only_outer_field() {
+    let result = analyze_single(
+        r#"
+pub struct Node {
+    pub val: i32,
+    pub next: *mut Node,
+}
+pub unsafe fn chase(n: *mut Node) -> i32 {
+    (*(*n).next).val
+}
+"#,
+        "chase",
+    );
+    let summary = param_query(&result, 0);
+    let fields: Vec<usize> = summary.fields.iter().map(|f| f.index()).collect();
+    assert_eq!(fields, vec![1]); // only `next`
 }

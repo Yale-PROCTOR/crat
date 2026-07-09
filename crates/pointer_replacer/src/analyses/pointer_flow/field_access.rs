@@ -3,15 +3,21 @@
 //! lookup is a linear filter, acceptable at per-body event counts.
 
 use rustc_abi::FieldIdx;
+use rustc_hash::FxHashSet;
 use rustc_middle::{
     mir::{
-        self, Body, Location, Place, ProjectionElem, Rvalue,
+        self, Body, Local, Location, Place, ProjectionElem, Rvalue,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     },
     ty::{self, TyCtxt},
 };
 
-use crate::analyses::pointer_flow::{collector::operand_place, graph::PfgNode, slots::SlotTable};
+use crate::analyses::pointer_flow::{
+    PointerFlowResult,
+    collector::operand_place,
+    graph::{BaseId, PfgNode, UnknownReason},
+    slots::SlotTable,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldAccess {
@@ -324,4 +330,76 @@ fn classify_place_context(context: PlaceContext) -> FieldAccessKind {
         PlaceContext::MutatingUse(_) => FieldAccessKind::Write,
         _ => FieldAccessKind::Read,
     }
+}
+
+/// per-parameter summary of field accesses and rejects reachable from a
+/// pointer parameter's base, plus any other bases that alias the same nodes.
+pub struct ParamFieldAccessSummary {
+    pub fields: FxHashSet<FieldIdx>,
+    pub accesses: Vec<FieldAccess>,
+    pub rejects: Vec<FieldAccessReject>,
+    /// nodes reachable from the param base that are also reachable from another,
+    /// non-null-like base. iteration order follows hash-map iteration and is
+    /// unspecified; callers must not depend on it.
+    pub multi_base_nodes: Vec<PfgNode>,
+}
+
+/// collects the field accesses and rejects on every node reachable from
+/// `param_local`'s base (may-base semantics: a node reachable from multiple
+/// bases still reports its events here). returns `None` when the parameter
+/// has no head slot, i.e. it is not a tracked pointer.
+pub fn field_accesses_reachable_from_param(
+    result: &PointerFlowResult,
+    param_local: Local,
+) -> Option<ParamFieldAccessSummary> {
+    let head = result.slot_table.local_head_slot(param_local)?;
+    let base = BaseId::Param {
+        local: param_local,
+        slot: head,
+    };
+
+    let mut nodes: FxHashSet<PfgNode> = FxHashSet::default();
+    let mut multi_base_nodes = vec![];
+    for (node, bases) in &result.provenance.reachable_bases {
+        if !bases.contains(&base) {
+            continue;
+        }
+        nodes.insert(node.clone());
+        // null-initialization before assignment is not a competing base,
+        // mirroring unique_non_null_base
+        let has_other_base = bases.iter().any(|b| {
+            b != &base
+                && !matches!(
+                    b,
+                    BaseId::Unknown {
+                        reason: UnknownReason::NullLike,
+                        ..
+                    }
+                )
+        });
+        if has_other_base {
+            multi_base_nodes.push(node.clone());
+        }
+    }
+
+    let accesses: Vec<FieldAccess> = result
+        .field_accesses
+        .iter()
+        .filter(|access| nodes.contains(&access.node))
+        .cloned()
+        .collect();
+    let rejects: Vec<FieldAccessReject> = result
+        .field_rejects
+        .iter()
+        .filter(|reject| nodes.contains(&reject.node))
+        .cloned()
+        .collect();
+    let fields = accesses.iter().map(|access| access.field).collect();
+
+    Some(ParamFieldAccessSummary {
+        fields,
+        accesses,
+        rejects,
+        multi_base_nodes,
+    })
 }
