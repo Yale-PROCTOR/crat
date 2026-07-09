@@ -49,14 +49,7 @@ impl MutProvider for bool {
 
 impl MutProvider for &MutFacts {
     fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
-        if self.all_mut {
-            return true;
-        }
-        self.mutables
-            .get(&fn_did)
-            .and_then(|per_local| per_local.get(local))
-            .copied()
-            .unwrap_or(true) // missing ⇒ Mut (the sole sound default; see `is_defaulted`)
+        MutFacts::is_mutable(self, fn_did, local)
     }
 }
 
@@ -122,6 +115,20 @@ impl MutFacts {
             mutables,
             all_mut: false,
         }
+    }
+
+    /// Per-local outermost-provenance mutability. Missing data (unseen `did` / out-of-range
+    /// `Local`) ⇒ `Mut` (the sole sound default). Inherent so the bo_c1 readout can query it
+    /// directly (the `&T`/`&mut` split); the `MutProvider` impl delegates here.
+    pub(crate) fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
+        if self.all_mut {
+            return true;
+        }
+        self.mutables
+            .get(&fn_did)
+            .and_then(|per_local| per_local.get(local))
+            .copied()
+            .unwrap_or(true)
     }
 
     /// Whether `(fn_did, local)` would fall back to the `Mut` default because the map has no

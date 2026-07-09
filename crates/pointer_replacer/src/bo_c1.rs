@@ -582,6 +582,11 @@ mod run {
             Some(m) => {
                 let (mut n_ref, mut n_raw, mut n_own) = (0usize, 0usize, 0usize);
                 let (mut n_ref_d0, mut n_raw_d0, mut n_own_d0) = (0usize, 0usize, 0usize);
+                // §NB2: split depth-0 Ref into shared (&T) vs mut (&mut T) via the fact map,
+                // and count depth-0 slots that defaulted to Mut for lack of a fact
+                // (missing-data guard — requirement #1; ~0 when the map is complete).
+                let (mut n_ref_shared_d0, mut n_ref_mut_d0, mut mut_default_fires) =
+                    (0usize, 0usize, 0usize);
                 for (s, kind) in m {
                     match kind {
                         SlotKind::Ref => n_ref += 1,
@@ -599,6 +604,18 @@ mod run {
                             SlotKind::Raw => n_raw_d0 += 1,
                             SlotKind::Owning => n_own_d0 += 1,
                         }
+                        if let SlotOwner::Local(local) = u.slot(*sid).owner {
+                            if mut_facts.is_defaulted(*fn_did, local) {
+                                mut_default_fires += 1;
+                            }
+                            if *kind == SlotKind::Ref {
+                                if mut_facts.is_mutable(*fn_did, local) {
+                                    n_ref_mut_d0 += 1;
+                                } else {
+                                    n_ref_shared_d0 += 1;
+                                }
+                            }
+                        }
                     }
                 }
                 let leaked = sources
@@ -612,6 +629,11 @@ mod run {
                 row.set("n_ref_d0", n_ref_d0);
                 row.set("n_raw_d0", n_raw_d0);
                 row.set("n_own_d0", n_own_d0);
+                // §NB2: &T vs &mut split of n_ref_d0 (shared + mut == n_ref_d0), plus the
+                // count of depth-0 slots that fell back to the Mut default.
+                row.set("n_ref_shared_d0", n_ref_shared_d0);
+                row.set("n_ref_mut_d0", n_ref_mut_d0);
+                row.set("mut_default_fires", mut_default_fires);
                 row.set("sources_leaked", leaked);
             }
         }
@@ -1803,6 +1825,10 @@ fn render_report(merged: &[report::Row]) -> String {
         "n_raw",
         "n_own",
         "n_ref_d0",
+        "n_ref_shared_d0",
+        "n_ref_mut_d0",
+        "mut_facts",
+        "mut_default_fires",
         "n_ref_prod",
         "d_ref_d0",
         "sources_total",
