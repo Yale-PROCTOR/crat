@@ -10751,6 +10751,67 @@ pub unsafe fn g(s: *mut S) {
         );
     }
 
+    /// §NB1 adversarial-review fold (Codex, 2026-07-10) — a pure WRITE/overwrite
+    /// destination is NOT a SAFE-MONO site. `(*s).f = malloc()` writes THROUGH
+    /// the parent `s` but does not dereference the field's OLD value as a
+    /// reference, so this site must not couple the (crate-wide) field kind to
+    /// the parent pointer's kind. Contrast `nb1_raw_parent_field_site_demotes`,
+    /// where the field is READ through the parent. The field may therefore be
+    /// `Owning` even when the parent is `Raw`: `raw(s@0) ∧ own(field.f@0)` must
+    /// stay SAT (the store LHS emits no clause). Pre-fold, the walk emitted the
+    /// clause for the store LHS too, spuriously coupling the field to every
+    /// parent pointer and over-demoting on the corpus. SAFE-MONO is heuristic
+    /// pruning — soundness is carried by the acceptance replay, not this clause.
+    #[test]
+    fn nb1_write_dest_does_not_couple_field_to_parent() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct S {
+    pub f: *mut core::ffi::c_void,
+}
+
+pub unsafe fn stash(s: *mut S) {
+    (*s).f = malloc(4);
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "stash");
+                let s_did = struct_by_name(&program, "S");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let solver = KindSolver::new(&slots);
+                add_coherence(&solver, &slots, f, &body);
+                let s = local_by_var_name(tcx, f, "s");
+                let parent = local_slot(&slots, f, s, 0);
+                let field_id = slots
+                    .field_slots
+                    .slot_for_field_depth(
+                        StructFieldSlot {
+                            struct_did: s_did,
+                            field_index: 0,
+                        },
+                        0,
+                    )
+                    .expect("field f depth-0 slot");
+                let field = SlotRef::Field(field_id);
+
+                solver.assume(parent, SlotKind::Raw);
+                solver.assume(field, SlotKind::Owning);
+                assert_eq!(
+                    solver.check(),
+                    SatResult::Sat,
+                    "a store destination must not couple the field kind to the parent pointer"
+                );
+            },
+        );
+    }
+
     /// B3b headline: interprocedural ownership flow across a *return* edge.
     /// `make` allocates and returns ownership; `forward` just returns `make()`'s
     /// result. `forward` contains no `malloc` and no sink, so the *only* path to
