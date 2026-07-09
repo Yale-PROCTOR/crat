@@ -252,18 +252,11 @@ impl<'tcx> Visitor<'tcx> for FieldEventScanner<'_, 'tcx> {
             }
             Rvalue::Aggregate(_, operands) => {
                 // a pointer packed into a composite value is out of slot-tracking
-                for operand in operands {
-                    if let Some(place) = operand_place(operand)
-                        && is_raw_ptr_to_adt(place.ty(self.body, self.tcx).ty)
-                        && let Some(node) = self.head_node(place)
-                    {
-                        self.field_rejects.push(FieldAccessReject {
-                            node,
-                            kind: FieldAccessRejectKind::EscapesToMemory,
-                            location,
-                        });
-                    }
-                }
+                self.reject_escaping_operands(operands.iter(), location);
+            }
+            Rvalue::Repeat(operand, _) => {
+                // a pointer repeated into an array is out of slot-tracking, same as Aggregate
+                self.reject_escaping_operands(std::iter::once(operand), location);
             }
             _ => {}
         }
@@ -276,6 +269,29 @@ impl<'tcx> FieldEventScanner<'_, 'tcx> {
         self.slot_table
             .place_head_slot(place, self.body, self.tcx)
             .map(PfgNode::Slot)
+    }
+
+    // shared by Rvalue::Aggregate and Rvalue::Repeat: any struct-pointer operand
+    // packed into a composite value escapes slot-tracking
+    fn reject_escaping_operands<'a>(
+        &mut self,
+        operands: impl Iterator<Item = &'a mir::Operand<'tcx>>,
+        location: Location,
+    ) where
+        'tcx: 'a,
+    {
+        for operand in operands {
+            if let Some(place) = operand_place(operand)
+                && is_raw_ptr_to_adt(place.ty(self.body, self.tcx).ty)
+                && let Some(node) = self.head_node(place)
+            {
+                self.field_rejects.push(FieldAccessReject {
+                    node,
+                    kind: FieldAccessRejectKind::EscapesToMemory,
+                    location,
+                });
+            }
+        }
     }
 }
 

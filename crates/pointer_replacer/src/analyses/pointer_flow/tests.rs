@@ -471,3 +471,24 @@ pub unsafe fn constify(ctx: *mut Ctx) -> i32 {
     assert!(rejects_reaching_param(&result, 0).is_empty());
     assert_eq!(accesses_reaching_param(&result, 0).len(), 1);
 }
+
+#[test]
+fn repeat_of_param_into_array_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn spread(ctx: *mut Ctx) -> [*mut Ctx; 4] {
+    [ctx; 4]
+}
+"#,
+        "spread",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::EscapesToMemory)
+    );
+}
