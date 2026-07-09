@@ -661,6 +661,79 @@ pub unsafe fn caller(ctx: *mut Ctx) {
     );
 }
 
+#[test]
+fn reborrow_passed_to_extern_callee_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+extern "C" {
+    fn consume_ref(r: &mut Ctx);
+}
+pub unsafe fn leak_reborrow(ctx: *mut Ctx) -> i32 {
+    let r = &mut *ctx;
+    consume_ref(r);
+    (*ctx).a
+}
+"#,
+        "leak_reborrow",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::UnknownCallee)
+    );
+}
+
+#[test]
+fn whole_union_copy_is_rejected() {
+    let result = analyze_single(
+        r#"
+#[derive(Clone, Copy)]
+pub union Val {
+    pub i: i32,
+    pub f: f32,
+}
+pub unsafe fn copy_union(v: *mut Val) -> Val {
+    *v
+}
+"#,
+        "copy_union",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::WholeStructUse)
+    );
+}
+
+#[test]
+fn aggregate_of_param_into_struct_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub struct Wrapper {
+    pub p: *mut Ctx,
+}
+pub unsafe fn wrap(ctx: *mut Ctx) -> Wrapper {
+    Wrapper { p: ctx }
+}
+"#,
+        "wrap",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::EscapesToMemory)
+    );
+}
+
 fn param_query(
     result: &PointerFlowResult,
     param_index: usize,

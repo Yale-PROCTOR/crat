@@ -108,6 +108,9 @@ impl<'a, 'tcx> FieldEventScanner<'a, 'tcx> {
             };
 
             let next = projection.get(i + 1);
+            // rust-native enum pointees are intentionally not handled here:
+            // c2rust does not produce them at this stage, and union_replacer
+            // runs later to introduce tagged unions
             if adt_def.is_union() {
                 match next {
                     Some(ProjectionElem::Field(..)) => {
@@ -120,23 +123,7 @@ impl<'a, 'tcx> FieldEventScanner<'a, 'tcx> {
                             location,
                         });
                     }
-                    _ => {
-                        // plain reborrows `&*q` / `&raw mut *q` are modeled precisely by
-                        // collect_raw_borrow_flow as a flow edge, not a struct use
-                        let plain_reborrow =
-                            projection.len() == 1 && matches!(use_kind, FieldAccessKind::Address);
-                        if plain_reborrow {
-                            continue;
-                        }
-                        let Some(node) = self.prefix_node(place, i) else {
-                            continue;
-                        };
-                        self.field_rejects.push(FieldAccessReject {
-                            node,
-                            kind: FieldAccessRejectKind::WholeStructUse,
-                            location,
-                        });
-                    }
+                    _ => self.record_whole_struct_use(place, i, use_kind, location),
                 }
             } else if adt_def.is_struct() {
                 match next {
@@ -160,26 +147,35 @@ impl<'a, 'tcx> FieldEventScanner<'a, 'tcx> {
                             location,
                         });
                     }
-                    _ => {
-                        // plain reborrows `&*q` / `&raw mut *q` are modeled precisely by
-                        // collect_raw_borrow_flow as a flow edge, not a struct use
-                        let plain_reborrow =
-                            projection.len() == 1 && matches!(use_kind, FieldAccessKind::Address);
-                        if plain_reborrow {
-                            continue;
-                        }
-                        let Some(node) = self.prefix_node(place, i) else {
-                            continue;
-                        };
-                        self.field_rejects.push(FieldAccessReject {
-                            node,
-                            kind: FieldAccessRejectKind::WholeStructUse,
-                            location,
-                        });
-                    }
+                    _ => self.record_whole_struct_use(place, i, use_kind, location),
                 }
             }
         }
+    }
+
+    // shared by the union and struct non-Field arms in scan_place: exempts
+    // plain reborrows (modeled precisely by collect_raw_borrow_flow as a flow
+    // edge, not a struct use) and otherwise pushes a WholeStructUse reject
+    fn record_whole_struct_use(
+        &mut self,
+        place: Place<'tcx>,
+        deref_index: usize,
+        use_kind: FieldAccessKind,
+        location: Location,
+    ) {
+        let projection = place.projection.as_ref();
+        let plain_reborrow = projection.len() == 1 && matches!(use_kind, FieldAccessKind::Address);
+        if plain_reborrow {
+            return;
+        }
+        let Some(node) = self.prefix_node(place, deref_index) else {
+            return;
+        };
+        self.field_rejects.push(FieldAccessReject {
+            node,
+            kind: FieldAccessRejectKind::WholeStructUse,
+            location,
+        });
     }
 }
 

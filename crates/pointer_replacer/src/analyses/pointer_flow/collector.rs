@@ -371,7 +371,18 @@ impl<'tcx> Collector<'_, 'tcx> {
             if !matches!(pointee.kind(), ty::TyKind::Adt(..)) {
                 continue;
             }
-            let Some(slot) = self.slot_table.place_head_slot(place, self.body, self.tcx) else {
+            // place_head_slot only resolves raw-pointer places; reborrows like
+            // `&mut *ctx` are reference-typed but must still be tracked here,
+            // so resolve locally instead of widening place_head_slot itself
+            // (that would also change base_for_raw_borrow's PFG construction)
+            if !arg_ty.is_raw_ptr() && !arg_ty.is_ref() {
+                continue;
+            }
+            let Some(slot) = self
+                .slot_table
+                .place_slots(place, self.body, self.tcx)
+                .and_then(|mut slots| slots.next())
+            else {
                 continue;
             };
             self.field_rejects.push(FieldAccessReject {
@@ -535,7 +546,18 @@ impl<'tcx> Collector<'_, 'tcx> {
         let Some(place) = operand_place(&arg.node) else {
             return;
         };
-        let Some(slot) = self.slot_table.place_head_slot(place, self.body, self.tcx) else {
+        // same widening as record_call_field_rejects: accept reference-typed
+        // places (reborrows) as well as raw pointers, without touching
+        // place_head_slot itself
+        let place_ty = place.ty(self.body, self.tcx).ty;
+        if !place_ty.is_raw_ptr() && !place_ty.is_ref() {
+            return;
+        }
+        let Some(slot) = self
+            .slot_table
+            .place_slots(place, self.body, self.tcx)
+            .and_then(|mut slots| slots.next())
+        else {
             return;
         };
         self.field_rejects.push(FieldAccessReject {
