@@ -19,6 +19,7 @@ use rustc_span::def_id::LocalDefId;
 use super::{
     SlotKind,
     crate_slots::CrateSlots,
+    mutability_facts::MutProvider,
     solver::{KindSolver, Selectors, SlotRef},
 };
 use crate::{
@@ -42,7 +43,7 @@ pub(crate) fn revalidate(
     program: &RustProgram,
     slots: &CrateSlots,
     is_ref: impl Fn(SlotRef) -> bool,
-    is_mutable: bool,
+    is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let edges = borrow::borrow_conflicts(
@@ -55,7 +56,9 @@ pub(crate) fn revalidate(
                     .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
             }
         },
-        move |_fn_did| move |_local| is_mutable,
+        // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+        // skipped by `borrow::invalidates`, so shared reads of one base stop conflicting.
+        move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local),
     );
 
     map_edges_to_slots(slots, edges)
@@ -73,7 +76,7 @@ pub(crate) fn revalidate_replaying(
     slots: &CrateSlots,
     is_ref: impl Fn(SlotRef) -> bool,
     is_raw: impl Fn(SlotRef) -> bool,
-    is_mutable: bool,
+    is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -95,7 +98,9 @@ pub(crate) fn revalidate_replaying(
                     .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
             }
         },
-        move |_fn_did| move |_local| is_mutable,
+        // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+        // skipped by `borrow::invalidates`, so shared reads of one base stop conflicting.
+        move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local),
     );
 
     map_edges_to_slots(slots, edges)
@@ -200,7 +205,7 @@ pub(crate) fn verify_to_fixpoint(
     slots: &CrateSlots,
     solver: &KindSolver,
     selectors: &Selectors,
-    is_mutable: bool,
+    is_mutable: impl MutProvider + Copy,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
