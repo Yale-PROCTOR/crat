@@ -334,6 +334,7 @@ fn classify_place_context(context: PlaceContext) -> FieldAccessKind {
 
 /// per-parameter summary of field accesses and rejects reachable from a
 /// pointer parameter's base, plus any other bases that alias the same nodes.
+#[allow(dead_code)] // query API has no client until Stage 4 (struct-parameter signature rewriting)
 pub struct ParamFieldAccessSummary {
     pub fields: FxHashSet<FieldIdx>,
     pub accesses: Vec<FieldAccess>,
@@ -348,6 +349,7 @@ pub struct ParamFieldAccessSummary {
 /// `param_local`'s base (may-base semantics: a node reachable from multiple
 /// bases still reports its events here). returns `None` when the parameter
 /// has no head slot, i.e. it is not a tracked pointer.
+#[allow(dead_code)] // query API has no client until Stage 4 (struct-parameter signature rewriting)
 pub fn field_accesses_reachable_from_param(
     result: &PointerFlowResult,
     param_local: Local,
