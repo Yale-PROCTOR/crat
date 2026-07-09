@@ -9727,6 +9727,7 @@ mod borrow_ownership_coherence {
                 coherence::{add_coherence, constrain_field_ownership},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
+                mutability_facts::MutFacts,
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
@@ -10807,6 +10808,210 @@ pub unsafe fn stash(s: *mut S) {
                     solver.check(),
                     SatResult::Sat,
                     "a store destination must not couple the field kind to the parent pointer"
+                );
+            },
+        );
+    }
+
+    /// §NB2 — mutability hard facts, the shared-read WIN (requirement #2, coexistence).
+    /// Two aliasing reborrows of one base that are only READ settle Foster `Imm`. Under
+    /// fact-driven mutability, `borrow::invalidates` skips their immutable loans
+    /// (`invalidates.rs:73`), so the aliasing produces no conflict and every slot stays `Ref`.
+    /// The control prong (forced-mut, pre-NB2) treats the same reads as mutable and demotes
+    /// >=1 slot — the two-prong design proves the mutability facts are the *sole* cause of the
+    /// win (identical program, only the oracle differs). Structurally this is the `bb0`
+    /// conflict with reads in place of writes.
+    ///
+    /// Liveness note: `errors = loan_liveness ∩ invalidates` (`errors.rs:8`), and `is_mutable`
+    /// is read ONLY in `invalidates` — so an immutable loan still fully participates in
+    /// liveness; only its invalidation is suppressed. That participation is structural (no
+    /// fixture can break it), which is why this pair pins invalidation, not liveness.
+    #[test]
+    fn nb2_two_shared_reads_both_ref() {
+        run_compiler(
+            r#"
+unsafe fn f(mut p: *mut i32) -> i32 {
+    let mut r1 = p;
+    let mut r2 = r1;
+    let mut q = r1;
+    let a = *q;
+    let b = *r1;
+    let c = *r2;
+    let d = *p;
+    a + b + c + d
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let slot_of =
+                    |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
+                let names = ["p", "r1", "r2", "q"];
+
+                // Control: forced-mutable (pre-NB2) — the aliasing reads are treated as
+                // mutable, so the CEGAR loop demotes >=1 slot off Ref.
+                let model_ctrl = {
+                    let solver = KindSolver::new(&slots);
+                    let (_s, selectors) =
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                            .expect("control emission");
+                    add_coherence(&solver, &slots, f, &body);
+                    verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                        .expect("control accepts")
+                };
+                let ctrl_ref = names
+                    .iter()
+                    .filter(|n| model_ctrl.get(&slot_of(n)) == Some(&SlotKind::Ref))
+                    .count();
+                assert!(
+                    ctrl_ref < names.len(),
+                    "forced-mut control: aliasing reads must demote >=1 slot; all stayed Ref"
+                );
+
+                // Treatment: fact-driven — all reads ⇒ Foster Imm ⇒ immutable loans skipped ⇒
+                // no conflict ⇒ every slot stays Ref.
+                let facts = MutFacts::from_program(&program);
+                let model_fact = {
+                    let solver = KindSolver::new(&slots);
+                    let (_s, selectors) =
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                            .expect("treatment emission");
+                    add_coherence(&solver, &slots, f, &body);
+                    verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+                        .expect("treatment accepts")
+                };
+                for n in names {
+                    assert_eq!(
+                        model_fact.get(&slot_of(n)),
+                        Some(&SlotKind::Ref),
+                        "fact-driven: `{n}` stays Ref (shared read, immutable loan skipped)"
+                    );
+                }
+            },
+        );
+    }
+
+    /// §NB2 — the write direction (requirement #2, "killed by a write"). A pointer WRITTEN
+    /// through is Foster `Mut`, so its loan is NOT skipped: the aliasing conflict survives
+    /// fact-driven mutability exactly as under forced-mut, and >=1 slot is still demoted. This
+    /// is the over-`Mut` sound direction (facts may only ADD conflicts vs a wrongly-immutable
+    /// slot); companion to `nb2_two_shared_reads_both_ref` (reads relax, writes do not). The
+    /// program is the `bb0` conflict verbatim.
+    #[test]
+    fn nb2_written_base_still_conflicts() {
+        run_compiler(
+            r#"
+unsafe fn f(mut p: *mut i32) -> i32 {
+    let mut r1 = p;
+    let mut r2 = r1;
+    let mut q = r1;
+    *q = 1;
+    *r1 = 2;
+    *r2 = 3;
+    *p = 4;
+    *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let slot_of =
+                    |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
+                let names = ["p", "r1", "r2", "q"];
+
+                let facts = MutFacts::from_program(&program);
+                let model = {
+                    let solver = KindSolver::new(&slots);
+                    let (_s, selectors) =
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                            .expect("emission");
+                    add_coherence(&solver, &slots, f, &body);
+                    verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+                        .expect("accepts")
+                };
+                let ref_count = names
+                    .iter()
+                    .filter(|n| model.get(&slot_of(n)) == Some(&SlotKind::Ref))
+                    .count();
+                assert!(
+                    ref_count < names.len(),
+                    "fact-driven: written bases stay Mut, so the conflict survives (>=1 demoted)"
+                );
+            },
+        );
+    }
+
+    /// §NB2 S2-6 witness — the cross-alias immutable-loan invalidation gap (amendment: pin the
+    /// RAW-writer variant). `reader` is only read ⇒ Foster `Imm` ⇒ shared `Ref`. The `p`/`r1`/
+    /// `r2`/`q` aliases are all WRITTEN through and mutably conflict (the `bb0` conflict), so
+    /// the CEGAR loop demotes one to `Raw` — a raw mutable writer of `*p`, a cell that may
+    /// alias `*reader`. (NB: BO's kind solver produces `Raw` only via borrow-conflict demotion,
+    /// not from fatness/provenance-breaking ops — the max-`Ref` objective keeps a bare
+    /// `addr as *mut i32` or extern-escaped pointer `Ref` — so a genuine conflict is how the
+    /// witness realizes a raw writer, exactly as on the corpus.) Under fact-driven mutability
+    /// `invalidates` skips `reader`'s immutable loan, so `reader` is NOT demoted even though
+    /// the raw write hits a cell it may alias (raw pointers give the analysis no non-aliasing
+    /// guarantee). Sound TODAY only via the §8 guardrail (BO unconsumed by codegen); at C2 it
+    /// is a rewriter obligation (**S2-6**). The two codegen instantiations:
+    ///   * the raw writer stays `Raw` (THIS fixture): compiles, and a foreign raw write to
+    ///     `reader`'s frozen `&` referent is genuine Tree-Borrows UB — SILENTLY shipped. The
+    ///     one S2-6 exists for.
+    ///   * every writer promoted to `&mut`: post-rewrite rustc rejects the `&`/`&mut` alias —
+    ///     caught. This is a characterization test (documents current behavior), not a win.
+    #[test]
+    fn nb2_cross_alias_write_uncaught_witness() {
+        run_compiler(
+            r#"
+unsafe fn f(mut p: *mut i32, reader: *mut i32) -> i32 {
+    let a0 = *reader;
+    let mut r1 = p;
+    let mut r2 = r1;
+    let mut q = r1;
+    *q = 1;
+    *r1 = 2;
+    *r2 = 3;
+    *p = 4;
+    let a1 = *reader;
+    a0 + a1 + *p
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let slot_of =
+                    |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
+
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        .expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+                    .expect("accepts");
+
+                // The immutable reader survives as a shared Ref despite the cross-alias write.
+                assert_eq!(
+                    model.get(&slot_of("reader")),
+                    Some(&SlotKind::Ref),
+                    "S2-6: immutable `reader` stays a shared Ref across a cross-alias raw write"
+                );
+                // The mutable conflict demotes a written alias to a Raw writer (silent-UB mode).
+                let raw_writer = ["p", "r1", "r2", "q"]
+                    .iter()
+                    .any(|n| model.get(&slot_of(n)) == Some(&SlotKind::Raw));
+                assert!(
+                    raw_writer,
+                    "S2-6 witness pins the raw-writer variant (a mutable alias demotes to Raw)"
                 );
             },
         );

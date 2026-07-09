@@ -295,6 +295,7 @@ mod mirror {
         borrow_verify::{SlotConflict, revalidate_replaying},
         coherence::constrain_field_ownership,
         crate_slots::CrateSlots,
+        mutability_facts::MutProvider,
         solver::{KindSolver, Selectors, SlotRef},
     };
     use crate::utils::rustc::RustProgram;
@@ -325,7 +326,7 @@ mod mirror {
         slots: &CrateSlots,
         solver: &KindSolver,
         selectors: &Selectors,
-        is_mutable: bool,
+        is_mutable: impl MutProvider + Copy,
     ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
         // §NB-R guard — mirrors the real loop's release-active refusal of
         // tracked solvers (kept in lockstep with borrow_verify.rs).
@@ -433,6 +434,7 @@ mod run {
             coherence::add_coherence,
             crate_slots::CrateSlots,
             emit_crate_ownership_constraints,
+            mutability_facts::{MutFacts, MutFactsMode},
             slots::{SlotId, SlotOwner},
             solver::{KindSolver, Selectors, SlotRef},
             sources::collect_malloc_source_slots,
@@ -495,6 +497,9 @@ mod run {
         // §NB1: record the active safety-monotonicity mode so the ablation
         // sweeps (per_site vs chain) are self-labeling in the results.
         row.set("safe_mono", SafeMonoMode::current().label());
+        // §NB2: record the active mutability-facts mode (on = fact-driven immutability from
+        // Foster; off = pre-NB2 forced-mut) so the dual-mode sweep is self-labeling.
+        row.set("mut_facts", MutFactsMode::current().label());
         phase("emit_done", t0);
 
         let t = Instant::now();
@@ -505,9 +510,18 @@ mod run {
         row.set("t_coherence_s", secs(t.elapsed()));
         phase("coherence_done", t0);
 
+        // §NB2: build the per-local mutability oracle once (production-parity map). Mode Off
+        // reproduces pre-NB2 forced-mut; the borrow replay reads it per pointer local.
+        let t = Instant::now();
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
+        row.set("t_mut_facts_s", secs(t.elapsed()));
+
         let t = Instant::now();
         let (model, rstats) =
-            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true);
+            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts);
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
 
@@ -618,7 +632,9 @@ mod run {
                             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                             add_coherence(&solver, &slots, g, &body);
                         }
-                        Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, true))
+                        // §NB2: same oracle as the mirror above, so the fidelity check
+                        // compares like with like (mirror facts vs real facts).
+                        Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts))
                     }
                     Err(_) => None,
                 }

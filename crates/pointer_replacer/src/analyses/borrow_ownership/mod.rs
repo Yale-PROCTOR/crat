@@ -14,6 +14,7 @@ pub mod coherence;
 pub mod crate_slots;
 pub(crate) mod sources;
 pub mod resolve;
+pub(crate) mod mutability_facts;
 pub(crate) mod safety_mono;
 pub mod solver;
 pub mod slots;
