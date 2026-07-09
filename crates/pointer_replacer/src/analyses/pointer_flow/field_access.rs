@@ -5,13 +5,13 @@
 use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{
-        Body, Location, Place, ProjectionElem,
+        self, Body, Location, Place, ProjectionElem, Rvalue,
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor},
     },
     ty::{self, TyCtxt},
 };
 
-use crate::analyses::pointer_flow::{graph::PfgNode, slots::SlotTable};
+use crate::analyses::pointer_flow::{collector::operand_place, graph::PfgNode, slots::SlotTable};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldAccess {
@@ -182,6 +182,117 @@ impl<'tcx> Visitor<'tcx> for FieldEventScanner<'_, 'tcx> {
         self.scan_place(*place, context, location);
         self.super_place(place, context, location);
     }
+
+    fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
+        // returning a pointer value: record on the return slot node; reachability
+        // decides which parameters it concerns
+        if place.local == mir::RETURN_PLACE
+            && place.projection.is_empty()
+            && let Some(slot) = self.slot_table.local_head_slot(place.local)
+        {
+            self.field_rejects.push(FieldAccessReject {
+                node: PfgNode::Slot(slot),
+                kind: FieldAccessRejectKind::Returned,
+                location,
+            });
+        }
+
+        // storing a struct-pointer value through a deref is tracked by the PFG,
+        // but the use itself is not rewritable by param specialization (the
+        // destination cell's declared type keeps the pointer alive) — see plan notes
+        if let Some(src_place) = assigned_pointer_source(rvalue)
+            && is_raw_ptr_to_adt(src_place.ty(self.body, self.tcx).ty)
+            && (place
+                .projection
+                .iter()
+                .any(|elem| matches!(elem, ProjectionElem::Deref))
+                || self
+                    .slot_table
+                    .place_slots(*place, self.body, self.tcx)
+                    .is_none())
+            && let Some(node) = self.head_node(src_place)
+        {
+            self.field_rejects.push(FieldAccessReject {
+                node,
+                kind: FieldAccessRejectKind::EscapesToMemory,
+                location,
+            });
+        }
+
+        self.super_assign(place, rvalue, location);
+    }
+
+    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+        match rvalue {
+            Rvalue::Cast(_, operand, target_ty) => {
+                if let Some(place) = operand_place(operand)
+                    && let src_ty = place.ty(self.body, self.tcx).ty
+                    && is_raw_ptr_to_adt(src_ty)
+                    && src_ty.builtin_deref(true) != target_ty.builtin_deref(true)
+                    && let Some(node) = self.head_node(place)
+                {
+                    self.field_rejects.push(FieldAccessReject {
+                        node,
+                        kind: FieldAccessRejectKind::IncompatibleCast,
+                        location,
+                    });
+                }
+            }
+            Rvalue::BinaryOp(mir::BinOp::Offset, box (lhs, _)) => {
+                if let Some(place) = operand_place(lhs)
+                    && is_raw_ptr_to_adt(place.ty(self.body, self.tcx).ty)
+                    && let Some(node) = self.head_node(place)
+                {
+                    self.field_rejects.push(FieldAccessReject {
+                        node,
+                        kind: FieldAccessRejectKind::PointerArithmetic,
+                        location,
+                    });
+                }
+            }
+            Rvalue::Aggregate(_, operands) => {
+                // a pointer packed into a composite value is out of slot-tracking
+                for operand in operands {
+                    if let Some(place) = operand_place(operand)
+                        && is_raw_ptr_to_adt(place.ty(self.body, self.tcx).ty)
+                        && let Some(node) = self.head_node(place)
+                    {
+                        self.field_rejects.push(FieldAccessReject {
+                            node,
+                            kind: FieldAccessRejectKind::EscapesToMemory,
+                            location,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.super_rvalue(rvalue, location);
+    }
+}
+
+impl<'tcx> FieldEventScanner<'_, 'tcx> {
+    fn head_node(&self, place: Place<'tcx>) -> Option<PfgNode> {
+        self.slot_table
+            .place_head_slot(place, self.body, self.tcx)
+            .map(PfgNode::Slot)
+    }
+}
+
+// use/cast/copy-for-deref of a place — the shapes a pointer store takes in MIR
+fn assigned_pointer_source<'tcx>(rvalue: &Rvalue<'tcx>) -> Option<Place<'tcx>> {
+    match rvalue {
+        Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand_place(operand),
+        Rvalue::CopyForDeref(place) => Some(*place),
+        _ => None,
+    }
+}
+
+fn is_raw_ptr_to_adt(ty: ty::Ty<'_>) -> bool {
+    ty.is_raw_ptr()
+        && ty
+            .builtin_deref(true)
+            .is_some_and(|pointee| matches!(pointee.kind(), ty::TyKind::Adt(..)))
 }
 
 fn classify_place_context(context: PlaceContext) -> FieldAccessKind {

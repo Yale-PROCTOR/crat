@@ -121,7 +121,14 @@ pub unsafe fn passthrough(p: *mut i32) -> *mut i32 {
         "passthrough",
     );
     assert!(result.field_accesses.is_empty());
-    assert!(result.field_rejects.is_empty());
+    // returning the pointer records a Returned reject on the return slot;
+    // the pointee is not a struct, so nothing else appears
+    assert!(
+        result
+            .field_rejects
+            .iter()
+            .all(|r| r.kind == FieldAccessRejectKind::Returned)
+    );
 }
 
 #[test]
@@ -369,4 +376,98 @@ pub unsafe fn read_union(v: *mut Val) -> i32 {
             .iter()
             .any(|r| r.kind == FieldAccessRejectKind::UnionFieldAccess)
     );
+}
+
+#[test]
+fn returning_the_param_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn id(ctx: *mut Ctx) -> *mut Ctx {
+    ctx
+}
+"#,
+        "id",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::Returned)
+    );
+}
+
+#[test]
+fn storing_param_into_memory_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub struct Holder {
+    pub p: *mut Ctx,
+}
+pub unsafe fn stash(h: *mut Holder, ctx: *mut Ctx) {
+    (*h).p = ctx;
+}
+"#,
+        "stash",
+    );
+    // ctx escapes into (*h).p
+    let ctx_rejects = rejects_reaching_param(&result, 1);
+    assert!(
+        ctx_rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::EscapesToMemory)
+    );
+    // h itself only gets a field write, no reject
+    let h_accesses = accesses_reaching_param(&result, 0);
+    assert!(
+        h_accesses
+            .iter()
+            .any(|a| a.field.index() == 0 && a.kind == FieldAccessKind::Write)
+    );
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+}
+
+#[test]
+fn incompatible_cast_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn as_bytes(ctx: *mut Ctx) -> u8 {
+    let p = ctx as *mut u8;
+    *p
+}
+"#,
+        "as_bytes",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::IncompatibleCast)
+    );
+}
+
+#[test]
+fn mut_to_const_cast_is_not_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn constify(ctx: *mut Ctx) -> i32 {
+    let p = ctx as *const Ctx;
+    (*p).a
+}
+"#,
+        "constify",
+    );
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+    assert_eq!(accesses_reaching_param(&result, 0).len(), 1);
 }
