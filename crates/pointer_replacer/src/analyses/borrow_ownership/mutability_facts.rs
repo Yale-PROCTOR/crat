@@ -12,12 +12,23 @@
 //! per-`(LocalDefId, Local)` boolean. The `&T`/`&mut T` distinction is a *readout* fact, not
 //! a solver kind (the domain has only `Raw`/`Ref`/`Owning`).
 //!
-//! Sound direction: Foster over-approximates `Mut` (`on_deref` bottoms every deref-LHS), and
-//! missing map data defaults to `Mut` — the sole unsound direction is a wrongly-immutable slot
-//! (a `&T` where `&mut T` is needed), so both fall back to `Mut`. The residual — an immutable
-//! loan not invalidated by a *cross-alias* WRITE through a `Raw` pointer — matches production's
-//! own `_no_guarantee` posture (`borrow::classified_references_..._no_guarantee`) and is gated
-//! at **S2-6**; sound today only because BO output is unconsumed by codegen (the §8 guardrail).
+//! Soundness (corrected per adversarial review 2026-07-10 — this is NOT "Foster
+//! over-approximates `Mut`"): Foster is *precise per-pointer* — it marks a pointer `Imm` iff
+//! that pointer is never written THROUGH, which is NOT the same as its referent cell being
+//! immutable. A read-only copy whose cell is written through a *sibling* pointer is therefore
+//! `Imm`, and its loan IS skipped by `invalidates.rs:73` — the latent S2-6 cross-alias gap
+//! (witnessed by `nb2_cross_alias_write_uncaught_witness`). Two legs keep this sound today:
+//!   1. MISSING map data defaults to `Mut` (`is_mutable` below) — the sole unsound *data*
+//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict.
+//!   2. At the ACCEPTANCE level, the flow-insensitive **coherence equate-closure** unifies each
+//!      copy cluster and demotes it to `Raw` when any member is written, so a skipped `Imm`
+//!      view never survives as a shared `Ref` aliasing a written cell. This is what actually
+//!      guards the cross-alias case (mode-independent — NOT the skip, NOT Foster's direction),
+//!      matching production's own `_no_guarantee` posture
+//!      (`borrow::classified_references_..._no_guarantee`).
+//! If the equate-closure is relaxed for flow-sensitivity (`borrow_verify.rs` BB3-b), the gap
+//! becomes an ACCEPTANCE-level unsoundness — hence **S2-6** gates codegen consumption; the §8
+//! guardrail (BO unconsumed by codegen) is the further backstop, not the primary reason.
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;

@@ -10894,12 +10894,14 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// §NB2 — the write direction (requirement #2, "killed by a write"). A pointer WRITTEN
-    /// through is Foster `Mut`, so its loan is NOT skipped: the aliasing conflict survives
-    /// fact-driven mutability exactly as under forced-mut, and >=1 slot is still demoted. This
-    /// is the over-`Mut` sound direction (facts may only ADD conflicts vs a wrongly-immutable
-    /// slot); companion to `nb2_two_shared_reads_both_ref` (reads relax, writes do not). The
-    /// program is the `bb0` conflict verbatim.
+    /// §NB2 — the write direction (requirement #2, "killed by a write"). A pointer written
+    /// through ITSELF is Foster `Mut` (Foster is precise for the same-pointer case), so its
+    /// loan is NOT skipped: the aliasing conflict survives fact-driven mutability exactly as
+    /// under forced-mut, and >=1 slot is still demoted. Companion to
+    /// `nb2_two_shared_reads_both_ref` (reads relax, writes do not). The program is the `bb0`
+    /// conflict verbatim. (The cross-alias case — a cell written through a *sibling* while a
+    /// read-only view stays `Imm` — is the separate S2-6 gap; see
+    /// `nb2_cross_alias_write_uncaught_witness`.)
     #[test]
     fn nb2_written_base_still_conflicts() {
         run_compiler(
@@ -10947,38 +10949,38 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// §NB2 S2-6 witness — the cross-alias immutable-loan invalidation gap (amendment: pin the
-    /// RAW-writer variant). `reader` is only read ⇒ Foster `Imm` ⇒ shared `Ref`. The `p`/`r1`/
-    /// `r2`/`q` aliases are all WRITTEN through and mutably conflict (the `bb0` conflict), so
-    /// the CEGAR loop demotes one to `Raw` — a raw mutable writer of `*p`, a cell that may
-    /// alias `*reader`. (NB: BO's kind solver produces `Raw` only via borrow-conflict demotion,
-    /// not from fatness/provenance-breaking ops — the max-`Ref` objective keeps a bare
-    /// `addr as *mut i32` or extern-escaped pointer `Ref` — so a genuine conflict is how the
-    /// witness realizes a raw writer, exactly as on the corpus.) Under fact-driven mutability
-    /// `invalidates` skips `reader`'s immutable loan, so `reader` is NOT demoted even though
-    /// the raw write hits a cell it may alias (raw pointers give the analysis no non-aliasing
-    /// guarantee). Sound TODAY only via the §8 guardrail (BO unconsumed by codegen); at C2 it
-    /// is a rewriter obligation (**S2-6**). The two codegen instantiations:
-    ///   * the raw writer stays `Raw` (THIS fixture): compiles, and a foreign raw write to
-    ///     `reader`'s frozen `&` referent is genuine Tree-Borrows UB — SILENTLY shipped. The
-    ///     one S2-6 exists for.
-    ///   * every writer promoted to `&mut`: post-rewrite rustc rejects the `&`/`&mut` alias —
-    ///     caught. This is a characterization test (documents current behavior), not a win.
+    /// §NB2 S2-6 witness — the cross-alias immutable-loan invalidation gap, and (the
+    /// adversarial-review correction, 2026-07-10) the *real* acceptance-level guard.
+    ///
+    /// `xp`/`z` are read-only copies of `p` (only `*z` is read). Foster classifies them `Imm`
+    /// — **verified below** — EVEN THOUGH the cell is written through the sibling `b` (`*b =
+    /// 5`). This refutes the naive "Foster over-approximates `Mut`, so never wrongly-immutable"
+    /// story: Foster is *precise per-pointer* (`z` is genuinely never-written-THROUGH), which is
+    /// NOT the same as the cell being immutable. So `z`'s loan (base `xp`, `Imm`) IS skip-
+    /// eligible at `invalidates.rs:73` — the latent S2-6 gap.
+    ///
+    /// What keeps this SOUND at the acceptance level today is NOT the skip and NOT Foster: it is
+    /// the flow-insensitive **coherence equate-closure**, which unifies the `p`/`xp`/`z`/`b`
+    /// copy cluster and demotes it to `Raw` because `b` is written. The witness pins that:
+    /// `z` is `Raw` **identically under forced-mut and fact-driven mutability**, so the skip
+    /// makes no difference — the equate-closure (mode-independent) is the guard. If the
+    /// equate-closure is later relaxed for flow-sensitivity (`borrow_verify.rs` BB3-b residual),
+    /// `z`'s skipped loan would let it survive as a shared `&T` aliasing a cell written via `b`
+    /// — an **acceptance-level** unsoundness, not merely the §8 codegen concern. That is why
+    /// **S2-6** gates codegen consumption. The §8 guardrail (BO unconsumed) is the further
+    /// backstop, not the primary reason.
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
             r#"
-unsafe fn f(mut p: *mut i32, reader: *mut i32) -> i32 {
-    let a0 = *reader;
-    let mut r1 = p;
-    let mut r2 = r1;
-    let mut q = r1;
-    *q = 1;
-    *r1 = 2;
-    *r2 = 3;
-    *p = 4;
-    let a1 = *reader;
-    a0 + a1 + *p
+unsafe fn f(mut p: *mut i32) -> i32 {
+    let xp = p;
+    let z = xp;
+    let b = p;
+    let r0 = *z;
+    *b = 5;
+    let r1 = *z;
+    r0 + r1
 }
 "#,
             |tcx| {
@@ -10989,29 +10991,53 @@ unsafe fn f(mut p: *mut i32, reader: *mut i32) -> i32 {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let slot_of =
                     |name: &str| local_slot(&slots, f, local_by_var_name(tcx, f, name), 0);
+                let local_of = |name: &str| local_by_var_name(tcx, f, name);
 
                 let facts = MutFacts::from_program(&program);
-                let solver = KindSolver::new(&slots);
-                let (_s, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
-                        .expect("emission");
-                add_coherence(&solver, &slots, f, &body);
-                let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
-                    .expect("accepts");
-
-                // The immutable reader survives as a shared Ref despite the cross-alias write.
-                assert_eq!(
-                    model.get(&slot_of("reader")),
-                    Some(&SlotKind::Ref),
-                    "S2-6: immutable `reader` stays a shared Ref across a cross-alias raw write"
-                );
-                // The mutable conflict demotes a written alias to a Raw writer (silent-UB mode).
-                let raw_writer = ["p", "r1", "r2", "q"]
-                    .iter()
-                    .any(|n| model.get(&slot_of(n)) == Some(&SlotKind::Raw));
+                // `z` (a read-only view) is Foster-Imm ⇒ its loan is skip-eligible, EVEN THOUGH
+                // the cell is written through the mutable sibling `b`. This is the S2-6 gap.
                 assert!(
-                    raw_writer,
-                    "S2-6 witness pins the raw-writer variant (a mutable alias demotes to Raw)"
+                    !facts.is_mutable(f, local_of("z")),
+                    "`z` is a read-only view ⇒ Foster Imm ⇒ its loan is skip-eligible"
+                );
+                assert!(
+                    facts.is_mutable(f, local_of("b")),
+                    "`b` writes the same cell ⇒ Foster Mut (the cross-alias writer)"
+                );
+
+                let kind_of_z = |mf_true: bool| {
+                    let solver = KindSolver::new(&slots);
+                    let (_s, selectors) =
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                            .expect("emission");
+                    add_coherence(&solver, &slots, f, &body);
+                    let z = slot_of("z");
+                    if mf_true {
+                        verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                            .expect("accepts")
+                            .get(&z)
+                            .copied()
+                    } else {
+                        verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+                            .expect("accepts")
+                            .get(&z)
+                            .copied()
+                    }
+                };
+
+                // The acceptance-level guard is the coherence equate-closure, NOT the skip:
+                // `z` is Raw identically in both modes, so fact-driven mutability changed
+                // nothing here. Were the equate-closure relaxed, the skipped Imm view would
+                // survive as an unsound shared Ref (S2-6).
+                assert_eq!(
+                    kind_of_z(false),
+                    Some(SlotKind::Raw),
+                    "fact-driven: the equate-closure demotes the written copy cluster, so `z` is Raw"
+                );
+                assert_eq!(
+                    kind_of_z(true),
+                    Some(SlotKind::Raw),
+                    "forced-mut: `z` is Raw too ⇒ the equate-closure (not the skip) is the guard"
                 );
             },
         );
