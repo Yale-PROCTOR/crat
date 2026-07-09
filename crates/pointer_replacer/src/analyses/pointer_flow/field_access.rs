@@ -103,14 +103,35 @@ impl<'a, 'tcx> FieldEventScanner<'a, 'tcx> {
 
             let next = projection.get(i + 1);
             if adt_def.is_union() {
-                let Some(node) = self.prefix_node(place, i) else {
-                    continue;
-                };
-                self.field_rejects.push(FieldAccessReject {
-                    node,
-                    kind: FieldAccessRejectKind::UnionFieldAccess,
-                    location,
-                });
+                match next {
+                    Some(ProjectionElem::Field(..)) => {
+                        let Some(node) = self.prefix_node(place, i) else {
+                            continue;
+                        };
+                        self.field_rejects.push(FieldAccessReject {
+                            node,
+                            kind: FieldAccessRejectKind::UnionFieldAccess,
+                            location,
+                        });
+                    }
+                    _ => {
+                        // plain reborrows `&*q` / `&raw mut *q` are modeled precisely by
+                        // collect_raw_borrow_flow as a flow edge, not a struct use
+                        let plain_reborrow =
+                            projection.len() == 1 && matches!(use_kind, FieldAccessKind::Address);
+                        if plain_reborrow {
+                            continue;
+                        }
+                        let Some(node) = self.prefix_node(place, i) else {
+                            continue;
+                        };
+                        self.field_rejects.push(FieldAccessReject {
+                            node,
+                            kind: FieldAccessRejectKind::WholeStructUse,
+                            location,
+                        });
+                    }
+                }
             } else if adt_def.is_struct() {
                 match next {
                     Some(ProjectionElem::Field(field, _)) => {
@@ -134,8 +155,21 @@ impl<'a, 'tcx> FieldEventScanner<'a, 'tcx> {
                         });
                     }
                     _ => {
-                        // whole-struct use of `*q`; the plain-reborrow exemption
-                        // and the reject arrive in Task 3
+                        // plain reborrows `&*q` / `&raw mut *q` are modeled precisely by
+                        // collect_raw_borrow_flow as a flow edge, not a struct use
+                        let plain_reborrow =
+                            projection.len() == 1 && matches!(use_kind, FieldAccessKind::Address);
+                        if plain_reborrow {
+                            continue;
+                        }
+                        let Some(node) = self.prefix_node(place, i) else {
+                            continue;
+                        };
+                        self.field_rejects.push(FieldAccessReject {
+                            node,
+                            kind: FieldAccessRejectKind::WholeStructUse,
+                            location,
+                        });
                     }
                 }
             }

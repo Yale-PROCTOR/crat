@@ -282,3 +282,91 @@ pub fn on_stack() -> i32 {
     assert!(result.field_accesses.is_empty());
     assert!(result.field_rejects.is_empty());
 }
+
+#[test]
+fn whole_struct_copy_is_rejected() {
+    let result = analyze_single(
+        r#"
+#[derive(Clone, Copy)]
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn copy_out(ctx: *mut Ctx) -> i32 {
+    let s = *ctx;
+    s.a
+}
+"#,
+        "copy_out",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::WholeStructUse)
+    );
+}
+
+#[test]
+fn whole_struct_store_is_rejected() {
+    let result = analyze_single(
+        r#"
+#[derive(Clone, Copy)]
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn overwrite(ctx: *mut Ctx, v: Ctx) {
+    *ctx = v;
+}
+"#,
+        "overwrite",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::WholeStructUse)
+    );
+}
+
+#[test]
+fn plain_reborrow_is_not_rejected_and_attributes_to_param() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn reborrow(ctx: *mut Ctx) -> i32 {
+    let r = &mut *ctx;
+    (*r).a
+}
+"#,
+        "reborrow",
+    );
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 0);
+}
+
+#[test]
+fn union_field_access_is_rejected() {
+    let result = analyze_single(
+        r#"
+#[derive(Clone, Copy)]
+pub union Val {
+    pub i: i32,
+    pub f: f32,
+}
+pub unsafe fn read_union(v: *mut Val) -> i32 {
+    (*v).i
+}
+"#,
+        "read_union",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::UnionFieldAccess)
+    );
+}
