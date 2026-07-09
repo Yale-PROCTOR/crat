@@ -10301,13 +10301,119 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 // Cross-ref S2-2 (2026-07-04-nb-stage2-backlog.md): the
                 // freed-slot kind census must find this pin, not rediscover
                 // it; a freed-`Ref` (not seen here) remains the
-                // soundness-critical case that gates C2.
+                // soundness-critical case that gates C2. This is a BREAKABLE
+                // observation, not a semantic contract: if a later phase
+                // (NB3/NB4 origins, call semantics) legitimately changes the
+                // value, re-derive and re-pin the observation — do not
+                // preserve Owning for its own sake.
                 let a_local = local_by_var_name(tcx, sink_side, "a");
                 let a_slot = local_slot(&slots, sink_side, a_local, 0);
                 assert_eq!(
                     model.get(&a_slot),
                     Some(&SlotKind::Owning),
                     "observed: leaked-free a pulled Owning via the broadcast + fork parent"
+                );
+            },
+        );
+    }
+
+    /// §S2-1 adversarial-review fold (Codex F1, HIGH) — the sinks-first
+    /// policy's cardinality trade, pinned as DELIBERATE: with overlapping
+    /// mixed cores `{s, k1}` and `{s, k2}` (one source's broadcast opposing
+    /// TWO caller frees), retaining the source costs TWO leaked sinks where
+    /// the pre-S2-1 positional pick would have leaked the one source. The
+    /// leak set is subset-minimal (phase 2 proves neither sink individually
+    /// restorable while the source is retained) but not minimum-cardinality
+    /// — D7's rationale: the source's Owning conversion is precision;
+    /// leaked frees stay raw-pointer frees. Zero corpus rows changed under
+    /// this policy (Phase-0 baseline sweep), so today the trade is
+    /// fixture-only; if corpus data ever shows material sink-leak
+    /// inflation, a cardinality-aware refinement is a stage-2 decision,
+    /// not a drive-by.
+    #[test]
+    fn nbs2_mixed_fanout_prefers_source_over_two_sinks() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn pass(_x: *mut core::ffi::c_void) {}
+
+pub unsafe fn source_side() -> *mut core::ffi::c_void {
+    let m = unsafe { malloc(4) };
+    unsafe { pass(m) };
+    m
+}
+
+pub unsafe fn sink_side1(a1: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let b = a1;
+    unsafe { pass(b) };
+    unsafe { free(a1) };
+    b
+}
+
+pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let b = a2;
+    unsafe { pass(b) };
+    unsafe { free(a2) };
+    b
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let source_side = function_by_name(&program, "source_side");
+                let source_body =
+                    tcx.mir_drops_elaborated_and_const_checked(source_side).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let kind_solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                        .expect("S2-1 fan-out emission should run");
+
+                assert_eq!(selectors.sources().len(), 1);
+                assert_eq!(selectors.sinks().len(), 2);
+                let s = selectors.sources()[0].clone();
+                let k1 = selectors.sinks()[0].clone();
+                let k2 = selectors.sinks()[1].clone();
+                let check =
+                    |set: &[&z3::ast::Bool]| kind_solver.optimize().check(
+                        &set.iter().map(|&b| b.clone()).collect::<Vec<_>>(),
+                    );
+
+                // The overlapping-core structure: the source ties with EACH
+                // sink separately; the two sinks do not tie with each other.
+                assert_eq!(check(&[&s, &k1]), SatResult::Unsat);
+                assert_eq!(check(&[&s, &k2]), SatResult::Unsat);
+                assert_eq!(check(&[&k1, &k2]), SatResult::Sat);
+                assert_eq!(check(&[&s]), SatResult::Sat);
+                assert_eq!(check(&[&k1]), SatResult::Sat);
+                assert_eq!(check(&[&k2]), SatResult::Sat);
+
+                // POLICY PIN: both sinks leak, the source is retained — a
+                // 2-leak outcome preferred over the 1-leak source drop.
+                let (model, dropped) = kind_solver
+                    .model_kinds_relaxing_reporting(&selectors)
+                    .expect("relax loop must converge to SAT");
+                assert_eq!(
+                    dropped.len(),
+                    2,
+                    "the fan-out trade leaks both sinks (subset-minimal, not min-cardinality)"
+                );
+                assert!(
+                    dropped.iter().all(|d| selectors.is_sink(d)),
+                    "every leaked selector is a sink; the source is retained"
+                );
+
+                let m_local = call_destination(tcx, &source_body, "malloc");
+                let m_slot = local_slot(&slots, source_side, m_local, 0);
+                assert_eq!(
+                    model.get(&m_slot),
+                    Some(&SlotKind::Owning),
+                    "the retained source must convert m to Owning"
                 );
             },
         );

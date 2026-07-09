@@ -386,9 +386,14 @@ impl KindSolver {
     }
 
     /// Solve assuming all of `selectors` (reproducing the hard sources and
-    /// sinks). On UNSAT, leak the **minimal** set of conflicting selectors and
-    /// return the resulting per-slot kinds, or `None` if the system is UNSAT
-    /// for non-selector reasons.
+    /// sinks). On UNSAT, leak a **subset-minimal** set of conflicting
+    /// selectors (phase 2 proves no leaked selector is individually
+    /// restorable) and return the resulting per-slot kinds, or `None` if the
+    /// system is UNSAT for non-selector reasons. Subset-minimal is NOT
+    /// minimum-cardinality: the §S2-1 sinks-first policy deliberately retains
+    /// a source even where leaking it alone would have been fewer total
+    /// leaks (a source's Owning conversion outweighs leaked frees —
+    /// `nbs2_mixed_fanout_prefers_source_over_two_sinks` pins the trade).
     ///
     /// All z3 Bools share the single thread-local context (the analysis is
     /// single-threaded), so `c == s` is `Z3_is_eq_ast` node identity — valid
