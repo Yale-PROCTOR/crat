@@ -583,3 +583,77 @@ pub unsafe fn checked(ctx: *mut Ctx) -> i32 {
     assert!(rejects_reaching_param(&result, 0).is_empty());
     assert_eq!(accesses_reaching_param(&result, 0).len(), 1);
 }
+
+#[test]
+fn field_access_forwards_through_one_callee() {
+    // reduced SPHINCS+ haraka shape: the direct access is in the callee,
+    // the caller learns it through the summary
+    let result = analyze_interprocedural(
+        r#"
+pub struct Ctx {
+    pub tweaked: [u64; 8],
+}
+pub unsafe fn perm(ctx: *mut Ctx) -> u64 {
+    (*ctx).tweaked[0]
+}
+pub unsafe fn haraka(ctx: *mut Ctx) {
+    perm(ctx);
+}
+"#,
+        "haraka",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 0);
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+}
+
+#[test]
+fn field_access_forwards_through_a_chain() {
+    let result = analyze_interprocedural(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+    pub b: i32,
+}
+pub unsafe fn leaf(ctx: *mut Ctx) {
+    (*ctx).b = 1;
+}
+pub unsafe fn mid(ctx: *mut Ctx) {
+    leaf(ctx);
+}
+pub unsafe fn root(ctx: *mut Ctx) {
+    mid(ctx);
+}
+"#,
+        "root",
+    );
+    let accesses = accesses_reaching_param(&result, 0);
+    assert_eq!(accesses.len(), 1);
+    assert_eq!(accesses[0].field.index(), 1);
+    assert_eq!(accesses[0].kind, FieldAccessKind::Write);
+}
+
+#[test]
+fn callee_reject_propagates_to_caller() {
+    let result = analyze_interprocedural(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn arith(ctx: *mut Ctx) {
+    let _ = ctx.offset(1);
+}
+pub unsafe fn caller(ctx: *mut Ctx) {
+    arith(ctx);
+}
+"#,
+        "caller",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::PointerArithmetic)
+    );
+}

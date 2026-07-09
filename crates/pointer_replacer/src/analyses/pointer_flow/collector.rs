@@ -484,6 +484,30 @@ impl<'tcx> Collector<'_, 'tcx> {
             );
         }
 
+        // field flows never affect whether the summary applies; a flow that cannot
+        // be instantiated degrades to an IncompleteCalleeSummary reject on the arg
+        for flow in &summary.param_field_accesses {
+            match self.instantiate_summary_source_node(&flow.src, args, location) {
+                Some(node) => self.field_accesses.push(FieldAccess {
+                    node,
+                    field: flow.field,
+                    kind: flow.kind,
+                    location,
+                }),
+                None => self.record_field_flow_instantiation_failure(&flow.src, args, location),
+            }
+        }
+        for flow in &summary.param_field_rejects {
+            match self.instantiate_summary_source_node(&flow.src, args, location) {
+                Some(node) => self.field_rejects.push(FieldAccessReject {
+                    node,
+                    kind: flow.kind,
+                    location,
+                }),
+                None => self.record_field_flow_instantiation_failure(&flow.src, args, location),
+            }
+        }
+
         self.call_effects.insert(
             location,
             CallEffects {
@@ -494,6 +518,31 @@ impl<'tcx> Collector<'_, 'tcx> {
         );
 
         true
+    }
+
+    fn record_field_flow_instantiation_failure(
+        &mut self,
+        src: &SummarySource,
+        args: &[Spanned<Operand<'tcx>>],
+        location: Location,
+    ) {
+        let SummarySource::ParamSlot { arg_index, .. } = src else {
+            return;
+        };
+        let Some(arg) = args.get(*arg_index) else {
+            return;
+        };
+        let Some(place) = operand_place(&arg.node) else {
+            return;
+        };
+        let Some(slot) = self.slot_table.place_head_slot(place, self.body, self.tcx) else {
+            return;
+        };
+        self.field_rejects.push(FieldAccessReject {
+            node: PfgNode::Slot(slot),
+            kind: FieldAccessRejectKind::IncompleteCalleeSummary,
+            location,
+        });
     }
 
     fn collect_terminator(&mut self, block: BasicBlock, location: Location) {

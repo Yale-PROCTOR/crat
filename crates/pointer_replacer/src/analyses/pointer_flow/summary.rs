@@ -1,3 +1,4 @@
+use rustc_abi::FieldIdx;
 use rustc_hash::FxHashSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
@@ -9,6 +10,7 @@ use crate::analyses::pointer_flow::{
     PointerFlowResult,
     builtin::{call_name, call_no_writes},
     collector::operand_place,
+    field_access::{FieldAccessKind, FieldAccessRejectKind},
     graph::{BaseId, PfgNode, UnknownReason},
     slots::{SlotIdx, SlotPathElem, count_slots, slot_path_from_projection},
 };
@@ -20,6 +22,8 @@ pub(crate) struct FunctionSummary {
     pub(crate) arg_write_flows: Vec<ArgWriteFlow>,
     pub(crate) unknown_return_slots: Vec<Vec<SlotPathElem>>,
     pub(crate) unknown_arg_writes: Vec<ArgWriteTarget>,
+    pub(crate) param_field_accesses: Vec<ParamFieldAccessFlow>,
+    pub(crate) param_field_rejects: Vec<ParamFieldRejectFlow>,
 }
 
 impl FunctionSummary {
@@ -36,6 +40,10 @@ impl FunctionSummary {
         self.unknown_return_slots.dedup();
         self.unknown_arg_writes.sort();
         self.unknown_arg_writes.dedup();
+        self.param_field_accesses.sort();
+        self.param_field_accesses.dedup();
+        self.param_field_rejects.sort();
+        self.param_field_rejects.dedup();
     }
 }
 
@@ -74,6 +82,19 @@ pub(crate) enum SummarySource {
     Unknown(UnknownReason),
     OpaqueReturn,
     HeapAlloc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ParamFieldAccessFlow {
+    pub(crate) src: SummarySource,
+    pub(crate) field: FieldIdx,
+    pub(crate) kind: FieldAccessKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ParamFieldRejectFlow {
+    pub(crate) src: SummarySource,
+    pub(crate) kind: FieldAccessRejectKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,6 +499,36 @@ pub(crate) fn build_function_summary<'tcx>(
 
     for target in boundary_unknown_arg_write_targets(body, tcx, result) {
         summary.unknown_arg_writes.push(target);
+    }
+
+    // field events on nodes that reach a param base cross the function boundary;
+    // events on unknown/non-param bases stay visible in this body's own result
+    for access in &result.field_accesses {
+        let Some(bases) = result.provenance.reachable_bases.get(&access.node) else {
+            continue;
+        };
+        for base in bases {
+            if matches!(base, BaseId::Param { .. }) {
+                summary.param_field_accesses.push(ParamFieldAccessFlow {
+                    src: summary_source_for_base(base, result),
+                    field: access.field,
+                    kind: access.kind,
+                });
+            }
+        }
+    }
+    for reject in &result.field_rejects {
+        let Some(bases) = result.provenance.reachable_bases.get(&reject.node) else {
+            continue;
+        };
+        for base in bases {
+            if matches!(base, BaseId::Param { .. }) {
+                summary.param_field_rejects.push(ParamFieldRejectFlow {
+                    src: summary_source_for_base(base, result),
+                    kind: reject.kind,
+                });
+            }
+        }
     }
 
     summary.normalize();
