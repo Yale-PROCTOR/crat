@@ -17,16 +17,47 @@ pub enum ResolvedSlot {
     Field(SlotId),
 }
 
+/// Push the pointer slot at `(range, depth)` — the pointer being dereferenced
+/// at this step — into `layers`, if it is a modeled slot and a caller asked for
+/// the traversed path (`§NB1` SAFE-MONO walk). A no-op when `layers` is `None`.
+fn push_layer(
+    layers: &mut Option<&mut Vec<ResolvedSlot>>,
+    is_field: bool,
+    range: &Option<Range<SlotId>>,
+    depth: u8,
+) {
+    let (Some(layers), Some(r)) = (layers.as_mut(), range.as_ref()) else {
+        return;
+    };
+    let idx = r.start.index() + depth as usize;
+    if idx < r.end.index() {
+        let slot = SlotId::from_usize(idx);
+        layers.push(if is_field {
+            ResolvedSlot::Field(slot)
+        } else {
+            ResolvedSlot::Local(slot)
+        });
+    }
+}
+
 /// Resolve a MIR place to the slot denoting that pointer value.
 ///
 /// `None` means the place is not a fully modeled pointer slot and callers must
 /// conservatively treat it as raw.
+///
+/// §NB1: when `layers` is `Some`, every pointer slot *dereferenced* on the way
+/// to the target is appended to it (shallowest first, across struct-field
+/// boundaries) — the SAFE-MONO walk's traversed layers. The target slot itself
+/// is NOT a layer. Layers are only meaningful when the call returns `Some`
+/// (a `None` return may leave a partially populated `layers`, which the caller
+/// discards). Callers that do not need the path pass `None`.
 pub fn resolve_place<'tcx>(
     slots: &CrateSlots,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
     place: Place<'tcx>,
     extra_deref: u8,
+    mut layers: Option<&mut Vec<ResolvedSlot>>,
 ) -> Option<ResolvedSlot> {
     let fn_locals = slots.fn_local_slots.get(&fn_did)?;
     let mut is_field = false;
@@ -37,6 +68,7 @@ pub fn resolve_place<'tcx>(
     for elem in place.projection {
         match elem {
             ProjectionElem::Deref => {
+                push_layer(&mut layers, is_field, &range, depth);
                 depth = depth.checked_add(1)?;
                 base_ty = base_ty.builtin_deref(true)?;
             }
@@ -75,7 +107,12 @@ pub fn resolve_place<'tcx>(
         }
     }
 
-    depth = depth.checked_add(extra_deref)?;
+    // Trailing `extra_deref`: the intermediate positions are traversed layers
+    // too (used only with `extra_deref > 0`; the SAFE-MONO walk passes 0).
+    for _ in 0..extra_deref {
+        push_layer(&mut layers, is_field, &range, depth);
+        depth = depth.checked_add(1)?;
+    }
     let range = range?;
     let idx = range.start.index() + depth as usize;
     if idx < range.end.index() {

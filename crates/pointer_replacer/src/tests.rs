@@ -10624,6 +10624,133 @@ pub unsafe fn ctrl() {
         );
     }
 
+    /// §NB1 test (a) — the TRANSITIVE gap. `safe(x) ≡ ¬raw(x)`. Accessing the
+    /// deepest slot of a pointer chain through its shallower layers asserts,
+    /// per site, `safe(deep) ⇒ safe(each traversed layer)`; so no model may
+    /// leave a SAFE deep slot over a RAW shallow one — including the
+    /// `raw@0 / ref@1 / own@2` inversion that the structural `i1-adjacency`
+    /// (`¬(raw ∧ own)` on adjacent pairs only) PERMITS for the `ref`-deep and
+    /// non-adjacent cases. Probed directly on the emitted clause: with the
+    /// per-site walk, assuming `raw(ppp@0) ∧ own(ppp@2)` is UNSAT (the deep
+    /// safe slot forces the shallow layer safe); the all-raw chain stays SAT
+    /// (non-vacuity — the clause only forbids safe-over-raw, never forces a
+    /// kind). Under the pre-NB1 `chain`/`off` behavior no such clause exists,
+    /// so the inversion is satisfiable — this fixture fails until the walk lands.
+    #[test]
+    fn nb1_transitive_gap_rejected() {
+        run_compiler(
+            r#"
+pub unsafe fn chain(ppp: *mut *mut *mut i32) {
+    let _y = **ppp;
+}
+"#,
+            |tcx| {
+                let build = |tcx| {
+                    let program = collect_program(tcx);
+                    let f = function_by_name(&program, "chain");
+                    let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                    let slots = CrateSlots::build(&program);
+                    let solver = KindSolver::new(&slots);
+                    add_coherence(&solver, &slots, f, &body);
+                    let ppp = local_by_var_name(tcx, f, "ppp");
+                    let s0 = local_slot(&slots, f, ppp, 0);
+                    let s2 = local_slot(&slots, f, ppp, 2);
+                    (solver, s0, s2)
+                };
+
+                // safe deep (own@2) over raw shallow (raw@0) is forbidden.
+                let (solver, s0, s2) = build(tcx);
+                solver.assume(s0, SlotKind::Raw);
+                solver.assume(s2, SlotKind::Owning);
+                assert_eq!(
+                    solver.check(),
+                    SatResult::Unsat,
+                    "per-site SAFE-MONO must forbid a safe deep slot over a raw shallow layer"
+                );
+
+                // Non-vacuity: an all-raw chain is fine (the clause forbids only
+                // safe-over-raw, it never forces a kind).
+                let (solver, s0, s2) = build(tcx);
+                solver.assume(s0, SlotKind::Raw);
+                solver.assume(s2, SlotKind::Raw);
+                assert_eq!(
+                    solver.check(),
+                    SatResult::Sat,
+                    "an all-raw chain must stay satisfiable"
+                );
+            },
+        );
+    }
+
+    /// §NB1 test (b) — the FIELD boundary the structural `i1-adjacency` cannot
+    /// reach. A struct field accessed through a raw parent pointer at a site
+    /// (`(*s).f`) is a per-site layer traversal: `safe(field.f@0) ⇒ safe(s@0)`.
+    /// So an `Owning`-eligible field cannot stay safe when read through a raw
+    /// parent. Probed: assuming `raw(s@0) ∧ ref(field.f@0)` is UNSAT with the
+    /// walk (a safe field over a raw parent is forbidden); `raw(s@0) ∧
+    /// raw(field.f@0)` stays SAT. The structural adjacency relates only
+    /// same-owner slots within one universe, so no `chain`/`off` clause spans
+    /// the Local→Field boundary — this fixture fails until the walk lands.
+    #[test]
+    fn nb1_raw_parent_field_site_demotes() {
+        run_compiler(
+            r#"
+#[repr(C)]
+pub struct S {
+    pub f: *mut i32,
+}
+
+pub unsafe fn g(s: *mut S) {
+    let _y = (*s).f;
+}
+"#,
+            |tcx| {
+                let build = |tcx| {
+                    let program = collect_program(tcx);
+                    let f = function_by_name(&program, "g");
+                    let s_did = struct_by_name(&program, "S");
+                    let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                    let slots = CrateSlots::build(&program);
+                    let solver = KindSolver::new(&slots);
+                    add_coherence(&solver, &slots, f, &body);
+                    let s = local_by_var_name(tcx, f, "s");
+                    let parent = local_slot(&slots, f, s, 0);
+                    let field_id = slots
+                        .field_slots
+                        .slot_for_field_depth(
+                            StructFieldSlot {
+                                struct_did: s_did,
+                                field_index: 0,
+                            },
+                            0,
+                        )
+                        .expect("field f depth-0 slot");
+                    (solver, parent, SlotRef::Field(field_id))
+                };
+
+                // safe field (ref) over raw parent is forbidden.
+                let (solver, parent, field) = build(tcx);
+                solver.assume(parent, SlotKind::Raw);
+                solver.assume(field, SlotKind::Ref);
+                assert_eq!(
+                    solver.check(),
+                    SatResult::Unsat,
+                    "per-site SAFE-MONO must demote a field read through a raw parent pointer"
+                );
+
+                // Non-vacuity: a raw field over a raw parent is fine.
+                let (solver, parent, field) = build(tcx);
+                solver.assume(parent, SlotKind::Raw);
+                solver.assume(field, SlotKind::Raw);
+                assert_eq!(
+                    solver.check(),
+                    SatResult::Sat,
+                    "a raw field over a raw parent must stay satisfiable"
+                );
+            },
+        );
+    }
+
     /// B3b headline: interprocedural ownership flow across a *return* edge.
     /// `make` allocates and returns ownership; `forward` just returns `make()`'s
     /// result. `forward` contains no `malloc` and no sink, so the *only* path to
@@ -13228,18 +13355,63 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
                 let fn_locals = slots.fn_local_slots.get(&g).expect("slots for g");
 
                 assert_eq!(
-                    resolve_place(&slots, g, body, base, 0),
+                    resolve_place(&slots, g, body, base, 0, None),
                     fn_locals
                         .slot_for_local_depth(pp, 0)
                         .map(ResolvedSlot::Local)
                 );
                 assert_eq!(
-                    resolve_place(&slots, g, body, base, 1),
+                    resolve_place(&slots, g, body, base, 1, None),
                     fn_locals
                         .slot_for_local_depth(pp, 1)
                         .map(ResolvedSlot::Local)
                 );
-                assert_eq!(resolve_place(&slots, g, body, base, 2), None);
+                assert_eq!(resolve_place(&slots, g, body, base, 2, None), None);
+            },
+        );
+    }
+
+    /// §NB1: the `layers` out-param records every pointer slot *dereferenced*
+    /// to reach the target (shallowest first), which the SAFE-MONO walk pairs
+    /// with the target. The target itself is not a layer; a bare local
+    /// traverses none.
+    #[test]
+    fn resolve_place_collects_traversed_layers() {
+        run_compiler(
+            r#"
+pub unsafe fn g(ppp: *mut *mut *mut i32) -> i32 {
+    ***ppp
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let g = function_by_name(&program, "g");
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                let body = &*body;
+                let ppp = Local::from_u32(1);
+                let fn_locals = slots.fn_local_slots.get(&g).expect("slots for g");
+                let d = |depth| {
+                    fn_locals
+                        .slot_for_local_depth(ppp, depth)
+                        .map(ResolvedSlot::Local)
+                        .unwrap()
+                };
+
+                // `**ppp` (two real Deref projections) targets depth 2, and
+                // traverses layers depth 0 then depth 1.
+                let two_derefs = Place::from(ppp)
+                    .project_deeper(&[ProjectionElem::Deref, ProjectionElem::Deref], tcx);
+                let mut layers = Vec::new();
+                let target = resolve_place(&slots, g, body, two_derefs, 0, Some(&mut layers));
+                assert_eq!(target, Some(d(2)));
+                assert_eq!(layers, vec![d(0), d(1)]);
+
+                // A bare local (no deref) traverses no layers.
+                let mut none = Vec::new();
+                let bare = resolve_place(&slots, g, body, Place::from(ppp), 0, Some(&mut none));
+                assert_eq!(bare, Some(d(0)));
+                assert!(none.is_empty(), "a bare local dereferences nothing");
             },
         );
     }
@@ -13280,14 +13452,14 @@ pub unsafe fn f(s: *mut S) {
                 );
 
                 assert_eq!(
-                    resolve_place(&slots, f, body, place, 0),
+                    resolve_place(&slots, f, body, place, 0, None),
                     slots
                         .field_slots
                         .slot_for_field_depth(field_a, 0)
                         .map(ResolvedSlot::Field)
                 );
                 assert_eq!(
-                    resolve_place(&slots, f, body, Place::from(s_local), 0),
+                    resolve_place(&slots, f, body, Place::from(s_local), 0, None),
                     slots
                         .fn_local_slots
                         .get(&f)
@@ -13347,7 +13519,7 @@ pub unsafe fn deep_field(p: *mut *mut *mut *mut S) -> *mut i32 {
                     tcx,
                 );
                 assert_eq!(
-                    resolve_place(&slots, ok_field, ok_body, ok_place, 0),
+                    resolve_place(&slots, ok_field, ok_body, ok_place, 0, None),
                     expected_field
                 );
 
@@ -13367,7 +13539,7 @@ pub unsafe fn deep_field(p: *mut *mut *mut *mut S) -> *mut i32 {
                     tcx,
                 );
                 assert_eq!(
-                    resolve_place(&slots, deep_field, deep_body, deep_place, 0),
+                    resolve_place(&slots, deep_field, deep_body, deep_place, 0, None),
                     None
                 );
             },
@@ -13394,13 +13566,13 @@ pub unsafe fn deep(p: *mut *mut *mut *mut i32) -> i32 {
 
                 for depth in 0..3 {
                     assert_eq!(
-                        resolve_place(&slots, deep, body, base, depth),
+                        resolve_place(&slots, deep, body, base, depth, None),
                         fn_locals
                             .slot_for_local_depth(p, depth)
                             .map(ResolvedSlot::Local)
                     );
                 }
-                assert_eq!(resolve_place(&slots, deep, body, base, 3), None);
+                assert_eq!(resolve_place(&slots, deep, body, base, 3, None), None);
             },
         );
     }
@@ -13451,13 +13623,13 @@ pub unsafe fn h(s: *mut S, a: [*mut i32; 4]) {
                     field_index: 1,
                 };
 
-                assert_eq!(resolve_place(&slots, h, body, arr_place, 0), None);
+                assert_eq!(resolve_place(&slots, h, body, arr_place, 0, None), None);
                 assert_eq!(
-                    resolve_place(&slots, h, body, Place::from(array_param), 0),
+                    resolve_place(&slots, h, body, Place::from(array_param), 0, None),
                     None
                 );
                 assert_eq!(
-                    resolve_place(&slots, h, body, scalar_place, 0),
+                    resolve_place(&slots, h, body, scalar_place, 0, None),
                     slots
                         .field_slots
                         .slot_for_field_depth(scalar_field, 0)
