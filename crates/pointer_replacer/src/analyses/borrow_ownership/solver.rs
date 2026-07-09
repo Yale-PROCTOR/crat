@@ -545,14 +545,13 @@ fn add_universe<F>(
     }
 
     // §NB1: the structural `i1-adjacency` chain clause. Emitted under `Chain`
-    // AND `PerSite`, skipped only under `Off`. Under `PerSite` the per-site
-    // SAFE-MONO walk (strictly stronger) logically subsumes it, so keeping it
-    // here is redundant — no model changes — but the NB-plan keeps it "initially"
-    // (to be deleted after the corpus differential confirms subsumption), and it
-    // still constrains never-dereferenced chains that the access-driven walk
-    // does not reach. The ablation delta stays clean: `Chain` = this clause
-    // only; `PerSite` = this clause + the walk = the walk (subsumed). See
-    // `SafeMonoMode`.
+    // AND `PerSite`, skipped only under `Off`. It is NOT redundant under
+    // `PerSite`: the per-site SAFE-MONO walk fires only on READ/borrow sites
+    // (write destinations excluded — `safety_mono`), so this clause is what
+    // still covers write-only and never-dereferenced same-owner chains. It
+    // stays under `PerSite` PERMANENTLY (the NB-plan's "delete after subsumption"
+    // is resolved the other way). Ablation stays clean: `Chain` = this clause
+    // only; `PerSite` = this clause + the read-site walk. See `SafeMonoMode`.
     if super::SafeMonoMode::current() == super::SafeMonoMode::Off {
         return;
     }
