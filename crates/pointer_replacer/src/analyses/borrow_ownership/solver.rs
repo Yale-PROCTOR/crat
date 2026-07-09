@@ -385,10 +385,10 @@ impl KindSolver {
         Some(self.read_kinds(&model))
     }
 
-    /// Solve assuming all `source_selectors` (reproducing the hard sources). On
-    /// UNSAT, leak the **minimal** set of conflicting sources and return the
-    /// resulting per-slot kinds, or `None` if the system is UNSAT for non-source
-    /// reasons.
+    /// Solve assuming all of `selectors` (reproducing the hard sources and
+    /// sinks). On UNSAT, leak the **minimal** set of conflicting selectors and
+    /// return the resulting per-slot kinds, or `None` if the system is UNSAT
+    /// for non-selector reasons.
     ///
     /// All z3 Bools share the single thread-local context (the analysis is
     /// single-threaded), so `c == s` is `Z3_is_eq_ast` node identity — valid
@@ -397,12 +397,13 @@ impl KindSolver {
     ///
     /// Terminates: phase 1 drops one of finitely many selectors per UNSAT round;
     /// phase 2 visits each dropped selector once. Leaking a source classifies
-    /// that allocation non-Owning, which is memory-safe.
+    /// that allocation non-Owning, which is memory-safe; leaking a sink leaves
+    /// an unprovable free a raw-pointer free.
     pub(crate) fn model_kinds_relaxing(
         &self,
-        source_selectors: &[Bool],
+        selectors: &Selectors,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
-        self.model_kinds_relaxing_reporting(source_selectors)
+        self.model_kinds_relaxing_reporting(selectors)
             .map(|(kinds, _dropped)| kinds)
     }
 
@@ -411,7 +412,7 @@ impl KindSolver {
     /// via `Selectors`). Same semantics; the plain fn delegates here.
     pub(crate) fn model_kinds_relaxing_reporting(
         &self,
-        source_selectors: &[Bool],
+        selectors: &Selectors,
     ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
         // §NB-R guard (release-active): under tracking, this loop's unsat-core
         // search would see foreign track literals in cores and its selector
@@ -421,7 +422,7 @@ impl KindSolver {
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
         );
-        let mut assumptions: Vec<Bool> = source_selectors.to_vec();
+        let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
 
         // Phase 1: drop conflicting selectors until SAT (or give up).
@@ -430,7 +431,20 @@ impl KindSolver {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
                     let core = self.solver.get_unsat_core();
-                    let idx = assumptions.iter().position(|s| core.iter().any(|c| c == s))?;
+                    let in_core = |s: &Bool| core.iter().any(|c| c == s);
+                    // §S2-1 (NB-F review F2): the drop choice on a MIXED
+                    // source/sink core is a deliberate policy — drop sinks
+                    // first, retain sources. A leaked sink costs a leak (the
+                    // free stays a raw-pointer free); a leaked source costs
+                    // Owning-conversion precision (D7's driver). On a true
+                    // either/or tie phase 2 cannot undo the choice, so it must
+                    // be made here. Within a class, and on cores with no sink
+                    // at all, the pick stays positional — the pre-S2-1
+                    // behavior exactly.
+                    let idx = assumptions
+                        .iter()
+                        .position(|s| selectors.is_sink(s) && in_core(s))
+                        .or_else(|| assumptions.iter().position(|s| in_core(s)))?;
                     leaked.push(assumptions.swap_remove(idx));
                 }
                 SatResult::Unknown => return None,
