@@ -18,7 +18,7 @@
 use rustc_hash::FxHashSet;
 use rustc_middle::mir::{
     Body, Location, Place,
-    visit::{PlaceContext, Visitor},
+    visit::{MutatingUseContext, PlaceContext, Visitor},
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -65,7 +65,28 @@ struct SafeMonoWalker<'a, 'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for SafeMonoWalker<'_, 'tcx> {
-    fn visit_place(&mut self, place: &Place<'tcx>, _context: PlaceContext, _location: Location) {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _location: Location) {
+        // §NB1: SAFE-MONO applies where the place's VALUE is loaded/read or a
+        // reference is borrowed from it — the site where a "safe reference behind
+        // the layers" is actually formed. A pure OVERWRITE destination
+        // (`(*s).f = x`, `*out = malloc()`, call/yield destinations, deinit,
+        // set-discriminant, asm output, drop) does NOT dereference the target's
+        // old value as a reference: writing THROUGH `s` requires `s` valid, but
+        // does not constrain the field/target kind by this site (the target's
+        // kind is set by its reads and the field-⋀ law). Emitting there
+        // spuriously coupled a crate-wide `Owning` field to every parent
+        // pointer's kind and over-demoted (Codex review, 2026-07-10). Non-uses
+        // (storage markers, debuginfo, user-ty ascriptions) never dereference.
+        // Soundness is unaffected either way — SAFE-MONO is heuristic pruning;
+        // the acceptance replay (D5) is the soundness carrier.
+        let emits = matches!(
+            context,
+            PlaceContext::NonMutatingUse(_)
+                | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
+        );
+        if !emits {
+            return;
+        }
         let mut layers = Vec::new();
         let Some(target) =
             resolve_place(self.slots, self.fn_did, self.body, *place, 0, Some(&mut layers))
