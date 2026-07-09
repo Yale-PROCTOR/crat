@@ -124,6 +124,10 @@ struct BindingUseSummary {
     address_taken_count: usize,
     unsupported_escape: bool,
     writes_through_pointer: bool,
+    /// number of write sites through the pointer (`*p = ..`, `*p.offset(a) = ..`);
+    /// each one keeps a raw deref and gains one materialized offset under an
+    /// index rewrite, so the cost model needs the count, not just the flag.
+    write_through_pointer_count: usize,
     multi_cursor_deref_expr_count: usize,
 }
 
@@ -476,6 +480,7 @@ pub unsafe fn foo(mut p: *mut Item) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     krate: &mut Crate,
     input: &RustProgram<'tcx>,
@@ -484,6 +489,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
 ) -> bool {
     let mut trace = RewriteTrace::from_env();
     let changed = apply_array_local_index_rewrite_inner(
@@ -494,6 +500,7 @@ pub(crate) fn apply_array_local_index_rewrite<'tcx>(
         nullity_result,
         points_to,
         ast_to_hir,
+        c_exposed_fns,
         &mut trace,
     );
     trace.emit(input.tcx);
@@ -509,6 +516,7 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
     trace: &mut RewriteTrace,
 ) -> bool {
     let mut plan = build_rewrite_plan(
@@ -521,7 +529,14 @@ fn apply_array_local_index_rewrite_inner<'tcx>(
     );
     refine_base_pointer_kinds_from_ast(krate, ast_to_hir, input.tcx, &mut plan);
     prune_unsupported_direct_place_uses(krate, ast_to_hir, input.tcx, &mut plan, trace);
-    choose_binding_representations(krate, ast_to_hir, input.tcx, &mut plan, trace);
+    choose_binding_representations(
+        krate,
+        ast_to_hir,
+        input.tcx,
+        c_exposed_fns,
+        &mut plan,
+        trace,
+    );
     if plan.by_hir_id.is_empty() {
         return false;
     }
@@ -548,6 +563,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
     nullity_result: &analyses::nullity::NullityResult,
     points_to: &andersen::AnalysisResult,
     ast_to_hir: &AstToHir,
+    c_exposed_fns: &FxHashSet<String>,
     enabled: bool,
 ) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
     let mut trace = RewriteTrace::for_test(enabled);
@@ -559,6 +575,7 @@ pub(crate) fn apply_array_local_index_rewrite_traced<'tcx>(
         nullity_result,
         points_to,
         ast_to_hir,
+        c_exposed_fns,
         &mut trace,
     );
     trace.into_events()
@@ -1578,6 +1595,18 @@ fn prune_unsupported_direct_place_uses(
     }
 }
 
+// whether a group-base binding is a function parameter (as opposed to a local).
+fn base_is_fn_param(tcx: TyCtxt<'_>, base_hir_id: HirId) -> bool {
+    for (_, node) in tcx.hir_parent_iter(base_hir_id) {
+        match node {
+            hir::Node::Param(_) => return true,
+            hir::Node::Pat(_) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn prune_orphan_base_cursors(plan: &mut RewritePlan) {
     let live_base_keys = plan
         .by_hir_id
@@ -1593,6 +1622,7 @@ fn choose_binding_representations(
     krate: &Crate,
     ast_to_hir: &AstToHir,
     tcx: TyCtxt<'_>,
+    c_exposed_fns: &FxHashSet<String>,
     plan: &mut RewritePlan,
     trace: &mut RewriteTrace,
 ) {
@@ -1608,6 +1638,71 @@ fn choose_binding_representations(
     visitor.visit_crate(krate);
     let mut summaries = std::mem::take(&mut visitor.summaries);
     drop(visitor);
+    // cost model: a nullable member of a raw base pays one raw `offset` per
+    // materialized use (value use, call argument, deref, write through the
+    // pointer) and only removes offsets for movements and existing
+    // `offset_from` uses. the decision is aggregated per group over its
+    // nullable raw-base members and applied to them as a unit: same-group
+    // copies make per-member drops inconsistent (a dropped copy target turns
+    // the free index copy into a fresh materialization on the kept member).
+    let mut group_costs: FxHashMap<BaseCursorKey, (usize, usize, Vec<HirId>)> =
+        FxHashMap::default();
+    for (hir_id, rewrite) in &plan.by_hir_id {
+        if !rewrite.nullable || !rewrite.base_is_raw_ptr || rewrite.field_base {
+            continue;
+        }
+        // only bail when the base is pinned raw for good: a parameter of a
+        // c-exposed function keeps its ABI type, so the materialized uses stay
+        // unsafe. any other base may still be upgraded to a slice by later
+        // stages, turning the same materializations into safe indexing.
+        if !base_is_fn_param(tcx, rewrite.base_hir_id)
+            || !super::transform::is_c_exposed_fn(
+                tcx,
+                rewrite.base_hir_id.owner.def_id,
+                c_exposed_fns,
+            )
+        {
+            continue;
+        }
+        let Some(summary) = summaries.get(hir_id) else { continue };
+        let added = summary.pointer_value_count
+            + summary.call_arg_count
+            + summary.deref_count
+            + summary.field_or_index_count
+            + summary.write_through_pointer_count;
+        let removed = summary.movement_count + summary.offset_from_count;
+        let entry = group_costs
+            .entry(base_cursor_key(rewrite.base_hir_id, &rewrite.base_name))
+            .or_default();
+        entry.0 += added;
+        entry.1 += removed;
+        entry.2.push(*hir_id);
+    }
+    let mut unprofitable: Vec<HirId> = Vec::new();
+    for (added, removed, members) in group_costs.into_values() {
+        if added > removed {
+            unprofitable.extend(members);
+        }
+    }
+    for hir_id in &unprofitable {
+        if let Some(rewrite) = plan.by_hir_id.get(hir_id) {
+            let source_name = rewrite.source_name.clone();
+            trace.record(
+                hir_id.owner.def_id,
+                TraceSubject::Member(source_name),
+                TraceStage::Representation,
+                TraceDecision::Dropped,
+                || {
+                    "cost: index rewrite would add more unsafe operations than it removes"
+                        .to_string()
+                },
+            );
+        }
+        plan.by_hir_id.remove(hir_id);
+    }
+    if !unprofitable.is_empty() {
+        prune_orphan_base_cursors(plan);
+    }
     for (hir_id, rewrite) in &mut plan.by_hir_id {
         let summary = summaries.remove(hir_id).unwrap_or_default();
         rewrite.has_index_benefit = summary.has_index_benefit();
@@ -2072,10 +2167,9 @@ impl BindingUseClassifier<'_, '_> {
 
     fn record_write_through_pointer(&mut self, expr: &Expr) {
         for hir_id in self.direct_pointer_deref_hir_ids(expr) {
-            self.summaries
-                .entry(hir_id)
-                .or_default()
-                .writes_through_pointer = true;
+            let summary = self.summaries.entry(hir_id).or_default();
+            summary.writes_through_pointer = true;
+            summary.write_through_pointer_count += 1;
         }
     }
 
@@ -3303,10 +3397,14 @@ fn member_offset_expr(base_live: bool, base_index_name: Option<&str>, index_expr
 }
 
 fn base_offset_expr_for_parts(base_name: &str, base_is_raw_ptr: bool, index_expr: &str) -> String {
-    if base_is_raw_ptr {
-        format!("({base_name}).offset({index_expr})")
-    } else {
-        format!("({base_name}).as_ptr().offset({index_expr})")
+    // a literal-zero index is the base itself; folding it away keeps one
+    // unsafe `offset` out of every materialization built on the group start.
+    let zero_index = matches!(index_expr, "0" | "0isize");
+    match (base_is_raw_ptr, zero_index) {
+        (true, true) => format!("({base_name})"),
+        (true, false) => format!("({base_name}).offset({index_expr})"),
+        (false, true) => format!("({base_name}).as_ptr()"),
+        (false, false) => format!("({base_name}).as_ptr().offset({index_expr})"),
     }
 }
 
@@ -3317,6 +3415,39 @@ fn base_offset_expr_for_index(rewrite: &BindingRewrite, index_expr: &str) -> Str
         index_expr,
     );
     base_offset_expr_for_parts(&rewrite.base_name, rewrite.base_is_raw_ptr, &offset)
+}
+
+#[cfg(test)]
+mod base_offset_expr_tests {
+    use super::base_offset_expr_for_parts;
+
+    #[test]
+    fn literal_zero_index_folds_to_bare_base() {
+        assert_eq!(
+            base_offset_expr_for_parts("uname", true, "0isize"),
+            "(uname)"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "0isize"),
+            "(buf).as_ptr()"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "0"),
+            "(buf).as_ptr()"
+        );
+    }
+
+    #[test]
+    fn non_zero_index_keeps_offset() {
+        assert_eq!(
+            base_offset_expr_for_parts("uname", true, "idx"),
+            "(uname).offset(idx)"
+        );
+        assert_eq!(
+            base_offset_expr_for_parts("buf", false, "i + 1"),
+            "(buf).as_ptr().offset(i + 1)"
+        );
+    }
 }
 
 fn pointer_expr_for_index(rewrite: &BindingRewrite) -> Expr {
@@ -3469,13 +3600,8 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
     /// recognizes a deref operand of the form `<local>.offset(a).add(b)...` (one
     /// or more offset/add calls, no receiver cast) whose innermost receiver is an
     /// introduced nullable index-rewritten member local, and returns the
-    /// replacement `*((base).offset(<index>) as <ptr_ty>)`. the index starts from
-    /// `idx_read_expr(rewrite)` (`prev_idx.unwrap()`) and folds each offset
-    /// argument with the existing `+` helper path. peeling with `unwrap_paren`
-    /// (not `unwrap_cast_and_paren`) keeps any receiver cast in place so it fails
-    /// the bare-local lookup, leaving cast-bearing projections to the existing
-    /// pointer-value fallback.
-    fn projected_deref_replacement(&self, operand: &Expr) -> Option<Expr> {
+    /// replacement `*((base).offset(<index>) as <ptr_ty>)`.
+    fn projected_deref_replacement(&mut self, operand: &Expr) -> Option<Expr> {
         let mut offsets: Vec<(&str, &Expr)> = Vec::new();
         let mut cur = unwrap_paren(operand);
         while let ExprKind::MethodCall(call) = &cur.kind {
@@ -3494,18 +3620,91 @@ impl ArrayLocalIndexRewriteVisitor<'_, '_> {
         if !self.introduced_hir_ids.contains(&hir_id) {
             return None;
         }
+        // rewrite each offset argument before stringifying it: the caller returns early
+        // without the normal recursive walk, so a rewritten local used by value inside
+        // the argument (e.g. `p` in `p.offset(strlen(p))`) would otherwise print under
+        // its removed name.
+        let rewritten: Vec<(&str, Expr)> = offsets
+            .iter()
+            .map(|(name, arg)| {
+                let mut arg = (**arg).clone();
+                self.visit_expr(&mut arg);
+                (*name, arg)
+            })
+            .collect();
         let rewrite = self.plan.by_hir_id.get(&hir_id)?;
         if !rewrite_uses_index_rewrite(rewrite) || !rewrite.nullable {
             return None;
         }
         // fold innermost offset first; additive folding is order-independent.
         let mut index = idx_read_expr(rewrite);
-        for (name, arg) in offsets.iter().rev() {
+        for (name, arg) in rewritten.iter().rev() {
             index = pprust::expr_to_string(&relative_index_expr(&index, name, arg));
         }
         let base_offset = base_offset_expr_for_index(rewrite, &index);
         let ptr = utils::expr!("{} as {}", base_offset, rewrite.ptr_ty);
         Some(utils::expr!("*({})", pprust::expr_to_string(&ptr)))
+    }
+
+    /// the value-position sibling of `projected_deref_replacement`: recognizes a
+    /// `<local>.offset(a).add(b)...` chain used as a pointer VALUE (call argument,
+    /// initializer, cast operand) whose innermost receiver is an introduced
+    /// nullable index-rewritten member local, and folds every offset into the
+    /// index inside the nullable closure:
+    /// `p.offset(k)` -> `p_idx.map_or(null, |idx| (base).offset((idx) + (k)) as ty)`.
+    /// without this, the bare local materializes via `pointer_value_expr` and the
+    /// chain stacks a second raw `.offset` on top of the materialized pointer.
+    fn projected_value_replacement(&mut self, operand: &Expr) -> Option<Expr> {
+        let mut offsets: Vec<(&str, &Expr)> = Vec::new();
+        let mut cur = unwrap_paren(operand);
+        while let ExprKind::MethodCall(call) = &cur.kind {
+            let name = call.seg.ident.name.as_str();
+            if !matches!(name, "offset" | "add") || call.args.len() != 1 {
+                return None;
+            }
+            offsets.push((name, &call.args[0]));
+            cur = unwrap_paren(&call.receiver);
+        }
+        // the zero-offset bare local is handled by the pointer-value fallback.
+        if offsets.is_empty() {
+            return None;
+        }
+        let hir_id = hir_id_of_ast_expr(self.ast_to_hir, self.tcx, cur.id)?;
+        if !self.introduced_hir_ids.contains(&hir_id) {
+            return None;
+        }
+        // rewrite each offset argument before stringifying it (same reason as in
+        // projected_deref_replacement), before borrowing the plan below.
+        let rewritten: Vec<(&str, Expr)> = offsets
+            .iter()
+            .map(|(name, arg)| {
+                let mut arg = (**arg).clone();
+                self.visit_expr(&mut arg);
+                (*name, arg)
+            })
+            .collect();
+        let rewrite = self.plan.by_hir_id.get(&hir_id)?;
+        if !rewrite_uses_index_rewrite(rewrite) || !rewrite.nullable {
+            return None;
+        }
+        // fold innermost offset first, starting from the closure-bound index.
+        let mut index = "idx".to_string();
+        for (name, arg) in rewritten.iter().rev() {
+            index = pprust::expr_to_string(&relative_index_expr(&index, name, arg));
+        }
+        let null_fn = if rewrite.ptr_mut {
+            "std::ptr::null_mut()"
+        } else {
+            "std::ptr::null()"
+        };
+        Some(utils::expr!(
+            "{}.map_or({} as {}, |idx| ({}) as {})",
+            rewrite.index_name,
+            null_fn,
+            rewrite.ptr_ty,
+            base_offset_expr_for_index(rewrite, &index),
+            rewrite.ptr_ty
+        ))
     }
 
     /// builds the index RHS for a conditional cursor update: visits the original
@@ -4018,6 +4217,14 @@ impl MutVisitor for ArrayLocalIndexRewriteVisitor<'_, '_> {
                 self.changed = true;
                 return;
             }
+        }
+
+        if let ExprKind::MethodCall(_) = &expr.kind
+            && let Some(replacement) = self.projected_value_replacement(expr)
+        {
+            *expr = replacement;
+            self.changed = true;
+            return;
         }
 
         mut_visit::walk_expr(self, expr);

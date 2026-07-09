@@ -1240,7 +1240,11 @@ enum PtrCtx {
     Deref(bool),
 }
 
-fn is_c_exposed_fn(tcx: TyCtxt<'_>, did: LocalDefId, c_exposed_fns: &FxHashSet<String>) -> bool {
+pub(crate) fn is_c_exposed_fn(
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    c_exposed_fns: &FxHashSet<String>,
+) -> bool {
     let name = tcx.item_name(did.to_def_id());
     c_exposed_fns.contains(name.as_str())
         || tcx

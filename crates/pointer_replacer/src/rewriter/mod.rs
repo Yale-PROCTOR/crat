@@ -38,9 +38,12 @@ pub(crate) mod array_local_trace;
 pub(crate) mod collector;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;
+mod epoch_split;
 mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
+
+pub use epoch_split::rewrite_epoch_split;
 
 pub struct Analysis {
     #[allow(dead_code)]
@@ -260,6 +263,7 @@ pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (Stri
         &nullity_result,
         &points_to,
         &ast_to_hir,
+        &config.c_exposed_fns,
     );
 
     (pprust::crate_to_string_for_macros(&krate), changed)
@@ -314,6 +318,7 @@ pub(crate) fn rewrite_array_local_provenance_trace(
         &nullity_result,
         &points_to,
         &ast_to_hir,
+        &config.c_exposed_fns,
         enabled,
     );
     (pprust::crate_to_string_for_macros(&krate), events)
