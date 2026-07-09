@@ -72,13 +72,26 @@ impl<'tcx> Visitor<'tcx> for SafeMonoWalker<'_, 'tcx> {
         // (`(*s).f = x`, `*out = malloc()`, call/yield destinations, deinit,
         // set-discriminant, asm output, drop) does NOT dereference the target's
         // old value as a reference: writing THROUGH `s` requires `s` valid, but
-        // does not constrain the field/target kind by this site (the target's
-        // kind is set by its reads and the field-⋀ law). Emitting there
-        // spuriously coupled a crate-wide `Owning` field to every parent
-        // pointer's kind and over-demoted (Codex review, 2026-07-10). Non-uses
-        // (storage markers, debuginfo, user-ty ascriptions) never dereference.
-        // Soundness is unaffected either way — SAFE-MONO is heuristic pruning;
-        // the acceptance replay (D5) is the soundness carrier.
+        // does not read the field/target's old value as a reference at this site.
+        // Emitting there spuriously coupled a crate-wide `Owning` field to every
+        // parent pointer's kind and over-demoted (Codex review, 2026-07-10).
+        // Non-uses (storage markers, debuginfo, user-ty ascriptions) never
+        // dereference.
+        //
+        // SOUNDNESS (do NOT weaken this to "heuristic pruning; the replay carries
+        // it" — that is a category error): SAFE-MONO is NOT borrow-validity. The
+        // acceptance replay (D5) checks Ref-vs-Ref aliasing and is STRUCTURALLY
+        // BLIND to the ownership/UB hazard here — an `Owning` slot issues no loan
+        // (`borrow_verify.rs`), so a raw-path write to an owned cell raises no
+        // conflict. SAFE-MONO covers that side: forging a safe reference through
+        // an unchecked path, and dropping an `Owning` cell reached through a
+        // dangling parent. Skipping WRITE sites therefore ALLOWS an `Owning`
+        // field under a raw parent; that is sound TODAY only because BO output is
+        // unconsumed by codegen (the §8 guardrail). Its discharge at C2 is a
+        // REWRITER OBLIGATION, not the replay: a raw-path store into an `Owning`
+        // cell must lower to a non-dropping (`ptr::write`-style) store, never a
+        // normal assignment (which would drop the possibly-invalid old value).
+        // Tracked as S2-5 in the stage-2 backlog; C2 gates on it.
         let emits = matches!(
             context,
             PlaceContext::NonMutatingUse(_)

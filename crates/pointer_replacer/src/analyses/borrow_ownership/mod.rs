@@ -76,11 +76,15 @@ const BO_PRECISION: Precision = 2;
 /// - `Off`: neither the chain clause nor the per-site walk.
 /// - `Chain`: the structural `i1-adjacency` only — the pre-NB1 behavior.
 /// - `PerSite` (default): the per-site walk, PLUS the structural `i1-adjacency`
-///   kept alongside it. The walk logically subsumes `i1-adjacency`, so keeping
-///   it is redundant on every *accessed* chain (no model change) and the
-///   ablation delta stays clean (`PerSite` result = the walk); it is retained
-///   only to also constrain never-dereferenced chains, per the NB-plan's "keep
-///   initially, delete after the differential confirms subsumption".
+///   kept alongside it PERMANENTLY. The walk does NOT subsume `i1-adjacency`:
+///   the walk fires only on READ/borrow access sites (write destinations are
+///   excluded — see `safety_mono`), so `i1-adjacency` still covers write-only
+///   and never-dereferenced same-owner chains the walk never reaches. The
+///   NB-plan's "delete `chain` after the differential confirms subsumption" is
+///   therefore resolved the OTHER way — `chain` is load-bearing under `PerSite`
+///   and stays. The ablation delta is still clean: `Chain` = `i1-adjacency`
+///   only; `PerSite` = `i1-adjacency` + the read-site walk, so `per_site − chain`
+///   isolates exactly the read-site walk's cost.
 ///
 /// Read from the env var `CRAT_BO_SAFE_MONO ∈ {off, chain, per_site}`;
 /// absent/unrecognized ⇒ the const default. Both the solver-build `i1-adjacency`
