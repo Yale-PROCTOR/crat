@@ -218,6 +218,68 @@ mod report {
     }
 }
 
+/// Provenance stamp for `results.jsonl` — a line-1 `{"_provenance":{...}}` object carrying
+/// the commit SHA a sweep was produced at, so a killed run that leaves a stale file cannot
+/// masquerade as current data (the phantom −97.7% regression postmortem, 2026-07-10). Pure
+/// and unit-tested here; the git + filesystem glue lives in `orchestrate` / `boc1_corpus`.
+mod provenance {
+    /// The line-1 object prepended to `results.jsonl`. Hand-built (not `to_json_line`) so it
+    /// never collides with a data row; `dirty`/`unix` are informational, `sha` is the key.
+    pub fn line(sha: &str, dirty: bool, unix: u64) -> String {
+        format!("{{\"_provenance\":{{\"sha\":\"{sha}\",\"dirty\":{dirty},\"unix\":{unix}}}}}")
+    }
+
+    /// Extract the stamped SHA from a candidate first line; `None` if it is not a provenance
+    /// stamp (e.g. a pre-guard data row `{"program":...}`).
+    pub fn parse_sha(first_line: &str) -> Option<String> {
+        let line = first_line.trim();
+        if !line.starts_with("{\"_provenance\":") {
+            return None;
+        }
+        let sha = line.split("\"sha\":\"").nth(1)?.split('"').next()?;
+        (!sha.is_empty()).then(|| sha.to_string())
+    }
+
+    /// Decide whether an existing `results.jsonl` must be moved aside before a sweep writes.
+    /// `Some(suffix)` ⇒ rename to `results.jsonl.stale-<suffix>` (SHA mismatch → the stale
+    /// file's short SHA; pre-guard file with no stamp → `nostamp`). `None` ⇒ keep (no file,
+    /// or the stamp matches the current SHA). Rename, never delete — preserves the forensic
+    /// trail that made the phantom-regression postmortem possible.
+    pub fn stale_verdict(existing_first_line: Option<&str>, current_sha: &str) -> Option<String> {
+        let line = existing_first_line?;
+        match parse_sha(line) {
+            Some(sha) if sha == current_sha => None,
+            Some(sha) => Some(sha.chars().take(8).collect()),
+            None => Some("nostamp".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn boc1_provenance_stamp_and_stale_verdict() {
+            let l = line("d2c4f828abcdef", false, 1_700_000_000);
+            assert!(l.starts_with("{\"_provenance\":"), "line-1 object: {l}");
+            assert_eq!(parse_sha(&l).as_deref(), Some("d2c4f828abcdef"));
+            assert!(line("abc", true, 1).contains("\"dirty\":true"), "dirty flag carried");
+            // A data row is not a provenance stamp.
+            assert_eq!(parse_sha("{\"program\":\"bst\",\"mode\":\"bo\"}"), None);
+            // Fresh (SHA matches) → keep; no file → keep.
+            assert_eq!(stale_verdict(Some(&l), "d2c4f828abcdef"), None);
+            assert_eq!(stale_verdict(None, "d2c4f828abcdef"), None);
+            // SHA mismatch → move aside under the STALE file's short SHA.
+            assert_eq!(stale_verdict(Some(&l), "ffffffffffff").as_deref(), Some("d2c4f828"));
+            // Pre-guard file (no stamp) → move aside as `nostamp` (the phantom-regression case).
+            assert_eq!(
+                stale_verdict(Some("{\"program\":\"bst\"}"), "d2c4f828abcdef").as_deref(),
+                Some("nostamp"),
+            );
+        }
+    }
+}
+
 /// MIRROR of `analyses::borrow_ownership::borrow_verify::verify_to_fixpoint`
 /// (plus its private helpers `round_cap`, `representative`,
 /// `guard_slots_are_ref`) with round/commit counters added. MUST stay
@@ -1436,6 +1498,40 @@ mod orchestrate {
             .unwrap_or_else(|_| workspace_root().join("target/boc1"))
     }
 
+    /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
+    /// Best-effort: `unknown` if git is unavailable.
+    pub fn git_sha() -> String {
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(workspace_root())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Whether the working tree is dirty (informational — sweeps often run on WIP branches,
+    /// so this warns rather than refuses).
+    pub fn git_dirty() -> bool {
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(workspace_root())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     fn rss_kb(pid: u32) -> Option<u64> {
         let out = Command::new("ps")
             .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -1577,6 +1673,30 @@ fn boc1_corpus() {
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
 
     fs::create_dir_all(out_dir().join("logs")).expect("create out dir");
+
+    // Provenance guard (NB2, 2026-07-10): stamp this run's SHA into results.jsonl (line 1)
+    // and move any SHA-mismatched / unstamped prior file aside so a killed sweep cannot
+    // masquerade as current data. Rename, not delete — forensic trail. See the NB2 task doc.
+    let sha = orchestrate::git_sha();
+    let dirty = orchestrate::git_dirty();
+    let unix = orchestrate::now_unix();
+    if dirty {
+        eprintln!("[boc1] WARNING: working tree dirty — provenance sha {sha} is approximate");
+    }
+    {
+        let results = out_dir().join("results.jsonl");
+        let first_line = results
+            .is_file()
+            .then(|| fs::read_to_string(&results).ok())
+            .flatten()
+            .and_then(|s| s.lines().next().map(|l| l.to_string()));
+        if let Some(suffix) = provenance::stale_verdict(first_line.as_deref(), &sha) {
+            let stale = out_dir().join(format!("results.jsonl.stale-{suffix}"));
+            fs::rename(&results, &stale).expect("rename stale results.jsonl aside");
+            eprintln!("[boc1] moved stale results.jsonl aside to {stale:?} (sweep sha {sha})");
+        }
+    }
+
     let mut raw_rows: Vec<Row> = Vec::new();
     let mut merged: Vec<Row> = Vec::new();
 
@@ -1637,8 +1757,13 @@ fn boc1_corpus() {
         eprintln!("[boc1] {crown_name}: {}", report::to_kv_line(&m));
         merged.push(m);
 
-        // Persist incrementally so partial sweeps still leave artifacts.
-        let jsonl: String = raw_rows.iter().map(|r| report::to_json_line(r) + "\n").collect();
+        // Persist incrementally so partial sweeps still leave artifacts. Line 1 is the
+        // provenance stamp (guard above); data rows follow.
+        let mut jsonl = provenance::line(&sha, dirty, unix) + "\n";
+        for r in &raw_rows {
+            jsonl.push_str(&report::to_json_line(r));
+            jsonl.push('\n');
+        }
         fs::write(out_dir().join("results.jsonl"), jsonl).expect("write jsonl");
         fs::write(out_dir().join("results.csv"), report::render_csv(&merged)).expect("write csv");
         fs::write(out_dir().join("report.md"), render_report(&merged)).expect("write report");
