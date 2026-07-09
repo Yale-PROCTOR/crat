@@ -103,6 +103,8 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "link-own",
     "borrow-exclusion",
     "one-hot",
+    // §NB1 per-site safety monotonicity (no substring overlap with the others).
+    "safe-mono",
     "i1-adjacency",
     "own-linear",
     "own-assume",
@@ -301,6 +303,31 @@ impl KindSolver {
             self.tracker.as_ref(),
             || format!("link-own({slot:?})"),
             &!vars.own.xor(external),
+        );
+    }
+
+    /// §NB1 SAFE-MONO clause: `safe(target) ⇒ safe(layer)` — a safe (`¬raw`)
+    /// target cannot sit behind a raw pointer `layer` that was dereferenced to
+    /// reach it. `safe(x) ≡ ¬raw(x)` (one-hot), so this is `raw(target) ∨
+    /// ¬raw(layer)`, a hard clause over the two slots' `raw` bits. It is
+    /// `¬safe`-only: it can only push a slot toward `raw`, never force
+    /// `ref`/`own` (theorems-doc invariant 7). `target` and `layer` are always
+    /// distinct slots (the target is never among the layers dereferenced to
+    /// reach it).
+    pub(crate) fn safe_mono(&self, target: SlotRef, layer: SlotRef) {
+        let t = self
+            .vars
+            .get(&target)
+            .unwrap_or_else(|| panic!("unknown slot: {target:?}"));
+        let l = self
+            .vars
+            .get(&layer)
+            .unwrap_or_else(|| panic!("unknown slot: {layer:?}"));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("safe-mono({target:?}=>{layer:?})"),
+            &Bool::or(&[&t.raw, &!&l.raw]),
         );
     }
 
@@ -517,6 +544,18 @@ fn add_universe<F>(
         vars.insert(sref, kind_vars);
     }
 
+    // §NB1: the structural `i1-adjacency` chain clause. Emitted under `Chain`
+    // AND `PerSite`, skipped only under `Off`. Under `PerSite` the per-site
+    // SAFE-MONO walk (strictly stronger) logically subsumes it, so keeping it
+    // here is redundant — no model changes — but the NB-plan keeps it "initially"
+    // (to be deleted after the corpus differential confirms subsumption), and it
+    // still constrains never-dereferenced chains that the access-driven walk
+    // does not reach. The ablation delta stays clean: `Chain` = this clause
+    // only; `PerSite` = this clause + the walk = the walk (subsumed). See
+    // `SafeMonoMode`.
+    if super::SafeMonoMode::current() == super::SafeMonoMode::Off {
+        return;
+    }
     for i in 0..universe.len().saturating_sub(1) {
         let a = SlotId::from_usize(i);
         let b = SlotId::from_usize(i + 1);

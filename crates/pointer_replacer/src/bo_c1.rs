@@ -366,7 +366,7 @@ mod run {
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
-            CrateCtxt, SlotKind,
+            CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::verify_to_fixpoint,
             coherence::add_coherence,
             crate_slots::CrateSlots,
@@ -430,6 +430,9 @@ mod run {
         row.set("z3_ast_len", stats.z3_ast_len);
         row.set("source_sink_emissions", stats.source_sink_emissions);
         row.set("selectors", selectors.all().len());
+        // §NB1: record the active safety-monotonicity mode so the ablation
+        // sweeps (per_site vs chain) are self-labeling in the results.
+        row.set("safe_mono", SafeMonoMode::current().label());
         phase("emit_done", t0);
 
         let t = Instant::now();

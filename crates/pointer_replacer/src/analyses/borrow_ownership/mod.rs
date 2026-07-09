@@ -14,6 +14,7 @@ pub mod coherence;
 pub mod crate_slots;
 pub(crate) mod sources;
 pub mod resolve;
+pub(crate) mod safety_mono;
 pub mod solver;
 pub mod slots;
 mod assoc;
@@ -64,6 +65,64 @@ pub type Precision = u8;
 /// over-claiming borrowed struct pointers whose fields are malloc'd. See task doc
 /// §9.11 (and §9.8 for the over-claim this avoids).
 const BO_PRECISION: Precision = 2;
+
+/// §NB1 — safety-monotonicity emission mode (the C1 cost ablation switch, A6).
+/// `safe(x) ≡ ¬raw(x)`; safety monotonicity is `safe(target) ⇒ safe(each
+/// traversed pointer layer)`, emitted PER ACCESS SITE (D2). It subsumes the
+/// structural `i1-adjacency` chain clause (`¬(raw(d) ∧ own(d+1))`) — it also
+/// forbids the `raw(shallow) ∧ ref(deep)` inversion the structural form permits
+/// — and reaches the struct-field boundary the structural adjacency misses.
+/// The three modes:
+/// - `Off`: neither the chain clause nor the per-site walk.
+/// - `Chain`: the structural `i1-adjacency` only — the pre-NB1 behavior.
+/// - `PerSite` (default): the per-site walk, PLUS the structural `i1-adjacency`
+///   kept alongside it. The walk logically subsumes `i1-adjacency`, so keeping
+///   it is redundant on every *accessed* chain (no model change) and the
+///   ablation delta stays clean (`PerSite` result = the walk); it is retained
+///   only to also constrain never-dereferenced chains, per the NB-plan's "keep
+///   initially, delete after the differential confirms subsumption".
+///
+/// Read from the env var `CRAT_BO_SAFE_MONO ∈ {off, chain, per_site}`;
+/// absent/unrecognized ⇒ the const default. Both the solver-build `i1-adjacency`
+/// (`solver::add_universe`) and the per-body walk (`safety_mono::add_safety_mono`,
+/// called from `coherence::add_coherence`) consult `current()`, so they always
+/// agree. No test sets the env var, so fixtures always see the `PerSite` default
+/// deterministically; the ablation sweep sets it in the shell for both runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SafeMonoMode {
+    Off,
+    Chain,
+    PerSite,
+}
+
+impl SafeMonoMode {
+    const DEFAULT: SafeMonoMode = SafeMonoMode::PerSite;
+
+    pub(crate) fn current() -> SafeMonoMode {
+        match std::env::var("CRAT_BO_SAFE_MONO").as_deref() {
+            Ok("off") => SafeMonoMode::Off,
+            Ok("chain") => SafeMonoMode::Chain,
+            Ok("per_site") => SafeMonoMode::PerSite,
+            _ => SafeMonoMode::DEFAULT,
+        }
+    }
+
+    /// Stable label for reporting (bo_c1 row column).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SafeMonoMode::Off => "off",
+            SafeMonoMode::Chain => "chain",
+            SafeMonoMode::PerSite => "per_site",
+        }
+    }
+}
+
+/// §NB1 (C4-ii, plumbing only) — STRONG ownership monotonicity: re-enable the
+/// production `dominate`-style `own(deeper) ⇒ own(shallower)` push that
+/// `infer::new_vars` deliberately dropped (the relaxation site). OFF by default;
+/// the wiring exists so the C4-ii ablation can flip it without a code change.
+/// No behavior when false.
+pub(crate) const STRONG_MONO: bool = false;
 
 #[derive(Clone, Debug)]
 enum Param<Var> {

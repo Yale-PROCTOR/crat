@@ -34,8 +34,8 @@ pub fn add_coherence<'tcx>(
                 | Rvalue::CopyForDeref(rhs) => {
                     for d in 0..MAX_SLOT_DEPTH {
                         if let (Some(la), Some(ra)) = (
-                            resolve_place(slots, fn_did, body, *lhs, d),
-                            resolve_place(slots, fn_did, body, *rhs, d),
+                            resolve_place(slots, fn_did, body, *lhs, d, None),
+                            resolve_place(slots, fn_did, body, *rhs, d, None),
                         ) {
                             // §9.10.2: a field STORE's depth-0 ownership is set crate-wide by
                             // `constrain_field_ownership` (`field.own <=> AND stored owns`), so
@@ -52,8 +52,8 @@ pub fn add_coherence<'tcx>(
                 Rvalue::Ref(_, _, rhs) | Rvalue::RawPtr(_, rhs) => {
                     for d in 0..MAX_SLOT_DEPTH {
                         if let (Some(la), Some(ra)) = (
-                            resolve_place(slots, fn_did, body, *lhs, d + 1),
-                            resolve_place(slots, fn_did, body, *rhs, d),
+                            resolve_place(slots, fn_did, body, *lhs, d + 1, None),
+                            resolve_place(slots, fn_did, body, *rhs, d, None),
                         ) {
                             solver.equate(to_slot_ref(la, fn_did), to_slot_ref(ra, fn_did));
                         }
@@ -85,7 +85,7 @@ pub fn add_coherence<'tcx>(
                             }
                             if let (Some(field_slot_id), Some(operand_slot)) = (
                                 slots.field_slots.slot_for_field_depth(field, d),
-                                resolve_place(slots, fn_did, body, operand_place, d),
+                                resolve_place(slots, fn_did, body, operand_place, d, None),
                             ) {
                                 solver.equate(
                                     SlotRef::Field(field_slot_id),
@@ -98,6 +98,14 @@ pub fn add_coherence<'tcx>(
                 _ => {}
             }
         }
+    }
+
+    // §NB1: per-site SAFE-MONO is emitted alongside coherence (every consumer
+    // adds coherence per body, so this is the single chokepoint). Gated to the
+    // `PerSite` mode; `Chain`/`Off` skip it (the structural `i1-adjacency` in
+    // `solver::add_universe` is the `Chain` arm).
+    if super::SafeMonoMode::current() == super::SafeMonoMode::PerSite {
+        super::safety_mono::add_safety_mono(solver, slots, fn_did, body);
     }
 }
 
@@ -161,7 +169,7 @@ pub(crate) fn constrain_field_ownership(
                         let f = SlotRef::Field(fid);
                         match operand {
                             Operand::Copy(p) | Operand::Move(p) => {
-                                match resolve_place(slots, fn_did, body, *p, 0) {
+                                match resolve_place(slots, fn_did, body, *p, 0, None) {
                                     Some(r) => {
                                         owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did))
                                     }
@@ -177,7 +185,7 @@ pub(crate) fn constrain_field_ownership(
                 }
 
                 // Non-aggregate: is `lhs` a struct-field store?
-                let Some(ResolvedSlot::Field(fid)) = resolve_place(slots, fn_did, body, *lhs, 0)
+                let Some(ResolvedSlot::Field(fid)) = resolve_place(slots, fn_did, body, *lhs, 0, None)
                 else {
                     continue;
                 };
@@ -195,7 +203,7 @@ pub(crate) fn constrain_field_ownership(
                     }
                     _ => None,
                 };
-                match rhs_place.and_then(|p| resolve_place(slots, fn_did, body, p, 0)) {
+                match rhs_place.and_then(|p| resolve_place(slots, fn_did, body, p, 0, None)) {
                     Some(r) => owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did)),
                     None => {
                         blocked.insert(f);

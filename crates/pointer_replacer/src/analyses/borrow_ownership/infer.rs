@@ -218,6 +218,22 @@ where
                 }
                 if let Some(ty_mut) = ty.builtin_deref(true) {
                     let var = vars.next().unwrap();
+                    // §NB1 (C4-ii, plumbing only) — STRONG ownership monotonicity.
+                    // BO deliberately dropped the production `dominate`'s
+                    // `own(deeper) ⇒ own(shallower)` push (the relaxation site
+                    // D2/`STRONG_MONO`). Re-enabled here behind the const so the
+                    // C4-ii ablation can flip it; OFF by default (dead code, no
+                    // behavior). Shape copied verbatim from
+                    // `analyses::ownership::infer::new_vars::dominate`.
+                    if super::STRONG_MONO
+                        && let Some(dom) = dom
+                    {
+                        database.push_less_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            var,
+                            dom,
+                        );
+                    }
                     dom = Some(var);
 
                     precision -= 1;
