@@ -280,7 +280,7 @@ mod mirror {
         let cap = round_cap(slots);
         constrain_field_ownership(solver, slots, program);
         let Some((mut model, dropped)) =
-            solver.model_kinds_relaxing_reporting(selectors.all())
+            solver.model_kinds_relaxing_reporting(selectors)
         else {
             return (None, stats);
         };
@@ -310,7 +310,7 @@ mod mirror {
             if committed == 0 {
                 return (Some(model), stats);
             }
-            model = match solver.model_kinds_relaxing_reporting(selectors.all()) {
+            model = match solver.model_kinds_relaxing_reporting(selectors) {
                 Some((m, dropped)) => {
                     record_dropped(&mut stats, &dropped);
                     m
@@ -471,7 +471,7 @@ mod run {
         match &model {
             None => {
                 row.set("status", "decline");
-                row.set("decline_reason", decline_reason(&solver, selectors.all()));
+                row.set("decline_reason", decline_reason(&solver, &selectors));
                 // §NB-R (opt-in): explain the decline via a second, TRACKED
                 // construction — labeled minimal core (or family histogram at
                 // scale). Never on the default path: doubles solve cost.
@@ -553,7 +553,7 @@ mod run {
                             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                             add_coherence(&solver, &slots, g, &body);
                         }
-                        Some(verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true))
+                        Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, true))
                     }
                     Err(_) => None,
                 }
@@ -584,8 +584,9 @@ mod run {
     /// up (Unknown)" by replaying `model_kinds_relaxing`'s phase-1 selector
     /// dropping read-only (`check` with assumptions asserts nothing). Runs on
     /// the solver state at the moment of decline, so for a round-0 decline it
-    /// replays exactly the failing first solve.
-    pub(super) fn decline_reason(solver: &KindSolver, selectors: &[Bool]) -> &'static str {
+    /// replays exactly the failing first solve. §S2-1: the replay mirrors the
+    /// real loop's sinks-first drop priority (lockstep with `solver.rs`).
+    pub(super) fn decline_reason(solver: &KindSolver, selectors: &Selectors) -> &'static str {
         // §NB-R guard (Codex F1): this replay assumes ONLY selectors; under a
         // tracked solver the hard constraints would be disabled and the reply
         // would be a bogus "sat-in-replay".
@@ -593,7 +594,7 @@ mod run {
             solver.tracker().is_none(),
             "tracked KindSolver must not enter decline_reason (constraints are track-gated)"
         );
-        let mut assumptions: Vec<Bool> = selectors.to_vec();
+        let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         loop {
             match solver.optimize().check(&assumptions) {
                 // Should not happen (relaxing declined); a nondeterministic
@@ -602,7 +603,12 @@ mod run {
                 SatResult::Unknown => return "z3-unknown",
                 SatResult::Unsat => {
                     let core = solver.optimize().get_unsat_core();
-                    match assumptions.iter().position(|s| core.iter().any(|c| c == s)) {
+                    let in_core = |s: &Bool| core.iter().any(|c| c == s);
+                    match assumptions
+                        .iter()
+                        .position(|s| selectors.is_sink(s) && in_core(s))
+                        .or_else(|| assumptions.iter().position(|s| in_core(s)))
+                    {
                         Some(i) => {
                             assumptions.swap_remove(i);
                         }
@@ -718,7 +724,7 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                 add_coherence(&solver, &slots, g, &body);
             }
-            verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
         };
 
         let (mirrored, stats) = {
@@ -962,7 +968,7 @@ fn boc1_mirror_matches_real_delete_node_leaked_frees() {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
         }
-        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true)
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
             .expect("accepts under retractable sinks");
         let f = program.functions[0];
         let root = SlotRef::Local(
@@ -1014,7 +1020,7 @@ fn nbf_sink_retractable_delete_node() {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
         }
-        let model = verify_to_fixpoint(&program, &slots, &solver, selectors.all(), true);
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
         assert!(
             model.is_some(),
             "retractable sinks: the witness must ACCEPT (its only forced owning \
@@ -1306,7 +1312,9 @@ fn nbr_tracked_solver_guard_panics() {
             let program = collect_program(tcx);
             let slots = CrateSlots::build(&program);
             let solver = KindSolver::new_tracked(&slots);
-            let _ = solver.model_kinds_relaxing(&[]);
+            let _ = solver.model_kinds_relaxing(
+                &crate::analyses::borrow_ownership::solver::Selectors::new(Vec::new(), Vec::new()),
+            );
         },
     )
     .unwrap_or_else(|e| e.raise());

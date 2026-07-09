@@ -15,12 +15,11 @@
 use rustc_hash::FxHashMap;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
-use z3::ast::Bool;
 
 use super::{
     SlotKind,
     crate_slots::CrateSlots,
-    solver::{KindSolver, SlotRef},
+    solver::{KindSolver, Selectors, SlotRef},
 };
 use crate::{
     analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
@@ -200,7 +199,7 @@ pub(crate) fn verify_to_fixpoint(
     program: &RustProgram,
     slots: &CrateSlots,
     solver: &KindSolver,
-    selectors: &[Bool],
+    selectors: &Selectors,
     is_mutable: bool,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
