@@ -492,3 +492,94 @@ pub unsafe fn spread(ctx: *mut Ctx) -> [*mut Ctx; 4] {
             .any(|r| r.kind == FieldAccessRejectKind::EscapesToMemory)
     );
 }
+
+#[test]
+fn extern_call_is_unknown_callee_reject() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+extern "C" {
+    fn consume(ctx: *mut Ctx);
+}
+pub unsafe fn call_extern(ctx: *mut Ctx) {
+    consume(ctx);
+}
+"#,
+        "call_extern",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::UnknownCallee)
+    );
+}
+
+#[test]
+fn pointer_arithmetic_call_is_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn advance(ctx: *mut Ctx) -> *mut Ctx {
+    ctx.offset(1)
+}
+"#,
+        "advance",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::PointerArithmetic)
+    );
+}
+
+#[test]
+fn local_callee_without_summary_is_incomplete_reject() {
+    // analyze_single passes callee_summaries: None, so the local callee has
+    // no summary at the call site
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn callee(ctx: *mut Ctx) -> i32 {
+    (*ctx).a
+}
+pub unsafe fn caller(ctx: *mut Ctx) {
+    callee(ctx);
+}
+"#,
+        "caller",
+    );
+    let rejects = rejects_reaching_param(&result, 0);
+    assert!(
+        rejects
+            .iter()
+            .any(|r| r.kind == FieldAccessRejectKind::IncompleteCalleeSummary)
+    );
+}
+
+#[test]
+fn null_check_is_not_rejected() {
+    let result = analyze_single(
+        r#"
+pub struct Ctx {
+    pub a: i32,
+}
+pub unsafe fn checked(ctx: *mut Ctx) -> i32 {
+    if ctx.is_null() {
+        return 0;
+    }
+    (*ctx).a
+}
+"#,
+        "checked",
+    );
+    assert!(rejects_reaching_param(&result, 0).is_empty());
+    assert_eq!(accesses_reaching_param(&result, 0).len(), 1);
+}

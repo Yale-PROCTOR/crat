@@ -12,7 +12,7 @@ use rustc_middle::{
     },
     ty::{self, Ty, TyCtxt},
 };
-use rustc_span::source_map::Spanned;
+use rustc_span::{def_id::DefId, source_map::Spanned};
 
 use crate::{
     analyses::{
@@ -24,7 +24,9 @@ use crate::{
                 constant_pointer_reason, is_as_ptr, is_empty_array_ref_ty, is_heap_alloc_call,
                 is_null_ptr_call, is_pointer_arithmetic, is_zero_int_operand,
             },
-            field_access::{FieldAccess, FieldAccessReject, FieldEventScanner},
+            field_access::{
+                FieldAccess, FieldAccessReject, FieldAccessRejectKind, FieldEventScanner,
+            },
             graph::{BaseId, PfgNode, PointerFlowGraph, UnknownReason, solve_reachable_bases},
             slots::{SlotIdx, SlotPathElem, SlotTable, count_slots},
             summary::{
@@ -337,6 +339,49 @@ impl<'tcx> Collector<'_, 'tcx> {
         self.apply_summary(&summary, args, destination, location)
     }
 
+    fn record_call_field_rejects(
+        &mut self,
+        call: Option<&(DefId, String)>,
+        args: &[Spanned<Operand<'tcx>>],
+        location: Location,
+    ) {
+        // is_null reads only the pointer value, never a field
+        if call.is_some_and(|(def_id, name)| call_no_writes(self.tcx, *def_id, name)) {
+            return;
+        }
+        let kind = match call {
+            Some((def_id, name)) if is_pointer_arithmetic(self.tcx, *def_id, name) => {
+                FieldAccessRejectKind::PointerArithmetic
+            }
+            Some((def_id, _))
+                if def_id.as_local().is_some() && !self.tcx.is_foreign_item(*def_id) =>
+            {
+                FieldAccessRejectKind::IncompleteCalleeSummary
+            }
+            _ => FieldAccessRejectKind::UnknownCallee,
+        };
+        for arg in args {
+            let Some(place) = operand_place(&arg.node) else {
+                continue;
+            };
+            let arg_ty = place.ty(self.body, self.tcx).ty;
+            let Some(pointee) = arg_ty.builtin_deref(true) else {
+                continue;
+            };
+            if !matches!(pointee.kind(), ty::TyKind::Adt(..)) {
+                continue;
+            }
+            let Some(slot) = self.slot_table.place_head_slot(place, self.body, self.tcx) else {
+                continue;
+            };
+            self.field_rejects.push(FieldAccessReject {
+                node: PfgNode::Slot(slot),
+                kind,
+                location,
+            });
+        }
+    }
+
     fn apply_summary(
         &mut self,
         summary: &FunctionSummary,
@@ -471,6 +516,11 @@ impl<'tcx> Collector<'_, 'tcx> {
         {
             return;
         }
+
+        // every call not covered by a complete local summary conservatively
+        // rejects its struct-pointer arguments for field-access clients;
+        // pointer flows below are unaffected
+        self.record_call_field_rejects(call.as_ref(), args, location);
 
         if let Some((def_id, name)) = call.as_ref()
             && let Some(summary) =
