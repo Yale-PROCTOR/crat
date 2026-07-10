@@ -1,0 +1,238 @@
+//! §NB3-3c-i — signature-origin inference (compute-only; NOT yet injected into the borrow replay).
+//!
+//! Thin-reuse architecture (ruled 2026-07-11): derive origin relations from production
+//! `lifetime_flow`'s signature-granularity value-flow summaries, wrapped **read-only** behind the
+//! single call site `derive_signature_flows` (isolation requirement — NB5-O swaps only that body for
+//! a BO-native derivation, drop-in, gated on a corpus differential). `OriginSummary` is the only
+//! interface the rest of BO sees.
+//!
+//! What this adds over the reused summaries: (1) a **transitively-correct** subset closure (the
+//! production `subset_closure` is 1-hop — D3, diagnostic-only, never reused); (2) `unknown` carried
+//! for 3c-ii candidacy demotion (production's conflict path never consumes the analogous
+//! `unknown_targets` — a fork-only soundness win). Origin inference is kind-independent and runs
+//! ONCE per program; `ORIGIN_WRAP_COUNT` (counting ORIGINS' wrap, not the underlying lifetime-flow
+//! call) backs the runs-once invariant.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rustc_index::{
+    Idx,
+    bit_set::{DenseBitSet, SparseBitMatrix},
+};
+
+use crate::analyses::borrow::lifetime_flow::{self, LifetimeFlowResults, LifetimeSlot};
+use crate::utils::rustc::RustProgram;
+
+use super::origin_summary::{OriginSummaries, OriginSummary};
+
+/// Counts ORIGINS' wrap (one increment per `compute_origins`), NOT the underlying lifetime-flow
+/// derivation. Backs the "origin inference runs once per program, kind-independent" invariant.
+pub(crate) static ORIGIN_WRAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The ONE derivation call site (isolation requirement). NB5-O swaps this body for a BO-native
+/// origin derivation from the fork's own borrow facts; everything downstream keys off
+/// `OriginSummary` and is unaffected. At 3c-ii injection this should consume the ctxt's already
+/// computed `lifetime_flows` (`GBorrowInferCtxt`, `pub`) rather than recompute — no double-compute.
+fn derive_signature_flows(program: &RustProgram<'_>) -> LifetimeFlowResults {
+    lifetime_flow::analyze_program_lifetime_flow(program)
+}
+
+/// Whole-program signature-origin summaries. Computed once, kind-independent.
+pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
+    ORIGIN_WRAP_COUNT.fetch_add(1, Ordering::Relaxed);
+    derive_signature_flows(program)
+        .into_iter()
+        .map(|(f, result)| {
+            let summary = result.summary;
+            let n = summary.slots.len();
+            let subset = transitive_closure(&summary.value_flows, n);
+            (
+                f,
+                OriginSummary { slots: summary.slots, subset, unknown: summary.unknown_targets },
+            )
+        })
+        .collect()
+}
+
+/// Correct multi-hop transitive closure of `value_flows` (edge `source → target` means
+/// `source`'s origin flows into `target`'s). `answer.contains(sub, sup)` ⇔ `sub` reaches `sup`.
+/// This is the transitively-correct closure the production `subset_closure` (1-hop, D3) is not —
+/// note line: successors are taken from the POPPED node, never the root.
+fn transitive_closure(
+    value_flows: &SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
+    n_slots: usize,
+) -> SparseBitMatrix<LifetimeSlot, LifetimeSlot> {
+    let mut answer = SparseBitMatrix::new(n_slots);
+    let mut stack: Vec<LifetimeSlot> = vec![];
+    let mut visited: DenseBitSet<LifetimeSlot> = DenseBitSet::new_empty(n_slots);
+    for root in (0..n_slots).map(LifetimeSlot::new) {
+        stack.clear();
+        visited.clear();
+        if let Some(succs) = value_flows.row(root) {
+            stack.extend(succs.iter());
+        }
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            answer.insert(root, node);
+            if let Some(succs) = value_flows.row(node) {
+                stack.extend(succs.iter());
+            }
+        }
+    }
+    answer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyses::borrow::lifetime_flow::{SignatureRoot, SignatureSlot};
+    use rustc_hash::FxHashMap;
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::ty::TyCtxt;
+
+    fn build_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = vec![];
+        let mut structs = vec![];
+        for maybe_owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = maybe_owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        RustProgram { tcx, functions, structs }
+    }
+
+    fn format_slot(slot: SignatureSlot) -> String {
+        let root = match slot.place.root {
+            SignatureRoot::Return => "return".to_string(),
+            SignatureRoot::Arg(local) => format!("arg{}", local.index()),
+        };
+        let derefs = "*".repeat(slot.place.deref_depth as usize);
+        let field = slot
+            .place
+            .field
+            .map(|f| format!(".field{}", f.field_index))
+            .unwrap_or_default();
+        format!("{root}{derefs}{field}@{}", slot.depth)
+    }
+
+    struct Facts {
+        subset: Vec<(String, String)>,
+        unknown: Vec<String>,
+    }
+
+    fn origin_facts(code: &str) -> FxHashMap<String, Facts> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_program(tcx);
+            let summaries = compute_origins(&program);
+            let mut out = FxHashMap::default();
+            for &f in &program.functions {
+                let s = &summaries[&f];
+                let edges = |m: &rustc_index::bit_set::SparseBitMatrix<LifetimeSlot, LifetimeSlot>| {
+                    let mut v = vec![];
+                    for sub in m.rows() {
+                        if let Some(sups) = m.row(sub) {
+                            for sup in sups.iter() {
+                                v.push((format_slot(s.slots[sub]), format_slot(s.slots[sup])));
+                            }
+                        }
+                    }
+                    v.sort();
+                    v
+                };
+                let mut unknown: Vec<String> =
+                    s.unknown.iter().map(|slot| format_slot(s.slots[slot])).collect();
+                unknown.sort();
+                out.insert(
+                    tcx.item_name(f.to_def_id()).to_string(),
+                    Facts { subset: edges(&s.subset), unknown },
+                );
+            }
+            out
+        })
+        .unwrap()
+    }
+
+    fn has(edges: &[(String, String)], sub: &str, sup: &str) -> bool {
+        edges.iter().any(|(a, b)| a == sub && b == sup)
+    }
+
+    /// RED: a callee that returns its arg ⇒ the return origin ⊇ the arg origin.
+    #[test]
+    fn nb3_id_flow_through() {
+        let facts = origin_facts("unsafe fn id(p: *mut i32) -> *mut i32 { p }");
+        let f = &facts["id"];
+        assert!(
+            has(&f.subset, "arg1@0", "return@0"),
+            "id: arg1@0 → return@0 expected in origin subset; got {:?}",
+            f.subset
+        );
+    }
+
+    /// RED: mutual recursion — the SCC fixpoint must converge with each fn's return ⊇ its arg.
+    #[test]
+    fn nb3_mutual_recursion_fixpoint() {
+        // Terminating mutual recursion (base case) — a non-terminating a→b→a never returns, so its
+        // return flow is (correctly) empty; the base case makes arg⇒return real and exercises the SCC.
+        let facts = origin_facts(
+            "unsafe fn a(p: *mut i32, n: i32) -> *mut i32 { if n == 0 { p } else { b(p, n - 1) } }\n\
+             unsafe fn b(p: *mut i32, n: i32) -> *mut i32 { if n == 0 { p } else { a(p, n - 1) } }",
+        );
+        assert!(
+            has(&facts["a"].subset, "arg1@0", "return@0"),
+            "a: arg1@0 → return@0 expected; got {:?}",
+            facts["a"].subset
+        );
+        assert!(
+            has(&facts["b"].subset, "arg1@0", "return@0"),
+            "b: arg1@0 → return@0 expected; got {:?}",
+            facts["b"].subset
+        );
+    }
+
+    /// RED: an opaque (extern) callee poisons the flowed-through origins.
+    #[test]
+    fn nb3_unknown_callee_poisons() {
+        let facts = origin_facts(
+            "unsafe extern \"C\" { fn ext(p: *mut i32) -> *mut i32; }\n\
+             unsafe fn f(p: *mut i32) -> *mut i32 { ext(p) }",
+        );
+        assert!(
+            !facts["f"].unknown.is_empty(),
+            "f: opaque callee ext must poison at least one origin; unknown was empty"
+        );
+    }
+
+    /// NEGATIVE CONTROL (req 4): a KNOWN callee (boundary-table pointer method) must NOT poison —
+    /// poisoning that fires on everything passes the positive test and silently destroys precision.
+    #[test]
+    fn nb3_known_callee_no_poison() {
+        let facts = origin_facts("unsafe fn f(p: *mut i32) -> *mut i32 { p.offset(1) }");
+        assert!(
+            facts["f"].unknown.is_empty(),
+            "f: known provenance-preserving method `.offset` must NOT poison; got {:?}",
+            facts["f"].unknown
+        );
+    }
+
+    /// RED: `*dst = src` — src's origin flows into arg0's storage (output-param shape).
+    #[test]
+    fn nb3_arg_into_arg0_storage_flow() {
+        let facts =
+            origin_facts("unsafe fn f(dst: *mut *mut i32, src: *mut i32) { *dst = src; }");
+        let f = &facts["f"];
+        // src (arg2@0) flows into dst's pointee (arg1@1 — the store `*dst = src`); the deref is
+        // captured in the slot depth, and this output-param flow lands in the same subset seam
+        // `depth0_value_flows` feeds.
+        assert!(
+            has(&f.subset, "arg2@0", "arg1@1"),
+            "f: arg2@0 (src) → arg1@1 (dst pointee) expected in subset; got {:?}",
+            f.subset
+        );
+    }
+}
