@@ -10972,11 +10972,26 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// `borrow::mutable_references_no_guarantee` promotes x and q to shared `&T` on this exact
     /// program (verified), so BO is not held to a stricter standard than what ships to the
     /// rewriter. The ONLY guard is the **§8 codegen guardrail** (BO output is unconsumed by
-    /// codegen) — the equate-closure is NOT an acceptance-level guard. The fix is write-aware
-    /// invalidation (NB3 sub-phase 3b); when it lands, the skip stops relaxing writes and the
-    /// fact-mode expectation below flips `Ref` → `Raw`. Until then this is a permanent On/Off
-    /// regression pinning the gap. (The SOUND-skip proof is `nb2_two_shared_reads_both_ref`; this
-    /// is its UNSOUND-skip counterpart.)
+    /// codegen) — the equate-closure is NOT an acceptance-level guard.
+    ///
+    /// **NB3-3b finding (2026-07-10): write-aware invalidation does NOT close THIS case.** 3b
+    /// restores the read/write distinction so an immutable loan is skipped for reads only. But the
+    /// cross-alias write here is `*b = 5` with `b = p` (a copy), and `local_map.row(b)` is EMPTY —
+    /// the loan is on `(*x)`/`(*p)`, not on `b`, so the write invalidates nothing. Place-conflict is
+    /// structurally blind to the call-return alias (`x = id(p)`); write-awareness cannot route the
+    /// write's invalidation of p's loan to x's loan. The forced-mut demotion of x/z/q rides the
+    /// READ pointer-copies `z = x`/`q = x` (verified: `INSERT rw=Read borrowed=(*x)` at those
+    /// points), which the read-skip soundly preserves. Closing this needs **3c origins** (subset
+    /// chain x ⊇ id-ret ⊇ p). This test is the **3c-boundary marker**: it stays `Ref` today and
+    /// must flip to `Raw` when 3c lands. (The SOUND-skip proof is `nb2_two_shared_reads_both_ref`;
+    /// this is its UNSOUND-skip counterpart.)
+    ///
+    /// **Decision B (2026-07-11):** the 3b write-aware fix was measured **corpus-inert** — 0
+    /// shared-ref demotions across all 19 accepts (same-base immutable-written cases don't arise
+    /// from real Foster facts: a written-through pointer is Foster `Mut`, so its loan is never
+    /// skip-eligible). Write-awareness is inert *without* origins (nothing routes a cross-alias
+    /// write to the aliased loan until 3c), so it was folded into 3c behind a toggle rather than
+    /// landed standalone. Until 3c, this remains `Ref` (fork == production; §8 is the sole guard).
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
@@ -11051,9 +11066,11 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     assert_eq!(
                         kind_of(name, false),
                         Some(SlotKind::Ref),
-                        "fact-mut (skip ON): `{name}` survives Ref — the CONFIRMED S2-6 gap (unsound \
-                         shared &T aliasing the call-return-written cell; §8 is the only guard; \
-                         NB3-3b write-aware invalidation flips this to Raw)"
+                        "fact-mut: `{name}` survives Ref — 3b's write-aware invalidation does NOT \
+                         reach this CALL-RETURN alias (the `*b=5` write invalidates nothing: b's \
+                         loan row is empty, place-conflict is blind to the call-return alias — \
+                         diagnosed 2026-07-10). S2-6 stays open here until 3c origins; §8 is the \
+                         only guard. This is now the 3c-boundary marker (see doc above)."
                     );
                 }
             },
