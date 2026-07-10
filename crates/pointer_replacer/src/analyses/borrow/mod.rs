@@ -158,10 +158,10 @@ impl std::fmt::Debug for ProvenanceData {
 /// This formulation is definitely wrong as we don't create [`Origin`]
 /// for nested pointers. But I guess it could be fine?
 pub struct ProvenanceSet {
-    local_data: IndexVec<Local, Option<Provenance>>,
+    pub(crate) local_data: IndexVec<Local, Option<Provenance>>,
     field_data: FxHashMap<StructFieldSlot, Option<Provenance>>,
-    provenance_data: IndexVec<Provenance, ProvenanceData>,
-    tree_borrow_local: RefCell<UnionFind<Local>>,
+    pub(crate) provenance_data: IndexVec<Provenance, ProvenanceData>,
+    pub(crate) tree_borrow_local: RefCell<UnionFind<Local>>,
 }
 
 impl ProvenanceSet {
@@ -391,8 +391,8 @@ impl<C> DebugWithContext<C> for Loan {}
 
 pub struct BorrowData<'tcx> {
     location: Location,
-    borrowed: Place<'tcx>,
-    assigned: Borrower,
+    pub(crate) borrowed: Place<'tcx>,
+    pub(crate) assigned: Borrower,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -409,9 +409,9 @@ impl std::fmt::Debug for BorrowData<'_> {
 }
 
 pub struct BorrowSet<'tcx> {
-    loans: IndexVec<Loan, BorrowData<'tcx>>,
+    pub(crate) loans: IndexVec<Loan, BorrowData<'tcx>>,
     location_map: FxHashMap<Location, Vec<Loan>>,
-    local_map: SparseBitMatrix<Local, Loan>,
+    pub(crate) local_map: SparseBitMatrix<Local, Loan>,
 }
 
 pub trait HasBorrowSet<'tcx> {
