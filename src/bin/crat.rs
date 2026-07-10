@@ -558,6 +558,14 @@ fn main() {
                 }
 
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
+                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
+                })
+                .unwrap();
+                if changed {
+                    std::fs::write(&file, s).unwrap();
+                }
+
+                let (s, changed) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
                 })
                 .unwrap();
