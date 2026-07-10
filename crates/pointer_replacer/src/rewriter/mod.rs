@@ -41,6 +41,7 @@ pub(crate) mod diagnostics;
 mod epoch_split;
 mod lifetimes;
 mod struct_array_field_pre;
+mod struct_param_field_spec;
 mod transform;
 
 pub use epoch_split::rewrite_epoch_split;
@@ -221,6 +222,42 @@ pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
         &ast_to_hir,
     );
 
+    (pprust::crate_to_string_for_macros(&krate), changed)
+}
+
+pub fn rewrite_struct_param_fields(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+    let mut krate = utils::ast::expanded_ast(tcx);
+    let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+    utils::ast::remove_unnecessary_items_from_ast(&mut krate);
+
+    let input = collect_input(tcx);
+    let arena = typed_arena::Arena::new();
+    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let andersen_config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: config.c_exposed_fns.clone(),
+    };
+    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
+    let alloc_fns = pre_points_to.alloc_fns.clone();
+    let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
+    let points_to = andersen::post_analyze(
+        &andersen_config,
+        pre_points_to,
+        points_to_solutions,
+        &tss,
+        tcx,
+    );
+    let nullity = analyses::nullity::analyze(&input, &points_to);
+    let flows = analyses::pointer_flow::pointer_flow_analysis(&input, &alloc_fns);
+    let plan = analyses::struct_param_field_spec::find_plan(
+        &input,
+        &flows,
+        &nullity,
+        &config.c_exposed_fns,
+    );
+
+    let changed =
+        struct_param_field_spec::apply_struct_param_field_spec(&mut krate, &plan, tcx, &ast_to_hir);
     (pprust::crate_to_string_for_macros(&krate), changed)
 }
 

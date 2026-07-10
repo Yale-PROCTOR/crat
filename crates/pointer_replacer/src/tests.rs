@@ -41,6 +41,143 @@ fn rewrite_struct_arrays_then_array_local_then_pointer(
     rewrite_with_config(input, config)
 }
 
+fn rewrite_struct_param_fields_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_struct_param_fields(config, tcx))
+        .unwrap()
+}
+
+fn run_param_field_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let config = Config::default();
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_struct_param_field_basic_specialization() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+    return build(0 as *mut st, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "(*s)[0] = 1 as u16",
+            "&raw mut (*s).lookup",
+            "0 as *mut [u16; 4]",
+        ],
+        &["build(s,", "build(0 as *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_no_trigger_no_rewrite() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    return build(s, tree);
+}
+"#,
+        &["fn build(mut s: *mut st"],
+        &["&raw mut"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_forwarding_chain() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn inner(mut s: *mut [u16; 4]",
+            "fn outer(mut s: *mut [u16; 4]",
+            "inner(s)",
+            "&raw mut (*s).lookup",
+        ],
+        &["fn inner(mut s: *mut st", "fn outer(mut s: *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_source_alias_blocks_rewrite() {
+    // `let t = s;` passes the MIR gate but fails AST edit resolution:
+    // the group must be dropped whole
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    let mut t: *mut st = s;
+    (*t).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &["fn build(mut s: *mut st"],
+        &["&raw mut", "*mut [u16; 4]"],
+    );
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);
