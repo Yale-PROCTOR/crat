@@ -1656,7 +1656,7 @@ fn choose_binding_representations(
         // unsafe. any other base may still be upgraded to a slice by later
         // stages, turning the same materializations into safe indexing.
         if !base_is_fn_param(tcx, rewrite.base_hir_id)
-            || !super::transform::is_c_exposed_fn(
+            || !crate::utils::rustc::is_c_exposed_fn(
                 tcx,
                 rewrite.base_hir_id.owner.def_id,
                 c_exposed_fns,

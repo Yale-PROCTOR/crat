@@ -16,7 +16,7 @@ use rustc_hir::{
     intravisit::{self, Visitor},
 };
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::{Symbol, sym};
+use rustc_span::Symbol;
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 use utils::{
@@ -38,7 +38,7 @@ use crate::{
         borrow::StructFieldSlot, fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
     },
-    utils::rustc::RustProgram,
+    utils::rustc::{RustProgram, is_c_exposed_fn},
 };
 
 pub(crate) struct TransformVisitor<'a, 'tcx> {
@@ -1238,21 +1238,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 enum PtrCtx {
     Rhs(PtrKind),
     Deref(bool),
-}
-
-pub(crate) fn is_c_exposed_fn(
-    tcx: TyCtxt<'_>,
-    did: LocalDefId,
-    c_exposed_fns: &FxHashSet<String>,
-) -> bool {
-    let name = tcx.item_name(did.to_def_id());
-    c_exposed_fns.contains(name.as_str())
-        || tcx
-            .get_attrs(did.to_def_id(), sym::export_name)
-            .any(|attr| {
-                attr.value_str()
-                    .is_some_and(|s| c_exposed_fns.contains(s.as_str()))
-            })
 }
 
 fn is_local_c_abi_struct(tcx: TyCtxt<'_>, did: LocalDefId) -> bool {

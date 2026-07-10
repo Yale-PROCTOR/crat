@@ -21,7 +21,7 @@ use crate::{
         field_access::field_accesses_reachable_from_param,
         graph::{BaseId, PfgNode, UnknownReason},
     },
-    utils::rustc::RustProgram,
+    utils::rustc::{RustProgram, is_c_exposed_fn},
 };
 
 /// the field a selected struct-pointer parameter is specialized to
@@ -108,7 +108,7 @@ pub(crate) fn collect_candidates(
     for &fn_did in &input.functions {
         let name = tcx.item_name(fn_did.to_def_id());
         if name.as_str() == "main"
-            || c_exposed_fns.contains(name.as_str())
+            || is_c_exposed_fn(tcx, fn_did, c_exposed_fns)
             || address_taken.contains(&fn_did)
             || tcx.fn_sig(fn_did).skip_binder().c_variadic()
         {
@@ -648,6 +648,34 @@ pub unsafe extern "C" fn take(mut s: *mut st) -> libc::c_int {
             let flows = pointer_flow_analysis(&program, &FxHashSet::default());
             let mut exposed = FxHashSet::default();
             exposed.insert("build".to_string());
+            collect_candidates(&program, &flows, &exposed).len()
+        })
+        .unwrap();
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn test_export_name_c_exposed_fn_is_excluded() {
+        // c2rust emits #[export_name] when the C symbol differs from the Rust
+        // item name; the c_exposed_fns set is keyed on the C symbol, so the
+        // exclusion must check export_name, not just the Rust item name
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+}
+#[export_name = "exposed_c_name"]
+pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    return 0 as libc::c_int;
+}
+"#;
+        let selected = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_rust_program(tcx);
+            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
+            let mut exposed = FxHashSet::default();
+            exposed.insert("exposed_c_name".to_string());
             collect_candidates(&program, &flows, &exposed).len()
         })
         .unwrap();
