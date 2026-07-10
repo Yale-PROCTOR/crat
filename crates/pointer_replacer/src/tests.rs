@@ -178,6 +178,47 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
     );
 }
 
+#[test]
+fn test_struct_param_field_specializes_inside_mod_wrapper() {
+    // c2rust wraps everything in `pub mod src { pub mod lib { ... } }`;
+    // the rewriter must recurse into nested modules to find struct/fn items
+    run_param_field_test(
+        r#"
+use ::libc;
+pub mod src {
+    pub mod lib {
+        use ::libc;
+        #[repr(C)]
+        pub struct st {
+            pub lookup: [u16; 4],
+            pub lit: [u32; 4],
+        }
+        pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+            if !s.is_null() {
+                (*s).lookup[0] = 1 as u16;
+            }
+            *tree.offset(0) = 0 as u32;
+            return 0 as libc::c_int;
+        }
+        pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+            return build(s, ((*s).lit).as_mut_ptr());
+        }
+        pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+            return build(0 as *mut st, ((*s).lit).as_mut_ptr());
+        }
+    }
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "(*s)[0] = 1 as u16",
+            "&raw mut (*s).lookup",
+            "0 as *mut [u16; 4]",
+        ],
+        &["build(s,", "build(0 as *mut st"],
+    );
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);

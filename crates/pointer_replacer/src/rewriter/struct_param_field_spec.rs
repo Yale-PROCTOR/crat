@@ -50,6 +50,18 @@ pub(crate) fn apply_struct_param_field_spec(
     visitor.changed
 }
 
+// recurses into `ItemKind::Mod` so callers see every item regardless of how
+// deeply c2rust nested it (it wraps translation units in `pub mod src { pub
+// mod lib { ... } }`); read-only, does not allocate a flattened copy
+fn walk_items<'a>(items: &'a [P<Item>], f: &mut impl FnMut(&'a Item)) {
+    for item in items {
+        f(item);
+        if let ItemKind::Mod(_, _, ModKind::Loaded(nested, ..)) = &item.kind {
+            walk_items(nested, f);
+        }
+    }
+}
+
 // phase 0: clone the declared AST type of each target field from its struct item
 fn collect_field_tys(
     krate: &Crate,
@@ -62,19 +74,19 @@ fn collect_field_tys(
         .map(|t| (t.struct_def, t.field.as_usize()))
         .collect();
     let mut out = FxHashMap::default();
-    for item in &krate.items {
+    walk_items(&krate.items, &mut |item| {
         let ItemKind::Struct(_, _, VariantData::Struct { fields, .. }) = &item.kind else {
-            continue;
+            return;
         };
         let Some(&did) = ast_to_hir.global_map.get(&item.id) else {
-            continue;
+            return;
         };
         for (idx, field) in fields.iter().enumerate() {
             if needed.contains(&(did, idx)) {
                 out.insert((did, idx), field.ty.clone());
             }
         }
-    }
+    });
     out
 }
 
@@ -90,12 +102,12 @@ fn resolve_and_validate(
     let mut fn_plans: FxHashMap<(LocalDefId, usize), FnPlan> = FxHashMap::default();
     let mut dropped: FxHashSet<(LocalDefId, usize)> = FxHashSet::default();
 
-    for item in &krate.items {
+    walk_items(&krate.items, &mut |item| {
         let ItemKind::Fn(func) = &item.kind else {
-            continue;
+            return;
         };
         let Some(&did) = ast_to_hir.global_map.get(&item.id) else {
-            continue;
+            return;
         };
         for (&(target_did, param_idx), target) in &plan.targets {
             if target_did != did {
@@ -108,7 +120,7 @@ fn resolve_and_validate(
                 dropped.insert(key);
             }
         }
-    }
+    });
     // targets whose fn item was never found are dropped too
     for key in plan.targets.keys() {
         if !fn_plans.contains_key(key) {
