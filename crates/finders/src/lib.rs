@@ -3,6 +3,7 @@
 #![warn(unused_extern_crates)]
 
 extern crate rustc_ast;
+extern crate rustc_ast_pretty;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_middle;
@@ -13,4 +14,5 @@ pub mod example;
 pub mod macro_finder;
 pub mod mapper;
 pub mod mir;
+pub mod symbol_finder;
 pub mod unsafe_finder;
