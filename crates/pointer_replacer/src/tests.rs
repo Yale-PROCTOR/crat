@@ -10949,35 +10949,46 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// §NB2 S2-6 witness — the cross-alias immutable-loan invalidation gap, and (the
-    /// adversarial-review correction, 2026-07-10) the *real* acceptance-level guard.
+    /// §NB2 S2-6 witness — the CONFIRMED cross-alias immutable-loan invalidation gap.
     ///
-    /// `xp`/`z` are read-only copies of `p` (only `*z` is read). Foster classifies them `Imm`
-    /// — **verified below** — EVEN THOUGH the cell is written through the sibling `b` (`*b =
-    /// 5`). This refutes the naive "Foster over-approximates `Mut`, so never wrongly-immutable"
-    /// story: Foster is *precise per-pointer* (`z` is genuinely never-written-THROUGH), which is
-    /// NOT the same as the cell being immutable. So `z`'s loan (base `xp`, `Imm`) IS skip-
-    /// eligible at `invalidates.rs:73` — the latent S2-6 gap.
+    /// Rebuilt 2026-07-10 after a Codex adversarial review DISPROVED the earlier "the coherence
+    /// equate-closure is the acceptance-level guard" claim. The earlier program was a *direct*
+    /// copy cluster (`let xp = p; let z = xp; let b = p; *b = 5;`): p/xp/z/b are one coherence
+    /// cluster, a mutable p/b conflict demotes the whole cluster in BOTH modes, so it was
+    /// non-causal (the skip changed nothing — even the round-0 conflict edges were byte-identical
+    /// across modes) and proved no gap. The equate-closure only unifies DIRECT copy clusters; it
+    /// does NOT model interprocedural aliases.
     ///
-    /// What keeps this SOUND at the acceptance level today is NOT the skip and NOT Foster: it is
-    /// the flow-insensitive **coherence equate-closure**, which unifies the `p`/`xp`/`z`/`b`
-    /// copy cluster and demotes it to `Raw` because `b` is written. The witness pins that:
-    /// `z` is `Raw` **identically under forced-mut and fact-driven mutability**, so the skip
-    /// makes no difference — the equate-closure (mode-independent) is the guard. If the
-    /// equate-closure is later relaxed for flow-sensitivity (`borrow_verify.rs` BB3-b residual),
-    /// `z`'s skipped loan would let it survive as a shared `&T` aliasing a cell written via `b`
-    /// — an **acceptance-level** unsoundness, not merely the §8 codegen concern. That is why
-    /// **S2-6** gates codegen consumption. The §8 guardrail (BO unconsumed) is the further
-    /// backstop, not the primary reason.
+    /// Here `x = id(p)` aliases `p` through a CALL RETURN, which coherence does not connect, so
+    /// x/z/q form their own cluster carrying ONLY immutable loans (Foster marks x/z/q `Imm` —
+    /// verified below — they are never written THROUGH; the write is via the mutable sibling `b`,
+    /// `b = p`). `*b = 5` demotes the p/b cluster but NOT x/z/q. Result — **mode-differential**
+    /// (the causal proof the skip runs, which the old witness lacked):
+    ///   - forced-mut (skip OFF): x/z/q = `Raw` (their loans participate; the write demotes them);
+    ///   - fact-mut  (skip ON):  x/z/q = `Ref` — a shared `&T` aliasing the written cell.
+    ///
+    /// The fact-mode `Ref` is an **acceptance-level unsoundness that is REAL TODAY** (not merely
+    /// "if flow-sensitivity is relaxed"). It is production-PARITY: production's own
+    /// `borrow::mutable_references_no_guarantee` promotes x and q to shared `&T` on this exact
+    /// program (verified), so BO is not held to a stricter standard than what ships to the
+    /// rewriter. The ONLY guard is the **§8 codegen guardrail** (BO output is unconsumed by
+    /// codegen) — the equate-closure is NOT an acceptance-level guard. The fix is write-aware
+    /// invalidation (NB3 sub-phase 3b); when it lands, the skip stops relaxing writes and the
+    /// fact-mode expectation below flips `Ref` → `Raw`. Until then this is a permanent On/Off
+    /// regression pinning the gap. (The SOUND-skip proof is `nb2_two_shared_reads_both_ref`; this
+    /// is its UNSOUND-skip counterpart.)
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
             r#"
+#[inline(never)]
+unsafe fn id(mut p: *mut i32) -> *mut i32 { p }
 unsafe fn f(mut p: *mut i32) -> i32 {
-    let xp = p;
-    let z = xp;
-    let b = p;
-    let r0 = *z;
+    let mut b = p;
+    let mut x = id(p);
+    let mut z = x;
+    let mut q = x;
+    let r0 = *z + *q;
     *b = 5;
     let r1 = *z;
     r0 + r1
@@ -10994,51 +11005,57 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let local_of = |name: &str| local_by_var_name(tcx, f, name);
 
                 let facts = MutFacts::from_program(&program);
-                // `z` (a read-only view) is Foster-Imm ⇒ its loan is skip-eligible, EVEN THOUGH
-                // the cell is written through the mutable sibling `b`. This is the S2-6 gap.
-                assert!(
-                    !facts.is_mutable(f, local_of("z")),
-                    "`z` is a read-only view ⇒ Foster Imm ⇒ its loan is skip-eligible"
-                );
+                // x/z/q are read-only views (never written THROUGH) ⇒ Foster `Imm` ⇒ their loans
+                // are skip-eligible at `invalidates.rs:73`. These ARE the real loan bases — the
+                // point the earlier witness got wrong (it asserted a copy, not the loan base).
+                for name in ["x", "z", "q"] {
+                    assert!(
+                        !facts.is_mutable(f, local_of(name)),
+                        "`{name}` is a read-only view ⇒ Foster Imm ⇒ its loan is skip-eligible"
+                    );
+                }
+                // `b` (= p) writes the cell x/z/q alias via `id` ⇒ Foster `Mut` (the writer).
                 assert!(
                     facts.is_mutable(f, local_of("b")),
-                    "`b` writes the same cell ⇒ Foster Mut (the cross-alias writer)"
+                    "`b` writes the aliased cell ⇒ Foster Mut (the cross-alias writer)"
                 );
 
-                let kind_of_z = |mf_true: bool| {
+                let kind_of = |name: &str, mf_true: bool| {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) =
                         emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
                             .expect("emission");
                     add_coherence(&solver, &slots, f, &body);
-                    let z = slot_of("z");
+                    let sid = slot_of(name);
                     if mf_true {
                         verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
                             .expect("accepts")
-                            .get(&z)
+                            .get(&sid)
                             .copied()
                     } else {
                         verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
                             .expect("accepts")
-                            .get(&z)
+                            .get(&sid)
                             .copied()
                     }
                 };
 
-                // The acceptance-level guard is the coherence equate-closure, NOT the skip:
-                // `z` is Raw identically in both modes, so fact-driven mutability changed
-                // nothing here. Were the equate-closure relaxed, the skipped Imm view would
-                // survive as an unsound shared Ref (S2-6).
-                assert_eq!(
-                    kind_of_z(false),
-                    Some(SlotKind::Raw),
-                    "fact-driven: the equate-closure demotes the written copy cluster, so `z` is Raw"
-                );
-                assert_eq!(
-                    kind_of_z(true),
-                    Some(SlotKind::Raw),
-                    "forced-mut: `z` is Raw too ⇒ the equate-closure (not the skip) is the guard"
-                );
+                // Mode-differential = the skip is causally exercised (the old witness asserted
+                // `Raw` in BOTH modes and proved nothing). fact-mode `Ref` = the CONFIRMED gap.
+                for name in ["x", "z", "q"] {
+                    assert_eq!(
+                        kind_of(name, true),
+                        Some(SlotKind::Raw),
+                        "forced-mut (skip OFF): `{name}`'s loan participates ⇒ the write demotes it to Raw"
+                    );
+                    assert_eq!(
+                        kind_of(name, false),
+                        Some(SlotKind::Ref),
+                        "fact-mut (skip ON): `{name}` survives Ref — the CONFIRMED S2-6 gap (unsound \
+                         shared &T aliasing the call-return-written cell; §8 is the only guard; \
+                         NB3-3b write-aware invalidation flips this to Raw)"
+                    );
+                }
             },
         );
     }

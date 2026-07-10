@@ -12,23 +12,28 @@
 //! per-`(LocalDefId, Local)` boolean. The `&T`/`&mut T` distinction is a *readout* fact, not
 //! a solver kind (the domain has only `Raw`/`Ref`/`Owning`).
 //!
-//! Soundness (corrected per adversarial review 2026-07-10 — this is NOT "Foster
-//! over-approximates `Mut`"): Foster is *precise per-pointer* — it marks a pointer `Imm` iff
-//! that pointer is never written THROUGH, which is NOT the same as its referent cell being
-//! immutable. A read-only copy whose cell is written through a *sibling* pointer is therefore
-//! `Imm`, and its loan IS skipped by `invalidates.rs:73` — the latent S2-6 cross-alias gap
-//! (witnessed by `nb2_cross_alias_write_uncaught_witness`). Two legs keep this sound today:
+//! Soundness posture (CORRECTED 2026-07-10 after a SECOND adversarial review DISPROVED the
+//! earlier "the coherence equate-closure is the acceptance-level guard" claim):
+//! Foster is *precise per-pointer* — it marks a pointer `Imm` iff that pointer is never written
+//! THROUGH, which is NOT the same as its referent cell being immutable. A read-only view whose
+//! cell is written through a *sibling* pointer is therefore `Imm`, and its loan IS skipped by
+//! `invalidates.rs:73`. That makes the immutable-skip **UNSOUND at the acceptance level TODAY**
+//! for interprocedurally-aliased writes:
 //!   1. MISSING map data defaults to `Mut` (`is_mutable` below) — the sole unsound *data*
-//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict.
-//!   2. At the ACCEPTANCE level, the flow-insensitive **coherence equate-closure** unifies each
-//!      copy cluster and demotes it to `Raw` when any member is written, so a skipped `Imm`
-//!      view never survives as a shared `Ref` aliasing a written cell. This is what actually
-//!      guards the cross-alias case (mode-independent — NOT the skip, NOT Foster's direction),
-//!      matching production's own `_no_guarantee` posture
-//!      (`borrow::classified_references_..._no_guarantee`).
-//! If the equate-closure is relaxed for flow-sensitivity (`borrow_verify.rs` BB3-b), the gap
-//! becomes an ACCEPTANCE-level unsoundness — hence **S2-6** gates codegen consumption; the §8
-//! guardrail (BO unconsumed by codegen) is the further backstop, not the primary reason.
+//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict. (Leg holds.)
+//!   2. The coherence equate-closure unifies only **DIRECT** copy clusters, so it demotes the
+//!      direct case but does NOT cover call-return / parameter / cast / offset / field aliases.
+//!      The call-return witness (`nb2_cross_alias_write_uncaught_witness`: `let x=id(p); let z=x;
+//!      let q=x; *b=5;`, `b=p`) leaves x/z/q a shared `&T` aliasing the written cell — a
+//!      fact-uniquely-unsound `Ref` at acceptance. Production's own
+//!      `borrow::mutable_references_no_guarantee` ships the same shared `&T` here (production-
+//!      parity: BO is not stricter than what ships to the rewriter).
+//! So the equate-closure is **NOT** an acceptance-level guard; the ONLY guard is the **§8
+//! codegen guardrail** (BO output unconsumed by codegen), and the acceptance-level unsoundness
+//! is REAL NOW (not contingent on future flow-sensitivity). The fix is **write-aware
+//! invalidation** (writes invalidate all overlapping loans regardless of Foster mutability),
+//! landing as NB3 in-fork sub-phase **3b**; the C2 codegen gate remains the backstop. **S2-6**
+//! tracks this.
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
