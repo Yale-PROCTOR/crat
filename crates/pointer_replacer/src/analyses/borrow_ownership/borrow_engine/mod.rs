@@ -57,10 +57,18 @@ impl ForkEngineMode {
     pub(crate) const DEFAULT: Self = ForkEngineMode::Production;
 
     pub(crate) fn current() -> Self {
-        match std::env::var("CRAT_BO_FORK_ENGINE").as_deref() {
-            Ok("fork") | Ok("on") => ForkEngineMode::Fork,
-            Ok("production") | Ok("off") => ForkEngineMode::Production,
-            _ => Self::DEFAULT,
+        // Reject a SET-but-invalid value (fail-loud on typos — a mistyped selector must NOT silently
+        // fall back to production and mask which engine ran; 3a Codex review [high]). Unset ⇒ DEFAULT.
+        match std::env::var("CRAT_BO_FORK_ENGINE") {
+            Ok(v) => match v.as_str() {
+                "fork" | "on" => ForkEngineMode::Fork,
+                "production" | "off" => ForkEngineMode::Production,
+                other => panic!(
+                    "CRAT_BO_FORK_ENGINE={other:?} is not a valid selector \
+                     (expected fork|on or production|off) — refusing to silently fall back"
+                ),
+            },
+            Err(_) => Self::DEFAULT,
         }
     }
 
