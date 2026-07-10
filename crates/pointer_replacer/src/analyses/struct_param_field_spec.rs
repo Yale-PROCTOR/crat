@@ -19,7 +19,7 @@ use crate::{
         PointerFlowResult,
         builtin::{call_name, is_as_ptr},
         field_access::field_accesses_reachable_from_param,
-        graph::{BaseId, PfgNode},
+        graph::{BaseId, PfgNode, UnknownReason},
     },
     utils::rustc::RustProgram,
 };
@@ -96,7 +96,6 @@ fn collect_address_taken_fns(input: &RustProgram<'_>) -> FxHashSet<LocalDefId> {
     taken
 }
 
-#[allow(dead_code)] // query API has no non-test client until Task 3 (final plan assembly)
 pub(crate) fn collect_candidates(
     input: &RustProgram<'_>,
     flows: &FxHashMap<LocalDefId, PointerFlowResult>,
@@ -265,6 +264,204 @@ fn call_target(_tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<LocalDefId> {
         return None;
     };
     def_id.as_local()
+}
+
+/// the assembled specialization plan: candidate params selected for
+/// rewriting, plus forwarding edges among them
+#[derive(Debug, Default)]
+pub struct SpecPlan {
+    pub targets: FxHashMap<(LocalDefId, usize), SpecTarget>,
+    /// forwarding edges among targets: caller (fn, param) passes its own
+    /// specialized param directly as callee (fn, param)
+    pub forwards: FxHashSet<((LocalDefId, usize), (LocalDefId, usize))>,
+}
+
+// how a call-site argument at a specialized position can be rewritten
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ArgClass {
+    // NullLike-only provenance: rewrite to `0 as *mut FieldTy`
+    Null,
+    // the caller's own candidate param passed through; valid only while the
+    // caller stays selected
+    Forward((LocalDefId, usize)),
+    // the same call already takes a field address on the same base, so the
+    // caller dereferences the base here anyway
+    FieldSibling,
+    // non-null per the nullity analysis: `&raw mut (*e).fld` is safe
+    NonNull,
+}
+
+// one call site into a candidate position, with every applicable class
+#[derive(Debug)]
+struct CallSiteFact {
+    callee: (LocalDefId, usize),
+    classes: Vec<ArgClass>,
+}
+
+fn all_bases_null_like(flow: &PointerFlowResult, op: &Operand<'_>) -> bool {
+    let Some(place) = op.place() else {
+        return false;
+    };
+    let Some(slot) = flow.slot_table.local_head_slot(place.local) else {
+        return false;
+    };
+    let Some(bases) = flow.provenance.reachable_bases.get(&PfgNode::Slot(slot)) else {
+        return false;
+    };
+    !bases.is_empty()
+        && bases.iter().all(|base| {
+            matches!(
+                base,
+                BaseId::Unknown {
+                    reason: UnknownReason::NullLike,
+                    ..
+                }
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_arg<'tcx>(
+    flow: &PointerFlowResult,
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    defs: &BodyDefs<'tcx>,
+    caller: LocalDefId,
+    candidates: &FxHashMap<(LocalDefId, usize), SpecTarget>,
+    nullity: &crate::analyses::nullity::NullityResult,
+    args: &[rustc_span::source_map::Spanned<Operand<'tcx>>],
+    arg_idx: usize,
+) -> Vec<ArgClass> {
+    let mut classes = vec![];
+    let arg = &args[arg_idx].node;
+
+    if all_bases_null_like(flow, arg) {
+        classes.push(ArgClass::Null);
+    }
+
+    let base = operand_base(flow, arg);
+    if let Some(BaseId::Param { local, .. }) = &base {
+        let param_key = (caller, local.index() - 1);
+        if candidates.contains_key(&param_key) {
+            classes.push(ArgClass::Forward(param_key));
+        }
+    }
+    if let Some(base) = &base {
+        let has_sibling = args.iter().enumerate().any(|(j, other)| {
+            j != arg_idx
+                && field_address_base(flow, body, tcx, defs, &other.node)
+                    .is_some_and(|b| &b == base)
+        });
+        if has_sibling {
+            classes.push(ArgClass::FieldSibling);
+        }
+    }
+    if let Some(place) = arg.place()
+        && let Some(locals) = nullity.non_null_locals.get(&caller)
+        && locals.contains(place.local)
+    {
+        classes.push(ArgClass::NonNull);
+    }
+
+    classes
+}
+
+pub fn find_plan(
+    input: &RustProgram<'_>,
+    flows: &FxHashMap<LocalDefId, PointerFlowResult>,
+    nullity: &crate::analyses::nullity::NullityResult,
+    c_exposed_fns: &FxHashSet<String>,
+) -> SpecPlan {
+    let tcx = input.tcx;
+    let candidates = collect_candidates(input, flows, c_exposed_fns);
+    let triggered = collect_triggered(input, flows, &candidates);
+
+    // every call site into a candidate position, plus forwarding edges
+    let mut facts: Vec<CallSiteFact> = vec![];
+    let mut forwards: FxHashSet<((LocalDefId, usize), (LocalDefId, usize))> =
+        FxHashSet::default();
+    for &fn_did in &input.functions {
+        let Some(flow) = flows.get(&fn_did) else {
+            continue;
+        };
+        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let defs = BodyDefs::new(&body, tcx);
+        for block in body.basic_blocks.iter() {
+            let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
+                continue;
+            };
+            let Some(callee) = call_target(tcx, func) else {
+                continue;
+            };
+            for i in 0..args.len() {
+                if !candidates.contains_key(&(callee, i)) {
+                    continue;
+                }
+                let classes = classify_arg(
+                    flow, &body, tcx, &defs, fn_did, &candidates, nullity, args, i,
+                );
+                for class in &classes {
+                    if let ArgClass::Forward(from) = class {
+                        forwards.insert((*from, (callee, i)));
+                    }
+                }
+                facts.push(CallSiteFact {
+                    callee: (callee, i),
+                    classes,
+                });
+            }
+        }
+    }
+
+    // closure: a selected caller that forwards its param drags the callee in
+    let mut selected: FxHashSet<(LocalDefId, usize)> = triggered;
+    loop {
+        let additions: Vec<_> = forwards
+            .iter()
+            .filter(|(from, to)| selected.contains(from) && !selected.contains(to))
+            .map(|(_, to)| *to)
+            .collect();
+        if additions.is_empty() {
+            break;
+        }
+        selected.extend(additions);
+    }
+
+    // validity fixpoint: every call site into a selected position needs a
+    // usable class, and a selected forwarder needs its target selected
+    loop {
+        let before = selected.len();
+        let keep: FxHashSet<(LocalDefId, usize)> = selected
+            .iter()
+            .filter(|key| {
+                let sites_ok = facts.iter().filter(|fact| fact.callee == **key).all(|fact| {
+                    fact.classes.iter().any(|class| match class {
+                        ArgClass::Null | ArgClass::FieldSibling | ArgClass::NonNull => true,
+                        ArgClass::Forward(from) => selected.contains(from),
+                    })
+                });
+                let forwards_ok = forwards
+                    .iter()
+                    .all(|(from, to)| from != *key || selected.contains(to));
+                sites_ok && forwards_ok
+            })
+            .copied()
+            .collect();
+        selected = keep;
+        if selected.len() == before {
+            break;
+        }
+    }
+
+    let targets = candidates
+        .into_iter()
+        .filter(|(key, _)| selected.contains(key))
+        .collect();
+    let forwards = forwards
+        .into_iter()
+        .filter(|(from, to)| selected.contains(from) && selected.contains(to))
+        .collect();
+    SpecPlan { targets, forwards }
 }
 
 /// call sites that alias a struct-pointer candidate argument with a pointer
@@ -531,5 +728,130 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
 }
 "#;
         assert_eq!(triggered_for(code), vec![]);
+    }
+
+    fn plan_for(code: &str) -> (Vec<(String, usize, String)>, usize) {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_rust_program(tcx);
+            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
+            let nullity = crate::analyses::nullity::NullityResult {
+                non_null_params: FxHashMap::default(),
+                non_null_locals: FxHashMap::default(),
+            };
+            let plan = find_plan(&program, &flows, &nullity, &FxHashSet::default());
+            let mut targets: Vec<(String, usize, String)> = plan
+                .targets
+                .iter()
+                .map(|(&(did, idx), target)| {
+                    (
+                        tcx.item_name(did.to_def_id()).to_string(),
+                        idx,
+                        target.field_name.to_string(),
+                    )
+                })
+                .collect();
+            targets.sort();
+            (targets, plan.forwards.len())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_plan_selects_triggered_fn_with_null_and_field_sites() {
+        // TRIGGERED plus a null-literal call site: both classes rewritable
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+    return build(0 as *mut st, ((*s).lit).as_mut_ptr());
+}
+"#;
+        let (targets, _) = plan_for(code);
+        assert_eq!(targets, vec![("build".to_string(), 0, "lookup".to_string())]);
+    }
+
+    #[test]
+    fn test_plan_closes_over_forwarding() {
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+        let (targets, forwards) = plan_for(code);
+        assert_eq!(
+            targets,
+            vec![
+                ("inner".to_string(), 0, "lookup".to_string()),
+                ("outer".to_string(), 0, "lookup".to_string()),
+            ]
+        );
+        assert_eq!(forwards, 1);
+    }
+
+    #[test]
+    fn test_unrewritable_call_site_drops_target_and_cascades() {
+        // extra caller passes a maybe-null variable with no sibling field
+        // pointer and no nullity fact: inner is unrewritable, and outer
+        // (which forwards into inner) must fall with it
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[1] = 2 as u16;
+    }
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    return inner(p);
+}
+"#;
+        let (targets, _) = plan_for(code);
+        assert_eq!(targets, vec![]);
     }
 }
