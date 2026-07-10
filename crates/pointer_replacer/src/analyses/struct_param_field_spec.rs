@@ -7,7 +7,7 @@ use rustc_abi::FieldIdx;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
     mir::{
-        Location, Operand, Terminator, TerminatorKind,
+        Body, Local, Location, Operand, Place, ProjectionElem, Rvalue, Terminator, TerminatorKind,
         visit::{MutatingUseContext, PlaceContext, Visitor},
     },
     ty::{self, TyCtxt},
@@ -15,7 +15,11 @@ use rustc_middle::{
 use rustc_span::{Symbol, def_id::LocalDefId};
 
 use crate::{
-    analyses::pointer_flow::{PointerFlowResult, field_access::field_accesses_reachable_from_param},
+    analyses::pointer_flow::{
+        PointerFlowResult,
+        field_access::field_accesses_reachable_from_param,
+        graph::{BaseId, PfgNode},
+    },
     utils::rustc::RustProgram,
 };
 
@@ -91,7 +95,7 @@ fn collect_address_taken_fns(input: &RustProgram<'_>) -> FxHashSet<LocalDefId> {
     taken
 }
 
-#[allow(dead_code)] // query API has no non-test client until Task 3 (trigger detection)
+#[allow(dead_code)] // query API has no non-test client until Task 3 (final plan assembly)
 pub(crate) fn collect_candidates(
     input: &RustProgram<'_>,
     flows: &FxHashMap<LocalDefId, PointerFlowResult>,
@@ -142,6 +146,172 @@ pub(crate) fn collect_candidates(
         }
     }
     candidates
+}
+
+// per-body maps for walking an argument's definition chain backward
+struct BodyDefs<'tcx> {
+    // local -> rvalues assigned to it (bare-local destinations only)
+    assigns: FxHashMap<Local, Vec<Rvalue<'tcx>>>,
+    // as_mut_ptr/as_ptr-style call destination -> receiver place
+    call_recv: FxHashMap<Local, Place<'tcx>>,
+}
+
+impl<'tcx> BodyDefs<'tcx> {
+    fn new(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
+        let mut assigns: FxHashMap<Local, Vec<Rvalue<'tcx>>> = FxHashMap::default();
+        let mut call_recv = FxHashMap::default();
+        for block in body.basic_blocks.iter() {
+            for statement in &block.statements {
+                if let rustc_middle::mir::StatementKind::Assign(box (place, rvalue)) =
+                    &statement.kind
+                    && let Some(local) = place.as_local()
+                {
+                    assigns.entry(local).or_default().push(rvalue.clone());
+                }
+            }
+            if let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &block.terminator().kind
+                && let Some(dest) = destination.as_local()
+                && let Some(fn_const) = func.constant()
+                && let ty::TyKind::FnDef(def_id, _) = fn_const.ty().kind()
+                && matches!(tcx.item_name(*def_id).as_str(), "as_mut_ptr" | "as_ptr")
+                && let Some(recv) = args.first().and_then(|arg| arg.node.place())
+            {
+                call_recv.insert(dest, recv);
+            }
+        }
+        Self { assigns, call_recv }
+    }
+}
+
+// unique non-null base of an operand's head slot, e.g. the struct pointer
+// argument temp copied from a local or param
+fn operand_base(flow: &PointerFlowResult, op: &Operand<'_>) -> Option<BaseId> {
+    let place = op.place()?;
+    let slot = flow.slot_table.local_head_slot(place.local)?;
+    flow.provenance.unique_non_null_base(&PfgNode::Slot(slot))
+}
+
+// if `place` is `(*prefix).field...`, return the unique non-null base of the
+// deref'd prefix
+fn deref_field_prefix_base<'tcx>(
+    flow: &PointerFlowResult,
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    place: Place<'tcx>,
+) -> Option<BaseId> {
+    let projection = place.projection.as_ref();
+    let deref_idx = projection
+        .iter()
+        .position(|elem| matches!(elem, ProjectionElem::Deref))?;
+    if !matches!(
+        projection.get(deref_idx + 1),
+        Some(ProjectionElem::Field(..))
+    ) {
+        return None;
+    }
+    let prefix = Place::from(place.local).project_deeper(&projection[..deref_idx], tcx);
+    let slot = flow.slot_table.place_head_slot(prefix, body, tcx)?;
+    flow.provenance.unique_non_null_base(&PfgNode::Slot(slot))
+}
+
+// walks an argument backward through the shapes c2rust emits (copies, casts,
+// unsize coercions, borrows, as_mut_ptr/as_ptr) until it reaches a field
+// address `&raw? (*prefix).field`; returns the prefix's base
+fn field_address_base<'tcx>(
+    flow: &PointerFlowResult,
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    defs: &BodyDefs<'tcx>,
+    op: &Operand<'tcx>,
+) -> Option<BaseId> {
+    let mut place = op.place()?;
+    let mut visited = FxHashSet::default();
+    loop {
+        if let Some(base) = deref_field_prefix_base(flow, body, tcx, place) {
+            return Some(base);
+        }
+        let local = place.as_local()?;
+        if !visited.insert(local) {
+            return None;
+        }
+        if let Some(rvalues) = defs.assigns.get(&local) {
+            // multiple assignments end the walk: the chain is no longer a
+            // single-definition temp
+            let [rvalue] = rvalues.as_slice() else {
+                return None;
+            };
+            match rvalue {
+                Rvalue::Use(op) | Rvalue::Cast(_, op, _) => place = op.place()?,
+                Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p) => place = *p,
+                Rvalue::CopyForDeref(p) => place = *p,
+                _ => return None,
+            }
+        } else if let Some(recv) = defs.call_recv.get(&local) {
+            place = *recv;
+        } else {
+            return None;
+        }
+    }
+}
+
+fn call_target(_tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<LocalDefId> {
+    let fn_const = func.constant()?;
+    let ty::TyKind::FnDef(def_id, _) = fn_const.ty().kind() else {
+        return None;
+    };
+    def_id.as_local()
+}
+
+/// call sites that alias a struct-pointer candidate argument with a pointer
+/// derived from a field of the same struct object passed in another argument
+/// of the same call. these are the sites the specialization plan (Task 3)
+/// must be able to rewrite: after the struct param is replaced by the field's
+/// value, the aliasing field-pointer argument would otherwise observe stale
+/// data.
+pub(crate) fn collect_triggered(
+    input: &RustProgram<'_>,
+    flows: &FxHashMap<LocalDefId, PointerFlowResult>,
+    candidates: &FxHashMap<(LocalDefId, usize), SpecTarget>,
+) -> FxHashSet<(LocalDefId, usize)> {
+    let tcx = input.tcx;
+    let mut triggered = FxHashSet::default();
+    for &fn_did in &input.functions {
+        let Some(flow) = flows.get(&fn_did) else {
+            continue;
+        };
+        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let defs = BodyDefs::new(&body, tcx);
+        for block in body.basic_blocks.iter() {
+            let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
+                continue;
+            };
+            let Some(callee) = call_target(tcx, func) else {
+                continue;
+            };
+            for (i, arg) in args.iter().enumerate() {
+                if !candidates.contains_key(&(callee, i)) {
+                    continue;
+                }
+                let Some(base) = operand_base(flow, &arg.node) else {
+                    continue;
+                };
+                let has_sibling_field_ptr = args.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && field_address_base(flow, &body, tcx, &defs, &other.node)
+                            .is_some_and(|b| b == base)
+                });
+                if has_sibling_field_ptr {
+                    triggered.insert((callee, i));
+                }
+            }
+        }
+    }
+    triggered
 }
 
 #[cfg(test)]
@@ -301,5 +471,65 @@ pub unsafe extern "C" fn caller(mut s: *mut st) -> libc::c_int {
                 ("caller".to_string(), 0, "lookup".to_string()),
             ]
         );
+    }
+
+    fn triggered_for(code: &str) -> Vec<(String, usize)> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_rust_program(tcx);
+            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
+            let candidates = collect_candidates(&program, &flows, &FxHashSet::default());
+            let triggered = collect_triggered(&program, &flows, &candidates);
+            let mut out: Vec<(String, usize)> = triggered
+                .iter()
+                .map(|&(did, idx)| (tcx.item_name(did.to_def_id()).to_string(), idx))
+                .collect();
+            out.sort();
+            out
+        })
+        .unwrap()
+    }
+
+    const TRIGGERED: &str = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+
+    #[test]
+    fn test_struct_and_field_pointer_call_site_triggers() {
+        assert_eq!(triggered_for(TRIGGERED), vec![("build".to_string(), 0)]);
+    }
+
+    #[test]
+    fn test_struct_pointer_alone_does_not_trigger() {
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    return build(s, tree);
+}
+"#;
+        assert_eq!(triggered_for(code), vec![]);
     }
 }
