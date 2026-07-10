@@ -17,6 +17,7 @@ use rustc_span::{Symbol, def_id::LocalDefId};
 use crate::{
     analyses::pointer_flow::{
         PointerFlowResult,
+        builtin::{call_name, is_as_ptr},
         field_access::field_accesses_reachable_from_param,
         graph::{BaseId, PfgNode},
     },
@@ -176,9 +177,8 @@ impl<'tcx> BodyDefs<'tcx> {
                 ..
             } = &block.terminator().kind
                 && let Some(dest) = destination.as_local()
-                && let Some(fn_const) = func.constant()
-                && let ty::TyKind::FnDef(def_id, _) = fn_const.ty().kind()
-                && matches!(tcx.item_name(*def_id).as_str(), "as_mut_ptr" | "as_ptr")
+                && let Some((def_id, name)) = call_name(tcx, func)
+                && is_as_ptr(tcx, def_id, &name)
                 && let Some(recv) = args.first().and_then(|arg| arg.node.place())
             {
                 call_recv.insert(dest, recv);
