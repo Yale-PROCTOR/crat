@@ -41,11 +41,11 @@ mod places_conflict;
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
-/// the production `borrow` engine. **Default = `Production` DURING 3a dev** (so the equivalence
-/// differential can compare the two); at **3a MERGE the default flips to `Fork`** (A1: the
-/// equivalence row is frozen and the engines are byte-equal, so the flip is free, and thereafter
-/// production is validator-only — reachable via the switch for differentials + NB6). Env
-/// `CRAT_BO_FORK_ENGINE ∈ {fork|on, production|off}`.
+/// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the
+/// default was `Production` so the equivalence differential could compare the two; the equivalence
+/// row is frozen and the engines are model-equal (edge multiset ⇒ demotion set ⇒ model), so the
+/// flip was free. Production is now validator-only — reachable via the switch for differentials +
+/// NB6. Env `CRAT_BO_FORK_ENGINE ∈ {fork|on, production|off}`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ForkEngineMode {
     Production,
@@ -53,8 +53,8 @@ pub(crate) enum ForkEngineMode {
 }
 
 impl ForkEngineMode {
-    /// Flips to `Fork` at 3a merge (A1). Until then, dev default is `Production`.
-    pub(crate) const DEFAULT: Self = ForkEngineMode::Production;
+    /// Flipped to `Fork` at 3a merge (A1); production stays reachable via `CRAT_BO_FORK_ENGINE`.
+    pub(crate) const DEFAULT: Self = ForkEngineMode::Fork;
 
     pub(crate) fn current() -> Self {
         // Reject a SET-but-invalid value (fail-loud on typos — a mistyped selector must NOT silently
