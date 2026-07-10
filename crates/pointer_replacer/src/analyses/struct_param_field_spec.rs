@@ -378,8 +378,7 @@ pub fn find_plan(
 
     // every call site into a candidate position, plus forwarding edges
     let mut facts: Vec<CallSiteFact> = vec![];
-    let mut forwards: FxHashSet<((LocalDefId, usize), (LocalDefId, usize))> =
-        FxHashSet::default();
+    let mut forwards: FxHashSet<((LocalDefId, usize), (LocalDefId, usize))> = FxHashSet::default();
     for &fn_did in &input.functions {
         let Some(flow) = flows.get(&fn_did) else {
             continue;
@@ -398,7 +397,15 @@ pub fn find_plan(
                     continue;
                 }
                 let classes = classify_arg(
-                    flow, &body, tcx, &defs, fn_did, &candidates, nullity, args, i,
+                    flow,
+                    &body,
+                    tcx,
+                    &defs,
+                    fn_did,
+                    &candidates,
+                    nullity,
+                    args,
+                    i,
                 );
                 for class in &classes {
                     if let ArgClass::Forward(from) = class {
@@ -434,12 +441,15 @@ pub fn find_plan(
         let keep: FxHashSet<(LocalDefId, usize)> = selected
             .iter()
             .filter(|key| {
-                let sites_ok = facts.iter().filter(|fact| fact.callee == **key).all(|fact| {
-                    fact.classes.iter().any(|class| match class {
-                        ArgClass::Null | ArgClass::FieldSibling | ArgClass::NonNull => true,
-                        ArgClass::Forward(from) => selected.contains(from),
-                    })
-                });
+                let sites_ok = facts
+                    .iter()
+                    .filter(|fact| fact.callee == **key)
+                    .all(|fact| {
+                        fact.classes.iter().any(|class| match class {
+                            ArgClass::Null | ArgClass::FieldSibling | ArgClass::NonNull => true,
+                            ArgClass::Forward(from) => selected.contains(from),
+                        })
+                    });
                 let forwards_ok = forwards
                     .iter()
                     .all(|(from, to)| from != *key || selected.contains(to));
@@ -781,7 +791,10 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
 }
 "#;
         let (targets, _) = plan_for(code);
-        assert_eq!(targets, vec![("build".to_string(), 0, "lookup".to_string())]);
+        assert_eq!(
+            targets,
+            vec![("build".to_string(), 0, "lookup".to_string())]
+        );
     }
 
     #[test]
