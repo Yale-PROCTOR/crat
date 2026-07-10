@@ -46,20 +46,28 @@ pub(crate) fn revalidate(
     is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
-    let edges = borrow::borrow_conflicts(
-        program,
-        move |fn_did| {
-            let universe = slots.fn_local_slots.get(&fn_did);
-            move |local: Local| {
-                universe
-                    .and_then(|u| u.slot_for_local_depth(local, 0))
-                    .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
-            }
-        },
-        // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
-        // skipped by `borrow::invalidates`, so shared reads of one base stop conflicting.
-        move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local),
-    );
+    let cand = move |fn_did| {
+        let universe = slots.fn_local_slots.get(&fn_did);
+        move |local: Local| {
+            universe
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
+        }
+    };
+    // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+    // skipped by the invalidation walk, so shared reads of one base stop conflicting.
+    let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
+    // §NB3-3a: route to the forked BO engine or production (default = production during dev,
+    // flips to Fork at 3a merge — A1). `cand`/`mutab` are `Copy` (all captures are Copy), so both
+    // match arms may reference them; only one runs. Same signatures ⇒ 1:1 dispatch.
+    let edges = match super::borrow_engine::ForkEngineMode::current() {
+        super::borrow_engine::ForkEngineMode::Production => {
+            borrow::borrow_conflicts(program, cand, mutab)
+        }
+        super::borrow_engine::ForkEngineMode::Fork => {
+            super::borrow_engine::borrow_conflicts(program, cand, mutab)
+        }
+    };
 
     map_edges_to_slots(slots, edges)
 }
@@ -80,28 +88,35 @@ pub(crate) fn revalidate_replaying(
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
-    let edges = borrow::borrow_conflicts_replaying(
-        program,
-        move |fn_did| {
-            let universe = slots.fn_local_slots.get(&fn_did);
-            move |local: Local| {
-                universe
-                    .and_then(|u| u.slot_for_local_depth(local, 0))
-                    .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
-            }
-        },
-        move |fn_did| {
-            let universe = slots.fn_local_slots.get(&fn_did);
-            move |local: Local| {
-                universe
-                    .and_then(|u| u.slot_for_local_depth(local, 0))
-                    .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
-            }
-        },
-        // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
-        // skipped by `borrow::invalidates`, so shared reads of one base stop conflicting.
-        move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local),
-    );
+    let cand = move |fn_did| {
+        let universe = slots.fn_local_slots.get(&fn_did);
+        move |local: Local| {
+            universe
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
+        }
+    };
+    let raw = move |fn_did| {
+        let universe = slots.fn_local_slots.get(&fn_did);
+        move |local: Local| {
+            universe
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
+        }
+    };
+    // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
+    // skipped by the invalidation walk, so shared reads of one base stop conflicting.
+    let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
+    // §NB3-3a: route to the forked BO engine or production (default = production during dev,
+    // flips to Fork at 3a merge — A1). All closures are `Copy`, so both arms may reference them.
+    let edges = match super::borrow_engine::ForkEngineMode::current() {
+        super::borrow_engine::ForkEngineMode::Production => {
+            borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
+        }
+        super::borrow_engine::ForkEngineMode::Fork => {
+            super::borrow_engine::borrow_conflicts_replaying(program, cand, raw, mutab)
+        }
+    };
 
     map_edges_to_slots(slots, edges)
 }

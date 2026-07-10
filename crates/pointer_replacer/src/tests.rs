@@ -11060,6 +11060,112 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB3-3a EQUIVALENCE GATE (fixture half). The forked BO borrow engine
+    /// (`borrow_ownership::borrow_engine`) must produce `ConflictEdge`s BYTE-IDENTICAL to
+    /// production `borrow` on every input. **Edge-level equality per replay call is the right
+    /// granularity (A3):** identical edges each round ⇒ identical demotion witnesses ⇒ identical
+    /// CEGAR trajectories ⇒ identical accepted models — strictly stronger than comparing only the
+    /// final model, and it localizes any divergence to the first differing call. (The corpus half
+    /// is the `bo_c1` sweep `3a` row == `2on`.) With ZERO new semantics at 3a this is GREEN; 3b's
+    /// write-aware `invalidates` change turns it RED by design (3b then updates the expectations).
+    #[test]
+    fn nb3a_fork_engine_edges_match_production() {
+        use crate::analyses::borrow::{self, ConflictEdge};
+        use crate::analyses::borrow_ownership::borrow_engine;
+        use rustc_hash::FxHashMap;
+        use rustc_span::def_id::LocalDefId;
+
+        fn canon(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> String {
+            // Debug is total over ConflictEdge/ProvenanceOwner; keys sorted for a canonical order,
+            // Vec order is deterministic (both engines iterate loans/live-provenances identically).
+            let mut items: Vec<_> = m.iter().collect();
+            items.sort_by_key(|(k, _)| format!("{k:?}"));
+            format!("{items:#?}")
+        }
+
+        let programs = [
+            // aliasing &mut borrows of one local, both live → conflict (all-mut)
+            "unsafe fn f() { let mut x = 0i32; let p = &mut x as *mut i32; \
+             let q = &mut x as *mut i32; *p = 1; *q = 2; }",
+            // aliasing borrows with reads (exercises mutability-dependent conflict)
+            "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+             let b = &mut x as *mut i32; let u = *a; let v = *b; let _ = (u, v); }",
+            // *mut *mut aliasing outer pointers + a call (the out-param shape)
+            "unsafe fn g(o: *mut *mut i32) { let _ = o; } \
+             unsafe fn f() { let mut local: *mut i32 = core::ptr::null_mut(); \
+             let p = &mut local as *mut *mut i32; let q = &mut local as *mut *mut i32; \
+             g(p); *q = core::ptr::null_mut(); }",
+            // raw-pointer copies (no borrows) → empty map (agreement on empty is still a real check)
+            "unsafe fn f(mut p: *mut i32) -> i32 { let a = p; let b = p; *a + *b }",
+            // call-return alias + write (the S2-6 shape)
+            "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; let r0 = *z; *b = 5; r0 + *z }",
+        ];
+
+        // Non-vacuity guard: prove the comparison is not empty==empty. Aliasing `&mut` borrows of
+        // one local (both live) MUST produce a conflict edge. (Raw-pointer COPIES issue no loans ⇒
+        // no conflicts — the first cut used such a program and CORRECTLY failed, catching that the
+        // differential would otherwise compare only empty maps.)
+        run_compiler(
+            "unsafe fn f() { let mut x = 0i32; let p = &mut x as *mut i32; \
+             let q = &mut x as *mut i32; *p = 1; *q = 2; }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let edges = borrow::borrow_conflicts(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| true,
+                );
+                assert!(
+                    !edges.is_empty(),
+                    "non-vacuity: aliasing &mut borrows must produce a conflict edge"
+                );
+            },
+        );
+
+        for src in programs {
+            run_compiler(src, |tcx| {
+                let program = collect_program(tcx);
+                // round-0 (`borrow_conflicts`) across mutability:
+                for mutb in [true, false] {
+                    let prod = borrow::borrow_conflicts(
+                        &program,
+                        |_: LocalDefId| |_: Local| true,
+                        move |_: LocalDefId| move |_: Local| mutb,
+                    );
+                    let fork = borrow_engine::borrow_conflicts(
+                        &program,
+                        |_: LocalDefId| |_: Local| true,
+                        move |_: LocalDefId| move |_: Local| mutb,
+                    );
+                    assert_eq!(canon(&prod), canon(&fork), "round-0 edges differ (mut={mutb}) for: {src}");
+                }
+                // replaying (`borrow_conflicts_replaying`) across raw-candidacy × mutability, all-Ref base:
+                for raw in [false, true] {
+                    for mutb in [true, false] {
+                        let prod = borrow::borrow_conflicts_replaying(
+                            &program,
+                            |_: LocalDefId| |_: Local| true,
+                            move |_: LocalDefId| move |_: Local| raw,
+                            move |_: LocalDefId| move |_: Local| mutb,
+                        );
+                        let fork = borrow_engine::borrow_conflicts_replaying(
+                            &program,
+                            |_: LocalDefId| |_: Local| true,
+                            move |_: LocalDefId| move |_: Local| raw,
+                            move |_: LocalDefId| move |_: Local| mutb,
+                        );
+                        assert_eq!(
+                            canon(&prod),
+                            canon(&fork),
+                            "replaying edges differ (raw={raw}, mut={mutb}) for: {src}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// B3b headline: interprocedural ownership flow across a *return* edge.
     /// `make` allocates and returns ownership; `forward` just returns `make()`'s
     /// result. `forward` contains no `malloc` and no sink, so the *only* path to
