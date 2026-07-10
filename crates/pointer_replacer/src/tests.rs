@@ -11066,8 +11066,12 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// review: production's `UnionFind` member set is a seed-randomized `std::HashSet`, and fork vs
     /// production build SEPARATE `GBorrowInferCtxt` instances ⇒ separate seeds ⇒ loan-ID allocation
     /// order — hence `Vec<ConflictEdge>` + requirer order — is NON-CONTRACTUAL and nondeterministic
-    /// in BOTH engines. What IS contractual, and what the fork reproduces: the edge multiset per
-    /// replay call, hence the accepted model + all aggregates.) `canon` below is order-INSENSITIVE.
+    /// in BOTH engines. What IS contractual — the reasoning chain a future session needs when it
+    /// wonders why this test isn't order-sensitive: **same edge multiset per replay call ⇒ same
+    /// demotion set ⇒ same accepted model** (hence all aggregates). The demotion set is a function
+    /// of WHICH conflicts exist, not the order they land in the `Vec`, so a seed-randomized `HashSet`
+    /// member walk can reorder the edges but cannot perturb any link in that chain.) `canon` below
+    /// is order-INSENSITIVE.
     /// The corpus half is the `bo_c1` sweep `3a` row == `2on` (order-insensitive aggregates); the
     /// model-level check is the full suite under `CRAT_BO_FORK_ENGINE=on`. See the mixed-Raw/Ref
     /// replay regression `nb3a_fork_engine_multiset_matches_mixed_replay`. With ZERO new semantics
@@ -11192,7 +11196,8 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// round one unions the Raw locals with `cell` (multi-member `UnionFind` groups) and round two
     /// allocates expanded loans by iterating a seed-randomized `std::HashSet`. Fork and production can
     /// order the resulting edges differently — so this asserts the edge MULTISET is equal (the
-    /// contractual property the fork reproduces), NOT the Vec order.
+    /// contractual property the fork reproduces), NOT the Vec order. (The contractual chain — edge
+    /// multiset ⇒ demotion set ⇒ model — is stated in full on `nb3a_fork_engine_edges_match_production`.)
     #[test]
     fn nb3a_fork_engine_multiset_matches_mixed_replay() {
         use crate::analyses::borrow::{self, ConflictEdge};
