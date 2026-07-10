@@ -238,8 +238,15 @@ pub(crate) fn verify_to_fixpoint(
             // candidate is strictly MORE conservative (its loans are included, never fewer), so it
             // cannot under-report. RESIDUAL (deferred to flow-sensitivity): a mixed-role local is
             // output `Owning` — an ownership-layer imprecision, NOT a borrow-verifier under-report
-            // (the borrow contract = the surviving `Ref` slots do not alias; that holds). The
-            // §8 guardrail (BO unconsumed) makes the imprecision harmless.
+            // (the borrow contract = the surviving `Ref` slots do not alias; that holds for the
+            // raw-role completeness THIS argument is about — but NOT under the NB2 mutability
+            // skip, which drops immutable *interprocedural* loans from invalidation: two surviving
+            // `Ref`s CAN then alias a written cell via a call-return/param/cast/offset/field alias
+            // the coherence equate-closure does not unify. That is the S2-6 acceptance-level gap,
+            // real today (call-return witness `nb2_cross_alias_write_uncaught_witness`;
+            // production-parity), guarded ONLY by §8 and fixed by write-aware invalidation in
+            // NB3-3b). The §8 guardrail (BO unconsumed) makes both the imprecision above and the
+            // S2-6 gap harmless until codegen.
             |s| model.get(&s) != Some(&SlotKind::Ref),
             is_mutable,
         );
