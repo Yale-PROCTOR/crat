@@ -11061,13 +11061,17 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     }
 
     /// §NB3-3a EQUIVALENCE GATE (fixture half). The forked BO borrow engine
-    /// (`borrow_ownership::borrow_engine`) must produce `ConflictEdge`s BYTE-IDENTICAL to
-    /// production `borrow` on every input. **Edge-level equality per replay call is the right
-    /// granularity (A3):** identical edges each round ⇒ identical demotion witnesses ⇒ identical
-    /// CEGAR trajectories ⇒ identical accepted models — strictly stronger than comparing only the
-    /// final model, and it localizes any divergence to the first differing call. (The corpus half
-    /// is the `bo_c1` sweep `3a` row == `2on`.) With ZERO new semantics at 3a this is GREEN; 3b's
-    /// write-aware `invalidates` change turns it RED by design (3b then updates the expectations).
+    /// (`borrow_ownership::borrow_engine`) must produce the same `ConflictEdge`s as production
+    /// `borrow` on every input — as a **MULTISET**, not byte-order. (Correction from the 3a Codex
+    /// review: production's `UnionFind` member set is a seed-randomized `std::HashSet`, and fork vs
+    /// production build SEPARATE `GBorrowInferCtxt` instances ⇒ separate seeds ⇒ loan-ID allocation
+    /// order — hence `Vec<ConflictEdge>` + requirer order — is NON-CONTRACTUAL and nondeterministic
+    /// in BOTH engines. What IS contractual, and what the fork reproduces: the edge multiset per
+    /// replay call, hence the accepted model + all aggregates.) `canon` below is order-INSENSITIVE.
+    /// The corpus half is the `bo_c1` sweep `3a` row == `2on` (order-insensitive aggregates); the
+    /// model-level check is the full suite under `CRAT_BO_FORK_ENGINE=on`. See the mixed-Raw/Ref
+    /// replay regression `nb3a_fork_engine_multiset_matches_mixed_replay`. With ZERO new semantics
+    /// at 3a this is GREEN; 3b's write-aware `invalidates` changes the multiset by design.
     #[test]
     fn nb3a_fork_engine_edges_match_production() {
         use crate::analyses::borrow::{self, ConflictEdge};
@@ -11075,12 +11079,28 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         use rustc_hash::FxHashMap;
         use rustc_span::def_id::LocalDefId;
 
+        // Order-INSENSITIVE canon (edge MULTISET): loan-ID order is non-contractual (production's
+        // UnionFind uses a seed-randomized std::HashSet), so sort requirers within each edge, sort
+        // the edges, and sort the fns. This compares semantics, not the nondeterministic Vec order.
         fn canon(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> String {
-            // Debug is total over ConflictEdge/ProvenanceOwner; keys sorted for a canonical order,
-            // Vec order is deterministic (both engines iterate loans/live-provenances identically).
-            let mut items: Vec<_> = m.iter().collect();
-            items.sort_by_key(|(k, _)| format!("{k:?}"));
-            format!("{items:#?}")
+            let mut fns: Vec<(String, Vec<String>)> = m
+                .iter()
+                .map(|(k, edges)| {
+                    let mut es: Vec<String> = edges
+                        .iter()
+                        .map(|e| {
+                            let mut rs: Vec<String> =
+                                e.requirers.iter().map(|o| format!("{o:?}")).collect();
+                            rs.sort();
+                            format!("issuer={:?} requirers={rs:?}", e.issuer)
+                        })
+                        .collect();
+                    es.sort();
+                    (format!("{k:?}"), es)
+                })
+                .collect();
+            fns.sort();
+            format!("{fns:#?}")
         }
 
         let programs = [
@@ -11164,6 +11184,88 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 }
             });
         }
+    }
+
+    /// §NB3-3a mixed-Raw/Ref replay regression (from the 3a Codex review — the [medium]). The shape
+    /// that exposes loan-ID order-nondeterminism: four `&mut cell` borrows (r0,r1,r2,keep) with copies
+    /// of `keep` staggered around writes through r0/r1/r2; classify r0/r1/r2 Raw and keep Ref, so
+    /// round one unions the Raw locals with `cell` (multi-member `UnionFind` groups) and round two
+    /// allocates expanded loans by iterating a seed-randomized `std::HashSet`. Fork and production can
+    /// order the resulting edges differently — so this asserts the edge MULTISET is equal (the
+    /// contractual property the fork reproduces), NOT the Vec order.
+    #[test]
+    fn nb3a_fork_engine_multiset_matches_mixed_replay() {
+        use crate::analyses::borrow::{self, ConflictEdge};
+        use crate::analyses::borrow_ownership::borrow_engine;
+        use rustc_hash::FxHashMap;
+        use rustc_span::def_id::LocalDefId;
+
+        fn multiset(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
+            let mut out: Vec<String> = m
+                .iter()
+                .flat_map(|(k, edges)| {
+                    edges.iter().map(move |e| {
+                        let mut rs: Vec<String> =
+                            e.requirers.iter().map(|o| format!("{o:?}")).collect();
+                        rs.sort();
+                        format!("{k:?} issuer={:?} requirers={rs:?}", e.issuer)
+                    })
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        run_compiler(
+            r#"
+unsafe fn f() {
+    let mut cell = 0i32;
+    let r0 = &mut cell as *mut i32;
+    let r1 = &mut cell as *mut i32;
+    let r2 = &mut cell as *mut i32;
+    let keep = &mut cell as *mut i32;
+    let k0 = keep;
+    *r0 = 1;
+    let k1 = keep;
+    *r1 = 2;
+    let k2 = keep;
+    *r2 = 3;
+    let s = *keep;
+    let _ = (k0, k1, k2, s);
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let rl: [Local; 3] = [
+                    local_by_var_name(tcx, f, "r0"),
+                    local_by_var_name(tcx, f, "r1"),
+                    local_by_var_name(tcx, f, "r2"),
+                ];
+                let rl = &rl;
+                let prod = borrow::borrow_conflicts_replaying(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    move |_fd: LocalDefId| move |local: Local| rl.contains(&local),
+                    |_: LocalDefId| |_: Local| true,
+                );
+                let fork = borrow_engine::borrow_conflicts_replaying(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    move |_fd: LocalDefId| move |local: Local| rl.contains(&local),
+                    |_: LocalDefId| |_: Local| true,
+                );
+                assert!(
+                    !prod.is_empty(),
+                    "non-vacuity: the mixed replay must produce conflict edges"
+                );
+                assert_eq!(
+                    multiset(&prod),
+                    multiset(&fork),
+                    "fork vs production conflict-edge MULTISET differs in a mixed Raw/Ref replay"
+                );
+            },
+        );
     }
 
     /// B3b headline: interprocedural ownership flow across a *return* edge.
