@@ -219,6 +219,72 @@ pub mod src {
     );
 }
 
+#[test]
+fn test_struct_param_field_const_param_specialization() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn probe(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        return (*s).lookup[0] as libc::c_int;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return probe(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+    return probe(0 as *const st, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn probe(mut s: *const [u16; 4]",
+            "&raw const (*s).lookup",
+            "0 as *const [u16; 4]",
+        ],
+        &["probe(s,", "probe(0 as *const st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_mixed_mut_forwarding() {
+    // a *mut caller param forwards into a *const callee param: both specialize,
+    // the forwarding arg stays bare (implicit *mut -> *const coercion)
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *const st) -> libc::c_int {
+    return (*s).lookup[1] as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn inner(mut s: *const [u16; 4]",
+            "fn outer(mut s: *mut [u16; 4]",
+            "inner(s)",
+        ],
+        &["fn inner(mut s: *const st", "fn outer(mut s: *mut st"],
+    );
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);

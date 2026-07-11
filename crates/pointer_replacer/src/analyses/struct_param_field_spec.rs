@@ -30,17 +30,19 @@ pub struct SpecTarget {
     pub field: FieldIdx,
     pub field_name: Symbol,
     pub struct_def: LocalDefId,
+    /// mutability of the original raw-pointer parameter; every downstream
+    /// pointer/borrow the rewriter emits preserves it
+    pub mutbl: ty::Mutability,
 }
 
 // param type must be a raw pointer to a local, non-generic struct
 fn struct_pointee<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: ty::Ty<'tcx>,
-) -> Option<(LocalDefId, ty::AdtDef<'tcx>)> {
-    if !ty.is_raw_ptr() {
+) -> Option<(LocalDefId, ty::AdtDef<'tcx>, ty::Mutability)> {
+    let ty::TyKind::RawPtr(pointee, mutbl) = ty.kind() else {
         return None;
-    }
-    let pointee = ty.builtin_deref(true)?;
+    };
     let ty::TyKind::Adt(adt_def, args) = pointee.kind() else {
         return None;
     };
@@ -48,7 +50,7 @@ fn struct_pointee<'tcx>(
         return None;
     }
     let _ = tcx;
-    adt_def.did().as_local().map(|did| (did, *adt_def))
+    adt_def.did().as_local().map(|did| (did, *adt_def, *mutbl))
 }
 
 // functions used as values (fn pointers) cannot change signature
@@ -119,7 +121,8 @@ pub(crate) fn collect_candidates(
         };
         let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         for (param_idx, local) in body.args_iter().enumerate() {
-            let Some((struct_def, adt_def)) = struct_pointee(tcx, body.local_decls[local].ty)
+            let Some((struct_def, adt_def, mutbl)) =
+                struct_pointee(tcx, body.local_decls[local].ty)
             else {
                 continue;
             };
@@ -141,6 +144,7 @@ pub(crate) fn collect_candidates(
                     field,
                     field_name,
                     struct_def,
+                    mutbl,
                 },
             );
         }

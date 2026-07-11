@@ -26,6 +26,7 @@ struct FnPlan {
     param_name: Symbol,
     field_name: Symbol,
     field_ty: P<Ty>,
+    mutbl: Mutability,
 }
 
 pub(crate) fn apply_struct_param_field_spec(
@@ -176,6 +177,7 @@ fn resolve_fn_plan(
         param_name: param_ident.name,
         field_name: target.field_name,
         field_ty,
+        mutbl: target.mutbl,
     })
 }
 
@@ -287,7 +289,7 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
                     id: DUMMY_NODE_ID,
                     kind: TyKind::Ptr(MutTy {
                         ty: fn_plan.field_ty.clone(),
-                        mutbl: Mutability::Mut,
+                        mutbl: fn_plan.mutbl,
                     }),
                     span: input.ty.span,
                     tokens: None,
@@ -373,8 +375,12 @@ impl SpecTransformVisitor<'_, '_> {
         }
         // null literal keeps its shape with the new pointee type
         if is_null_literal(arg) {
+            let m = match target.mutbl {
+                Mutability::Mut => "mut",
+                Mutability::Not => "const",
+            };
             let ty_str = pprust::ty_to_string(&target.field_ty);
-            *arg = utils::expr!("0 as *mut {}", ty_str);
+            *arg = utils::expr!("0 as *{} {}", m, ty_str);
             self.changed = true;
             return;
         }
@@ -395,7 +401,7 @@ impl SpecTransformVisitor<'_, '_> {
             attrs: thin_vec![],
             tokens: None,
         };
-        arg.kind = ExprKind::AddrOf(BorrowKind::Raw, Mutability::Mut, P(field));
+        arg.kind = ExprKind::AddrOf(BorrowKind::Raw, target.mutbl, P(field));
         self.changed = true;
     }
 }
