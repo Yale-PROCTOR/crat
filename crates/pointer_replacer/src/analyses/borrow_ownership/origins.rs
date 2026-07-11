@@ -51,16 +51,15 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
         .map(|(f, result)| {
             let summary = result.summary;
             let n = summary.slots.len();
+            // `summary.value_flows` is post-`closed()`, which already unions the symmetric
+            // `storage_aliases` in (lifetime_flow.rs:678-680) — so `subset` contains the storage
+            // relation, both directions. No separate storage matrix (see origin_summary.rs note).
             let subset = transitive_closure(&summary.value_flows, n);
-            // storage_aliases is symmetric (lifetime_flow inserts both directions); our correct
-            // closure preserves that symmetry (a→b & b→a in ⇒ a→c & c→a out).
-            let storage = transitive_closure(&summary.storage_aliases, n);
             (
                 f,
                 OriginSummary {
                     slots: summary.slots,
                     subset,
-                    storage,
                     unknown: summary.unknown_targets,
                 },
             )
@@ -137,7 +136,6 @@ mod tests {
 
     struct Facts {
         subset: Vec<(String, String)>,
-        storage: Vec<(String, String)>,
         unknown: Vec<String>,
     }
 
@@ -165,7 +163,7 @@ mod tests {
                 unknown.sort();
                 out.insert(
                     tcx.item_name(f.to_def_id()).to_string(),
-                    Facts { subset: edges(&s.subset), storage: edges(&s.storage), unknown },
+                    Facts { subset: edges(&s.subset), unknown },
                 );
             }
             out
@@ -251,24 +249,26 @@ mod tests {
         );
     }
 
-    /// STORAGE-FOLD JUSTIFICATION (req 2026-07-11): `storage_aliases` is SYMMETRIC; carried
-    /// SEPARATELY from directed `subset` so 3c-ii injection cannot lose a direction of conflict
-    /// routing. Forwarding a `*mut *mut` aliases the pointee storage `arg1@1 ↔ return@1` — assert
-    /// BOTH directions are present (a directed subset could only carry one).
+    /// SYMMETRIC storage alias folds into `subset` (corrected 2026-07-11 after the 3c-i adversarial
+    /// review). `lifetime_flow`'s `closed()` unions the symmetric `storage_aliases` into `value_flows`
+    /// (lifetime_flow.rs:678-680) BEFORE the summary, so both directions of a `*mut *mut` forwarding
+    /// alias (`arg1@1 ↔ return@1`) land in `subset` — there is no separate `storage` field and no
+    /// lost direction (the earlier "carry storage separately" concern was moot). Asserting BOTH
+    /// directions in `subset` is exactly what pins that the symmetric relation survives the fold.
     #[test]
     fn nb3_storage_alias_symmetric() {
         let facts =
             origin_facts("unsafe fn forward(out: *mut *mut i32) -> *mut *mut i32 { out }");
         let f = &facts["forward"];
         assert!(
-            has(&f.storage, "arg1@1", "return@1"),
-            "forward: arg1@1 → return@1 storage alias expected; got {:?}",
-            f.storage
+            has(&f.subset, "arg1@1", "return@1"),
+            "forward: arg1@1 → return@1 (folded storage alias) expected in subset; got {:?}",
+            f.subset
         );
         assert!(
-            has(&f.storage, "return@1", "arg1@1"),
-            "forward: return@1 → arg1@1 (the symmetric direction) expected; got {:?}",
-            f.storage
+            has(&f.subset, "return@1", "arg1@1"),
+            "forward: return@1 → arg1@1 (the symmetric direction, folded into subset) expected; got {:?}",
+            f.subset
         );
     }
 

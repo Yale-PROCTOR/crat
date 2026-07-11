@@ -33,19 +33,19 @@ use crate::analyses::borrow::lifetime_flow::{LifetimeSlot, SignatureSlot};
 pub struct OriginSummary {
     pub slots: IndexVec<LifetimeSlot, SignatureSlot>,
     pub subset: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
-    /// **SYMMETRIC** storage-alias relation (both `(a,b)` and `(b,a)`), transitively closed — e.g.
-    /// forwarding `out: *mut *mut i32 -> out` aliases the pointee storage `arg1@1 ↔ return@1`.
-    /// Adopted from `lifetime_flow`'s `storage_aliases`, which is symmetric by construction
-    /// (`add_alias`, lifetime_flow.rs:640-641, inserts both directions). Kept **separate** from the
-    /// **directed** `subset` (not folded) so neither direction of conflict routing is lost: a
-    /// directed subset cannot represent `a↔b` without both `a⊆b` and `b⊆a`. `storage_aliases` is NOT
-    /// part of the injected `depth0_value_flows` seam, so production drops it — carried here so 3c-ii
-    /// can OPTIONALLY inject it both-directions (a candidate fork-only win, like `unknown`; the
-    /// injection decision is 3c-ii's). (Directional storage-*write* flows like `*dst = src` are a
-    /// different thing and land in `subset`.)
-    pub storage: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub unknown: DenseBitSet<LifetimeSlot>,
 }
+
+// NOTE — storage aliases are NOT a separate field (removed after the 3c-i adversarial review, which
+// showed the earlier "storage-fold catch" was addressing a non-problem). `lifetime_flow`'s
+// `BodyLifetimeFlow::closed()` (lifetime_flow.rs:678-680) unions the SYMMETRIC `storage_aliases`
+// into `value_flows` **before** the summary is produced, so `subset` (our closure over the
+// post-`closed` `value_flows`) ALREADY contains the storage relation — both directions. A separate
+// `storage` matrix would be a strict sub-relation of `subset` (redundant). Consequence for 3c-ii:
+// storage-induced reachability is baked into `subset` and is injected whenever `subset` is; there is
+// no independent "inject storage or not" lever at the thin-reuse wrap. If 3c-ii ever needs value-only
+// vs value+storage selectivity, it must obtain a PRE-fusion value relation — naturally an NB5-O task
+// (BO-native derivation), not a wrap of the already-fused `lifetime_flow` summary.
 
 /// Per-function origin summaries, keyed like `LifetimeFlowResults`.
 pub type OriginSummaries = FxHashMap<LocalDefId, OriginSummary>;
