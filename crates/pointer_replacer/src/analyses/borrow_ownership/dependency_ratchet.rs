@@ -92,11 +92,22 @@ mod tests {
                     i += 1;
                 }
             } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                // Rust block comments NEST — track depth to the matching outer `*/`, else a
+                // `/* … /* … */ #[cfg(test)] */` leaves the inner `#[cfg(test)]` visible and
+                // strip_cfg_test removes a real declaration after it.
                 i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
+                let mut depth = 1usize;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
-                i = (i + 2).min(b.len());
                 out.push(' ');
             } else if c == b'r'
                 && {
@@ -319,7 +330,19 @@ mod tests {
                             while k < b.len() && is_ident(b[k]) {
                                 k += 1;
                             }
-                            add_seg(kind, &text[s0..k], found);
+                            let seg = &text[s0..k];
+                            // `self as X` inside a group aliases the WHOLE module → record `*` (a
+                            // normal `Foo as Bar` keeps `Foo` as the captured segment; only a self-alias
+                            // hides the module behind a new name).
+                            let mut q = k;
+                            while q < b.len() && (b[q] as char).is_whitespace() {
+                                q += 1;
+                            }
+                            let self_aliased = seg == "self"
+                                && b.get(q) == Some(&b'a')
+                                && b.get(q + 1) == Some(&b's')
+                                && b.get(q + 2).is_some_and(|&x| (x as char).is_whitespace());
+                            add_seg(kind, if self_aliased { "*" } else { seg }, found);
                             expect = false;
                         }
                         _ => k += 1,
@@ -469,5 +492,30 @@ mod tests {
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
         assert!(set.contains("REAL_DEP"), "dep after a raw string must survive scanning; got {set:?}");
+    }
+
+    /// A self-aliased group `borrow::{self as prod}` aliases the WHOLE module — must record `*`, not
+    /// just capture the sibling `self` (Codex 3rd review).
+    #[test]
+    fn scanner_catches_grouped_self_alias() {
+        let cleaned =
+            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self as prod};"));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(
+            set.contains("*"),
+            "grouped self-alias `borrow::{{self as prod}}` must record `*`; got {set:?}"
+        );
+    }
+
+    /// Rust block comments NEST — `/* /* */ #[cfg(test)] */` must be fully stripped so the interior
+    /// cfg token cannot make strip_cfg_test remove a real dependency after it (Codex 3rd review).
+    #[test]
+    fn scanner_nested_block_comment() {
+        let src = "/* outer /* inner */ #[cfg(test)] */ type H = crate::analyses::borrow::REAL_DEP;";
+        let cleaned = strip_cfg_test(strip_comments_and_strings(src));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("REAL_DEP"), "dep after a nested block comment must survive; got {set:?}");
     }
 }
