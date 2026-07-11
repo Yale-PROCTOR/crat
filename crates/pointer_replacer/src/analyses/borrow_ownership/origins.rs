@@ -2,9 +2,14 @@
 //!
 //! Thin-reuse architecture (ruled 2026-07-11): derive origin relations from production
 //! `lifetime_flow`'s signature-granularity value-flow summaries, wrapped **read-only** behind the
-//! single call site `derive_signature_flows` (isolation requirement — NB5-O swaps only that body for
-//! a BO-native derivation, drop-in, gated on a corpus differential). `OriginSummary` is the only
-//! interface the rest of BO sees.
+//! single call site `derive_signature_flows` (isolation requirement). `OriginSummary` is the only
+//! interface the rest of BO sees. **NB5-O is NOT a body-only swap** (corrected after the 3c-i
+//! adversarial review): `OriginSummary` still uses production slot types (`LifetimeSlot` /
+//! `SignatureSlot`) and `derive_signature_flows` returns `LifetimeFlowResults`, so retiring
+//! `lifetime_flow` at NB5-O replaces the derivation body AND those interface/return types with
+//! BO-owned index/place/slot types — with the production→BO conversion kept behind this one adapter.
+//! Scoped (the isolation still holds — one call site + one type boundary), but not drop-in; gated on
+//! a corpus differential.
 //!
 //! What this adds over the reused summaries: (1) a **transitively-correct** subset closure (the
 //! production `subset_closure` is 1-hop — D3, diagnostic-only, never reused); (2) `unknown` carried
@@ -35,9 +40,11 @@ thread_local! {
     pub(crate) static ORIGIN_WRAP_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The ONE derivation call site (isolation requirement). NB5-O swaps this body for a BO-native
-/// origin derivation from the fork's own borrow facts; everything downstream keys off
-/// `OriginSummary` and is unaffected. At 3c-ii injection this should consume the ctxt's already
+/// The ONE derivation call site (isolation requirement). NB5-O replaces this body's derivation AND
+/// its `LifetimeFlowResults` return with a BO-native origin derivation over BO-owned types; downstream
+/// keys off `OriginSummary`, whose field types (`LifetimeSlot`/`SignatureSlot`) are ALSO swapped to
+/// BO-owned at that point (not a body-only change — 3c-i review). At 3c-ii injection this should
+/// consume the ctxt's already
 /// computed `lifetime_flows` (`GBorrowInferCtxt`, `pub`) rather than recompute — no double-compute.
 fn derive_signature_flows(program: &RustProgram<'_>) -> LifetimeFlowResults {
     lifetime_flow::analyze_program_lifetime_flow(program)
