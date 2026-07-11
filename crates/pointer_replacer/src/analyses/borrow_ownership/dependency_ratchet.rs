@@ -112,6 +112,40 @@ mod tests {
                     i += 1;
                 }
                 out.push(' ');
+            } else if c == b'\'' {
+                // Char literal vs lifetime. A char literal (`'x'`, `'\n'`, `'{'`, `'\u{7f}'`) is
+                // blanked so its contents — braces especially — cannot corrupt `strip_cfg_test`'s
+                // brace count (a `'{'` inside a #[cfg(test)] block would otherwise over-consume and
+                // swallow real code). A lifetime (`'a`, `'static`: ident chars, no closing quote) is
+                // left untouched. Heuristic: it's a char literal iff the char after `'` is `\`
+                // (escape) or is followed immediately by a closing `'`.
+                let is_char_lit =
+                    b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
+                if is_char_lit {
+                    i += 1; // opening '
+                    if b.get(i) == Some(&b'\\') {
+                        i += 1; // backslash
+                        match b.get(i) {
+                            Some(&b'x') => i += 3,      // \xNN
+                            Some(&b'u') => {
+                                while i < b.len() && b[i] != b'}' {
+                                    i += 1;
+                                }
+                                i += 1; // past '}'
+                            }
+                            _ => i += 1, // \n \\ \' \0 ...
+                        }
+                    } else {
+                        i += 1; // the single char
+                    }
+                    if b.get(i) == Some(&b'\'') {
+                        i += 1; // closing '
+                    }
+                    out.push(' ');
+                } else {
+                    out.push('\''); // lifetime tick
+                    i += 1;
+                }
             } else {
                 out.push(if c.is_ascii() { c as char } else { ' ' });
                 i += 1;
@@ -213,6 +247,10 @@ mod tests {
                         _ => k += 1,
                     }
                 }
+            } else if j < b.len() && b[j] == b'*' {
+                // Glob import `borrow::*` pulls in the ENTIRE module surface — record it as "*" so it
+                // can never SILENTLY pass (not in any allowlist ⇒ the ratchet trips on it).
+                add_seg(kind, "*", found);
             } else if j < b.len() && is_ident(b[j]) {
                 let s0 = j;
                 let mut k = j;
@@ -272,5 +310,30 @@ mod tests {
             BORROW_ALLOW.len(),
             OWNERSHIP_ALLOW.len(),
         );
+    }
+
+    /// A glob import `borrow::*` pulls in the entire module surface. `extract` must record it as `*`
+    /// (which is in no allowlist ⇒ the ratchet trips) rather than capturing nothing and silently
+    /// passing — the whole-surface false-negative.
+    #[test]
+    fn scanner_catches_glob_import() {
+        let cleaned = strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::*;"));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("*"), "glob `borrow::*` must be recorded, not silently missed; got {set:?}");
+    }
+
+    /// A `'{'` char literal inside a `#[cfg(test)]` block must not make `strip_cfg_test` over-consume
+    /// and swallow a real `borrow::` ref AFTER the block (a silent false-negative). The ref INSIDE the
+    /// (test) block must itself be stripped.
+    #[test]
+    fn scanner_char_literal_brace_is_stripped() {
+        let src = "#[cfg(test)] mod t { let _c = '{'; let _ = borrow::TEST_ONLY; } \
+                   fn real() { let _ = borrow::REAL_DEP; }";
+        let cleaned = strip_cfg_test(strip_comments_and_strings(src));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("REAL_DEP"), "real ref after the block must survive; got {set:?}");
+        assert!(!set.contains("TEST_ONLY"), "test-only ref inside the block must be stripped; got {set:?}");
     }
 }
