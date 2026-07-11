@@ -30,6 +30,8 @@ pub(crate) mod ptr;
 mod struct_ctxt;
 mod vec_vec;
 pub mod ssa;
+#[cfg(test)]
+mod dependency_ratchet;
 
 #[allow(unused_imports)]
 pub use domain::SlotKind;
