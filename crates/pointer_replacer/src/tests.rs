@@ -11077,151 +11077,43 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// §NB3-3a EQUIVALENCE GATE (fixture half). The forked BO borrow engine
-    /// (`borrow_ownership::borrow_engine`) must produce the same `ConflictEdge`s as production
-    /// `borrow` on every input — as a **MULTISET**, not byte-order. (Correction from the 3a Codex
-    /// review: production's `UnionFind` member set is a seed-randomized `std::HashSet`, and fork vs
-    /// production build SEPARATE `GBorrowInferCtxt` instances ⇒ separate seeds ⇒ loan-ID allocation
-    /// order — hence `Vec<ConflictEdge>` + requirer order — is NON-CONTRACTUAL and nondeterministic
-    /// in BOTH engines. What IS contractual — the reasoning chain a future session needs when it
-    /// wonders why this test isn't order-sensitive: **same edge multiset per replay call ⇒ same
-    /// demotion set ⇒ same accepted model** (hence all aggregates). The demotion set is a function
-    /// of WHICH conflicts exist, not the order they land in the `Vec`, so a seed-randomized `HashSet`
-    /// member walk can reorder the edges but cannot perturb any link in that chain.) `canon` below
-    /// is order-INSENSITIVE.
-    /// The corpus half is the `bo_c1` sweep `3a` row == `2on` (order-insensitive aggregates); the
-    /// model-level check is the full suite under `CRAT_BO_FORK_ENGINE=on`. See the mixed-Raw/Ref
-    /// replay regression `nb3a_fork_engine_multiset_matches_mixed_replay`. With ZERO new semantics
-    /// at 3a this is GREEN; 3b's write-aware `invalidates` changes the multiset by design.
+    /// §NB3-3c EQUIVALENCE SUCCESSOR — replaces the two retired 3a byte/multiset-equivalence
+    /// fixtures (`nb3a_fork_engine_edges_match_production`, `nb3a_fork_engine_multiset_matches_mixed_replay`).
+    ///
+    /// 3a's job was pre-divergence faithfulness: fork == production on every case. 3c is the first
+    /// deliberate divergence (3c-ii injects origins), so the gate's shape changes from "fork ==
+    /// production, always" to "**fork == production modulo an ENUMERATED divergence list**". This is
+    /// that successor. It collects the case-ID of every (program, mode) where the fork's conflict-edge
+    /// MULTISET differs from production's, and asserts that divergence set EQUALS
+    /// `FORK_PRODUCTION_DIVERGENCE` — both directions, exactly as the §0.2 dependency ratchet does:
+    ///   - fork≠prod on an un-enumerated case → fails (a divergence must be declared, with its cause);
+    ///   - an enumerated case that no longer diverges → fails (the list must shrink to match reality).
+    ///
+    /// **At 3c-i the list is EMPTY:** origins are computed but NOT injected, so the fork is still
+    /// byte/multiset-equal to production on every case — the successor proves itself against the (still
+    /// present) 3a gate before any divergence exists, which is the correct retirement sequence. 3c-ii's
+    /// injection commit adds one case-ID per program×mode its new interprocedural conflicts perturb.
+    ///
+    /// Covers BOTH 3a fixtures' inputs: the uniform program×mode differential (round-0 across
+    /// mutability; replaying across raw-candidacy × mutability, all-Ref base) AND the mixed-Raw/Ref
+    /// replay (r0/r1/r2 Raw, keep Ref). Comparison is order-INSENSITIVE (`multiset`): loan-ID / edge
+    /// order is non-contractual (production's `UnionFind` walks a seed-randomized `std::HashSet`); the
+    /// contractual chain is **same edge multiset per replay ⇒ same demotion set ⇒ same accepted model**.
     #[test]
-    fn nb3a_fork_engine_edges_match_production() {
+    fn nb3c_fork_equals_production_modulo_divergence() {
         use crate::analyses::borrow::{self, ConflictEdge};
         use crate::analyses::borrow_ownership::borrow_engine;
         use rustc_hash::FxHashMap;
         use rustc_span::def_id::LocalDefId;
+        use std::collections::BTreeSet;
 
-        // Order-INSENSITIVE canon (edge MULTISET): loan-ID order is non-contractual (production's
-        // UnionFind uses a seed-randomized std::HashSet), so sort requirers within each edge, sort
-        // the edges, and sort the fns. This compares semantics, not the nondeterministic Vec order.
-        fn canon(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> String {
-            let mut fns: Vec<(String, Vec<String>)> = m
-                .iter()
-                .map(|(k, edges)| {
-                    let mut es: Vec<String> = edges
-                        .iter()
-                        .map(|e| {
-                            let mut rs: Vec<String> =
-                                e.requirers.iter().map(|o| format!("{o:?}")).collect();
-                            rs.sort();
-                            format!("issuer={:?} requirers={rs:?}", e.issuer)
-                        })
-                        .collect();
-                    es.sort();
-                    (format!("{k:?}"), es)
-                })
-                .collect();
-            fns.sort();
-            format!("{fns:#?}")
-        }
+        // 3c-i: EMPTY. 3c-ii enumerates deliberate divergences here, one case-ID
+        // ("{program}/round0/mut=.." | "{program}/replay/raw=../mut=.." | "mixed_replay") per case
+        // origins' injection makes fork≠production — so `git log` + this list name exactly what
+        // diverged and why.
+        const FORK_PRODUCTION_DIVERGENCE: &[&str] = &[];
 
-        let programs = [
-            // aliasing &mut borrows of one local, both live → conflict (all-mut)
-            "unsafe fn f() { let mut x = 0i32; let p = &mut x as *mut i32; \
-             let q = &mut x as *mut i32; *p = 1; *q = 2; }",
-            // aliasing borrows with reads (exercises mutability-dependent conflict)
-            "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
-             let b = &mut x as *mut i32; let u = *a; let v = *b; let _ = (u, v); }",
-            // *mut *mut aliasing outer pointers + a call (the out-param shape)
-            "unsafe fn g(o: *mut *mut i32) { let _ = o; } \
-             unsafe fn f() { let mut local: *mut i32 = core::ptr::null_mut(); \
-             let p = &mut local as *mut *mut i32; let q = &mut local as *mut *mut i32; \
-             g(p); *q = core::ptr::null_mut(); }",
-            // raw-pointer copies (no borrows) → empty map (agreement on empty is still a real check)
-            "unsafe fn f(mut p: *mut i32) -> i32 { let a = p; let b = p; *a + *b }",
-            // call-return alias + write (the S2-6 shape)
-            "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
-             unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; let r0 = *z; *b = 5; r0 + *z }",
-        ];
-
-        // Non-vacuity guard: prove the comparison is not empty==empty. Aliasing `&mut` borrows of
-        // one local (both live) MUST produce a conflict edge. (Raw-pointer COPIES issue no loans ⇒
-        // no conflicts — the first cut used such a program and CORRECTLY failed, catching that the
-        // differential would otherwise compare only empty maps.)
-        run_compiler(
-            "unsafe fn f() { let mut x = 0i32; let p = &mut x as *mut i32; \
-             let q = &mut x as *mut i32; *p = 1; *q = 2; }",
-            |tcx| {
-                let program = collect_program(tcx);
-                let edges = borrow::borrow_conflicts(
-                    &program,
-                    |_: LocalDefId| |_: Local| true,
-                    |_: LocalDefId| |_: Local| true,
-                );
-                assert!(
-                    !edges.is_empty(),
-                    "non-vacuity: aliasing &mut borrows must produce a conflict edge"
-                );
-            },
-        );
-
-        for src in programs {
-            run_compiler(src, |tcx| {
-                let program = collect_program(tcx);
-                // round-0 (`borrow_conflicts`) across mutability:
-                for mutb in [true, false] {
-                    let prod = borrow::borrow_conflicts(
-                        &program,
-                        |_: LocalDefId| |_: Local| true,
-                        move |_: LocalDefId| move |_: Local| mutb,
-                    );
-                    let fork = borrow_engine::borrow_conflicts(
-                        &program,
-                        |_: LocalDefId| |_: Local| true,
-                        move |_: LocalDefId| move |_: Local| mutb,
-                    );
-                    assert_eq!(canon(&prod), canon(&fork), "round-0 edges differ (mut={mutb}) for: {src}");
-                }
-                // replaying (`borrow_conflicts_replaying`) across raw-candidacy × mutability, all-Ref base:
-                for raw in [false, true] {
-                    for mutb in [true, false] {
-                        let prod = borrow::borrow_conflicts_replaying(
-                            &program,
-                            |_: LocalDefId| |_: Local| true,
-                            move |_: LocalDefId| move |_: Local| raw,
-                            move |_: LocalDefId| move |_: Local| mutb,
-                        );
-                        let fork = borrow_engine::borrow_conflicts_replaying(
-                            &program,
-                            |_: LocalDefId| |_: Local| true,
-                            move |_: LocalDefId| move |_: Local| raw,
-                            move |_: LocalDefId| move |_: Local| mutb,
-                        );
-                        assert_eq!(
-                            canon(&prod),
-                            canon(&fork),
-                            "replaying edges differ (raw={raw}, mut={mutb}) for: {src}"
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// §NB3-3a mixed-Raw/Ref replay regression (from the 3a Codex review — the [medium]). The shape
-    /// that exposes loan-ID order-nondeterminism: four `&mut cell` borrows (r0,r1,r2,keep) with copies
-    /// of `keep` staggered around writes through r0/r1/r2; classify r0/r1/r2 Raw and keep Ref, so
-    /// round one unions the Raw locals with `cell` (multi-member `UnionFind` groups) and round two
-    /// allocates expanded loans by iterating a seed-randomized `std::HashSet`. Fork and production can
-    /// order the resulting edges differently — so this asserts the edge MULTISET is equal (the
-    /// contractual property the fork reproduces), NOT the Vec order. (The contractual chain — edge
-    /// multiset ⇒ demotion set ⇒ model — is stated in full on `nb3a_fork_engine_edges_match_production`.)
-    #[test]
-    fn nb3a_fork_engine_multiset_matches_mixed_replay() {
-        use crate::analyses::borrow::{self, ConflictEdge};
-        use crate::analyses::borrow_ownership::borrow_engine;
-        use rustc_hash::FxHashMap;
-        use rustc_span::def_id::LocalDefId;
-
+        // Order-INSENSITIVE canonical edge multiset (per-fn key embedded), for prod-vs-fork equality.
         fn multiset(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
             let mut out: Vec<String> = m
                 .iter()
@@ -11238,6 +11130,98 @@ unsafe fn f(mut p: *mut i32) -> i32 {
             out
         }
 
+        // (stable case-ID root, source) — the 3a fixture-1 program family.
+        let programs: [(&str, &str); 5] = [
+            // aliasing &mut borrows of one local, both live → conflict (all-mut)
+            (
+                "mut_alias",
+                "unsafe fn f() { let mut x = 0i32; let p = &mut x as *mut i32; \
+                 let q = &mut x as *mut i32; *p = 1; *q = 2; }",
+            ),
+            // aliasing borrows with reads (exercises mutability-dependent conflict)
+            (
+                "mut_alias_reads",
+                "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let u = *a; let v = *b; let _ = (u, v); }",
+            ),
+            // *mut *mut aliasing outer pointers + a call (the out-param shape)
+            (
+                "outparam_call",
+                "unsafe fn g(o: *mut *mut i32) { let _ = o; } \
+                 unsafe fn f() { let mut local: *mut i32 = core::ptr::null_mut(); \
+                 let p = &mut local as *mut *mut i32; let q = &mut local as *mut *mut i32; \
+                 g(p); *q = core::ptr::null_mut(); }",
+            ),
+            // raw-pointer copies (no borrows) → empty map (agreement on empty is still a real check)
+            ("raw_copies", "unsafe fn f(mut p: *mut i32) -> i32 { let a = p; let b = p; *a + *b }"),
+            // call-return alias + write (the S2-6 shape — the case 3c-ii origins will diverge on)
+            (
+                "call_return_write",
+                "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+                 unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; let r0 = *z; *b = 5; r0 + *z }",
+            ),
+        ];
+
+        let mut diverged: BTreeSet<String> = BTreeSet::new();
+
+        // Non-vacuity guard (from 3a fixture-1): aliasing &mut borrows of one local, both live, MUST
+        // produce a conflict edge — proves the differential is not comparing empty==empty.
+        run_compiler(programs[0].1, |tcx| {
+            let program = collect_program(tcx);
+            let edges = borrow::borrow_conflicts(
+                &program,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| true,
+            );
+            assert!(
+                !edges.is_empty(),
+                "non-vacuity: aliasing &mut borrows must produce a conflict edge"
+            );
+        });
+
+        for (label, src) in programs {
+            run_compiler(src, |tcx| {
+                let program = collect_program(tcx);
+                // round-0 (`borrow_conflicts`) across mutability:
+                for mutb in [true, false] {
+                    let prod = borrow::borrow_conflicts(
+                        &program,
+                        |_: LocalDefId| |_: Local| true,
+                        move |_: LocalDefId| move |_: Local| mutb,
+                    );
+                    let fork = borrow_engine::borrow_conflicts(
+                        &program,
+                        |_: LocalDefId| |_: Local| true,
+                        move |_: LocalDefId| move |_: Local| mutb,
+                    );
+                    if multiset(&prod) != multiset(&fork) {
+                        diverged.insert(format!("{label}/round0/mut={mutb}"));
+                    }
+                }
+                // replaying across raw-candidacy × mutability, all-Ref base:
+                for raw in [false, true] {
+                    for mutb in [true, false] {
+                        let prod = borrow::borrow_conflicts_replaying(
+                            &program,
+                            |_: LocalDefId| |_: Local| true,
+                            move |_: LocalDefId| move |_: Local| raw,
+                            move |_: LocalDefId| move |_: Local| mutb,
+                        );
+                        let fork = borrow_engine::borrow_conflicts_replaying(
+                            &program,
+                            |_: LocalDefId| |_: Local| true,
+                            move |_: LocalDefId| move |_: Local| raw,
+                            move |_: LocalDefId| move |_: Local| mutb,
+                        );
+                        if multiset(&prod) != multiset(&fork) {
+                            diverged.insert(format!("{label}/replay/raw={raw}/mut={mutb}"));
+                        }
+                    }
+                }
+            });
+        }
+
+        // The 3a fixture-2 mixed-Raw/Ref replay (r0/r1/r2 Raw, keep Ref) — the loan-ID-order stressor.
         run_compiler(
             r#"
 unsafe fn f() {
@@ -11277,16 +11261,22 @@ unsafe fn f() {
                     move |_fd: LocalDefId| move |local: Local| rl.contains(&local),
                     |_: LocalDefId| |_: Local| true,
                 );
-                assert!(
-                    !prod.is_empty(),
-                    "non-vacuity: the mixed replay must produce conflict edges"
-                );
-                assert_eq!(
-                    multiset(&prod),
-                    multiset(&fork),
-                    "fork vs production conflict-edge MULTISET differs in a mixed Raw/Ref replay"
-                );
+                assert!(!prod.is_empty(), "non-vacuity: the mixed replay must produce conflict edges");
+                if multiset(&prod) != multiset(&fork) {
+                    diverged.insert("mixed_replay".to_string());
+                }
             },
+        );
+
+        let expected: BTreeSet<String> =
+            FORK_PRODUCTION_DIVERGENCE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            diverged, expected,
+            "fork vs production divergence set != enumerated FORK_PRODUCTION_DIVERGENCE.\n  \
+             unexpected (fork≠prod but not enumerated — declare the divergence + its cause): {:?}\n  \
+             stale (enumerated but fork==prod now — shrink the list): {:?}",
+            diverged.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&diverged).collect::<Vec<_>>(),
         );
     }
 
