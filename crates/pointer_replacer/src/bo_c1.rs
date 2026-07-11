@@ -435,6 +435,7 @@ mod run {
             crate_slots::CrateSlots,
             emit_crate_ownership_constraints,
             mutability_facts::{MutFacts, MutFactsMode},
+            origins::compute_origins,
             slots::{SlotId, SlotOwner},
             solver::{KindSolver, Selectors, SlotRef},
             sources::collect_malloc_source_slots,
@@ -460,6 +461,15 @@ mod run {
         let program = collect_program(tcx);
         row.set("fn_count", program.functions.len());
         row.set("struct_count", program.structs.len());
+
+        // §NB3-3c-i: signature-origin summaries — computed ONCE per program here, kind-independent,
+        // and NOT yet injected into the borrow replay (compute-only; fork == production preserved).
+        // This is the single driver call site the runs-once invariant (`ORIGIN_WRAP_COUNT`) pins;
+        // 3c-ii threads `_origins` into the replay's subset input. `t_origins_s` is reported so the
+        // sweep can watch origin-derivation cost (brotli specifically — plan §3d numeric stop).
+        let t = Instant::now();
+        let _origins = compute_origins(&program);
+        row.set("t_origins_s", secs(t.elapsed()));
 
         // MIR warm-up: forces the (memoized) query per fn so `t_slots`/`t_emit`
         // below time the analysis, not rustc's MIR pipeline. Result-neutral.
@@ -775,6 +785,31 @@ mod run {
         row.set("status", "ok");
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
         row
+    }
+
+    /// §NB3-3c-i runs-once invariant: the driver (`run_bo`) computes signature origins EXACTLY ONCE
+    /// per program, kind-independent. `ORIGIN_WRAP_COUNT` is thread-local, so this before/after delta
+    /// around a single `run_bo` call — all on one compiler-callback thread — is race-free under the
+    /// suite's parallel (thread-local rustc-session) test execution. Guards against a future refactor
+    /// that recomputes origins per-kind / per-fn / per-query (which would push the delta above 1).
+    #[test]
+    fn origins_runs_once_per_program() {
+        use crate::analyses::borrow_ownership::origins::ORIGIN_WRAP_COUNT;
+        ::utils::compilation::run_compiler_on_str(
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p }\n\
+             unsafe fn f(p: *mut i32) -> *mut i32 { id(p) }",
+            |tcx| {
+                let before = ORIGIN_WRAP_COUNT.with(|c| c.get());
+                let _row = run_bo(tcx, Duration::ZERO);
+                let delta = ORIGIN_WRAP_COUNT.with(|c| c.get()) - before;
+                assert_eq!(
+                    delta, 1,
+                    "compute_origins must run exactly once per program on the analysis path \
+                     (kind-independent); the driver made {delta} calls"
+                );
+            },
+        )
+        .unwrap_or_else(|e| e.raise());
     }
 }
 
@@ -1818,6 +1853,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "status",
         "wall_s",
         "t_fixpoint_s",
+        "t_origins_s",
         "rounds",
         "commits_conflict",
         "slots_total",
