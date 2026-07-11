@@ -468,8 +468,24 @@ mod run {
         // 3c-ii threads `_origins` into the replay's subset input. `t_origins_s` is reported so the
         // sweep can watch origin-derivation cost (brotli specifically — plan §3d numeric stop).
         let t = Instant::now();
-        let _origins = compute_origins(&program);
+        let origins = compute_origins(&program);
         row.set("t_origins_s", secs(t.elapsed()));
+        // §NB3-3c-i brotli-scale stop instrumentation (plan §3d). `origin_slots` IS the origin-count
+        // metric for the stop (≤ ~10× signature slots): at 3c-i origins reuse `lifetime_flow`'s
+        // signature slots 1:1, so origin_slots == the signature-slot count (ratio 1.0). `subset_edges`
+        // reports the transitive-closure size (the real space concern at brotli scale). Both are
+        // read-only over the still-UNINJECTED summaries — no effect on the replay / n_ref.
+        row.set("origin_slots", origins.values().map(|s| s.slots.len()).sum::<usize>());
+        row.set(
+            "origin_subset_edges",
+            origins
+                .values()
+                .map(|s| {
+                    s.subset.rows().map(|r| s.subset.row(r).map_or(0, |b| b.iter().count())).sum::<usize>()
+                })
+                .sum::<usize>(),
+        );
+        let _origins = origins; // uninjected at 3c-i; 3c-ii threads this into the replay's subset input
 
         // MIR warm-up: forces the (memoized) query per fn so `t_slots`/`t_emit`
         // below time the analysis, not rustc's MIR pipeline. Result-neutral.
