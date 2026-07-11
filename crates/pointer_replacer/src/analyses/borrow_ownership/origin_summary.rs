@@ -6,8 +6,13 @@
 //! (`borrow/mod.rs:760` converts `depth0_value_flows` into `SubsetConstraint`s); the provenance
 //! universe is depth-0/Local-grained, so full-depth+field origin granularity exists only in
 //! `lifetime_flow`'s `SignatureSlot` model — hence the shape is adopted from it, read-only.
-//! At NB5-O the derivation is swapped for BO-native borrow facts (drop-in, gated on a corpus
-//! differential); `OriginSummary`'s shape is the stable interface that survives that swap.
+//! At NB5-O the derivation is swapped for BO-native borrow facts, gated on a corpus differential.
+//! **This is NOT a drop-in swap** (corrected after the 3c-i adversarial review): only the CONCEPTUAL
+//! `slots`/`subset`/`unknown` boundary survives — NB5-O must also replace the production-owned types
+//! this interface is built from (`LifetimeSlot`, `SignatureSlot`, and `derive_signature_flows`'s
+//! `LifetimeFlowResults` return) with BO-owned index/place/slot types, keeping the production→BO
+//! conversion behind the one adapter. The isolation holds (one call site + one type boundary); the
+//! type replacement is the real NB5-O work.
 
 use rustc_hash::FxHashMap;
 use rustc_index::{
@@ -36,16 +41,16 @@ pub struct OriginSummary {
     pub unknown: DenseBitSet<LifetimeSlot>,
 }
 
-// NOTE — storage aliases are NOT a separate field (removed after the 3c-i adversarial review, which
-// showed the earlier "storage-fold catch" was addressing a non-problem). `lifetime_flow`'s
-// `BodyLifetimeFlow::closed()` (lifetime_flow.rs:678-680) unions the SYMMETRIC `storage_aliases`
-// into `value_flows` **before** the summary is produced, so `subset` (our closure over the
-// post-`closed` `value_flows`) ALREADY contains the storage relation — both directions. A separate
-// `storage` matrix would be a strict sub-relation of `subset` (redundant). Consequence for 3c-ii:
-// storage-induced reachability is baked into `subset` and is injected whenever `subset` is; there is
-// no independent "inject storage or not" lever at the thin-reuse wrap. If 3c-ii ever needs value-only
-// vs value+storage selectivity, it must obtain a PRE-fusion value relation — naturally an NB5-O task
-// (BO-native derivation), not a wrap of the already-fused `lifetime_flow` summary.
+// NOTE — storage aliases are NOT a separate field: `compute_origins` folds them INTO `subset` by
+// unioning `summary.storage_aliases` into `summary.value_flows` before the transitive closure. This
+// is deliberate and load-bearing (Codex 3c-i re-review): `value_flows` alone is NOT a superset of
+// `storage_aliases` — `to_summary()` re-projects value-flow targets through an
+// `observable_value_target` filter (lifetime_flow.rs:758) that drops some argument depth-0 targets,
+// whereas `storage_aliases` is retained UNFILTERED (:774), so a symmetric storage direction to a
+// non-observable arg slot survives only in `storage_aliases`. Folding it into `subset` keeps the
+// complete (both-directions) relation in one matrix. Consequence for 3c-ii: storage reachability is
+// in `subset` and injected whenever `subset` is — no independent storage lever at the thin-reuse
+// wrap; value-only vs value+storage selectivity would require a BO-native derivation (NB5-O).
 
 /// Per-function origin summaries, keyed like `LifetimeFlowResults`.
 pub type OriginSummaries = FxHashMap<LocalDefId, OriginSummary>;

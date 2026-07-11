@@ -98,6 +98,37 @@ mod tests {
                 }
                 i = (i + 2).min(b.len());
                 out.push(' ');
+            } else if c == b'r'
+                && {
+                    // Raw string prefix `r` `#`×N `"` (also matches the `r` of a byte-raw `br"…"`,
+                    // whose leading `b` is pushed harmlessly). NOT a raw identifier `r#ident` (no `"`).
+                    let mut h = i + 1;
+                    while h < b.len() && b[h] == b'#' {
+                        h += 1;
+                    }
+                    h < b.len() && b[h] == b'"'
+                }
+            {
+                // Raw string `r #×N " … " #×N` — content is uninterpreted; find the closing `"`
+                // followed by exactly N `#` and blank the whole literal, so an interior `"` (or `/*`)
+                // cannot desync the scanner and swallow the following code.
+                let mut h = i + 1;
+                while h < b.len() && b[h] == b'#' {
+                    h += 1;
+                }
+                let hashes = h - (i + 1);
+                let mut m = h + 1;
+                while m < b.len() {
+                    if b[m] == b'"'
+                        && b[m + 1..].iter().take(hashes).filter(|&&x| x == b'#').count() == hashes
+                    {
+                        m += 1 + hashes;
+                        break;
+                    }
+                    m += 1;
+                }
+                i = m;
+                out.push(' ');
             } else if c == b'"' {
                 i += 1;
                 while i < b.len() {
@@ -239,6 +270,15 @@ mod tests {
                 p += 1;
             }
             if !(p + 1 < b.len() && b[p] == b':' && b[p + 1] == b':') {
+                // Not `::`. A module ALIAS `borrow as X` imports the whole module under a new name —
+                // a whole-surface dependency the alias would otherwise hide from segment tracking, so
+                // record `*` (not in any allowlist ⇒ the ratchet trips).
+                if b.get(p) == Some(&b'a')
+                    && b.get(p + 1) == Some(&b's')
+                    && b.get(p + 2).is_some_and(|&x| (x as char).is_whitespace())
+                {
+                    add_seg(kind, "*", found);
+                }
                 continue;
             }
             let mut j = p + 2;
@@ -265,6 +305,13 @@ mod tests {
                         }
                         b',' if depth == 1 => {
                             expect = true;
+                            k += 1;
+                        }
+                        b'*' if depth == 1 && expect => {
+                            // A grouped glob `borrow::{self, *}` imports the whole surface — record `*`
+                            // (else the group walker would capture only the sibling idents and miss it).
+                            add_seg(kind, "*", found);
+                            expect = false;
                             k += 1;
                         }
                         c if depth == 1 && expect && is_ident(c) => {
@@ -389,5 +436,38 @@ mod tests {
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
         assert!(set.contains("SpacedDep"), "space around `::` must not evade the scanner; got {set:?}");
+    }
+
+    /// A grouped glob `borrow::{self, *}` must record `*` — not silently capture only the sibling
+    /// `self` (Codex re-review). The `*` imports the whole surface.
+    #[test]
+    fn scanner_catches_grouped_glob() {
+        let cleaned =
+            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self, *};"));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("*"), "grouped glob `borrow::{{self, *}}` must record `*`; got {set:?}");
+    }
+
+    /// A module alias `use borrow as prod;` imports the whole surface under a new name — record `*`
+    /// (the alias would otherwise hide every `prod::X` use from segment tracking) (Codex re-review).
+    #[test]
+    fn scanner_catches_module_alias() {
+        let cleaned =
+            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow as prod;"));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("*"), "module alias `borrow as prod` must record `*`; got {set:?}");
+    }
+
+    /// A raw string with an interior `"` must not desync the scanner and blank the following code —
+    /// the dependency AFTER it must survive scanning (Codex re-review).
+    #[test]
+    fn scanner_raw_string_does_not_swallow_following_dep() {
+        let src = "const S: &str = r#\"one quote: \"\"#; fn f() { let _ = borrow::REAL_DEP; }";
+        let cleaned = strip_cfg_test(strip_comments_and_strings(src));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("REAL_DEP"), "dep after a raw string must survive scanning; got {set:?}");
     }
 }
