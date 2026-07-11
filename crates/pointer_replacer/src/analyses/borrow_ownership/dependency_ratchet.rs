@@ -154,39 +154,56 @@ mod tests {
         out
     }
 
-    /// Remove every `#[cfg(test)]`-gated item span (mod / fn / use). Operates on already-ASCII text,
-    /// so byte offsets are char boundaries.
+    /// Remove every `#[cfg(test)]`-gated item span (mod / fn / use / FIELD / variant). Operates on
+    /// already-ASCII text, so byte offsets are char boundaries. The item terminator is found while
+    /// tracking `()`/`[]`/`{}` nesting, so a comma or brace *inside* a parameter list, type, or
+    /// initializer is not mistaken for the item boundary: the item ends at the first **depth-0** `;`
+    /// or `,` (use / mod-decl / field / enum variant), or a depth-0 `{` (mod / fn / impl body) whose
+    /// matching `}` closes it. (Residual: a generic field type with a *top-level* comma, e.g.
+    /// `f: Map<K, V>,` — `<>` is not tracked (angle brackets are ambiguous with comparison) — would
+    /// under-consume; that fails LOUD as a false positive, never a silent false-negative.)
     fn strip_cfg_test(mut s: String) -> String {
         const ATTR: &str = "#[cfg(test)]";
         while let Some(pos) = s.find(ATTR) {
             let b = s.as_bytes();
-            let mut j = pos + ATTR.len();
-            while j < b.len() && b[j] != b'{' && b[j] != b';' {
-                j += 1;
-            }
-            let end = if j >= b.len() {
-                b.len()
-            } else if b[j] == b';' {
-                j + 1
-            } else {
-                let mut depth = 0usize;
-                let mut k = j;
-                while k < b.len() {
-                    match b[k] {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                k += 1;
-                                break;
+            let mut depth = 0i32;
+            let mut k = pos + ATTR.len();
+            let mut end = b.len();
+            while k < b.len() {
+                match b[k] {
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => depth -= 1,
+                    b'{' if depth == 0 => {
+                        // Brace-match the item body.
+                        let mut d = 0i32;
+                        let mut m = k;
+                        while m < b.len() {
+                            match b[m] {
+                                b'{' => d += 1,
+                                b'}' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        m += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
+                            m += 1;
                         }
-                        _ => {}
+                        end = m;
+                        break;
                     }
-                    k += 1;
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    b';' | b',' if depth == 0 => {
+                        end = k + 1;
+                        break;
+                    }
+                    _ => {}
                 }
-                k
-            };
+                k += 1;
+            }
             s.replace_range(pos..end, " ");
         }
         s
@@ -196,21 +213,35 @@ mod tests {
         c.is_ascii_alphanumeric() || c == b'_'
     }
 
-    /// Extract the first path segment after each word-boundary `{kind}::` occurrence, expanding a
-    /// top-level `{ … }` group into its depth-1 leading identifiers.
+    /// Extract the first path segment after each whole-word `{kind}` followed by (optionally spaced)
+    /// `::`, expanding a top-level `{ … }` group into its depth-1 leading identifiers and recording a
+    /// glob `*`. Matching the WORD (not the literal `{kind}::`) catches `borrow :: X` spaced
+    /// separators; the whole-word guards keep `borrow_ownership` / `borrow_inference`'s inner
+    /// substrings from matching.
     fn extract(kind: &str, text: &str, found: &mut BTreeSet<String>) {
         let b = text.as_bytes();
-        let needle = format!("{kind}::");
         let mut base = 0;
-        while let Some(rel) = text[base..].find(&needle) {
+        while let Some(rel) = text[base..].find(kind) {
             let start = base + rel;
-            let after = start + needle.len();
-            base = after;
-            // word boundary: `borrow_ownership::` must not match `ownership::`.
+            let after_word = start + kind.len();
+            base = after_word;
+            // Whole word: non-ident on BOTH sides (so `borrow_ownership`, `borrow_inference`,
+            // `xborrow` don't match on their embedded `borrow`/`ownership`).
             if start > 0 && is_ident(b[start - 1]) {
                 continue;
             }
-            let mut j = after;
+            if after_word < b.len() && is_ident(b[after_word]) {
+                continue;
+            }
+            // Optional whitespace, then the `::` path separator.
+            let mut p = after_word;
+            while p < b.len() && (b[p] as char).is_whitespace() {
+                p += 1;
+            }
+            if !(p + 1 < b.len() && b[p] == b':' && b[p + 1] == b':') {
+                continue;
+            }
+            let mut j = p + 2;
             while j < b.len() && (b[j] as char).is_whitespace() {
                 j += 1;
             }
@@ -335,5 +366,28 @@ mod tests {
         extract("borrow", &cleaned, &mut set);
         assert!(set.contains("REAL_DEP"), "real ref after the block must survive; got {set:?}");
         assert!(!set.contains("TEST_ONLY"), "test-only ref inside the block must be stripped; got {set:?}");
+    }
+
+    /// A comma-terminated `#[cfg(test)]` FIELD (the `call_graph.rs:109` shape) must be stripped at its
+    /// comma, NOT brace-match the next block and swallow real code with its `borrow::` ref (a silent
+    /// false-negative). The test-only field type must not be counted either.
+    #[test]
+    fn scanner_cfg_gated_field_does_not_over_consume() {
+        let src = "struct S { #[cfg(test)] dbg: VecVec<DefId>, keep: T } \
+                   impl S { fn m() { let _ = borrow::REAL_DEP; } }";
+        let cleaned = strip_cfg_test(strip_comments_and_strings(src));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("REAL_DEP"), "real ref after a cfg-gated field must survive; got {set:?}");
+    }
+
+    /// A spaced path separator `borrow :: X` (or `borrow:: X`) must not evade the scanner — a
+    /// hand-written space around `::` would otherwise hide a real dependency.
+    #[test]
+    fn scanner_handles_spaced_path_separator() {
+        let cleaned = strip_cfg_test(strip_comments_and_strings("fn f() { let _ = borrow :: SpacedDep; }"));
+        let mut set = BTreeSet::new();
+        extract("borrow", &cleaned, &mut set);
+        assert!(set.contains("SpacedDep"), "space around `::` must not evade the scanner; got {set:?}");
     }
 }
