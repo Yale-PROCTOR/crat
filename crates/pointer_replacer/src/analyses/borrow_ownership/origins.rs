@@ -58,10 +58,25 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
         .map(|(f, result)| {
             let summary = result.summary;
             let n = summary.slots.len();
-            // `summary.value_flows` is post-`closed()`, which already unions the symmetric
-            // `storage_aliases` in (lifetime_flow.rs:678-680) — so `subset` contains the storage
-            // relation, both directions. No separate storage matrix (see origin_summary.rs note).
-            let subset = transitive_closure(&summary.value_flows, n);
+            // `subset` = closure(value_flows ∪ storage_aliases). `closed()` fuses storage into
+            // value_flows at BODY granularity, but `to_summary()` re-projects value_flow targets
+            // through an `observable_value_target` filter (lifetime_flow.rs:758) that DROPS some
+            // argument depth-0 targets, while `storage_aliases` is retained UNFILTERED (:774). So the
+            // summary's `value_flows` is NOT a superset of `storage_aliases` — a symmetric storage
+            // direction to a non-observable arg slot lives only in `storage_aliases` (Codex 3c-i
+            // re-review; witness `&raw mut p`: value has arg1@0→return@1, storage the return@1→arg1@0).
+            // Unioning `storage_aliases` back in BEFORE closing restores the complete relation in one
+            // matrix (no separate storage field). The union is not pre-closed across value↔storage
+            // chains, so `transitive_closure` below does real work (and is guarded directly).
+            let mut combined = summary.value_flows;
+            for src in summary.storage_aliases.rows() {
+                if let Some(tgts) = summary.storage_aliases.row(src) {
+                    for tgt in tgts.iter() {
+                        combined.insert(src, tgt);
+                    }
+                }
+            }
+            let subset = transitive_closure(&combined, n);
             (
                 f,
                 OriginSummary {
@@ -294,6 +309,43 @@ mod tests {
             has(&f.subset, "arg3@1", "arg1@1"),
             "chain: arg3@1 → arg1@1 must hold transitively (arg3@1→arg2@1→arg1@1); a 1-hop closure \
              misses it; got {:?}",
+            f.subset
+        );
+    }
+
+    /// DIRECT guard for the multi-hop `transitive_closure` (Codex 3c-i re-review). The end-to-end
+    /// three-node fixture above is vacuous for THIS function: `lifetime_flow`'s summary is already
+    /// transitively closed, so a 1-hop or no-op closure still passes it. This feeds a synthetic,
+    /// NOT-pre-closed matrix (only A→B and B→C) and asserts the transitive A→C — which a 1-hop closure
+    /// (successors taken from the seed, not the popped node) would miss. This is the real guard for the
+    /// closure the NB5-O BO-native (un-closed) input will depend on.
+    #[test]
+    fn transitive_closure_multi_hop_from_synthetic() {
+        let mut m: SparseBitMatrix<LifetimeSlot, LifetimeSlot> = SparseBitMatrix::new(3);
+        let (a, b, c) = (LifetimeSlot::new(0), LifetimeSlot::new(1), LifetimeSlot::new(2));
+        m.insert(a, b);
+        m.insert(b, c);
+        let closed = transitive_closure(&m, 3);
+        let reaches = |x: LifetimeSlot, y: LifetimeSlot| closed.row(x).is_some_and(|r| r.iter().any(|z| z == y));
+        assert!(reaches(a, c), "A→C must hold transitively (A→B→C); a 1-hop closure misses it");
+        assert!(reaches(a, b) && reaches(b, c), "direct A→B and B→C must hold");
+    }
+
+    /// Argument depth-0 storage symmetry regression (Codex 3c-i re-review). A storage alias whose
+    /// target is a NON-observable argument depth-0 slot survives ONLY in `storage_aliases` —
+    /// `to_summary()` drops it from `value_flows` via the `observable_value_target` filter. `&raw mut
+    /// p` aliases the returned `*mut *mut` pointee storage with `p`'s address, so `subset` must carry
+    /// BOTH directions — proving `compute_origins` unions `storage_aliases` in (not lost with the
+    /// removed separate field).
+    #[test]
+    fn nb3_arg_depth0_storage_symmetry() {
+        let facts =
+            origin_facts("unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }");
+        let f = &facts["addr"];
+        assert!(
+            has(&f.subset, "arg1@0", "return@1") && has(&f.subset, "return@1", "arg1@0"),
+            "addr: BOTH storage directions (arg1@0 ↔ return@1) must be in subset after the storage \
+             union; got {:?}",
             f.subset
         );
     }
