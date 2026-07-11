@@ -4,6 +4,8 @@
 //! before any mutation; an unresolvable function drops out together with the
 //! targets that forward into it (group-atomic, no partial rewrites).
 
+use std::fmt::Write as _;
+
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
@@ -14,7 +16,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::{Ident, Symbol, def_id::LocalDefId};
+use rustc_span::{Ident, Symbol, def_id::LocalDefId, sym};
 use thin_vec::thin_vec;
 use utils::ir::AstToHir;
 
@@ -27,6 +29,9 @@ struct FnPlan {
     field_name: Symbol,
     field_ty: P<Ty>,
     mutbl: Mutability,
+    // Some(new name) when the fn is c-exposed: rename to `{name}_field`, strip
+    // abi attrs, emit an original-signature wrapper
+    exposed_rename: Option<Symbol>,
 }
 
 pub(crate) fn apply_struct_param_field_spec(
@@ -40,8 +45,13 @@ pub(crate) fn apply_struct_param_field_spec(
     if fn_plans.is_empty() {
         return false;
     }
+    let exposed_renames: FxHashMap<LocalDefId, Symbol> = fn_plans
+        .iter()
+        .filter_map(|(&(did, _), fp)| fp.exposed_rename.map(|n| (did, n)))
+        .collect();
     let mut visitor = SpecTransformVisitor {
         fn_plans: &fn_plans,
+        exposed_renames: &exposed_renames,
         tcx,
         ast_to_hir,
         current_fn: None,
@@ -91,6 +101,17 @@ fn collect_field_tys(
     out
 }
 
+// all function item names in the crate, for `_field` collision checks
+fn crate_fn_names(krate: &Crate) -> FxHashSet<Symbol> {
+    let mut names = FxHashSet::default();
+    walk_items(&krate.items, &mut |item| {
+        if let ItemKind::Fn(func) = &item.kind {
+            names.insert(func.ident.name);
+        }
+    });
+    names
+}
+
 // phase 1: resolve edits per target fn; reject functions whose param is used
 // outside the rewritable shapes; cascade drops through forwarding edges
 fn resolve_and_validate(
@@ -102,6 +123,7 @@ fn resolve_and_validate(
 ) -> FxHashMap<(LocalDefId, usize), FnPlan> {
     let mut fn_plans: FxHashMap<(LocalDefId, usize), FnPlan> = FxHashMap::default();
     let mut dropped: FxHashSet<(LocalDefId, usize)> = FxHashSet::default();
+    let fn_names = crate_fn_names(krate);
 
     walk_items(&krate.items, &mut |item| {
         let ItemKind::Fn(func) = &item.kind else {
@@ -115,8 +137,27 @@ fn resolve_and_validate(
                 continue;
             }
             let key = (did, param_idx);
-            let ok = resolve_fn_plan(func, param_idx, target, field_tys, tcx, ast_to_hir, plan)
-                .map(|fn_plan| fn_plans.insert(key, fn_plan));
+            let exposed_rename = if target.exposed {
+                let new_name = Symbol::intern(&format!("{}_field", func.ident.name));
+                if fn_names.contains(&new_name) {
+                    dropped.insert(key);
+                    continue;
+                }
+                Some(new_name)
+            } else {
+                None
+            };
+            let ok = resolve_fn_plan(
+                func,
+                param_idx,
+                target,
+                field_tys,
+                tcx,
+                ast_to_hir,
+                plan,
+                exposed_rename,
+            )
+            .map(|fn_plan| fn_plans.insert(key, fn_plan));
             if ok.is_none() {
                 dropped.insert(key);
             }
@@ -145,6 +186,7 @@ fn resolve_and_validate(
     fn_plans
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_fn_plan(
     func: &Fn,
     param_idx: usize,
@@ -153,6 +195,7 @@ fn resolve_fn_plan(
     tcx: TyCtxt<'_>,
     ast_to_hir: &AstToHir,
     plan: &SpecPlan,
+    exposed_rename: Option<Symbol>,
 ) -> Option<FnPlan> {
     let field_ty = field_tys
         .get(&(target.struct_def, target.field.as_usize()))?
@@ -178,6 +221,7 @@ fn resolve_fn_plan(
         field_name: target.field_name,
         field_ty,
         mutbl: target.mutbl,
+        exposed_rename,
     })
 }
 
@@ -265,6 +309,7 @@ fn resolve_callee(tcx: TyCtxt<'_>, ast_to_hir: &AstToHir, callee: &Expr) -> Opti
 
 struct SpecTransformVisitor<'a, 'tcx> {
     fn_plans: &'a FxHashMap<(LocalDefId, usize), FnPlan>,
+    exposed_renames: &'a FxHashMap<LocalDefId, Symbol>,
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
     // targets of the function currently being visited, keyed by param name
@@ -273,17 +318,30 @@ struct SpecTransformVisitor<'a, 'tcx> {
 }
 
 impl MutVisitor for SpecTransformVisitor<'_, '_> {
-    fn visit_item(&mut self, item: &mut Item) {
+    fn flat_map_item(&mut self, mut item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         let mut entered = false;
-        if let ItemKind::Fn(func) = &mut item.kind
+        // (orig-signature snapshot, new name) for wrapper emission
+        let mut wrapper_info: Option<(P<Item>, Symbol)> = None;
+
+        if matches!(item.kind, ItemKind::Fn(_))
             && let Some(&did) = self.ast_to_hir.global_map.get(&item.id)
         {
             let mut by_name = FxHashMap::default();
+            let mut rename: Option<Symbol> = None;
             for (&(target_did, _), fn_plan) in self.fn_plans {
                 if target_did != did {
                     continue;
                 }
-                // narrow the parameter type to a mut pointer to the field type
+                rename = rename.or(fn_plan.exposed_rename);
+                by_name.insert(fn_plan.param_name, fn_plan);
+            }
+            if let Some(new_name) = rename {
+                // snapshot the original item (name, attrs, signature) before mutation
+                wrapper_info = Some((item.clone(), new_name));
+            }
+            let ItemKind::Fn(func) = &mut item.kind else { unreachable!() };
+            for fn_plan in by_name.values() {
+                // narrow the parameter type to a pointer to the field type
                 let input = &mut func.sig.decl.inputs[fn_plan.param_idx];
                 input.ty = P(Ty {
                     id: DUMMY_NODE_ID,
@@ -294,18 +352,28 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
                     span: input.ty.span,
                     tokens: None,
                 });
-                by_name.insert(fn_plan.param_name, fn_plan);
                 self.changed = true;
+            }
+            if let Some((_, new_name)) = &wrapper_info {
+                func.ident.name = *new_name;
+                item.attrs.retain(|attr| {
+                    !attr.has_name(sym::export_name) && !attr.has_name(sym::no_mangle)
+                });
             }
             if !by_name.is_empty() {
                 self.current_fn = Some(by_name);
                 entered = true;
             }
         }
-        mut_visit::walk_item(self, item);
+
+        let mut items = mut_visit::walk_flat_map_item(self, item);
         if entered {
             self.current_fn = None;
         }
+        if let Some((orig_item, new_name)) = wrapper_info {
+            items.push(self.build_wrapper(orig_item, new_name));
+        }
+        items
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
@@ -318,6 +386,39 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
 }
 
 impl SpecTransformVisitor<'_, '_> {
+    // original name/attrs/signature; body forwards to the renamed function,
+    // converting each specialized param to a null-guarded field address
+    fn build_wrapper(&mut self, mut wrapper: P<Item>, new_name: Symbol) -> P<Item> {
+        let ItemKind::Fn(func) = &mut wrapper.kind else { unreachable!() };
+        let did = self.ast_to_hir.global_map[&wrapper.id];
+        let mut call = format!("{new_name}(");
+        for (i, param) in func.sig.decl.inputs.iter().enumerate() {
+            let PatKind::Ident(_, ident, _) = param.pat.kind else { unreachable!() };
+            let x = ident.name;
+            if let Some(fn_plan) = self.fn_plans.get(&(did, i)) {
+                let m = match fn_plan.mutbl {
+                    Mutability::Mut => "mut",
+                    Mutability::Not => "const",
+                };
+                let ty = pprust::ty_to_string(&fn_plan.field_ty);
+                let fld = fn_plan.field_name;
+                write!(
+                    call,
+                    "if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &raw {m} (*{x}).{fld} }}, ",
+                )
+                .unwrap();
+            } else {
+                write!(call, "{x}, ").unwrap();
+            }
+        }
+        call.push(')');
+        let body = func.body.as_mut().unwrap();
+        body.stmts.clear();
+        body.stmts.push(utils::stmt!("{call}"));
+        self.changed = true;
+        wrapper
+    }
+
     // `(*s).field` -> `(*s)` inside a specialized function
     fn rewrite_body_field_access(&mut self, expr: &mut Expr) {
         let Some(params) = &self.current_fn else {
@@ -356,6 +457,13 @@ impl SpecTransformVisitor<'_, '_> {
         let Some(callee_did) = resolve_callee(self.tcx, self.ast_to_hir, callee) else {
             return;
         };
+        if let Some(new_name) = self.exposed_renames.get(&callee_did)
+            && let ExprKind::Path(None, path) = &mut callee.kind
+            && let Some(seg) = path.segments.last_mut()
+        {
+            seg.ident.name = *new_name;
+            self.changed = true;
+        }
         for (i, arg) in args.iter_mut().enumerate() {
             let Some(fn_plan) = self.fn_plans.get(&(callee_did, i)) else {
                 continue;

@@ -61,6 +61,25 @@ fn run_param_field_test(code: &str, includes: &[&str], excludes: &[&str]) {
     }
 }
 
+fn run_param_field_test_with_config(
+    code: &str,
+    config: &Config,
+    includes: &[&str],
+    excludes: &[&str],
+) {
+    let (s, _) = rewrite_struct_param_fields_with_config(code, config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
 #[test]
 fn test_struct_param_field_basic_specialization() {
     run_param_field_test(
@@ -282,6 +301,142 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
             "inner(s)",
         ],
         &["fn inner(mut s: *const st", "fn outer(mut s: *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_exposed_gets_wrapper() {
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    run_param_field_test_with_config(
+        code,
+        &config,
+        &[
+            "fn build_field(mut s: *mut [u16; 4]",
+            "fn build(mut s: *mut st",
+            "if s.is_null()",
+            "build_field(&raw mut (*s).lookup",
+        ],
+        &["build(s,"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_export_name_wrapper_keeps_attr() {
+    // the exposed C symbol comes from #[export_name]; the wrapper must carry it
+    // and the renamed internal function must lose it
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+#[export_name = "build"]
+pub unsafe extern "C" fn build_impl(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build_impl(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("fn build_impl_field(mut s: *mut [u16; 4]"),
+        "{s}"
+    );
+    assert!(s.contains("fn build_impl(mut s: *mut st"), "{s}");
+    assert_eq!(s.matches("export_name = \"build\"").count(), 1, "{s}");
+}
+
+#[test]
+fn test_struct_param_field_wrapper_name_collision_skips() {
+    // a pre-existing `build_field` item blocks the rename; the target is dropped
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build_field() {}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    run_param_field_test_with_config(code, &config, &["fn build(mut s: *mut st"], &["&raw mut"]);
+}
+
+#[test]
+fn test_struct_param_field_forward_into_exposed_retargets() {
+    // non-exposed outer forwards into exposed inner: outer's forwarding call
+    // must retarget to the renamed inner_field
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("inner".to_string());
+    run_param_field_test_with_config(
+        code,
+        &config,
+        &[
+            "fn inner_field(mut s: *mut [u16; 4]",
+            "fn inner(mut s: *mut st",
+            "inner_field(s)",
+            "fn outer(mut s: *mut [u16; 4]",
+        ],
+        &["fn inner(mut s: *mut [u16; 4]"],
     );
 }
 

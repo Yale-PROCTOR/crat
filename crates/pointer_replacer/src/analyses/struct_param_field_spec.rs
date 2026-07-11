@@ -33,6 +33,9 @@ pub struct SpecTarget {
     /// mutability of the original raw-pointer parameter; every downstream
     /// pointer/borrow the rewriter emits preserves it
     pub mutbl: ty::Mutability,
+    /// true when the function's C ABI must be preserved: the rewriter renames
+    /// it to `{name}_field` and re-exposes a wrapper with the original signature
+    pub exposed: bool,
 }
 
 // param type must be a raw pointer to a local, non-generic struct
@@ -110,12 +113,12 @@ pub(crate) fn collect_candidates(
     for &fn_did in &input.functions {
         let name = tcx.item_name(fn_did.to_def_id());
         if name.as_str() == "main"
-            || is_c_exposed_fn(tcx, fn_did, c_exposed_fns)
             || address_taken.contains(&fn_did)
             || tcx.fn_sig(fn_did).skip_binder().c_variadic()
         {
             continue;
         }
+        let exposed = is_c_exposed_fn(tcx, fn_did, c_exposed_fns);
         let Some(flow) = flows.get(&fn_did) else {
             continue;
         };
@@ -145,6 +148,7 @@ pub(crate) fn collect_candidates(
                     field_name,
                     struct_def,
                     mutbl,
+                    exposed,
                 },
             );
         }
@@ -645,24 +649,44 @@ pub unsafe extern "C" fn take(mut s: *mut st) -> libc::c_int {
         );
     }
 
-    #[test]
-    fn test_c_exposed_fn_is_excluded() {
-        let selected = ::utils::compilation::run_compiler_on_str(SINGLE_FIELD, |tcx| {
+    // returns sorted (fn name, param index, exposed) triples
+    fn exposed_flags_for(code: &str, exposed: &[&str]) -> Vec<(String, usize, bool)> {
+        let exposed: FxHashSet<String> = exposed.iter().map(|s| s.to_string()).collect();
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let program = build_rust_program(tcx);
             let flows = pointer_flow_analysis(&program, &FxHashSet::default());
-            let mut exposed = FxHashSet::default();
-            exposed.insert("build".to_string());
-            collect_candidates(&program, &flows, &exposed).len()
+            let candidates = collect_candidates(&program, &flows, &exposed);
+            let mut out: Vec<(String, usize, bool)> = candidates
+                .iter()
+                .map(|(&(did, idx), target)| {
+                    (
+                        tcx.item_name(did.to_def_id()).to_string(),
+                        idx,
+                        target.exposed,
+                    )
+                })
+                .collect();
+            out.sort();
+            out
         })
-        .unwrap();
-        assert_eq!(selected, 0);
+        .unwrap()
     }
 
     #[test]
-    fn test_export_name_c_exposed_fn_is_excluded() {
+    fn test_c_exposed_fn_is_marked_exposed() {
+        // replaces test_c_exposed_fn_is_excluded: exposed fns are now candidates
+        // carrying the exposed flag (the rewriter wraps them)
+        assert_eq!(
+            exposed_flags_for(SINGLE_FIELD, &["build"]),
+            vec![("build".to_string(), 0, true)]
+        );
+    }
+
+    #[test]
+    fn test_export_name_c_exposed_fn_is_marked_exposed() {
         // c2rust emits #[export_name] when the C symbol differs from the Rust
         // item name; the c_exposed_fns set is keyed on the C symbol, so the
-        // exclusion must check export_name, not just the Rust item name
+        // exposed flag must check export_name, not just the Rust item name
         let code = r#"
 use ::libc;
 #[repr(C)]
@@ -675,15 +699,10 @@ pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
     return 0 as libc::c_int;
 }
 "#;
-        let selected = ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let program = build_rust_program(tcx);
-            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
-            let mut exposed = FxHashSet::default();
-            exposed.insert("exposed_c_name".to_string());
-            collect_candidates(&program, &flows, &exposed).len()
-        })
-        .unwrap();
-        assert_eq!(selected, 0);
+        assert_eq!(
+            exposed_flags_for(code, &["exposed_c_name"]),
+            vec![("build".to_string(), 0, true)]
+        );
     }
 
     #[test]
