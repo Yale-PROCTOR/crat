@@ -11077,6 +11077,44 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// Multiset difference for the §NB3-3c divergence delta: `a` minus `b`, each `b` element removing
+    /// exactly ONE `a` element (multiplicity-preserving, so a duplicated or dropped edge is not
+    /// masked). Module-level so `nb3c_divergence_delta_multiplicity` can guard it directly.
+    fn multiset_diff(a: &[String], b: &[String]) -> Vec<String> {
+        let mut remaining: std::collections::BTreeMap<&String, usize> =
+            std::collections::BTreeMap::new();
+        for x in b {
+            *remaining.entry(x).or_default() += 1;
+        }
+        let mut out = vec![];
+        for x in a {
+            match remaining.get_mut(x) {
+                Some(c) if *c > 0 => *c -= 1,
+                _ => out.push(x.clone()),
+            }
+        }
+        out
+    }
+
+    /// Guards the §NB3-3c divergence DELTA (Codex F3): the multiplicity-preserving symmetric
+    /// difference must (a) be empty for equal multisets, (b) CHANGE when an edge within a case
+    /// changes, and (c) not mask a dropped duplicate. Without this, once 3c-ii allowlists a case,
+    /// edges shifting inside it would leave the case-ID present and the gate green.
+    #[test]
+    fn nb3c_divergence_delta_multiplicity() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // (a) equal ⇒ empty both ways.
+        assert!(multiset_diff(&s(&["A", "B"]), &s(&["B", "A"])).is_empty());
+        // (b) a within-case edge change (fork C→D) alters the fork-only side of the delta.
+        let prod = s(&["A", "B"]);
+        let before = multiset_diff(&s(&["A", "C"]), &prod); // fork_only when fork = {A,C}
+        let after = multiset_diff(&s(&["A", "D"]), &prod); // fork_only when fork = {A,D}
+        assert_eq!(before, s(&["C"]));
+        assert_ne!(before, after, "changing an edge within a case must change the delta");
+        // (c) multiplicity: a dropped DUPLICATE is surfaced, not masked by the other copy.
+        assert_eq!(multiset_diff(&s(&["A", "A"]), &s(&["A"])), s(&["A"]));
+    }
+
     /// §NB3-3c EQUIVALENCE SUCCESSOR — replaces the two retired 3a byte/multiset-equivalence
     /// fixtures (`nb3a_fork_engine_edges_match_production`, `nb3a_fork_engine_multiset_matches_mixed_replay`).
     ///
@@ -11105,13 +11143,14 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         use crate::analyses::borrow_ownership::borrow_engine;
         use rustc_hash::FxHashMap;
         use rustc_span::def_id::LocalDefId;
-        use std::collections::BTreeSet;
+        use std::collections::BTreeMap;
 
-        // 3c-i: EMPTY. 3c-ii enumerates deliberate divergences here, one case-ID
-        // ("{program}/round0/mut=.." | "{program}/replay/raw=../mut=.." | "mixed_replay") per case
-        // origins' injection makes fork≠production — so `git log` + this list name exactly what
-        // diverged and why.
-        const FORK_PRODUCTION_DIVERGENCE: &[&str] = &[];
+        // 3c-i: EMPTY. 3c-ii enumerates deliberate divergences here as (case-ID, expected DELTA)
+        // pairs — case-ID is "{program}/round0/mut=.." | "{program}/replay/raw=../mut=.." |
+        // "mixed_replay"; the DELTA is the canonical per-case prod-vs-fork edge symmetric-difference
+        // string (`case_delta`). Enumerating the DELTA (not just the ID) means edges CHANGING within
+        // an already-allowed divergence still fails the gate (Codex F3).
+        const FORK_PRODUCTION_DIVERGENCE: &[(&str, &str)] = &[];
 
         // Order-INSENSITIVE canonical edge multiset (per-fn key embedded), for prod-vs-fork equality.
         fn multiset(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
@@ -11128,6 +11167,21 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 .collect();
             out.sort();
             out
+        }
+
+        // The per-case divergence DELTA (Codex F3): the multiplicity-preserving symmetric difference
+        // of the prod vs fork edge multisets, as a canonical string. `None` ⇔ multisets equal (no
+        // divergence). Comparing the DELTA (not just a case ID) makes a change to the edges WITHIN an
+        // already-enumerated divergence fail the gate.
+        fn case_delta(
+            prod: &FxHashMap<LocalDefId, Vec<ConflictEdge>>,
+            fork: &FxHashMap<LocalDefId, Vec<ConflictEdge>>,
+        ) -> Option<String> {
+            let (p, f) = (multiset(prod), multiset(fork));
+            let prod_only = multiset_diff(&p, &f);
+            let fork_only = multiset_diff(&f, &p);
+            (!prod_only.is_empty() || !fork_only.is_empty())
+                .then(|| format!("prod_only={prod_only:?} fork_only={fork_only:?}"))
         }
 
         // (stable case-ID root, source) — the 3a fixture-1 program family.
@@ -11162,7 +11216,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
             ),
         ];
 
-        let mut diverged: BTreeSet<String> = BTreeSet::new();
+        let mut diverged: BTreeMap<String, String> = BTreeMap::new();
 
         // Non-vacuity guard (from 3a fixture-1): aliasing &mut borrows of one local, both live, MUST
         // produce a conflict edge — proves the differential is not comparing empty==empty.
@@ -11194,8 +11248,8 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                         |_: LocalDefId| |_: Local| true,
                         move |_: LocalDefId| move |_: Local| mutb,
                     );
-                    if multiset(&prod) != multiset(&fork) {
-                        diverged.insert(format!("{label}/round0/mut={mutb}"));
+                    if let Some(d) = case_delta(&prod, &fork) {
+                        diverged.insert(format!("{label}/round0/mut={mutb}"), d);
                     }
                 }
                 // replaying across raw-candidacy × mutability, all-Ref base:
@@ -11213,8 +11267,8 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                             move |_: LocalDefId| move |_: Local| raw,
                             move |_: LocalDefId| move |_: Local| mutb,
                         );
-                        if multiset(&prod) != multiset(&fork) {
-                            diverged.insert(format!("{label}/replay/raw={raw}/mut={mutb}"));
+                        if let Some(d) = case_delta(&prod, &fork) {
+                            diverged.insert(format!("{label}/replay/raw={raw}/mut={mutb}"), d);
                         }
                     }
                 }
@@ -11262,21 +11316,22 @@ unsafe fn f() {
                     |_: LocalDefId| |_: Local| true,
                 );
                 assert!(!prod.is_empty(), "non-vacuity: the mixed replay must produce conflict edges");
-                if multiset(&prod) != multiset(&fork) {
-                    diverged.insert("mixed_replay".to_string());
+                if let Some(d) = case_delta(&prod, &fork) {
+                    diverged.insert("mixed_replay".to_string(), d);
                 }
             },
         );
 
-        let expected: BTreeSet<String> =
-            FORK_PRODUCTION_DIVERGENCE.iter().map(|s| s.to_string()).collect();
+        let expected: BTreeMap<String, String> = FORK_PRODUCTION_DIVERGENCE
+            .iter()
+            .map(|(id, delta)| (id.to_string(), delta.to_string()))
+            .collect();
         assert_eq!(
             diverged, expected,
-            "fork vs production divergence set != enumerated FORK_PRODUCTION_DIVERGENCE.\n  \
-             unexpected (fork≠prod but not enumerated — declare the divergence + its cause): {:?}\n  \
-             stale (enumerated but fork==prod now — shrink the list): {:?}",
-            diverged.difference(&expected).collect::<Vec<_>>(),
-            expected.difference(&diverged).collect::<Vec<_>>(),
+            "fork vs production per-case divergence DELTAs != enumerated FORK_PRODUCTION_DIVERGENCE.\n  \
+             A case-ID on one side only is a new/removed divergence; a case-ID on both sides with a \
+             DIFFERENT delta is a changed (possibly regressed) divergence — all fail.\n  \
+             observed: {diverged:#?}\n  expected: {expected:#?}"
         );
     }
 
