@@ -487,6 +487,15 @@ mod run {
         );
         let _origins = origins; // uninjected at 3c-i; 3c-ii threads this into the replay's subset input
 
+        // §NB3-3c-i measurement seam: origins-only mode returns before the fixpoint solve, so the
+        // origin-derivation cost (t_origins) and size (origin_slots/origin_subset_edges) can be
+        // sampled at brotli scale without paying the ~minutes-long z3 fixpoint. Off by default —
+        // no effect on any normal sweep run. Reused verbatim at 3c-ii's double-sweep origins-watch.
+        if std::env::var_os("CRAT_BOC1_ORIGINS_ONLY").is_some() {
+            row.set("status", "origins-only");
+            return row;
+        }
+
         // MIR warm-up: forces the (memoized) query per fn so `t_slots`/`t_emit`
         // below time the analysis, not rustc's MIR pipeline. Result-neutral.
         let t = Instant::now();
