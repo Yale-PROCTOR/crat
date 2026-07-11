@@ -32,11 +32,18 @@ use crate::analyses::borrow::lifetime_flow::{LifetimeSlot, SignatureSlot};
 #[derive(Clone, Debug)]
 pub struct OriginSummary {
     pub slots: IndexVec<LifetimeSlot, SignatureSlot>,
-    /// Note: interprocedural *storage-write* flows (e.g. an output-param `*dst = src`) land in
-    /// `subset` at the pointee depth (`src → dst@depth+1`), the same seam `depth0_value_flows`
-    /// feeds — so no separate storage relation is carried (lifetime_flow's `storage_aliases` is not
-    /// part of the injected subset seam).
     pub subset: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
+    /// **SYMMETRIC** storage-alias relation (both `(a,b)` and `(b,a)`), transitively closed — e.g.
+    /// forwarding `out: *mut *mut i32 -> out` aliases the pointee storage `arg1@1 ↔ return@1`.
+    /// Adopted from `lifetime_flow`'s `storage_aliases`, which is symmetric by construction
+    /// (`add_alias`, lifetime_flow.rs:640-641, inserts both directions). Kept **separate** from the
+    /// **directed** `subset` (not folded) so neither direction of conflict routing is lost: a
+    /// directed subset cannot represent `a↔b` without both `a⊆b` and `b⊆a`. `storage_aliases` is NOT
+    /// part of the injected `depth0_value_flows` seam, so production drops it — carried here so 3c-ii
+    /// can OPTIONALLY inject it both-directions (a candidate fork-only win, like `unknown`; the
+    /// injection decision is 3c-ii's). (Directional storage-*write* flows like `*dst = src` are a
+    /// different thing and land in `subset`.)
+    pub storage: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub unknown: DenseBitSet<LifetimeSlot>,
 }
 

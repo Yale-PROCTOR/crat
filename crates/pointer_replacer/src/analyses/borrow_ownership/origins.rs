@@ -46,9 +46,17 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
             let summary = result.summary;
             let n = summary.slots.len();
             let subset = transitive_closure(&summary.value_flows, n);
+            // storage_aliases is symmetric (lifetime_flow inserts both directions); our correct
+            // closure preserves that symmetry (a→b & b→a in ⇒ a→c & c→a out).
+            let storage = transitive_closure(&summary.storage_aliases, n);
             (
                 f,
-                OriginSummary { slots: summary.slots, subset, unknown: summary.unknown_targets },
+                OriginSummary {
+                    slots: summary.slots,
+                    subset,
+                    storage,
+                    unknown: summary.unknown_targets,
+                },
             )
         })
         .collect()
@@ -123,6 +131,7 @@ mod tests {
 
     struct Facts {
         subset: Vec<(String, String)>,
+        storage: Vec<(String, String)>,
         unknown: Vec<String>,
     }
 
@@ -150,7 +159,7 @@ mod tests {
                 unknown.sort();
                 out.insert(
                     tcx.item_name(f.to_def_id()).to_string(),
-                    Facts { subset: edges(&s.subset), unknown },
+                    Facts { subset: edges(&s.subset), storage: edges(&s.storage), unknown },
                 );
             }
             out
@@ -232,6 +241,46 @@ mod tests {
         assert!(
             has(&f.subset, "arg2@0", "arg1@1"),
             "f: arg2@0 (src) → arg1@1 (dst pointee) expected in subset; got {:?}",
+            f.subset
+        );
+    }
+
+    /// STORAGE-FOLD JUSTIFICATION (req 2026-07-11): `storage_aliases` is SYMMETRIC; carried
+    /// SEPARATELY from directed `subset` so 3c-ii injection cannot lose a direction of conflict
+    /// routing. Forwarding a `*mut *mut` aliases the pointee storage `arg1@1 ↔ return@1` — assert
+    /// BOTH directions are present (a directed subset could only carry one).
+    #[test]
+    fn nb3_storage_alias_symmetric() {
+        let facts =
+            origin_facts("unsafe fn forward(out: *mut *mut i32) -> *mut *mut i32 { out }");
+        let f = &facts["forward"];
+        assert!(
+            has(&f.storage, "arg1@1", "return@1"),
+            "forward: arg1@1 → return@1 storage alias expected; got {:?}",
+            f.storage
+        );
+        assert!(
+            has(&f.storage, "return@1", "arg1@1"),
+            "forward: return@1 → arg1@1 (the symmetric direction) expected; got {:?}",
+            f.storage
+        );
+    }
+
+    /// 3-NODE-CHAIN closure (req 2026-07-11): a→b→c ⇒ a→c — the exact test whose absence let the
+    /// D3 1-hop bug survive in production `subset_closure`. `*a=*b; *b=*c` gives value-flows
+    /// arg3@1→arg2@1→arg1@1; a correct multi-hop closure MUST yield arg3@1→arg1@1 (a 1-hop closure
+    /// would miss it). Pins the "successors from the POPPED node, not the seed" fix forever.
+    #[test]
+    fn nb3_transitive_closure_three_node_chain() {
+        let facts = origin_facts(
+            "unsafe fn chain(a: *mut *mut i32, b: *mut *mut i32, c: *mut *mut i32) { \
+             *a = *b; *b = *c; }",
+        );
+        let f = &facts["chain"];
+        assert!(
+            has(&f.subset, "arg3@1", "arg1@1"),
+            "chain: arg3@1 → arg1@1 must hold transitively (arg3@1→arg2@1→arg1@1); a 1-hop closure \
+             misses it; got {:?}",
             f.subset
         );
     }
