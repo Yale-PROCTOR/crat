@@ -13,7 +13,7 @@
 //! ONCE per program; `ORIGIN_WRAP_COUNT` (counting ORIGINS' wrap, not the underlying lifetime-flow
 //! call) backs the runs-once invariant.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use rustc_index::{
     Idx,
@@ -25,9 +25,15 @@ use crate::utils::rustc::RustProgram;
 
 use super::origin_summary::{OriginSummaries, OriginSummary};
 
-/// Counts ORIGINS' wrap (one increment per `compute_origins`), NOT the underlying lifetime-flow
-/// derivation. Backs the "origin inference runs once per program, kind-independent" invariant.
-pub(crate) static ORIGIN_WRAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Per-thread count of `compute_origins` invocations (one increment per call), NOT the underlying
+    /// lifetime-flow derivation. Backs the "origin inference runs once per program, kind-independent"
+    /// invariant. **THREAD-LOCAL, not a global atomic:** compiler test sessions run on separate
+    /// threads with thread-local rustc session globals, so compute_origins calls from concurrent tests
+    /// race a global counter; the runs-once test measures this counter's delta around a single driver
+    /// call, all on one callback thread, where a thread-local delta is exact.
+    pub(crate) static ORIGIN_WRAP_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The ONE derivation call site (isolation requirement). NB5-O swaps this body for a BO-native
 /// origin derivation from the fork's own borrow facts; everything downstream keys off
@@ -39,7 +45,7 @@ fn derive_signature_flows(program: &RustProgram<'_>) -> LifetimeFlowResults {
 
 /// Whole-program signature-origin summaries. Computed once, kind-independent.
 pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
-    ORIGIN_WRAP_COUNT.fetch_add(1, Ordering::Relaxed);
+    ORIGIN_WRAP_COUNT.with(|c| c.set(c.get() + 1));
     derive_signature_flows(program)
         .into_iter()
         .map(|(f, result)| {
