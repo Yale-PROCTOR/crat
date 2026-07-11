@@ -485,6 +485,10 @@ mod run {
                 })
                 .sum::<usize>(),
         );
+        // §NB3-3c-i F5 (Codex): the other retained-footprint dimension besides slots/subset edges is
+        // the poisoned-slot set. (Storage is no longer a separate matrix — it folds into subset, F4 —
+        // so there is no separate storage-edge count to report.)
+        row.set("origin_unknown_slots", origins.values().map(|s| s.unknown.count()).sum::<usize>());
         let _origins = origins; // uninjected at 3c-i; 3c-ii threads this into the replay's subset input
 
         // §NB3-3c-i measurement seam: origins-only mode returns before the fixpoint solve, so the
