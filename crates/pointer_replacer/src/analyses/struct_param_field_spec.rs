@@ -157,7 +157,11 @@ pub(crate) fn collect_candidates(
                     FieldAccessKind::Write | FieldAccessKind::Address
                 )
             });
-            let mutbl = if needs_mut { mutbl } else { ty::Mutability::Not };
+            let mutbl = if needs_mut {
+                mutbl
+            } else {
+                ty::Mutability::Not
+            };
             candidates.insert(
                 (fn_did, param_idx),
                 SpecTarget {
