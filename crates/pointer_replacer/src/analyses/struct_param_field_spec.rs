@@ -129,6 +129,11 @@ pub(crate) fn collect_candidates(
             else {
                 continue;
             };
+            // multi-field filter: a field pointer into a one-field struct is
+            // byte-equivalent to the struct pointer; narrowing is churn
+            if adt_def.non_enum_variant().fields.len() < 2 {
+                continue;
+            }
             let Some(summary) = field_accesses_reachable_from_param(flow, local) else {
                 continue;
             };
@@ -382,7 +387,6 @@ pub fn find_plan(
 ) -> SpecPlan {
     let tcx = input.tcx;
     let candidates = collect_candidates(input, flows, c_exposed_fns);
-    let triggered = collect_triggered(input, flows, &candidates);
 
     // every call site into a candidate position, plus forwarding edges
     let mut facts: Vec<CallSiteFact> = vec![];
@@ -428,19 +432,10 @@ pub fn find_plan(
         }
     }
 
-    // closure: a selected caller that forwards its param drags the callee in
-    let mut selected: FxHashSet<(LocalDefId, usize)> = triggered;
-    loop {
-        let additions: Vec<_> = forwards
-            .iter()
-            .filter(|(from, to)| selected.contains(from) && !selected.contains(to))
-            .map(|(_, to)| *to)
-            .collect();
-        if additions.is_empty() {
-            break;
-        }
-        selected.extend(additions);
-    }
+    // all-candidates policy: seed with every candidate and let the validity
+    // fixpoint prune (policy decided by simulation, see
+    // docs/superpowers/specs/2026-07-12-field-spec-all-candidates-selection.md)
+    let mut selected: FxHashSet<(LocalDefId, usize)> = candidates.keys().copied().collect();
 
     // validity fixpoint: every call site into a selected position needs a
     // usable class, and a selected forwarder needs its target selected
@@ -480,53 +475,6 @@ pub fn find_plan(
         .filter(|(from, to)| selected.contains(from) && selected.contains(to))
         .collect();
     SpecPlan { targets, forwards }
-}
-
-/// call sites that alias a struct-pointer candidate argument with a pointer
-/// derived from a field of the same struct object passed in another argument
-/// of the same call. these are the sites the specialization plan (Task 3)
-/// must be able to rewrite: after the struct param is replaced by the field's
-/// value, the aliasing field-pointer argument would otherwise observe stale
-/// data.
-pub(crate) fn collect_triggered(
-    input: &RustProgram<'_>,
-    flows: &FxHashMap<LocalDefId, PointerFlowResult>,
-    candidates: &FxHashMap<(LocalDefId, usize), SpecTarget>,
-) -> FxHashSet<(LocalDefId, usize)> {
-    let tcx = input.tcx;
-    let mut triggered = FxHashSet::default();
-    for &fn_did in &input.functions {
-        let Some(flow) = flows.get(&fn_did) else {
-            continue;
-        };
-        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-        let defs = BodyDefs::new(&body, tcx);
-        for block in body.basic_blocks.iter() {
-            let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
-                continue;
-            };
-            let Some(callee) = call_target(tcx, func) else {
-                continue;
-            };
-            for (i, arg) in args.iter().enumerate() {
-                if !candidates.contains_key(&(callee, i)) {
-                    continue;
-                }
-                let Some(base) = operand_base(flow, &arg.node) else {
-                    continue;
-                };
-                let has_sibling_field_ptr = args.iter().enumerate().any(|(j, other)| {
-                    j != i
-                        && field_address_base(flow, &body, tcx, &defs, &other.node)
-                            .is_some_and(|b| b == base)
-                });
-                if has_sibling_field_ptr {
-                    triggered.insert((callee, i));
-                }
-            }
-        }
-    }
-    triggered
 }
 
 #[cfg(test)]
@@ -692,6 +640,7 @@ use ::libc;
 #[repr(C)]
 pub struct st {
     pub lookup: [u16; 4],
+    pub lit: [u32; 4],
 }
 #[export_name = "exposed_c_name"]
 pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
@@ -713,6 +662,7 @@ use ::libc;
 #[repr(C)]
 pub struct st {
     pub lookup: [u16; 4],
+    pub lit: [u32; 4],
 }
 pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
     (*s).lookup[0] = 1 as u16;
@@ -731,64 +681,22 @@ pub unsafe extern "C" fn caller(mut s: *mut st) -> libc::c_int {
         );
     }
 
-    fn triggered_for(code: &str) -> Vec<(String, usize)> {
-        ::utils::compilation::run_compiler_on_str(code, |tcx| {
-            let program = build_rust_program(tcx);
-            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
-            let candidates = collect_candidates(&program, &flows, &FxHashSet::default());
-            let triggered = collect_triggered(&program, &flows, &candidates);
-            let mut out: Vec<(String, usize)> = triggered
-                .iter()
-                .map(|&(did, idx)| (tcx.item_name(did.to_def_id()).to_string(), idx))
-                .collect();
-            out.sort();
-            out
-        })
-        .unwrap()
-    }
-
-    const TRIGGERED: &str = r#"
-use ::libc;
-#[repr(C)]
-pub struct st {
-    pub lookup: [u16; 4],
-    pub lit: [u32; 4],
-}
-pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
-    if !s.is_null() {
-        (*s).lookup[0] = 1 as u16;
-    }
-    *tree.offset(0) = 0 as u32;
-    return 0 as libc::c_int;
-}
-pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
-    return build(s, ((*s).lit).as_mut_ptr());
-}
-"#;
-
     #[test]
-    fn test_struct_and_field_pointer_call_site_triggers() {
-        assert_eq!(triggered_for(TRIGGERED), vec![("build".to_string(), 0)]);
-    }
-
-    #[test]
-    fn test_struct_pointer_alone_does_not_trigger() {
+    fn test_single_field_struct_is_filtered() {
+        // a one-field struct makes the "field pointer" byte-equivalent to the
+        // struct pointer; narrowing is churn, so the candidate is filtered
         let code = r#"
 use ::libc;
 #[repr(C)]
-pub struct st {
-    pub lookup: [u16; 4],
+pub struct rnd {
+    pub state: [u64; 2],
 }
-pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
-    (*s).lookup[0] = 1 as u16;
-    *tree.offset(0) = 0 as u32;
+pub unsafe extern "C" fn next(mut r: *mut rnd) -> libc::c_int {
+    (*r).state[0] = 1 as u64;
     return 0 as libc::c_int;
 }
-pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
-    return build(s, tree);
-}
 "#;
-        assert_eq!(triggered_for(code), vec![]);
+        assert_eq!(candidates_for(code), vec![]);
     }
 
     fn plan_for(code: &str) -> (Vec<(String, usize, String)>, usize) {
@@ -819,7 +727,10 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
 
     #[test]
     fn test_plan_selects_triggered_fn_with_null_and_field_sites() {
-        // TRIGGERED plus a null-literal call site: both classes rewritable
+        // both call-site classes into build (null literal, field sibling) are
+        // rewritable, and dynamic is itself a candidate: it directly accesses
+        // (*s).lit as its only field, independent of the null literal it
+        // passes to build
         let code = r#"
 use ::libc;
 #[repr(C)]
@@ -844,7 +755,10 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
         let (targets, _) = plan_for(code);
         assert_eq!(
             targets,
-            vec![("build".to_string(), 0, "lookup".to_string())]
+            vec![
+                ("build".to_string(), 0, "lookup".to_string()),
+                ("dynamic".to_string(), 0, "lit".to_string()),
+            ]
         );
     }
 
@@ -882,10 +796,14 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
     }
 
     #[test]
-    fn test_unrewritable_call_site_drops_target_and_cascades() {
-        // extra caller passes a maybe-null variable with no sibling field
-        // pointer and no nullity fact: inner is unrewritable, and outer
-        // (which forwards into inner) must fall with it
+    fn test_stray_forward_through_maybe_null_local_is_selected() {
+        // stray's `p` is assigned either null or stray's own param `s`; the
+        // provenance analysis's unique_non_null_base ignores the null branch,
+        // so this still resolves to a Forward((stray, 0)) class, and under
+        // all-candidates seeding stray is itself a candidate (its own lookup
+        // access is propagated through inner). top stays unselected: its
+        // summary combines its own lit access with outer's propagated lookup,
+        // giving it two fields.
         let code = r#"
 use ::libc;
 #[repr(C)]
@@ -916,6 +834,13 @@ pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c
 }
 "#;
         let (targets, _) = plan_for(code);
-        assert_eq!(targets, vec![]);
+        assert_eq!(
+            targets,
+            vec![
+                ("inner".to_string(), 0, "lookup".to_string()),
+                ("outer".to_string(), 0, "lookup".to_string()),
+                ("stray".to_string(), 0, "lookup".to_string()),
+            ]
+        );
     }
 }

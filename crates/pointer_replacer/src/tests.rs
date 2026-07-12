@@ -109,19 +109,28 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
             "(*s)[0] = 1 as u16",
             "&mut (*s).lookup as *mut [u16; 4]",
             "0 as *mut [u16; 4]",
+            // dynamic accesses only (*s).lit, so it specializes to the `lit`
+            // field type under the all-candidates policy
+            "fn dynamic(mut s: *mut [u32; 4]",
+            "build(0 as *mut [u16; 4], ((*s)).as_mut_ptr())",
         ],
-        &["build(s,", "build(0 as *mut st"],
+        &[
+            "build(s,",
+            "build(0 as *mut st",
+            "fn dynamic(mut s: *mut st",
+        ],
     );
 }
 
 #[test]
-fn test_struct_param_field_no_trigger_no_rewrite() {
+fn test_struct_param_field_specializes_without_trigger() {
     run_param_field_test(
         r#"
 use ::libc;
 #[repr(C)]
 pub struct st {
     pub lookup: [u16; 4],
+    pub lit: [u32; 4],
 }
 pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
     (*s).lookup[0] = 1 as u16;
@@ -132,8 +141,12 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
     return build(s, tree);
 }
 "#,
-        &["fn build(mut s: *mut st"],
-        &["&raw mut"],
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "fn fixed(mut s: *mut [u16; 4]",
+            "build(s,",
+        ],
+        &["*mut st"],
     );
 }
 
@@ -266,8 +279,16 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
             "fn probe(mut s: *const [u16; 4]",
             "&(*s).lookup as *const [u16; 4]",
             "0 as *const [u16; 4]",
+            // dynamic accesses only (*s).lit, so it specializes to the `lit`
+            // field type under the all-candidates policy
+            "fn dynamic(mut s: *mut [u32; 4]",
+            "probe(0 as *const [u16; 4], ((*s)).as_mut_ptr())",
         ],
-        &["probe(s,", "probe(0 as *const st"],
+        &[
+            "probe(s,",
+            "probe(0 as *const st",
+            "fn dynamic(mut s: *mut st",
+        ],
     );
 }
 
