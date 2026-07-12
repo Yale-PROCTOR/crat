@@ -18,7 +18,7 @@ use crate::{
     analyses::pointer_flow::{
         PointerFlowResult,
         builtin::{call_name, is_as_ptr},
-        field_access::field_accesses_reachable_from_param,
+        field_access::{FieldAccessKind, field_accesses_reachable_from_param},
         graph::{BaseId, PfgNode, UnknownReason},
     },
     utils::rustc::{RustProgram, is_c_exposed_fn},
@@ -146,6 +146,18 @@ pub(crate) fn collect_candidates(
             }
             let field = *summary.fields.iter().next().unwrap();
             let field_name = adt_def.non_enum_variant().fields[field].name;
+            // minimal privilege: a field never written through this param can be
+            // specialized as *const even when the original pointer was *mut, keeping
+            // downstream borrow promotion free to choose shared references at read-only
+            // call sites. address-kind accesses may feed writes (e.g. memset through
+            // as_mut_ptr), so they conservatively keep the declared mutability
+            let needs_mut = summary.accesses.iter().any(|access| {
+                matches!(
+                    access.kind,
+                    FieldAccessKind::Write | FieldAccessKind::Address
+                )
+            });
+            let mutbl = if needs_mut { mutbl } else { ty::Mutability::Not };
             candidates.insert(
                 (fn_did, param_idx),
                 SpecTarget {
@@ -510,6 +522,29 @@ mod tests {
         }
     }
 
+    // returns sorted (fn name, param index, field name, mutbl) quadruples
+    fn candidates_with_mutbl_for(code: &str) -> Vec<(String, usize, String, ty::Mutability)> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_rust_program(tcx);
+            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
+            let candidates = collect_candidates(&program, &flows, &FxHashSet::default());
+            let mut out: Vec<(String, usize, String, ty::Mutability)> = candidates
+                .iter()
+                .map(|(&(did, idx), target)| {
+                    (
+                        tcx.item_name(did.to_def_id()).to_string(),
+                        idx,
+                        target.field_name.to_string(),
+                        target.mutbl,
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        })
+        .unwrap()
+    }
+
     // returns sorted (fn name, param index, field name) triples
     fn candidates_for(code: &str) -> Vec<(String, usize, String)> {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
@@ -841,6 +876,90 @@ pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c
                 ("outer".to_string(), 0, "lookup".to_string()),
                 ("stray".to_string(), 0, "lookup".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_read_only_field_demotes_to_const() {
+        // build only reads (*s).lookup through a declared *mut param; minimal
+        // privilege lets the specialization carry *const instead, freeing
+        // downstream borrow promotion to choose a shared reference at call sites
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
+    return (*s).lookup[0] as libc::c_int;
+}
+"#;
+        assert_eq!(
+            candidates_with_mutbl_for(code),
+            vec![(
+                "build".to_string(),
+                0,
+                "lookup".to_string(),
+                ty::Mutability::Not
+            )]
+        );
+    }
+
+    #[test]
+    fn test_written_field_keeps_mut() {
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    return 0 as libc::c_int;
+}
+"#;
+        assert_eq!(
+            candidates_with_mutbl_for(code),
+            vec![(
+                "build".to_string(),
+                0,
+                "lookup".to_string(),
+                ty::Mutability::Mut
+            )]
+        );
+    }
+
+    #[test]
+    fn test_address_taken_field_keeps_mut() {
+        // as_mut_ptr on the field yields an Address-kind access that may feed a
+        // write (e.g. through a memset-style callee) even though this function
+        // body itself performs no direct Write projection; conservatively keeps
+        // the declared mutability
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn sink(mut p: *mut u16) -> libc::c_int {
+    *p.offset(0) = 1 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn build(mut s: *mut st) -> libc::c_int {
+    return sink(((*s).lookup).as_mut_ptr());
+}
+"#;
+        assert_eq!(
+            candidates_with_mutbl_for(code),
+            vec![(
+                "build".to_string(),
+                0,
+                "lookup".to_string(),
+                ty::Mutability::Mut
+            )]
         );
     }
 }

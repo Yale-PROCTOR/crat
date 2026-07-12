@@ -332,9 +332,6 @@ fn classify_place_context(context: PlaceContext) -> FieldAccessKind {
 /// pointer parameter's base, plus any other bases that alias the same nodes.
 pub struct ParamFieldAccessSummary {
     pub fields: FxHashSet<FieldIdx>,
-    // per-access kind/location data used by tests and future clients; the
-    // field-spec rewriter resolves edits syntactically and does not read this.
-    #[allow(dead_code)]
     pub accesses: Vec<FieldAccess>,
     pub rejects: Vec<FieldAccessReject>,
     /// nodes reachable from the param base that are also reachable from another,
