@@ -46,6 +46,15 @@ fn rewrite_struct_param_fields_with_config(code: &str, config: &Config) -> (Stri
         .unwrap()
 }
 
+fn rewrite_struct_param_fields_then_pointer(
+    code: &str,
+    config: &Config,
+) -> (String, BytemuckDependency) {
+    let (pre, changed) = rewrite_struct_param_fields_with_config(code, config);
+    let input = if changed { pre.as_str() } else { code };
+    rewrite_with_config(input, config)
+}
+
 fn run_param_field_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
@@ -595,6 +604,51 @@ pub unsafe extern "C" fn probe(mut s: *const st) -> libc::c_int {
     assert!(s.contains("fn probe_field(mut s: *const [u16; 4]"), "{s}");
     assert!(s.contains("if s.is_null()"), "{s}");
     assert!(s.contains("&(*s).lookup as *const [u16; 4]"), "{s}");
+}
+
+#[test]
+fn test_struct_param_field_wrapper_survives_borrow_promotion() {
+    // regression: the wrapper's null-guarded field conversion used to be emitted
+    // inline in the call argument, which collided with replace_local_borrows's
+    // independent hoist-opt-ref-borrow and is_null->is_none rewrite rules,
+    // producing E0502/E0284-shaped output (see generic_foreach corpus case).
+    // hoisting the conversion into a `let` before the call routes both branches
+    // of the guard through the same transform context and avoids the collision.
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub size: usize,
+    pub data: *mut i32,
+}
+pub unsafe extern "C" fn clear(mut s: *mut st) {
+    if !s.is_null() {
+        (*s).size = 0 as usize;
+    }
+}
+pub unsafe extern "C" fn get(mut s: *mut st, mut index: usize) -> i32 {
+    return *((*s).data).offset(index as isize);
+}
+pub unsafe extern "C" fn use_clear(mut s: *mut st) {
+    clear(s);
+}
+pub unsafe extern "C" fn use_get(mut s: *mut st, mut index: usize) -> i32 {
+    return get(s, index);
+}
+pub unsafe extern "C" fn use_clear_null() {
+    clear(0 as *mut st);
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("clear".to_string());
+    config.c_exposed_fns.insert("get".to_string());
+    let (s, _) = rewrite_struct_param_fields_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn clear_field"), "{s}");
+    assert!(s.contains("fn get_field"), "{s}");
+    assert!(!s.contains("_borrowed = None"), "{s}");
+    assert!(!s.contains("None.as_deref_mut"), "{s}");
+    assert!(!s.contains("(None).as_deref"), "{s}");
 }
 
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {

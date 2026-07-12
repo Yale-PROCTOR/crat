@@ -405,6 +405,13 @@ impl SpecTransformVisitor<'_, '_> {
     fn build_wrapper(&mut self, mut wrapper: P<Item>, new_name: Symbol) -> P<Item> {
         let ItemKind::Fn(func) = &mut wrapper.kind else { unreachable!() };
         let did = self.ast_to_hir.global_map[&wrapper.id];
+        // each specialized param's null-guarded conversion is hoisted into its own
+        // `let` statement ahead of the call, instead of being embedded inline in the
+        // call argument. this lets the downstream borrow-promotion pass transform the
+        // guard and the field-address branch together, under one context, instead of
+        // two independent call-argument-scoped rewrite rules colliding on the same
+        // source variable (see wrapper-io-diagnosis.md)
+        let mut lets = Vec::new();
         let mut call = format!("{new_name}(");
         for (i, param) in func.sig.decl.inputs.iter().enumerate() {
             let PatKind::Ident(_, ident, _) = param.pat.kind else { unreachable!() };
@@ -420,11 +427,11 @@ impl SpecTransformVisitor<'_, '_> {
                 };
                 let ty = pprust::ty_to_string(&fn_plan.field_ty);
                 let fld = fn_plan.field_name;
-                write!(
-                    call,
-                    "if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &{mm}(*{x}).{fld} as *{m} {ty} }}, ",
-                )
-                .unwrap();
+                let local = format!("__crat_{x}_field");
+                lets.push(utils::stmt!(
+                    "let {local} = if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &{mm}(*{x}).{fld} as *{m} {ty} }};",
+                ));
+                write!(call, "{local}, ").unwrap();
             } else {
                 write!(call, "{x}, ").unwrap();
             }
@@ -432,6 +439,7 @@ impl SpecTransformVisitor<'_, '_> {
         call.push(')');
         let body = func.body.as_mut().unwrap();
         body.stmts.clear();
+        body.stmts.extend(lets);
         body.stmts.push(utils::stmt!("{call}"));
         self.changed = true;
         wrapper
