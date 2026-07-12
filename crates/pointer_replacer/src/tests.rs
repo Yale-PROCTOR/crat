@@ -213,12 +213,13 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
 #[test]
 fn test_maybe_null_alias_drops_group() {
     // stray's `p = s;` assigns the bare param outside any rewritable AST
-    // shape, so stray fails AST resolution and drops; under all-candidates
-    // seeding inner and outer are only selected because their call sites are
-    // justified by Forward(stray)/Forward(outer) edges, so the drop must
-    // cascade forward through the group instead of leaving inner rewritten
-    // with a general field-address wrap around stray's maybe-null local
-    // (which would silently change null-check semantics into UB)
+    // shape. under trigger seeding, top triggers outer and the forward
+    // closure pulls in inner, but stray's call site into inner carries only
+    // a Forward class on the never-selected stray, so the detector fixpoint
+    // already drops the chain; should any layer ever select it, the
+    // rewriter's bidirectional cascade must still prevent inner from being
+    // rewritten with a general field-address wrap around stray's maybe-null
+    // local (which would silently change null-check semantics into UB)
     run_param_field_test(
         r#"
 use ::libc;
