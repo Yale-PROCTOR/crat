@@ -514,6 +514,89 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
     );
 }
 
+#[test]
+fn test_struct_param_field_no_mangle_wrapper_keeps_attr() {
+    // the internal fn must lose #[no_mangle]; the wrapper must keep it
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+#[no_mangle]
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn build_field(mut s: *mut [u16; 4]"), "{s}");
+    assert!(s.contains("fn build(mut s: *mut st"), "{s}");
+    assert_eq!(s.matches("no_mangle").count(), 1, "{s}");
+}
+
+#[test]
+fn test_struct_param_field_const_to_const_forwarding() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *const st) -> libc::c_int {
+    return (*s).lookup[1] as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *const st) -> libc::c_int {
+    if (*s).lookup[0] as libc::c_int != 0 {
+        return inner(s);
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "fn inner(mut s: *const [u16; 4]",
+            "fn outer(mut s: *const [u16; 4]",
+            "inner(s)",
+        ],
+        &["*const st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_wrapper_const_conversion() {
+    // wrapper body must use the const branch: &(*x).fld as *const T with a null guard
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn probe(mut s: *const st) -> libc::c_int {
+    if !s.is_null() {
+        return (*s).lookup[0] as libc::c_int;
+    }
+    return 0 as libc::c_int;
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("probe".to_string());
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn probe_field(mut s: *const [u16; 4]"), "{s}");
+    assert!(s.contains("if s.is_null()"), "{s}");
+    assert!(s.contains("&(*s).lookup as *const [u16; 4]"), "{s}");
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);

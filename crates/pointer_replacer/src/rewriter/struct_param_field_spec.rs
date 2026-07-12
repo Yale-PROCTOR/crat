@@ -102,6 +102,11 @@ fn collect_field_tys(
 }
 
 // all function item names in the crate, for `_field` collision checks
+//
+// intentionally name-only and module-blind: a same-named fn in another
+// module registers as a collision and skips the target (fails closed).
+// call-site retargeting resolves callees by defid, never by name, so a
+// false collision can only suppress a rewrite, not misdirect one.
 fn crate_fn_names(krate: &Crate) -> FxHashSet<Symbol> {
     let mut names = FxHashSet::default();
     walk_items(&krate.items, &mut |item| {
