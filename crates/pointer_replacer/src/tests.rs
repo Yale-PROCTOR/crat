@@ -107,7 +107,7 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
         &[
             "fn build(mut s: *mut [u16; 4]",
             "(*s)[0] = 1 as u16",
-            "&raw mut (*s).lookup",
+            "&mut (*s).lookup as *mut [u16; 4]",
             "0 as *mut [u16; 4]",
         ],
         &["build(s,", "build(0 as *mut st"],
@@ -164,7 +164,7 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
             "fn inner(mut s: *mut [u16; 4]",
             "fn outer(mut s: *mut [u16; 4]",
             "inner(s)",
-            "&raw mut (*s).lookup",
+            "&mut (*s).lookup as *mut [u16; 4]",
         ],
         &["fn inner(mut s: *mut st", "fn outer(mut s: *mut st"],
     );
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
 }
 "#,
         &["fn build(mut s: *mut st"],
-        &["&raw mut", "*mut [u16; 4]"],
+        &["as *mut [u16; 4]", "*mut [u16; 4]"],
     );
 }
 
@@ -231,7 +231,7 @@ pub mod src {
         &[
             "fn build(mut s: *mut [u16; 4]",
             "(*s)[0] = 1 as u16",
-            "&raw mut (*s).lookup",
+            "&mut (*s).lookup as *mut [u16; 4]",
             "0 as *mut [u16; 4]",
         ],
         &["build(s,", "build(0 as *mut st"],
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
 "#,
         &[
             "fn probe(mut s: *const [u16; 4]",
-            "&raw const (*s).lookup",
+            "&(*s).lookup as *const [u16; 4]",
             "0 as *const [u16; 4]",
         ],
         &["probe(s,", "probe(0 as *const st"],
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
             "fn build_field(mut s: *mut [u16; 4]",
             "fn build(mut s: *mut st",
             "if s.is_null()",
-            "build_field(&raw mut (*s).lookup",
+            "build_field(&mut (*s).lookup as *mut [u16; 4]",
         ],
         &["build(s,"],
     );
@@ -398,7 +398,12 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
 "#;
     let mut config = Config::default();
     config.c_exposed_fns.insert("build".to_string());
-    run_param_field_test_with_config(code, &config, &["fn build(mut s: *mut st"], &["&raw mut"]);
+    run_param_field_test_with_config(
+        code,
+        &config,
+        &["fn build(mut s: *mut st"],
+        &["as *mut [u16; 4]"],
+    );
 }
 
 #[test]

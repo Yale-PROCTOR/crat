@@ -400,11 +400,15 @@ impl SpecTransformVisitor<'_, '_> {
                     Mutability::Mut => "mut",
                     Mutability::Not => "const",
                 };
+                let mm = match fn_plan.mutbl {
+                    Mutability::Mut => "mut ",
+                    Mutability::Not => "",
+                };
                 let ty = pprust::ty_to_string(&fn_plan.field_ty);
                 let fld = fn_plan.field_name;
                 write!(
                     call,
-                    "if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &raw {m} (*{x}).{fld} }}, ",
+                    "if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &{mm}(*{x}).{fld} as *{m} {ty} }}, ",
                 )
                 .unwrap();
             } else {
@@ -509,7 +513,23 @@ impl SpecTransformVisitor<'_, '_> {
             attrs: thin_vec![],
             tokens: None,
         };
-        arg.kind = ExprKind::AddrOf(BorrowKind::Raw, target.mutbl, P(field));
+        let reference = Expr {
+            id: DUMMY_NODE_ID,
+            kind: ExprKind::AddrOf(BorrowKind::Ref, target.mutbl, P(field)),
+            span,
+            attrs: thin_vec![],
+            tokens: None,
+        };
+        let ptr_ty = P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: TyKind::Ptr(MutTy {
+                ty: target.field_ty.clone(),
+                mutbl: target.mutbl,
+            }),
+            span,
+            tokens: None,
+        });
+        arg.kind = ExprKind::Cast(P(reference), ptr_ty);
         self.changed = true;
     }
 }
