@@ -13,10 +13,20 @@
 //!
 //! What this adds over the reused summaries: (1) a **transitively-correct** subset closure (the
 //! production `subset_closure` is 1-hop — D3, diagnostic-only, never reused); (2) `unknown` carried
-//! for 3c-ii candidacy demotion (production's conflict path never consumes the analogous
-//! `unknown_targets` — a fork-only soundness win). Origin inference is kind-independent and runs
-//! ONCE per program; `ORIGIN_WRAP_COUNT` (counting ORIGINS' wrap, not the underlying lifetime-flow
-//! call) backs the runs-once invariant.
+//! for candidacy demotion. Origin inference is kind-independent and runs ONCE per program;
+//! `ORIGIN_WRAP_COUNT` (counting ORIGINS' wrap, not the underlying lifetime-flow call) backs the
+//! runs-once invariant.
+//!
+//! §NB3-3c-ii OUTCOME (2026-07-12): compute-only is where origins STAY on the BO path.
+//! - **Depth-0 subset is NOT injected — proven redundant.** `nb3c_origins_subset_redundant_vs_depth0`
+//!   shows every depth-0 origins subset edge (minus `unknown`) is already consumed by the fork via
+//!   production's `depth0_value_flows` seam (fixtures + corpus: all `already`; closure/storage/
+//!   genuinely-new = 0). So there is nothing to inject at depth-0 (deeper origins are the NB5-O harvest).
+//! - **`unknown` candidacy demotion moves to NB4.** A blunt emission-time `¬ref` clause on
+//!   opaque-poisoned slots was prototyped and REJECTED by adversarial review: `¬ref` still permits an
+//!   unsound `Owning` on may-overwrite slots, and it misses direct-arg/field retention. The sound
+//!   treatment is effect-dependent (may-overwrite vs may-supply vs pure-read) = NB4. The clause impl +
+//!   retain-shape/negative-control witnesses are saved as an NB4 seed patch.
 
 use std::cell::Cell;
 
@@ -43,9 +53,9 @@ thread_local! {
 /// The ONE derivation call site (isolation requirement). NB5-O replaces this body's derivation AND
 /// its `LifetimeFlowResults` return with a BO-native origin derivation over BO-owned types; downstream
 /// keys off `OriginSummary`, whose field types (`LifetimeSlot`/`SignatureSlot`) are ALSO swapped to
-/// BO-owned at that point (not a body-only change — 3c-i review). At 3c-ii injection this should
-/// consume the ctxt's already
-/// computed `lifetime_flows` (`GBorrowInferCtxt`, `pub`) rather than recompute — no double-compute.
+/// BO-owned at that point (not a body-only change — 3c-i review). (3c-ii established that origins are
+/// NOT injected into the replay — the depth-0 subset is redundant — so there is no double-compute to
+/// avoid on an injection path; NB4's effect-aware `unknown` use will consume the ctxt's `lifetime_flows`.)
 fn derive_signature_flows(program: &RustProgram<'_>) -> LifetimeFlowResults {
     lifetime_flow::analyze_program_lifetime_flow(program)
 }
@@ -366,28 +376,38 @@ mod tests {
     // and 3c-ii injection would be depth-0 (the depth-0/Local-grained provenance universe). Deeper
     // origins are the NB5-O harvest, out of scope here.
 
-    use crate::analyses::borrow::ProvenanceOwner;
+    use crate::analyses::borrow::{ProvenanceOwner, StructFieldSlot};
+    use rustc_hash::FxHashSet;
 
-    type OKey = (char, usize);
+    // Owner key preserving FULL field identity (F4, Codex 2026-07-12): `StructFieldSlot` carries
+    // `struct_did` + `field_index`, so keying fields by `field_index` alone collided field-0 across
+    // DIFFERENT structs and could mask a genuinely-new cross-struct edge as already/reflexive. The
+    // enum keeps the whole `StructFieldSlot` — exactly what `provenance_owner` (and thus
+    // `depth0_value_flows`) compares.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum OKey {
+        Local(usize),
+        Field(StructFieldSlot),
+    }
 
     fn owner_key(o: ProvenanceOwner) -> OKey {
         match o {
-            ProvenanceOwner::Local(l) => ('L', l.index()),
-            ProvenanceOwner::Field(sf) => ('F', sf.field_index),
+            ProvenanceOwner::Local(l) => OKey::Local(l.index()),
+            ProvenanceOwner::Field(sf) => OKey::Field(sf),
         }
     }
 
-    // A depth-0 `SignatureSlot` → the SAME (kind, index) key `depth0_value_flows` uses via
-    // `provenance_owner` (Field collapses to its field index). None for depth>0 (out of scope).
+    // A depth-0 `SignatureSlot` → the SAME key `depth0_value_flows` uses via `provenance_owner`.
+    // None for depth>0 (out of scope — deeper origins are the NB5-O harvest).
     fn slot_key(slot: SignatureSlot) -> Option<OKey> {
         if slot.depth != 0 {
             return None;
         }
         match slot.place.field {
-            Some(sf) => Some(('F', sf.field_index)),
+            Some(sf) => Some(OKey::Field(sf)),
             None => match slot.place.root {
-                SignatureRoot::Return => Some(('L', 0)),
-                SignatureRoot::Arg(l) => Some(('L', l.index())),
+                SignatureRoot::Return => Some(OKey::Local(0)), // RETURN_PLACE = _0
+                SignatureRoot::Arg(l) => Some(OKey::Local(l.index())),
             },
         }
     }
@@ -406,8 +426,8 @@ mod tests {
 
     // `v` reachable from `u` over the directed edge set `b` (multi-hop) — the fork's own subset
     // closure. BFS; successors taken from the POPPED node (the D3-correct closure).
-    fn reachable(b: &std::collections::BTreeSet<(OKey, OKey)>, u: OKey, v: OKey) -> bool {
-        let mut seen = std::collections::BTreeSet::new();
+    fn reachable(b: &FxHashSet<(OKey, OKey)>, u: OKey, v: OKey) -> bool {
+        let mut seen: FxHashSet<OKey> = FxHashSet::default();
         let mut stack = vec![u];
         while let Some(n) = stack.pop() {
             if !seen.insert(n) {
@@ -437,13 +457,13 @@ mod tests {
                 let storage = &flows[&f].summary.storage_aliases;
 
                 // B = depth0_value_flows edges (owner-key space) — what the fork already consumes.
-                let mut b: std::collections::BTreeSet<(OKey, OKey)> = Default::default();
+                let mut b: FxHashSet<(OKey, OKey)> = FxHashSet::default();
                 for (s, t) in body.depth0_value_flows() {
                     b.insert((owner_key(s), owner_key(t)));
                 }
                 // Direct storage-alias edges at depth-0 (owner-key space) — the fork does NOT get
                 // these (`depth0_value_flows` reads value_flows only), so they classify as `storage`.
-                let mut store: std::collections::BTreeSet<(OKey, OKey)> = Default::default();
+                let mut store: FxHashSet<(OKey, OKey)> = FxHashSet::default();
                 for sub in storage.rows() {
                     let Some(sk) = slot_key(o.slots[sub]) else { continue };
                     if let Some(sups) = storage.row(sub) {
@@ -512,6 +532,14 @@ mod tests {
                 "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
                  unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; \
                  let r0 = *z; *b = 5; r0 + *z }",
+            ),
+            // Two structs with a same-INDEX pointer field (F4 non-vacuity, Codex): exercises field
+            // slots so the `OKey::Field(StructFieldSlot)` full-identity key is actually stressed — a
+            // `field_index`-only key would conflate `A.f0` with `B.f0`.
+            (
+                "two_struct_same_index_fields",
+                "#[repr(C)] pub struct A { pub f0: *mut i32 } #[repr(C)] pub struct B { pub f0: *mut i32 } \
+                 pub unsafe fn f(a: *mut A, b: *mut B) { (*a).f0 = (*b).f0; }",
             ),
         ];
         for (label, src) in FIXTURES {
