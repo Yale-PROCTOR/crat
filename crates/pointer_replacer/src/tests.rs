@@ -211,6 +211,54 @@ pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
 }
 
 #[test]
+fn test_maybe_null_alias_drops_group() {
+    // stray's `p = s;` assigns the bare param outside any rewritable AST
+    // shape, so stray fails AST resolution and drops; under all-candidates
+    // seeding inner and outer are only selected because their call sites are
+    // justified by Forward(stray)/Forward(outer) edges, so the drop must
+    // cascade forward through the group instead of leaving inner rewritten
+    // with a general field-address wrap around stray's maybe-null local
+    // (which would silently change null-check semantics into UB)
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[1] = 2 as u16;
+    }
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    return inner(p);
+}
+"#,
+        &[
+            "fn inner(mut s: *mut st",
+            "fn outer(mut s: *mut st",
+            "fn stray(mut s: *mut st",
+        ],
+        &["as *mut [u16; 4]", "*mut [u16; 4]"],
+    );
+}
+
+#[test]
 fn test_struct_param_field_specializes_inside_mod_wrapper() {
     // c2rust wraps everything in `pub mod src { pub mod lib { ... } }`;
     // the rewriter must recurse into nested modules to find struct/fn items

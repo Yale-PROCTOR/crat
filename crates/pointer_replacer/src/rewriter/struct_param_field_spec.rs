@@ -170,12 +170,21 @@ fn resolve_and_validate(
         }
     }
 
-    // cascade: a forwarder into a dropped target cannot be rewritten either
+    // cascade both directions over forwarding edges (from, to):
+    // - a forwarder into a dropped callee cannot be rewritten either, since
+    //   its own call site into `to` is now meaningless
+    // - a callee whose only justification for a call site was Forward(from)
+    //   loses that justification when `from` drops; conservatively drop `to`
+    //   too rather than re-deriving whether another class still covers the
+    //   site (group-atomicity: no partial rewrites)
     loop {
         let before = dropped.len();
         for (from, to) in &plan.forwards {
             if dropped.contains(to) {
                 dropped.insert(*from);
+            }
+            if dropped.contains(from) {
+                dropped.insert(*to);
             }
         }
         if dropped.len() == before {
