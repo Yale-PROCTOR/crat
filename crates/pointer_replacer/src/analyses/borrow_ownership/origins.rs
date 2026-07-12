@@ -38,7 +38,9 @@ use rustc_index::{
 use crate::analyses::borrow::lifetime_flow::{self, LifetimeFlowResults, LifetimeSlot};
 use crate::utils::rustc::RustProgram;
 
+use super::crate_slots::CrateSlots;
 use super::origin_summary::{OriginSummaries, OriginSummary};
+use super::solver::SlotRef;
 
 thread_local! {
     /// Per-thread count of `compute_origins` invocations (one increment per call), NOT the underlying
@@ -97,6 +99,45 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
             )
         })
         .collect()
+}
+
+/// §NB3-3c-ii → NB4 SEED: map origins' `unknown`-poisoned SIGNATURE slots (args/returns) to their
+/// kind-solver `SlotRef`s. Base-pointer slots only (fields conservatively skipped — the summary↔kind
+/// field-depth correspondence is not 1:1). **Kept in the tree, not a patch, so the NB4-boundary marker
+/// tests can guard current behavior against silent drift** (e.g. S2-4 objective restructuring changing
+/// what poisoned slots settle to). Currently consumed ONLY by those marker tests.
+///
+/// NB4 rebuilds this as an EFFECT-AWARE demotion (the 3c-ii `¬ref`-only clause was Codex-rejected —
+/// `¬ref` permits an unsound `Owning` on may-overwrite slots, and it misses direct-arg/field retention;
+/// see the 3c task-doc Codex fold). The clause-emission seed is
+/// `scratchpad/nb3c-ii-unknown-nref-clause-for-nb4.patch`.
+#[allow(dead_code)] // wired into production at NB4; today only the marker tests consume it
+pub(crate) fn collect_unknown_poisoned_slots(
+    origins: &OriginSummaries,
+    slots: &CrateSlots,
+) -> Vec<SlotRef> {
+    use crate::analyses::borrow::lifetime_flow::SignatureRoot;
+    use rustc_middle::mir::RETURN_PLACE;
+    let mut out = vec![];
+    for (&f, summary) in origins.iter() {
+        let Some(universe) = slots.fn_local_slots.get(&f) else {
+            continue;
+        };
+        for slot in summary.unknown.iter() {
+            let sig = summary.slots[slot];
+            if sig.place.field.is_some() {
+                continue; // field slot — conservatively skipped (NB4 covers it)
+            }
+            let local = match sig.place.root {
+                SignatureRoot::Return => RETURN_PLACE,
+                SignatureRoot::Arg(l) => l,
+            };
+            if let Some(id) = universe.slot_for_local_depth(local, sig.depth) {
+                out.push(SlotRef::Local(f, id));
+            }
+        }
+    }
+    out
 }
 
 /// Correct multi-hop transitive closure of `value_flows` (edge `source → target` means
