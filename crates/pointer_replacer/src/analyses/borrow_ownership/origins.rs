@@ -349,4 +349,186 @@ mod tests {
             f.subset
         );
     }
+
+    // ---- §NB3-3c-ii REDUNDANCY WITNESS (guard-claim discipline) ----
+    //
+    // The rescope claim (2026-07-12): injecting origins' depth-0 subset into the fork adds nothing —
+    // the fork ALREADY consumes `lifetime_flow`'s interprocedural flows through production's own
+    // `depth0_value_flows` seam (fork replay → `borrow_inference` → `ProvenanceConstraintGraph::new`).
+    // This witness proves it PER EDGE-CLASS: every depth-0 origins subset edge (minus `unknown`
+    // endpoints) is one of — (already) already in `depth0_value_flows`; (closure) derivable by the
+    // fork's own transitive closure of those edges (`compute_subset_closure`/`requires`); or a
+    // genuinely-new (storage / composite) edge the fork CANNOT re-derive. The GATE asserts the last
+    // two soundness-relevant buckets (`storage`, `genuinely_new`) are EMPTY. If either is non-empty,
+    // injection would add a real constraint ⇒ the redundancy claim is false ⇒ STOP.
+    //
+    // Only DEPTH-0 endpoints are in scope: `depth0_value_flows` never carries deeper pointer levels,
+    // and 3c-ii injection would be depth-0 (the depth-0/Local-grained provenance universe). Deeper
+    // origins are the NB5-O harvest, out of scope here.
+
+    use crate::analyses::borrow::ProvenanceOwner;
+
+    type OKey = (char, usize);
+
+    fn owner_key(o: ProvenanceOwner) -> OKey {
+        match o {
+            ProvenanceOwner::Local(l) => ('L', l.index()),
+            ProvenanceOwner::Field(sf) => ('F', sf.field_index),
+        }
+    }
+
+    // A depth-0 `SignatureSlot` → the SAME (kind, index) key `depth0_value_flows` uses via
+    // `provenance_owner` (Field collapses to its field index). None for depth>0 (out of scope).
+    fn slot_key(slot: SignatureSlot) -> Option<OKey> {
+        if slot.depth != 0 {
+            return None;
+        }
+        match slot.place.field {
+            Some(sf) => Some(('F', sf.field_index)),
+            None => match slot.place.root {
+                SignatureRoot::Return => Some(('L', 0)),
+                SignatureRoot::Arg(l) => Some(('L', l.index())),
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct Buckets {
+        already: usize,
+        closure: usize,
+        /// Reflexive `sub ⊆ sub` — trivially true, a vacuous no-op as a subset constraint. Arises
+        /// e.g. from a symmetric storage alias round-tripping through a deeper slot (`addr`'s
+        /// `arg1@0 ↔ return@1` yields `arg1@0 → arg1@0`). Excluded from the gate: it adds nothing.
+        reflexive: usize,
+        storage: Vec<(OKey, OKey)>,
+        genuinely_new: Vec<(OKey, OKey)>,
+    }
+
+    // `v` reachable from `u` over the directed edge set `b` (multi-hop) — the fork's own subset
+    // closure. BFS; successors taken from the POPPED node (the D3-correct closure).
+    fn reachable(b: &std::collections::BTreeSet<(OKey, OKey)>, u: OKey, v: OKey) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![u];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            for &(s, t) in b {
+                if s == n {
+                    if t == v {
+                        return true;
+                    }
+                    stack.push(t);
+                }
+            }
+        }
+        false
+    }
+
+    fn redundancy_buckets(src: &str) -> Vec<(String, Buckets)> {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = build_program(tcx);
+            let origins = compute_origins(&program);
+            let flows = lifetime_flow::analyze_program_lifetime_flow(&program);
+            let mut out = vec![];
+            for &f in &program.functions {
+                let o = &origins[&f];
+                let body = &flows[&f].body;
+                let storage = &flows[&f].summary.storage_aliases;
+
+                // B = depth0_value_flows edges (owner-key space) — what the fork already consumes.
+                let mut b: std::collections::BTreeSet<(OKey, OKey)> = Default::default();
+                for (s, t) in body.depth0_value_flows() {
+                    b.insert((owner_key(s), owner_key(t)));
+                }
+                // Direct storage-alias edges at depth-0 (owner-key space) — the fork does NOT get
+                // these (`depth0_value_flows` reads value_flows only), so they classify as `storage`.
+                let mut store: std::collections::BTreeSet<(OKey, OKey)> = Default::default();
+                for sub in storage.rows() {
+                    let Some(sk) = slot_key(o.slots[sub]) else { continue };
+                    if let Some(sups) = storage.row(sub) {
+                        for sup in sups.iter() {
+                            if let Some(tk) = slot_key(o.slots[sup]) {
+                                store.insert((sk, tk));
+                            }
+                        }
+                    }
+                }
+
+                let unknown: std::collections::BTreeSet<LifetimeSlot> = o.unknown.iter().collect();
+                let mut buckets = Buckets::default();
+                for sub in o.subset.rows() {
+                    if unknown.contains(&sub) {
+                        continue;
+                    }
+                    let Some(sk) = slot_key(o.slots[sub]) else { continue };
+                    if let Some(sups) = o.subset.row(sub) {
+                        for sup in sups.iter() {
+                            if unknown.contains(&sup) {
+                                continue;
+                            }
+                            let Some(tk) = slot_key(o.slots[sup]) else { continue };
+                            let edge = (sk, tk);
+                            if sk == tk {
+                                buckets.reflexive += 1; // vacuous `sub ⊆ sub` — never a real constraint
+                            } else if b.contains(&edge) {
+                                buckets.already += 1;
+                            } else if reachable(&b, sk, tk) {
+                                buckets.closure += 1;
+                            } else if store.contains(&edge) {
+                                buckets.storage.push(edge);
+                            } else {
+                                buckets.genuinely_new.push(edge);
+                            }
+                        }
+                    }
+                }
+                out.push((tcx.item_name(f.to_def_id()).to_string(), buckets));
+            }
+            out
+        })
+        .unwrap()
+    }
+
+    /// GATE: origins' depth-0 subset (minus `unknown`) carries only edges the fork already has or
+    /// re-derives by closure — no `storage`/`genuinely_new`. STOP if either bucket is non-empty.
+    #[test]
+    fn nb3c_origins_subset_redundant_vs_depth0() {
+        const FIXTURES: &[(&str, &str)] = &[
+            ("id", "unsafe fn id(p: *mut i32) -> *mut i32 { p }"),
+            (
+                "copychain",
+                "unsafe fn f(a: *mut i32, b: *mut i32, c: *mut i32) -> *mut i32 { \
+                 let x = a; let y = x; let _ = (b, c); y }",
+            ),
+            ("addr", "unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }"),
+            (
+                "storechain",
+                "unsafe fn f(a: *mut *mut i32, b: *mut *mut i32, c: *mut *mut i32) { \
+                 *a = *b; *b = *c; }",
+            ),
+            (
+                "witness",
+                "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+                 unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; \
+                 let r0 = *z; *b = 5; r0 + *z }",
+            ),
+        ];
+        for (label, src) in FIXTURES {
+            for (fname, bk) in redundancy_buckets(src) {
+                eprintln!(
+                    "REDUNDANCY {label}/{fname}: already={} closure={} reflexive={} storage={} \
+                     genuinely_new={}",
+                    bk.already, bk.closure, bk.reflexive, bk.storage.len(), bk.genuinely_new.len()
+                );
+                assert!(
+                    bk.storage.is_empty() && bk.genuinely_new.is_empty(),
+                    "{label}/{fname}: origins carry depth-0 subset edges the fork cannot re-derive — \
+                     injection is NOT redundant (STOP). storage={:?} genuinely_new={:?} \
+                     (already={} closure={} reflexive={})",
+                    bk.storage, bk.genuinely_new, bk.already, bk.closure, bk.reflexive
+                );
+            }
+        }
+    }
 }
