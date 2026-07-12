@@ -118,21 +118,16 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
             "(*s)[0] = 1 as u16",
             "&mut (*s).lookup as *mut [u16; 4]",
             "0 as *mut [u16; 4]",
-            // dynamic accesses only (*s).lit, so it specializes to the `lit`
-            // field type under the all-candidates policy
-            "fn dynamic(mut s: *mut [u32; 4]",
-            "build(0 as *mut [u16; 4], ((*s)).as_mut_ptr())",
         ],
-        &[
-            "build(s,",
-            "build(0 as *mut st",
-            "fn dynamic(mut s: *mut st",
-        ],
+        &["build(s,", "build(0 as *mut st"],
     );
 }
 
 #[test]
-fn test_struct_param_field_specializes_without_trigger() {
+fn test_struct_param_field_no_trigger_no_rewrite() {
+    // no call site aliases the struct-pointer arg with a sibling field
+    // pointer, so build never becomes a trigger and the 2-field struct stays
+    // unspecialized; excludes prove no narrowing happened anywhere
     run_param_field_test(
         r#"
 use ::libc;
@@ -150,12 +145,8 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
     return build(s, tree);
 }
 "#,
-        &[
-            "fn build(mut s: *mut [u16; 4]",
-            "fn fixed(mut s: *mut [u16; 4]",
-            "build(s,",
-        ],
-        &["*mut st"],
+        &["fn build(mut s: *mut st"],
+        &["as *mut [u16; 4]", "*mut [u16; 4]"],
     );
 }
 
@@ -336,16 +327,8 @@ pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
             "fn probe(mut s: *const [u16; 4]",
             "&(*s).lookup as *const [u16; 4]",
             "0 as *const [u16; 4]",
-            // dynamic accesses only (*s).lit, so it specializes to the `lit`
-            // field type under the all-candidates policy
-            "fn dynamic(mut s: *mut [u32; 4]",
-            "probe(0 as *const [u16; 4], ((*s)).as_mut_ptr())",
         ],
-        &[
-            "probe(s,",
-            "probe(0 as *const st",
-            "fn dynamic(mut s: *mut st",
-        ],
+        &["probe(s,", "probe(0 as *const st"],
     );
 }
 
@@ -525,7 +508,9 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
 
 #[test]
 fn test_struct_param_field_no_mangle_wrapper_keeps_attr() {
-    // the internal fn must lose #[no_mangle]; the wrapper must keep it
+    // the internal fn must lose #[no_mangle]; the wrapper must keep it.
+    // fixed's call site aliases s with a sibling field pointer, triggering
+    // build's selection under the trigger-based policy
     let code = r#"
 use ::libc;
 #[repr(C)]
@@ -541,6 +526,9 @@ pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
     *tree.offset(0) = 0 as u32;
     return 0 as libc::c_int;
 }
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
 "#;
     let mut config = Config::default();
     config.c_exposed_fns.insert("build".to_string());
@@ -553,6 +541,9 @@ pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
 
 #[test]
 fn test_struct_param_field_const_to_const_forwarding() {
+    // top's call site aliases s with a sibling field pointer, triggering
+    // outer's selection; outer forwards s into inner, which the forward
+    // closure then selects too
     run_param_field_test(
         r#"
 use ::libc;
@@ -564,11 +555,15 @@ pub struct st {
 pub unsafe extern "C" fn inner(mut s: *const st) -> libc::c_int {
     return (*s).lookup[1] as libc::c_int;
 }
-pub unsafe extern "C" fn outer(mut s: *const st) -> libc::c_int {
+pub unsafe extern "C" fn outer(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
     if (*s).lookup[0] as libc::c_int != 0 {
         return inner(s);
     }
+    *tree.offset(0) = 0 as u32;
     return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
 }
 "#,
         &[
@@ -582,7 +577,9 @@ pub unsafe extern "C" fn outer(mut s: *const st) -> libc::c_int {
 
 #[test]
 fn test_struct_param_field_wrapper_const_conversion() {
-    // wrapper body must use the const branch: &(*x).fld as *const T with a null guard
+    // wrapper body must use the const branch: &(*x).fld as *const T with a null guard.
+    // fixed's call site aliases s with a sibling field pointer, triggering
+    // probe's selection under the trigger-based policy
     let code = r#"
 use ::libc;
 #[repr(C)]
@@ -590,11 +587,15 @@ pub struct st {
     pub lookup: [u16; 4],
     pub lit: [u32; 4],
 }
-pub unsafe extern "C" fn probe(mut s: *const st) -> libc::c_int {
+pub unsafe extern "C" fn probe(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
     if !s.is_null() {
         return (*s).lookup[0] as libc::c_int;
     }
+    *tree.offset(0) = 0 as u32;
     return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return probe(s, ((*s).lit).as_mut_ptr());
 }
 "#;
     let mut config = Config::default();
@@ -614,29 +615,38 @@ fn test_struct_param_field_wrapper_survives_borrow_promotion() {
     // producing E0502/E0284-shaped output (see generic_foreach corpus case).
     // hoisting the conversion into a `let` before the call routes both branches
     // of the guard through the same transform context and avoids the collision.
+    // clear/get each stay single-field candidates (clear touches only size;
+    // get only touches data). fixed_clear/fixed_get each pass s alongside a
+    // sibling field-address argument on the same base (the standard trigger
+    // idiom), triggering clear's and get's selection under the trigger-based
+    // policy; use_clear_null exercises the wrapper's null branch with a plain
+    // null-literal call site, which is valid once clear is already selected
     let code = r#"
 use ::libc;
 #[repr(C)]
 pub struct st {
     pub size: usize,
     pub data: *mut i32,
+    pub lit: [u32; 4],
 }
-pub unsafe extern "C" fn clear(mut s: *mut st) {
+pub unsafe extern "C" fn clear(mut s: *mut st, mut tree: *mut u32) {
     if !s.is_null() {
         (*s).size = 0 as usize;
     }
+    *tree.offset(0) = 0 as u32;
 }
-pub unsafe extern "C" fn get(mut s: *mut st, mut index: usize) -> i32 {
+pub unsafe extern "C" fn get(mut s: *mut st, mut index: usize, mut tree: *mut u32) -> i32 {
+    *tree.offset(0) = 0 as u32;
     return *((*s).data).offset(index as isize);
 }
-pub unsafe extern "C" fn use_clear(mut s: *mut st) {
-    clear(s);
-}
-pub unsafe extern "C" fn use_get(mut s: *mut st, mut index: usize) -> i32 {
-    return get(s, index);
-}
 pub unsafe extern "C" fn use_clear_null() {
-    clear(0 as *mut st);
+    clear(0 as *mut st, 0 as *mut u32);
+}
+pub unsafe extern "C" fn fixed_clear(mut s: *mut st) {
+    clear(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn fixed_get(mut s: *mut st, mut index: usize) -> i32 {
+    return get(s, index, ((*s).lit).as_mut_ptr());
 }
 "#;
     let mut config = Config::default();
