@@ -9728,6 +9728,7 @@ mod borrow_ownership_coherence {
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
                 mutability_facts::MutFacts,
+                origins::{collect_unknown_poisoned_slots, compute_origins},
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
@@ -11084,6 +11085,110 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                          guard. This is now the NB4-boundary marker (see doc above)."
                     );
                 }
+            },
+        );
+    }
+
+    // ---- §NB3-3c-ii → NB4-BOUNDARY MARKERS ----
+    //
+    // These pin CURRENT (no-`unknown`-clause) behavior of opaque-poisoned slots. They are the §8
+    // guarded-hazard family (like `nb2_cross_alias_write_uncaught_witness`): the state is unsound at
+    // acceptance TODAY, guarded only by §8 (BO unconsumed by codegen), and MUST flip when NB4's
+    // effect-aware `unknown` demotion lands. Shipped as EXECUTABLE tests (not a patch) so S2-4's
+    // objective restructuring — or any change to what poisoned slots settle to — cannot silently
+    // invalidate NB4's sizing assumptions without a red test. `collect_unknown_poisoned_slots` (the
+    // NB4 seed) is their only consumer today.
+
+    /// MARKER: an opaque-callee-provenance RETURN is `unknown`-poisoned and settles **`Ref` today**
+    /// (a shared `&T` over unknown C-state the callee may retain + write → the FFI-edition S2-6 hazard).
+    /// NB4's effect-aware demotion must flip this to `Raw` (may-supply ⇒ `¬ref`).
+    #[test]
+    fn nb3c_marker_poisoned_return_is_ref_today() {
+        run_compiler(
+            "unsafe extern \"C\" { fn opaque_dup(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32) -> *mut i32 { opaque_dup(p) }",
+            |tcx| {
+                use rustc_middle::mir::RETURN_PLACE;
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let ret = local_slot(&slots, f, RETURN_PLACE, 0);
+                assert!(
+                    collect_unknown_poisoned_slots(&origins, &slots).contains(&ret),
+                    "opaque-return must be unknown-poisoned (the hazard the NB4 demotion targets)"
+                );
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(
+                    m.get(&ret),
+                    Some(&SlotKind::Ref),
+                    "TODAY (no unknown clause) f's opaque return settles Ref — §8-guarded hazard; \
+                     NB4's effect-aware demotion must flip this to Raw"
+                );
+            },
+        );
+    }
+
+    /// MARKER (negative control): a KNOWN provenance-preserving callee (`.offset`) is NOT poisoned, so
+    /// its return legitimately stays `Ref` — the NB4 demotion must leave it alone (pairs with
+    /// `nb3_known_callee_no_poison`).
+    #[test]
+    fn nb3c_marker_known_callee_not_poisoned() {
+        run_compiler("unsafe fn f(p: *mut i32) -> *mut i32 { p.offset(1) }", |tcx| {
+            use rustc_middle::mir::RETURN_PLACE;
+            let program = collect_program(tcx);
+            let f = function_by_name(&program, "f");
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let ret = local_slot(&slots, f, RETURN_PLACE, 0);
+            assert!(
+                !collect_unknown_poisoned_slots(&origins, &slots).contains(&ret),
+                "known provenance-preserving `.offset` must NOT poison f's return (no NB4 demotion)"
+            );
+        });
+    }
+
+    /// MARKER (the UAF marker — NB4's strongest sizing evidence): a poisoned MAY-OVERWRITE slot settles
+    /// **`Owning` today** under no clause. `*out = malloc(); opaque(out)` gives `out@1` owning evidence
+    /// AND poisons it; if `opaque` overwrites `*out` with foreign memory, codegen drops the "owned"
+    /// slot → UAF. This is exactly why NB4's demotion must be effect-aware: a blunt `¬ref` leaves this
+    /// `Owning` untouched — the may-overwrite case needs `¬owning`/Raw, NOT just `¬ref`.
+    #[test]
+    fn nb3c_marker_poisoned_may_overwrite_is_owning_today() {
+        run_compiler(
+            "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; fn opaque(out: *mut *mut i32); } \
+             unsafe fn f(out: *mut *mut i32) { *out = malloc(core::mem::size_of::<i32>()); opaque(out); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let out1 = local_slot(&slots, f, local_by_var_name(tcx, f, "out"), 1);
+                assert!(
+                    collect_unknown_poisoned_slots(&origins, &slots).contains(&out1),
+                    "the out-param pointee must be unknown-poisoned (opaque may overwrite it)"
+                );
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    .expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(
+                    m.get(&out1),
+                    Some(&SlotKind::Owning),
+                    "TODAY `out@1` settles Owning even though it is poisoned — the UAF the blunt `¬ref` \
+                     clause does NOT prevent (verified basis for dropping the clause → NB4 effect-aware)"
+                );
             },
         );
     }
