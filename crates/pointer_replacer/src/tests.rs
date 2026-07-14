@@ -9724,6 +9724,7 @@ mod borrow_ownership_coherence {
                     SlotConflict, materialize_guards, revalidate, revalidate_replaying,
                     verify_to_fixpoint,
                 },
+                call_effects::CallEffects,
                 coherence::{add_coherence, constrain_field_ownership},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -11277,6 +11278,135 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     }
 
     const NB4_ID: &str = "#[inline(never)] unsafe fn id(q: *mut i32) -> *mut i32 { q } ";
+
+    // ---- §NB4-4a-ii — `call_effects`: does a callee ever ACCESS the POINTEE of a param? ----
+    // Least-fixpoint taint. These pin the analysis itself, independently of the invalidation
+    // gate that consumes it.
+
+    /// `is_no_access(fn_name, param)`.
+    fn nb4_no_access(program: &RustProgram<'_>, fn_name: &str, param: usize) -> bool {
+        let f = function_by_name(program, fn_name);
+        CallEffects::analyze(program).is_no_access(f, param)
+    }
+
+    /// ⚠ **LOAD-BEARING** (`call_effects` module doc): a RETURNED param is NOT `no-access`. The
+    /// entire 4a-i fixture set routes its conflict through `id`, whose param is returned — if this
+    /// rule were relaxed, `id`'s calls would lose their `Deep` access and (c)/(a)/(c′) would
+    /// silently un-demote. This test is the reason nobody may weaken "returned ⇒ access".
+    #[test]
+    fn nb4_returned_param_is_not_no_access() {
+        run_compiler(NB4_ID, |tcx| {
+            let program = collect_program(tcx);
+            assert!(
+                !nb4_no_access(&program, "id", 0),
+                "`id` RETURNS its param ⇒ its provenance escapes the callee ⇒ NOT no-access. \
+                 Relaxing this un-demotes the whole 4a-i fixture set."
+            );
+        });
+    }
+
+    /// A param that is never dereferenced (and never escapes) IS `no-access` — the class the
+    /// 4a-ii gate consumes.
+    #[test]
+    fn nb4_no_deref_param_is_no_access() {
+        run_compiler("unsafe fn ignores(_q: *mut i32) -> i32 { 0 }", |tcx| {
+            let program = collect_program(tcx);
+            assert!(nb4_no_access(&program, "ignores", 0), "`_q` is never touched");
+        });
+    }
+
+    /// A param whose pointee is merely READ is NOT `no-access` (a read of `*p` against a live
+    /// `&mut` is a genuine conflict — the `inline_read` control proved it arises with no call).
+    #[test]
+    fn nb4_deref_param_is_not_no_access() {
+        run_compiler("unsafe fn reader(q: *mut i32) -> i32 { *q }", |tcx| {
+            let program = collect_program(tcx);
+            assert!(!nb4_no_access(&program, "reader", 0), "`*q` is a direct pointee access");
+        });
+    }
+
+    /// NEGATIVE transitive control: forwarding a param to a callee that DEREFS it taints it
+    /// through the call edge (the fixpoint must propagate).
+    #[test]
+    fn nb4_transitive_deref_not_no_access() {
+        run_compiler(
+            "unsafe fn g(r: *mut i32) { *r = 1; } \
+             unsafe fn f(q: *mut i32) { g(q); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                assert!(!nb4_no_access(&program, "g", 0), "`g` writes `*r`");
+                assert!(
+                    !nb4_no_access(&program, "f", 0),
+                    "`f` forwards `q` to a deref-ing callee ⇒ taint must propagate along the edge"
+                );
+            },
+        );
+    }
+
+    /// POSITIVE transitive control (rider 3) — **the gain the fixpoint is bought for.** `f`
+    /// forwards its param to `g`, which never touches the pointee ⇒ `f`'s param is STILL
+    /// `no-access`. Without this, the fixpoint is untested against a mere "unused-param" rule.
+    #[test]
+    fn nb4_transitive_no_access_gated() {
+        run_compiler(
+            "unsafe fn g(_r: *mut i32) -> i32 { 0 } \
+             unsafe fn f(q: *mut i32) -> i32 { g(q) }",
+            |tcx| {
+                let program = collect_program(tcx);
+                assert!(nb4_no_access(&program, "g", 0), "`g` never touches `_r`");
+                assert!(
+                    nb4_no_access(&program, "f", 0),
+                    "`f` only FORWARDS `q` to a no-access callee ⇒ `f` is no-access too. This is \
+                     the transitive gain a simple unused-param rule cannot see."
+                );
+            },
+        );
+    }
+
+    /// An EXTERN/opaque callee is WORST-CASE access (rider 1: never silently drop the alias).
+    #[test]
+    fn nb4_extern_callee_param_is_not_no_access() {
+        run_compiler(
+            "unsafe extern \"C\" { fn opaque(p: *mut i32); } \
+             unsafe fn f(q: *mut i32) { opaque(q); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                assert!(
+                    !nb4_no_access(&program, "f", 0),
+                    "an opaque callee may do anything to the pointee ⇒ worst-case access"
+                );
+            },
+        );
+    }
+
+    /// `is_null` inspects the POINTER, never the pointee ⇒ the `NoAccess` boundary row applies
+    /// (matched with `library.rs`'s exact `RustPtrPath` discipline, not a bare name).
+    #[test]
+    fn nb4_is_null_param_is_no_access() {
+        run_compiler("unsafe fn f(q: *mut i32) -> bool { q.is_null() }", |tcx| {
+            let program = collect_program(tcx);
+            assert!(
+                nb4_no_access(&program, "f", 0),
+                "`is_null` reads the pointer VALUE only ⇒ `f`'s param stays no-access"
+            );
+        });
+    }
+
+    /// A param STORED through a projection escapes into memory the analysis cannot follow ⇒
+    /// worst-case access.
+    #[test]
+    fn nb4_stored_param_is_not_no_access() {
+        run_compiler(
+            "unsafe fn f(out: *mut *mut i32, q: *mut i32) { *out = q; }",
+            |tcx| {
+                let program = collect_program(tcx);
+                assert!(
+                    !nb4_no_access(&program, "f", 1),
+                    "`q` is stored through `*out` ⇒ it escapes ⇒ worst-case access"
+                );
+            },
+        );
+    }
 
     // ===== §NB4-4a NAMED RESIDUAL — "unmodeled call-boundary materialization" =====
     // (raw caller arg → `Ref` callee param.)
