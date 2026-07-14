@@ -23,6 +23,8 @@
 //! bare name across every callee kind. Type guards (slice-shaped args/dests)
 //! are recorded in `note` as documentation, not enforced here.
 
+use rustc_span::def_id::DefId;
+
 /// Semantic role of a callee, per the NB0 taxonomy (source / sink /
 /// loan-creating / provenance-preserving flow / unknown), refined by the
 /// concrete role kinds the legacy lists actually encode.
@@ -58,6 +60,67 @@ pub(crate) enum Role {
     Lend,
     /// BO boundary hook deliberately ignores the argument (`addr`).
     Ignore,
+}
+
+/// §NB4-4a-ii — the **pointee-effect axis**: what a callee may do to the POINTEE of a
+/// pointer argument. Orthogonal to `Role` (which describes provenance/ownership
+/// plumbing, not pointee access). **Pinned here once; 4c consumes it unmodified.**
+///
+/// `NoAccess` is the BOTTOM of the lattice and is the only class 4a-ii consumes: an
+/// argument whose callee provably never touches the pointee gets a SHALLOW access (the
+/// pointer VALUE) instead of the blanket `Deep` access to `(*arg)` that the Call arm emits
+/// today — which is what manufactures conflicts a callee cannot possibly cause.
+///
+/// **Opaque (a callee with no row) = the WORST-CASE row**: every effect assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// The callee never dereferences the argument. It may copy, compare, or inspect the
+    /// POINTER VALUE (`is_null`, `addr`), but the pointee is never read or written.
+    /// **The class 4a-ii gates on.**
+    NoAccess,
+    /// The pointee may be READ, never written.
+    PureRead,
+    /// The pointee may be WRITTEN in place.
+    MayWrite,
+    /// The pointee may be REPLACED with foreign memory (an out-param the callee overwrites)
+    /// — the class that makes a blunt `¬ref` unsound (it needs `¬owning` too). Consumed at 4c.
+    MayOverwrite,
+    /// The callee may SUPPLY caller-visible provenance (its return, or an out-param, carries
+    /// memory the callee owns or borrows). Consumed at 4c.
+    MaySupply,
+    /// The callee may RETAIN the pointer beyond the call (store it into foreign state).
+    /// Nothing consumes retention until 4c; it is pinned now so the schema is not re-litigated.
+    MayRetain,
+}
+
+/// §NB4-4a-ii — the ONE `Role` → `Effect` mapping (rider 5: stated once, here). 4c consumes
+/// it unmodified. Anything NOT mapped to `NoAccess` is treated as touching the pointee.
+///
+/// Only `Ignore` (`addr` — the arg is discarded) and `Lend` (`is_null` — the POINTER is
+/// inspected, never the pointee) are `NoAccess`. Every other role either reads, writes, frees,
+/// or reborrows the pointee, so all of them keep the `Deep` access.
+pub(crate) fn role_effects(role: Role) -> &'static [Effect] {
+    match role {
+        Role::Ignore => &[Effect::NoAccess],
+        Role::Lend => &[Effect::NoAccess],
+        // `malloc`/`calloc` take no pointer arg; `strdup` READS its arg's pointee and supplies
+        // fresh owned memory; `realloc` reads + frees arg0 and supplies.
+        Role::Source => &[Effect::PureRead, Effect::MaySupply],
+        // `free`: the pointee is deallocated — a write in the strongest sense, and the pointer
+        // is consumed.
+        Role::Sink => &[Effect::MayOverwrite, Effect::MayRetain],
+        // `memset`: bytes written through the destination pointer.
+        Role::FlowTransfer => &[Effect::MayWrite],
+        // `offset`/`as_ptr`: reborrow of the pointee — no read/write of the VALUE, but the
+        // result aliases it, so it must not be gated as `NoAccess`.
+        Role::LoanCreating => &[Effect::MaySupply],
+        // pointer arithmetic / slice views / C-string search: arg0's provenance flows out.
+        Role::ProvenanceFlow => &[Effect::PureRead, Effect::MaySupply],
+        // slice splits: suppression only, but the halves alias the input.
+        Role::FlowSuppression => &[Effect::MaySupply],
+        // `null`/`null_mut`: fresh pointer, no argument at all.
+        Role::NullConstructor => &[Effect::NoAccess],
+    }
 }
 
 /// The match discipline a row's origin list uses. Recorded per row so the
@@ -213,6 +276,42 @@ pub(crate) fn lookup(name: &str, matcher: Matcher) -> Option<&'static Entry> {
     TABLE
         .iter()
         .find(|e| e.name == name && e.matcher == matcher)
+}
+
+/// §NB4-4a-ii — `true` iff `callee` is a NON-LOCAL boundary callee whose row is entirely
+/// `NoAccess` (it inspects the POINTER value, never the pointee): `is_null`, `addr`.
+///
+/// Uses the `RustPtrPath` discipline **verbatim** from `infer/boundary/library.rs:27-56`
+/// (`def_path` starts at `TypeNs("ptr")` AND `def_path.data[3]` is a `ValueNs` with the name).
+/// Do NOT loosen this to a bare-name match: an unrelated non-local fn named `is_null` would
+/// then be silently gated to `NoAccess` and its pointee accesses would vanish from
+/// invalidation. `nb4_no_access_rows_are_exactly_is_null_and_addr` pins the row set.
+pub(crate) fn callee_is_no_access(tcx: rustc_middle::ty::TyCtxt<'_>, callee: DefId) -> bool {
+    let def_path = tcx.def_path(callee);
+    let in_ptr = matches!(
+        def_path.data.first().map(|d| matches!(
+            d.data,
+            rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr"
+        )),
+        Some(true)
+    );
+    if !in_ptr {
+        return false;
+    }
+    let Some(d) = def_path.data.get(3) else {
+        return false;
+    };
+    let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data else {
+        return false;
+    };
+    lookup(s.as_str(), Matcher::RustPtrPath).is_some_and(entry_is_no_access)
+}
+
+/// A row is gate-eligible iff EVERY role it carries maps to `Effect::NoAccess`.
+pub(crate) fn entry_is_no_access(e: &Entry) -> bool {
+    e.roles
+        .iter()
+        .all(|r| role_effects(*r) == [Effect::NoAccess])
 }
 
 // ---------------------------------------------------------------------------
