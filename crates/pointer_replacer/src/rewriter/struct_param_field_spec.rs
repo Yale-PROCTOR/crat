@@ -17,12 +17,13 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::{Ident, Symbol, def_id::LocalDefId, sym};
-use thin_vec::thin_vec;
+use thin_vec::{ThinVec, thin_vec};
 use utils::ir::AstToHir;
 
-use crate::analyses::struct_param_field_spec::{SpecPlan, SpecTarget};
+use crate::analyses::struct_param_field_spec::{SiteEmission, SpecPlan, SpecTarget};
 
 // per-function rewrite instructions resolved during validation
+#[derive(Clone)]
 struct FnPlan {
     param_idx: usize,
     param_name: Symbol,
@@ -52,9 +53,13 @@ pub(crate) fn apply_struct_param_field_spec(
     let mut visitor = SpecTransformVisitor {
         fn_plans: &fn_plans,
         exposed_renames: &exposed_renames,
+        plan,
         tcx,
         ast_to_hir,
         current_fn: None,
+        current_fn_did: None,
+        pending_renames: FxHashMap::default(),
+        guard_counter: 0,
         changed: false,
     };
     visitor.visit_crate(krate);
@@ -174,6 +179,34 @@ fn resolve_and_validate(
             dropped.insert(*key);
         }
     }
+
+    // audit every call site into a still-live target: a specialized-position
+    // argument must have a known, hoistable emission (forwarding shape,
+    // null literal, or a site_emissions entry that is not Guarded-in-a-
+    // while-head); violations drop the callee target before the cascade.
+    // own_param_names mirrors the transform phase's `current_fn` map: a bare
+    // path only counts as forwarding when it names the enclosing fn's own
+    // already-specialized parameter, not any arbitrary local variable
+    let mut own_param_names: FxHashMap<LocalDefId, FxHashSet<Symbol>> = FxHashMap::default();
+    for (&(fn_did, _), fn_plan) in &fn_plans {
+        own_param_names
+            .entry(fn_did)
+            .or_default()
+            .insert(fn_plan.param_name);
+    }
+    let mut auditor = CallSiteAuditor {
+        tcx,
+        ast_to_hir,
+        plan,
+        own_param_names: &own_param_names,
+        current_fn: None,
+        in_while_head: false,
+        violations: FxHashSet::default(),
+    };
+    walk_items(&krate.items, &mut |item| {
+        auditor.visit_item(item);
+    });
+    dropped.extend(auditor.violations);
 
     // cascade both directions over forwarding edges (from, to):
     // - a forwarder into a dropped callee cannot be rewritten either, since
@@ -321,14 +354,158 @@ fn resolve_callee(tcx: TyCtxt<'_>, ast_to_hir: &AstToHir, callee: &Expr) -> Opti
     def_id.as_local()
 }
 
+// read-only, resolution-phase visitor: audits every call into a selected
+// target. each specialized-position argument must have a known, hoistable
+// emission (forwarding shape, null literal, or a site_emissions entry that
+// is Direct, or Guarded outside a while-loop condition); anything else
+// drops the callee target. the bidirectional cascade (run by the caller,
+// after this visitor) then propagates the drop
+struct CallSiteAuditor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &'a AstToHir,
+    plan: &'a SpecPlan,
+    // fn did -> names of that fn's own already-specialized parameters, used
+    // to recognize genuine forwarding shapes (mirrors the transform phase's
+    // `current_fn` map)
+    own_param_names: &'a FxHashMap<LocalDefId, FxHashSet<Symbol>>,
+    // the enclosing fn's did, set by visit_item
+    current_fn: Option<LocalDefId>,
+    // true while visiting a `while` condition subtree
+    in_while_head: bool,
+    violations: FxHashSet<(LocalDefId, usize)>,
+}
+
+impl<'a> AstVisitor<'a> for CallSiteAuditor<'_, '_> {
+    fn visit_item(&mut self, item: &'a Item) {
+        if matches!(item.kind, ItemKind::Fn(_)) {
+            let outer = self.current_fn;
+            self.current_fn = self.ast_to_hir.global_map.get(&item.id).copied();
+            ast_visit::walk_item(self, item);
+            self.current_fn = outer;
+            return;
+        }
+        ast_visit::walk_item(self, item);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let ExprKind::While(cond, body, _) = &expr.kind {
+            let outer = self.in_while_head;
+            self.in_while_head = true;
+            self.visit_expr(cond);
+            self.in_while_head = outer;
+            self.visit_block(body);
+            return;
+        }
+        if let ExprKind::Call(callee, args) = &expr.kind {
+            self.audit_call(expr, callee, args);
+        }
+        ast_visit::walk_expr(self, expr);
+    }
+}
+
+impl CallSiteAuditor<'_, '_> {
+    fn audit_call(&mut self, call_expr: &Expr, callee: &Expr, args: &[P<Expr>]) {
+        let Some(callee_did) = resolve_callee(self.tcx, self.ast_to_hir, callee) else {
+            return;
+        };
+        let Some(current_fn) = self.current_fn else {
+            return;
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let key = (callee_did, i);
+            if !self.plan.targets.contains_key(&key) {
+                continue;
+            }
+            if self.arg_is_hoistable(current_fn, call_expr, arg, i) {
+                continue;
+            }
+            self.violations.insert(key);
+        }
+    }
+
+    // forwarding shape or null literal need no site_emissions entry; else
+    // look up the entry recorded by the detector for this call site
+    fn arg_is_hoistable(
+        &self,
+        current_fn: LocalDefId,
+        call_expr: &Expr,
+        arg: &Expr,
+        arg_idx: usize,
+    ) -> bool {
+        if is_null_literal(arg) {
+            return true;
+        }
+        if let ExprKind::Path(None, path) = &utils::ast::unwrap_paren(arg).kind
+            && path.segments.len() == 1
+            && self
+                .own_param_names
+                .get(&current_fn)
+                .is_some_and(|names| names.contains(&path.segments[0].ident.name))
+        {
+            // bare path naming the enclosing fn's own already-specialized
+            // parameter: forwarding shape (matches the rewriter's
+            // `rewrite_arg` forwarding check, which is name-based)
+            return true;
+        }
+        match self.lookup_emission(current_fn, call_expr, arg_idx) {
+            Some(SiteEmission::Direct) => true,
+            Some(SiteEmission::Guarded) => !self.in_while_head,
+            None => false,
+        }
+    }
+
+    // span matching: the detector recorded the MIR call terminator's span;
+    // match the AST call expression's span by equality first (established
+    // crat idiom, same compilation session, real output confirms exact
+    // equality holds), falling back to containment, then to a scan over all
+    // entries for this (fn, arg_idx) as a last resort; no match is missing
+    // (fail closed)
+    fn lookup_emission(
+        &self,
+        current_fn: LocalDefId,
+        call_expr: &Expr,
+        arg_idx: usize,
+    ) -> Option<SiteEmission> {
+        let span = call_expr.span;
+        if let Some(&em) = self.plan.site_emissions.get(&(current_fn, span, arg_idx)) {
+            return Some(em);
+        }
+        self.plan
+            .site_emissions
+            .iter()
+            .find(|((fn_did, recorded, idx), _)| {
+                *fn_did == current_fn
+                    && *idx == arg_idx
+                    && (span.contains(*recorded) || recorded.contains(span))
+            })
+            .map(|(_, em)| *em)
+    }
+}
+
 struct SpecTransformVisitor<'a, 'tcx> {
     fn_plans: &'a FxHashMap<(LocalDefId, usize), FnPlan>,
     exposed_renames: &'a FxHashMap<LocalDefId, Symbol>,
+    plan: &'a SpecPlan,
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a AstToHir,
     // targets of the function currently being visited, keyed by param name
     current_fn: Option<FxHashMap<Symbol, &'a FnPlan>>,
+    // did of the function currently being visited, tracked for every fn
+    // (not just target fns), used to key site_emissions lookups
+    current_fn_did: Option<LocalDefId>,
+    // arg NodeId -> hoisted field-pointer local name, consulted by
+    // rewrite_arg before the inline Direct fallback
+    pending_renames: FxHashMap<NodeId, Symbol>,
+    // per-function counter for unique `__crat_g{n}` names
+    guard_counter: u32,
     changed: bool,
+}
+
+// a hoisted null-checked guard for one guarded-emission call argument
+struct Hoist {
+    arg_node_id: NodeId,
+    name: Symbol,
+    stmts: [Stmt; 2],
 }
 
 impl MutVisitor for SpecTransformVisitor<'_, '_> {
@@ -336,10 +513,18 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
         let mut entered = false;
         // (orig-signature snapshot, new name) for wrapper emission
         let mut wrapper_info: Option<(P<Item>, Symbol)> = None;
+        // current_fn_did is tracked for every fn item, not just target fns:
+        // the hoist scan needs it to key site_emissions lookups regardless
+        // of whether the enclosing fn itself specializes a param
+        let outer_fn_did = self.current_fn_did;
+        let mut entered_fn_did = false;
 
         if matches!(item.kind, ItemKind::Fn(_))
             && let Some(&did) = self.ast_to_hir.global_map.get(&item.id)
         {
+            self.current_fn_did = Some(did);
+            self.guard_counter = 0;
+            entered_fn_did = true;
             let mut by_name = FxHashMap::default();
             let mut rename: Option<Symbol> = None;
             for (&(target_did, _), fn_plan) in self.fn_plans {
@@ -384,6 +569,9 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
         if entered {
             self.current_fn = None;
         }
+        if entered_fn_did {
+            self.current_fn_did = outer_fn_did;
+        }
         if let Some((orig_item, new_name)) = wrapper_info {
             items.push(self.build_wrapper(orig_item, new_name));
         }
@@ -396,6 +584,31 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
         mut_visit::walk_expr(self, expr);
         self.rewrite_body_field_access(expr);
         self.rewrite_call_args(expr);
+    }
+
+    fn visit_block(&mut self, block: &mut Block) {
+        let mut new_stmts: ThinVec<Stmt> = ThinVec::with_capacity(block.stmts.len());
+        for stmt in block.stmts.drain(..) {
+            // pass 1: read-only scan for guarded-emission call arguments in
+            // this statement, allocating hoisted names and building the
+            // two-let capture/guard pair for each
+            let hoists = self.collect_hoists(&stmt);
+            for hoist in &hoists {
+                self.pending_renames.insert(hoist.arg_node_id, hoist.name);
+            }
+            for hoist in hoists {
+                let [capture, guard] = hoist.stmts;
+                new_stmts.push(capture);
+                new_stmts.push(guard);
+            }
+            // pass 2: mutate the statement normally; rewrite_arg consults
+            // pending_renames first, replacing hoisted args with the
+            // captured field-pointer name
+            new_stmts.extend(self.flat_map_stmt(stmt));
+        }
+        block.stmts = new_stmts;
+        self.visit_id(&mut block.id);
+        self.visit_span(&mut block.span);
     }
 }
 
@@ -499,6 +712,13 @@ impl SpecTransformVisitor<'_, '_> {
     }
 
     fn rewrite_arg(&mut self, arg: &mut Expr, target: &FnPlan) {
+        // a hoisted guard was emitted for this exact argument node ahead of
+        // the enclosing statement: swap in the captured field-pointer name
+        if let Some(name) = self.pending_renames.remove(&arg.id) {
+            *arg = utils::expr!("{}", name);
+            self.changed = true;
+            return;
+        }
         // forwarding: the caller's own specialized param passes through
         if let Some(params) = &self.current_fn
             && let ExprKind::Path(None, path) = &utils::ast::unwrap_paren(arg).kind
@@ -518,7 +738,16 @@ impl SpecTransformVisitor<'_, '_> {
             self.changed = true;
             return;
         }
-        // general case: take the field address on the original argument
+        // by this point the auditor has guaranteed every remaining
+        // specialized-position argument reached a Direct emission; a
+        // Guarded or missing entry here would mean a hoist should have
+        // fired above (unreachable if the auditor is sound)
+        debug_assert!(
+            self.direct_emission_at(arg),
+            "rewrite_arg reached the inline fallback for a non-Direct site"
+        );
+        // general case (Direct emission): take the field address inline on
+        // the original argument
         let span = arg.span;
         let old = utils::ast::take_expr(arg);
         let deref = Expr {
@@ -553,6 +782,163 @@ impl SpecTransformVisitor<'_, '_> {
         });
         arg.kind = ExprKind::Cast(P(reference), ptr_ty);
         self.changed = true;
+    }
+
+    // read-only scan of one (not-yet-mutated) statement: finds call exprs
+    // into selected targets whose specialized-position arguments need a
+    // hoisted guard (not a forwarding shape, not a null literal, and the
+    // site_emissions lookup says Guarded); returns (arg node id, arg
+    // pretty-printed, target) triples in source order, deferring name
+    // allocation and stmt-building to the caller (which owns &mut self)
+    fn find_guarded_args(&self, stmt: &Stmt) -> Vec<(NodeId, String, FnPlan)> {
+        let mut found = Vec::new();
+        let mut finder = HoistFinder {
+            visitor: self,
+            found: &mut found,
+        };
+        finder.visit_stmt(stmt);
+        found
+    }
+
+    // allocates unique names and builds the two-let capture/guard pair for
+    // every guarded argument found in `stmt`
+    fn collect_hoists(&mut self, stmt: &Stmt) -> Vec<Hoist> {
+        self.find_guarded_args(stmt)
+            .into_iter()
+            .map(|(arg_node_id, e, target)| {
+                let n = self.guard_counter;
+                self.guard_counter += 1;
+                let g = format!("__crat_g{n}");
+                let gf = format!("__crat_g{n}_field");
+                let m = match target.mutbl {
+                    Mutability::Mut => "mut",
+                    Mutability::Not => "const",
+                };
+                let mm = match target.mutbl {
+                    Mutability::Mut => "mut ",
+                    Mutability::Not => "",
+                };
+                let ty = pprust::ty_to_string(&target.field_ty);
+                let fld = target.field_name;
+                let capture = utils::stmt!("let {g} = {e};");
+                let guard = utils::stmt!(
+                    "let {gf} = if {g}.is_null() {{ 0 as *{m} {ty} }} else {{ &{mm}(*{g}).{fld} as *{m} {ty} }};",
+                );
+                Hoist {
+                    arg_node_id,
+                    name: Symbol::intern(&gf),
+                    stmts: [capture, guard],
+                }
+            })
+            .collect()
+    }
+
+    // true, purely for the debug_assert, when `arg` (post pending_renames
+    // check, post forwarding check, post null-literal check) is confirmed
+    // Direct by the site_emissions lookup at the enclosing call
+    fn direct_emission_at(&self, arg: &Expr) -> bool {
+        let Some(current_fn) = self.current_fn_did else {
+            return false;
+        };
+        // the enclosing call expr's span is arg's own span's superset in
+        // practice, but we don't have the call expr here; fall back to a
+        // scan over site_emissions for any Direct entry whose span contains
+        // this argument's span (mirrors the auditor's containment fallback)
+        self.plan
+            .site_emissions
+            .iter()
+            .any(|((fn_did, span, _), em)| {
+                *fn_did == current_fn && span.contains(arg.span) && *em == SiteEmission::Direct
+            })
+    }
+
+    // span matching identical to the auditor's: equality against the AST
+    // call expression's span first, then containment either direction
+    fn lookup_emission(
+        &self,
+        current_fn: LocalDefId,
+        call_expr: &Expr,
+        arg_idx: usize,
+    ) -> Option<SiteEmission> {
+        let span = call_expr.span;
+        if let Some(&em) = self.plan.site_emissions.get(&(current_fn, span, arg_idx)) {
+            return Some(em);
+        }
+        self.plan
+            .site_emissions
+            .iter()
+            .find(|((fn_did, recorded, idx), _)| {
+                *fn_did == current_fn
+                    && *idx == arg_idx
+                    && (span.contains(*recorded) || recorded.contains(span))
+            })
+            .map(|(_, em)| *em)
+    }
+}
+
+// read-only visitor run once per (not-yet-mutated) statement by
+// find_guarded_args; descends into every expression at this statement's own
+// level, including nested calls (e.g. a guarded call as another call's
+// argument), so those are still found. crucially does NOT descend into
+// nested blocks (if/while/loop bodies, etc.): the outer visit_block will
+// separately scan each nested block's own statements when it recurses
+// there, so descending here would double-hoist the same call. purely
+// read-only: name allocation and stmt-building happen afterward in
+// collect_hoists, which owns &mut self
+struct HoistFinder<'a, 'b, 'tcx> {
+    visitor: &'a SpecTransformVisitor<'b, 'tcx>,
+    found: &'a mut Vec<(NodeId, String, FnPlan)>,
+}
+
+impl<'a> AstVisitor<'a> for HoistFinder<'_, '_, '_> {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let ExprKind::Call(callee, args) = &expr.kind {
+            self.visit_call(expr, callee, args);
+        }
+        ast_visit::walk_expr(self, expr);
+    }
+
+    // stop at nested block boundaries: visit_block (the outer
+    // SpecTransformVisitor's) handles each nested block independently
+    fn visit_block(&mut self, _block: &'a Block) {}
+}
+
+impl HoistFinder<'_, '_, '_> {
+    fn visit_call(&mut self, call_expr: &Expr, callee: &Expr, args: &[P<Expr>]) {
+        let v = self.visitor;
+        let Some(callee_did) = resolve_callee(v.tcx, v.ast_to_hir, callee) else {
+            return;
+        };
+        let Some(current_fn) = v.current_fn_did else {
+            return;
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let Some(fn_plan) = v.fn_plans.get(&(callee_did, i)) else {
+                continue;
+            };
+            if self.is_forwarding_or_null(arg) {
+                continue;
+            }
+            if v.lookup_emission(current_fn, call_expr, i) != Some(SiteEmission::Guarded) {
+                continue;
+            }
+            self.found
+                .push((arg.id, pprust::expr_to_string(arg), fn_plan.clone()));
+        }
+    }
+
+    fn is_forwarding_or_null(&self, arg: &Expr) -> bool {
+        if is_null_literal(arg) {
+            return true;
+        }
+        if let Some(params) = &self.visitor.current_fn
+            && let ExprKind::Path(None, path) = &utils::ast::unwrap_paren(arg).kind
+            && path.segments.len() == 1
+            && params.contains_key(&path.segments[0].ident.name)
+        {
+            return true;
+        }
+        false
     }
 }
 

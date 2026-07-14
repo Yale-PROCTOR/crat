@@ -354,8 +354,6 @@ pub struct SpecPlan {
     /// that need neither the null-literal retype nor bare forwarding; keyed
     /// by the caller function, the call terminator's span, and the argument
     /// index (a single call site may specialize multiple arguments).
-    // consumed by the rewriter once it lands (guarded-conversion follow-up)
-    #[allow(dead_code)]
     pub site_emissions: FxHashMap<(LocalDefId, Span, usize), SiteEmission>,
 }
 
@@ -546,10 +544,10 @@ pub fn find_plan(
         selected.extend(additions);
     }
 
-    // the rewriter cannot yet emit Guarded call sites (Task 2); until it can,
-    // a would-be-Guarded site instead drops its target, mimicking the
-    // pre-guarded-conversion behavior exactly. flipped in the guarded-emission task
-    let guarded_live = false;
+    // the rewriter now emits Guarded call sites as hoisted null-checked
+    // guards (see rewriter/struct_param_field_spec.rs), so a would-be-Guarded
+    // site keeps its target selected instead of dropping through the cascade
+    let guarded_live = true;
 
     // validity fixpoint: every call site into a selected position needs a
     // usable class, and a selected forwarder needs its target selected.
@@ -1003,7 +1001,6 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
     }
 
     #[test]
-    #[ignore = "enabled with guarded emission"]
     fn test_unprovable_site_is_guarded() {
         // stranger has neither a sibling field pointer nor a nullity fact for
         // its argument to build: the site is unprovable and must be Guarded,
@@ -1046,7 +1043,6 @@ pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: 
     }
 
     #[test]
-    #[ignore = "enabled with guarded emission"]
     fn test_forward_on_unselected_is_guarded() {
         // outer2 is an untriggered candidate caller that forwards its own
         // param into inner; inner is selected via the sibling trigger in
@@ -1156,10 +1152,12 @@ pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
     }
 
     #[test]
-    fn test_unrewritable_call_site_drops_target_and_cascades() {
-        // extra caller passes a maybe-null variable with no sibling field
-        // pointer and no nullity fact: inner is unrewritable, and outer
-        // (which forwards into inner) must fall with it
+    fn test_stray_site_gets_guarded_and_chain_survives() {
+        // extra caller stray passes a maybe-null variable with no sibling
+        // field pointer and no nullity fact. stray is never selected
+        // (trigger-based selection never seeds it), so its call site does
+        // not drop inner/outer: inner/outer stay selected via top's trigger
+        // chain, and stray's site into inner gets a Guarded emission
         let code = r#"
 use ::libc;
 #[repr(C)]
@@ -1190,7 +1188,18 @@ pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c
 }
 "#;
         let (targets, _) = plan_for(code);
-        assert_eq!(targets, vec![]);
+        assert_eq!(
+            targets,
+            vec![
+                ("inner".to_string(), 0, "lookup".to_string()),
+                ("outer".to_string(), 0, "lookup".to_string()),
+            ]
+        );
+        let emissions = emissions_for(code, "inner");
+        assert!(
+            emissions.contains(&("stray".to_string(), 0, "Guarded".to_string())),
+            "expected Guarded emission for stray's site, got {emissions:?}"
+        );
     }
 
     #[test]
