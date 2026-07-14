@@ -11730,3 +11730,133 @@ pub mod b {
     assert!(mod_b.contains("*mut [u16; 4]"), "{s}");
     assert!(!mod_b.contains("myint_t"), "{s}");
 }
+
+#[test]
+fn test_struct_param_field_glob_use_no_corrupted_sibling_import() {
+    // guards `sibling_field_use`'s UseTreeKind::Simple-only gate. before the
+    // gate, the prefix-truncation (`rfind("::")` + truncate, meant to drop a
+    // Simple use's trailing symbol segment) was applied uniformly to every
+    // `use` item's `tree.prefix`. for a non-Simple tree the last `::`
+    // segment of `prefix` is a real module path component, not a symbol --
+    // for `use crate::a::*;` (Glob), `tree.prefix` is `crate::a`, so the old
+    // code would truncate at the `crate`/`a` boundary and emit the corrupted
+    // `use crate::build_field;` (missing the `a::` module segment entirely),
+    // rather than either the correct sibling or nothing.
+    //
+    // empirically, `crate::a::*` already resolves `build_field` into scope
+    // by itself (that's the point of a glob import), so `sibling_field_use`
+    // never reaches the corrupting code even pre-gate: HIR resolves a glob
+    // `use` item's `value_ns` to the module, not to the specific fn, so the
+    // `Res::Def(DefKind::Fn, _)` match fails before the prefix is ever
+    // touched. this test pins that (the output must compile and must NOT
+    // contain a second, corrupted `use crate::build_field;`), and the gate
+    // added above is the documented, fail-closed backstop for any future
+    // change to the HIR resolution path that would otherwise let a Glob (or
+    // Nested) tree reach the truncation logic.
+    //
+    // a true `UseTreeKind::Nested` case (`use crate::a::{build, st};`)
+    // cannot be exercised end-to-end here: `AstToHirMapper::map_item_to_item`
+    // (crates/utils/src/ir/ast_to_hir.rs:90) panics unconditionally on any
+    // Nested use tree, crate-wide, before rewriting begins -- confirmed by
+    // direct probe (`thread 'rustc' panicked at
+    // crates/utils/src/ir/ast_to_hir.rs:90:22: explicit panic`). that panic
+    // fires regardless of this fix, so no test (e2e or otherwise, since
+    // `sibling_field_use` requires a live `TyCtxt` to call at all) can drive
+    // a Nested tree into this gate; the Simple-only match is verified here
+    // for Glob, and by code inspection for Nested (structurally identical:
+    // `tree.prefix` for `use crate::a::{b, c};` is `crate::a`, the same
+    // "prefix has no symbol segment" shape as Glob).
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let code = r#"
+use ::libc;
+pub mod a {
+    use ::libc;
+    pub type myint_t = u16;
+    #[repr(C)]
+    pub struct st {
+        pub lookup: [myint_t; 4],
+        pub lit: [u32; 4],
+    }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+        if !s.is_null() {
+            (*s).lookup[0] = 1 as myint_t;
+        }
+        *tree.offset(0) = 0 as u32;
+        return 0 as libc::c_int;
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+        return build(s, ((*s).lit).as_mut_ptr());
+    }
+}
+pub mod b {
+    use ::libc;
+    use crate::a::*;
+    pub unsafe extern "C" fn stranger(
+        mut s: *mut st,
+        mut tree: *mut u32,
+        mut flag: libc::c_int,
+    ) -> libc::c_int {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 {
+            p = s;
+        }
+        build(p, tree);
+        return 0 as libc::c_int;
+    }
+}
+"#;
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the glob import brings `build_field` into module b's scope on its
+    // own; no additional sibling `use` should be injected for it, and in
+    // particular no corrupted `use crate::build_field;` (missing `a::`)
+    let mod_b = s.split("pub mod b").nth(1).expect("module b present");
+    assert!(!mod_b.contains("use crate::build_field"), "{s}");
+    assert!(!mod_b.contains("use crate::a::build_field"), "{s}");
+}
+#[test]
+fn probe_glob_use_panic() {
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let code = r#"
+use ::libc;
+pub mod a {
+    use ::libc;
+    pub type myint_t = u16;
+    #[repr(C)]
+    pub struct st {
+        pub lookup: [myint_t; 4],
+        pub lit: [u32; 4],
+    }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+        if !s.is_null() {
+            (*s).lookup[0] = 1 as myint_t;
+        }
+        *tree.offset(0) = 0 as u32;
+        return 0 as libc::c_int;
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+        return build(s, ((*s).lit).as_mut_ptr());
+    }
+}
+pub mod b {
+    use ::libc;
+    use crate::a::*;
+    pub unsafe extern "C" fn stranger(
+        mut s: *mut st,
+        mut tree: *mut u32,
+        mut flag: libc::c_int,
+    ) -> libc::c_int {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 {
+            p = s;
+        }
+        build(p, tree);
+        return 0 as libc::c_int;
+    }
+}
+"#;
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    println!("{s}");
+}

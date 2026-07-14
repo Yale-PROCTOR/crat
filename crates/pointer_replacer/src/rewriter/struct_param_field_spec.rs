@@ -667,6 +667,20 @@ impl SpecTransformVisitor<'_, '_> {
         let ItemKind::Use(tree) = &item.kind else {
             return None;
         };
+        // simple-tree only: the prefix-truncation below assumes the last
+        // `::`-segment of `tree.prefix` is the imported symbol itself, which
+        // only holds for `use a::b::Name;` (UseTreeKind::Simple). for
+        // Glob/Nested trees that segment is a real module path component,
+        // not a symbol, so truncating it would emit a corrupted `use`
+        // pointing at the wrong module rather than just skipping the
+        // injection. c2rust emits one Simple use per imported symbol, so
+        // this is the shape actually seen on the corpus; bailing out here
+        // for anything else is fail-closed: the retargeted call site will
+        // then surface as a loud compile error in that hypothetical shape,
+        // instead of a silently wrong import
+        if !matches!(tree.kind, UseTreeKind::Simple(..)) {
+            return None;
+        }
         let hir_item = self.ast_to_hir.get_item(item.id, self.tcx)?;
         let hir::ItemKind::Use(path, _) = &hir_item.kind else {
             return None;
