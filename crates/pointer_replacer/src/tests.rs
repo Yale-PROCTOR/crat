@@ -11659,3 +11659,74 @@ pub unsafe fn f(mut uname: *mut i8) -> *mut i8 {
     assert!(s.contains("let mut p0: *mut i8"), "{s}");
     assert!(!s.contains("p0_idx"), "{s}");
 }
+
+#[test]
+fn test_struct_param_field_cross_module_guarded_exposed_call_site_compiles() {
+    // c2rust merges translation units as sibling modules importing each
+    // other via plain `use` items (not the single-crate-body shape every
+    // other struct_param_field_spec test uses). module `b`'s `stranger`
+    // reaches the exposed, `_field`-renamed `build` through
+    // `use crate::a::build;` and specializes a maybe-null argument into a
+    // hoisted guard whose cast type comes from the field's declared AST
+    // type, which spells the c2rust alias `myint_t` -- a type module `b`
+    // never imports. two bugs, reproduced together:
+    // - bug A (E0425): the call site rewrite retargets to `build_field`,
+    //   but no `use ... build_field` sibling import is emitted for module b
+    // - bug B (E0412): the hoisted guard casts through `myint_t`, which is
+    //   only in scope inside module `a`
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let code = r#"
+use ::libc;
+pub mod a {
+    use ::libc;
+    pub type myint_t = u16;
+    #[repr(C)]
+    pub struct st {
+        pub lookup: [myint_t; 4],
+        pub lit: [u32; 4],
+    }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+        if !s.is_null() {
+            (*s).lookup[0] = 1 as myint_t;
+        }
+        *tree.offset(0) = 0 as u32;
+        return 0 as libc::c_int;
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+        return build(s, ((*s).lit).as_mut_ptr());
+    }
+}
+pub mod b {
+    use ::libc;
+    use crate::a::build;
+    use crate::a::st;
+    pub unsafe extern "C" fn stranger(
+        mut s: *mut st,
+        mut tree: *mut u32,
+        mut flag: libc::c_int,
+    ) -> libc::c_int {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 {
+            p = s;
+        }
+        build(p, tree);
+        return 0 as libc::c_int;
+    }
+}
+"#;
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // bug A fix: module b imports the `_field` redirect target alongside the
+    // original wrapper import
+    assert!(s.contains("use crate::a::build_field"), "{s}");
+    assert!(s.contains("build_field(__crat_g0_field"), "{s}");
+    // bug B fix: module b's hoisted guard casts through the alias-free MIR
+    // spelling `[u16; 4]`, not the c2rust alias `myint_t` (which module b
+    // never imports). `myint_t` legitimately still appears in module `a`
+    // (the alias definition itself, and the same-module wrapper/signature
+    // emission this task does not touch), so isolate module b's text
+    let mod_b = s.split("pub mod b").nth(1).expect("module b present");
+    assert!(mod_b.contains("*mut [u16; 4]"), "{s}");
+    assert!(!mod_b.contains("myint_t"), "{s}");
+}

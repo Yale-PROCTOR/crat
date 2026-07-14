@@ -15,6 +15,8 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir as hir;
+use rustc_hir::def::{DefKind, Res};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::{Ident, Symbol, def_id::LocalDefId, sym};
 use thin_vec::{ThinVec, thin_vec};
@@ -29,6 +31,13 @@ struct FnPlan {
     param_name: Symbol,
     field_name: Symbol,
     field_ty: P<Ty>,
+    // the field's type spelled from its MIR type (`utils::ir::mir_ty_to_string`),
+    // not the cloned AST type: alias-free (e.g. `[u64; 8]`, never a c2rust
+    // typedef like `uint64_t`), so it type-checks in every module, including
+    // ones that never import the struct's own module's aliases. used only for
+    // guard-statement casts (wrapper lets, hoisted call-site guards); wrapper
+    // and signature emission keep using `field_ty` (same-module, unaffected)
+    field_mir_ty_str: String,
     mutbl: Mutability,
     // Some(new name) when the fn is c-exposed: rename to `{name}_field`, strip
     // abi attrs, emit an original-signature wrapper
@@ -233,6 +242,24 @@ fn resolve_and_validate(
     fn_plans
 }
 
+// the field's type spelled from its MIR type, not the AST: alias-free (e.g.
+// `[u64; 8]`, never a c2rust typedef like `uint64_t`), so it type-checks in
+// any module. the struct is guaranteed non-generic by the detector (see
+// `struct_pointee` in analyses/struct_param_field_spec.rs, which only admits
+// candidates with empty generic args), so `args` is always empty
+fn field_mir_ty_string(
+    tcx: TyCtxt<'_>,
+    struct_def: LocalDefId,
+    field: rustc_abi::FieldIdx,
+) -> String {
+    let struct_ty = tcx.type_of(struct_def).skip_binder();
+    let ty::TyKind::Adt(adt_def, args) = struct_ty.kind() else {
+        unreachable!("struct_def target must resolve to an Adt")
+    };
+    let field_ty = adt_def.non_enum_variant().fields[field].ty(tcx, args);
+    utils::ir::mir_ty_to_string(field_ty, tcx)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_fn_plan(
     func: &Fn,
@@ -247,6 +274,7 @@ fn resolve_fn_plan(
     let field_ty = field_tys
         .get(&(target.struct_def, target.field.as_usize()))?
         .clone();
+    let field_mir_ty_str = field_mir_ty_string(tcx, target.struct_def, target.field);
     let input = func.sig.decl.inputs.get(param_idx)?;
     let PatKind::Ident(_, param_ident, _) = input.pat.kind else {
         return None;
@@ -267,6 +295,7 @@ fn resolve_fn_plan(
         param_name: param_ident.name,
         field_name: target.field_name,
         field_ty,
+        field_mir_ty_str,
         mutbl: target.mutbl,
         exposed_rename,
     })
@@ -510,6 +539,19 @@ struct Hoist {
 
 impl MutVisitor for SpecTransformVisitor<'_, '_> {
     fn flat_map_item(&mut self, mut item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
+        // a `use` item resolving to a renamed (exposed) fn: the wrapper still
+        // exists under the original name (build_wrapper preserves it), so the
+        // original import keeps working, but call sites in this module that
+        // got retargeted to the `_field` name (rewrite_call_args) also need
+        // that name in scope. emit an additional sibling import for it rather
+        // than renaming in place
+        if let Some(sibling) = self.sibling_field_use(&item) {
+            let mut items = smallvec::SmallVec::new();
+            items.push(item);
+            items.push(sibling);
+            return items;
+        }
+
         let mut entered = false;
         // (orig-signature snapshot, new name) for wrapper emission
         let mut wrapper_info: Option<(P<Item>, Symbol)> = None;
@@ -613,6 +655,39 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
 }
 
 impl SpecTransformVisitor<'_, '_> {
+    // if `item` is a `use` item resolving (via HIR) to a fn that got renamed
+    // to `{name}_field`, build an additional sibling `use` item importing
+    // that new name, so cross-module call sites retargeted by
+    // rewrite_call_args (which rewrites the call-expr path segment, not the
+    // module's imports) resolve. the original `use` item is left untouched:
+    // the wrapper still exists under the original name (build_wrapper), so
+    // the pre-existing import keeps working for callers of the ABI-preserving
+    // wrapper
+    fn sibling_field_use(&self, item: &Item) -> Option<P<Item>> {
+        let ItemKind::Use(tree) = &item.kind else {
+            return None;
+        };
+        let hir_item = self.ast_to_hir.get_item(item.id, self.tcx)?;
+        let hir::ItemKind::Use(path, _) = &hir_item.kind else {
+            return None;
+        };
+        let Res::Def(DefKind::Fn, def_id) = path.res.value_ns? else {
+            return None;
+        };
+        let def_id = def_id.as_local()?;
+        let new_name = *self.exposed_renames.get(&def_id)?;
+        let mut prefix = pprust::path_to_string(&tree.prefix);
+        // drop the original (last) segment, replaced with `new_name` below
+        if let Some(idx) = prefix.rfind("::") {
+            prefix.truncate(idx);
+        } else {
+            return None;
+        }
+        let mut sibling = P(utils::item!("use {prefix}::{new_name};"));
+        sibling.vis = item.vis.clone();
+        Some(sibling)
+    }
+
     // original name/attrs/signature; body forwards to the renamed function,
     // converting each specialized param to a null-guarded field address
     fn build_wrapper(&mut self, mut wrapper: P<Item>, new_name: Symbol) -> P<Item> {
@@ -638,7 +713,10 @@ impl SpecTransformVisitor<'_, '_> {
                     Mutability::Mut => "mut ",
                     Mutability::Not => "",
                 };
-                let ty = pprust::ty_to_string(&fn_plan.field_ty);
+                // module-independent spelling: this guard may be printed into
+                // a module that never imports the field's declaring module's
+                // c2rust type aliases (see field_mir_ty_string)
+                let ty = &fn_plan.field_mir_ty_str;
                 let fld = fn_plan.field_name;
                 let local = format!("__crat_{x}_field");
                 lets.push(utils::stmt!(
@@ -818,7 +896,10 @@ impl SpecTransformVisitor<'_, '_> {
                     Mutability::Mut => "mut ",
                     Mutability::Not => "",
                 };
-                let ty = pprust::ty_to_string(&target.field_ty);
+                // module-independent spelling: this guard is hoisted at the
+                // call site, which may live in a module that never imports
+                // the callee field's declaring module's c2rust type aliases
+                let ty = &target.field_mir_ty_str;
                 let fld = target.field_name;
                 let capture = utils::stmt!("let {g} = {e};");
                 let guard = utils::stmt!(
