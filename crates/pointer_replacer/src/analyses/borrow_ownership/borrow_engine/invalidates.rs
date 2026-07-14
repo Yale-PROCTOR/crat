@@ -53,13 +53,31 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     location_map: &'g DenseLocationMap,
 }
 
+/// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
+///
+/// **INERT TODAY, BY CONSTRUCTION**: `check_access_for_conflict` does not consult it. The
+/// immutable-loan skip fires for both kinds, and a mutable loan conflicts with both, so no
+/// decision depends on it. It is threaded now so that **4b's write-aware invalidation is a
+/// one-line change to the SKIP condition**, not a refactor of every access site — which keeps
+/// 4b's sweep row **WA-ALONE** instead of conflating write-awareness with a site→kind
+/// re-labeling. (Same hoisting logic as BB3-a and the effect axis landing in 4a.)
+///
+/// The site→kind table below is the 3b Task-0 table. Inertness is verified by the suite +
+/// a spot sweep being byte-identical across this commit; if it were NOT inert, that would mean
+/// access kinds already matter somewhere unknown, and it is a STOP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccessKind {
+    Read,
+    Write,
+}
+
 impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
-    fn deeply_access_place(&mut self, location: Location, place: Place<'tcx>) {
-        self.check_access_for_conflict(location, place, AccessDepth::Deep);
+    fn deeply_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
+        self.check_access_for_conflict(location, place, AccessDepth::Deep, kind);
     }
 
-    fn shallowly_access_place(&mut self, location: Location, place: Place<'tcx>) {
-        self.check_access_for_conflict(location, place, AccessDepth::Shallow);
+    fn shallowly_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
+        self.check_access_for_conflict(location, place, AccessDepth::Shallow, kind);
     }
 
     fn check_access_for_conflict(
@@ -67,6 +85,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         location: Location,
         place: Place<'tcx>,
         access_depth: AccessDepth,
+        // §NB4-4a-ii: labeled, DELIBERATELY UNCONSUMED (see `AccessKind`). 4b's write-aware
+        // rule turns this into `kind` and skips the immutable loan for `Read` only.
+        _kind: AccessKind,
     ) {
         let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) else {
             return;
@@ -94,14 +115,15 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         }
     }
 
-    /// Simulates consumption of an operand.
-    fn consume_operand(&mut self, location: Location, operand: &Operand<'tcx>) {
+    /// Simulates consumption of an operand. Reading an operand's VALUE is a `Read` at every
+    /// site except `copy_nonoverlapping`'s destination, which passes `Write` explicitly.
+    fn consume_operand(&mut self, location: Location, operand: &Operand<'tcx>, kind: AccessKind) {
         match *operand {
             Operand::Copy(place) => {
-                self.deeply_access_place(location, place);
+                self.deeply_access_place(location, place, kind);
             }
             Operand::Move(place) => {
-                self.deeply_access_place(location, place);
+                self.deeply_access_place(location, place, kind);
             }
             Operand::Constant(_) => {}
         }
@@ -109,13 +131,25 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
 
     // Simulates consumption of an rvalue
     fn consume_rvalue(&mut self, location: Location, rvalue: &Rvalue<'tcx>) {
+        use rustc_middle::mir::{BorrowKind, RawPtrKind};
         match rvalue {
-            &Rvalue::Ref(_ /* rgn */, _, place) => {
-                self.deeply_access_place(location, place);
+            // A borrow's kind IS its access kind: `&mut`/`&raw mut` write, shared borrows read.
+            &Rvalue::Ref(_ /* rgn */, borrow_kind, place) => {
+                let kind = if matches!(borrow_kind, BorrowKind::Mut { .. }) {
+                    AccessKind::Write
+                } else {
+                    AccessKind::Read
+                };
+                self.deeply_access_place(location, place, kind);
             }
 
-            &Rvalue::RawPtr(_, place) => {
-                self.deeply_access_place(location, place);
+            &Rvalue::RawPtr(ptr_kind, place) => {
+                let kind = if matches!(ptr_kind, RawPtrKind::Mut) {
+                    AccessKind::Write
+                } else {
+                    AccessKind::Read
+                };
+                self.deeply_access_place(location, place, kind);
             }
 
             Rvalue::ThreadLocalRef(_) => {}
@@ -125,33 +159,33 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
             | Rvalue::UnaryOp(_ /* un_op */, operand)
             | Rvalue::Cast(_ /* cast_kind */, operand, _ /* ty */)
             | Rvalue::ShallowInitBox(operand, _ /* ty */) => {
-                self.consume_operand(location, operand)
+                self.consume_operand(location, operand, AccessKind::Read)
             }
 
             &Rvalue::CopyForDeref(place) => {
                 let op = &Operand::Copy(place);
-                self.consume_operand(location, op);
+                self.consume_operand(location, op, AccessKind::Read);
             }
 
             &(Rvalue::Len(place) | Rvalue::Discriminant(place)) => {
-                self.deeply_access_place(location, place);
+                self.deeply_access_place(location, place, AccessKind::Read);
             }
 
             Rvalue::BinaryOp(_bin_op, box (operand1, operand2)) => {
-                self.consume_operand(location, operand1);
-                self.consume_operand(location, operand2);
+                self.consume_operand(location, operand1, AccessKind::Read);
+                self.consume_operand(location, operand2, AccessKind::Read);
             }
 
             Rvalue::NullaryOp(_op, _ty) => {}
 
             Rvalue::Aggregate(_, operands) => {
                 for operand in operands {
-                    self.consume_operand(location, operand);
+                    self.consume_operand(location, operand, AccessKind::Read);
                 }
             }
 
             Rvalue::WrapUnsafeBinder(op, _) => {
-                self.consume_operand(location, op);
+                self.consume_operand(location, op, AccessKind::Read);
             }
         }
     }
@@ -165,22 +199,24 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
             StatementKind::Assign(box (lhs, rhs)) => {
                 self.consume_rvalue(location, rhs);
 
-                self.shallowly_access_place(location, *lhs);
+                // The assignment's destination is WRITTEN.
+                self.shallowly_access_place(location, *lhs, AccessKind::Write);
             }
             StatementKind::FakeRead(box (_, _)) => {
                 // Only relevant for initialized/liveness/safety checks.
             }
             StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(op)) => {
-                self.consume_operand(location, op);
+                self.consume_operand(location, op, AccessKind::Read);
             }
             StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(CopyNonOverlapping {
                 src,
                 dst,
                 count,
             })) => {
-                self.consume_operand(location, src);
-                self.consume_operand(location, dst);
-                self.consume_operand(location, count);
+                self.consume_operand(location, src, AccessKind::Read);
+                // `copy_nonoverlapping` WRITES through the destination pointer.
+                self.consume_operand(location, dst, AccessKind::Write);
+                self.consume_operand(location, count, AccessKind::Read);
             }
             // Only relevant for mir typeck
             StatementKind::AscribeUserType(..)
@@ -191,10 +227,8 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
             // Does not actually affect borrowck
             | StatementKind::StorageLive(..) => {}
             StatementKind::StorageDead(local) => {
-                self.shallowly_access_place(
-                    location,
-                    Place::from(*local),
-                );
+                // Storage is deallocated — a write in the strongest sense.
+                self.shallowly_access_place(location, Place::from(*local), AccessKind::Write);
             }
             StatementKind::ConstEvalCounter
             | StatementKind::Nop
@@ -212,7 +246,7 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         match &terminator.kind {
             TerminatorKind::SwitchInt { discr, targets: _ } => {
-                self.consume_operand(location, discr);
+                self.consume_operand(location, discr, AccessKind::Read);
             }
             TerminatorKind::Drop {
                 place: drop_place,
@@ -222,7 +256,8 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 drop: _,
                 async_fut: _,
             } => {
-                self.deeply_access_place(location, *drop_place);
+                // Dropping runs the destructor through the place — a write.
+                self.deeply_access_place(location, *drop_place, AccessKind::Write);
             }
             TerminatorKind::Call {
                 func,
@@ -233,16 +268,20 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 call_source: _,
                 fn_span: _,
             } => {
-                self.consume_operand(location, func);
+                self.consume_operand(location, func, AccessKind::Read);
                 for arg in args {
-                    self.consume_operand(location, &arg.node);
+                    // §NB4-4a-ii: labeled `Read` here; 4a-ii's GATING commit refines the arg
+                    // access by the callee's effect class (a `no-access` callee gets a SHALLOW
+                    // access instead of this blanket `Deep` one).
+                    self.consume_operand(location, &arg.node, AccessKind::Read);
                 }
-                self.deeply_access_place(location, *destination);
+                // The call's return value is WRITTEN into the destination.
+                self.deeply_access_place(location, *destination, AccessKind::Write);
             }
             TerminatorKind::TailCall { func, args, .. } => {
-                self.consume_operand(location, func);
+                self.consume_operand(location, func, AccessKind::Read);
                 for arg in args {
-                    self.consume_operand(location, &arg.node);
+                    self.consume_operand(location, &arg.node, AccessKind::Read);
                 }
             }
             TerminatorKind::Assert {
@@ -252,11 +291,11 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 target: _,
                 unwind: _,
             } => {
-                self.consume_operand(location, cond);
+                self.consume_operand(location, cond, AccessKind::Read);
                 use rustc_middle::mir::AssertKind;
                 if let AssertKind::BoundsCheck { len, index } = &**msg {
-                    self.consume_operand(location, len);
-                    self.consume_operand(location, index);
+                    self.consume_operand(location, len, AccessKind::Read);
+                    self.consume_operand(location, index, AccessKind::Read);
                 }
             }
             TerminatorKind::Yield { .. } => {
@@ -286,7 +325,7 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 for op in operands {
                     match op {
                         InlineAsmOperand::In { reg: _, value } => {
-                            self.consume_operand(location, value);
+                            self.consume_operand(location, value, AccessKind::Read);
                         }
                         InlineAsmOperand::Out {
                             reg: _,
@@ -295,7 +334,7 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                             ..
                         } => {
                             if let &Some(place) = place {
-                                self.deeply_access_place(location, place);
+                                self.deeply_access_place(location, place, AccessKind::Write);
                             }
                         }
                         InlineAsmOperand::InOut {
@@ -304,9 +343,9 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                             in_value,
                             out_place,
                         } => {
-                            self.consume_operand(location, in_value);
+                            self.consume_operand(location, in_value, AccessKind::Read);
                             if let &Some(out_place) = out_place {
-                                self.deeply_access_place(location, out_place);
+                                self.deeply_access_place(location, out_place, AccessKind::Write);
                             }
                         }
                         InlineAsmOperand::Const { value: _ }
