@@ -384,16 +384,28 @@ mod mirror {
         panic!("BOC1 mirror: CEGAR did not converge within {cap} rounds");
     }
 
-    /// Copy of `borrow_verify::representative`.
+    /// Copy of `borrow_verify::representative` — INCLUDING §NB4-4a A′ (live-requirer discharge).
+    /// Must stay byte-equivalent in behavior to the original or the corpus sweep silently reports
+    /// a different model than the suite verifies (the mirror-drift liability NB7 retires).
     fn representative(
         conflict: &SlotConflict,
         model: &FxHashMap<SlotRef, SlotKind>,
     ) -> Option<SlotRef> {
+        let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
+        // A′: a live `Ref` requirer BEYOND the issuer must carry the discharge.
+        if let Some(r) = conflict
+            .requirers
+            .iter()
+            .copied()
+            .find(|r| Some(*r) != conflict.issuer && is_ref(r))
+        {
+            return Some(r);
+        }
         conflict
             .issuer
             .into_iter()
             .chain(conflict.requirers.iter().copied())
-            .find(|s| model.get(s) == Some(&SlotKind::Ref))
+            .find(is_ref)
     }
 
     /// Copy of `borrow_verify::round_cap`.

@@ -179,10 +179,10 @@ pub(crate) fn materialize_guards(
 /// by `emit_crate_ownership_constraints`, so no model this loop ever sees can mark a
 /// source `Ref` and the old lazy per-round source commit is gone. Each round: solve →
 /// derive the candidacy from the model's *actual* Raw/Ref/Owning kinds → commit `¬ref`
-/// on **one representative slot per residual borrow conflict** (BB2-ii — issuer if
-/// present, else a requirer, see `representative`; conflicts come from
-/// `revalidate_replaying`'s `tree_borrow_local` union replay) → re-solve. Accept when
-/// no committable (currently-`Ref`) slot remains.
+/// on **one representative slot per residual borrow conflict** (BB2-ii — §NB4-4a **A′**: a
+/// live `Ref` requirer *beyond* the issuer if one exists, else the issuer; see
+/// `representative`; conflicts come from `revalidate_replaying`'s `tree_borrow_local`
+/// union replay) → re-solve. Accept when no committable (currently-`Ref`) slot remains.
 ///
 /// Mode A = *monotone single-slot commitment*, deliberately NOT BB1's disjunctive
 /// `materialize_guards`. Committing one currently-`Ref` slot forces exactly that slot off
@@ -289,20 +289,46 @@ pub(crate) fn verify_to_fixpoint(
     panic!("BB2-ii CEGAR did not converge within {cap} rounds");
 }
 
-/// Pick the slot of a residual conflict to commit `¬ref` on (Mode A): the issuer if it
-/// is currently `Ref`, else the first currently-`Ref` requirer. Committing the issuer
-/// demotes the loan at its source; any conflict that survives surfaces next round.
+/// Pick the slot of a residual conflict to commit `¬ref` on (Mode A).
+///
+/// §NB4-4a **A′ — live-requirer discharge.** Demoting a slot discharges an edge only if it
+/// removes the **conflict**, not the **requirement**. Demoting the *issuer* removes its loan
+/// from the ANALYSIS (the replay disables that provenance and the loan disappears next round),
+/// but a live `Ref` **requirer** of that loan still aliases the written cell — it is not made
+/// safe by the issuer going `Raw`. So when a live `Ref` requirer exists **beyond** the issuer,
+/// it must carry the discharge; the issuer stays in the menu only when no such requirer exists
+/// (self-edges, issuer-only edges).
+///
+/// This RESTRICTS the commit menu — it introduces no new assertion kind, so §3 invariant 7
+/// (lemmas are `¬ref`-only) is untouched. Without it, `x = id(p); …; *b = 2;` (b = p) accepts
+/// `p`/`b` = `Raw` while `x` survives `Ref` — a shared reference into a cell written through a
+/// raw alias (the S2-6 family, production-parity, §8-guarded). Fixtures:
+/// `nb4_returned_borrow_vs_base_mutation`, `nb4_callee_write_invalidates_caller_loan`,
+/// `nb4_returned_immutable_borrow_vs_base_write` (A′'s reach is a property of the edge menu, so
+/// it closes the IMMUTABLE shape too — orthogonal to the immutable-loan skip).
+///
 /// Returns `None` only when the conflict has no committable `Local` owner — i.e. a
 /// `Field`-only residual (the deferred struct field-slot gap). A residual `Local` owner
 /// is always currently-`Ref`: `borrow_conflicts_replaying`'s inert-ness invariant keeps
 /// non-witness `Raw` locals out of residual edges, so an "all owners already `Raw`"
 /// residual cannot arise for Locals.
 fn representative(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Option<SlotRef> {
+    let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
+    // A′: a live `Ref` requirer BEYOND the issuer must carry the discharge.
+    if let Some(r) = conflict
+        .requirers
+        .iter()
+        .copied()
+        .find(|r| Some(*r) != conflict.issuer && is_ref(r))
+    {
+        return Some(r);
+    }
+    // No requirer beyond the issuer ⇒ the pre-A′ menu (issuer first, then requirers).
     conflict
         .issuer
         .into_iter()
         .chain(conflict.requirers.iter().copied())
-        .find(|s| model.get(s) == Some(&SlotKind::Ref))
+        .find(is_ref)
 }
 
 /// Generous round-cap backstop for `verify_to_fixpoint`. The real bound is ≤ |slots|
