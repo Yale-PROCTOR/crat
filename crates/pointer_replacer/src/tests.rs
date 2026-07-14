@@ -11085,6 +11085,40 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                          guard. This is now the NB4-boundary marker (see doc above)."
                     );
                 }
+
+                // §NB4-4a STATE-2 (named + EXECUTABLE): A′ is INERT on this witness, and this pins
+                // the REASON, not merely the kind — the witness's only residual edge is a SELF-EDGE
+                // (issuer == requirer == `b`), so there is no live `Ref` requirer BEYOND the issuer
+                // for A′'s restricted menu to bind.
+                //
+                // Borrow-structure dump (2026-07-12) — why `*b = 5` changes nothing:
+                //     L_(0) borrowed=(*p) assigned=Assign(b)      ← b = p
+                //     L_(1) borrowed=(*p) assigned=Assign(temp)   ← id()'s arg temp; x/z/q REQUIRE it
+                //     ERROR = { L_(0) } only — L_(1) is NEVER invalidated.
+                // `*b = 5` looks up `local_map.row(b)`, which is **EMPTY**: every loan is keyed under
+                // `p`, and `b` is a *copy* of p (a different `Local`). The cross-alias write is
+                // invisible to invalidation. Hence NEITHER A′ NOR write-awareness flips this witness
+                // — WA changes the immutable-loan SKIP, but there is no loan in b's row to skip. 4b's
+                // closure must ROUTE a write through a copy to its copy-group's loans
+                // (`tree_borrow_local` is already in the 7-field manifest ⇒ fork-side, freeze-safe).
+                // This assertion is what makes that finding non-forgettable: if 4b's routing lands,
+                // this edge set CHANGES and this assertion fails — by design.
+                let edges = revalidate_replaying(&program, &slots, |_| true, |_| false, &facts);
+                let b_slot = slot_of("b");
+                let fn_edges = edges.get(&f).map(Vec::as_slice).unwrap_or(&[]);
+                assert_eq!(
+                    fn_edges.len(),
+                    1,
+                    "state-2: the witness has exactly ONE residual conflict edge"
+                );
+                assert_eq!(fn_edges[0].issuer, Some(b_slot), "state-2: its issuer is `b`");
+                assert_eq!(
+                    fn_edges[0].requirers,
+                    vec![b_slot],
+                    "state-2: it is a SELF-edge (requirer == issuer == `b`) — there is no live `Ref` \
+                     requirer beyond the issuer, which is precisely WHY A′ is inert on this witness \
+                     and the S2-6 closure must wait for 4b's copy-group routing"
+                );
             },
         );
     }
@@ -11188,6 +11222,284 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     Some(&SlotKind::Owning),
                     "TODAY `out@1` settles Owning even though it is poisoned — the UAF the blunt `¬ref` \
                      clause does NOT prevent (verified basis for dropping the clause → NB4 effect-aware)"
+                );
+            },
+        );
+    }
+
+    // ================= §NB4-4a — call-site semantics: A′ (live-requirer discharge) =================
+    //
+    // RULED 2026-07-12 after a borrow-STRUCTURE DUMP refuted the "the destination has no loan"
+    // premise (that claim was inferred from one code site and was FALSE; the dump standard exists
+    // because of it). What the dump actually shows for every shape below:
+    //
+    //     LOAN L_(0) borrowed=(*p) assigned=Assign(<arg temp>)   ← the call's arg-temp copy
+    //     REQUIRES   x → [L_(0)]                                  ← x ALREADY requires it
+    //     ERROR      L_(0) live ∧ invalidated                     ← already an error
+    //     EDGE       issuer=<arg temp> requirers=[x]
+    //
+    // So the loan, the requirement, and the error all already exist. The bug is the DISCHARGE MENU:
+    // Mode-A's `representative` prefers the ISSUER, so the arg temp (≡ `p`) is demoted and the live
+    // requirer `x` survives as a `Ref` aliasing a cell written through a now-`Raw` sibling.
+    //
+    // A′ PRINCIPLE: demoting a slot discharges an edge only if it removes the CONFLICT, not the
+    // REQUIREMENT. An edge with live `Ref` requirers BEYOND the issuer is discharged by
+    // `⋁¬ref(live requirers)`; the issuer stays in the menu only when no such requirer exists.
+    // (This RESTRICTS the commit menu — it adds no new assertion kind, so §3 invariant 7 holds.)
+
+    /// §NB4-4a helper — solve `f` to fixpoint under fact-driven mutability; return each named
+    /// local's depth-0 accepted kind + its Foster mutability.
+    fn nb4_accept<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        program: &RustProgram<'tcx>,
+        fn_name: &str,
+        names: &[&str],
+    ) -> Vec<(Option<SlotKind>, bool)> {
+        let f = function_by_name(program, fn_name);
+        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        let slots = CrateSlots::build(program);
+        let crate_ctxt = CrateCtxt::new(program);
+        let facts = MutFacts::from_program(program);
+        let solver = KindSolver::new(&slots);
+        let (_s, sel) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+        add_coherence(&solver, &slots, f, &body);
+        let model =
+            verify_to_fixpoint(program, &slots, &solver, &sel, &facts).expect("accepts");
+        names
+            .iter()
+            .map(|n| {
+                let l = local_by_var_name(tcx, f, n);
+                let slot = local_slot(&slots, f, l, 0);
+                (model.get(&slot).copied(), facts.is_mutable(f, l))
+            })
+            .collect()
+    }
+
+    const NB4_ID: &str = "#[inline(never)] unsafe fn id(q: *mut i32) -> *mut i32 { q } ";
+
+    // ===== §NB4-4a NAMED RESIDUAL — "unmodeled call-boundary materialization" =====
+    // (raw caller arg → `Ref` callee param.)
+    //
+    // Surfaced by 4a-i's WIDENED §0.1 residual-model probe. **PRE-EXISTING**: both markers below
+    // hold identically before A′, so A′ neither introduces nor regresses this class — the probe
+    // only made it visible.
+    //
+    // STATUS: accepted for this pass, **§8-guarded** (BO output is unconsumed by codegen). It is
+    // NOT proven safe and no safety is claimed here. A `Ref` callee param reached from a `Raw`
+    // caller arg forces the rewriter to materialize `&mut *p` at the call. That materialized
+    // reborrow is never modeled: its issuer (the arg temp) is `Raw`, and a `Raw` local issues no
+    // loan in the replay, so no loan exists to check. This is a **LOAN-CREATION GAP** (plan
+    // fragment-F / §6.4 list: OPEN).
+    //
+    // MECHANISM OWNERSHIP: the candidate fix ("retain the loan when the callee param is `Ref`
+    // though the caller arg is `Raw`") is ENTANGLED with the F2 copy-group routing redesign — a
+    // materialized loan is inert without routing, because the invalidating access is keyed under a
+    // different `Local` (the same `local_map` blindness). Investigation is assigned to **4b's
+    // micro-plan**, alongside routing; the homing decision is made there, with dumps.
+
+    /// MARKER — raw caller arg → `Ref` callee param, unmodeled. `f`'s whole cluster is correctly
+    /// `Raw` under A′, yet `id`'s PARAM settles `Ref`, so the call must materialize `&mut *p` from
+    /// a raw pointer. §8-guarded; must flip when the materialized reborrow is modeled.
+    #[test]
+    fn nb4_marker_raw_arg_ref_param_unmodeled() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let x = id(p); *x = 1; let b = p; *b = 2; *x }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let caller = nb4_accept(tcx, &program, "f", &["x", "p", "b"]);
+                let sig = nb4_accept(tcx, &program, "id", &["q"]);
+                for (n, k) in [("x", caller[0].0), ("p", caller[1].0), ("b", caller[2].0)] {
+                    assert_eq!(k, Some(SlotKind::Raw), "A′: caller-side `{n}` is Raw");
+                }
+                assert_eq!(
+                    sig[0].0,
+                    Some(SlotKind::Ref),
+                    "TODAY `id.q` settles `Ref` while every caller-side slot is `Raw` — the call \
+                     materializes `&mut *p` from a raw pointer and that reborrow is UNMODELED \
+                     (§8-guarded). Must flip when the materialized loan is modeled."
+                );
+            },
+        );
+    }
+
+    /// MARKER (the SHARPEST instance) — **two aliasing args, both `Ref`**. `id2(p, p)` passes the
+    /// same raw pointer twice into a callee whose params BOTH settle `Ref`, so the call site
+    /// materializes **two overlapping `&mut` to one cell**. That is UB at materialization — no
+    /// during-call write is even required. Accepted today; §8-guarded.
+    #[test]
+    fn nb4_marker_two_aliasing_args_both_ref() {
+        run_compiler(
+            "#[inline(never)] unsafe fn id2(a: *mut i32, b: *mut i32) -> i32 \
+             { *a = 1; *b = 2; *a } \
+             unsafe fn f(p: *mut i32) -> i32 { id2(p, p) }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let callee = nb4_accept(tcx, &program, "id2", &["a", "b"]);
+                let caller = nb4_accept(tcx, &program, "f", &["p"]);
+                assert_eq!(caller[0].0, Some(SlotKind::Raw), "the caller's `p` is Raw");
+                assert_eq!(
+                    (callee[0].0, callee[1].0),
+                    (Some(SlotKind::Ref), Some(SlotKind::Ref)),
+                    "TODAY both params of `id2` settle `Ref` while the sole caller passes ONE raw \
+                     pointer to both — the call materializes two overlapping `&mut` to the same \
+                     cell (UB at materialization). §8-guarded; must flip when the materialized \
+                     loans are modeled."
+                );
+            },
+        );
+    }
+
+    /// §NB4-4a RED (c) — **returned borrow vs base mutation.** `x = id(p)` aliases `(*p)` through
+    /// the call return; the base is then mutated through the sibling copy `b = p`. TODAY the edge
+    /// `issuer=<arg temp> requirers=[x]` is discharged via the ISSUER, so `p`/`b` go `Raw` and
+    /// **`x` survives `Ref`** — a shared reference into a cell written through a raw alias (the
+    /// S2-6 family, production-parity, §8-guarded). A′ must demote the live requirer `x`.
+    ///
+    /// §0.1 residual-model probe (WIDENED, ruled 2026-07-12): the accepted model is inspected for
+    /// the WHOLE aliasing cluster, not just `x` — no slot in it may remain `Ref`, or the "fix" has
+    /// merely relocated the unsoundness. Any `Ref` here is a STOP requiring a soundness argument.
+    #[test]
+    fn nb4_returned_borrow_vs_base_mutation() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let x = id(p); *x = 1; let b = p; *b = 2; *x }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["x", "p", "b"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "A′: `x` is a LIVE requirer of the invalidated loan on `(*p)`; demoting the \
+                     issuer (the arg temp ≡ `p`) removes the CONFLICT but not x's REQUIREMENT — \
+                     x must not survive `Ref`"
+                );
+                // §0.1 WIDENED residual-model probe: pin the FULL accepted model, not just `x` —
+                // a "fix" that merely relocates the unsoundness must not pass.
+                for (label, (kind, _)) in [("p", m[1]), ("b", m[2])] {
+                    assert_ne!(
+                        kind,
+                        Some(SlotKind::Ref),
+                        "residual-model probe: `{label}` aliases the written cell and must not \
+                         settle `Ref` — a `Ref` here means the unsoundness moved, not closed"
+                    );
+                }
+                // The ONE slot that does settle `Ref`: the callee PARAM. Pinned, not excused — it
+                // is the named residual "unmodeled call-boundary materialization" (§8-guarded,
+                // pre-existing, assigned to 4b's micro-plan). See
+                // `nb4_marker_raw_arg_ref_param_unmodeled` and `nb4_marker_two_aliasing_args_both_ref`.
+                let sig = nb4_accept(tcx, &program, "id", &["q"]);
+                assert_eq!(
+                    sig[0].0,
+                    Some(SlotKind::Ref),
+                    "residual-model probe: `id.q` is the sole `Ref` in the accepted model — the \
+                     named call-boundary-materialization residual, NOT closed by A′"
+                );
+            },
+        );
+    }
+
+    /// §NB4-4a RED (a) — **callee write kills the caller's alias.** Same edge shape as (c), but the
+    /// invalidating write comes from a CALLEE (`writer` writes `*q`) rather than an inline base
+    /// mutation. This is the INTERACTION fixture: it must hold under A′ (4a-i) *and* survive
+    /// 4a-ii's effect gating, because `writer` is classified **may-write** — gating must not
+    /// silently switch off a real writer's access.
+    #[test]
+    fn nb4_callee_write_invalidates_caller_loan() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn writer(q: *mut i32) {{ *q = 7; }} \
+                 unsafe fn f(p: *mut i32) -> i32 {{ let x = id(p); *x = 1; writer(p); *x }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["x", "p"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "A′: `writer(p)` invalidates the loan `x` requires; x is the live requirer and \
+                     must be demoted (today the issuer is demoted and x survives `Ref`)"
+                );
+                assert_ne!(m[1].0, Some(SlotKind::Ref), "residual probe: `p` must not stay `Ref`");
+            },
+        );
+    }
+
+    /// §NB4-4a RED (c′) — the **minimal S2-6-family** shape: the returned borrow `x` is IMMUTABLE
+    /// (never written through ⇒ Foster `Imm`), and the base is written through the sibling `b = p`.
+    /// A′ closes this **a phase early** — its reach is a property of the EDGE MENU, not of loan
+    /// mutability, so the "immutable ⇒ needs write-awareness" intuition does not apply.
+    ///
+    /// ⚠ TRIPWIRE (recorded 2026-07-12): this closure rests on the pointer-copy-as-`Deep`-access
+    /// OVER-APPROXIMATION — `let b = p` is a copy of the pointer VALUE, not an access to the
+    /// pointee, yet it invalidates the loan `x` requires. If any future precision work gates copy
+    /// accesses, this fixture goes RED and the soundness must be re-carried by the copy-group
+    /// routing mechanism (the redesigned 4b closure). This test is the tripwire for exactly that.
+    #[test]
+    fn nb4_returned_immutable_borrow_vs_base_write() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let x = id(p); let b = p; *b = 5; *x }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["x", "p", "b"]);
+                assert!(
+                    !m[0].1,
+                    "precondition: `x` is never written THROUGH ⇒ Foster `Imm` (this is the \
+                     immutable shape — the one the Imm-skip protects at 4b)"
+                );
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "A′ demotes the live requirer `x` even though its provenance is IMMUTABLE — \
+                     the menu restriction is orthogonal to the immutable-loan skip"
+                );
+                assert_ne!(m[1].0, Some(SlotKind::Ref), "residual probe: `p`");
+                assert_ne!(m[2].0, Some(SlotKind::Ref), "residual probe: `b`");
+            },
+        );
+    }
+
+    /// §NB4-4a-ii RED (no-deref) — **the effect-gating fixture**, three-state.
+    ///
+    /// `ignores` takes the pointer BY VALUE and never dereferences it. Passing a pointer while a
+    /// `&mut` to its pointee is live is perfectly legal — yet the Call arm's effect-blind
+    /// `consume_operand(arg)` emits a `Deep` access to `(*arg)` anyway, manufacturing a conflict.
+    /// (CONTROL that proved this is the real over-invalidation class, and that a read-only-DEREF
+    /// callee is NOT: the identical edge appears for an inline `let _v = *p;` with **no call at
+    /// all** — so read-through-alias vs a live `&mut` is a GENUINE conflict, not a call artifact.)
+    ///
+    /// Trajectory — one assertion per stage, flipped by the commit that causes each transition:
+    ///   • TODAY  `Ref` — the issuer-discharge accidentally spares `x`  ← asserted here
+    ///   • 4a-i   `Raw` — A′ demotes the live requirer of a SPURIOUS edge (visible over-demotion)
+    ///   • 4a-ii  `Ref` — effect gating classifies `ignores` as **no-access**, the edge disappears
+    #[test]
+    fn nb4_no_deref_callee_loan_survives() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn ignores(_q: *mut i32) -> i32 {{ 0 }} \
+                 unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let x = id(p); *x = 1; let v = ignores(p); *x + v }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["x"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "STAGE 2 (4a-i / A′ landed): `x` is now demoted — but the edge driving it is \
+                     SPURIOUS (`ignores` never dereferences `q`; the Call arm's effect-blind `Deep` \
+                     access to `(*arg)` manufactured the conflict). This is the KNOWN over-demotion \
+                     A′ introduces, and it is what 4a-ii's **no-access** effect gating must claw \
+                     back to `Ref` (STAGE 3). Asserted per-stage so the clawback cannot be silently \
+                     skipped: when 4a-ii lands, this flips back to `Ref`."
                 );
             },
         );
