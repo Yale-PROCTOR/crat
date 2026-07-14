@@ -544,16 +544,10 @@ pub fn find_plan(
         selected.extend(additions);
     }
 
-    // the rewriter now emits Guarded call sites as hoisted null-checked
-    // guards (see rewriter/struct_param_field_spec.rs), so a would-be-Guarded
-    // site keeps its target selected instead of dropping through the cascade
-    let guarded_live = true;
-
     // validity fixpoint: every call site into a selected position needs a
     // usable class, and a selected forwarder needs its target selected.
-    // Guarded is usable only once the rewriter can emit it (guarded_live);
-    // until then a Guarded-only site behaves like the old "no usable class"
-    // case and sinks its target through the same cascade
+    // Guarded is always usable — the rewriter emits such sites as hoisted
+    // null-checked guards (see rewriter/struct_param_field_spec.rs)
     loop {
         let before = selected.len();
         let keep: FxHashSet<(LocalDefId, usize)> = selected
@@ -565,7 +559,7 @@ pub fn find_plan(
                     .all(|fact| {
                         fact.classes.iter().any(|class| match class {
                             ArgClass::Null | ArgClass::FieldSibling | ArgClass::NonNull => true,
-                            ArgClass::Guarded => guarded_live,
+                            ArgClass::Guarded => true,
                             ArgClass::Forward(from) => selected.contains(from),
                         })
                     });
@@ -608,8 +602,8 @@ pub fn find_plan(
         let emission = if direct {
             SiteEmission::Direct
         } else {
-            // only reachable when guarded_live: otherwise the fixpoint above
-            // already sank any target whose sole class here is Guarded
+            // no proven-safe class at this site: the rewriter hoists a
+            // null-checked guard here
             SiteEmission::Guarded
         };
         site_emissions.insert((fact.caller, fact.span, fact.arg_idx), emission);
@@ -1048,10 +1042,8 @@ pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: 
         // param into inner; inner is selected via the sibling trigger in
         // top->outer, but outer2 itself never triggers selection (it has no
         // sibling field pointer and no nullity fact), so its forward
-        // degrades to Guarded rather than dropping inner. like test B, this
-        // depends on guarded_live=true (a Forward to an unselected caller
-        // has no other usable class), so it is ignored until Task 2 flips
-        // the flag
+        // degrades to Guarded rather than dropping inner (a Forward to an
+        // unselected caller has no other usable class)
         let code = r#"
 use ::libc;
 #[repr(C)]
