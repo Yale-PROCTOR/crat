@@ -12,7 +12,7 @@ use rustc_middle::{
     },
     ty::{self, TyCtxt},
 };
-use rustc_span::{Symbol, def_id::LocalDefId};
+use rustc_span::{Span, Symbol, def_id::LocalDefId};
 
 use crate::{
     analyses::pointer_flow::{
@@ -350,6 +350,24 @@ pub struct SpecPlan {
     /// forwarding edges among targets: caller (fn, param) passes its own
     /// specialized param directly as callee (fn, param)
     pub forwards: FxHashSet<((LocalDefId, usize), (LocalDefId, usize))>,
+    /// per-call-site emission decision for specialized-position arguments
+    /// that need neither the null-literal retype nor bare forwarding; keyed
+    /// by the caller function, the call terminator's span, and the argument
+    /// index (a single call site may specialize multiple arguments).
+    // consumed by the rewriter once it lands (guarded-conversion follow-up)
+    #[allow(dead_code)]
+    pub site_emissions: FxHashMap<(LocalDefId, Span, usize), SiteEmission>,
+}
+
+/// how a call-site argument that needs no special-case emission (not a
+/// null literal, not a bare forward into a selected target) should be
+/// rewritten by the resolver/rewriter
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteEmission {
+    // provably safe: `&mut/& (*e).fld as *T` inline
+    Direct,
+    // unprovable: needs a hoisted null-checked let before the statement
+    Guarded,
 }
 
 // how a call-site argument at a specialized position can be rewritten
@@ -365,6 +383,10 @@ enum ArgClass {
     FieldSibling,
     // non-null per the nullity analysis: `&raw mut (*e).fld` is safe
     NonNull,
+    // universal fallback: no class above applies, but the site is still
+    // rewritable via a hoisted null-checked guard (Task 2); keeps arg_ok
+    // semantics uniform (every candidate position now has a usable class)
+    Guarded,
 }
 
 // one call site into a candidate position, with every applicable class
@@ -372,6 +394,11 @@ enum ArgClass {
 struct CallSiteFact {
     callee: (LocalDefId, usize),
     classes: Vec<ArgClass>,
+    // the caller function, the call terminator's span, and the argument
+    // index, used to key `SpecPlan::site_emissions`
+    caller: LocalDefId,
+    span: Span,
+    arg_idx: usize,
 }
 
 fn all_bases_null_like(flow: &PointerFlowResult, op: &Operand<'_>) -> bool {
@@ -439,6 +466,10 @@ fn classify_arg<'tcx>(
         classes.push(ArgClass::NonNull);
     }
 
+    // universal fallback: every candidate position is rewritable via a
+    // hoisted guard, so arg_ok never needs a "no class matched" case
+    classes.push(ArgClass::Guarded);
+
     classes
 }
 
@@ -462,12 +493,14 @@ pub fn find_plan(
         let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         let defs = BodyDefs::new(&body, tcx);
         for block in body.basic_blocks.iter() {
-            let TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
+            let terminator = block.terminator();
+            let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
                 continue;
             };
             let Some(callee) = call_target(tcx, func) else {
                 continue;
             };
+            let span = terminator.source_info.span;
             for i in 0..args.len() {
                 if !candidates.contains_key(&(callee, i)) {
                     continue;
@@ -491,6 +524,9 @@ pub fn find_plan(
                 facts.push(CallSiteFact {
                     callee: (callee, i),
                     classes,
+                    caller: fn_did,
+                    span,
+                    arg_idx: i,
                 });
             }
         }
@@ -510,8 +546,16 @@ pub fn find_plan(
         selected.extend(additions);
     }
 
+    // the rewriter cannot yet emit Guarded call sites (Task 2); until it can,
+    // a would-be-Guarded site instead drops its target, mimicking the
+    // pre-guarded-conversion behavior exactly. flipped in the guarded-emission task
+    let guarded_live = false;
+
     // validity fixpoint: every call site into a selected position needs a
-    // usable class, and a selected forwarder needs its target selected
+    // usable class, and a selected forwarder needs its target selected.
+    // Guarded is usable only once the rewriter can emit it (guarded_live);
+    // until then a Guarded-only site behaves like the old "no usable class"
+    // case and sinks its target through the same cascade
     loop {
         let before = selected.len();
         let keep: FxHashSet<(LocalDefId, usize)> = selected
@@ -523,6 +567,7 @@ pub fn find_plan(
                     .all(|fact| {
                         fact.classes.iter().any(|class| match class {
                             ArgClass::Null | ArgClass::FieldSibling | ArgClass::NonNull => true,
+                            ArgClass::Guarded => guarded_live,
                             ArgClass::Forward(from) => selected.contains(from),
                         })
                     });
@@ -539,6 +584,39 @@ pub fn find_plan(
         }
     }
 
+    // per-site emission decisions for arguments into surviving targets that
+    // need neither the null-literal retype nor bare forwarding
+    let mut site_emissions = FxHashMap::default();
+    for fact in &facts {
+        if !selected.contains(&fact.callee) {
+            continue;
+        }
+        // skip: null-literal sites keep the retype path
+        if fact.classes.contains(&ArgClass::Null) {
+            continue;
+        }
+        // skip: bare-pass sites forwarding a still-selected candidate stay forwarding
+        let forwards_selected = fact
+            .classes
+            .iter()
+            .any(|class| matches!(class, ArgClass::Forward(from) if selected.contains(from)));
+        if forwards_selected {
+            continue;
+        }
+        let direct = fact
+            .classes
+            .iter()
+            .any(|class| matches!(class, ArgClass::FieldSibling | ArgClass::NonNull));
+        let emission = if direct {
+            SiteEmission::Direct
+        } else {
+            // only reachable when guarded_live: otherwise the fixpoint above
+            // already sank any target whose sole class here is Guarded
+            SiteEmission::Guarded
+        };
+        site_emissions.insert((fact.caller, fact.span, fact.arg_idx), emission);
+    }
+
     let targets = candidates
         .into_iter()
         .filter(|(key, _)| selected.contains(key))
@@ -547,7 +625,11 @@ pub fn find_plan(
         .into_iter()
         .filter(|(from, to)| selected.contains(from) && selected.contains(to))
         .collect();
-    SpecPlan { targets, forwards }
+    SpecPlan {
+        targets,
+        forwards,
+        site_emissions,
+    }
 }
 
 #[cfg(test)]
@@ -880,6 +962,133 @@ pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_in
             (targets, plan.forwards.len())
         })
         .unwrap()
+    }
+
+    // returns sorted (caller fn, arg idx, emission) triples for a callee name
+    fn emissions_for(code: &str, callee: &str) -> Vec<(String, usize, String)> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_rust_program(tcx);
+            let flows = pointer_flow_analysis(&program, &FxHashSet::default());
+            let nullity = crate::analyses::nullity::NullityResult {
+                non_null_params: FxHashMap::default(),
+                non_null_locals: FxHashMap::default(),
+            };
+            let plan = find_plan(&program, &flows, &nullity, &FxHashSet::default());
+            let mut out: Vec<(String, usize, String)> = plan
+                .site_emissions
+                .iter()
+                .filter(|((_, _, _), _)| true)
+                .map(|(&(caller, _, idx), em)| {
+                    (
+                        tcx.item_name(caller.to_def_id()).to_string(),
+                        idx,
+                        format!("{em:?}"),
+                    )
+                })
+                .collect();
+            let _ = callee;
+            out.sort();
+            out
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_field_sibling_site_is_direct() {
+        let emissions = emissions_for(TRIGGERED, "build");
+        assert!(
+            emissions.contains(&("fixed".to_string(), 0, "Direct".to_string())),
+            "expected Direct emission for fixed's site, got {emissions:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "enabled with guarded emission"]
+    fn test_unprovable_site_is_guarded() {
+        // stranger has neither a sibling field pointer nor a nullity fact for
+        // its argument to build: the site is unprovable and must be Guarded,
+        // not dropped
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    return build(p, tree);
+}
+"#;
+        let emissions = emissions_for(code, "build");
+        assert!(
+            emissions.contains(&("stranger".to_string(), 0, "Guarded".to_string())),
+            "expected Guarded emission for stranger's site, got {emissions:?}"
+        );
+        let (targets, _) = plan_for(code);
+        assert!(
+            !targets.is_empty(),
+            "build must remain selected once unprovable sites are guarded, not dropped"
+        );
+    }
+
+    #[test]
+    #[ignore = "enabled with guarded emission"]
+    fn test_forward_on_unselected_is_guarded() {
+        // outer2 is an untriggered candidate caller that forwards its own
+        // param into inner; inner is selected via the sibling trigger in
+        // top->outer, but outer2 itself never triggers selection (it has no
+        // sibling field pointer and no nullity fact), so its forward
+        // degrades to Guarded rather than dropping inner. like test B, this
+        // depends on guarded_live=true (a Forward to an unselected caller
+        // has no other usable class), so it is ignored until Task 2 flips
+        // the flag
+        let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn outer2(mut s: *mut st) -> libc::c_int {
+    return inner(s);
+}
+"#;
+        let emissions = emissions_for(code, "inner");
+        assert!(
+            emissions.contains(&("outer2".to_string(), 0, "Guarded".to_string())),
+            "expected Guarded emission for outer2's site, got {emissions:?}"
+        );
+        let (targets, _) = plan_for(code);
+        assert!(
+            targets.iter().any(|(name, _, _)| name == "inner"),
+            "inner must stay selected, got {targets:?}"
+        );
     }
 
     #[test]
