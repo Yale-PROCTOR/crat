@@ -39,6 +39,10 @@ mod places_conflict;
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
+// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
+// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
+#[cfg(test)]
+pub(crate) use invalidates::{RoutedCompose, route_compose};
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the
