@@ -11530,6 +11530,54 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB4-R MARKER — Codex adversarial review (2026-07-15) surfaced two code-level fragilities in
+    /// the routing under MULTIPLY-ASSIGNED / branch-joined MIR locals:
+    ///   (F1) offset exclusion keys by `(Local, Place)` without loan-location, so a local assigned
+    ///        BOTH `b = p.offset(1)` and `b = p` (same source) has its copy loan wrongly excluded;
+    ///   (F2) the routing walk dedups by base `Local`, so a writer branch-joined from `h.q`/`h.r`
+    ///        (both base local `h`) has one field edge dropped by the visited set.
+    /// Both are in the UNDER-invalidation direction (a missed demotion → §8-guarded UAF class).
+    ///
+    /// This marker WITNESSES that on both flagged shapes the views settle `Raw` REGARDLESS of routing
+    /// (verified `Raw` with `CRAT_NB4R_ROUTING` on AND off, 2026-07-15): the tree-borrow GROUP
+    /// machinery demotes the branch/collision copies independently, so the routing edge-drop /
+    /// over-exclusion is MASKED — no observable under-invalidation. The findings are latent code
+    /// fragility, not an active regression. If a future change removes the grouping safety net for
+    /// these shapes, this marker flips (a view goes `Ref`) and surfaces the hole. See the NB4-R task
+    /// doc for the fix options (F2: dedup the walk by loan/edge, not base local; F1: disambiguate
+    /// offset vs copy via a copy-signature set).
+    #[test]
+    fn nb4r_marker_multiassign_grouping_masked() {
+        let f2 = format!(
+            "{NB4_ID} #[repr(C)] struct H {{ q: *mut i32, r: *mut i32 }} \
+             unsafe fn f(mut h: H, c: bool) -> i32 \
+             {{ let vq = id(h.q); let vr = id(h.r); let b = if c {{ h.q }} else {{ h.r }}; \
+                let r0 = *vq + *vr; *b = 5; r0 + *vq + *vr }}"
+        );
+        let f1 = format!(
+            "{NB4_ID} unsafe fn f(mut p: *mut i32, c: bool) -> i32 \
+             {{ let v = id(p); let mut b = p; if c {{ b = p.offset(1); }} \
+                let r0 = *v; *b = 5; r0 + *v }}"
+        );
+        for (label, src, views) in [
+            ("F2 branch-joined field sources", f2, &["vq", "vr"][..]),
+            ("F1 offset+copy collision", f1, &["v"][..]),
+        ] {
+            run_compiler(&src, |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", views);
+                for (i, v) in views.iter().enumerate() {
+                    assert_eq!(
+                        m[i].0,
+                        Some(SlotKind::Raw),
+                        "{label}: view `{v}` is demoted by the grouping safety net (Raw), masking the \
+                         Codex-flagged routing fragility — no observable under-invalidation here."
+                    );
+                }
+            });
+        }
+    }
+
     // ===== §NB4-R — place-based cross-alias-write routing (RED-first, pre-implementation) =====
     //
     // Spec: docs/agents/tasks/2026-07-15-nb4r-place-based-routing-spec.md.
