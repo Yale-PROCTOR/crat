@@ -23,8 +23,6 @@
 //! bare name across every callee kind. Type guards (slice-shaped args/dests)
 //! are recorded in `note` as documentation, not enforced here.
 
-use rustc_span::def_id::DefId;
-
 /// Semantic role of a callee, per the NB0 taxonomy (source / sink /
 /// loan-creating / provenance-preserving flow / unknown), refined by the
 /// concrete role kinds the legacy lists actually encode.
@@ -276,42 +274,6 @@ pub(crate) fn lookup(name: &str, matcher: Matcher) -> Option<&'static Entry> {
     TABLE
         .iter()
         .find(|e| e.name == name && e.matcher == matcher)
-}
-
-/// §NB4-4a-ii — `true` iff `callee` is a NON-LOCAL boundary callee whose row is entirely
-/// `NoAccess` (it inspects the POINTER value, never the pointee): `is_null`, `addr`.
-///
-/// Uses the `RustPtrPath` discipline **verbatim** from `infer/boundary/library.rs:27-56`
-/// (`def_path` starts at `TypeNs("ptr")` AND `def_path.data[3]` is a `ValueNs` with the name).
-/// Do NOT loosen this to a bare-name match: an unrelated non-local fn named `is_null` would
-/// then be silently gated to `NoAccess` and its pointee accesses would vanish from
-/// invalidation. `nb4_no_access_rows_are_exactly_is_null_and_addr` pins the row set.
-pub(crate) fn callee_is_no_access(tcx: rustc_middle::ty::TyCtxt<'_>, callee: DefId) -> bool {
-    let def_path = tcx.def_path(callee);
-    let in_ptr = matches!(
-        def_path.data.first().map(|d| matches!(
-            d.data,
-            rustc_hir::definitions::DefPathData::TypeNs(s) if s.as_str() == "ptr"
-        )),
-        Some(true)
-    );
-    if !in_ptr {
-        return false;
-    }
-    let Some(d) = def_path.data.get(3) else {
-        return false;
-    };
-    let rustc_hir::definitions::DefPathData::ValueNs(s) = d.data else {
-        return false;
-    };
-    lookup(s.as_str(), Matcher::RustPtrPath).is_some_and(entry_is_no_access)
-}
-
-/// A row is gate-eligible iff EVERY role it carries maps to `Effect::NoAccess`.
-pub(crate) fn entry_is_no_access(e: &Entry) -> bool {
-    e.roles
-        .iter()
-        .all(|r| role_effects(*r) == [Effect::NoAccess])
 }
 
 // ---------------------------------------------------------------------------
