@@ -10982,9 +10982,9 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// structurally blind to the call-return alias (`x = id(p)`); write-awareness cannot route the
     /// write's invalidation of p's loan to x's loan. The forced-mut demotion of x/z/q rides the
     /// READ pointer-copies `z = x`/`q = x` (verified: `INSERT rw=Read borrowed=(*x)` at those
-    /// points), which the read-skip soundly preserves. Closing this needs **NB4 call-as-access**
-    /// (corrected 2026-07-12 — see below). This test is the **NB4-boundary marker**: it stays `Ref`
-    /// today and must flip to `Raw` when NB4 lands. (The SOUND-skip proof is
+    /// points), which the read-skip soundly preserves. Closing this needs **routing** (corrected
+    /// below — the router is NB4-R, place-based). This test is the **NB4-R-boundary marker**: it stays
+    /// `Ref` today and must flip to `Raw` when NB4-R lands. (The SOUND-skip proof is
     /// `nb2_two_shared_reads_both_ref`; this is its UNSOUND-skip counterpart.)
     ///
     /// **Decision B (2026-07-11):** the 3b write-aware fix was measured **corpus-inert** — 0
@@ -10993,16 +10993,20 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// skip-eligible). Write-awareness is inert *without* a router that makes the cross-alias write
     /// reach the aliased loan.
     ///
-    /// **CORRECTED 2026-07-12 (NB3-3c-ii spike-first, before any code): the router is NB4
-    /// call-as-access, NOT 3c origins.** The decision-B fold guessed origins would route the write;
-    /// the spike refuted it: `compute_origins` carries **0 subset edges** for this caller `f`
-    /// (signature `(*mut i32) -> i32`), origins are subset relations while invalidation is
-    /// **place-based (local-keyed)** so subset edges never change what a write invalidates, and
-    /// `x ⊇ p` is already in production's subset via `lifetime_flow::apply_call_summary` yet the
-    /// witness stays `Ref` (measured: `*b=5` invalidates only b's own loan `_2`). The router is
-    /// **NB4's call-as-access** — treating `x=id(p)` as a deep-write access reaches x's loan. WA +
-    /// this witness's three-state now live at **NB4**. Until NB4, this remains `Ref` (fork ==
-    /// production; §8 is the sole guard).
+    /// **STATE-2 §8-guarded marker (router = NB4-R, place-based; earlier routers all refuted).**
+    /// The write's non-reach was diagnosed by dump: `*b=5` invalidates only b's own loan (`row(b)`
+    /// keyed under b, empty of the loan x/z/q require, which is keyed under p). Three routers were
+    /// refuted, each by a dump — recorded so none is re-attempted:
+    ///   • 3c origins (subset edges) — invalidation is place-based, subset never changes a write's reach;
+    ///   • `tree_borrow_local` copy-groups — singleton at round 0 (only unioned during demotion replay);
+    ///   • `Local`-based issues→borrowed re-basing (NB4-4b `ffd90100`) — fixture-level closure but on
+    ///     the corpus it CRASHED 3 programs (re-basing a projection across incompatible types) and
+    ///     over-demoted −17.7% (offset conflation). REVERTED.
+    /// WA is also refuted for this witness: the loan x/z/q require has base `p` which is Foster `Mut`
+    /// (never skip-eligible) — routing alone flips it. The real router is **NB4-R (place-based
+    /// cross-alias routing, before NB5): `places_conflict`-grade algebra, `offset` excluded, bounded
+    /// walk.** Until NB4-R lands this stays `Ref` (fork == production; §8 is the sole guard) and must
+    /// flip to `Raw` then. (Fixture-level closure is validated; corpus substrate is the open work.)
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
@@ -11098,11 +11102,13 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 // `*b = 5` looks up `local_map.row(b)`, which is **EMPTY**: every loan is keyed under
                 // `p`, and `b` is a *copy* of p (a different `Local`). The cross-alias write is
                 // invisible to invalidation. Hence NEITHER A′ NOR write-awareness flips this witness
-                // — WA changes the immutable-loan SKIP, but there is no loan in b's row to skip. 4b's
-                // closure must ROUTE a write through a copy to its copy-group's loans
-                // (`tree_borrow_local` is already in the 7-field manifest ⇒ fork-side, freeze-safe).
-                // This assertion is what makes that finding non-forgettable: if 4b's routing lands,
-                // this edge set CHANGES and this assertion fails — by design.
+                // — WA changes the immutable-loan SKIP, but the loan x/z/q require has a `Mut` base
+                // (never skip-eligible), and there is no loan in b's row to reach. The closure must
+                // ROUTE the write through b's issued loan (`borrowed=(*p)`) to `row(p)` — the deferred
+                // NB4-R (place-based cross-alias routing) phase (the `Local`-based and
+                // `tree_borrow_local` routes were both refuted; see the doc above). This assertion is
+                // what makes the finding non-forgettable: when NB4-R's routing lands, this edge set
+                // CHANGES and this assertion fails — by design.
                 let edges = revalidate_replaying(&program, &slots, |_| true, |_| false, &facts);
                 let b_slot = slot_of("b");
                 let fn_edges = edges.get(&f).map(Vec::as_slice).unwrap_or(&[]);
@@ -11117,7 +11123,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     vec![b_slot],
                     "state-2: it is a SELF-edge (requirer == issuer == `b`) — there is no live `Ref` \
                      requirer beyond the issuer, which is precisely WHY A′ is inert on this witness \
-                     and the S2-6 closure must wait for 4b's copy-group routing"
+                     and the S2-6 closure must wait for NB4-R place-based routing"
                 );
             },
         );
