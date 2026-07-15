@@ -4,13 +4,15 @@
 // immutable-loan skip (`continue; // loan of immutable provenance does not invalidate`) fires for
 // READS only, not writes. NO sync tripwire (divergence is the deliverable). NB6's validator uses the
 // UNFORKED production engine (D5).
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::{
     mir::{
-        Body, CopyNonOverlapping, InlineAsmOperand, Location, NonDivergingIntrinsic, Operand,
-        Place, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, visit::Visitor,
+        Body, CopyNonOverlapping, InlineAsmOperand, Local, Location, NonDivergingIntrinsic, Operand,
+        Place, PlaceElem, PlaceRef, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        visit::Visitor,
     },
-    ty::TyCtxt,
+    ty::{TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
@@ -18,7 +20,7 @@ use super::{
     BorrowSet, Loan,
     places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
 };
-use crate::analyses::borrow::ProvenanceSet;
+use crate::analyses::borrow::{Borrower, ProvenanceOwner, ProvenanceSet};
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
@@ -31,6 +33,13 @@ pub fn compute_invalidates<'tcx>(
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
 
+    // §NB4-R routing toggle (default ON). `CRAT_NB4R_ROUTING=off|0` disables the cross-alias-write
+    // walk, restoring pre-NB4-R invalidation — the sweep's gross-demotion attribution runs both.
+    let routing_enabled = !matches!(
+        std::env::var("CRAT_NB4R_ROUTING").as_deref(),
+        Ok("off") | Ok("0")
+    );
+
     LoanInvalidatesGenerator {
         facts: &mut invalidates,
         tcx,
@@ -38,10 +47,96 @@ pub fn compute_invalidates<'tcx>(
         borrow_set,
         provenance_set,
         location_map,
+        issued_loans: if routing_enabled {
+            build_issued_loans(tcx, body, borrow_set)
+        } else {
+            FxHashMap::default()
+        },
+        routing_enabled,
     }
     .visit_body(body);
 
     invalidates
+}
+
+/// §NB4-R — an `offset`-call destination signature `(dest_local, borrowed=(*arg0))`. The fork
+/// CANNOT tell an `offset` loan from a copy loan by `BorrowData` alone (both build `borrowed=(*arg0)`,
+/// and `BorrowData::location` is private to the `borrow` module), so the offset destinations are
+/// re-derived here by re-walking the MIR. **COUPLING GUARD (spec §4.1 / Amendment 4):** production's
+/// `is_borrowing_method` = `{offset, as_ptr, as_mut_ptr}` (`borrow/mod.rs:783`, FROZEN); only `offset`
+/// is address-CHANGING — `as_ptr`/`as_mut_ptr` are address-preserving and STAY as routing edges
+/// (array-cell collapse). This matches ONLY `offset`; if the frozen set ever gains an address-changing
+/// method, extend this filter (`address-changing(is_borrowing_method) ⊆ {offset}`).
+fn build_offset_sigs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> FxHashSet<(Local, Place<'tcx>)> {
+    let mut sigs = FxHashSet::default();
+    for data in body.basic_blocks.iter() {
+        let Some(term) = &data.terminator else {
+            continue;
+        };
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &term.kind
+        else {
+            continue;
+        };
+        let TyKind::FnDef(def_id, _) = func.ty(body, tcx).kind() else {
+            continue;
+        };
+        if def_id.is_local()
+            || tcx.def_kind(*def_id) != rustc_hir::def::DefKind::AssocFn
+            || tcx.item_name(*def_id).as_str() != "offset"
+        {
+            continue;
+        }
+        let Some(arg0) = args.first().and_then(|a| a.node.place()) else {
+            continue;
+        };
+        sigs.insert((
+            destination.local,
+            arg0.project_deeper(&[PlaceElem::Deref], tcx),
+        ));
+    }
+    sigs
+}
+
+/// §NB4-R — the copy/reborrow chain a routed write follows: maps each local to the loans it ISSUES
+/// (`assigned == Assign(Local(l))`). A chain edge is a COPY/REBORROW, whose `borrowed` place is
+/// `source.project_deeper([Deref])` and therefore ENDS in `Deref` (`b=p`→`[Deref]`; `b=h.q`→
+/// `[Field, Deref]`; `b=*pp`→`[Deref, Deref]`; `&mut *p`→`[Deref]`). A DIRECT sub-borrow (`&mut a`→
+/// `[]`; `&mut a.f`→`[Field]`; `&mut (*p).f`→`[Deref, Field]`) does NOT end in `Deref` and is excluded
+/// (spec §11-B: the discriminator is the LAST element, not the first). Address-changing `offset` edges
+/// are excluded via `build_offset_sigs`. `CallArg` loans are not edges (the issuer is a callee, not a
+/// copy) but remain invalidation TARGETS in `local_map`. Built once per `compute_invalidates`.
+fn build_issued_loans<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+) -> FxHashMap<Local, Vec<Loan>> {
+    let offset_sigs = build_offset_sigs(tcx, body);
+    let mut m: FxHashMap<Local, Vec<Loan>> = FxHashMap::default();
+    for loan in borrow_set.loans.indices() {
+        let bd = &borrow_set.loans[loan];
+        let Borrower::Assign(ProvenanceOwner::Local(issuer)) = bd.assigned else {
+            continue;
+        };
+        if bd.borrowed.projection.last() != Some(&PlaceElem::Deref) {
+            continue; // a direct sub-borrow, not a pointer copy/reborrow
+        }
+        if bd.borrowed.local == issuer {
+            continue; // degenerate self-alias
+        }
+        if offset_sigs.contains(&(issuer, bd.borrowed)) {
+            continue; // address-changing offset (would over-demote; §4.1)
+        }
+        m.entry(issuer).or_default().push(loan);
+    }
+    m
 }
 
 struct LoanInvalidatesGenerator<'g, 'tcx> {
@@ -51,6 +146,10 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     borrow_set: &'g BorrowSet<'tcx>,
     provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
+    /// §NB4-R routing chain (see `build_issued_loans`). Empty when routing is disabled.
+    issued_loans: FxHashMap<Local, Vec<Loan>>,
+    /// §NB4-R toggle (`CRAT_NB4R_ROUTING`); gates the cross-alias-write walk for sweep attribution.
+    routing_enabled: bool,
 }
 
 /// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
@@ -85,32 +184,129 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         location: Location,
         place: Place<'tcx>,
         access_depth: AccessDepth,
-        // §NB4-4a-ii: labeled, DELIBERATELY UNCONSUMED (see `AccessKind`). 4b's write-aware
-        // rule turns this into `kind` and skips the immutable loan for `Read` only.
-        _kind: AccessKind,
+        // §NB4-4a-ii labeled the kind but left it unconsumed. §NB4-R consumes it: only a WRITE
+        // access ROUTES (below). The DIRECT check still fires for both kinds (production parity).
+        kind: AccessKind,
     ) {
-        let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) else {
-            return;
-        };
-
         let point_index = self.location_map.point_from_location(location);
 
-        for loan in borrows_for_place_base.iter() {
-            let borrow_data = &self.borrow_set.loans[loan];
-            if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
-                && !self.provenance_set.provenance_data[p].is_mutable()
-            {
-                continue; // loan of immutable provenance does not invalidate
+        // DIRECT check: loans keyed under the accessed local.
+        if let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) {
+            for loan in borrows_for_place_base.iter() {
+                let borrow_data = &self.borrow_set.loans[loan];
+                if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
+                    && !self.provenance_set.provenance_data[p].is_mutable()
+                {
+                    continue; // loan of immutable provenance does not invalidate
+                }
+                if places_conflict(
+                    self.tcx,
+                    self.body,
+                    borrow_data.borrowed,
+                    place,
+                    access_depth,
+                    PlaceConflictBias::Overlap,
+                ) {
+                    self.facts.insert(point_index, loan);
+                }
             }
-            if places_conflict(
-                self.tcx,
-                self.body,
-                borrow_data.borrowed,
-                place,
-                access_depth,
-                PlaceConflictBias::Overlap,
-            ) {
-                self.facts.insert(point_index, loan);
+        }
+
+        // §NB4-R CROSS-ALIAS-WRITE ROUTING. Writing `(*x)[rest]` where `x` is a copy/reborrow of some
+        // base cell is a WRITE to THAT cell, but `local_map` keys loans by their borrowed base and
+        // `places_conflict` bails on differing locals, so `row(x)` is BLIND to loans on the aliased
+        // cell (the S2-6 hole). Walk `x`'s issued-loan chain to each aliased base, COMPOSE the access
+        // onto the loan's own (type-valid) BORROWED place, and re-check `row(base)`. Runs even when
+        // `row(x)` was empty above — that is exactly the witness case.
+        //
+        // Gated to WRITE + DEREF only: a bare-value read/move touches the pointer VALUE, not the
+        // pointee (would route `store_global`-style over-invalidation); and a READ never NEEDS to
+        // route — the cross-alias WRITE that makes the cell hazardous already routes to (and demotes)
+        // every read view live across it, so routing reads is redundant (and would spuriously demote
+        // shared reads of a mutable cell in forced-mut mode). This is the "cross-alias-WRITE routing"
+        // divergence class (spec §8).
+        if !self.routing_enabled
+            || kind != AccessKind::Write
+            || place.projection.first() != Some(&PlaceElem::Deref)
+        {
+            return;
+        }
+        let rest = &place.projection[1..];
+        // ty of `(*x)`: the original access's deref type, computed ONCE. The composition
+        // `L.borrowed ++ rest` is well-typed iff `ty(L.borrowed) == deref_ty` (same-type copies
+        // preserve it; a type-changing cast breaks it → whole-cell fallback). This equality is what
+        // keeps `places_conflict` from hitting its `unreachable!` (both operands well-typed at base).
+        let deref_ty = PlaceRef {
+            local: place.local,
+            projection: &place.projection[..1],
+        }
+        .ty(self.body, self.tcx)
+        .ty;
+
+        // PRE-order bounded walk. Visited keyed on base Local, seeded with the access local, marked on
+        // ENTRY — the sole guard against O(2^k) re-expansion of a reconverging copy DAG.
+        let cap = self.body.local_decls.len();
+        let mut visited: FxHashSet<Local> = FxHashSet::default();
+        visited.insert(place.local);
+        let mut expansions = 0usize;
+        let mut worklist: Vec<Loan> = self
+            .issued_loans
+            .get(&place.local)
+            .cloned()
+            .unwrap_or_default();
+        while let Some(edge) = worklist.pop() {
+            let edge_borrowed = self.borrow_set.loans[edge].borrowed;
+            let base = edge_borrowed.local;
+            if !visited.insert(base) {
+                continue;
+            }
+            expansions += 1;
+            assert!(
+                expansions <= cap,
+                "NB4-R routing walk exceeded the per-site cap ({cap}); visited discipline regressed"
+            );
+            // Compose onto the edge's borrowed place, or fall back to whole-cell on a type mismatch.
+            let (routed, routed_depth) = if rest.is_empty() {
+                (edge_borrowed, access_depth)
+            } else if edge_borrowed.ty(self.body, self.tcx).ty == deref_ty {
+                (edge_borrowed.project_deeper(rest, self.tcx), access_depth)
+            } else {
+                // type-changing cast: `L.borrowed ++ rest` would be ill-typed ⇒ whole cell, Deep
+                // (sound over-approximation; §4 ruling — whole-cell, never a silent Disjoint).
+                (edge_borrowed, AccessDepth::Deep)
+            };
+            if let Some(borrows_for_base) = self.borrow_set.local_map.row(base) {
+                for loan in borrows_for_base.iter() {
+                    let borrow_data = &self.borrow_set.loans[loan];
+                    // self-loan skip: the access IS through `place.local`; its OWN loan (keyed under
+                    // `base`) is not a conflict with itself, or every `let b=&mut *p; *b=…` reborrow
+                    // would self-demote.
+                    if matches!(
+                        borrow_data.assigned,
+                        Borrower::Assign(ProvenanceOwner::Local(l)) if l == place.local
+                    ) {
+                        continue;
+                    }
+                    if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
+                        && !self.provenance_set.provenance_data[p].is_mutable()
+                    {
+                        continue; // loan of immutable provenance does not invalidate (read-only cell)
+                    }
+                    if places_conflict(
+                        self.tcx,
+                        self.body,
+                        borrow_data.borrowed,
+                        routed,
+                        routed_depth,
+                        PlaceConflictBias::Overlap,
+                    ) {
+                        self.facts.insert(point_index, loan);
+                    }
+                }
+            }
+            // continue the walk from `base`
+            if let Some(next) = self.issued_loans.get(&base) {
+                worklist.extend(next.iter().copied());
             }
         }
     }

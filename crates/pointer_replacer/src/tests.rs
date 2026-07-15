@@ -10966,14 +10966,16 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// `b = p`). `*b = 5` demotes the p/b cluster but NOT x/z/q. Result — **mode-differential**
     /// (the causal proof the skip runs, which the old witness lacked):
     ///   - forced-mut (skip OFF): x/z/q = `Raw` (their loans participate; the write demotes them);
-    ///   - fact-mut  (skip ON):  x/z/q = `Ref` — a shared `&T` aliasing the written cell.
+    ///   - fact-mut  (skip ON):  x/z/q = `Ref` in STATE-2 — a shared `&T` aliasing the written cell;
+    ///     NB4-R (STATE-3, 2026-07-15) now routes the write to their loan, so this is `Raw` too (the
+    ///     mode differential collapses).
     ///
-    /// The fact-mode `Ref` is an **acceptance-level unsoundness that is REAL TODAY** (not merely
-    /// "if flow-sensitivity is relaxed"). It is production-PARITY: production's own
-    /// `borrow::mutable_references_no_guarantee` promotes x and q to shared `&T` on this exact
-    /// program (verified), so BO is not held to a stricter standard than what ships to the
-    /// rewriter. The ONLY guard is the **§8 codegen guardrail** (BO output is unconsumed by
-    /// codegen) — the equate-closure is NOT an acceptance-level guard.
+    /// In STATE-2 the fact-mode `Ref` was an **acceptance-level unsoundness REAL TODAY** (not merely
+    /// "if flow-sensitivity is relaxed"), production-PARITY (production's own
+    /// `borrow::mutable_references_no_guarantee` promotes x and q to shared `&T` on this exact program
+    /// — verified), guarded ONLY by the **§8 codegen guardrail** (BO output unconsumed by codegen).
+    /// NB4-R (STATE-3) removes that unsoundness for this shape by demoting x/z/q to `Raw` at analysis
+    /// time — §8 is no longer the sole guard here.
     ///
     /// **NB3-3b finding (2026-07-10): write-aware invalidation does NOT close THIS case.** 3b
     /// restores the read/write distinction so an immutable loan is skipped for reads only. But the
@@ -10982,10 +10984,10 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// structurally blind to the call-return alias (`x = id(p)`); write-awareness cannot route the
     /// write's invalidation of p's loan to x's loan. The forced-mut demotion of x/z/q rides the
     /// READ pointer-copies `z = x`/`q = x` (verified: `INSERT rw=Read borrowed=(*x)` at those
-    /// points), which the read-skip soundly preserves. Closing this needs **routing** (corrected
-    /// below — the router is NB4-R, place-based). This test is the **NB4-R-boundary marker**: it stays
-    /// `Ref` today and must flip to `Raw` when NB4-R lands. (The SOUND-skip proof is
-    /// `nb2_two_shared_reads_both_ref`; this is its UNSOUND-skip counterpart.)
+    /// points), which the read-skip soundly preserves. Closing this needed **routing** (the router is
+    /// NB4-R, place-based). **NB4-R HAS LANDED (2026-07-15): this now flips to `Raw` — see the in-test
+    /// STATE-3 assertions.** (The SOUND-skip proof is `nb2_two_shared_reads_both_ref`; this was its
+    /// UNSOUND-skip counterpart until NB4-R.)
     ///
     /// **Decision B (2026-07-11):** the 3b write-aware fix was measured **corpus-inert** — 0
     /// shared-ref demotions across all 19 accepts (same-base immutable-written cases don't arise
@@ -10993,20 +10995,21 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// skip-eligible). Write-awareness is inert *without* a router that makes the cross-alias write
     /// reach the aliased loan.
     ///
-    /// **STATE-2 §8-guarded marker (router = NB4-R, place-based; earlier routers all refuted).**
-    /// The write's non-reach was diagnosed by dump: `*b=5` invalidates only b's own loan (`row(b)`
-    /// keyed under b, empty of the loan x/z/q require, which is keyed under p). Three routers were
-    /// refuted, each by a dump — recorded so none is re-attempted:
+    /// **STATE-3: S2-6 CLOSED by NB4-R (2026-07-15).** The write's non-reach was diagnosed by dump:
+    /// `*b=5` invalidates only b's own loan (`row(b)` keyed under b, empty of the loan x/z/q require,
+    /// which is keyed under p). Three routers were refuted BEFORE NB4-R, each by a dump — recorded so
+    /// none is re-attempted:
     ///   • 3c origins (subset edges) — invalidation is place-based, subset never changes a write's reach;
     ///   • `tree_borrow_local` copy-groups — singleton at round 0 (only unioned during demotion replay);
     ///   • `Local`-based issues→borrowed re-basing (NB4-4b `ffd90100`) — fixture-level closure but on
     ///     the corpus it CRASHED 3 programs (re-basing a projection across incompatible types) and
     ///     over-demoted −17.7% (offset conflation). REVERTED.
     /// WA is also refuted for this witness: the loan x/z/q require has base `p` which is Foster `Mut`
-    /// (never skip-eligible) — routing alone flips it. The real router is **NB4-R (place-based
-    /// cross-alias routing, before NB5): `places_conflict`-grade algebra, `offset` excluded, bounded
-    /// walk.** Until NB4-R lands this stays `Ref` (fork == production; §8 is the sole guard) and must
-    /// flip to `Raw` then. (Fixture-level closure is validated; corpus substrate is the open work.)
+    /// (never skip-eligible) — routing alone flips it. NB4-R is the router that landed: **place-based
+    /// cross-alias routing (before NB5) — compose-onto-`borrowed` algebra with a type-check + whole-cell
+    /// fallback (no re-basing crash), `offset` excluded (no −17.7%), PRE-order bounded walk.** x/z/q
+    /// now settle `Raw` in both mut modes; §8 is no longer the sole guard for this shape. (Corpus
+    /// impact is measured at the NB4-R sweep gate.)
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
@@ -11070,60 +11073,41 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     }
                 };
 
-                // Mode-differential = the skip is causally exercised (the old witness asserted
-                // `Raw` in BOTH modes and proved nothing). fact-mode `Ref` = the CONFIRMED gap.
+                // §NB4-R STATE-3 (S2-6 CLOSED): place-based cross-alias routing lands and flips this
+                // witness. `*b = 5` now ROUTES through `b`'s issued loan (`b = p`, borrowed=(*p)) to
+                // `row(p)`, where the loan x/z/q require (the id-arg copy's main loan, borrowed=(*p),
+                // keyed under `p`) lives — and invalidates it. x/z/q were the CALL-RETURN alias the
+                // pre-routing engine's `row(b)`-empty lookup was blind to (state-2). They now settle
+                // `Raw` in BOTH mut modes — the routed demotion does not depend on the mut-fact skip
+                // (`p` is a `Mut` base, never skip-eligible) — so the state-2 mode differential
+                // collapses. This is the executable proof that NB4-R closed S2-6.
                 for name in ["x", "z", "q"] {
                     assert_eq!(
                         kind_of(name, true),
                         Some(SlotKind::Raw),
-                        "forced-mut (skip OFF): `{name}`'s loan participates ⇒ the write demotes it to Raw"
+                        "forced-mut: `{name}`'s loan participates ⇒ Raw (unchanged from state-2)"
                     );
                     assert_eq!(
                         kind_of(name, false),
-                        Some(SlotKind::Ref),
-                        "fact-mut: `{name}` survives Ref — write-aware invalidation does NOT \
-                         reach this CALL-RETURN alias (the `*b=5` write invalidates nothing: b's \
-                         loan row is empty, place-conflict is blind to the call-return alias — \
-                         diagnosed 2026-07-10). S2-6 stays open here until NB4 call-as-access (the \
-                         3c-origins route was refuted spike-first 2026-07-12); §8 is the only \
-                         guard. This is now the NB4-boundary marker (see doc above)."
+                        Some(SlotKind::Raw),
+                        "fact-mut: `{name}` is now `Raw` — NB4-R routing reaches the call-return alias's \
+                         loan on `(*p)` via `b`'s issued loan. S2-6 CLOSED here (was `Ref` in state-2)."
                     );
                 }
 
-                // §NB4-4a STATE-2 (named + EXECUTABLE): A′ is INERT on this witness, and this pins
-                // the REASON, not merely the kind — the witness's only residual edge is a SELF-EDGE
-                // (issuer == requirer == `b`), so there is no live `Ref` requirer BEYOND the issuer
-                // for A′'s restricted menu to bind.
-                //
-                // Borrow-structure dump (2026-07-12) — why `*b = 5` changes nothing:
-                //     L_(0) borrowed=(*p) assigned=Assign(b)      ← b = p
-                //     L_(1) borrowed=(*p) assigned=Assign(temp)   ← id()'s arg temp; x/z/q REQUIRE it
-                //     ERROR = { L_(0) } only — L_(1) is NEVER invalidated.
-                // `*b = 5` looks up `local_map.row(b)`, which is **EMPTY**: every loan is keyed under
-                // `p`, and `b` is a *copy* of p (a different `Local`). The cross-alias write is
-                // invisible to invalidation. Hence NEITHER A′ NOR write-awareness flips this witness
-                // — WA changes the immutable-loan SKIP, but the loan x/z/q require has a `Mut` base
-                // (never skip-eligible), and there is no loan in b's row to reach. The closure must
-                // ROUTE the write through b's issued loan (`borrowed=(*p)`) to `row(p)` — the deferred
-                // NB4-R (place-based cross-alias routing) phase (the `Local`-based and
-                // `tree_borrow_local` routes were both refuted; see the doc above). This assertion is
-                // what makes the finding non-forgettable: when NB4-R's routing lands, this edge set
-                // CHANGES and this assertion fails — by design.
+                // The edge set is no longer a lone self-edge: routing adds a genuine cross-slot
+                // conflict that demotes the view `z` (the CEGAR representative of the x/z/q alias
+                // group) via a NON-self issuer — the concrete S2-6 closure witness. (The `b` self-edge
+                // from `*b=5` on b's own cell persists alongside it.)
                 let edges = revalidate_replaying(&program, &slots, |_| true, |_| false, &facts);
-                let b_slot = slot_of("b");
+                let z_slot = slot_of("z");
                 let fn_edges = edges.get(&f).map(Vec::as_slice).unwrap_or(&[]);
-                assert_eq!(
-                    fn_edges.len(),
-                    1,
-                    "state-2: the witness has exactly ONE residual conflict edge"
-                );
-                assert_eq!(fn_edges[0].issuer, Some(b_slot), "state-2: its issuer is `b`");
-                assert_eq!(
-                    fn_edges[0].requirers,
-                    vec![b_slot],
-                    "state-2: it is a SELF-edge (requirer == issuer == `b`) — there is no live `Ref` \
-                     requirer beyond the issuer, which is precisely WHY A′ is inert on this witness \
-                     and the S2-6 closure must wait for NB4-R place-based routing"
+                assert!(
+                    fn_edges
+                        .iter()
+                        .any(|e| e.requirers == vec![z_slot] && e.issuer != Some(z_slot)),
+                    "state-3: a routed cross-alias edge must demote the view `z` via a non-self issuer \
+                     (the S2-6 closure). Edges: {fn_edges:?}"
                 );
             },
         );
@@ -11546,6 +11530,253 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    // ===== §NB4-R — place-based cross-alias-write routing (RED-first, pre-implementation) =====
+    //
+    // Spec: docs/agents/tasks/2026-07-15-nb4r-place-based-routing-spec.md.
+    //
+    // WHAT THE ROUTING HOLE ACTUALLY IS (dump 2026-07-15, corrected from the spec's assumption): the
+    // existing tree-borrow-GROUP machinery already produces cross-alias conflict edges for most
+    // co-located views — a DIRECT copy view (`c=p`), a 2-hop writer (`c=b=p`), a field/cast writer —
+    // are demoted TODAY without routing. The genuine hole is NARROW: a grouping-BROKEN view (a call
+    // return `c=id(p)`, keyed under the base cell but NOT linked to the writer by a group loan) written
+    // through a SIMPLE 1-hop / deref / reconverging sibling. There, `*b=…` looks up the EMPTY `row(b)`
+    // and leaves `c` at `Ref`. Routing composes the write onto the loan's BORROWED place, sends it to
+    // `row(base)`, and demotes `c` to `Raw`.
+    //
+    // So the fixtures split two ways:
+    //   * RED FLIPS (view `Ref` today, `Raw` after routing) — the isolating tests: `sibling_copies`
+    //     (1-hop), `deref_chain_no_crash` (multi-level), `reconverging_dag_bounded` (multi-writer).
+    //   * CRASH-SAFETY / NO-REGRESSION CONTROLS (view already `Raw`, or `Ref` in both states) — routing
+    //     must FIRE on these composition shapes without panicking or regressing: `copy_of_copy`
+    //     (2-hop), `field_local_source` (leading-Field — the reverted crash), `type_pun_invalidates`
+    //     (cast whole-cell fallback — the `places_conflict` `unreachable!` class), `offset_excluded`
+    //     (offset shape), `reborrow_self_write_survives` (self-skip → `Ref`), `no_alias_ablation`
+    //     (inert → `Ref`). These are NOT RED.
+
+    /// §NB4-R RED (Amendment 3a) — **1-hop sibling, call-return view.** `b=p` (writer) and `c=id(p)`
+    /// (a call-return alias of `(*p)`) address the same cell, but `c` is NOT tree-borrow-grouped with
+    /// `b` (a call return is not a copy rvalue), so `*b=5` — which looks up the EMPTY `row(b)` — leaves
+    /// `c` at `Ref` today (the S2-6 hole; direct `c=p` is grouped-demoted and would NOT isolate
+    /// routing — confirmed by dump 2026-07-15). Routing walks `b`'s issued loan to `row(p)` and demotes
+    /// `c`. One hop (`b→p`); contrast `nb4r_copy_of_copy`.
+    #[test]
+    fn nb4r_sibling_copies() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let b = p; let c = id(p); let r0 = *c; *b = 5; r0 + *c }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["c"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`c` (call-return view of (*p), live across `*b=5`) must be demoted: routing sends \
+                     the write through `b`'s issued loan (borrowed=(*p)) to `row(p)` (S2-6 closure, 1-hop)."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (crash-safety, 2-hop composition) — writer `c = b = p`; `*c=5` makes routing
+    /// walk `c→b→p` (PRE-order visited discipline). The call-return view `v=id(p)` is already demoted
+    /// TODAY by the group machinery (a 2-hop writer links to the view's cell via group loans), so this
+    /// is NOT a flip — it guards that the multi-hop walk does not crash or regress `v` off `Raw`.
+    #[test]
+    fn nb4r_copy_of_copy() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let v = id(p); let b = p; let c = b; let r0 = *v; *c = 5; r0 + *v }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["v"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`v` stays `Raw`: the 2-hop routing walk c→b→p must terminate cleanly and not \
+                     regress the (already group-demoted) view."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (crash-safety, leading-Field composition) — writer `b = h.q` builds
+    /// `borrowed=(*(h.q)) = [Field(q), Deref]` — LAST element `Deref` (a copy of a field pointer), so
+    /// it IS a chain edge (the reverted `first==Deref` filter wrongly dropped it, §11-B). Compose
+    /// routes `*b=5` onto `(*(h.q))` (type-valid); the reverted `Local` re-base produced `(*h)` (a
+    /// STRUCT deref → `places_conflict` crash). The view `v=id(h.q)` is already group-demoted, so this
+    /// guards that leading-Field composition routes without the crash — not a flip.
+    #[test]
+    fn nb4r_field_local_source() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} #[repr(C)] struct H {{ q: *mut i32 }} \
+                 unsafe fn f(mut h: H) -> i32 \
+                 {{ let v = id(h.q); let b = h.q; let r0 = *v; *b = 5; r0 + *v }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["v"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`v` stays `Raw`: leading-Field composition onto `(*(h.q))` must route without the \
+                     struct-deref crash the `Local` re-base hit."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R RED — **multi-level deref, no crash.** writer `inner = *pp` builds `borrowed=(**pp) =
+    /// [Deref, Deref]` — the exact shape the reverted re-base crashed on (`places_conflict`
+    /// `unreachable!`). Compose routes `*inner=5` to `(**pp)` cleanly and demotes the call-return view
+    /// `v=id(*pp)` (keyed under `pp`).
+    #[test]
+    fn nb4r_deref_chain_no_crash() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(pp: *mut *mut i32) -> i32 \
+                 {{ let inner = *pp; let v = id(*pp); let r0 = *v; *inner = 5; r0 + *v }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["v"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`v` (call-return view of *pp) is demoted by `*inner=5` via the multi-level chain \
+                     to `(**pp)` — routes clean where the old rule panicked."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (Amendment 3b — type-pun whole-cell fallback; no-crash + invalidation) — writer
+    /// `b = p as *mut Pair` casts the pointee type; `(*b).a = 5` would compose `(*p):i32 ++ [Field(a)]`
+    /// which is ILL-TYPED. The type-check MUST catch this and fall back to whole-cell `(*p)` Deep — if
+    /// it instead emitted the composed place, `places_conflict` would `unreachable!` (panic) or return
+    /// `Disjoint` (silent miss → UAF). `w=id(p)` ends `Raw` (invalidated, not silently missed).
+    ///
+    /// ISOLATION CAVEAT (dump 2026-07-15): the cast operand is a compiler-inserted copy of `p`
+    /// (`_5=copy _1; _4=_5 as Pair`), which the group machinery links to the view's cell, so `w` is
+    /// already `Raw` today. The fallback's positive effect therefore CANNOT be isolated as a `Ref→Raw`
+    /// flip in a minimal fixture; this test guards the two properties that ARE testable here — the
+    /// type-check prevents the `places_conflict` crash (no panic) and the write does invalidate `w`
+    /// (`Raw`, not silently dropped). Reported to the user as a deviation from Amendment 3b's "isolate
+    /// the fallback" wording, with this structural reason.
+    #[test]
+    fn nb4r_type_pun_invalidates() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} #[repr(C)] struct Pair {{ a: i32, b: i32 }} \
+                 unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let w = id(p); let b = p as *mut Pair; let r0 = *w; (*b).a = 5; r0 + *w }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["w"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`w` stays `Raw`: the ill-typed cast composition must fall back to whole-cell `(*p)` \
+                     Deep — no `places_conflict` panic, and the write is NOT silently missed."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R RED (walk-bound smoke) — reconverging copy chains (`s→a→p`, `s2→b→p`) must terminate
+    /// within the N cap and still demote the call-return view `v=id(p)`. PRE-order visited-marking
+    /// keeps the reconvergence at `p` from re-expanding; the impl's per-site cap asserts it.
+    #[test]
+    fn nb4r_reconverging_dag_bounded() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let a = p; let b = p; let s = a; let s2 = b; let v = id(p); \
+                    let r0 = *v; *s = 1; *s2 = 2; r0 + *v }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["v"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`v` demoted by the routed writes; the reconverging chains terminate (no hang/panic)."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (offset shape — no crash) — writer `r = p.offset(1)` builds the copy-identical
+    /// `borrowed=(*p)` but addresses a DIFFERENT cell (`p+1`), so routing EXCLUDES it as a chain edge
+    /// (§4.1 coupling guard). Here the view `c=id(p)` is already demoted by the existing engine's
+    /// handling of the offset write (dump 2026-07-15: `c=Raw` today), so this shape cannot isolate the
+    /// −17.7% over-demotion the exclusion prevents — that guard lives at the CORPUS gate (§8). This
+    /// unit only pins that routing handles the offset shape without a crash/regression.
+    #[test]
+    fn nb4r_offset_excluded() {
+        run_compiler(
+            &format!(
+                "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+                 {{ let c = id(p); let r = p.offset(1); let v0 = *c; *r = 9; v0 + *c }}"
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["c"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Raw),
+                    "`c` stays `Raw` (already demoted by the existing offset-write handling); routing \
+                     with offset EXCLUDED must not crash or regress it. The over-demotion guard is the \
+                     corpus gate, not this unit."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (self-loan skip — finding C) — `b = p; *b = 5; *b`. `b` is the SOLE alias and
+    /// writes through itself; routing reaches `b`'s OWN loan in `row(p)` (keyed under p, not b), which
+    /// must be SKIPPED (`assigned == Assign(b)`) or `b` self-demotes. `b` stays `Ref` (a valid `&mut`)
+    /// in BOTH states. Without the skip, every `let b=&mut *p; *b=…` reborrow would regress.
+    #[test]
+    fn nb4r_reborrow_self_write_survives() {
+        run_compiler(
+            "unsafe fn f(p: *mut i32) -> i32 { let b = p; *b = 5; *b }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["b"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Ref),
+                    "`b` writes through itself as the sole alias — a valid `&mut`. Routing must skip \
+                     `b`'s own loan (self-loan skip) or it spuriously self-demotes."
+                );
+            },
+        );
+    }
+
+    /// §NB4-R CONTROL (ablation — byte-identical) — a shared view with NO cross-alias write anywhere
+    /// stays `Ref` in BOTH states. Routing must not perturb a program with nothing to route.
+    #[test]
+    fn nb4r_no_alias_ablation() {
+        run_compiler(
+            "unsafe fn f(p: *mut i32) -> i32 { let c = p; let r0 = *c; let r1 = *c; r0 + r1 }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["c"]);
+                assert_eq!(
+                    m[0].0,
+                    Some(SlotKind::Ref),
+                    "no write ⇒ `c` stays a shared `&` view; routing is inert here."
+                );
+            },
+        );
+    }
+
     /// Multiset difference for the §NB3-3c divergence delta: `a` minus `b`, each `b` element removing
     /// exactly ONE `a` element (multiplicity-preserving, so a duplicated or dropped edge is not
     /// masked). Module-level so `nb3c_divergence_delta_multiplicity` can guard it directly.
@@ -11619,7 +11850,23 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         // "mixed_replay"; the DELTA is the canonical per-case prod-vs-fork edge symmetric-difference
         // string (`case_delta`). Enumerating the DELTA (not just the ID) means edges CHANGING within
         // an already-allowed divergence still fails the gate (Codex F3).
-        const FORK_PRODUCTION_DIVERGENCE: &[(&str, &str)] = &[];
+        // §NB4-R cross-alias-WRITE routing divergence class (2026-07-15). Fork routes the write
+        // `*b=5` through `b`'s issued loan to the aliased loan (the S2-6 closure); production is
+        // structurally blind. SOUND DIRECTION — every entry is `prod_only=[]` (fork ⊇ production;
+        // fork only ADDS conflict edges, never drops one), so the fork is strictly more conservative.
+        // Surfaces only in forced-`mut=true` (the gate's all-mutable mode); the real fact-mut flip is
+        // proven by `nb2_cross_alias_write_uncaught_witness` (state-3). Routing is gated to WRITE
+        // accesses, so read-only cases (`raw_copies`) do NOT diverge.
+        const FORK_PRODUCTION_DIVERGENCE: &[(&str, &str)] = &[
+            (
+                "call_return_write/round0/mut=true",
+                "prod_only=[] fork_only=[\"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_4)) requirers=[\\\"Local(_5)\\\"]\"]",
+            ),
+            (
+                "call_return_write/replay/raw=false/mut=true",
+                "prod_only=[] fork_only=[\"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_4)) requirers=[\\\"Local(_5)\\\"]\"]",
+            ),
+        ];
 
         // Order-INSENSITIVE canonical edge multiset (per-fn key embedded), for prod-vs-fork equality.
         fn multiset(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
