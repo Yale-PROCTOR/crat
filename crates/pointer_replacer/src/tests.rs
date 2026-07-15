@@ -10993,16 +10993,19 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// skip-eligible). Write-awareness is inert *without* a router that makes the cross-alias write
     /// reach the aliased loan.
     ///
-    /// **CORRECTED 2026-07-12 (NB3-3c-ii spike-first, before any code): the router is NB4
-    /// call-as-access, NOT 3c origins.** The decision-B fold guessed origins would route the write;
-    /// the spike refuted it: `compute_origins` carries **0 subset edges** for this caller `f`
-    /// (signature `(*mut i32) -> i32`), origins are subset relations while invalidation is
-    /// **place-based (local-keyed)** so subset edges never change what a write invalidates, and
-    /// `x ⊇ p` is already in production's subset via `lifetime_flow::apply_call_summary` yet the
-    /// witness stays `Ref` (measured: `*b=5` invalidates only b's own loan `_2`). The router is
-    /// **NB4's call-as-access** — treating `x=id(p)` as a deep-write access reaches x's loan. WA +
-    /// this witness's three-state now live at **NB4**. Until NB4, this remains `Ref` (fork ==
-    /// production; §8 is the sole guard).
+    /// **CLOSED 2026-07-15 by NB4-4b-i ROUTING (the executable three-state, rider 4).** The router
+    /// is NOT `tree_borrow_local` copy-groups (refuted — singletons at round 0) and NOT WA (retired —
+    /// vacuous under Foster-unified mutability: the required loan's base `p` is `Mut`, never
+    /// skip-eligible). It is the **issues→borrowed chain**: `*b=5` follows b's issued loan
+    /// `L_(0) borrowed=(*p)` to `row(p)`, invalidating `L_(1)` (which x/z/q require), and A′ (merged)
+    /// discharges the edge to the live requirers. The three states, each pinned to its mechanism:
+    ///   • pre-NB4  `Ref` — the S2-6 gap.
+    ///   • post-4a  `Ref` — A′ inert (round-0 edge was the `{b,b}` SELF-edge; the required loan was
+    ///                      never invalidated, so A′ had no requirer beyond the issuer to bind).
+    ///   • post-4b-i `Raw` — routing invalidates `L_(1)`; A′ discharges to x/z/q.
+    /// The S2-6 boundary is scoped exactly (task doc): routing+A′ closes the **loan-ISSUING** alias
+    /// class. Writes through raw-from-round-0 aliases (eager-`¬ref`/poisoned slots) issue no loans and
+    /// stay invisible — that is **S2-5's** pre-existing family, §8-guarded, NOT closed here.
     #[test]
     fn nb2_cross_alias_write_uncaught_witness() {
         run_compiler(
@@ -11066,58 +11069,129 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     }
                 };
 
-                // Mode-differential = the skip is causally exercised (the old witness asserted
-                // `Raw` in BOTH modes and proved nothing). fact-mode `Ref` = the CONFIRMED gap.
+                // §NB4-4b-i STATE-3 (routing landed): the CALL-RETURN alias is now closed. `*b = 5`
+                // (b = p) routes through b's issued loan `L_(0) borrowed=(*p)` to `row(p)`, invalidating
+                // `L_(1) borrowed=(*p)` — the loan x/z/q require via `x ⊇ id-ret ⊇ p` — and A′ (merged)
+                // discharges the resulting edge to its live requirers x/z/q. Both modes now `Raw`;
+                // fact-mut no longer survives `Ref`. (The old mode-differential is retired: the fact-mode
+                // `Ref` WAS the S2-6 gap; routing closes it. See the three-state narrative in the doc.)
                 for name in ["x", "z", "q"] {
                     assert_eq!(
                         kind_of(name, true),
                         Some(SlotKind::Raw),
-                        "forced-mut (skip OFF): `{name}`'s loan participates ⇒ the write demotes it to Raw"
+                        "forced-mut: `{name}`'s loan participates ⇒ demoted (unchanged)"
                     );
                     assert_eq!(
                         kind_of(name, false),
-                        Some(SlotKind::Ref),
-                        "fact-mut: `{name}` survives Ref — write-aware invalidation does NOT \
-                         reach this CALL-RETURN alias (the `*b=5` write invalidates nothing: b's \
-                         loan row is empty, place-conflict is blind to the call-return alias — \
-                         diagnosed 2026-07-10). S2-6 stays open here until NB4 call-as-access (the \
-                         3c-origins route was refuted spike-first 2026-07-12); §8 is the only \
-                         guard. This is now the NB4-boundary marker (see doc above)."
+                        Some(SlotKind::Raw),
+                        "STATE-3 fact-mut: `{name}` is now `Raw` — 4b-i routing sends `*b=5` to the \
+                         cell `b` points into `(*p)`, invalidating the loan `{name}` requires. The \
+                         required loan's base `p` is Foster `Mut` (written via the alias), so this is \
+                         a ROUTING closure, not a write-awareness one (WA retired: vacuous under \
+                         Foster-unified mutability)."
                     );
                 }
 
-                // §NB4-4a STATE-2 (named + EXECUTABLE): A′ is INERT on this witness, and this pins
-                // the REASON, not merely the kind — the witness's only residual edge is a SELF-EDGE
-                // (issuer == requirer == `b`), so there is no live `Ref` requirer BEYOND the issuer
-                // for A′'s restricted menu to bind.
-                //
-                // Borrow-structure dump (2026-07-12) — why `*b = 5` changes nothing:
-                //     L_(0) borrowed=(*p) assigned=Assign(b)      ← b = p
-                //     L_(1) borrowed=(*p) assigned=Assign(temp)   ← id()'s arg temp; x/z/q REQUIRE it
-                //     ERROR = { L_(0) } only — L_(1) is NEVER invalidated.
-                // `*b = 5` looks up `local_map.row(b)`, which is **EMPTY**: every loan is keyed under
-                // `p`, and `b` is a *copy* of p (a different `Local`). The cross-alias write is
-                // invisible to invalidation. Hence NEITHER A′ NOR write-awareness flips this witness
-                // — WA changes the immutable-loan SKIP, but there is no loan in b's row to skip. 4b's
-                // closure must ROUTE a write through a copy to its copy-group's loans
-                // (`tree_borrow_local` is already in the 7-field manifest ⇒ fork-side, freeze-safe).
-                // This assertion is what makes that finding non-forgettable: if 4b's routing lands,
-                // this edge set CHANGES and this assertion fails — by design.
+                // §NB4-4b-i STATE-3 (EXECUTABLE three-state narrative — rider 4). The witness has
+                // travelled three states, each pinned to the mechanism that moved it:
+                //   • pre-NB4 : `Ref` — the S2-6 gap (production-parity, §8-guarded).
+                //   • post-4a : `Ref` — A′ (live-requirer discharge) is INERT here because the ONLY
+                //               round-0 edge was a SELF-edge `{issuer=b, requirers=[b]}`: `*b=5` hit
+                //               `row(b)` = EMPTY (b is a *copy* of p; loans key under p), so the
+                //               required loan `L_(1) borrowed=(*p)` was never invalidated and A′ had
+                //               no live `Ref` requirer beyond the issuer to bind.
+                //   • post-4b-i: `Raw` — ROUTING. `*b=5` now follows b's issued loan
+                //               `L_(0) borrowed=(*p)` to `row(p)`, invalidating `L_(1)`; A′ then
+                //               discharges the resulting edge `{issuer=<arg temp>, requirers=[x,z,q]}`
+                //               to the live requirers. Routing produces the edge; A′ routes the
+                //               demotion. WA plays NO part (L_(1)'s base p is `Mut`).
+                // The state-2 self-edge assertion is now REPLACED by this state-3 one — it broke by
+                // design when routing landed (as the 4a commit predicted).
                 let edges = revalidate_replaying(&program, &slots, |_| true, |_| false, &facts);
-                let b_slot = slot_of("b");
                 let fn_edges = edges.get(&f).map(Vec::as_slice).unwrap_or(&[]);
-                assert_eq!(
-                    fn_edges.len(),
-                    1,
-                    "state-2: the witness has exactly ONE residual conflict edge"
+                let xzq = [slot_of("x"), slot_of("z"), slot_of("q")];
+                let b_slot = slot_of("b");
+                // The ROUTED edge: routing reached the cross-alias required loan `L_(1)`, so a NEW
+                // edge now names a read-only view (x/z/q) as a requirer — the world before routing had
+                // ONLY the `{b, b}` self-edge, which named none of them. (The edge names whichever of
+                // x/z/q is LIVE at the `*b=5` point — `z` is used after — and coherence unifies the
+                // x/z/q copy cluster for the rest; hence "≥1", not "all three in one edge".)
+                let routed = fn_edges.iter().find(|e| {
+                    e.requirers.iter().any(|r| xzq.contains(r)) && e.issuer != Some(b_slot)
+                });
+                assert!(
+                    routed.is_some(),
+                    "state-3: routing must produce a NON-self-edge whose requirers include a cross- \
+                     alias view (x/z/q) — proof `*b=5` reached the required loan `L_(1)` on `(*p)`. \
+                     Round-0 edges = {fn_edges:?}"
                 );
-                assert_eq!(fn_edges[0].issuer, Some(b_slot), "state-2: its issuer is `b`");
+            },
+        );
+    }
+
+    /// §NB4-4b-i RED (chain transitivity, rider 5) — the write is through a COPY-OF-A-COPY.
+    /// `b = p; b2 = b; … *b2 = 5`. Reaching the loan `x` requires (`borrowed=(*p)`) needs TWO
+    /// issues→borrowed hops: `b2`'s loan `borrowed=(*b)` → base `b` → `b`'s loan `borrowed=(*p)` →
+    /// base `p` → `row(p)`. A depth-1 walk stops at `row(b)` (empty) and silently reintroduces the
+    /// blindness one copy deeper — so the routing walk MUST iterate to a fixpoint. `x` must be `Raw`.
+    #[test]
+    fn nb4b_routing_copy_of_copy() {
+        run_compiler(
+            "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(mut p: *mut i32) -> i32 { let mut b = p; let mut b2 = b; \
+             let mut x = id(p); let mut z = x; let r0 = *z; *b2 = 5; let r1 = *z; r0 + r1 }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["x", "z"]);
+                for (n, (k, _)) in [("x", m[0]), ("z", m[1])] {
+                    assert_eq!(
+                        k,
+                        Some(SlotKind::Raw),
+                        "chain transitivity: `*b2=5` (b2=b=p) must route TWO hops to reach the loan \
+                         `{n}` requires — a depth-1 walk would leave `{n}` `Ref` (blindness one copy deeper)"
+                    );
+                }
+            },
+        );
+    }
+
+    /// §NB4-4b-i CONTROL (same-base double-count, rider 6) — the repurposed `*q=null`. `p`/`q` both
+    /// borrow the SAME cell DIRECTLY (`&raw mut cell`), so the write already place-conflicts with the
+    /// shared loan without routing; both are Foster `Mut` and demote at round 0. Routing must be
+    /// IDEMPOTENT here — the issues→borrowed hop lands on the same `row(cell)` the direct access
+    /// already hit, so the result is unchanged (`Raw`/`Raw`), NOT double-counted into a different
+    /// model. (This is why `*q=null` is NOT a routing win — its "WA win" label was a `mut=false`
+    /// closure artifact; it demotes at round 0 via the direct double-borrow.)
+    #[test]
+    fn nb4b_same_base_not_double_counted() {
+        run_compiler(
+            "unsafe fn g(_a: *mut *mut i32) {} \
+             unsafe fn f() -> *mut i32 { let mut cell: *mut i32 = core::ptr::null_mut(); \
+             let p = &raw mut cell; let q = &raw mut cell; g(p); *q = core::ptr::null_mut(); cell }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["p", "q"]);
+                assert_eq!(m[0].0, Some(SlotKind::Raw), "same-base `p` demotes at round 0 (direct double-borrow)");
+                assert_eq!(m[1].0, Some(SlotKind::Raw), "same-base `q` demotes at round 0; routing is idempotent here");
+            },
+        );
+    }
+
+    /// §NB4-4b-i ABLATION (no copy-alias, rider 6) — a program with pointers but NO copy-alias must be
+    /// unaffected by routing: with no issued loan to follow, the issues→borrowed walk is a no-op and
+    /// the accepted model is exactly what it was pre-routing. (Byte-identical edge-equality is checked
+    /// at the DUMP/sweep level during implementation; this fixture pins the accepted kinds.)
+    #[test]
+    fn nb4b_no_alias_unaffected() {
+        run_compiler(
+            "unsafe fn f(p: *mut i32) -> i32 { *p = 1; *p }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let m = nb4_accept(tcx, &program, "f", &["p"]);
                 assert_eq!(
-                    fn_edges[0].requirers,
-                    vec![b_slot],
-                    "state-2: it is a SELF-edge (requirer == issuer == `b`) — there is no live `Ref` \
-                     requirer beyond the issuer, which is precisely WHY A′ is inert on this witness \
-                     and the S2-6 closure must wait for 4b's copy-group routing"
+                    m[0].0,
+                    Some(SlotKind::Ref),
+                    "no copy-alias ⇒ no cross-alias conflict ⇒ `p` stays `Ref` (routing changes nothing)"
                 );
             },
         );
@@ -11608,12 +11682,26 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         use rustc_span::def_id::LocalDefId;
         use std::collections::BTreeMap;
 
-        // 3c-i: EMPTY. 3c-ii enumerates deliberate divergences here as (case-ID, expected DELTA)
-        // pairs — case-ID is "{program}/round0/mut=.." | "{program}/replay/raw=../mut=.." |
-        // "mixed_replay"; the DELTA is the canonical per-case prod-vs-fork edge symmetric-difference
-        // string (`case_delta`). Enumerating the DELTA (not just the ID) means edges CHANGING within
-        // an already-allowed divergence still fails the gate (Codex F3).
-        const FORK_PRODUCTION_DIVERGENCE: &[(&str, &str)] = &[];
+        // Deliberate divergences as (case-ID, expected DELTA) pairs — case-ID is
+        // "{program}/round0/mut=.." | "{program}/replay/raw=../mut=.." | "mixed_replay"; the DELTA is
+        // the canonical per-case prod-vs-fork edge symmetric-difference string (`case_delta`).
+        // Enumerating the DELTA (not just the ID) means edges CHANGING within an already-allowed
+        // divergence still fails the gate (Codex F3).
+        //
+        // §NB4-4b-i CROSS-ALIAS-WRITE ROUTING — the FIRST fork≠production divergence class (empty
+        // through 4a; predicted at 4a to land at 4b's routing). All four deltas are `prod_only=[]`:
+        // the fork ADDS conflicts production misses, never removes — the SOUND direction. Routing
+        // sends a write through a copy/reborrow (`b = p`; `*b=5`) to the aliased loan on `(*p)`, so
+        // two cross-alias fixtures now diverge: `call_return_write` (the witness shape
+        // `x=id(p); *b=5`) and `raw_copies` (a direct pointer-copy cluster written cross-alias).
+        // The DefId crate-hash `rust_out[…]` is a fixed harness constant (identical across fixtures ⇒
+        // not source-derived), stable per pinned toolchain.
+        const FORK_PRODUCTION_DIVERGENCE: &[(&str, &str)] = &[
+            ("call_return_write/replay/raw=false/mut=true", "prod_only=[] fork_only=[\"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_4)) requirers=[\\\"Local(_5)\\\"]\", \"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_5)) requirers=[\\\"Local(_5)\\\"]\"]"),
+            ("call_return_write/round0/mut=true", "prod_only=[] fork_only=[\"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_4)) requirers=[\\\"Local(_5)\\\"]\", \"DefId(0:4 ~ rust_out[96a3]::f) issuer=Some(Local(_5)) requirers=[\\\"Local(_5)\\\"]\"]"),
+            ("raw_copies/replay/raw=false/mut=true", "prod_only=[] fork_only=[\"DefId(0:3 ~ rust_out[96a3]::f) issuer=Some(Local(_3)) requirers=[\\\"Local(_3)\\\"]\"]"),
+            ("raw_copies/round0/mut=true", "prod_only=[] fork_only=[\"DefId(0:3 ~ rust_out[96a3]::f) issuer=Some(Local(_3)) requirers=[\\\"Local(_3)\\\"]\"]"),
+        ];
 
         // Order-INSENSITIVE canonical edge multiset (per-fn key embedded), for prod-vs-fork equality.
         fn multiset(m: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
