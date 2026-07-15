@@ -12,7 +12,7 @@ use rustc_middle::{
         Place, PlaceElem, PlaceRef, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         visit::Visitor,
     },
-    ty::{TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
@@ -139,6 +139,37 @@ fn build_issued_loans<'tcx>(
     m
 }
 
+/// §NB4-R — the routed place a cross-alias access composes to (extracted so the type-check/fallback
+/// is testable in isolation, independent of the grouping that masks the end-to-end outcome).
+pub(crate) enum RoutedCompose<'tcx> {
+    /// `L.borrowed ++ rest` is well-typed (or `rest` is empty) — check it at the access's own depth.
+    Composed(Place<'tcx>),
+    /// `rest` is NOT applicable to `ty(L.borrowed)` (a type-changing cast) — composing would feed
+    /// `places_conflict` an ill-typed place (`unreachable!`) or silently miss (`Disjoint`→UAF). Fall
+    /// back to the whole borrowed cell, forced Deep (sound over-approximation; §4 ruling).
+    WholeCell(Place<'tcx>),
+}
+
+/// Decide how a WRITE access `(*x)[rest]` composes onto an issued loan's `borrowed` place. Pure over
+/// `(edge_borrowed, rest, deref_ty)`: `Composed` iff `rest` is empty or `ty(edge_borrowed) == deref_ty`
+/// (the original access's deref type); otherwise `WholeCell`. The equality is exactly what guarantees
+/// `places_conflict` only ever sees well-typed places rooted at the same base.
+pub(crate) fn route_compose<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    edge_borrowed: Place<'tcx>,
+    rest: &[PlaceElem<'tcx>],
+    deref_ty: Ty<'tcx>,
+) -> RoutedCompose<'tcx> {
+    if rest.is_empty() {
+        RoutedCompose::Composed(edge_borrowed)
+    } else if edge_borrowed.ty(body, tcx).ty == deref_ty {
+        RoutedCompose::Composed(edge_borrowed.project_deeper(rest, tcx))
+    } else {
+        RoutedCompose::WholeCell(edge_borrowed)
+    }
+}
+
 struct LoanInvalidatesGenerator<'g, 'tcx> {
     facts: &'g mut Invalidates,
     tcx: TyCtxt<'tcx>,
@@ -243,11 +274,14 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         .ty(self.body, self.tcx)
         .ty;
 
-        // PRE-order bounded walk. Visited keyed on base Local, seeded with the access local, marked on
-        // ENTRY — the sole guard against O(2^k) re-expansion of a reconverging copy DAG.
-        let cap = self.body.local_decls.len();
-        let mut visited: FxHashSet<Local> = FxHashSet::default();
-        visited.insert(place.local);
+        // PRE-order bounded walk. Visited keyed on the LOAN (edge), NOT the base Local: distinct edges
+        // can share a base local while naming different cells (a writer branch-joined from `h.q`/`h.r`
+        // issues loans `(*(h.q))` and `(*(h.r))`, both base `h`); keying on the local would drop one
+        // route and miss the cell aliased on the relevant path (Codex F2). Keying on the loan checks
+        // every reachable edge exactly once, so the bound is `≤ loans.len()` and reconvergence still
+        // cannot re-expand.
+        let cap = self.borrow_set.loans.len();
+        let mut visited: FxHashSet<Loan> = FxHashSet::default();
         let mut expansions = 0usize;
         let mut worklist: Vec<Loan> = self
             .issued_loans
@@ -255,25 +289,28 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
             .cloned()
             .unwrap_or_default();
         while let Some(edge) = worklist.pop() {
-            let edge_borrowed = self.borrow_set.loans[edge].borrowed;
-            let base = edge_borrowed.local;
-            if !visited.insert(base) {
+            if !visited.insert(edge) {
                 continue;
             }
+            let edge_borrowed = self.borrow_set.loans[edge].borrowed;
+            let base = edge_borrowed.local;
             expansions += 1;
             assert!(
                 expansions <= cap,
                 "NB4-R routing walk exceeded the per-site cap ({cap}); visited discipline regressed"
             );
             // Compose onto the edge's borrowed place, or fall back to whole-cell on a type mismatch.
-            let (routed, routed_depth) = if rest.is_empty() {
-                (edge_borrowed, access_depth)
-            } else if edge_borrowed.ty(self.body, self.tcx).ty == deref_ty {
-                (edge_borrowed.project_deeper(rest, self.tcx), access_depth)
-            } else {
+            let (routed, routed_depth) = match route_compose(
+                self.tcx,
+                self.body,
+                edge_borrowed,
+                rest,
+                deref_ty,
+            ) {
+                RoutedCompose::Composed(p) => (p, access_depth),
                 // type-changing cast: `L.borrowed ++ rest` would be ill-typed ⇒ whole cell, Deep
                 // (sound over-approximation; §4 ruling — whole-cell, never a silent Disjoint).
-                (edge_borrowed, AccessDepth::Deep)
+                RoutedCompose::WholeCell(p) => (p, AccessDepth::Deep)
             };
             if let Some(borrows_for_base) = self.borrow_set.local_map.row(base) {
                 for loan in borrows_for_base.iter() {

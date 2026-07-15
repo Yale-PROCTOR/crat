@@ -11578,6 +11578,88 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         }
     }
 
+    /// §NB4-R MARKER — the READ-direction residue that WRITE-gating could open (user probe 2026-07-16).
+    /// Shape: `x = id(p)` is a LIVE MUTABLE call-return `&mut` (it writes `*x=1` later); a foreign read
+    /// `v = *b` (b=p, sibling) sits between x's borrow and x's write. Under Tree Borrows the foreign
+    /// read freezes x's tag → `*x=1` is UB, so x must NOT stay a safe `&mut`. Routing is WRITE-gated,
+    /// so `*b` (a read) does NOT route to x's loan (keyed under p) — the worry was that this leaves x
+    /// at `Ref`.
+    ///
+    /// WITNESS: x settles `Raw` with `CRAT_NB4R_ROUTING` on AND off (verified 2026-07-16). MECHANISM —
+    /// GROUPING masks it: unlike a shared read *view* (which survives grouping and is the S2-6 hole a
+    /// WRITE must route to close, e.g. `nb4r_sibling_copies`), a `&mut` view aliasing the same cell is
+    /// linked through `p` to the co-aliaser `b` and demoted by the tree-borrow group conflict. So
+    /// write-gating did NOT open an observable residue in the read-vs-`&mut` direction. This joins
+    /// F1/F2/3b behind the grouping safety net (see NB4-R task doc §13). If a future change stops
+    /// grouping from demoting a `&mut` with a live foreign read, this marker flips (x → Ref) and the
+    /// residue becomes real — at which point route read-derefs but check only MUTABLE loans
+    /// (borrowck's read-vs-`&mut`; the immutable-loan skip already spares read-only cells).
+    #[test]
+    fn nb4r_marker_read_vs_mut_grouping_masked() {
+        let src = format!(
+            "{NB4_ID} unsafe fn f(p: *mut i32) -> i32 \
+             {{ let x = id(p); let b = p; let v = *b; *x = 1; v + *x }}"
+        );
+        run_compiler(&src, |tcx| {
+            let program = collect_program(tcx);
+            let m = nb4_accept(tcx, &program, "f", &["x"]);
+            assert_eq!(
+                m[0].0,
+                Some(SlotKind::Raw),
+                "x (a &mut call-return frozen by the foreign read `*b`) is demoted to Raw by the \
+                 grouping safety net — so WRITE-gating opens no observable read-vs-&mut residue."
+            );
+        });
+    }
+
+    /// §NB4-R WHITE-BOX (Amendment 3b, grouping-independent) — the whole-cell fallback DECISION.
+    /// The end-to-end `nb4r_type_pun_invalidates` is grouping-masked (the view is `Raw` regardless), so
+    /// a fallback REGRESSION (composing the ill-typed place → `places_conflict` `unreachable!`/`Disjoint`)
+    /// could hide behind grouping. This tests `route_compose` directly: an `(*p):i32` edge with a
+    /// `Pair`-field `rest` and `deref_ty = Pair` MUST return `WholeCell` (the whole i32 cell, later
+    /// forced Deep), never `Composed` (which would feed `places_conflict` an ill-typed place). The
+    /// well-typed control (`(*q):Pair` edge, same rest) MUST `Composed`. Survives grouping changes.
+    #[test]
+    fn nb4r_route_compose_fallback_on_type_mismatch() {
+        use crate::analyses::borrow_ownership::borrow_engine::{RoutedCompose, route_compose};
+        use rustc_abi::FieldIdx;
+        use rustc_middle::mir::{Place, PlaceElem};
+        run_compiler(
+            "#[repr(C)] struct Pair { a: i32, b: i32 } \
+             unsafe fn f(p: *mut i32, q: *mut Pair) { let _ = (p, q); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                let bp = Place::from(p).project_deeper(&[PlaceElem::Deref], tcx); // (*p): i32
+                let bq = Place::from(q).project_deeper(&[PlaceElem::Deref], tcx); // (*q): Pair
+                let i32_ty = bp.ty(&*body, tcx).ty;
+                let pair_ty = bq.ty(&*body, tcx).ty;
+                let field0 = [PlaceElem::Field(FieldIdx::from_usize(0), i32_ty)]; // Pair.a : i32
+
+                // MISMATCH: edge `(*p):i32`, access derefs to `Pair` with a Pair-field rest ⇒ fallback.
+                match route_compose(tcx, &*body, bp, &field0, pair_ty) {
+                    RoutedCompose::WholeCell(pl) => {
+                        assert_eq!(pl, bp, "fallback must be the whole borrowed cell `(*p)`")
+                    }
+                    RoutedCompose::Composed(_) => {
+                        panic!("type mismatch MUST fall back — composing feeds places_conflict a \
+                                Field-of-Pair on an i32 place (unreachable!/Disjoint→UAF)")
+                    }
+                }
+                // WELL-TYPED control: edge `(*q):Pair`, `deref_ty=Pair`, Pair-field rest ⇒ compose.
+                match route_compose(tcx, &*body, bq, &field0, pair_ty) {
+                    RoutedCompose::Composed(pl) => {
+                        assert_eq!(pl, bq.project_deeper(&field0, tcx), "well-typed composition")
+                    }
+                    RoutedCompose::WholeCell(_) => panic!("well-typed composition MUST compose"),
+                }
+            },
+        );
+    }
+
     // ===== §NB4-R — place-based cross-alias-write routing (RED-first, pre-implementation) =====
     //
     // Spec: docs/agents/tasks/2026-07-15-nb4r-place-based-routing-spec.md.
