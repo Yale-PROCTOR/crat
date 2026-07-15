@@ -9724,7 +9724,6 @@ mod borrow_ownership_coherence {
                     SlotConflict, materialize_guards, revalidate, revalidate_replaying,
                     verify_to_fixpoint,
                 },
-                call_effects::CallEffects,
                 coherence::{add_coherence, constrain_field_ownership},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
@@ -11279,133 +11278,35 @@ unsafe fn f(mut p: *mut i32) -> i32 {
 
     const NB4_ID: &str = "#[inline(never)] unsafe fn id(q: *mut i32) -> *mut i32 { q } ";
 
-    // ---- §NB4-4a-ii — `call_effects`: does a callee ever ACCESS the POINTEE of a param? ----
-    // Least-fixpoint taint. These pin the analysis itself, independently of the invalidation
-    // gate that consumes it.
-
-    /// `is_no_access(fn_name, param)`.
-    fn nb4_no_access(program: &RustProgram<'_>, fn_name: &str, param: usize) -> bool {
-        let f = function_by_name(program, fn_name);
-        CallEffects::analyze(program).is_no_access(f, param)
-    }
-
-    /// ⚠ **LOAD-BEARING** (`call_effects` module doc): a RETURNED param is NOT `no-access`. The
-    /// entire 4a-i fixture set routes its conflict through `id`, whose param is returned — if this
-    /// rule were relaxed, `id`'s calls would lose their `Deep` access and (c)/(a)/(c′) would
-    /// silently un-demote. This test is the reason nobody may weaken "returned ⇒ access".
+    /// §NB4-4a-ii — pins the six-class pointee-effect SCHEMA and the ONE `Role → Effect` mapping
+    /// (rider 5: stated once; 4c consumes it unmodified). The gate that would have consumed
+    /// `no-access` at invalidation time was refuted (see `nb4_no_deref_callee_still_conflicts`);
+    /// the SCHEMA survives because 4c's `unknown` demotion is defined over these classes. This
+    /// test keeps the mapping honest until then — it is the schema's only consumer.
     #[test]
-    fn nb4_returned_param_is_not_no_access() {
-        run_compiler(NB4_ID, |tcx| {
-            let program = collect_program(tcx);
+    fn nb4_effect_schema_role_mapping() {
+        use crate::analyses::borrow_ownership::boundary_table::{Effect, Role, role_effects};
+        // The bottom class is exactly the roles that never touch the pointee.
+        for r in [Role::Ignore, Role::Lend, Role::NullConstructor] {
+            assert_eq!(role_effects(r), [Effect::NoAccess], "{r:?} must be no-access");
+        }
+        // Every other role touches the pointee (read/write/free/reborrow) — never no-access.
+        for r in [
+            Role::Source,
+            Role::Sink,
+            Role::FlowTransfer,
+            Role::LoanCreating,
+            Role::ProvenanceFlow,
+            Role::FlowSuppression,
+        ] {
             assert!(
-                !nb4_no_access(&program, "id", 0),
-                "`id` RETURNS its param ⇒ its provenance escapes the callee ⇒ NOT no-access. \
-                 Relaxing this un-demotes the whole 4a-i fixture set."
+                !role_effects(r).contains(&Effect::NoAccess),
+                "{r:?} accesses the pointee and must NOT be no-access"
             );
-        });
-    }
-
-    /// A param that is never dereferenced (and never escapes) IS `no-access` — the class the
-    /// 4a-ii gate consumes.
-    #[test]
-    fn nb4_no_deref_param_is_no_access() {
-        run_compiler("unsafe fn ignores(_q: *mut i32) -> i32 { 0 }", |tcx| {
-            let program = collect_program(tcx);
-            assert!(nb4_no_access(&program, "ignores", 0), "`_q` is never touched");
-        });
-    }
-
-    /// A param whose pointee is merely READ is NOT `no-access` (a read of `*p` against a live
-    /// `&mut` is a genuine conflict — the `inline_read` control proved it arises with no call).
-    #[test]
-    fn nb4_deref_param_is_not_no_access() {
-        run_compiler("unsafe fn reader(q: *mut i32) -> i32 { *q }", |tcx| {
-            let program = collect_program(tcx);
-            assert!(!nb4_no_access(&program, "reader", 0), "`*q` is a direct pointee access");
-        });
-    }
-
-    /// NEGATIVE transitive control: forwarding a param to a callee that DEREFS it taints it
-    /// through the call edge (the fixpoint must propagate).
-    #[test]
-    fn nb4_transitive_deref_not_no_access() {
-        run_compiler(
-            "unsafe fn g(r: *mut i32) { *r = 1; } \
-             unsafe fn f(q: *mut i32) { g(q); }",
-            |tcx| {
-                let program = collect_program(tcx);
-                assert!(!nb4_no_access(&program, "g", 0), "`g` writes `*r`");
-                assert!(
-                    !nb4_no_access(&program, "f", 0),
-                    "`f` forwards `q` to a deref-ing callee ⇒ taint must propagate along the edge"
-                );
-            },
-        );
-    }
-
-    /// POSITIVE transitive control (rider 3) — **the gain the fixpoint is bought for.** `f`
-    /// forwards its param to `g`, which never touches the pointee ⇒ `f`'s param is STILL
-    /// `no-access`. Without this, the fixpoint is untested against a mere "unused-param" rule.
-    #[test]
-    fn nb4_transitive_no_access_gated() {
-        run_compiler(
-            "unsafe fn g(_r: *mut i32) -> i32 { 0 } \
-             unsafe fn f(q: *mut i32) -> i32 { g(q) }",
-            |tcx| {
-                let program = collect_program(tcx);
-                assert!(nb4_no_access(&program, "g", 0), "`g` never touches `_r`");
-                assert!(
-                    nb4_no_access(&program, "f", 0),
-                    "`f` only FORWARDS `q` to a no-access callee ⇒ `f` is no-access too. This is \
-                     the transitive gain a simple unused-param rule cannot see."
-                );
-            },
-        );
-    }
-
-    /// An EXTERN/opaque callee is WORST-CASE access (rider 1: never silently drop the alias).
-    #[test]
-    fn nb4_extern_callee_param_is_not_no_access() {
-        run_compiler(
-            "unsafe extern \"C\" { fn opaque(p: *mut i32); } \
-             unsafe fn f(q: *mut i32) { opaque(q); }",
-            |tcx| {
-                let program = collect_program(tcx);
-                assert!(
-                    !nb4_no_access(&program, "f", 0),
-                    "an opaque callee may do anything to the pointee ⇒ worst-case access"
-                );
-            },
-        );
-    }
-
-    /// `is_null` inspects the POINTER, never the pointee ⇒ the `NoAccess` boundary row applies
-    /// (matched with `library.rs`'s exact `RustPtrPath` discipline, not a bare name).
-    #[test]
-    fn nb4_is_null_param_is_no_access() {
-        run_compiler("unsafe fn f(q: *mut i32) -> bool { q.is_null() }", |tcx| {
-            let program = collect_program(tcx);
-            assert!(
-                nb4_no_access(&program, "f", 0),
-                "`is_null` reads the pointer VALUE only ⇒ `f`'s param stays no-access"
-            );
-        });
-    }
-
-    /// A param STORED through a projection escapes into memory the analysis cannot follow ⇒
-    /// worst-case access.
-    #[test]
-    fn nb4_stored_param_is_not_no_access() {
-        run_compiler(
-            "unsafe fn f(out: *mut *mut i32, q: *mut i32) { *out = q; }",
-            |tcx| {
-                let program = collect_program(tcx);
-                assert!(
-                    !nb4_no_access(&program, "f", 1),
-                    "`q` is stored through `*out` ⇒ it escapes ⇒ worst-case access"
-                );
-            },
-        );
+        }
+        // The two effect classes 4c gates on are represented where expected.
+        assert!(role_effects(Role::Sink).contains(&Effect::MayOverwrite), "free ⇒ may-overwrite");
+        assert!(role_effects(Role::Source).contains(&Effect::MaySupply), "alloc ⇒ may-supply");
     }
 
     // ===== §NB4-4a NAMED RESIDUAL — "unmodeled call-boundary materialization" =====
@@ -11597,21 +11498,27 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    /// §NB4-4a-ii RED (no-deref) — **the effect-gating fixture**, three-state.
+    /// §NB4-4a-ii **CONTROL — the fixture that KILLED the no-access gate.** (Was
+    /// `nb4_no_deref_callee_loan_survives`, asserting `x` stays `Ref`. That assertion was
+    /// **UNSOUND**; it now pins the opposite, and exists to stop the gate being re-attempted.)
     ///
-    /// `ignores` takes the pointer BY VALUE and never dereferences it. Passing a pointer while a
-    /// `&mut` to its pointee is live is perfectly legal — yet the Call arm's effect-blind
-    /// `consume_operand(arg)` emits a `Deep` access to `(*arg)` anyway, manufacturing a conflict.
-    /// (CONTROL that proved this is the real over-invalidation class, and that a read-only-DEREF
-    /// callee is NOT: the identical edge appears for an inline `let _v = *p;` with **no call at
-    /// all** — so read-through-alias vs a live `&mut` is a GENUINE conflict, not a call artifact.)
+    /// `ignores` takes the pointer BY VALUE and never dereferences it, so the "spurious
+    /// over-invalidation" story was: the Call arm's effect-blind `Deep` access to `(*arg)`
+    /// manufactures a conflict no callee could cause ⇒ gate it and `x` survives `Ref`.
     ///
-    /// Trajectory — one assertion per stage, flipped by the commit that causes each transition:
-    ///   • TODAY  `Ref` — the issuer-discharge accidentally spares `x`  ← asserted here
-    ///   • 4a-i   `Raw` — A′ demotes the live requirer of a SPURIOUS edge (visible over-demotion)
-    ///   • 4a-ii  `Ref` — effect gating classifies `ignores` as **no-access**, the edge disappears
+    /// **The no-call CONTROL refutes that.** Replacing `ignores(p)` with a plain value use of `p`
+    /// and **no call at all** (`let v = p as usize as i32;`) demotes `x` to `Raw` *identically*.
+    /// So the conflict is not about the POINTEE and not about the call: it is a **use of `p`
+    /// while `x` holds an outstanding reborrow of `(*p)`**, which under the reference reading the
+    /// model is deciding is a GENUINE borrowck conflict (`let x = id(p); *x = 1; /* use p */; *x`
+    /// — you cannot use a `&mut` while a live reborrow derives from it).
+    ///
+    /// Therefore `Deep`-access-on-copy is **not** an over-approximation of pointee access — it is
+    /// the correct conservative treatment of a use of a BORROWED BASE, and there is no
+    /// over-invalidation class to gate at the argument level. `call_effects`'s `no-access` facts
+    /// are real, but gating invalidation on them is unsound. **Do not re-add the gate.**
     #[test]
-    fn nb4_no_deref_callee_loan_survives() {
+    fn nb4_no_deref_callee_still_conflicts() {
         run_compiler(
             &format!(
                 "{NB4_ID} unsafe fn ignores(_q: *mut i32) -> i32 {{ 0 }} \
@@ -11624,12 +11531,10 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 assert_eq!(
                     m[0].0,
                     Some(SlotKind::Raw),
-                    "STAGE 2 (4a-i / A′ landed): `x` is now demoted — but the edge driving it is \
-                     SPURIOUS (`ignores` never dereferences `q`; the Call arm's effect-blind `Deep` \
-                     access to `(*arg)` manufactured the conflict). This is the KNOWN over-demotion \
-                     A′ introduces, and it is what 4a-ii's **no-access** effect gating must claw \
-                     back to `Ref` (STAGE 3). Asserted per-stage so the clawback cannot be silently \
-                     skipped: when 4a-ii lands, this flips back to `Ref`."
+                    "`x` MUST be demoted: passing `p` to `ignores` is a USE of `p` while `x` holds \
+                     a live reborrow of `(*p)` — a genuine conflict, independent of what the callee \
+                     does with the pointee. The no-call control (`let v = p as usize`) demotes `x` \
+                     identically, which is what refuted the no-access gate. Do not gate this."
                 );
             },
         );
