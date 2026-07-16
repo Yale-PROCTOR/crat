@@ -11152,6 +11152,83 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         }
     }
 
+    /// §NB4-4c MARKER (§8-guarded — the Codex-F1 re-review residue, 2026-07-17). `summary.unknown`
+    /// is a MAY-set, not an exclusive no-origin partition: a signature RETURN can carry BOTH a
+    /// modeled borrow origin (`q = p`) AND a stale opaque may-definition (`q = op(p)`) that a later
+    /// overwrite kills. Because the opaque def still MAY-reaches, the return lands in
+    /// `collect_no_borrow_origin_slots`; the monotone `¬ref` demotes it, and copy-coherence drags the
+    /// modeled-origin param `p` and the copy `q` to `Raw` too — COLLATERAL over-demotion of slots that
+    /// have a real borrow origin. This is the strong-form failure of the NB4-4c "F1 refutation": the
+    /// demotion is signature-boundary for DIRECT membership (an internal-only local is never in the
+    /// set — see `nb4_4c_demotion_is_signature_boundary_only`), but a modeled-origin SIGNATURE slot
+    /// CAN be, and coherence then spreads it.
+    ///
+    /// SOUNDNESS: this is COMPLETENESS-CLASS (precision), NOT unsoundness — `Ref → Raw` is the
+    /// conservative direction (Raw is always memory-safe), the model still ACCEPTS, and BO output is
+    /// unconsumed by codegen (§8). It FLIPS (`p` back to `Ref`, return out of the set) when the
+    /// deferred "definitely-overwritten vs may-reach unknown-def" distinction lands (one bucket, gate
+    /// = effect-row + opaque-interaction detection). Tripwire, not a regression.
+    #[test]
+    fn nb4_4c_marker_coherence_collateral_demotes_modeled_origin() {
+        use rustc_middle::mir::RETURN_PLACE;
+        // Control: pure modeled copy — return has ONLY a modeled origin, stays Ref (baseline).
+        run_compiler(
+            "unsafe fn f(p: *mut i32) -> *mut i32 { let q = p; q }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let ret = local_slot(&slots, f, RETURN_PLACE, 0);
+                let p0 = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
+                assert!(
+                    !collect_no_borrow_origin_slots(&origins, &slots).contains(&ret),
+                    "control: a pure modeled-copy return must NOT be no-borrow-origin"
+                );
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver).expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(m.get(&p0), Some(&SlotKind::Ref), "control: modeled-origin p stays Ref");
+            },
+        );
+        // Mixed: q first opaque, then overwritten with modeled p, then returned. TODAY: the return is
+        // in the set (may-set over-inclusion) and coherence collaterally demotes p to Raw.
+        run_compiler(
+            "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32) -> *mut i32 { let mut q = op(p); q = p; q }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let ret = local_slot(&slots, f, RETURN_PLACE, 0);
+                let p0 = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
+                assert!(
+                    collect_no_borrow_origin_slots(&origins, &slots).contains(&ret),
+                    "TODAY: a modeled-origin return with a stale opaque may-def IS over-included \
+                     (may-set); this flips when the overwrite-kill distinction lands"
+                );
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver).expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(
+                    m.get(&p0),
+                    Some(&SlotKind::Raw),
+                    "TODAY: coherence collaterally demotes the modeled-origin param p to Raw \
+                     (conservative, §8-guarded); flips to Ref when the deferred fix lands"
+                );
+            },
+        );
+    }
+
     // ---- §NB4-4c — MAY-SUPPLY DEMOTION over the NO-BORROW-ORIGIN set ----
     //
     // These were the §NB3-3c-ii NB4-boundary markers. NB4-4c lands the **may-supply demotion**: a

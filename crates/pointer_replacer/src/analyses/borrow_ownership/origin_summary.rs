@@ -31,12 +31,19 @@ use crate::analyses::borrow::lifetime_flow::{LifetimeSlot, SignatureSlot};
 ///   sup)` means `sub`'s origin flows into (is contained in) `sup`'s — mirroring the engine's own
 ///   `subset_closure.contains(arg, return)` convention (`borrow/mod.rs:1205`). Built here with a
 ///   correct multi-hop closure (NOT the 1-hop production `subset_closure` — D3, diagnostic-only).
-/// - `unknown`: slots with NO trackable borrow origin — an opaque-callee RESULT **or** a freshly
-///   `malloc`'d OWNED pointer. **This is "no-borrow-origin", NOT "opaque-poisoned"** (NB4-4c dump
-///   correction: the `malloc_only` vs `malloc_opaque` ablation proves an opaque call adds nothing to
-///   this set). Production's conflict path never consumes the analogous `unknown_targets` (verified),
-///   so NB4-4c consuming this for the may-supply `¬ref` demotion is a fork-only soundness win — but
-///   `¬ref` ONLY, since an owned member must keep `Owning` (a uniform `¬own` over-demotes it).
+/// - `unknown`: slots at least one of whose may-definitions has NO trackable borrow origin — an
+///   opaque-callee RESULT **or** a freshly `malloc`'d OWNED pointer. **This is "no-borrow-origin", NOT
+///   "opaque-poisoned"** (NB4-4c dump correction: the `malloc_only` vs `malloc_opaque` ablation proves
+///   an opaque call adds nothing to this set). **It is a MAY-set, not an exclusive partition** (Codex
+///   re-review 2026-07-17): a slot with a REAL modeled origin can also be here via a stale-but-may-reach
+///   opaque def that a later assignment kills — so membership means "some may-def is origin-less", NOT
+///   "this slot has no origin". Production's conflict path never consumes the analogous `unknown_targets`
+///   (verified), so NB4-4c consuming this for the may-supply `¬ref` demotion is a fork-only win — sound
+///   because `¬ref` is CONSERVATIVE (`Ref → Raw`), not because membership is exclusive. `¬ref` ONLY: an
+///   owned member must keep `Owning` (a uniform `¬own` over-demotes it). The may-set over-inclusion
+///   collaterally demotes modeled-origin slots via coherence — completeness-class, marker-pinned
+///   (`nb4_4c_marker_coherence_collateral_demotes_modeled_origin`), fix deferred (definitely-overwritten
+///   vs may-reach distinction).
 #[derive(Clone, Debug)]
 pub struct OriginSummary {
     pub slots: IndexVec<LifetimeSlot, SignatureSlot>,
