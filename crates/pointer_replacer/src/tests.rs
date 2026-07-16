@@ -11113,6 +11113,45 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB4-4c SCOPE GUARD: the demotion set is the interprocedural SIGNATURE boundary only
+    /// (args/returns/fields, via `to_summary`), NEVER internal locals. An internal `Copy`/`Move` of an
+    /// addr-of-local / `.offset` / plain / opaque-result pointer is body-level unknown but is NOT a
+    /// signature slot, so it is not demoted — no promotion coverage is lost on intermediates. (This
+    /// refutes the "source-less copies get hard `¬ref`" concern: those are internal locals.)
+    #[test]
+    fn nb4_4c_demotion_is_signature_boundary_only() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("addrof_copy", "q",
+             "fn f() { let mut x = 0i32; let p = &raw mut x; let q = p; unsafe { *q = 1; } }"),
+            ("offset_copy", "q",
+             "unsafe fn f(p: *mut i32) { let r = p.offset(1); let q = r; let _ = q; }"),
+            ("plain_copy", "q",
+             "unsafe fn f(p: *mut i32) { let q = p; let _ = q; }"),
+            ("opaque_result_local", "q",
+             "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+              unsafe fn f(p: *mut i32) { let q = op(p); let _ = q; }"),
+        ];
+        for (label, var, code) in cases {
+            run_compiler(code, |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let set = collect_no_borrow_origin_slots(&origins, &slots);
+                let local = local_by_var_name(tcx, f, var);
+                let s0 = slots
+                    .fn_local_slots
+                    .get(&f)
+                    .and_then(|u| u.slot_for_local_depth(local, 0))
+                    .map(|id| SlotRef::Local(f, id));
+                assert!(
+                    !s0.map(|s| set.contains(&s)).unwrap_or(false),
+                    "{label}: an internal local `{var}` must NOT be demoted (signature-boundary only)"
+                );
+            });
+        }
+    }
+
     // ---- §NB4-4c — MAY-SUPPLY DEMOTION over the NO-BORROW-ORIGIN set ----
     //
     // These were the §NB3-3c-ii NB4-boundary markers. NB4-4c lands the **may-supply demotion**: a
