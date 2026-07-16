@@ -230,6 +230,7 @@ pub(crate) struct BoOwnEmissionStats {
 pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     crate_ctxt: &CrateCtxt<'tcx>,
     slots: &CrateSlots,
+    origins: &origin_summary::OriginSummaries,
     kind_solver: &KindSolver,
 ) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
     let mut var_gen = Gen::new();
@@ -278,6 +279,27 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     let fns: Vec<_> = crate_ctxt.fns().iter().map(|d| d.expect_local()).collect();
     for slot in sources::collect_malloc_source_slots(crate_ctxt.tcx, &fns, slots) {
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
+    }
+
+    // §NB4-4c: MAY-SUPPLY demotion over the NO-BORROW-ORIGIN set. A monotone `¬ref` on every
+    // no-borrow-origin slot — base signature slots (args/returns) AND struct fields, per
+    // `collect_no_borrow_origin_slots` (NO depth-0 arg tier — deferred). Emitted EAGERLY here
+    // (candidacy-independent), mirroring the malloc-source `¬ref` loop above (the 3c-ii lesson).
+    // `origins` is THREADED in (F3 split-brain fix): CHECK_REAL, explain_unsat, and every test see the
+    // identical clause set.
+    //
+    // `¬ref`-ONLY, not `¬ref ∧ ¬own`: `summary.unknown` is "NO-BORROW-ORIGIN", not "opaque-poisoned"
+    // (the malloc_only vs malloc_opaque ablation — `opaque(out)` adds nothing to the set), so it also
+    // holds owned-heap `*out = malloc()` / `return malloc()` transfers. `¬ref` is SELF-DISCRIMINATING:
+    // an owned slot keeps `Owning` via its source selector; an opaque RESULT loses `Ref` → `Raw`. A
+    // uniform `¬own` over-demoted the owned transfers (9 tests). The may-overwrite `¬own` is
+    // un-targetable from this set (the overwrite is not in `summary.unknown`) and DEFERS to the
+    // effect-row/opaque-interaction bucket; see the task doc.
+    if let Some(tracker) = kind_solver.tracker() {
+        tracker.set_context("nb4-4c-may-supply-demotion");
+    }
+    for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
+        kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
     }
 
     let selectors = Selectors::new(

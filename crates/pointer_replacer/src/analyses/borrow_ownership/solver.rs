@@ -102,6 +102,9 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "field-forbid",
     "link-own",
     "borrow-exclusion",
+    // §NB4-4c: `¬own(slot)` demotion companion to `borrow-exclusion`. No substring overlap with
+    // the `own-*` families or `borrow-exclusion` (first-containment matching stays unambiguous).
+    "own-exclusion",
     "one-hot",
     // §NB1 per-site safety monotonicity (no substring overlap with the others).
     "safe-mono",
@@ -378,6 +381,34 @@ impl KindSolver {
             self.tracker.as_ref(),
             || format!("borrow-exclusion({issuer:?},{requirers:?})"),
             &Bool::or(&refs),
+        );
+    }
+
+    /// §NB4-4c — assert `¬own(slot)`: a monotone ownership-exclusion clause, the companion to
+    /// `add_borrow_exclusion` (`¬ref`). Together (`¬ref ∧ ¬own`) they pin an unknown-poisoned slot
+    /// to `Raw` by one-hot — the may-overwrite/may-retain case where a bare `¬ref` would leave an
+    /// unsound `Owning` (the 3c-ii rejection of the blunt `¬ref`-only clause). *Forbid-only*: it
+    /// never asserts a positive kind bit, so it only pushes toward raw — theorems-doc invariant 7
+    /// intact, and it is trivially compatible with the `i1-adjacency` coupling clause (`raw(d) ⇒
+    /// ¬own(d+1)` says nothing when a slot is forced non-`Owning`). When the slot ALSO carries a
+    /// retractable malloc-source selector, this hard `¬own` forces that selector to LEAK under
+    /// `model_kinds_relaxing` (a relaxed accept with the slot `Raw`), never a hard decline.
+    ///
+    /// Precondition (as `add_borrow_exclusion`): `slot` must be registered in this solver.
+    ///
+    /// NB4-4c: the may-supply demotion uses `¬ref` only; this `¬own` is the tool for the DEFERRED
+    /// may-overwrite demotion (needs opaque-overwrite detection, which `summary.unknown` does not
+    /// provide). Kept warm by `nb4_4c_add_owning_exclusion_forbids_owning`, not `allow(dead_code)`.
+    pub(crate) fn add_owning_exclusion(&self, slot: SlotRef) {
+        let vars = self
+            .vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("own-exclusion({slot:?})"),
+            &!&vars.own,
         );
     }
 

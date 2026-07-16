@@ -101,18 +101,33 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
         .collect()
 }
 
-/// §NB3-3c-ii → NB4 SEED: map origins' `unknown`-poisoned SIGNATURE slots (args/returns) to their
-/// kind-solver `SlotRef`s. Base-pointer slots only (fields conservatively skipped — the summary↔kind
-/// field-depth correspondence is not 1:1). **Kept in the tree, not a patch, so the NB4-boundary marker
-/// tests can guard current behavior against silent drift** (e.g. S2-4 objective restructuring changing
-/// what poisoned slots settle to). Currently consumed ONLY by those marker tests.
+/// §NB4-4c NO-BORROW-ORIGIN DEMOTION SET: the origins' `unknown` SIGNATURE/FIELD slots, mapped to
+/// their kind-solver `SlotRef`s. `emit_crate_ownership_constraints` applies a monotone `¬ref` to each
+/// (the may-supply demotion).
 ///
-/// NB4 rebuilds this as an EFFECT-AWARE demotion (the 3c-ii `¬ref`-only clause was Codex-rejected —
-/// `¬ref` permits an unsound `Owning` on may-overwrite slots, and it misses direct-arg/field retention;
-/// see the 3c task-doc Codex fold). The clause-emission seed is
-/// `scratchpad/nb3c-ii-unknown-nref-clause-for-nb4.patch`.
-#[allow(dead_code)] // wired into production at NB4; today only the marker tests consume it
-pub(crate) fn collect_unknown_poisoned_slots(
+/// **The set is "NO-BORROW-ORIGIN", NOT "opaque-poisoned"** (dump-corrected 2026-07-16). A slot lands
+/// in `summary.unknown` when its value has no trackable *borrow* origin — either an opaque-callee
+/// RESULT (opaque return / opaque-supplied field), OR a freshly-`malloc`'d OWNED pointer
+/// (`*out = malloc()`, `return malloc()`). The `malloc_only` vs `malloc_opaque` ablation proves
+/// `opaque(out)` adds NOTHING to this set, so a member cannot be read as "an opaque callee may
+/// overwrite it."
+///
+/// `¬ref`-only is sound precisely because it is SELF-DISCRIMINATING and makes no may-overwrite claim:
+/// - an OWNED slot keeps `Owning` — its malloc source selector still settles it, and `¬ref` forbids
+///   only the *reference* reading; the slot is `Owning` before AND after (no over-demotion — this is
+///   what a uniform `¬own` got wrong: it forced owned `*out=malloc()` transfers to `Raw`).
+/// - an opaque RESULT (no owning origin, previously `Ref`) drops to `Raw` — the may-supply FFI-S2-6
+///   fix (a shared `&T` over unknown callee memory the callee may retain + write).
+///
+/// Covers base signature slots (args/returns) AND struct fields (the field skip is dropped).
+///
+/// DEFERRED — one bucket, gate = effect-row + opaque-interaction detection (see task doc): (a) the
+/// may-OVERWRITE demotion of an owned slot an opaque callee may overwrite — UN-targetable here (the
+/// overwrite is not in `summary.unknown`); marker = the reverted `out@1`-Owning-today assertion.
+/// (b) depth-0 arg retention — marker `nb4_4c_marker_depth0_arg_retention_open`; the tier-2 seed-size
+/// dump (harness `CRAT_BOC1_SEED_SIZE`) sizes it. Both need opaque-callee-interaction detection that
+/// this no-borrow-origin set does not provide.
+pub(crate) fn collect_no_borrow_origin_slots(
     origins: &OriginSummaries,
     slots: &CrateSlots,
 ) -> Vec<SlotRef> {
@@ -120,14 +135,30 @@ pub(crate) fn collect_unknown_poisoned_slots(
     use rustc_middle::mir::RETURN_PLACE;
     let mut out = vec![];
     for (&f, summary) in origins.iter() {
-        let Some(universe) = slots.fn_local_slots.get(&f) else {
-            continue;
-        };
         for slot in summary.unknown.iter() {
             let sig = summary.slots[slot];
-            if sig.place.field.is_some() {
-                continue; // field slot — conservatively skipped (NB4 covers it)
+            // §NB4-4c: field slots are no longer skipped — a no-borrow-origin struct-field slot maps
+            // to its crate-wide kind `SlotRef::Field`. It is a genuine may-supply hazard (a field
+            // holding opaque-supplied memory); the `¬ref` demotion is GLOBAL because the field slot is
+            // flow-insensitive (consistent with the existing field-ownership model), and harmless to an
+            // owned field (which keeps `Owning`).
+            if let Some(field) = sig.place.field {
+                // The signature carries the `borrow`-side `StructFieldSlot`; the kind universe keys
+                // on the `borrow_ownership::slots` one — identically shaped, SAME `(struct_did,
+                // all-fields `field_index`)` semantics (`borrow/mod.rs:136` `field.index()` vs
+                // `crate_slots.rs:39-46` `all_fields().enumerate()`), but distinct nominal types.
+                let kind_field = super::slots::StructFieldSlot {
+                    struct_did: field.struct_did,
+                    field_index: field.field_index,
+                };
+                if let Some(id) = slots.field_slots.slot_for_field_depth(kind_field, sig.depth) {
+                    out.push(SlotRef::Field(id));
+                }
+                continue;
             }
+            let Some(universe) = slots.fn_local_slots.get(&f) else {
+                continue;
+            };
             let local = match sig.place.root {
                 SignatureRoot::Return => RETURN_PLACE,
                 SignatureRoot::Arg(l) => l,
