@@ -9728,7 +9728,7 @@ mod borrow_ownership_coherence {
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
                 mutability_facts::MutFacts,
-                origins::{collect_unknown_poisoned_slots, compute_origins},
+                origins::{collect_no_borrow_origin_slots, compute_origins},
                 slots::StructFieldSlot,
                 solver::{KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
@@ -9841,7 +9841,7 @@ mod borrow_ownership_coherence {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let (_s, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("ownership emission");
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver).expect("ownership emission");
         add_coherence(&solver, &slots, f, &body);
 
         // Non-vacuous: the shape is genuinely hazardous (a round-0 all-Ref aliasing conflict).
@@ -9900,7 +9900,7 @@ pub unsafe fn alloc_free() {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("B1 ownership emission should run");
 
                 assert!(
@@ -9984,7 +9984,7 @@ pub unsafe fn alloc_free() {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                 .expect("B2 ownership emission should run");
 
                 let p_local = call_destination(tcx, &body, "malloc");
@@ -10026,7 +10026,7 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                 .expect("B2 ownership emission should run");
                 add_coherence(&kind_solver, &slots, fill, &body);
 
@@ -10081,7 +10081,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                 .expect("B3a ownership emission should run");
 
                 // Prove the relax path is genuinely exercised: exactly one source
@@ -10141,7 +10141,7 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                 .expect("B3a ownership emission should run");
 
                 // Two sources + (§NB-F) one free-sink selector; assuming all is
@@ -10242,7 +10242,7 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("S2-1 ownership emission should run");
 
                 // Exactly ONE source (source_side's malloc) and ONE sink
@@ -10373,7 +10373,7 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("S2-1 fan-out emission should run");
 
                 assert_eq!(selectors.sources().len(), 1);
@@ -10469,7 +10469,7 @@ pub unsafe fn ctrl2(a: *mut core::ffi::c_void) {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("S2-1 control emission should run");
 
                 assert_eq!(selectors.sources().len(), 2);
@@ -10574,7 +10574,7 @@ pub unsafe fn ctrl() {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("S2-1 control emission should run");
 
                 assert_eq!(selectors.sources().len(), 1);
@@ -10857,7 +10857,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let model_ctrl = {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) =
-                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                             .expect("control emission");
                     add_coherence(&solver, &slots, f, &body);
                     verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
@@ -10878,7 +10878,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let model_fact = {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) =
-                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                             .expect("treatment emission");
                     add_coherence(&solver, &slots, f, &body);
                     verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
@@ -10932,7 +10932,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let model = {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) =
-                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                             .expect("emission");
                     add_coherence(&solver, &slots, f, &body);
                     verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
@@ -11056,7 +11056,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let kind_of = |name: &str, mf_true: bool| {
                     let solver = KindSolver::new(&slots);
                     let (_s, selectors) =
-                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                        emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                             .expect("emission");
                     add_coherence(&solver, &slots, f, &body);
                     let sid = slot_of(name);
@@ -11113,21 +11113,31 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
-    // ---- §NB3-3c-ii → NB4-BOUNDARY MARKERS ----
+    // ---- §NB4-4c — MAY-SUPPLY DEMOTION over the NO-BORROW-ORIGIN set ----
     //
-    // These pin CURRENT (no-`unknown`-clause) behavior of opaque-poisoned slots. They are the §8
-    // guarded-hazard family (like `nb2_cross_alias_write_uncaught_witness`): the state is unsound at
-    // acceptance TODAY, guarded only by §8 (BO unconsumed by codegen), and MUST flip when NB4's
-    // effect-aware `unknown` demotion lands. Shipped as EXECUTABLE tests (not a patch) so S2-4's
-    // objective restructuring — or any change to what poisoned slots settle to — cannot silently
-    // invalidate NB4's sizing assumptions without a red test. `collect_unknown_poisoned_slots` (the
-    // NB4 seed) is their only consumer today.
+    // These were the §NB3-3c-ii NB4-boundary markers. NB4-4c lands the **may-supply demotion**: a
+    // monotone `¬ref` on every NO-BORROW-ORIGIN slot (`collect_no_borrow_origin_slots`, base
+    // signature slots + struct fields), wired into `emit_crate_ownership_constraints` (was:
+    // marker-tests-only).
+    //
+    // KEY CONCEPT (dump-corrected 2026-07-16): `summary.unknown` is "NO-BORROW-ORIGIN", NOT
+    // "opaque-poisoned". A slot lands there when its value has no trackable *borrow* origin — an
+    // opaque-callee RESULT, OR a freshly-`malloc`'d OWNED pointer. The `malloc_only` vs `malloc_opaque`
+    // ablation proves `opaque(out)` adds nothing to the set. So `¬ref`-ONLY (not `¬ref ∧ ¬own`, which
+    // over-demoted owned transfers — 9 tests): it is SELF-DISCRIMINATING — an owned slot keeps
+    // `Owning` (source selector), an opaque RESULT loses `Ref` → `Raw`.
+    //
+    // Two markers pin DEFERRED §8-guarded hazards (flip when opaque-INTERACTION detection lands, one
+    // bucket): `nb4_4c_marker_may_overwrite_owning_today` (owned out@1 an opaque callee may overwrite)
+    // and `nb4_4c_marker_depth0_arg_retention_open` (depth-0 arg an opaque callee may retain). The
+    // GREEN tests below encode the may-supply FIX (opaque results → Raw); the controls stay `Ref`.
 
-    /// MARKER: an opaque-callee-provenance RETURN is `unknown`-poisoned and settles **`Ref` today**
-    /// (a shared `&T` over unknown C-state the callee may retain + write → the FFI-edition S2-6 hazard).
-    /// NB4's effect-aware demotion must flip this to `Raw` (may-supply ⇒ `¬ref`).
+    /// §NB4-4c (MAY-SUPPLY): an opaque-callee-RESULT RETURN is a NO-BORROW-ORIGIN slot and is DEMOTED
+    /// to **`Raw`** by the monotone `¬ref` — the FFI-edition S2-6 fix (a shared `&T` over unknown
+    /// C-state the callee may retain + write is now forbidden). No owning source reaches it (opacity
+    /// breaks the link), so `¬ref` settles it `Raw`.
     #[test]
-    fn nb3c_marker_poisoned_return_is_ref_today() {
+    fn nb4_4c_no_origin_return_demoted_to_raw() {
         run_compiler(
             "unsafe extern \"C\" { fn opaque_dup(p: *mut i32) -> *mut i32; } \
              unsafe fn f(p: *mut i32) -> *mut i32 { opaque_dup(p) }",
@@ -11142,50 +11152,187 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let facts = MutFacts::from_program(&program);
                 let ret = local_slot(&slots, f, RETURN_PLACE, 0);
                 assert!(
-                    collect_unknown_poisoned_slots(&origins, &slots).contains(&ret),
-                    "opaque-return must be unknown-poisoned (the hazard the NB4 demotion targets)"
+                    collect_no_borrow_origin_slots(&origins, &slots).contains(&ret),
+                    "opaque-return must be no-borrow-origin (the hazard the 4c demotion targets)"
                 );
                 let solver = KindSolver::new(&slots);
-                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("emission");
                 add_coherence(&solver, &slots, f, &body);
                 let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
                 assert_eq!(
                     m.get(&ret),
-                    Some(&SlotKind::Ref),
-                    "TODAY (no unknown clause) f's opaque return settles Ref — §8-guarded hazard; \
-                     NB4's effect-aware demotion must flip this to Raw"
+                    Some(&SlotKind::Raw),
+                    "NB4-4c: no-borrow-origin may-supply return must be demoted to Raw (¬ref)"
                 );
             },
         );
     }
 
-    /// MARKER (negative control): a KNOWN provenance-preserving callee (`.offset`) is NOT poisoned, so
-    /// its return legitimately stays `Ref` — the NB4 demotion must leave it alone (pairs with
-    /// `nb3_known_callee_no_poison`).
+    /// §NB4-4c (negative control + PURE-READ RESIDUAL): a KNOWN provenance-preserving callee
+    /// (`.offset`) has a borrow origin, so its return legitimately stays `Ref` — the demotion must leave
+    /// it alone. Green before AND after 4c (the boundary gates WHO gets demoted).
     #[test]
-    fn nb3c_marker_known_callee_not_poisoned() {
+    fn nb4_4c_known_callee_not_demoted_stays_ref() {
         run_compiler("unsafe fn f(p: *mut i32) -> *mut i32 { p.offset(1) }", |tcx| {
             use rustc_middle::mir::RETURN_PLACE;
             let program = collect_program(tcx);
             let f = function_by_name(&program, "f");
+            let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
             let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
             let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
             let ret = local_slot(&slots, f, RETURN_PLACE, 0);
             assert!(
-                !collect_unknown_poisoned_slots(&origins, &slots).contains(&ret),
-                "known provenance-preserving `.offset` must NOT poison f's return (no NB4 demotion)"
+                !collect_no_borrow_origin_slots(&origins, &slots).contains(&ret),
+                "known provenance-preserving `.offset` must NOT poison f's return (no 4c demotion)"
+            );
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
+                .expect("emission");
+            add_coherence(&solver, &slots, f, &body);
+            let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+            assert_eq!(
+                m.get(&ret),
+                Some(&SlotKind::Ref),
+                "NB4-4c: an origin-carrying `.offset` return must stay Ref (demotion must not over-reach)"
             );
         });
     }
 
-    /// MARKER (the UAF marker — NB4's strongest sizing evidence): a poisoned MAY-OVERWRITE slot settles
-    /// **`Owning` today** under no clause. `*out = malloc(); opaque(out)` gives `out@1` owning evidence
-    /// AND poisons it; if `opaque` overwrites `*out` with foreign memory, codegen drops the "owned"
-    /// slot → UAF. This is exactly why NB4's demotion must be effect-aware: a blunt `¬ref` leaves this
-    /// `Owning` untouched — the may-overwrite case needs `¬owning`/Raw, NOT just `¬ref`.
+    /// §NB4-4c (PURE-READ RESIDUAL): a `*mut i32` param only READ through (`*p`) is NOT a
+    /// no-borrow-origin slot and stays `Ref` — the demotion must never touch an ordinary read-only
+    /// pointer. Green throughout.
     #[test]
-    fn nb3c_marker_poisoned_may_overwrite_is_owning_today() {
+    fn nb4_4c_pure_read_preserves_ref() {
+        run_compiler("unsafe fn f(p: *mut i32) -> i32 { *p }", |tcx| {
+            let program = collect_program(tcx);
+            let f = function_by_name(&program, "f");
+            let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+            let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let p0 = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
+            assert!(
+                !collect_no_borrow_origin_slots(&origins, &slots).contains(&p0),
+                "a read-only param must NOT be a no-borrow-origin slot"
+            );
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
+                .expect("emission");
+            add_coherence(&solver, &slots, f, &body);
+            let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+            assert_eq!(
+                m.get(&p0),
+                Some(&SlotKind::Ref),
+                "NB4-4c: a purely-read param must stay Ref (pure-read residual)"
+            );
+        });
+    }
+
+    /// §NB4-4c MARKER (§8-guarded — the DEFERRED depth-0-arg retention gap, ruled 2026-07-16): a
+    /// direct depth-0 `*mut T` arg to a genuinely-opaque callee stays UN-DEMOTED (`Ref`) today. base
+    /// (lifetime_flow unknown-targets) does NOT poison it — pure-read externs are correctly left
+    /// alone, which is why the seed-size dump showed a blanket depth-0 extension is a firehose (~21k
+    /// args, ~all pure-read: __assert_fail/printf/fprintf/str/mem). The sound-AND-precise extension
+    /// is deferred to a boundary-table effect-row expansion (fragment-F/§6.4 gap + backlog; sizing =
+    /// tier-2 dump, harness `CRAT_BOC1_SEED_SIZE`). This pins the OPEN behavior: if `opaque_take`
+    /// RETAINS `p` and later writes `*p`, a surviving `Ref` is unsound (§8-guarded, BO unconsumed).
+    /// It FLIPS to `Raw` when the effect-row-paired extension lands — a tripwire, not a regression.
+    #[test]
+    fn nb4_4c_marker_depth0_arg_retention_open() {
+        run_compiler(
+            "unsafe extern \"C\" { fn opaque_take(p: *mut i32); } \
+             unsafe fn f(p: *mut i32) { opaque_take(p); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let p0 = local_slot(&slots, f, local_by_var_name(tcx, f, "p"), 0);
+                assert!(
+                    !collect_no_borrow_origin_slots(&origins, &slots).contains(&p0),
+                    "base must NOT poison a depth-0 arg to an opaque callee (the deferred gap)"
+                );
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
+                    .expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(
+                    m.get(&p0),
+                    Some(&SlotKind::Ref),
+                    "§8-guarded OPEN gap: depth-0 arg retention un-demoted today; flips to Raw when \
+                     the effect-row-paired depth-0 extension lands"
+                );
+            },
+        );
+    }
+
+    /// §NB4-4c (FIELD coverage — the F2 field extension, LANDED this row per the seed-size ruling):
+    /// a struct pointer field that receives opaque-callee provenance is a no-borrow-origin slot and
+    /// DEMOTED to `Raw`. Drops the `field.is_some()` seed skip and maps the signature field slot to
+    /// its kind `SlotRef::Field` via `slot_for_field_depth`. NB the field slot is crate-wide
+    /// flow-insensitive, so this is a GLOBAL demotion (consistent with the existing field model).
+    #[test]
+    fn nb4_4c_no_origin_field_demoted_to_raw() {
+        run_compiler(
+            "struct S { p: *mut i32 } \
+             unsafe extern \"C\" { fn opaque_dup(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(s: *mut S, q: *mut i32) { (*s).p = opaque_dup(q); }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let s_did = struct_by_name(&program, "S");
+                let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                // Fixture validity, independent of the seed's field-skip: a field slot IS no-borrow-origin.
+                assert!(
+                    origins.values().any(|su| su
+                        .unknown
+                        .iter()
+                        .any(|sl| su.slots[sl].place.field.is_some())),
+                    "fixture must poison a struct-field slot"
+                );
+                let field = StructFieldSlot { struct_did: s_did, field_index: 0 };
+                let fslot = slots
+                    .field_slots
+                    .slot_for_field_depth(field, 0)
+                    .expect("field S::p depth-0 kind slot");
+                let fref = SlotRef::Field(fslot);
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
+                    .expect("emission");
+                add_coherence(&solver, &slots, f, &body);
+                let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
+                assert_eq!(
+                    m.get(&fref),
+                    Some(&SlotKind::Raw),
+                    "NB4-4c: a no-borrow-origin struct-field slot must be demoted to Raw (field skip dropped)"
+                );
+            },
+        );
+    }
+
+    /// §NB4-4c MARKER (§8-guarded — the DEFERRED may-OVERWRITE hazard, ruled 2026-07-16): `out@1`
+    /// (`*out = malloc()` then `opaque(out)`) holds owned heap and is in the NO-BORROW-ORIGIN set, so
+    /// it settles **`Owning` today** — unchanged by the may-supply `¬ref` (which leaves an owned slot
+    /// `Owning`). If `opaque` overwrites `*out` with foreign memory, codegen dropping the "owned" slot
+    /// is a UAF. This hazard is NOT targetable from `summary.unknown`: the `malloc_only` vs
+    /// `malloc_opaque` ablation proves `opaque(out)` adds nothing to the set, so a `¬own` here cannot
+    /// tell it apart from a SAFE `*out = malloc()` (which must stay `Owning` — `store_through_ptr_*`).
+    /// It DEFERS to the effect-row/opaque-interaction bucket (with depth-0). Pins `Owning`; FLIPS to
+    /// `Raw` when overwrite detection lands — a tripwire, not a regression.
+    #[test]
+    fn nb4_4c_marker_may_overwrite_owning_today() {
         run_compiler(
             "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; fn opaque(out: *mut *mut i32); } \
              unsafe fn f(out: *mut *mut i32) { *out = malloc(core::mem::size_of::<i32>()); opaque(out); }",
@@ -11199,19 +11346,61 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let facts = MutFacts::from_program(&program);
                 let out1 = local_slot(&slots, f, local_by_var_name(tcx, f, "out"), 1);
                 assert!(
-                    collect_unknown_poisoned_slots(&origins, &slots).contains(&out1),
-                    "the out-param pointee must be unknown-poisoned (opaque may overwrite it)"
+                    collect_no_borrow_origin_slots(&origins, &slots).contains(&out1),
+                    "the out-param pointee is in the no-borrow-origin set (owned heap, no borrow origin)"
                 );
                 let solver = KindSolver::new(&slots);
-                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
                     .expect("emission");
                 add_coherence(&solver, &slots, f, &body);
                 let m = verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts");
                 assert_eq!(
                     m.get(&out1),
                     Some(&SlotKind::Owning),
-                    "TODAY `out@1` settles Owning even though it is poisoned — the UAF the blunt `¬ref` \
-                     clause does NOT prevent (verified basis for dropping the clause → NB4 effect-aware)"
+                    "§8-guarded: owned out@1 stays Owning under may-supply ¬ref; the may-overwrite \
+                     demotion is DEFERRED (opaque overwrite is not in the no-borrow-origin set)"
+                );
+            },
+        );
+    }
+
+    /// §NB4-4c white-box: `KindSolver::add_owning_exclusion(slot)` forbids `Owning` — the CONTRACT of
+    /// the deferred may-overwrite tool (rider 3, kept warm in place of `allow(dead_code)`). On a lone
+    /// `malloc`-source return (which settles `Owning` under the may-supply `¬ref`), adding `¬own` makes
+    /// the retractable source selector LEAK under relaxation → the slot settles `Raw`, never `Owning`,
+    /// and never a hard decline.
+    #[test]
+    fn nb4_4c_add_owning_exclusion_forbids_owning() {
+        run_compiler(
+            "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; } \
+             unsafe fn f() -> *mut i32 { malloc(4) }",
+            |tcx| {
+                use rustc_middle::mir::RETURN_PLACE;
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let ret = local_slot(&slots, f, RETURN_PLACE, 0);
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                    .expect("emission");
+                // Baseline (may-supply `¬ref` already applied): the malloc'd return settles Owning.
+                let base = solver.model_kinds_relaxing(&sel).expect("sat");
+                assert_eq!(
+                    base.get(&ret),
+                    Some(&SlotKind::Owning),
+                    "baseline: a malloc-source return is Owning under ¬ref-only"
+                );
+                // `¬own` forbids Owning → the source selector leaks → Raw (non-Owning), not a decline.
+                solver.add_owning_exclusion(ret);
+                let m = solver
+                    .model_kinds_relaxing(&sel)
+                    .expect("relaxed accept, NOT a decline");
+                assert_eq!(
+                    m.get(&ret),
+                    Some(&SlotKind::Raw),
+                    "¬own must force non-Owning; on a malloc source it leaks → Raw"
                 );
             },
         );
@@ -11252,7 +11441,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         let facts = MutFacts::from_program(program);
         let solver = KindSolver::new(&slots);
         let (_s, sel) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver).expect("emission");
         add_coherence(&solver, &slots, f, &body);
         let model =
             verify_to_fixpoint(program, &slots, &solver, &sel, &facts).expect("accepts");
@@ -12217,7 +12406,7 @@ pub unsafe fn forward() -> *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("B3b crate emission should run");
 
                 // The only malloc is in `make`; a selector here proves `make`'s
@@ -12271,7 +12460,7 @@ pub unsafe fn reader(p: *mut i32) -> i32 {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("B4 crate emission should run");
 
                 // `p` is param Local 1; read-only, so its depth-0 slot must be Ref.
@@ -12314,7 +12503,7 @@ pub unsafe fn caller(pp: *mut *mut i32) {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("B4b: c_void local-call emission should run without panicking");
 
                 assert!(
@@ -12351,7 +12540,7 @@ pub unsafe fn passes_through(p: *mut i32) {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("B4b: pass-through emission should run");
 
                 let p = local_slot(&slots, passes_through, Local::from_u32(1), 0);
@@ -12477,7 +12666,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 // construction); the guard in Solver B is thus the only added hard fact.
                 let solver_a = KindSolver::new(&slots);
                 let (_a, selectors_a) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver_a)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver_a)
                         .expect("BB1 baseline emission");
                 add_coherence(&solver_a, &slots, f, &body);
                 let model_a = solver_a
@@ -12496,7 +12685,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 // must demote >=1 involved slot off Ref.
                 let solver_b = KindSolver::new(&slots);
                 let (_b, selectors_b) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver_b)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver_b)
                         .expect("BB1 guarded emission");
                 add_coherence(&solver_b, &slots, f, &body);
                 let conflicts = revalidate(&program, &slots, |_| true, true);
@@ -12561,7 +12750,7 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("escape emission should run");
                 add_coherence(&kind_solver, &slots, make, &make_body);
                 add_coherence(&kind_solver, &slots, caller, &caller_body);
@@ -12613,7 +12802,7 @@ pub unsafe fn stash(owner: *mut Holder) {
                 let kind_solver = KindSolver::new(&slots);
 
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("stash emission should run");
                 add_coherence(&kind_solver, &slots, stash, &stash_body);
 
@@ -12677,7 +12866,7 @@ pub unsafe fn caller() -> *mut core::ffi::c_void {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
                 let (_s, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                         .expect("ownership emission");
                 add_coherence(&solver, &slots, make, &make_body);
                 add_coherence(&solver, &slots, caller, &caller_body);
@@ -12854,7 +13043,7 @@ pub unsafe fn f() {
 
                 // --- BB2-ii loop reaches the clean fixpoint. ---
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
                 let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
@@ -12923,7 +13112,7 @@ pub unsafe fn g() {
                 let s = local_slot(&slots, f, local_by_var_name(tcx, f, "s"), 0);
 
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
                 let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
@@ -12980,7 +13169,7 @@ pub unsafe fn dcu() {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13028,7 +13217,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13066,7 +13255,7 @@ pub unsafe fn foo(p: *mut i32) -> i32 {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13106,7 +13295,7 @@ pub unsafe fn fill(out: *mut *mut core::ffi::c_void) {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13148,7 +13337,7 @@ pub unsafe fn leak_cast() -> *mut *mut i32 {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13188,7 +13377,7 @@ pub unsafe fn leak_calloc() -> *mut *mut core::ffi::c_void {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13229,7 +13418,7 @@ pub unsafe fn alloc_free() {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13268,7 +13457,7 @@ pub unsafe fn leak_realloc() -> *mut *mut core::ffi::c_void {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13306,7 +13495,7 @@ pub unsafe fn leak_strdup(s: *const i8) -> *mut *mut i8 {
                 let slots = CrateSlots::build(&program);
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                     .expect("ownership emission");
                 add_coherence(&solver, &slots, f, &body);
 
@@ -13385,7 +13574,7 @@ pub unsafe fn f() {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
                 let (_s, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
                         .expect("the uthash is_ref shape must emit cleanly");
                 assert!(
                     solver.model_kinds_relaxing(&selectors).is_some(),
@@ -13421,7 +13610,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let kind_solver = KindSolver::new(&slots);
                 let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &kind_solver)
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &kind_solver)
                         .expect("NB0 emission");
 
                 let model = kind_solver
@@ -13675,7 +13864,7 @@ pub unsafe fn offcase() {
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
-        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
             .expect("BB-parity: ownership emission");
         for &g in &program.functions {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
@@ -14220,7 +14409,7 @@ pub unsafe fn agg_fn(ptr: *mut i32) -> S {
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
-        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+        let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(&program), &solver)
             .expect("BB-parity-own: ownership emission");
         for &g in &program.functions {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();

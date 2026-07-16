@@ -501,7 +501,115 @@ mod run {
         // the poisoned-slot set. (Storage is no longer a separate matrix — it folds into subset, F4 —
         // so there is no separate storage-edge count to report.)
         row.set("origin_unknown_slots", origins.values().map(|s| s.unknown.count()).sum::<usize>());
-        let _origins = origins; // uninjected at 3c-i; 3c-ii threads this into the replay's subset input
+
+        // §NB4-4c SEED-SIZE GATE (amendment 1): compute-only poisoned-slot tiers + untabled-extern
+        // histogram, then return BEFORE the emit/solve. Sizes the F2 arg/field extensions so the
+        // demotion row cannot be catastrophic "for the wrong reason" (a printf/fprintf-class untabled
+        // extern making every pointer arg it touches Raw). Off by default; no effect on normal sweeps.
+        //   tier-1 `poison_base`             = current `collect_no_borrow_origin_slots` (fields skipped)
+        //   tier-2 `poison_arg0_extern_delta`= depth-0 raw-ptr args to UNTABLED externs, NEW over base
+        //   tier-3 `poison_field_sig`        = `summary.unknown` field-slots (count only; the kind-slot
+        //                                      bridge is the deferred RED-5 spike, not needed for sizing)
+        //   `untabled_externs`              = "name:ptr_arg_calls" histogram, top 12 by frequency
+        if std::env::var_os("CRAT_BOC1_SEED_SIZE").is_some() {
+            use crate::analyses::borrow_ownership::{
+                boundary_table::{self, Matcher},
+                origins::collect_no_borrow_origin_slots,
+            };
+            use rustc_hash::{FxHashMap, FxHashSet};
+            use rustc_middle::mir::TerminatorKind;
+
+            let slots = CrateSlots::build(&program);
+            let base: FxHashSet<SlotRef> =
+                collect_no_borrow_origin_slots(&origins, &slots).into_iter().collect();
+            row.set("poison_base", base.len());
+
+            // c2rust emits cross-module *local* callees as `extern "C"` DECLARATIONS (ForeignItems
+            // with no body) at their call sites, while the DEFINITION lives elsewhere in the crate.
+            // Those are summary-covered, NOT opaque — exclude them by name so "opaque" means a
+            // genuine foreign symbol (no crate-local definition), matching lifetime_flow's notion.
+            let crate_fn_names: FxHashSet<String> = program
+                .functions
+                .iter()
+                .map(|f| tcx.item_name(f.to_def_id()).to_string())
+                .collect();
+
+            let mut arg0_new: FxHashSet<SlotRef> = FxHashSet::default();
+            let mut hist: FxHashMap<String, usize> = FxHashMap::default();
+            for &fn_did in &program.functions {
+                let Some(universe) = slots.fn_local_slots.get(&fn_did) else {
+                    continue;
+                };
+                let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+                for bb in body.basic_blocks.iter() {
+                    let Some(term) = &bb.terminator else { continue };
+                    let TerminatorKind::Call { func, args, .. } = &term.kind else {
+                        continue;
+                    };
+                    // Untabled extern = a crate-local `ForeignItem` decl with no ForeignC row
+                    // (mirrors `sources.rs::is_allocator_call` gating). Opaque = worst-case.
+                    let Some((def_id, _)) = func.const_fn_def() else { continue };
+                    let Some(local_did) = def_id.as_local() else { continue };
+                    let rustc_hir::Node::ForeignItem(fi) = tcx.hir_node_by_def_id(local_did) else {
+                        continue;
+                    };
+                    let name = fi.ident.as_str();
+                    if boundary_table::lookup(name, Matcher::ForeignC).is_some() {
+                        continue; // tabled — a known effect row, not opaque
+                    }
+                    if crate_fn_names.contains(name) {
+                        continue; // cross-module crate-local decl — summary-covered, not opaque
+                    }
+                    let mut ptr_args = 0usize;
+                    for a in args.iter() {
+                        let Some(place) = a.node.place() else { continue };
+                        if !place.ty(&*body, tcx).ty.is_raw_ptr() {
+                            continue;
+                        }
+                        ptr_args += 1;
+                        if let Some(base_local) = place.as_local()
+                            && let Some(id) = universe.slot_for_local_depth(base_local, 0)
+                        {
+                            let sref = SlotRef::Local(fn_did, id);
+                            if !base.contains(&sref) {
+                                arg0_new.insert(sref);
+                            }
+                        }
+                    }
+                    if ptr_args > 0 {
+                        *hist.entry(name.to_string()).or_default() += ptr_args;
+                    }
+                }
+            }
+            row.set("poison_arg0_extern_delta", arg0_new.len());
+
+            let field_sig: usize = origins
+                .values()
+                .map(|s| {
+                    s.unknown
+                        .iter()
+                        .filter(|slot| s.slots[*slot].place.field.is_some())
+                        .count()
+                })
+                .sum();
+            row.set("poison_field_sig", field_sig);
+
+            let mut hv: Vec<(String, usize)> = hist.into_iter().collect();
+            hv.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+            let hs = hv
+                .iter()
+                .take(12)
+                .map(|(n, c)| format!("{n}:{c}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            row.set("untabled_externs", hs);
+            row.set("status", "seed-size");
+            return row;
+        }
+
+        // §NB4-4c: `origins` is now THREADED into `emit_crate_ownership_constraints` below (F3) —
+        // computed ONCE here (the `ORIGIN_WRAP_COUNT` runs-once site), passed by reference. No longer
+        // the pre-4c uninjected `_origins`.
 
         // §NB3-3c-i measurement seam: origins-only mode returns before the fixpoint solve, so the
         // origin-derivation cost (t_origins) and size (origin_slots/origin_subset_edges) can be
@@ -529,11 +637,26 @@ mod run {
         row.set("slots_total", slots_total);
         phase("slots_done", t0);
 
+        // §NB4-4c per-class demotion counts (rider 5): the no-borrow-origin slots the may-supply
+        // `¬ref` demotes, split base (Local) vs struct field. The honest per-class sweep columns.
+        {
+            let demoted =
+                crate::analyses::borrow_ownership::origins::collect_no_borrow_origin_slots(
+                    &origins, &slots,
+                );
+            let field_ct = demoted
+                .iter()
+                .filter(|s| matches!(s, SlotRef::Field(_)))
+                .count();
+            row.set("nb4c_demoted_base", demoted.len() - field_ct);
+            row.set("nb4c_demoted_field", field_ct);
+        }
+
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let t = Instant::now();
         let (stats, selectors) =
-            match emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver) {
+            match emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver) {
                 Ok(x) => x,
                 Err(e) => {
                     row.set("status", "emit-error");
@@ -699,7 +822,9 @@ mod run {
             let real = {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                match emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver) {
+                // §NB4-4c F3: CHECK_REAL reuses run_bo's `origins` — the SAME demotion seed as the
+                // mirrored solve, so the fidelity cross-check compares identical clause sets.
+                match emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver) {
                     Ok((_s, selectors)) => {
                         for &g in &program.functions {
                             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
@@ -897,7 +1022,7 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
         let real = {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
-            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
                 .expect("real: emission");
             for &g in &program.functions {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
@@ -909,7 +1034,7 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
         let (mirrored, stats) = {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
-            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
                 .expect("mirror: emission");
             for &g in &program.functions {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
@@ -1142,7 +1267,7 @@ fn boc1_mirror_matches_real_delete_node_leaked_frees() {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let (_s, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver).expect("emission");
         for &g in &program.functions {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
@@ -1194,7 +1319,7 @@ fn nbf_sink_retractable_delete_node() {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let (_s, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver).expect("emission");
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver).expect("emission");
         for &g in &program.functions {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
@@ -1259,7 +1384,7 @@ mod explain {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new_tracked(&slots);
         let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &solver)
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
                 .expect("NB-R: tracked emission");
         let tracker = solver.tracker().expect("new_tracked");
         tracker.set_context("coherence");
