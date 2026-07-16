@@ -520,9 +520,22 @@ mod run {
             use rustc_middle::mir::TerminatorKind;
 
             let slots = CrateSlots::build(&program);
-            let base: FxHashSet<SlotRef> =
+            // The full no-borrow-origin set (base signature slots + mapped fields). Decompose it into
+            // the two tiers so they don't double-count (the diagnostic's job is to isolate the field
+            // extension): `poison_base` = unique Local members, `poison_field` = unique mapped
+            // `SlotRef::Field` members. `all` (both) is the membership set the arg0-tier delta checks.
+            let all: FxHashSet<SlotRef> =
                 collect_no_borrow_origin_slots(&origins, &slots).into_iter().collect();
+            let base: FxHashSet<SlotRef> = all
+                .iter()
+                .copied()
+                .filter(|s| matches!(s, SlotRef::Local(..)))
+                .collect();
             row.set("poison_base", base.len());
+            row.set(
+                "poison_field",
+                all.iter().filter(|s| matches!(s, SlotRef::Field(_))).count(),
+            );
 
             // c2rust emits cross-module *local* callees as `extern "C"` DECLARATIONS (ForeignItems
             // with no body) at their call sites, while the DEFINITION lives elsewhere in the crate.
