@@ -11229,6 +11229,119 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB4-4c-Q RED (item-4 sizing gate, 2026-07-17): the coherence-collateral measurement, validated
+    /// against the INDEPENDENT multi-agent derivation (user ruling 2026-07-17). Exercises the EXACT
+    /// harness code (`bo_c1::measure_collateral`) the corpus sweep runs.
+    ///
+    /// GRANULARITY (user-ruled MIR-slot-level 2026-07-17): the collateral is measured in the `n_ref` /
+    /// `n_ref_d0` metric's own units — MIR SLOTS, not source variables. The agents' source-variable
+    /// derivation (Sh1=3, Sh3=4) is right at its granularity; the metric adds the coherence-equated MIR
+    /// COPY-TEMPS (`_3` the `op(p)` arg copy, `_4` the call-result temp → +2 on copy-chain shapes). The
+    /// gate ratio's denominator (corpus `n_ref_d0`) counts these temps too, so the ratio is honest — but
+    /// per-program outlier inspection must remember temps inflate the raw copy-chain counts. Sh4 has no
+    /// +2 because the depth-0 field-store equate skip (`coherence.rs:45-47`) blocks the drag.
+    #[test]
+    fn nb4_4c_q_collateral_shapes() {
+        fn measure(code: &str) -> crate::bo_c1::CollateralMeasurement {
+            let mut out = None;
+            run_compiler(code, |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                out = Some(crate::bo_c1::measure_collateral(&program, &slots, &origins, &mut_facts));
+            });
+            out.expect("run_compiler ran the callback")
+        }
+        // Shape 1: definitely-overwritten copy. coherence chain p≡q≡return (2 equates, 3 slots).
+        let s1 = measure(
+            "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32) -> *mut i32 { let mut q = op(p); q = p; q }",
+        );
+        assert_eq!(s1.status, "ok", "Shape 1: solved");
+        assert_eq!(s1.overincl_mit, 1, "Shape 1: over-inclusion (mitigated) = 1 (the return)");
+        // MIR-slot-level = source view (3: p,q,return) + arg/result copy-temps (2: _3,_4) = 5.
+        assert_eq!(s1.collateral_mit, 5, "Shape 1: collateral = 5 (MIR slots)");
+        assert_eq!(s1.collateral_upper, 5, "Shape 1: upper == mit (no restored/storage extra here)");
+        // Shape 3: 2-hop copy chain (+r=q). Drag SCALES with chain length: source view 4 + 2 temps = 6.
+        let s3 = measure(
+            "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32) -> *mut i32 { let mut q = op(p); q = p; let r = q; r }",
+        );
+        assert_eq!(s3.overincl_mit, 1, "Shape 3: over-inclusion = 1");
+        assert_eq!(s3.collateral_mit, 6, "Shape 3: collateral = 6 (MIR slots)");
+        // Shape 4: field store. coherence.rs:45-47 skips the depth-0 field-store equate → NO drag onto
+        // p; field collateral shows in n_ref (=1) but is INVISIBLE in n_ref_d0 (=0).
+        let s4 = measure(
+            "#[repr(C)] pub struct S { pub g: *mut i32 } \
+             unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(s: *mut S, p: *mut i32) { (*s).g = op(p); (*s).g = p; }",
+        );
+        assert_eq!(s4.overincl_mit, 1, "Shape 4: over-inclusion = 1 (the field)");
+        assert_eq!(s4.collateral_mit, 1, "Shape 4: collateral = 1 (n_ref)");
+        assert_eq!(
+            s4.collateral_d0_mit, 0,
+            "Shape 4: collateral_d0 = 0 (field slots are invisible at depth-0)"
+        );
+        // Shape 2: branch-join. Predicate FIRES identically to Shape 1 (flow-insensitive), but the
+        // demotion is LEGITIMATE — MINUS un-demoting it reinstates an unsound Ref. THIS IS THE PROOF
+        // that MINUS is MEASUREMENT-ONLY and must never ship; item-4's definitely-overwritten kill
+        // would NOT fire here.
+        let s2 = measure(
+            "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32, c: bool) -> *mut i32 { let q = if c { op(p) } else { p }; q }",
+        );
+        assert_eq!(s2.overincl_mit, 1, "Shape 2: predicate FIRES (measurement-only; MINUS must not ship)");
+        assert_eq!(
+            s2.collateral_mit, 4,
+            "Shape 2: collateral = 4 (MIR slots). MINUS un-demoting this is UNSOUND — the `op(p)` branch \
+             can return opaque memory at runtime; the shippable item-4 kill would NOT fire on a branch-join."
+        );
+        // SECOND measurement-only witness (the "_4 tell", user-noted 2026-07-17): in Shape 1 the flipping
+        // set includes `_4`, the OPAQUE-RESULT temp — under MINUS it becomes `Ref`, which is itself
+        // unsound. So even the direct copy shape carries an unsound-under-MINUS slot; MINUS is a sizing
+        // measurement only, never a shippable demotion set (Shape 2 is the other witness).
+        // Counterexample (amendment 1): the storage-alias false positive. `&raw mut p` makes the return
+        // pointee alias `p`'s storage — a SYMMETRIC subset edge whose true (opaque) source is filtered
+        // out of `unknown`, so RAW fires but MITIGATED (reverse-edge discard) does NOT. Guards the
+        // predicate against storage-edge inflation.
+        let cx = measure(
+            "unsafe extern \"C\" { fn op() -> *mut i32; } \
+             unsafe fn f(mut p: *mut i32) -> *mut *mut i32 { p = op(); &raw mut p }",
+        );
+        assert!(cx.overincl_raw >= 1, "counterexample: RAW predicate fires via the storage edge");
+        assert_eq!(
+            cx.overincl_mit, 0,
+            "counterexample: MITIGATED predicate must NOT fire (symmetric storage edge discarded)"
+        );
+        assert!(
+            cx.overincl_upper >= 1,
+            "counterexample: UPPER bound DOES catch it (any incoming edge, self/symmetric-inclusive)"
+        );
+        // RESTORED-OUTPUT-PARAM (Codex F1, 2026-07-17 — SUMMARY-INVISIBLE residual): `*out` is restored
+        // to its original value after an opaque overwrite. Codex predicted the recovered origin survives
+        // as a self-loop; the DUMP shows otherwise for this engine — `*out = op()` POISONS `arg1@1`, and
+        // the value store `*out = old` into a poisoned pointee is DROPPED, so the summary has NO edge at
+        // all (unknown={arg1@1}, subset=∅). Neither the mitigated NOR the self-inclusive upper predicate
+        // can see it (both 0) — it is a flow-sensitive DEFINITE-OVERWRITE recovery that only item-4 can
+        // size. (Contrast the storage counterexample above: an ADDRESS alias survives poisoning, so
+        // `upper` DOES catch that one — the difference between a value restore and an address alias.)
+        // This fixture PINS the summary-level measurement's floor: the gate's `collateral_upper` sizes
+        // the summary-VISIBLE collateral; this component-2 residual is a documented, rare (COMPLETENESS)
+        // limitation carried to item-4.
+        let restored = measure(
+            "unsafe extern \"C\" { fn op() -> *mut i32; } \
+             unsafe fn f(out: *mut *mut i32) { let old = *out; *out = op(); *out = old; }",
+        );
+        assert_eq!(restored.overincl_mit, 0, "restored: mitigated misses it (no summary edge)");
+        assert_eq!(
+            restored.overincl_upper, 0,
+            "restored: UPPER also misses it — SUMMARY-INVISIBLE (poisoning drops the value restore); \
+             this component-2 residual is item-4 territory, not sizable at the summary level"
+        );
+        assert_eq!(restored.status, "no-oi", "restored: no summary over-inclusion → no solve");
+    }
+
     // ---- §NB4-4c — MAY-SUPPLY DEMOTION over the NO-BORROW-ORIGIN set ----
     //
     // These were the §NB3-3c-ii NB4-boundary markers. NB4-4c lands the **may-supply demotion**: a

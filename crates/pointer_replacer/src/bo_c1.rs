@@ -429,11 +429,16 @@ mod mirror {
     }
 }
 
+// §NB4-4c-Q: re-export the collateral measurement so the RED shape tests (in `tests.rs`, outside this
+// private module) validate the EXACT harness code the sweep runs, not a copy.
+#[cfg(test)]
+pub(crate) use run::{CollateralMeasurement, measure_collateral};
+
 /// Per-mode analysis drivers producing report rows.
 mod run {
     use std::time::{Duration, Instant};
 
-    use rustc_hash::FxHashSet;
+    use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_middle::ty::TyCtxt;
     use z3::{SatResult, ast::Bool};
 
@@ -462,6 +467,163 @@ mod run {
         eprintln!("BOC1PHASE {name} t={:.2}", since.elapsed().as_secs_f64());
     }
 
+    // ───────────────────────── §NB4-4c-Q collateral measurement (item-4 sizing) ─────────────────────
+    //
+    // Sizes the coherence-collateral Ref-loss from over-including modeled-origin slots in the
+    // may-supply demotion set (Codex re-review 2026-07-17). Runs TWO real solves per program in-process
+    // (the CHECK_REAL second-solver pattern): FULL demotes the whole no-borrow-origin set (the shipped
+    // behavior); MINUS demotes that set with the MITIGATED over-inclusion removed. The n_ref delta
+    // (MINUS − FULL) is the collateral. **MEASUREMENT-ONLY** — MINUS must NEVER ship: it un-demotes
+    // legitimately-may-reach branch-joins (see `collect_overincluded_modeled_origin_slots`), so the
+    // measured collateral is an UPPER BOUND on what the precise item-4 fix would recover.
+
+    pub(crate) struct CollateralMeasurement {
+        /// "no-oi" (no over-inclusion → collateral 0, no solves), "ok" (solved + anchorable), or
+        /// "real-decline" (a REAL solve declined/unknown — the number is NOT trustworthy; the sweep
+        /// surfaces it, post-sweep audit must see none). Codex F2a: never silently skip a decline.
+        pub status: &'static str,
+        pub overincl_raw: usize,
+        pub overincl_mit: usize,
+        /// Codex F1: the self-inclusive UPPER-BOUND over-inclusion (catches restored self-origins the
+        /// mitigated set misses). `mitigated ⊆ upper`, so `collateral_upper ≥ collateral_mit`.
+        pub overincl_upper: usize,
+        /// FULL model counts — `Some` only when `status == "ok"` (a real FULL solve ran). The sweep
+        /// anchors BOTH to the shipped MIRROR (Codex F2b: n_ref AND n_ref_d0, not just n_ref).
+        pub nref_full: Option<usize>,
+        pub nref_d0_full: Option<usize>,
+        /// collateral = n_ref(MINUS) − n_ref(FULL); may be negative (do NOT assert ≥ 0). `_mit` uses the
+        /// mitigated over-inclusion (tighter, storage-excluded), `_upper` the maximal set (the gate).
+        pub collateral_mit: i64,
+        pub collateral_d0_mit: i64,
+        pub collateral_upper: i64,
+        pub collateral_d0_upper: i64,
+    }
+
+    /// Count Ref slots (all depths) and Ref slots at depth-0 LOCAL only — the exact accounting
+    /// `run_bo` uses for `n_ref` / `n_ref_d0` (field slots contribute to `n_ref` but NOT `n_ref_d0`,
+    /// which is why field collateral is invisible in the d0 metric).
+    fn count_refs(model: &FxHashMap<SlotRef, SlotKind>, slots: &CrateSlots) -> (usize, usize) {
+        let (mut n_ref, mut n_ref_d0) = (0usize, 0usize);
+        for (s, kind) in model {
+            if *kind == SlotKind::Ref {
+                n_ref += 1;
+                if let SlotRef::Local(fn_did, sid) = s
+                    && let Some(u) = slots.fn_local_slots.get(fn_did)
+                    && u.slot(*sid).depth == 0
+                {
+                    n_ref_d0 += 1;
+                }
+            }
+        }
+        (n_ref, n_ref_d0)
+    }
+
+    /// Emit with EMPTY origins (no in-emit demotion), manually `¬ref` exactly `demote`, add coherence,
+    /// and solve with the REAL `verify_to_fixpoint`. `emit_crate_ownership_constraints` reads `origins`
+    /// ONLY for its demotion loop, so this reproduces the shipped pipeline with a SWAPPED demotion set.
+    fn solve_with_demotion(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        demote: &[SlotRef],
+        mut_facts: &MutFacts,
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        let empty = crate::analyses::borrow_ownership::origin_summary::OriginSummaries::default();
+        let crate_ctxt = CrateCtxt::new(program);
+        let solver = KindSolver::new(slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, slots, &empty, &solver).ok()?;
+        for slot in demote {
+            solver.add_borrow_exclusion(Some(*slot), &[]);
+        }
+        for &g in &program.functions {
+            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, slots, g, &body);
+        }
+        verify_to_fixpoint(program, slots, &solver, &selectors, mut_facts)
+    }
+
+    /// Measure the collateral. Returns a status-tagged struct (never panics on decline — Codex F2a).
+    /// FULL preserves the SHIPPED Vec order/multiplicity (Codex F2c). Short-circuits with no solves
+    /// when there is no over-inclusion (the common corpus case). Asserts every over-inclusion set ⊆
+    /// FULL and `mitigated ⊆ upper` (mapping/invariant drift = hard STOP).
+    pub(crate) fn measure_collateral(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+        mut_facts: &MutFacts,
+    ) -> CollateralMeasurement {
+        use crate::analyses::borrow_ownership::origins::{
+            collect_no_borrow_origin_slots, collect_overincluded_modeled_origin_slots,
+            collect_upperbound_overincluded_slots,
+        };
+        // FULL demotion set = the SHIPPED Vec (preserve order + multiplicity — F2c).
+        let full_vec = collect_no_borrow_origin_slots(origins, slots);
+        let full_set: FxHashSet<SlotRef> = full_vec.iter().copied().collect();
+        let raw_set: FxHashSet<SlotRef> =
+            collect_overincluded_modeled_origin_slots(origins, slots, false).into_iter().collect();
+        let mit_set: FxHashSet<SlotRef> =
+            collect_overincluded_modeled_origin_slots(origins, slots, true).into_iter().collect();
+        let upper_set: FxHashSet<SlotRef> =
+            collect_upperbound_overincluded_slots(origins, slots).into_iter().collect();
+        assert!(
+            raw_set.is_subset(&full_set)
+                && mit_set.is_subset(&full_set)
+                && upper_set.is_subset(&full_set),
+            "NB4-4c-Q: an over-inclusion set ⊄ FULL demotion set (mapping drift)"
+        );
+        assert!(mit_set.is_subset(&upper_set), "NB4-4c-Q: mitigated ⊄ upper (invariant)");
+        let (n_raw, n_mit, n_upper) = (raw_set.len(), mit_set.len(), upper_set.len());
+        let build = |status, nf: Option<usize>, nd0, cm, cdm, cu, cdu| CollateralMeasurement {
+            status,
+            overincl_raw: n_raw,
+            overincl_mit: n_mit,
+            overincl_upper: n_upper,
+            nref_full: nf,
+            nref_d0_full: nd0,
+            collateral_mit: cm,
+            collateral_d0_mit: cdm,
+            collateral_upper: cu,
+            collateral_d0_upper: cdu,
+        };
+        // Short-circuit: no over-inclusion ⇒ MINUS == FULL for both variants ⇒ collateral 0, no solves.
+        if upper_set.is_empty() {
+            return build("no-oi", None, None, 0, 0, 0, 0);
+        }
+        // Real FULL solve — for the like-with-like delta AND the anchor (both solves are REAL, so the
+        // collateral is not confounded by a mirror-vs-real difference; F2b anchors real FULL to mirror).
+        let Some(full_model) = solve_with_demotion(program, slots, &full_vec, mut_facts) else {
+            return build("real-decline", None, None, 0, 0, 0, 0);
+        };
+        let (nref_full, nref_d0_full) = count_refs(&full_model, slots);
+        let minus = |exclude: &FxHashSet<SlotRef>| -> Option<(usize, usize)> {
+            let v: Vec<SlotRef> = full_vec.iter().copied().filter(|s| !exclude.contains(s)).collect();
+            solve_with_demotion(program, slots, &v, mut_facts).map(|m| count_refs(&m, slots))
+        };
+        let Some((nref_mu, nref_d0_mu)) = minus(&upper_set) else {
+            return build("real-decline", Some(nref_full), Some(nref_d0_full), 0, 0, 0, 0);
+        };
+        // MINUS_mit: reuse FULL if `mit` empty, reuse `upper`'s solve if the sets are equal, else solve.
+        let (nref_mm, nref_d0_mm) = if mit_set.is_empty() {
+            (nref_full, nref_d0_full)
+        } else if mit_set == upper_set {
+            (nref_mu, nref_d0_mu)
+        } else {
+            match minus(&mit_set) {
+                Some(x) => x,
+                None => return build("real-decline", Some(nref_full), Some(nref_d0_full), 0, 0, 0, 0),
+            }
+        };
+        build(
+            "ok",
+            Some(nref_full),
+            Some(nref_d0_full),
+            nref_mm as i64 - nref_full as i64,
+            nref_d0_mm as i64 - nref_d0_full as i64,
+            nref_mu as i64 - nref_full as i64,
+            nref_d0_mu as i64 - nref_d0_full as i64,
+        )
+    }
+
     /// BO mode: the exact `assert_ownership_parity` construction, with the
     /// mirrored fixpoint loop for round/commit counts, per-phase timings, and
     /// the model readout (kind tallies + leaked sources).
@@ -469,6 +631,16 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
+
+        // §NB4-4c-Q (amendment 4d): pin z3's random seeds for the collateral mode BEFORE the first z3
+        // context is created (`Optimize::new` → `Context::thread_local`, and `Z3_global_param_set` does
+        // not affect already-created contexts). Each corpus program runs in a FRESH worker process
+        // (`boc1_run_one`), so this bites per program. Determinism is confirmed EMPIRICALLY by the
+        // variance spot-check (amendment 4f); the pin + version stamp are provenance. No-op off-mode.
+        if std::env::var_os("CRAT_BOC1_COLLATERAL").is_some() {
+            z3::set_global_param("smt.random_seed", "0");
+            z3::set_global_param("sat.random_seed", "0");
+        }
 
         let program = collect_program(tcx);
         row.set("fn_count", program.functions.len());
@@ -665,6 +837,22 @@ mod run {
             row.set("nb4c_demoted_field", field_ct);
         }
 
+        // §NB4-4c-Q COUNT-ONLY (compute-only, no solve): the over-inclusion COUNTS for programs whose
+        // collateral SOLVE times out (binn/brotli under the 3-solve collateral mode). If a program's
+        // upper over-inclusion is 0, its collateral is 0 by construction (no slot removed) — the gate is
+        // complete without the expensive solve. Off by default; returns before emit/fixpoint.
+        if std::env::var_os("CRAT_BOC1_COLLATERAL_COUNT").is_some() {
+            use crate::analyses::borrow_ownership::origins::{
+                collect_overincluded_modeled_origin_slots, collect_upperbound_overincluded_slots,
+            };
+            let dedup = |v: Vec<SlotRef>| v.into_iter().collect::<FxHashSet<_>>().len();
+            row.set("nb4c_overincl_raw", dedup(collect_overincluded_modeled_origin_slots(&origins, &slots, false)));
+            row.set("nb4c_overincl_mit", dedup(collect_overincluded_modeled_origin_slots(&origins, &slots, true)));
+            row.set("nb4c_overincl_upper", dedup(collect_upperbound_overincluded_slots(&origins, &slots)));
+            row.set("status", "collateral-count");
+            return row;
+        }
+
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let t = Instant::now();
@@ -823,6 +1011,42 @@ mod run {
                 row.set("mut_default_fires", mut_default_fires);
                 row.set("sources_leaked", leaked);
             }
+        }
+
+        // §NB4-4c-Q collateral measurement (CRAT_BOC1_COLLATERAL=1): size the coherence-collateral
+        // Ref-loss from over-including modeled-origin slots (Codex re-review 2026-07-17). Two extra
+        // real solves in-process (FULL then MINUS); MEASUREMENT-ONLY. Off by default. Gate metric =
+        // `nb4c_collateral_d0` (net corpus-wide); `nb4c_collateral` (full n_ref) reported alongside
+        // because FIELD collateral is invisible at depth-0.
+        if std::env::var_os("CRAT_BOC1_COLLATERAL").is_some() {
+            let t = Instant::now();
+            row.set("z3_full_version", z3::full_version().to_string());
+            let cm = measure_collateral(&program, &slots, &origins, &mut_facts);
+            row.set("nb4c_collateral_status", cm.status);
+            row.set("nb4c_overincl_raw", cm.overincl_raw);
+            row.set("nb4c_overincl_mit", cm.overincl_mit);
+            row.set("nb4c_overincl_upper", cm.overincl_upper);
+            row.set("nb4c_collateral_mit", cm.collateral_mit); // n_ref delta, may be < 0
+            row.set("nb4c_collateral_d0_mit", cm.collateral_d0_mit);
+            row.set("nb4c_collateral_upper", cm.collateral_upper); // the GATE numerator (upper bound)
+            row.set("nb4c_collateral_d0_upper", cm.collateral_d0_upper);
+            // ANCHOR (amendment 4a + Codex F2b): when the measurement actually solved FULL, it must
+            // reproduce the shipped MIRROR n_ref AND n_ref_d0 — validates emit(empty)+manual-demotion ≡
+            // shipped pipeline AND mirror ≡ real here. A mismatch is a hard STOP. (Committed-row anchor
+            // is the external check, post-sweep; a "real-decline" status is surfaced, never silent — F2a.)
+            if let (Some(nf), Some(nd0), Some(m)) = (cm.nref_full, cm.nref_d0_full, &model) {
+                let (mirror_nref, mirror_nref_d0) = count_refs(m, &slots);
+                assert_eq!(
+                    nf, mirror_nref,
+                    "NB4-4c-Q ANCHOR: FULL n_ref ({nf}) != shipped mirror n_ref ({mirror_nref})"
+                );
+                assert_eq!(
+                    nd0, mirror_nref_d0,
+                    "NB4-4c-Q ANCHOR: FULL n_ref_d0 ({nd0}) != shipped mirror n_ref_d0 ({mirror_nref_d0})"
+                );
+            }
+            row.set("t_collateral_s", secs(t.elapsed()));
+            phase("collateral_done", t0);
         }
 
         // Optional corpus-level fidelity cross-check (CRAT_BOC1_CHECK_REAL=1):

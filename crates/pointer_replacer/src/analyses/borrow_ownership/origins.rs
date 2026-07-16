@@ -131,40 +131,131 @@ pub(crate) fn collect_no_borrow_origin_slots(
     origins: &OriginSummaries,
     slots: &CrateSlots,
 ) -> Vec<SlotRef> {
-    use crate::analyses::borrow::lifetime_flow::SignatureRoot;
-    use rustc_middle::mir::RETURN_PLACE;
     let mut out = vec![];
     for (&f, summary) in origins.iter() {
         for slot in summary.unknown.iter() {
-            let sig = summary.slots[slot];
-            // §NB4-4c: field slots are no longer skipped — a no-borrow-origin struct-field slot maps
-            // to its crate-wide kind `SlotRef::Field`. It is a genuine may-supply hazard (a field
-            // holding opaque-supplied memory); the `¬ref` demotion is GLOBAL because the field slot is
-            // flow-insensitive (consistent with the existing field-ownership model), and harmless to an
-            // owned field (which keeps `Owning`).
-            if let Some(field) = sig.place.field {
-                // The signature carries the `borrow`-side `StructFieldSlot`; the kind universe keys
-                // on the `borrow_ownership::slots` one — identically shaped, SAME `(struct_did,
-                // all-fields `field_index`)` semantics (`borrow/mod.rs:136` `field.index()` vs
-                // `crate_slots.rs:39-46` `all_fields().enumerate()`), but distinct nominal types.
-                let kind_field = super::slots::StructFieldSlot {
-                    struct_did: field.struct_did,
-                    field_index: field.field_index,
-                };
-                if let Some(id) = slots.field_slots.slot_for_field_depth(kind_field, sig.depth) {
-                    out.push(SlotRef::Field(id));
-                }
-                continue;
+            if let Some(r) = signature_slot_to_ref(summary.slots[slot], f, slots) {
+                out.push(r);
             }
-            let Some(universe) = slots.fn_local_slots.get(&f) else {
-                continue;
-            };
-            let local = match sig.place.root {
-                SignatureRoot::Return => RETURN_PLACE,
-                SignatureRoot::Arg(l) => l,
-            };
-            if let Some(id) = universe.slot_for_local_depth(local, sig.depth) {
-                out.push(SlotRef::Local(f, id));
+        }
+    }
+    out
+}
+
+/// Map a signature slot to its kind-solver `SlotRef` (shared by the demotion set and the NB4-4c-Q
+/// over-inclusion measurement, so both agree on the mapping).
+///
+/// §NB4-4c: field slots are NOT skipped — a no-borrow-origin struct-field slot maps to its crate-wide
+/// kind `SlotRef::Field`. The signature carries the `borrow`-side `StructFieldSlot`; the kind universe
+/// keys on the `borrow_ownership::slots` one — identically shaped, SAME `(struct_did, all-fields
+/// `field_index`)` semantics (`borrow/mod.rs:136` `field.index()` vs `crate_slots.rs:39-46`
+/// `all_fields().enumerate()`), but distinct nominal types.
+fn signature_slot_to_ref(
+    sig: crate::analyses::borrow::lifetime_flow::SignatureSlot,
+    f: rustc_span::def_id::LocalDefId,
+    slots: &CrateSlots,
+) -> Option<SlotRef> {
+    use crate::analyses::borrow::lifetime_flow::SignatureRoot;
+    use rustc_middle::mir::RETURN_PLACE;
+    if let Some(field) = sig.place.field {
+        let kind_field = super::slots::StructFieldSlot {
+            struct_did: field.struct_did,
+            field_index: field.field_index,
+        };
+        return slots
+            .field_slots
+            .slot_for_field_depth(kind_field, sig.depth)
+            .map(SlotRef::Field);
+    }
+    let universe = slots.fn_local_slots.get(&f)?;
+    let local = match sig.place.root {
+        SignatureRoot::Return => RETURN_PLACE,
+        SignatureRoot::Arg(l) => l,
+    };
+    universe
+        .slot_for_local_depth(local, sig.depth)
+        .map(|id| SlotRef::Local(f, id))
+}
+
+/// §NB4-4c-Q (MEASUREMENT-ONLY — item-4 sizing, 2026-07-17): the OVER-INCLUSION subset of the
+/// no-borrow-origin demotion set — `unknown` SIGNATURE/FIELD slots that ALSO carry a modeled borrow
+/// origin. These are the slots the may-supply `¬ref` demotes despite them having a real origin; the
+/// coherence-collateral Ref-loss they cause is what the `CRAT_BOC1_COLLATERAL` sweep measures (n_ref
+/// with these slots removed from the demotion set MINUS n_ref with the full set).
+///
+/// **NEVER SHIP a demotion that excludes these.** A branch-join `q = if c { op(p) } else { p }` fires
+/// this predicate identically to a definitely-overwritten `q = op(p); q = p` (flow-insensitivity), yet
+/// the branch-join demotion is LEGITIMATE — un-demoting it reinstates an unsound `Ref`. The shippable
+/// fix is item-4's definitely-overwritten-vs-may-reach distinction, not this set. This collector exists
+/// solely to SIZE the collateral (an UPPER BOUND on what the precise fix would recover).
+///
+/// `mitigated`: discard incoming edges whose REVERSE is also in `subset`. `subset` folds the SYMMETRIC
+/// `storage_aliases` (both directions), and `observable_value_target` filters `unknown` but NOT storage
+/// — so an opaque-derived slot can pass "sub ∉ unknown" via a bidirectional storage edge whose true
+/// source was filtered out of `unknown`. Genuine `q = p` value flows are unidirectional and survive the
+/// mitigation; storage pairs are discarded. Both counts are reported so the storage inflation is visible.
+pub(crate) fn collect_overincluded_modeled_origin_slots(
+    origins: &OriginSummaries,
+    slots: &CrateSlots,
+    mitigated: bool,
+) -> Vec<SlotRef> {
+    let mut out = vec![];
+    for (&f, summary) in origins.iter() {
+        for s in summary.unknown.iter() {
+            if carries_modeled_origin(summary, s, mitigated) {
+                if let Some(r) = signature_slot_to_ref(summary.slots[s], f, slots) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True iff `s` has an incoming subset edge `sub → s` from a non-self, non-`unknown` source (a modeled
+/// borrow origin flows into it). `mitigated` additionally requires the edge be unidirectional (no
+/// reverse `s → sub`), discarding the symmetric storage aliases folded into `subset`.
+fn carries_modeled_origin(summary: &OriginSummary, s: LifetimeSlot, mitigated: bool) -> bool {
+    for sub in summary.subset.rows() {
+        if sub == s || summary.unknown.contains(sub) {
+            continue;
+        }
+        if !summary.subset.contains(sub, s) {
+            continue;
+        }
+        if mitigated && summary.subset.contains(s, sub) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// §NB4-4c-Q UPPER BOUND (Codex F1, 2026-07-17): the MAXIMAL over-inclusion — `unknown` SIGNATURE slots
+/// with ANY incoming subset edge, SELF-INCLUSIVE and UNMITIGATED. Unlike the mitigated set, this catches
+/// (a) restored input-root self-origins — `*out = old` after `*out = op()`, whose recovered origin
+/// survives projection only as a self-loop `s → s` (the intermediate `old` is dropped) — and (b)
+/// symmetric storage aliases. Removing these from the demotion set yields collateral ≥ the TRUE
+/// recoverable, so it is the SOUND upper bound the defer/gate decision needs. A pure opaque result has
+/// NO incoming edge (the opaque call breaks the flow), so it stays demoted — correctly excluded.
+fn has_any_incoming_origin(summary: &OriginSummary, s: LifetimeSlot) -> bool {
+    summary.subset.rows().any(|sub| summary.subset.contains(sub, s))
+}
+
+/// §NB4-4c-Q UPPER-BOUND over-inclusion collector (Codex F1). The self-inclusive maximal set; see
+/// `has_any_incoming_origin`. Reported alongside the mitigated set so the gate can use a sound upper
+/// bound (`mitigated ⊆ upper`).
+pub(crate) fn collect_upperbound_overincluded_slots(
+    origins: &OriginSummaries,
+    slots: &CrateSlots,
+) -> Vec<SlotRef> {
+    let mut out = vec![];
+    for (&f, summary) in origins.iter() {
+        for s in summary.unknown.iter() {
+            if has_any_incoming_origin(summary, s) {
+                if let Some(r) = signature_slot_to_ref(summary.slots[s], f, slots) {
+                    out.push(r);
+                }
             }
         }
     }
