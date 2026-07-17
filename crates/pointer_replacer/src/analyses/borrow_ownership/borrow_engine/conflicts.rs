@@ -18,7 +18,7 @@ use rustc_span::def_id::LocalDefId;
 
 use crate::analyses::borrow::{
     Borrower, BorrowInferenceResults, ConflictEdge, GBorrowInferCtxt, Loan, Provenance,
-    ProvenanceOwner, ProvenanceSet, borrow_inference, collect_invalid_loan_demotions,
+    ProvenanceOwner, ProvenanceSet, StructFieldSlot, borrow_inference, collect_invalid_loan_demotions,
 };
 use crate::utils::rustc::RustProgram;
 
@@ -143,6 +143,7 @@ pub fn borrow_conflicts_replaying<I, J, M, N, K, L>(
     is_ref: I,
     is_raw: M,
     is_mutable: K,
+    raw_fields: &[StructFieldSlot],
 ) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
 where
     I: Fn(LocalDefId) -> J,
@@ -158,6 +159,20 @@ where
         move |local: Local| ref_f(local) || raw_f(local)
     };
     let mut ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
+
+    // §NB5-F2 — field candidacy: a struct-field slot the model settled `Raw` is a raw pointer, not a
+    // borrow, so its loan must be disabled — the field analogue of a Raw local's `local_data=None`
+    // demotion below. A field slot is `Raw` CRATE-WIDE, so disable it in EVERY function's provenance
+    // set (the crate-wide hammer). `disable_owner` is a no-op where a function has no provenance for
+    // that field, so passing the whole raw-field list is safe. Cleared field loans stop regenerating
+    // the field conflicts that Option A (NB5-F) had to decline, so those programs now accept with the
+    // field `Raw`. Genuinely un-dischargeable field residuals (never disabled here) still hit the
+    // `residual_nonref_field` decline backstop in the caller — B narrows the decline set, not deletes it.
+    for provenance_set in ctxt.provenances.values_mut() {
+        for &field in raw_fields {
+            provenance_set.disable_owner(ProvenanceOwner::Field(field));
+        }
+    }
 
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {

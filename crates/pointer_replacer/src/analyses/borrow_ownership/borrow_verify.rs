@@ -21,6 +21,7 @@ use super::{
     SlotKind,
     crate_slots::CrateSlots,
     mutability_facts::MutProvider,
+    slots::{SlotId, SlotOwner},
     solver::{KindSolver, Selectors, SlotRef},
 };
 use crate::{
@@ -108,6 +109,20 @@ pub(crate) fn revalidate_replaying(
     // §NB2: per-local mutability (was forced `true`). An immutable provenance's loan is
     // skipped by the invalidation walk, so shared reads of one base stop conflicting.
     let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
+    // §NB5-F2 — the model's Raw FIELD slots, bridged to `borrow::StructFieldSlot`, so the fork can
+    // disable their loans (the field analogue of the Local raw candidacy above). Only the Fork arm
+    // consumes them; production stays frozen at its 4-arg signature.
+    let raw_fields: Vec<borrow::StructFieldSlot> = (0..slots.field_slots.len())
+        .map(SlotId::from_usize)
+        .filter(|&sid| slots.field_slots.slot(sid).depth == 0 && is_raw(SlotRef::Field(sid)))
+        .filter_map(|sid| match slots.field_slots.slot(sid).owner {
+            SlotOwner::Field(f) => Some(borrow::StructFieldSlot {
+                struct_did: f.struct_did,
+                field_index: f.field_index,
+            }),
+            SlotOwner::Local(_) => None,
+        })
+        .collect();
     // §NB3-3a: route to the forked BO engine or production (default = production during dev,
     // flips to Fork at 3a merge — A1). All closures are `Copy`, so both arms may reference them.
     let edges = match super::borrow_engine::ForkEngineMode::current() {
@@ -115,7 +130,7 @@ pub(crate) fn revalidate_replaying(
             borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
         }
         super::borrow_engine::ForkEngineMode::Fork => {
-            super::borrow_engine::borrow_conflicts_replaying(program, cand, raw, mutab)
+            super::borrow_engine::borrow_conflicts_replaying(program, cand, raw, mutab, &raw_fields)
         }
     };
 

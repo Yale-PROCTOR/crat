@@ -191,7 +191,7 @@ impl ProvenanceSet {
             .map(|_| ProvenanceOwner::Field(field))
     }
 
-    fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
+    pub(crate) fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
         match owner {
             ProvenanceOwner::Local(local) => {
                 let changed = self.local_data[local].is_some();
