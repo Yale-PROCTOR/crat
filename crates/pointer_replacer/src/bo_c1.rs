@@ -11,16 +11,15 @@
 //! baseline (`demote_pointers_iterative_with_fields` from all-Ref, the same
 //! independent driver `assert_borrow_parity` uses) for the BO-vs-prod Ref delta.
 //!
-//! RECORDED DECISION (mirror over instrumentation): `verify_to_fixpoint` does
-//! not expose its round count, and a ~5-line counter inside it would be
-//! behavior-neutral — but it would break the `analyses/**` freeze whose diff
-//! audit is deliberately trivial. Since NB5 replaces that loop and NB7 brings
-//! real instrumentation, this harness instead carries a verbatim MIRROR of the
-//! loop (`mirror::verify_to_fixpoint_counting`), and the non-ignored
-//! `boc1_mirror_matches_real_*` tests enforce model equality against the real
-//! `verify_to_fixpoint` on fixtures covering the accept, conflict-cascade,
-//! source-commit, and selector-drop (leak) paths. If those tests fail after an
-//! `analyses/**` change, update the mirror to match — never the reverse.
+//! §NB5-M — NATIVE COUNTERS (mirror retired). The BO fork's
+//! `borrow_ownership::borrow_verify::verify_to_fixpoint_counting` exposes the round/commit/leak
+//! counters directly (`RoundStats`); `verify_to_fixpoint` is its model-only wrapper. The fork is
+//! NOT under the `analyses/**` freeze, so the old "mirror over instrumentation" tradeoff (a counter
+//! would break the frozen diff audit) never applied here. The former verbatim MIRROR of the loop
+//! (`mirror::verify_to_fixpoint_counting`) is DELETED — its parity was proven at the NB5-M gate
+//! (native == mirror, byte-identical to the NB5-Z baseline on all 19 accepts, both profiles) before
+//! retirement. Wrapper-thinness (no logic added to the wrapper that would diverge the sweep's
+//! counters from what the suite verifies) is now guarded by `verify_to_fixpoint_is_thin_wrapper`.
 //!
 //! Entry points (all `#[ignore]`d except the guards):
 //!   worker:      CRAT_BOC1_INPUT=<crate-root.rs> [CRAT_BOC1_MODE=bo|prod]
@@ -280,154 +279,6 @@ mod provenance {
     }
 }
 
-/// MIRROR of `analyses::borrow_ownership::borrow_verify::verify_to_fixpoint`
-/// (plus its private helpers `round_cap`, `representative`,
-/// `guard_slots_are_ref`) with round/commit counters added. MUST stay
-/// semantically identical to the original — enforced by the non-ignored
-/// `boc1_mirror_matches_real_*` tests below. On divergence, fix the mirror.
-mod mirror {
-    use rustc_hash::FxHashMap;
-    use rustc_span::def_id::LocalDefId;
-    use z3::ast::Bool;
-
-    use crate::analyses::borrow_ownership::{
-        SlotKind,
-        borrow_verify::{SlotConflict, revalidate_replaying},
-        coherence::constrain_field_ownership,
-        crate_slots::CrateSlots,
-        mutability_facts::MutProvider,
-        solver::{KindSolver, Selectors, SlotRef},
-    };
-    use crate::utils::rustc::RustProgram;
-
-    #[derive(Clone, Debug, Default)]
-    pub struct RoundStats {
-        /// Validate rounds run, INCLUDING the accepting round (a fixture that
-        /// accepts its first model has `rounds == 1`).
-        pub rounds: usize,
-        /// §NB0: source commits no longer exist — the BB3-a `¬ref(source)`
-        /// invariant is emitted eagerly, so every commit is a conflict commit.
-        pub commits_conflict: usize,
-        pub commits_per_round: Vec<usize>,
-        /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
-        /// Observation-only, from `model_kinds_relaxing_reporting` (whose
-        /// plain twin the real loop uses with identical semantics); stored as
-        /// counts, not `Bool`s, so results stay `Send` across `run_compiler`.
-        pub dropped_sinks: usize,
-        /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
-        pub dropped_sources: usize,
-    }
-
-    /// Mirror of `borrow_verify::verify_to_fixpoint`. Differences: the round
-    /// loop counts into `RoundStats`, and `None` (decline) carries the stats of
-    /// the rounds that did run.
-    pub fn verify_to_fixpoint_counting(
-        program: &RustProgram<'_>,
-        slots: &CrateSlots,
-        solver: &KindSolver,
-        selectors: &Selectors,
-        is_mutable: impl MutProvider + Copy,
-    ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-        // §NB-R guard — mirrors the real loop's release-active refusal of
-        // tracked solvers (kept in lockstep with borrow_verify.rs).
-        assert!(
-            solver.tracker().is_none(),
-            "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
-        );
-        // §NB-F: classify a dropped-selector set into leak counts.
-        let record_dropped = |stats: &mut RoundStats, dropped: &[Bool]| {
-            stats.dropped_sinks = dropped.iter().filter(|d| selectors.is_sink(d)).count();
-            stats.dropped_sources = dropped.len() - stats.dropped_sinks;
-        };
-        let mut stats = RoundStats::default();
-        let cap = round_cap(slots);
-        constrain_field_ownership(solver, slots, program);
-        let Some((mut model, dropped)) =
-            solver.model_kinds_relaxing_reporting(selectors)
-        else {
-            return (None, stats);
-        };
-        record_dropped(&mut stats, &dropped);
-        for _ in 0..cap {
-            stats.rounds += 1;
-            let conflicts = revalidate_replaying(
-                program,
-                slots,
-                |s: SlotRef| model.get(&s) == Some(&SlotKind::Ref),
-                |s: SlotRef| model.get(&s) != Some(&SlotKind::Ref),
-                is_mutable,
-            );
-            assert!(
-                guard_slots_are_ref(&conflicts, &model),
-                "every residual conflict slot must be Ref in the current model"
-            );
-            let mut committed = 0;
-            for conflict in conflicts.values().flatten() {
-                if let Some(slot) = representative(conflict, &model) {
-                    solver.add_borrow_exclusion(Some(slot), &[]);
-                    committed += 1;
-                    stats.commits_conflict += 1;
-                }
-            }
-            stats.commits_per_round.push(committed);
-            if committed == 0 {
-                return (Some(model), stats);
-            }
-            model = match solver.model_kinds_relaxing_reporting(selectors) {
-                Some((m, dropped)) => {
-                    record_dropped(&mut stats, &dropped);
-                    m
-                }
-                None => return (None, stats),
-            };
-        }
-        panic!("BOC1 mirror: CEGAR did not converge within {cap} rounds");
-    }
-
-    /// Copy of `borrow_verify::representative` — INCLUDING §NB4-4a A′ (live-requirer discharge).
-    /// Must stay byte-equivalent in behavior to the original or the corpus sweep silently reports
-    /// a different model than the suite verifies (the mirror-drift liability NB7 retires).
-    fn representative(
-        conflict: &SlotConflict,
-        model: &FxHashMap<SlotRef, SlotKind>,
-    ) -> Option<SlotRef> {
-        let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
-        // A′: a live `Ref` requirer BEYOND the issuer must carry the discharge.
-        if let Some(r) = conflict
-            .requirers
-            .iter()
-            .copied()
-            .find(|r| Some(*r) != conflict.issuer && is_ref(r))
-        {
-            return Some(r);
-        }
-        conflict
-            .issuer
-            .into_iter()
-            .chain(conflict.requirers.iter().copied())
-            .find(is_ref)
-    }
-
-    /// Copy of `borrow_verify::round_cap`.
-    fn round_cap(slots: &CrateSlots) -> usize {
-        let n: usize = slots.field_slots.len()
-            + slots.fn_local_slots.values().map(|u| u.len()).sum::<usize>();
-        n + 8
-    }
-
-    /// Copy of `borrow_verify::guard_slots_are_ref`.
-    fn guard_slots_are_ref(
-        conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
-        model: &FxHashMap<SlotRef, SlotKind>,
-    ) -> bool {
-        conflicts.values().flatten().all(|c| {
-            c.issuer
-                .iter()
-                .chain(c.requirers.iter())
-                .all(|s| model.get(s) == Some(&SlotKind::Ref))
-        })
-    }
-}
 
 // §NB4-4c-Q: re-export the collateral measurement so the RED shape tests (in `tests.rs`, outside this
 // private module) validate the EXACT harness code the sweep runs, not a copy.
@@ -442,7 +293,7 @@ mod run {
     use rustc_middle::ty::TyCtxt;
     use z3::{SatResult, ast::Bool};
 
-    use super::{collect_program, mirror, report::Row};
+    use super::{collect_program, report::Row};
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
@@ -891,45 +742,15 @@ mod run {
         row.set("t_mut_facts_s", secs(t.elapsed()));
 
         let t = Instant::now();
-        // §NB5-M: NATIVE fork counters are the source of truth now (`run_bo` no longer mirrors the
-        // loop). PARITY WINDOW (dual-compute — retired at NB5-M step 4): a fresh, independent mirror
-        // construction cross-checks every counter + the model on each program. Each CEGAR loop mutates
-        // its own solver, so the mirror gets its own emission + coherence (this doubles fixpoint cost —
-        // gate runs use CRAT_BOC1_TIMEOUT_SECS ≥ 2400).
+        // §NB5-M: native fork counters (the bo_c1 mirror is RETIRED — parity was proven at the NB5-M
+        // gate, byte-identical to the NB5-Z baseline on all 19 both profiles). `verify_to_fixpoint_counting`
+        // is the single CEGAR loop; `verify_to_fixpoint` is its model-only wrapper.
         let (model, rstats) =
             crate::analyses::borrow_ownership::borrow_verify::verify_to_fixpoint_counting(
                 &program, &slots, &solver, &selectors, &mut_facts,
             );
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
-        {
-            let m_solver = KindSolver::new(&slots);
-            let (_ms, m_selectors) =
-                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &m_solver)
-                    .expect("NB5-M parity: mirror emission");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&m_solver, &slots, g, &body);
-            }
-            let (m_model, m_stats) = mirror::verify_to_fixpoint_counting(
-                &program, &slots, &m_solver, &m_selectors, &mut_facts,
-            );
-            assert_eq!(model, m_model, "NB5-M parity: native model != mirror model");
-            assert_eq!(rstats.rounds, m_stats.rounds, "NB5-M parity: rounds");
-            assert_eq!(
-                rstats.commits_conflict, m_stats.commits_conflict,
-                "NB5-M parity: commits_conflict"
-            );
-            assert_eq!(
-                rstats.commits_per_round, m_stats.commits_per_round,
-                "NB5-M parity: commits_per_round"
-            );
-            assert_eq!(rstats.dropped_sinks, m_stats.dropped_sinks, "NB5-M parity: dropped_sinks");
-            assert_eq!(
-                rstats.dropped_sources, m_stats.dropped_sources,
-                "NB5-M parity: dropped_sources"
-            );
-        }
 
         row.set("rounds", rstats.rounds);
         row.set("commits_conflict", rstats.commits_conflict);
@@ -1061,18 +882,19 @@ mod run {
             row.set("nb4c_collateral_upper", cm.collateral_upper); // the GATE numerator (upper bound)
             row.set("nb4c_collateral_d0_upper", cm.collateral_d0_upper);
             // ANCHOR (amendment 4a + Codex F2b): when the measurement actually solved FULL, it must
-            // reproduce the shipped MIRROR n_ref AND n_ref_d0 — validates emit(empty)+manual-demotion ≡
-            // shipped pipeline AND mirror ≡ real here. A mismatch is a hard STOP. (Committed-row anchor
-            // is the external check, post-sweep; a "real-decline" status is surfaced, never silent — F2a.)
+            // reproduce the shipped n_ref AND n_ref_d0 — validates emit(empty)+manual-demotion ≡ the
+            // shipped pipeline here. A mismatch is a hard STOP. (Committed-row anchor is the external
+            // check, post-sweep; a "real-decline" status is surfaced, never silent — F2a.) §NB5-M:
+            // "shipped" is now run_bo's NATIVE `verify_to_fixpoint_counting` model (mirror retired).
             if let (Some(nf), Some(nd0), Some(m)) = (cm.nref_full, cm.nref_d0_full, &model) {
-                let (mirror_nref, mirror_nref_d0) = count_refs(m, &slots);
+                let (shipped_nref, shipped_nref_d0) = count_refs(m, &slots);
                 assert_eq!(
-                    nf, mirror_nref,
-                    "NB4-4c-Q ANCHOR: FULL n_ref ({nf}) != shipped mirror n_ref ({mirror_nref})"
+                    nf, shipped_nref,
+                    "NB4-4c-Q ANCHOR: FULL n_ref ({nf}) != shipped n_ref ({shipped_nref})"
                 );
                 assert_eq!(
-                    nd0, mirror_nref_d0,
-                    "NB4-4c-Q ANCHOR: FULL n_ref_d0 ({nd0}) != shipped mirror n_ref_d0 ({mirror_nref_d0})"
+                    nd0, shipped_nref_d0,
+                    "NB4-4c-Q ANCHOR: FULL n_ref_d0 ({nd0}) != shipped n_ref_d0 ({shipped_nref_d0})"
                 );
             }
             row.set("t_collateral_s", secs(t.elapsed()));
@@ -1246,237 +1068,8 @@ mod run {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mirror-fidelity guards (non-ignored: they run in every `cargo test`).
-// ---------------------------------------------------------------------------
-
-/// What `assert_mirror_matches` observed, for fixture-specific assertions.
-#[cfg(test)]
-struct MirrorOutcome {
-    accepted: bool,
-    stats: mirror::RoundStats,
-    /// Malloc-source slots (propagation-closed count).
-    sources: usize,
-    /// Source slots whose final kind is not `Owning`.
-    leaked: usize,
-    /// Source slots whose final kind is `Ref` — must be 0 in every accepted
-    /// model (§NB0 eager `¬ref`); combined with `leaked`, proves a leaked
-    /// source settled `Raw`.
-    sources_ref: usize,
-    /// §NB-F: sink selectors the final solve dropped (leaked frees).
-    dropped_sinks: usize,
-    /// §NB-F: source selectors the final solve dropped (leaked allocs).
-    dropped_sources: usize,
-}
-
-/// Runs both the REAL `verify_to_fixpoint` and the mirror on independent fresh
-/// constructions over one compiled snippet; asserts model equality; returns the
-/// mirror's stats + source/leak accounting for fixture-specific assertions.
-#[cfg(test)]
-fn assert_mirror_matches(code: &str) -> MirrorOutcome {
-    use crate::analyses::borrow_ownership::{
-        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
-        crate_slots::CrateSlots, emit_crate_ownership_constraints, solver::KindSolver,
-        sources::collect_malloc_source_slots,
-    };
-
-    ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let program = collect_program(tcx);
-        // One slot universe: `CrateSlots::build` is deterministic, but sharing
-        // it removes any doubt that SlotIds line up across the two models.
-        let slots = CrateSlots::build(&program);
-
-        let real = {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
-                .expect("real: emission");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
-        };
-
-        let (mirrored, stats) = {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
-                .expect("mirror: emission");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
-        };
-
-        // §NB5-M: the fork-native counting must reproduce the mirror's model + RoundStats exactly.
-        // (This cross-check retires at NB5-M step 4, replaced by the wrapper-thinness guard.)
-        let (native_model, native_stats) = {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
-                .expect("native: emission");
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            crate::analyses::borrow_ownership::borrow_verify::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
-        };
-        assert_eq!(native_model, mirrored, "§NB5-M: fork-native model != mirror model");
-        assert_eq!(native_stats.rounds, stats.rounds, "§NB5-M: rounds");
-        assert_eq!(native_stats.commits_conflict, stats.commits_conflict, "§NB5-M: commits_conflict");
-        assert_eq!(native_stats.commits_per_round, stats.commits_per_round, "§NB5-M: commits_per_round");
-        assert_eq!(native_stats.dropped_sinks, stats.dropped_sinks, "§NB5-M: dropped_sinks");
-        assert_eq!(native_stats.dropped_sources, stats.dropped_sources, "§NB5-M: dropped_sources");
-
-        match (&real, &mirrored) {
-            (Some(a), Some(b)) => {
-                if a != b {
-                    for (s, k) in a {
-                        if b.get(s) != Some(k) {
-                            eprintln!("mirror diff at {s:?}: real={k:?} mirror={:?}", b.get(s));
-                        }
-                    }
-                    panic!("mirror model != real model");
-                }
-            }
-            (None, None) => {}
-            _ => panic!(
-                "mirror accept/decline mismatch: real={} mirror={}",
-                real.is_some(),
-                mirrored.is_some()
-            ),
-        }
-
-        let sources = collect_malloc_source_slots(program.tcx, &program.functions, &slots);
-        let count_kind = |pred: &dyn Fn(Option<&SlotKind>) -> bool| {
-            mirrored
-                .as_ref()
-                .map(|m| sources.iter().filter(|s| pred(m.get(s))).count())
-                .unwrap_or(0)
-        };
-        let (dropped_sinks, dropped_sources) = (stats.dropped_sinks, stats.dropped_sources);
-        MirrorOutcome {
-            accepted: mirrored.is_some(),
-            stats,
-            sources: sources.len(),
-            leaked: count_kind(&|k| k != Some(&SlotKind::Owning)),
-            sources_ref: count_kind(&|k| k == Some(&SlotKind::Ref)),
-            dropped_sinks,
-            dropped_sources,
-        }
-    })
-    .unwrap_or_else(|e| e.raise())
-}
-
-/// (a) Accept-first-model path: alloc+free settles Owning with no commits.
-#[test]
-fn boc1_mirror_matches_real_alloc_free() {
-    let o = assert_mirror_matches(
-        r#"
-unsafe extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-    fn free(ptr: *mut core::ffi::c_void);
-}
-
-pub unsafe fn f() {
-    let p = malloc(4);
-    free(p);
-}
-"#,
-    );
-    assert!(o.accepted);
-    assert_eq!(o.stats.rounds, 1, "first model accepted: exactly one validate round");
-    assert_eq!(o.stats.commits_conflict, 0);
-    // `sources_total` counts source SLOTS (propagation-closed), not allocations:
-    // the one malloc yields its destination `p` PLUS the `free(p)` call-arg temp.
-    assert_eq!((o.sources, o.leaked), (2, 0), "the freed alloc is retained, not leaked");
-}
-
-/// (b) Conflict-commit cascade: two `&mut` of one base force iterated commits.
-#[test]
-fn boc1_mirror_matches_real_conflict_cascade() {
-    let o = assert_mirror_matches(
-        r#"
-pub unsafe fn f() {
-    let mut local = 0i32;
-    let x = &mut local as *mut i32;
-    let y = &mut local as *mut i32;
-    *x = 1;
-    *y = 2;
-}
-"#,
-    );
-    assert!(o.accepted);
-    assert!(o.stats.rounds >= 2, "cascade must iterate; got {} rounds", o.stats.rounds);
-    assert!(o.stats.commits_conflict >= 1, "at least one conflict commit");
-}
-
-/// (c) Selector-drop (leak) path under §NB0's EAGER `¬ref(source)`: the leaked
-/// malloc's selector is dropped by `model_kinds_relaxing`, and — because the
-/// hoisted BB3-a constraint is present from emission — the source can never
-/// float to `Ref`: it is `Raw` from the very first model. That first model's
-/// union replay (source now a raw candidate in round 1, where the old
-/// trajectory only reached this state after its round-1 source commit)
-/// surfaces ONE borrow conflict, whose commit yields the accepted round-2
-/// model: rounds == 2, commits_conflict == 1, no source commits (the field is
-/// gone). Guards the headline `sources_leaked` accounting end-to-end.
-/// (Final-kind `Raw` on the real path is independently pinned by
-/// tests.rs::bb3a_leaked_source_forced_raw.)
-#[test]
-fn boc1_mirror_matches_real_leaked_source() {
-    let o = assert_mirror_matches(
-        r#"
-unsafe extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-
-pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
-    let mut p = unsafe { malloc(8) };
-    &raw mut p
-}
-"#,
-    );
-    assert!(o.accepted);
-    assert_eq!(
-        (o.stats.rounds, o.stats.commits_conflict),
-        (2, 1),
-        "eager ¬ref: round-1 model has the source Raw; its union replay surfaces \
-         one conflict, committed into the accepted round-2 model"
-    );
-    assert_eq!((o.sources, o.leaked), (1, 1), "the leaked alloc must be counted leaked");
-    assert_eq!(o.sources_ref, 0, "a source may never end Ref (leaked ⇒ Raw)");
-}
-
-/// (d) Maximal-source-retention: of two allocations only the conflicting one
-/// leaks (1-of-2 accounting).
-#[test]
-fn boc1_mirror_matches_real_two_allocs_one_leak() {
-    let o = assert_mirror_matches(
-        r#"
-unsafe extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-    fn free(ptr: *mut core::ffi::c_void);
-}
-
-pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
-    let a = unsafe { malloc(8) };
-    unsafe { free(a) };
-    let mut b = unsafe { malloc(8) };
-    &raw mut b
-}
-"#,
-    );
-    assert!(o.accepted);
-    // Slot-level source accounting: `a` + its `free(a)` call-arg temp + `b` = 3
-    // source slots for 2 allocations; only `b`'s slot leaks (kind != Owning).
-    assert_eq!((o.sources, o.leaked), (3, 1), "exactly the conflicting alloc leaks");
-    assert_eq!(o.sources_ref, 0, "no source may end Ref");
-}
-
-/// The smallest confirmed real-corpus decliner (bst `deleteNode`, bisect-
-/// minimized) — shared by the decline fixture and the §NB-R explain tests.
+/// Shared C2Rust delete-node fixture (was defined among the retired mirror tests; several surviving
+/// NB-F / leak tests below use it).
 #[cfg(test)]
 const DELETE_NODE_WITNESS: &str = r#"
 unsafe extern "C" {
@@ -1517,71 +1110,68 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
 }
 "#;
 
-/// §NB-F stage 1 — the deleteNode witness under LEAK-THE-FREES semantics.
-/// (Flipped from NB-R's decline fixture when sinks became retractable —
-/// option (a), approved at the NB-R gate. History: this shape was the
-/// bisect-minimized Family-A witness; NB-R's core showed its ONLY forced
-/// owning was the free sink, so retraction dissolves the UNSAT.)
-/// The relax loop drops both free-sink selectors (an unprovable free stays a
-/// raw free); with no malloc there are no source selectors; mirror and real
-/// loop must agree and ACCEPT. The freed value's final kind is an OBSERVED
-/// pin (see the assertion comment), not a design guarantee: dropping a sink
-/// selector asserts neither ¬own nor ¬ref.
+// ---------------------------------------------------------------------------
+// §NB5-M wrapper-thinness guard (replaces the retired mirror-fidelity tests).
+// ---------------------------------------------------------------------------
+
+/// §NB5-M: guards WRAPPER-THINNESS. `verify_to_fixpoint` is a model-only wrapper over
+/// `verify_to_fixpoint_counting` (the single CEGAR loop). This is a near-tautology today — the
+/// wrapper literally returns `verify_to_fixpoint_counting(..).0` — and that is exactly its purpose:
+/// if anyone later adds logic to the wrapper (a filter, retry, or a different solve), the sweep's
+/// NATIVE counters would silently diverge from the model the suite verifies through the wrapper (the
+/// mirror-drift the retired `boc1_mirror_matches_real_*` tests guarded). It runs an accept-no-commit
+/// and an accept-with-commit shape so the loop is exercised; decline yields the same wrapper==native
+/// by construction (both are the same loop).
 #[test]
-fn boc1_mirror_matches_real_delete_node_leaked_frees() {
-    use rustc_middle::mir::Local;
-
+fn verify_to_fixpoint_is_thin_wrapper() {
     use crate::analyses::borrow_ownership::{
-        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
-        crate_slots::CrateSlots, emit_crate_ownership_constraints,
-        solver::{KindSolver, SlotRef},
+        CrateCtxt,
+        borrow_verify::{verify_to_fixpoint, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
     };
-
-    let o = assert_mirror_matches(DELETE_NODE_WITNESS);
-    assert!(o.accepted, "retractable sinks: the witness must accept");
-    assert_eq!(
-        (o.dropped_sinks, o.dropped_sources),
-        (2, 0),
-        "exactly the two frees leak; there are no sources to leak"
-    );
-    assert_eq!(o.sources, 0, "no malloc in the shape");
-
-    // The freed-value observation (stage-2 residual, recorded not fixed): what
-    // does leaked-free `root` settle to under the max-ref objective?
-    ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let crate_ctxt = CrateCtxt::new(&program);
-        let solver = KindSolver::new(&slots);
-        let (_s, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver).expect("emission");
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, &slots, g, &body);
-        }
-        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
-            .expect("accepts under retractable sinks");
-        let f = program.functions[0];
-        let root = SlotRef::Local(
-            f,
-            slots.fn_local_slots[&f]
-                .slot_for_local_depth(Local::from_u32(1), 0)
-                .expect("root (_1) has a depth-0 slot"),
-        );
-        // OBSERVED pin (2026-07-04, not a design guarantee): leaked-free
-        // `root` settles `Raw` — the CEGAR replay polices the `Ref` reading
-        // even with the sink retracted (root-as-Ref surfaces aliasing
-        // conflicts through the recursion). A leaked free CAN in principle
-        // settle `Ref` where no conflict surfaces — the named stage-2
-        // residual; the corpus sweep counts freed-`Ref` occurrences before
-        // codegen may trust this.
-        assert_eq!(
-            model.get(&root),
-            Some(&SlotKind::Raw),
-            "observed leaked-free kind changed — revisit the stage-2 residual note"
-        );
-    })
-    .unwrap_or_else(|e| e.raise());
+    let shapes = [
+        // accept, no commit (rounds == 1).
+        "unsafe fn f(p: *mut i32) -> *mut i32 { let q = p; q }",
+        // accept with a commit (coherence drags the modeled-origin param to Raw).
+        "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+         unsafe fn f(p: *mut i32) -> *mut i32 { let mut q = op(p); q = p; q }",
+    ];
+    for code in shapes {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let build = || {
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, selectors) = emit_crate_ownership_constraints(
+                    &crate_ctxt,
+                    &slots,
+                    &compute_origins(&program),
+                    &solver,
+                )
+                .expect("emission");
+                for &g in &program.functions {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                    add_coherence(&solver, &slots, g, &body);
+                }
+                (solver, selectors)
+            };
+            let (ws, wsel) = build();
+            let wrapper = verify_to_fixpoint(&program, &slots, &ws, &wsel, true);
+            let (ns, nsel) = build();
+            let native = verify_to_fixpoint_counting(&program, &slots, &ns, &nsel, true).0;
+            assert_eq!(
+                wrapper, native,
+                "§NB5-M: verify_to_fixpoint (wrapper) must equal verify_to_fixpoint_counting(..).0 — \
+                 keep the wrapper thin"
+            );
+        })
+        .unwrap_or_else(|e| e.raise());
+    }
 }
 
 /// §NB-F stage 1 (option (a), approved at the NB-R gate) — the CAUSAL flip:
