@@ -244,6 +244,13 @@ pub(crate) struct RoundStats {
     pub dropped_sinks: usize,
     /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
     pub dropped_sources: usize,
+    /// §NB5-F: set when the loop declined because a residual borrow conflict named a non-`Ref`
+    /// FIELD slot (the A′ principle extended to field requirers — the field is a live requirer the
+    /// Local-only replay candidacy cannot soundly demote, so decline is the sound outcome). Carries
+    /// the offending field slot for the sweep's per-program attribution (which field). `None` for an
+    /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
+    /// `decline_reason`).
+    pub field_conflict_decline: Option<SlotRef>,
 }
 
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
@@ -310,9 +317,22 @@ pub(crate) fn verify_to_fixpoint_counting(
             |s| model.get(&s) != Some(&SlotKind::Ref),
             is_mutable,
         );
+        // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
+        // residual is the A′ principle extended to field requirers: the field is a live requirer the
+        // Local-only replay candidacy cannot soundly demote (committing it just regenerates the
+        // conflict), so DECLINE (Option A) is the sound outcome — tagged for the sweep's attribution.
+        // A non-`Ref` LOCAL residual stays a fail-closed invariant violation: the inert-ness invariant
+        // (see `representative`) keeps non-witness `Raw` locals out of residual edges, so a residual
+        // local is always `Ref`; a violation is a real under-report, asserted even in release (BB3-c).
+        // (No Local fixture forces this arm — its coverage rests on that invariant, not a synthesized
+        // case.) The field early-return runs first, so the assert now effectively guards Locals only.
+        if let Some(field) = residual_nonref_field(&conflicts, &model) {
+            stats.field_conflict_decline = Some(field);
+            return (None, stats);
+        }
         assert!(
             guard_slots_are_ref(&conflicts, &model),
-            "every residual conflict slot must be Ref in the current model"
+            "every residual conflict LOCAL slot must be Ref in the current model (fields decline above)"
         );
         let mut committed = 0;
         for conflict in conflicts.values().flatten() {
@@ -325,10 +345,11 @@ pub(crate) fn verify_to_fixpoint_counting(
         }
         stats.commits_per_round.push(committed);
         if committed == 0 {
-            // No committable residual: a genuine fixpoint, or only `Field`-owner
-            // residuals (the deferred Local-only gap) — accept for this pass. Because every
-            // non-`Ref` slot was a replay candidate above, an empty residual means the surviving
-            // `Ref` slots genuinely do not alias (no `Owning` slot's reference role is hidden).
+            // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
+            // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
+            // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
+            // committed like any `Ref` slot and a non-`Ref` field residual already declined above, so
+            // this path no longer silently accepts a dropped-`Field` residual (the old Local-only gap).
             return (Some(model), stats);
         }
         model = match solver.model_kinds_relaxing_reporting(selectors) {
@@ -360,11 +381,12 @@ pub(crate) fn verify_to_fixpoint_counting(
 /// `nb4_returned_immutable_borrow_vs_base_write` (A′'s reach is a property of the edge menu, so
 /// it closes the IMMUTABLE shape too — orthogonal to the immutable-loan skip).
 ///
-/// Returns `None` only when the conflict has no committable `Local` owner — i.e. a
-/// `Field`-only residual (the deferred struct field-slot gap). A residual `Local` owner
-/// is always currently-`Ref`: `borrow_conflicts_replaying`'s inert-ness invariant keeps
-/// non-witness `Raw` locals out of residual edges, so an "all owners already `Raw`"
-/// residual cannot arise for Locals.
+/// Returns `None` only when no owner of the conflict is currently `Ref`. §NB5-F: this cannot
+/// arise on the live path — a non-`Ref` field residual is decline-intercepted (`residual_nonref_field`)
+/// and a non-`Ref` `Local` residual is assert-intercepted (`guard_slots_are_ref`) before this runs, so
+/// every conflict reaching here has a committable `Ref` owner (`Local` OR field). A residual `Local`
+/// owner is always `Ref` anyway: `borrow_conflicts_replaying`'s inert-ness invariant keeps non-witness
+/// `Raw` locals out of residual edges. The `None` arm is kept defensive (e.g. an empty edge).
 fn representative(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Option<SlotRef> {
     let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
     // A′: a live `Ref` requirer BEYOND the issuer must carry the discharge.
@@ -393,10 +415,28 @@ fn round_cap(slots: &CrateSlots) -> usize {
     n + 8
 }
 
+/// §NB5-F — the first `SlotRef::Field` in a residual conflict the model left non-`Ref` (a field
+/// that owns/borrow-aliases a written cell). Option A declines on this: it is not a committable
+/// `Ref`, and the Local-only replay candidacy cannot disable its loan, so forcing it would corrupt
+/// the ownership fact / loop forever. The paired non-`Ref` `Local` case stays a fail-closed
+/// invariant violation (`guard_slots_are_ref`). Returns the offending field for attribution.
+fn residual_nonref_field(
+    conflicts: &FxHashMap<LocalDefId, Vec<SlotConflict>>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<SlotRef> {
+    conflicts
+        .values()
+        .flatten()
+        .flat_map(|c| c.issuer.into_iter().chain(c.requirers.iter().copied()))
+        .find(|s| matches!(s, SlotRef::Field(_)) && model.get(s) != Some(&SlotKind::Ref))
+}
+
 /// Invariant tripwire for the loop: every slot in a residual conflict edge must be
 /// `Ref` in the current model. `Raw` slots are replay-demoted (witnessed) and `Owning`
 /// slots are non-candidates, so a residual edge can only name surviving `Ref`
 /// candidates; a violation signals the deferred Owning-issuer / under-report cases.
+/// §NB5-F: `residual_nonref_field` runs first, so any non-`Ref` slot reaching this guard
+/// is a `Local` (a genuine violation).
 /// Release-active (BB3-c): a violation = a model with a live residual conflict whose
 /// owner slot is not `Ref`, so `representative` cannot commit it and the loop would
 /// silently accept an unsound model bound for codegen — it must fail-closed even in
@@ -413,8 +453,10 @@ fn guard_slots_are_ref(
     })
 }
 
-/// Translate a borrow `ProvenanceOwner` to a BO `SlotRef`. BB0 handles `Local` owners
-/// (→ the local's depth-0 slot); `Field` owners are dropped pending the field mapping.
+/// Translate a borrow `ProvenanceOwner` to a BO `SlotRef`. A `Local` owner maps to the
+/// local's depth-0 slot; a `Field` owner (§NB5-F) maps to the global struct-field slot's
+/// depth-0 slot in `field_slots` (already built + solver-encoded). `SlotRef`'s variant
+/// disambiguates the two per-universe `SlotId` spaces, so there is no id collision.
 fn owner_to_slot(slots: &CrateSlots, fn_did: LocalDefId, owner: ProvenanceOwner) -> Option<SlotRef> {
     match owner {
         ProvenanceOwner::Local(local) => {
@@ -424,6 +466,16 @@ fn owner_to_slot(slots: &CrateSlots, fn_did: LocalDefId, owner: ProvenanceOwner)
                 .slot_for_local_depth(local, 0)?;
             Some(SlotRef::Local(fn_did, slot_id))
         }
-        ProvenanceOwner::Field(_) => None,
+        ProvenanceOwner::Field(field) => {
+            // `borrow::StructFieldSlot` and `slots::StructFieldSlot` are structurally
+            // identical but nominally distinct types (same `struct_did` / `field_index`);
+            // bridge to the slot-universe key.
+            let field = super::slots::StructFieldSlot {
+                struct_did: field.struct_did,
+                field_index: field.field_index,
+            };
+            let slot_id = slots.field_slots.slot_for_field_depth(field, 0)?;
+            Some(SlotRef::Field(slot_id))
+        }
     }
 }
