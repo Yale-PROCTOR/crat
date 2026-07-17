@@ -12608,6 +12608,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                             |_: LocalDefId| |_: Local| true,
                             move |_: LocalDefId| move |_: Local| raw,
                             move |_: LocalDefId| move |_: Local| mutb,
+                            &[], // §NB5-F2: no field candidacy → fork matches production's field handling
                         );
                         if let Some(d) = case_delta(&prod, &fork) {
                             diverged.insert(format!("{label}/replay/raw={raw}/mut={mutb}"), d);
@@ -12656,6 +12657,7 @@ unsafe fn f() {
                     |_: LocalDefId| |_: Local| true,
                     move |_fd: LocalDefId| move |local: Local| rl.contains(&local),
                     |_: LocalDefId| |_: Local| true,
+                    &[], // §NB5-F2: no field candidacy → fork matches production's field handling
                 );
                 assert!(!prod.is_empty(), "non-vacuity: the mixed replay must produce conflict edges");
                 if let Some(d) = case_delta(&prod, &fork) {
