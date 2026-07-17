@@ -15,6 +15,7 @@
 use rustc_hash::FxHashMap;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
+use z3::ast::Bool;
 
 use super::{
     SlotKind,
@@ -222,6 +223,40 @@ pub(crate) fn verify_to_fixpoint(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    // §NB5-M: thin wrapper over the single counting loop (model only). KEEP THIN — any logic
+    // added here but not in `verify_to_fixpoint_counting` diverges the sweep's counters from what
+    // the suite verifies (exactly the mirror-drift the retired bo_c1 mirror guarded; wrapper-
+    // thinness is now the guard — see `verify_to_fixpoint_is_thin_wrapper`).
+    verify_to_fixpoint_counting(program, slots, solver, selectors, is_mutable).0
+}
+
+/// §NB5-M CEGAR round/commit counters, native to the fork — retires the bo_c1 mirror
+/// (`mirror::verify_to_fixpoint_counting`). `None` (decline) carries the stats of the rounds that
+/// ran. `verify_to_fixpoint` is the model-only wrapper over this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoundStats {
+    /// Validate rounds run, INCLUDING the accepting round (accept-first-model ⇒ `rounds == 1`).
+    pub rounds: usize,
+    /// §NB0: every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
+    pub commits_conflict: usize,
+    pub commits_per_round: Vec<usize>,
+    /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
+    pub dropped_sinks: usize,
+    /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
+    pub dropped_sources: usize,
+}
+
+/// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
+/// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
+/// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
+/// the leak counts).
+pub(crate) fn verify_to_fixpoint_counting(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
@@ -234,8 +269,18 @@ pub(crate) fn verify_to_fixpoint(
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
     super::coherence::constrain_field_ownership(solver, slots, program);
-    let mut model = solver.model_kinds_relaxing(selectors)?;
+    // §NB-F: classify a dropped-selector set into leak counts (native counter, was the mirror's).
+    let record_dropped = |stats: &mut RoundStats, dropped: &[Bool]| {
+        stats.dropped_sinks = dropped.iter().filter(|d| selectors.is_sink(d)).count();
+        stats.dropped_sources = dropped.len() - stats.dropped_sinks;
+    };
+    let mut stats = RoundStats::default();
+    let Some((mut model, dropped)) = solver.model_kinds_relaxing_reporting(selectors) else {
+        return (None, stats);
+    };
+    record_dropped(&mut stats, &dropped);
     for _ in 0..cap {
+        stats.rounds += 1;
         let conflicts = revalidate_replaying(
             program,
             slots,
@@ -275,16 +320,24 @@ pub(crate) fn verify_to_fixpoint(
                 // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                 solver.add_borrow_exclusion(Some(slot), &[]);
                 committed += 1;
+                stats.commits_conflict += 1;
             }
         }
+        stats.commits_per_round.push(committed);
         if committed == 0 {
             // No committable residual: a genuine fixpoint, or only `Field`-owner
             // residuals (the deferred Local-only gap) — accept for this pass. Because every
             // non-`Ref` slot was a replay candidate above, an empty residual means the surviving
             // `Ref` slots genuinely do not alias (no `Owning` slot's reference role is hidden).
-            return Some(model);
+            return (Some(model), stats);
         }
-        model = solver.model_kinds_relaxing(selectors)?;
+        model = match solver.model_kinds_relaxing_reporting(selectors) {
+            Some((m, dropped)) => {
+                record_dropped(&mut stats, &dropped);
+                m
+            }
+            None => return (None, stats),
+        };
     }
     panic!("BB2-ii CEGAR did not converge within {cap} rounds");
 }
