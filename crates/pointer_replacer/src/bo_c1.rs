@@ -299,7 +299,7 @@ mod run {
         borrow_ownership::{
             CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::verify_to_fixpoint,
-            coherence::add_coherence,
+            coherence::{add_coherence, field_ownership_candidates},
             crate_slots::CrateSlots,
             emit_crate_ownership_constraints,
             mutability_facts::{MutFacts, MutFactsMode},
@@ -774,14 +774,46 @@ mod run {
         row.set("sinks_leaked", rstats.dropped_sinks);
         row.set("sources_leaked_sel", rstats.dropped_sources);
 
+        // §S2-3 field-yield histogram (NB5-F). Model-independent buckets: `fields_total` = depth-0
+        // pointer field slots (denominator); `stores_owned` = Owning CANDIDATES (≥1 owned store, no
+        // blocking non-owned store) from the same scan the field-ownership constraints use; `blocked`
+        // = fields with a non-owned store (upstream cause). `owning_model` (the S2-3 gate numerator —
+        // fields that come out `Owning` in the accepted model) is emitted in the accept arm below.
+        let s23_fields_total = (0..slots.field_slots.len())
+            .filter(|&i| slots.field_slots.slot(SlotId::from_usize(i)).depth == 0)
+            .count();
+        let (s23_candidates, s23_blocked) = field_ownership_candidates(&slots, &program);
+        row.set("s23_fields_total", s23_fields_total);
+        row.set("s23_stores_owned", s23_candidates.len());
+        row.set("s23_blocked", s23_blocked.len());
+
         match &model {
             None => {
                 row.set("status", "decline");
-                row.set("decline_reason", decline_reason(&solver, &selectors));
+                // §NB5-F: a field-conflict decline is SAT-with-a-non-`Ref`-field-residual, NOT an
+                // UNSAT — running `decline_reason` (a selector-core replay) would misreport it as
+                // `sat-in-replay`. Intercept it from the native stats FIRST, tag it distinctly, and
+                // attribute it to the offending field for the sweep's per-program accounting (rider 1).
+                // Only genuine UNSAT-family declines fall through to `decline_reason` + the explain path.
+                if let Some(field_slot) = rstats.field_conflict_decline {
+                    row.set("decline_reason", "field-conflict");
+                    if let SlotRef::Field(id) = field_slot
+                        && let SlotOwner::Field(f) = slots.field_slots.slot(id).owner
+                    {
+                        row.set(
+                            "decline_field",
+                            format!("{}::field{}", tcx.def_path_str(f.struct_did.to_def_id()), f.field_index),
+                        );
+                    }
+                } else {
+                    row.set("decline_reason", decline_reason(&solver, &selectors));
+                }
                 // §NB-R (opt-in): explain the decline via a second, TRACKED
                 // construction — labeled minimal core (or family histogram at
-                // scale). Never on the default path: doubles solve cost.
-                if std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
+                // scale). Never on the default path: doubles solve cost. §NB5-F: skip for
+                // field-conflict declines (they are SAT, so the tracked replay would not be UNSAT).
+                if rstats.field_conflict_decline.is_none()
+                    && std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
                     let t = Instant::now();
                     match super::explain::explain_unsat(tcx) {
                         super::explain::Explained::Unsat { core, minimized } => {
@@ -862,6 +894,18 @@ mod run {
                 row.set("n_ref_mut_d0", n_ref_mut_d0);
                 row.set("mut_default_fires", mut_default_fires);
                 row.set("sources_leaked", leaked);
+                // §S2-3 numerator: depth-0 struct-field slots that come out `Owning` in the accepted
+                // model — the field-ownership yield the S2-3 gate ("still zero after NB5") consumes.
+                let mut s23_owning_model = 0usize;
+                for (s, kind) in m {
+                    if let SlotRef::Field(id) = s
+                        && slots.field_slots.slot(*id).depth == 0
+                        && *kind == SlotKind::Owning
+                    {
+                        s23_owning_model += 1;
+                    }
+                }
+                row.set("s23_owning_model", s23_owning_model);
             }
         }
 
@@ -1219,6 +1263,9 @@ fn nb5m_native_round_stats_contract() {
     assert_eq!(accept.commits_per_round, vec![0], "accept: [0]");
     assert_eq!(accept.dropped_sinks, 0, "accept: no sinks");
     assert_eq!(accept.dropped_sources, 0, "accept: no sources");
+    // §NB5-F: an accept never carries a field-conflict decline (positive case pinned by the
+    // NB5-F decline fixture `nb5f_field_conflict_declines`).
+    assert_eq!(accept.field_conflict_decline, None, "accept: no field-conflict decline");
     // (b) accept WITH a conflict CASCADE: `x = id(p)` is a live Ref requirer invalidated by the write
     // through the base `b = p` (A′), committed `¬ref` over two commit rounds + the accepting round.
     let commit = stats_of(
@@ -1253,6 +1300,94 @@ fn nb5m_native_round_stats_contract() {
     assert_eq!(source.commits_per_round, vec![1, 0]);
     assert_eq!(source.dropped_sinks, 0, "no free in this shape");
     assert_eq!(source.dropped_sources, 1, "the leaked alloc drops its source selector (POSITIVE)");
+}
+
+/// §NB5-F — field-universe expansion makes struct-field borrow conflicts visible to the BO
+/// verifier (`owner_to_slot` no longer drops `Field` owners). Because the replay candidacy is
+/// Local-only, a field requirer cannot be soundly demoted (its loan is not model-gated), so the
+/// A′ principle extended to field requirers yields a DECLINE (Option A) rather than an unsound
+/// discharge. This fixture is also the empirical test of the three-fact mechanism reading:
+/// pre-partition it fails as the guard PANIC (`borrow_verify.rs` "every residual conflict slot
+/// must be Ref"); post-partition it declines with the offending field tagged. Both shapes assert
+/// the FINAL semantics: model `None` + `field_conflict_decline = Some(the field)`.
+#[test]
+fn nb5f_field_conflict_declines() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::verify_to_fixpoint_counting,
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        slots::SlotOwner,
+        solver::{KindSolver, SlotRef},
+    };
+    // Returns (declined?, the demoted field's `Struct::fieldN` name if a field-conflict decline).
+    fn decline_field(code: &str) -> (bool, Option<String>) {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            let (model, stats) =
+                verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true);
+            let field = stats.field_conflict_decline.map(|s| match s {
+                SlotRef::Field(id) => match slots.field_slots.slot(id).owner {
+                    SlotOwner::Field(f) => format!(
+                        "{}::field{}",
+                        tcx.item_name(f.struct_did.to_def_id()),
+                        f.field_index
+                    ),
+                    SlotOwner::Local(_) => "LOCAL-owner(bug)".to_string(),
+                },
+                SlotRef::Local(..) => "LOCAL-slot(bug)".to_string(),
+            });
+            (model.is_none(), field)
+        })
+        .unwrap_or_else(|e| e.raise())
+    }
+
+    // (1) PURE field conflict: `h.p` borrows `x`, the direct write `x = 1` invalidates that loan,
+    // `*h.p` uses it after — production borrow demotes `Holder::field0` (see the borrow-module test
+    // `demote_struct_field_assignment_on_conflict`). In BO the field is the residual requirer.
+    let (declined, field) = decline_field(
+        "struct Holder { p: *mut i32 } \
+         unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
+         h.p = &raw mut x; x = 1; *h.p = 2; }",
+    );
+    assert!(declined, "pure field conflict must DECLINE (Option A), not accept");
+    assert_eq!(
+        field.as_deref(),
+        Some("Holder::field0"),
+        "the decline is attributed to the conflicting field Holder::field0"
+    );
+
+    // (2) MIXED edge (local issuer + field requirer): a local `v` and the field `h.p` both alias
+    // `x`; `x = 1` conflicts both. Today (field dropped) A′ would discharge by demoting the local
+    // issuer while the live `Ref` FIELD keeps requiring the loan — the A′-unsound shape. NB5-F makes
+    // the field visible, A′ refuses that discharge, and the non-demotable field requirer DECLINES.
+    let (declined, field) = decline_field(
+        "struct Holder { p: *mut i32 } \
+         unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
+         let v = &raw mut x; h.p = &raw mut x; x = 1; *h.p = 2; *v = 3; }",
+    );
+    assert!(declined, "mixed local+field conflict must DECLINE (no mask-lift), not accept");
+    assert_eq!(
+        field.as_deref(),
+        Some("Holder::field0"),
+        "the mixed-edge decline is attributed to the non-demotable field requirer Holder::field0"
+    );
 }
 
 /// §NB-F stage 1 (option (a), approved at the NB-R gate) — the CAUSAL flip:

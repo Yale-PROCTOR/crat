@@ -138,6 +138,25 @@ pub(crate) fn constrain_field_ownership(
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) {
+    let (owned_stores, blocked) = scan_field_stores(slots, program);
+    for (field, rhs) in &owned_stores {
+        if !blocked.contains(field) {
+            solver.constrain_field_own(*field, rhs);
+        }
+    }
+    for &field in &blocked {
+        solver.forbid_field_own(field);
+    }
+}
+
+/// §S2-3 — the field-store ownership scan, shared by `constrain_field_ownership` (which emits the
+/// `field.own <=> AND(stored owns)` constraints from it) and the sweep's field-yield histogram (which
+/// counts Owning candidates from it). Returns per-field owned-store RHS places and the set of fields
+/// blocked by a non-owned store. Byte-identical to the scan `constrain_field_ownership` inlined before.
+fn scan_field_stores(
+    slots: &CrateSlots,
+    program: &RustProgram<'_>,
+) -> (FxHashMap<SlotRef, Vec<SlotRef>>, FxHashSet<SlotRef>) {
     let mut owned_stores: FxHashMap<SlotRef, Vec<SlotRef>> = FxHashMap::default();
     let mut blocked: FxHashSet<SlotRef> = FxHashSet::default();
 
@@ -213,12 +232,21 @@ pub(crate) fn constrain_field_ownership(
         }
     }
 
-    for (field, rhs) in &owned_stores {
-        if !blocked.contains(field) {
-            solver.constrain_field_own(*field, rhs);
-        }
-    }
-    for &field in &blocked {
-        solver.forbid_field_own(field);
-    }
+    (owned_stores, blocked)
+}
+
+/// §S2-3 — Owning-candidate fields (≥1 owned store and no blocking non-owned store) and the blocked
+/// set, for the field-yield histogram. Derived from the same `scan_field_stores` the solver
+/// constraints use, so the candidate count matches what `constrain_field_own` was applied to.
+pub(crate) fn field_ownership_candidates(
+    slots: &CrateSlots,
+    program: &RustProgram<'_>,
+) -> (FxHashSet<SlotRef>, FxHashSet<SlotRef>) {
+    let (owned_stores, blocked) = scan_field_stores(slots, program);
+    let candidates = owned_stores
+        .keys()
+        .copied()
+        .filter(|f| !blocked.contains(f))
+        .collect();
+    (candidates, blocked)
 }
