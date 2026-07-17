@@ -896,16 +896,25 @@ mod run {
                 row.set("sources_leaked", leaked);
                 // §S2-3 numerator: depth-0 struct-field slots that come out `Owning` in the accepted
                 // model — the field-ownership yield the S2-3 gate ("still zero after NB5") consumes.
+                // §NB5-F2: `s23_fields_raw` counts depth-0 field slots settled `Raw` — the direct
+                // measure of the crate-wide field-demotion hammer (a Raw field's loans are disabled in
+                // every function). These are INVISIBLE in `n_ref_d0`/`n_raw_d0` (Local-only), so this is
+                // the column that shows the row's real field cost (pre-load 3).
                 let mut s23_owning_model = 0usize;
+                let mut s23_fields_raw = 0usize;
                 for (s, kind) in m {
                     if let SlotRef::Field(id) = s
                         && slots.field_slots.slot(*id).depth == 0
-                        && *kind == SlotKind::Owning
                     {
-                        s23_owning_model += 1;
+                        match kind {
+                            SlotKind::Owning => s23_owning_model += 1,
+                            SlotKind::Raw => s23_fields_raw += 1,
+                            SlotKind::Ref => {}
+                        }
                     }
                 }
                 row.set("s23_owning_model", s23_owning_model);
+                row.set("s23_fields_raw", s23_fields_raw);
             }
         }
 
@@ -1263,8 +1272,10 @@ fn nb5m_native_round_stats_contract() {
     assert_eq!(accept.commits_per_round, vec![0], "accept: [0]");
     assert_eq!(accept.dropped_sinks, 0, "accept: no sinks");
     assert_eq!(accept.dropped_sources, 0, "accept: no sources");
-    // §NB5-F: an accept never carries a field-conflict decline (positive case pinned by the
-    // NB5-F decline fixture `nb5f_field_conflict_declines`).
+    // §NB5-F: an accept never carries a field-conflict decline. Under NB5-F2 the field-conflict
+    // path now RESTORES (field loan disabled → accept with the field Raw; see
+    // `nb5f2_field_conflict_restores`); `field_conflict_decline` stays reachable only as the backstop
+    // for genuinely un-dischargeable field residuals.
     assert_eq!(accept.field_conflict_decline, None, "accept: no field-conflict decline");
     // (b) accept WITH a conflict CASCADE: `x = id(p)` is a live Ref requirer invalidated by the write
     // through the base `b = p` (A′), committed `¬ref` over two commit rounds + the accepting round.
@@ -1311,19 +1322,27 @@ fn nb5m_native_round_stats_contract() {
 /// must be Ref"); post-partition it declines with the offending field tagged. Both shapes assert
 /// the FINAL semantics: model `None` + `field_conflict_decline = Some(the field)`.
 #[test]
-fn nb5f_field_conflict_declines() {
+fn nb5f2_field_conflict_restores() {
     use crate::analyses::borrow_ownership::{
-        CrateCtxt,
+        CrateCtxt, SlotKind,
         borrow_verify::verify_to_fixpoint_counting,
         coherence::add_coherence,
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
         origins::compute_origins,
-        slots::SlotOwner,
+        slots::{SlotId, SlotOwner},
         solver::{KindSolver, SlotRef},
     };
-    // Returns (declined?, the demoted field's `Struct::fieldN` name if a field-conflict decline).
-    fn decline_field(code: &str) -> (bool, Option<String>) {
+    // §NB5-F2: run the BO verifier and report (accepted?, kinds of every depth-0 FIELD slot in the
+    // accepted model, the tagged decline field if it declined). F2 extends the fork's demotion loop to
+    // DISABLE a Raw field's loan (via the manifest-widened `disable_owner(Field)`) — so a field
+    // conflict that F CB-declined now clears and ACCEPTS with the field `Raw`, exactly like a local.
+    struct Outcome {
+        accepted: bool,
+        field_kinds: Vec<(String, SlotKind)>,
+        decline_field: Option<String>,
+    }
+    fn run(code: &str) -> Outcome {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let program = collect_program(tcx);
             let slots = CrateSlots::build(&program);
@@ -1340,53 +1359,60 @@ fn nb5f_field_conflict_declines() {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                 add_coherence(&solver, &slots, g, &body);
             }
+            let field_name = |id: SlotId| match slots.field_slots.slot(id).owner {
+                SlotOwner::Field(f) => {
+                    format!("{}::field{}", tcx.item_name(f.struct_did.to_def_id()), f.field_index)
+                }
+                SlotOwner::Local(_) => "LOCAL-owner(bug)".to_string(),
+            };
             let (model, stats) =
                 verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true);
-            let field = stats.field_conflict_decline.map(|s| match s {
-                SlotRef::Field(id) => match slots.field_slots.slot(id).owner {
-                    SlotOwner::Field(f) => format!(
-                        "{}::field{}",
-                        tcx.item_name(f.struct_did.to_def_id()),
-                        f.field_index
-                    ),
-                    SlotOwner::Local(_) => "LOCAL-owner(bug)".to_string(),
-                },
+            let mut field_kinds = Vec::new();
+            if let Some(m) = &model {
+                for (s, kind) in m {
+                    if let SlotRef::Field(id) = s
+                        && slots.field_slots.slot(*id).depth == 0
+                    {
+                        field_kinds.push((field_name(*id), *kind));
+                    }
+                }
+            }
+            let decline_field = stats.field_conflict_decline.map(|s| match s {
+                SlotRef::Field(id) => field_name(id),
                 SlotRef::Local(..) => "LOCAL-slot(bug)".to_string(),
             });
-            (model.is_none(), field)
+            Outcome { accepted: model.is_some(), field_kinds, decline_field }
         })
         .unwrap_or_else(|e| e.raise())
     }
 
-    // (1) PURE field conflict: `h.p` borrows `x`, the direct write `x = 1` invalidates that loan,
-    // `*h.p` uses it after — production borrow demotes `Holder::field0` (see the borrow-module test
-    // `demote_struct_field_assignment_on_conflict`). In BO the field is the residual requirer.
-    let (declined, field) = decline_field(
+    // (1) PURE field conflict (the F fixture, flipped): `h.p` borrows `x`, `x = 1` invalidates that
+    // loan, `*h.p` uses it after. Under F this DECLINED (field requirer un-dischargeable); under F2 the
+    // demotion loop disables `Holder::field0`'s loan → the conflict clears → ACCEPT with the field Raw.
+    let o = run(
         "struct Holder { p: *mut i32 } \
          unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
          h.p = &raw mut x; x = 1; *h.p = 2; }",
     );
-    assert!(declined, "pure field conflict must DECLINE (Option A), not accept");
-    assert_eq!(
-        field.as_deref(),
-        Some("Holder::field0"),
-        "the decline is attributed to the conflicting field Holder::field0"
+    assert!(o.accepted, "F2: pure field conflict must now ACCEPT (field loan disabled), not decline");
+    assert!(
+        o.field_kinds.contains(&("Holder::field0".to_string(), SlotKind::Raw)),
+        "F2: the restored field settles Raw (its loan was disabled); got {:?}",
+        o.field_kinds
     );
 
-    // (2) MIXED edge (local issuer + field requirer): a local `v` and the field `h.p` both alias
-    // `x`; `x = 1` conflicts both. Today (field dropped) A′ would discharge by demoting the local
-    // issuer while the live `Ref` FIELD keeps requiring the loan — the A′-unsound shape. NB5-F makes
-    // the field visible, A′ refuses that discharge, and the non-demotable field requirer DECLINES.
-    let (declined, field) = decline_field(
+    // (2) MIXED edge (local `v` + field `h.p` both alias `x`, both written after): under F2 the field
+    // is disabled AND the local `v` demotes on its own path → ACCEPT with the field Raw.
+    let o = run(
         "struct Holder { p: *mut i32 } \
          unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
          let v = &raw mut x; h.p = &raw mut x; x = 1; *h.p = 2; *v = 3; }",
     );
-    assert!(declined, "mixed local+field conflict must DECLINE (no mask-lift), not accept");
-    assert_eq!(
-        field.as_deref(),
-        Some("Holder::field0"),
-        "the mixed-edge decline is attributed to the non-demotable field requirer Holder::field0"
+    assert!(o.accepted, "F2: mixed local+field conflict must now ACCEPT, not decline");
+    assert!(
+        o.field_kinds.contains(&("Holder::field0".to_string(), SlotKind::Raw)),
+        "F2: the restored field settles Raw; got {:?}",
+        o.field_kinds
     );
 }
 
