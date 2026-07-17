@@ -1340,7 +1340,6 @@ fn nb5f2_field_conflict_restores() {
     struct Outcome {
         accepted: bool,
         field_kinds: Vec<(String, SlotKind)>,
-        decline_field: Option<String>,
     }
     fn run(code: &str) -> Outcome {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
@@ -1365,7 +1364,7 @@ fn nb5f2_field_conflict_restores() {
                 }
                 SlotOwner::Local(_) => "LOCAL-owner(bug)".to_string(),
             };
-            let (model, stats) =
+            let (model, _stats) =
                 verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true);
             let mut field_kinds = Vec::new();
             if let Some(m) = &model {
@@ -1377,11 +1376,7 @@ fn nb5f2_field_conflict_restores() {
                     }
                 }
             }
-            let decline_field = stats.field_conflict_decline.map(|s| match s {
-                SlotRef::Field(id) => field_name(id),
-                SlotRef::Local(..) => "LOCAL-slot(bug)".to_string(),
-            });
-            Outcome { accepted: model.is_some(), field_kinds, decline_field }
+            Outcome { accepted: model.is_some(), field_kinds }
         })
         .unwrap_or_else(|e| e.raise())
     }
@@ -1412,6 +1407,30 @@ fn nb5f2_field_conflict_restores() {
     assert!(
         o.field_kinds.contains(&("Holder::field0".to_string(), SlotKind::Raw)),
         "F2: the restored field settles Raw; got {:?}",
+        o.field_kinds
+    );
+
+    // (3) BACKSTOP TRIPWIRE (Codex NB5-F2 HIGH). The fix: F2 disables only EXACT-`Raw` fields, so an
+    // `Owning` field is NEVER disabled — it falls through to the `residual_nonref_field` decline. A
+    // POSITIVE owning-field-decline fixture is NOT constructible: an owning field is all-malloc-store
+    // (no `&`-loan), so it cannot BE in a borrow conflict, and the solver prefers `Ref`/`Raw` over
+    // `Owning` anyway (corpus-wide `s23_owning_model == 0`). So this is a defensive tripwire, not a
+    // positive exercise (rider-3: don't synthesize). Codex's shape (a malloc'd pointer stored into
+    // `H::p`, then aliased+written) DOES produce a field conflict; the field settles `Raw` and F2
+    // restores it. The invariant we guard: **no accepted model of a field-conflict shape may carry an
+    // `Owning` field** — that would be the unsound owning-field-aliased accept the exact-`Raw` guard
+    // exists to prevent. Coverage of the owning branch rests on the exact-`Raw` predicate itself (cf.
+    // the NB5-F Local-assert arm), not a synthesized case.
+    let o = run(
+        "unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; } \
+         struct H { p: *mut i32 } \
+         unsafe fn f() { let mut h = H { p: core::ptr::null_mut() }; \
+         let p = malloc(4) as *mut i32; h.p = p; *p = 1; let _ = *h.p; }",
+    );
+    assert!(
+        !(o.accepted && o.field_kinds.iter().any(|(_, k)| *k == SlotKind::Owning)),
+        "F2 BACKSTOP: an accepted field-conflict model must not carry an Owning field (exact-Raw \
+         guard regressed → owning-field disable → unsound accept); got {:?}",
         o.field_kinds
     );
 }

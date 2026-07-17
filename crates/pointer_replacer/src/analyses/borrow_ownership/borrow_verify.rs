@@ -329,7 +329,19 @@ pub(crate) fn verify_to_fixpoint_counting(
             // production-parity), guarded ONLY by §8 and fixed by write-aware invalidation in
             // NB3-3b). The §8 guardrail (BO unconsumed) makes both the imprecision above and the
             // S2-6 gap harmless until codegen.
-            |s| model.get(&s) != Some(&SlotKind::Ref),
+            //
+            // §NB5-F2 (Codex HIGH fix): this predicate is used TWO ways in `revalidate_replaying` and
+            // the two owner classes need OPPOSITE semantics. LOCAL replay candidacy stays the
+            // conservative non-`Ref` above (an `Owning` local's loans must be INCLUDED — BB3-b). But
+            // the field DISABLE list REMOVES loans, so it must be EXACT `Raw`: disabling an `Owning`
+            // field's loan would delete a conflict that should decline/demote (an owning + borrow-
+            // aliased field → unsound accept). So branch on the owner: fields → exactly `Raw`, locals
+            // → non-`Ref`. (`Raw` fields are the only ones F2 dischargeds; `Owning` fields fall through
+            // to the `residual_nonref_field` decline backstop.)
+            |s| match s {
+                SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
+                SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
+            },
             is_mutable,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
