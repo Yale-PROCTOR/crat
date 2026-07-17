@@ -891,10 +891,45 @@ mod run {
         row.set("t_mut_facts_s", secs(t.elapsed()));
 
         let t = Instant::now();
+        // §NB5-M: NATIVE fork counters are the source of truth now (`run_bo` no longer mirrors the
+        // loop). PARITY WINDOW (dual-compute — retired at NB5-M step 4): a fresh, independent mirror
+        // construction cross-checks every counter + the model on each program. Each CEGAR loop mutates
+        // its own solver, so the mirror gets its own emission + coherence (this doubles fixpoint cost —
+        // gate runs use CRAT_BOC1_TIMEOUT_SECS ≥ 2400).
         let (model, rstats) =
-            mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts);
+            crate::analyses::borrow_ownership::borrow_verify::verify_to_fixpoint_counting(
+                &program, &slots, &solver, &selectors, &mut_facts,
+            );
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
+        {
+            let m_solver = KindSolver::new(&slots);
+            let (_ms, m_selectors) =
+                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &m_solver)
+                    .expect("NB5-M parity: mirror emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&m_solver, &slots, g, &body);
+            }
+            let (m_model, m_stats) = mirror::verify_to_fixpoint_counting(
+                &program, &slots, &m_solver, &m_selectors, &mut_facts,
+            );
+            assert_eq!(model, m_model, "NB5-M parity: native model != mirror model");
+            assert_eq!(rstats.rounds, m_stats.rounds, "NB5-M parity: rounds");
+            assert_eq!(
+                rstats.commits_conflict, m_stats.commits_conflict,
+                "NB5-M parity: commits_conflict"
+            );
+            assert_eq!(
+                rstats.commits_per_round, m_stats.commits_per_round,
+                "NB5-M parity: commits_per_round"
+            );
+            assert_eq!(rstats.dropped_sinks, m_stats.dropped_sinks, "NB5-M parity: dropped_sinks");
+            assert_eq!(
+                rstats.dropped_sources, m_stats.dropped_sources,
+                "NB5-M parity: dropped_sources"
+            );
+        }
 
         row.set("rounds", rstats.rounds);
         row.set("commits_conflict", rstats.commits_conflict);
@@ -1274,6 +1309,26 @@ fn assert_mirror_matches(code: &str) -> MirrorOutcome {
             }
             mirror::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
         };
+
+        // §NB5-M: the fork-native counting must reproduce the mirror's model + RoundStats exactly.
+        // (This cross-check retires at NB5-M step 4, replaced by the wrapper-thinness guard.)
+        let (native_model, native_stats) = {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, selectors) = emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
+                .expect("native: emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            crate::analyses::borrow_ownership::borrow_verify::verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
+        };
+        assert_eq!(native_model, mirrored, "§NB5-M: fork-native model != mirror model");
+        assert_eq!(native_stats.rounds, stats.rounds, "§NB5-M: rounds");
+        assert_eq!(native_stats.commits_conflict, stats.commits_conflict, "§NB5-M: commits_conflict");
+        assert_eq!(native_stats.commits_per_round, stats.commits_per_round, "§NB5-M: commits_per_round");
+        assert_eq!(native_stats.dropped_sinks, stats.dropped_sinks, "§NB5-M: dropped_sinks");
+        assert_eq!(native_stats.dropped_sources, stats.dropped_sources, "§NB5-M: dropped_sources");
 
         match (&real, &mirrored) {
             (Some(a), Some(b)) => {
