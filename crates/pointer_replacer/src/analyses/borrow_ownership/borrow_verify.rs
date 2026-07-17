@@ -12,7 +12,9 @@
 //! for a Round-0 (all-Ref) candidacy; partial candidacy that encodes demotions also
 //! needs the `tree_borrow_local` union replay the demotion loop performs (BB2).
 
-use rustc_hash::FxHashMap;
+use std::cell::Cell;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::Local;
 use rustc_span::def_id::LocalDefId;
 use z3::ast::Bool;
@@ -28,6 +30,88 @@ use crate::{
     analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
     utils::rustc::RustProgram,
 };
+
+thread_local! {
+    /// §NB5-L — test/sweep-scoped `RepairMode` override (see `RepairMode::with_override`). Wins over
+    /// the env selector so ONE process can run both repair modes (the differential harness + the S7
+    /// sweep). `None` ⇒ fall through to env/`DEFAULT`.
+    static REPAIR_OVERRIDE: Cell<Option<RepairMode>> = const { Cell::new(None) };
+}
+
+/// §NB5-L — the repair strategy the CEGAR loop uses to discharge a residual borrow conflict.
+///
+/// - `ModeA`: commit one `¬ref(representative)` per residual edge — monotone, permanent (the shipped
+///   loop through NB5-F2).
+/// - `Lemmas` (MVP): emit `⋁¬ref(A′-menu)` per residual edge — an **empty-context, A′-restricted
+///   disjunctive lemma** (`¬ref`-only, invariant 7). It does NOT dominate `ModeA`: the hoped upside
+///   (spare a "sparable" requirer) never arises because A′ excludes the only sparable slot (the
+///   write-issuer); the disjunction's freedom to pick a NON-minimal menu member instead becomes a
+///   *downside*. The two modes are **incomparable in general** (the loop is non-confluent — different
+///   commit strategies induce different lemma sets and different optima); on tested fixtures
+///   `Ref(lemmas) ⊆ Ref(mode_a)` and on a high-arity fan-out strictly ⊊ (Lemmas loses ≥1 Ref). So the
+///   disjunction axis is dead; `ModeA` is the shipped default and the demotion-choice mechanism.
+///
+/// Selected by env `CRAT_BO_REPAIR ∈ {mode_a, lemmas}` (default `ModeA`; the gate did NOT flip it),
+/// or a thread-local `with_override` that WINS over env. A uniform strategy toggle, constant within an
+/// override scope — no path-divergence hazard (unlike 4c's threaded origins, which were divergent DATA).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RepairMode {
+    ModeA,
+    Lemmas,
+}
+
+impl Default for RepairMode {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl RepairMode {
+    /// Default until the gate flips it on the S7 differential (NB5-L rider 2). `RoundStats` derives
+    /// `Default`, so this is also the mode a default-constructed stats block reports.
+    pub(crate) const DEFAULT: Self = RepairMode::ModeA;
+
+    /// Resolve the active mode: thread-local override first, then env `CRAT_BO_REPAIR`, then `DEFAULT`.
+    /// Fail-loud on a SET-but-invalid env value (a typo must not silently fall back and mask which
+    /// repair ran — the `ForkEngineMode` discipline).
+    pub(crate) fn current() -> Self {
+        if let Some(m) = REPAIR_OVERRIDE.with(|c| c.get()) {
+            return m;
+        }
+        match std::env::var("CRAT_BO_REPAIR") {
+            Ok(v) => match v.as_str() {
+                "mode_a" | "mode-a" => RepairMode::ModeA,
+                "lemmas" => RepairMode::Lemmas,
+                other => panic!(
+                    "CRAT_BO_REPAIR={other:?} is not a valid selector (expected mode_a or lemmas) \
+                     — refusing to silently fall back"
+                ),
+            },
+            Err(_) => Self::DEFAULT,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RepairMode::ModeA => "mode_a",
+            RepairMode::Lemmas => "lemmas",
+        }
+    }
+
+    /// §NB5-L guard 2 — run `f` with `mode` forced on this thread, restoring the prior override on
+    /// exit INCLUDING on panic (a drop-guard, not a manual reset: a panicking test must not leak its
+    /// mode onto the thread for the next test). Test/sweep-only; production resolves via `current()`.
+    pub(crate) fn with_override<T>(mode: RepairMode, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<RepairMode>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                REPAIR_OVERRIDE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(REPAIR_OVERRIDE.with(|c| c.replace(Some(mode))));
+        f()
+    }
+}
 
 /// A borrow conflict edge with its owners translated to BO `SlotRef`s. `Field` owners
 /// are dropped in BB0 (Local-only); `issuer` is `None` for a non-`Assign` borrower.
@@ -266,6 +350,16 @@ pub(crate) struct RoundStats {
     /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
     /// `decline_reason`).
     pub field_conflict_decline: Option<SlotRef>,
+    /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
+    /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so the S7
+    /// differential is never mode-ambiguous. Defaults to `ModeA` (= `RepairMode::DEFAULT`).
+    pub repair: RepairMode,
+    /// §NB5-L (Codex MEDIUM) — set when the loop declined because the `Lemmas` round cap was exhausted
+    /// (the controlled backstop for a hypothetical subset-oscillation blowup, which does not manifest
+    /// empirically). A distinct decline KIND: `bo_c1` must tag it before `decline_reason`, which would
+    /// otherwise mislabel this relaxed-SAT decline as `sat-in-replay` and hide the cap exhaustion. Never
+    /// set under `ModeA` (that path panics — its linear bound is proven).
+    pub cap_exhausted: bool,
 }
 
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
@@ -297,6 +391,10 @@ pub(crate) fn verify_to_fixpoint_counting(
         stats.dropped_sources = dropped.len() - stats.dropped_sinks;
     };
     let mut stats = RoundStats::default();
+    // §NB5-L guard 1 — resolve the repair strategy ONCE per invocation into a local; NO mid-loop
+    // re-reads, so the whole fixpoint runs one consistent strategy. Guard 3 stamps it into `stats`.
+    let repair = RepairMode::current();
+    stats.repair = repair;
     let Some((mut model, dropped)) = solver.model_kinds_relaxing_reporting(selectors) else {
         return (None, stats);
     };
@@ -362,12 +460,44 @@ pub(crate) fn verify_to_fixpoint_counting(
             "every residual conflict LOCAL slot must be Ref in the current model (fields decline above)"
         );
         let mut committed = 0;
-        for conflict in conflicts.values().flatten() {
-            if let Some(slot) = representative(conflict, &model) {
-                // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
-                solver.add_borrow_exclusion(Some(slot), &[]);
-                committed += 1;
-                stats.commits_conflict += 1;
+        match repair {
+            // §NB5-L Mode A (shipped through NB5-F2): one monotone `¬ref(representative)` per residual
+            // edge. Iteration order left on FxHash — Mode-A's z3 assertion order (hence its corpus
+            // numbers) stays byte-comparable to every prior row (the S5 asymmetry: sort Lemmas ONLY).
+            RepairMode::ModeA => {
+                for conflict in conflicts.values().flatten() {
+                    if let Some(slot) = representative(conflict, &model) {
+                        // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
+                        solver.add_borrow_exclusion(Some(slot), &[]);
+                        committed += 1;
+                        stats.commits_conflict += 1;
+                    }
+                }
+            }
+            // §NB5-L Lemmas (MVP): one empty-context, A′-restricted disjunctive lemma `⋁¬ref(A′-menu)`
+            // per residual edge. The objective can satisfy it by demoting ANY menu member, which does
+            // NOT beat Mode-A — A′ excludes the only slot whose demotion would help (the issuer), and
+            // the freedom to pick a non-minimal member instead LOSES Ref vs Mode-A's minimal commit on
+            // high-arity edges (≤ / incomparable, not ≥; see the `RepairMode` doc). Rider 3: STABLE-SORT
+            // the edges HERE ONLY (`SlotRef` is not `Ord`, so key explicitly) so the emitted lemma SET
+            // is deterministic BY CONSTRUCTION (Mode-A's assertion order is left untouched).
+            RepairMode::Lemmas => {
+                let mut ordered: Vec<(LocalDefId, &SlotConflict)> = conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
+                    .collect();
+                ordered
+                    .sort_by(|(da, ca), (db, cb)| conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb)));
+                for (_did, conflict) in ordered {
+                    let menu = a_prime_menu(conflict, &model);
+                    if !menu.is_empty() {
+                        // `add_borrow_exclusion(None, &menu)` emits the disjunction `⋁¬ref(menu)` with
+                        // NO antecedent (empty context — the context-conditioned form is NB5-L2).
+                        solver.add_borrow_exclusion(None, &menu);
+                        committed += 1;
+                        stats.commits_conflict += 1;
+                    }
+                }
             }
         }
         stats.commits_per_round.push(committed);
@@ -387,7 +517,29 @@ pub(crate) fn verify_to_fixpoint_counting(
             None => return (None, stats),
         };
     }
-    panic!("BB2-ii CEGAR did not converge within {cap} rounds");
+    // §NB5-L cap exhaustion — behaviour depends on the repair mode's termination guarantee (Codex
+    // HIGH, 2026-07-18). Mode-A has a PROVEN linear bound (each round commits ≥1 fresh slot to a
+    // PERMANENT `¬ref`, so ≤ |slots| rounds); reaching the cap there is a real bug → panic. Lemmas
+    // has NO such bound: its disjunctions are non-monotone, so the Max-Ref optimizer could in
+    // principle walk subsets of a k-requirer edge for up to ~2^k rounds (subset oscillation). That
+    // worst case does NOT manifest under the pinned z3 seed — empirically a 33-requirer edge still
+    // converges in 3 rounds (`nb5l_high_arity_no_panic`) — but it is not PROVEN impossible, so the
+    // cap must be a CONTROLLED backstop, not a crash: return a sound decline (invariant 6 — decline
+    // is always legal; the §8 guardrail keeps it harmless). This is exactly rider-1's "real
+    // backstop": a rounds explosion becomes a decline the sweep surfaces, never a panic.
+    match repair {
+        RepairMode::ModeA => panic!(
+            "Mode-A CEGAR did not converge within {cap} rounds — this violates the proven linear \
+             bound (each round commits ≥1 fresh permanent ¬ref), so it is a genuine analysis bug."
+        ),
+        RepairMode::Lemmas => {
+            // Non-monotone lemma loop hit the cap (subset oscillation): controlled decline, not panic.
+            // Tag the decline KIND so `bo_c1` reports it as cap-exhaustion, not a mislabeled
+            // `sat-in-replay` (Codex MEDIUM).
+            stats.cap_exhausted = true;
+            (None, stats)
+        }
+    }
 }
 
 /// Pick the slot of a residual conflict to commit `¬ref` on (Mode A).
@@ -415,31 +567,99 @@ pub(crate) fn verify_to_fixpoint_counting(
 /// owner is always `Ref` anyway: `borrow_conflicts_replaying`'s inert-ness invariant keeps non-witness
 /// `Raw` locals out of residual edges. The `None` arm is kept defensive (e.g. an empty edge).
 fn representative(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Option<SlotRef> {
+    // §NB5-L: Mode-A's single pick is the FIRST member of the A′ menu (byte-identical refactor —
+    // `find` returned the first satisfying element in both A′ branches, and `a_prime_menu`'s
+    // order-preserving de-dup never changes the first element).
+    a_prime_menu(conflict, model).into_iter().next()
+}
+
+/// §NB5-L — the A′-restricted commit menu as a **set** (the `Lemmas` disjunction `⋁¬ref(menu)`
+/// ranges over exactly this). Same A′ discipline as `representative` (which is its first element):
+/// a live `Ref` requirer BEYOND the issuer must carry the discharge, so if any exist the menu is
+/// **exactly those requirers — the issuer is NOT offered** (rider 2: the disjunction's soundness
+/// invariant; offering the issuer would let the solver discharge by demoting it while a live `Ref`
+/// requirer keeps aliasing the written cell, the S2-6 hole). Otherwise (self-edges, issuer-only
+/// edges) the menu is the `Ref` owners, issuer first. Order-preserving de-dup keeps the emitted
+/// clause (and the reported lemma set) minimal. Empty iff no owner is currently `Ref` — which the
+/// `residual_nonref_field` decline + `guard_slots_are_ref` assert rule out on the live path.
+fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Vec<SlotRef> {
     let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
-    // A′: a live `Ref` requirer BEYOND the issuer must carry the discharge.
-    if let Some(r) = conflict
+    let beyond: Vec<SlotRef> = conflict
         .requirers
         .iter()
         .copied()
-        .find(|r| Some(*r) != conflict.issuer && is_ref(r))
-    {
-        return Some(r);
+        .filter(|r| Some(*r) != conflict.issuer && is_ref(r))
+        .collect();
+    let mut menu = if beyond.is_empty() {
+        conflict
+            .issuer
+            .into_iter()
+            .chain(conflict.requirers.iter().copied())
+            .filter(is_ref)
+            .collect()
+    } else {
+        beyond
+    };
+    let mut seen = FxHashSet::default();
+    menu.retain(|s| seen.insert(*s));
+    menu
+}
+
+/// §NB5-L rider 3 — a stable total-order key for a `SlotRef` (`SlotRef: !Ord`, because `LocalDefId`
+/// is not; `SlotId` IS orderable). Variant tag orders `Field < Local`; within each, by the
+/// underlying id(s). Used ONLY to canonicalize the `Lemmas` emission order (Mode-A stays on FxHash).
+fn slotref_key(s: &SlotRef) -> (u8, u32, usize) {
+    match s {
+        SlotRef::Field(sid) => (0, 0, sid.index()),
+        SlotRef::Local(did, sid) => (1, did.local_def_index.as_u32(), sid.index()),
     }
-    // No requirer beyond the issuer ⇒ the pre-A′ menu (issuer first, then requirers).
-    conflict
-        .issuer
-        .into_iter()
-        .chain(conflict.requirers.iter().copied())
-        .find(is_ref)
+}
+
+/// Stable sort key for a residual conflict edge: (owning fn, issuer, requirers). Deterministic by
+/// construction across runs, so the emitted LEMMA SET is comparable row-to-row without resting on
+/// the FxHash iteration argument.
+fn conflict_sort_key(
+    did: LocalDefId,
+    c: &SlotConflict,
+) -> (u32, (u8, u32, usize), Vec<(u8, u32, usize)>) {
+    (
+        did.local_def_index.as_u32(),
+        c.issuer.as_ref().map_or((2, 0, 0), slotref_key),
+        c.requirers.iter().map(slotref_key).collect(),
+    )
+}
+
+thread_local! {
+    /// §NB5-L (Codex MEDIUM) — test-only round-cap override so a test can FORCE cap exhaustion
+    /// (the oscillation blowup does not manifest naturally). `None` ⇒ the real `n + 8` bound.
+    static CAP_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Generous round-cap backstop for `verify_to_fixpoint`. The real bound is ≤ |slots|
 /// (each round commits a fresh slot off `Ref`); `n + slack` covers it with margin. Not
-/// the termination guarantee — only a panic tripwire if the monotone bound is wrong.
+/// the termination guarantee — only a panic tripwire (Mode-A) / decline backstop (Lemmas). A
+/// test-only `CAP_OVERRIDE` can lower it to exercise the cap branches.
 fn round_cap(slots: &CrateSlots) -> usize {
+    if let Some(c) = CAP_OVERRIDE.with(|c| c.get()) {
+        return c;
+    }
     let n: usize = slots.field_slots.len()
         + slots.fn_local_slots.values().map(|u| u.len()).sum::<usize>();
     n + 8
+}
+
+/// §NB5-L (Codex MEDIUM) — run `f` with the round cap forced to `cap` on this thread (test-only;
+/// panic-safe drop-guard, like `RepairMode::with_override`).
+#[cfg(test)]
+pub(crate) fn with_cap_override<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAP_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CAP_OVERRIDE.with(|c| c.replace(Some(cap))));
+    f()
 }
 
 /// §NB5-F — the first `SlotRef::Field` in a residual conflict the model left non-`Ref` (a field
@@ -504,5 +724,60 @@ fn owner_to_slot(slots: &CrateSlots, fn_did: LocalDefId, owner: ProvenanceOwner)
             let slot_id = slots.field_slots.slot_for_field_depth(field, 0)?;
             Some(SlotRef::Field(slot_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod nb5l_a_prime_menu_tests {
+    //! §NB5-L (a′) — the A′-menu-restriction invariant (rider 2), tested directly on the private
+    //! `a_prime_menu` with hand-built `SlotConflict`s + models. Owner-agnostic logic, so `Field`
+    //! slots (trivially constructible from a `usize`) exercise it without a compiler run.
+    use super::*;
+
+    fn field(n: usize) -> SlotRef {
+        SlotRef::Field(SlotId::from_usize(n))
+    }
+
+    fn model(pairs: &[(SlotRef, SlotKind)]) -> FxHashMap<SlotRef, SlotKind> {
+        pairs.iter().copied().collect()
+    }
+
+    /// The disjunction's soundness invariant: when a live `Ref` requirer exists BEYOND the issuer,
+    /// the A′ menu is EXACTLY those requirers — the issuer is NOT offered, even though it is `Ref`
+    /// and in the naive issuer∪requirers menu. (Offering it would let the solver discharge by
+    /// demoting the issuer while a live `Ref` requirer keeps aliasing the written cell — the S2-6
+    /// hole the lemma must not permit.)
+    #[test]
+    fn a_prime_menu_excludes_issuer_when_live_requirer() {
+        let (i, r1, r2) = (field(0), field(1), field(2));
+        let conflict = SlotConflict { issuer: Some(i), requirers: vec![r1, r2] };
+        let m = model(&[(i, SlotKind::Ref), (r1, SlotKind::Ref), (r2, SlotKind::Ref)]);
+        let menu = a_prime_menu(&conflict, &m);
+        assert!(!menu.contains(&i), "A′ must NOT offer the issuer when a live Ref requirer exists");
+        assert_eq!(menu, vec![r1, r2], "menu = exactly the Ref requirers beyond the issuer");
+        // Mode-A's single pick is the menu's first element (the byte-identical refactor).
+        assert_eq!(representative(&conflict, &m), Some(r1));
+    }
+
+    /// Else-branch: no requirer beyond the issuer ⇒ the issuer IS the menu (self / issuer-only
+    /// edges keep the pre-A′ behavior — A′ only RESTRICTS, it never empties a real edge).
+    #[test]
+    fn a_prime_menu_offers_issuer_when_no_requirer_beyond() {
+        let i = field(0);
+        let conflict = SlotConflict { issuer: Some(i), requirers: vec![i] };
+        let m = model(&[(i, SlotKind::Ref)]);
+        let menu = a_prime_menu(&conflict, &m);
+        assert_eq!(menu, vec![i], "issuer offered (order-preserving de-dup) when no requirer beyond");
+        assert_eq!(representative(&conflict, &m), Some(i));
+    }
+
+    /// A non-`Ref` requirer beyond the issuer is not a LIVE requirer, so it does not trip the A′
+    /// "if" branch — the menu falls back to the `Ref` owners (here the issuer).
+    #[test]
+    fn a_prime_menu_ignores_non_ref_requirer() {
+        let (i, r) = (field(0), field(1));
+        let conflict = SlotConflict { issuer: Some(i), requirers: vec![r] };
+        let m = model(&[(i, SlotKind::Ref), (r, SlotKind::Raw)]);
+        assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
     }
 }
