@@ -11229,6 +11229,41 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB4-4c-Q (Codex confirming pass, 2026-07-17): PIN the restored-output-param OUTCOME directly on
+    /// `compute_origins` — the collector-output test (`overincl` 0/0) alone does not prove it. Records
+    /// only the OBSERVED signature-level fact: the restore-after-opaque shape yields exactly one unknown
+    /// slot and ZERO summary subset edges, so neither over-inclusion predicate can see it. The MECHANISM
+    /// is deliberately NOT claimed: the earlier "poisoning drops the value-restore edge" explanation was
+    /// refuted (`mark_unknown` only sets a bit; the store IS recorded), and a body-level
+    /// `arg1@1 → old → arg1@1` path exists whose signature projection threads the internal local `old`.
+    /// The precise reason the SIGNATURE summary carries no self-loop is untraced and belongs to item-4
+    /// (the flow-sensitive analysis that will size this component-2 residual). This test guards the
+    /// outcome the gate relies on (both predicates miss ⇒ summary-invisible-at-signature-level).
+    #[test]
+    fn nb4_4c_q_restored_summary_invisible() {
+        run_compiler(
+            "unsafe extern \"C\" { fn op() -> *mut i32; } \
+             unsafe fn f(out: *mut *mut i32) { let old = *out; *out = op(); *out = old; }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let origins = compute_origins(&program);
+                let f = function_by_name(&program, "f");
+                let sum = &origins[&f];
+                assert_eq!(sum.unknown.count(), 1, "restored: exactly one unknown signature slot");
+                let edges: usize = sum
+                    .subset
+                    .rows()
+                    .map(|r| sum.subset.row(r).map_or(0, |b| b.iter().count()))
+                    .sum();
+                assert_eq!(
+                    edges, 0,
+                    "restored: ZERO summary subset edges — both over-inclusion predicates miss it \
+                     (the summary-invisible OUTCOME; mechanism untraced, item-4's to pin)"
+                );
+            },
+        );
+    }
+
     /// §NB4-4c-Q RED (item-4 sizing gate, 2026-07-17): the coherence-collateral measurement, validated
     /// against the INDEPENDENT multi-agent derivation (user ruling 2026-07-17). Exercises the EXACT
     /// harness code (`bo_c1::measure_collateral`) the corpus sweep runs.
@@ -11318,17 +11353,17 @@ unsafe fn f(mut p: *mut i32) -> i32 {
             cx.overincl_upper >= 1,
             "counterexample: UPPER bound DOES catch it (any incoming edge, self/symmetric-inclusive)"
         );
-        // RESTORED-OUTPUT-PARAM (Codex F1, 2026-07-17 — SUMMARY-INVISIBLE residual): `*out` is restored
-        // to its original value after an opaque overwrite. Codex predicted the recovered origin survives
-        // as a self-loop; the DUMP shows otherwise for this engine — `*out = op()` POISONS `arg1@1`, and
-        // the value store `*out = old` into a poisoned pointee is DROPPED, so the summary has NO edge at
-        // all (unknown={arg1@1}, subset=∅). Neither the mitigated NOR the self-inclusive upper predicate
-        // can see it (both 0) — it is a flow-sensitive DEFINITE-OVERWRITE recovery that only item-4 can
-        // size. (Contrast the storage counterexample above: an ADDRESS alias survives poisoning, so
-        // `upper` DOES catch that one — the difference between a value restore and an address alias.)
-        // This fixture PINS the summary-level measurement's floor: the gate's `collateral_upper` sizes
-        // the summary-VISIBLE collateral; this component-2 residual is a documented, rare (COMPLETENESS)
-        // limitation carried to item-4.
+        // RESTORED-OUTPUT-PARAM (Codex F1 + confirming pass, 2026-07-17 — component-2 residual): `*out`
+        // is restored to its original value after an opaque overwrite. OBSERVED signature-level outcome
+        // (pinned by `nb4_4c_q_restored_summary_invisible`): exactly one unknown slot and ZERO summary
+        // subset edges, so NEITHER the mitigated NOR the upper predicate sees it (both 0). The MECHANISM
+        // is NOT claimed — the earlier "poisoning drops the store" explanation was REFUTED (`mark_unknown`
+        // only sets a bit; the store is recorded); the reason the `arg1@1→old→arg1@1` body path leaves no
+        // SIGNATURE self-loop is untraced and belongs to item-4. (Contrast the storage counterexample
+        // above: an ADDRESS alias survives to `to_summary`, so `upper` DOES catch that — value-restore
+        // vs address-alias.) The gate's `collateral_upper` sizes only the summary-VISIBLE collateral;
+        // this component-2 case is UNMEASURED at the summary level (COMPLETENESS — test-only, unconsumed,
+        // conservative Ref→Raw; NOT asserted empirically rare) and carried to item-4's RED scope.
         let restored = measure(
             "unsafe extern \"C\" { fn op() -> *mut i32; } \
              unsafe fn f(out: *mut *mut i32) { let old = *out; *out = op(); *out = old; }",
