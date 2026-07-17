@@ -752,6 +752,9 @@ mod run {
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
 
+        // §NB5-L guard 3 — mode-stamp the sweep row with the repair strategy that produced it, so the
+        // S7 both-mode differential is never mode-ambiguous in the log.
+        row.set("repair", rstats.repair.label());
         row.set("rounds", rstats.rounds);
         row.set("commits_conflict", rstats.commits_conflict);
         row.set(
@@ -795,7 +798,12 @@ mod run {
                 // `sat-in-replay`. Intercept it from the native stats FIRST, tag it distinctly, and
                 // attribute it to the offending field for the sweep's per-program accounting (rider 1).
                 // Only genuine UNSAT-family declines fall through to `decline_reason` + the explain path.
-                if let Some(field_slot) = rstats.field_conflict_decline {
+                // §NB5-L (Codex MEDIUM): a `Lemmas` cap-exhaustion decline is a relaxed-SAT model that
+                // hit the round cap — NOT an UNSAT. Intercept it FIRST so `decline_reason` (a
+                // selector-core replay) does not mislabel it `sat-in-replay` and hide the cap exhaustion.
+                if rstats.cap_exhausted {
+                    row.set("decline_reason", "cap-exhausted");
+                } else if let Some(field_slot) = rstats.field_conflict_decline {
                     row.set("decline_reason", "field-conflict");
                     if let SlotRef::Field(id) = field_slot
                         && let SlotOwner::Field(f) = slots.field_slots.slot(id).owner
@@ -810,9 +818,11 @@ mod run {
                 }
                 // §NB-R (opt-in): explain the decline via a second, TRACKED
                 // construction — labeled minimal core (or family histogram at
-                // scale). Never on the default path: doubles solve cost. §NB5-F: skip for
-                // field-conflict declines (they are SAT, so the tracked replay would not be UNSAT).
+                // scale). Never on the default path: doubles solve cost. §NB5-F/L: skip for
+                // field-conflict and cap-exhaustion declines (both are SAT, so the tracked replay
+                // would not be UNSAT).
                 if rstats.field_conflict_decline.is_none()
+                    && !rstats.cap_exhausted
                     && std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
                     let t = Instant::now();
                     match super::explain::explain_unsat(tcx) {
@@ -2296,4 +2306,289 @@ fn render_report(merged: &[report::Row]) -> String {
     );
     out.push_str(&report::render_markdown(merged, &cols));
     out
+}
+
+/// §NB5-L — the empty-context disjunctive lemma vs Mode-A, per-slot (first-touch dump 2026-07-18; the
+/// original "≡ Mode-A" claim was an AGGREGATE-COUNT claim, REFUTED by this per-slot check — Codex-
+/// demanded). **This is an EMPIRICAL observation on these fixtures + the pinned seed, NOT a universal
+/// law** (Codex re-review): the loop is NON-CONFLUENT, so the two models are **incomparable in
+/// general** — there is no proof `Ref(lemmas) ⊆ Ref(mode_a)` always holds. What IS established: on the
+/// fixtures below the inclusion holds, and on a 33-requirer fan-out it is STRICT — Lemmas loses ≥1 Ref
+/// by demoting a NON-MINIMAL menu member (`nb5l_high_arity_lemmas_converges_no_panic`), the hazard
+/// `verify_to_fixpoint`'s doc names ("Mode A = monotone single-slot commitment, deliberately NOT
+/// disjunctive"). So the disjunction has no established upside and a demonstrated downside — the
+/// disjunction axis is DEAD; the positive win, if any, is NB5-L2's orthogonal context axis
+/// (context-conditioned SINGLE-LITERAL commits, hazard-free), gated behind the commit-necessity audit.
+/// Non-vacuity: at least one shape emits a genuine ≥2-literal A′ menu (distinct requirers ≠ issuer), so
+/// the disjunction path is actually exercised (not a trivial singleton ≡ Mode-A).
+#[cfg(test)]
+#[test]
+fn nb5l_lemma_ref_subset_mode_a_on_fixtures() {
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, SlotKind,
+        borrow_verify::{RepairMode, revalidate, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::{KindSolver, SlotRef},
+    };
+    struct Outcome {
+        model: FxHashMap<SlotRef, SlotKind>,
+    }
+    // Returns (mode_a, lemmas, max_a_prime_menu_len) for `code`. The menu-len witness mirrors
+    // `a_prime_menu` at the round-0 all-Ref model: the count of DISTINCT requirers r with r ≠ issuer
+    // (the Lemmas disjunction's ACTUAL literal set). NOT raw `requirers.len()` — that counts the
+    // issuer as a self-requirer and any duplicate owners, over-reporting arity so the non-vacuity
+    // guard could pass on singleton menus (Codex MEDIUM 2026-07-18).
+    fn run(code: &str) -> (Outcome, Outcome, usize) {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let max_menu = revalidate(&program, &slots, |_s: SlotRef| true, true)
+                .values()
+                .flatten()
+                .map(|e| {
+                    let mut seen = FxHashSet::default();
+                    e.requirers
+                        .iter()
+                        .filter(|r| Some(**r) != e.issuer)
+                        .filter(|r| seen.insert(**r))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            let solve = |mode: RepairMode| {
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_s, sel) = emit_crate_ownership_constraints(
+                    &crate_ctxt,
+                    &slots,
+                    &compute_origins(&program),
+                    &solver,
+                )
+                .expect("emit");
+                for &g in &program.functions {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                    add_coherence(&solver, &slots, g, &body);
+                }
+                let (model, stats) = RepairMode::with_override(mode, || {
+                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+                });
+                assert_eq!(stats.repair, mode, "mode-stamp (guard 3) must record the active repair");
+                Outcome { model: model.expect("fixture must accept under both modes") }
+            };
+            (solve(RepairMode::ModeA), solve(RepairMode::Lemmas), max_menu)
+        })
+        .unwrap_or_else(|e| e.raise())
+    }
+    // Shapes: a single-requirer cascade plus three that produce genuine ≥2-requirer edges (a shared
+    // reborrow aliased by several interproc copies, all live at one invalidating write).
+    let shapes: [(&str, &str); 4] = [
+        (
+            "single_req_cascade",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }",
+        ),
+        (
+            "two_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let base = id(p); let a = id(base); let b = id(base); \
+             let w = p; *w = 9; *a + *b }",
+        ),
+        (
+            "three_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let bb = p; let x = id(p); let z = id(x); let q = id(x); \
+             *bb = 5; *x + *z + *q }",
+        ),
+        (
+            "asymmetric",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let a = id(p); let b = id(p); let d = id(b); \
+             *a = 1; *b = 2; *d = 3; let w = p; *w = 4; *a + *b + *d }",
+        ),
+    ];
+    let ref_of = |m: &FxHashMap<SlotRef, SlotKind>| -> FxHashSet<SlotRef> {
+        m.iter().filter(|(_, k)| **k == SlotKind::Ref).map(|(s, _)| *s).collect()
+    };
+    let mut max_menu_seen = 0usize;
+    for (tag, code) in shapes {
+        let (a, l, max_menu) = run(code);
+        // EMPIRICAL per-slot relation on these fixtures (per-slot — the granularity Codex demanded;
+        // aggregate counts hid the high-arity divergence). Lemmas' Ref-set ⊆ Mode-A's here: the
+        // disjunction keeps no MORE Ref than Mode-A's minimal unit commit and CAN keep fewer (the
+        // high-arity witness). This inclusion is an OBSERVATION on these fixtures + the pinned seed,
+        // NOT a universal law — the loop is non-confluent, so the models are incomparable in general.
+        assert!(
+            ref_of(&l.model).is_subset(&ref_of(&a.model)),
+            "{tag}: on this fixture Lemmas Ref-set should be ⊆ Mode-A's; a Lemmas-only Ref would mean \
+             the modes are incomparable here (still not a regression-in-our-favor — see the row doc)"
+        );
+        // NOTE: no path-cost assertion. `commits`/`rounds` are NOT ordered between the modes in general
+        // (non-confluence — Lemmas could converge in fewer or more rounds on a given program); asserting
+        // `≥` would be an unsupported dominance claim (Codex). The counts are reported by the sweep.
+        max_menu_seen = max_menu_seen.max(max_menu);
+    }
+    // Non-vacuity: at least one shape must emit a genuine ≥2-literal A′ menu (≥2 DISTINCT requirers
+    // ≠ issuer). Without this the equality could hold trivially because every emitted lemma is a
+    // singleton ≡ Mode-A, leaving the disjunction path — the whole point of the row — untested.
+    assert!(
+        max_menu_seen >= 2,
+        "non-vacuity: no shape emitted a ≥2-literal A′ menu (max distinct requirers≠issuer = {max_menu_seen}); \
+         the disjunction path is untested"
+    );
+}
+
+/// §NB5-L high-arity regression (Codex HIGH, 2026-07-18). One loan required by a large fan-out of
+/// live requirers is the shape whose disjunction could, in the abstract, drive subset oscillation up
+/// to ~2^k rounds against the linear cap. This test pins the EMPIRICAL reality under the NB5-Z seed:
+/// even a 33-distinct-requirer edge **converges in a handful of rounds under Lemmas and never panics**
+/// — the 2^k worst case does not manifest. It is also the **≤-regression witness**: here `Ref(lemmas)`
+/// is a STRICT subset of `Ref(mode_a)` (Lemmas loses ≥1 Ref to non-minimal demotion), so the modes do
+/// NOT match per-slot. The cap-exhaustion path is a CONTROLLED decline (not a panic) for Lemmas
+/// regardless (see `verify_to_fixpoint_counting` + `nb5l_cap_exhaustion_declines_not_panics`), so even
+/// if a future solver/seed did oscillate, the outcome is a sound decline, never a crash.
+#[test]
+fn nb5l_high_arity_lemmas_converges_no_panic() {
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt, SlotKind,
+        borrow_verify::{RepairMode, revalidate, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::{KindSolver, SlotRef},
+    };
+    let n = 32usize; // 32 aliases + x ⇒ a 33-distinct-requirer single-loan edge.
+    let aliases: String =
+        (0..n).map(|i| format!("let a{i} = id(x);")).collect::<Vec<_>>().join(" ");
+    let uses: String = (0..n).map(|i| format!("*a{i}")).collect::<Vec<_>>().join(" + ");
+    let code = format!(
+        "unsafe fn id(p: *mut i32) -> *mut i32 {{ p }} \
+         unsafe fn f(p: *mut i32) -> i32 {{ let bb = p; let x = id(p); {aliases} *bb = 5; {uses} + *x }}"
+    );
+    ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        // Confirm the shape actually has the high-arity edge (else the regression is vacuous).
+        let max_menu = revalidate(&program, &slots, |_s: SlotRef| true, true)
+            .values()
+            .flatten()
+            .map(|e| e.requirers.iter().filter(|r| Some(**r) != e.issuer).count())
+            .max()
+            .unwrap_or(0);
+        assert!(max_menu >= 16, "regression must build a high-arity edge; got menu {max_menu}");
+        let run = |mode: RepairMode| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emit");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            RepairMode::with_override(mode, || {
+                verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+            })
+        };
+        let (am, ast) = run(RepairMode::ModeA);
+        let (lm, lst) = run(RepairMode::Lemmas);
+        // No panic (we reached here). Lemmas converges (accepts) — the 2^k oscillation worst case does
+        // NOT fire under the pinned seed.
+        let am = am.expect("Mode-A must accept the high-arity fan-out");
+        let lm = lm.expect("Lemmas must converge (accept), not oscillate to the cap, on high arity");
+        assert!(
+            lst.rounds <= ast.rounds + 4,
+            "high-arity: Lemmas rounds ({}) must stay near Mode-A ({}) — no subset-oscillation blowup",
+            lst.rounds, ast.rounds
+        );
+        // THE HAZARD WITNESS (Codex HIGH follow-through). ≤ law: Lemmas' Ref-set ⊆ Mode-A's. And here
+        // the inclusion is STRICT — Lemmas demotes ≥1 slot Mode-A keeps Ref (non-minimal demotion), so
+        // `n_ref(lemmas) < n_ref(mode_a)`. This fixture is the shipped regression witness that the
+        // empty-context disjunction is ≤ Mode-A, NOT ≡, and that the loss is real (not just theoretical).
+        let ref_of = |m: &FxHashMap<SlotRef, SlotKind>| -> FxHashSet<SlotRef> {
+            m.iter().filter(|(_, k)| **k == SlotKind::Ref).map(|(s, _)| *s).collect()
+        };
+        let (ra, rl) = (ref_of(&am), ref_of(&lm));
+        assert!(rl.is_subset(&ra), "high-arity: Lemmas Ref-set must be ⊆ Mode-A's (the ≤ law)");
+        assert!(
+            rl.len() < ra.len(),
+            "high-arity: expected Lemmas to lose ≥1 Ref via non-minimal demotion (the regression \
+             witness); Mode-A Ref={}, Lemmas Ref={}",
+            ra.len(), rl.len()
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// §NB5-L (Codex MEDIUM) — the cap backstop is repair-mode-dependent: `Lemmas` returns a CONTROLLED
+/// decline tagged `cap_exhausted` (the oscillation blowup does not manifest, but Lemmas has no proven
+/// linear bound), while `ModeA` PANICS (its linear bound is proven, so a cap hit is a genuine bug).
+/// The natural oscillation never reaches the cap, so this forces it with a test-only cap override.
+#[test]
+fn nb5l_cap_exhaustion_declines_not_panics() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{RepairMode, verify_to_fixpoint_counting, with_cap_override},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    // An alias cascade that genuinely needs >1 CEGAR round (so cap=1 exhausts).
+    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let solve = |mode: RepairMode, cap: usize| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emit");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            with_cap_override(cap, || {
+                RepairMode::with_override(mode, || {
+                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+                })
+            })
+        };
+        // Sanity: the fixture needs >1 round, else cap=1 would not exhaust.
+        let (_m, natural) = solve(RepairMode::ModeA, 999);
+        assert!(natural.rounds > 1, "fixture must need >1 round (got {})", natural.rounds);
+        // Lemmas at cap=1 ⇒ controlled decline, tagged cap_exhausted (NOT a panic, NOT mislabeled).
+        let (model, stats) = solve(RepairMode::Lemmas, 1);
+        assert!(
+            model.is_none() && stats.cap_exhausted,
+            "Lemmas cap-exhaustion must be a tagged decline (model={:?}, cap_exhausted={})",
+            model.is_some(), stats.cap_exhausted
+        );
+        // Mode-A at cap=1 ⇒ PANIC (proven linear bound; a hit is a real bug). Drop-guards restore the
+        // cap/mode on unwind, so this does not leak state into later tests.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solve(RepairMode::ModeA, 1)
+        }))
+        .is_err();
+        assert!(panicked, "Mode-A cap-exhaustion must PANIC (its linear bound is proven)");
+    })
+    .unwrap_or_else(|e| e.raise())
 }
