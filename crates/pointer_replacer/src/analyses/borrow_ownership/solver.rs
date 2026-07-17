@@ -412,6 +412,24 @@ impl KindSolver {
         );
     }
 
+    /// §S2-3 DIAGNOSTIC PROBE (compute-only, no production caller). FORCE a slot `Owning` and let the
+    /// caller `check()`: SAT ⇒ `own(slot)` is achievable under the hard constraints, so a zero yield in
+    /// the optimized model is a SOFT (objective/retention) blocker, not a mechanism gap; UNSAT (best via
+    /// `new_tracked`) ⇒ a hard constraint family forbids it and the core names it. Symmetric to
+    /// `add_owning_exclusion`. Kept warm by `s23_owning_blocker_probe`.
+    pub(crate) fn assert_owning(&self, slot: SlotRef) {
+        let vars = self
+            .vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("s23-force-own({slot:?})"),
+            &vars.own,
+        );
+    }
+
     pub fn check(&self) -> SatResult {
         // §NB-R guard: a no-assumption check on a tracked solver is vacuously
         // SAT (all hard constraints are track-gated) — refuse, like the other
