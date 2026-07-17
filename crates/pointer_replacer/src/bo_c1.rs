@@ -632,20 +632,10 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
 
-        // §NB5-Z (2026-07-17): pin z3's random seeds GLOBALLY — for EVERY BO sweep run, not just the
-        // collateral mode (NB4-4c-Q had this `CRAT_BOC1_COLLATERAL`-gated). This MUST run before the
-        // first z3 context is built: z3 0.19's `Context` is a per-thread `thread_local!` created once as
-        // `Context::new(&Config::new())` and reused, and `set_global_param` only feeds a context created
-        // AFTER it fires. So the pin belongs at the fresh worker-process entry (here, top of `run_bo`,
-        // before any z3 op) — NOT in the solver: `solver.rs:146`'s `Optimize::new` runs only after the
-        // ownership analysis and BO SSA have already built this thread's context, where the pin would be
-        // a no-op. Each corpus program is a FRESH `boc1_run_one` process, so this bites per program.
-        // Expected behavior-neutral (z3's default seed is already 0); the pin's value is the explicit
-        // cross-VERSION contract, held with the `z3_full_version` stamp below — any tie-break drift is
-        // recorded at the NB5-Z re-baseline. In-process test determinism is inherent (one shared
-        // thread-local context) and needs no pin — see `nb5z_solve_run_to_run_deterministic`.
-        z3::set_global_param("smt.random_seed", "0");
-        z3::set_global_param("sat.random_seed", "0");
+        // §NB5-Z (2026-07-17): stamp the z3 library version on every BO row — provenance for the seed
+        // pin. The PIN itself lives at the ignored `boc1_run_one` worker entry (see there for why it
+        // must NOT live here or in the solver — both are reached by the parallel suite). Unconditional
+        // now (was `CRAT_BOC1_COLLATERAL`-gated in NB4-4c-Q).
         row.set("z3_full_version", z3::full_version().to_string());
 
         let program = collect_program(tcx);
@@ -1882,6 +1872,23 @@ fn boc1_run_one() {
     };
     let mode = std::env::var("CRAT_BOC1_MODE").unwrap_or_else(|_| "bo".to_string());
     let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+
+    // §NB5-Z (2026-07-17): pin z3's random seeds for the BO sweep — HERE, at the ignored per-program
+    // worker entry, before ANY z3 op in this fresh process. z3 0.19's `Context` is a per-thread
+    // `thread_local!` built once as `Context::new(&Config::new())` and reused; `set_global_param` only
+    // feeds a context created AFTER it fires, so the pin must precede this process's first z3 touch.
+    // This is the ONLY correct site: `run_bo` and `solver.rs` are both reached by NON-ignored suite
+    // tests (e.g. `origins_runs_once_per_program` calls `run_bo` directly), so pinning there would leak
+    // this PROCESS-GLOBAL param into the PARALLEL test runner (Codex NB5-Z finding). `boc1_run_one` is
+    // `#[ignore]` and spawned one-per-program as a fresh single-threaded process, so the pin fires once
+    // per program and never under the parallel suite. Gated to `bo` mode — NB5-Z's scope is BO
+    // determinism; `prod` is the frozen production reference, left untouched. Expected behavior-neutral
+    // (z3's default seed is already 0 — the NB5-Z re-baseline is byte-identical on both profiles); its
+    // value is the explicit cross-VERSION contract, recorded as the `z3_full_version` stamp on each BO row.
+    if mode == "bo" {
+        z3::set_global_param("smt.random_seed", "0");
+        z3::set_global_param("sat.random_seed", "0");
+    }
 
     let t0 = Instant::now();
     let result = ::utils::compilation::run_compiler_on_path(Path::new(&input), |tcx| {
