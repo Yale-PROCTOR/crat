@@ -1435,6 +1435,82 @@ fn nb5f2_field_conflict_restores() {
     );
 }
 
+/// §S2-3 DIAGNOSTIC PROBE (NB5-F2 carried item 2; compute-only, no fixes). The corpus histogram shows
+/// 155 owning-store field CANDIDATES but 0 field-`Owning` in-model, with `s23_blocked == 0` everywhere —
+/// so the ⋀-law store-block (family (a)) is ruled out. This probe answers the remaining question on an
+/// owning-CAPABLE field (malloc store + `free` sink, the corpus candidate pattern): is `own(field)`
+/// **achievable** (SAT ⇒ the zero yield is a SOFT objective/retention blocker — `Ref ≻ Raw ≻ Owning` +
+/// leak-minimal drops the source/sink rather than paying `Owning`), or **hard-blocked** (UNSAT ⇒ a
+/// constraint family forbids it)? Reports the verdict; not a fix.
+#[test]
+#[ignore = "S2-3 diagnostic probe (compute-only); run explicitly"]
+fn s23_owning_blocker_probe() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        coherence::{add_coherence, constrain_field_ownership},
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        slots::{SlotId, SlotOwner},
+        solver::{KindSolver, SlotRef},
+    };
+    use z3::{SatResult, ast::Bool};
+    ::utils::compilation::run_compiler_on_str(
+        "unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); } \
+         struct H { p: *mut i32 } \
+         unsafe fn f() { let mut h = H { p: core::ptr::null_mut() }; \
+         h.p = malloc(4) as *mut i32; free(h.p as *mut core::ffi::c_void); }",
+        |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
+            // TRACKED solver so an UNSAT core maps to labeled constraint families (per `explain_unsat`).
+            let solver = KindSolver::new_tracked(&slots);
+            let (_s, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt, &slots, &compute_origins(&program), &solver,
+            ).expect("emission");
+            let tracker = solver.tracker().expect("new_tracked");
+            tracker.set_context("coherence");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            tracker.set_context("field-law");
+            constrain_field_ownership(&solver, &slots, &program);
+            let field = (0..slots.field_slots.len())
+                .map(SlotId::from_usize)
+                .find(|&sid| {
+                    slots.field_slots.slot(sid).depth == 0
+                        && matches!(slots.field_slots.slot(sid).owner, SlotOwner::Field(_))
+                })
+                .map(SlotRef::Field)
+                .expect("H::p depth-0 field slot");
+            tracker.set_context("s23-force-own");
+            solver.assert_owning(field);
+            // Assume every track (⇔ the untracked hard system) + all source/sink selectors retained.
+            let mut assumptions: Vec<Bool> = tracker.tracks();
+            assumptions.extend(selectors.all().iter().cloned());
+            match solver.optimize().check(&assumptions) {
+                SatResult::Sat => eprintln!("S23_PROBE field={field:?} force_own=SAT (SOFT blocker: own achievable, objective/retention settles it lower)"),
+                SatResult::Unknown => eprintln!("S23_PROBE field={field:?} force_own=UNKNOWN"),
+                SatResult::Unsat => {
+                    let core = solver.optimize().get_unsat_core();
+                    let labels: Vec<String> = core.iter().map(|l| {
+                        tracker.label_of(l).unwrap_or_else(|| {
+                            if selectors.is_sink(l) { "sink-selector".to_string() }
+                            else { "source-selector".to_string() }
+                        })
+                    }).collect();
+                    eprintln!(
+                        "S23_PROBE field={field:?} force_own=UNSAT (HARD blocker) core_labels={labels:?}"
+                    );
+                }
+            }
+        },
+    )
+    .unwrap_or_else(|e| e.raise());
+}
+
 /// §NB-F stage 1 (option (a), approved at the NB-R gate) — the CAUSAL flip:
 /// with `free`/`realloc` sink owning selector-gated, the deleteNode witness
 /// must ACCEPT under the REAL `verify_to_fixpoint` — the relax loop drops the
