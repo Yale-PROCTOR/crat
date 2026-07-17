@@ -441,7 +441,7 @@ mod run {
             return build("no-oi", None, None, 0, 0, 0, 0);
         }
         // Real FULL solve — for the like-with-like delta AND the anchor (both solves are REAL, so the
-        // collateral is not confounded by a mirror-vs-real difference; F2b anchors real FULL to mirror).
+        // collateral is not confounded by an impl difference; F2b anchors real FULL to run_bo's model).
         let Some(full_model) = solve_with_demotion(program, slots, &full_vec, mut_facts) else {
             return build("real-decline", None, None, 0, 0, 0, 0);
         };
@@ -475,9 +475,9 @@ mod run {
         )
     }
 
-    /// BO mode: the exact `assert_ownership_parity` construction, with the
-    /// mirrored fixpoint loop for round/commit counts, per-phase timings, and
-    /// the model readout (kind tallies + leaked sources).
+    /// BO mode: the exact `assert_ownership_parity` construction, with the native fixpoint loop's
+    /// round/commit counts (`verify_to_fixpoint_counting`), per-phase timings, and the model readout
+    /// (kind tallies + leaked sources).
     pub fn run_bo(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         let t0 = Instant::now();
         let mut row = Row::default();
@@ -911,16 +911,16 @@ mod run {
             let real = {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                // §NB4-4c F3: CHECK_REAL reuses run_bo's `origins` — the SAME demotion seed as the
-                // mirrored solve, so the fidelity cross-check compares identical clause sets.
+                // §NB4-4c F3: CHECK_REAL reuses run_bo's `origins` — the SAME demotion seed as run_bo's
+                // native solve, so the fidelity cross-check compares identical clause sets.
                 match emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver) {
                     Ok((_s, selectors)) => {
                         for &g in &program.functions {
                             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                             add_coherence(&solver, &slots, g, &body);
                         }
-                        // §NB2: same oracle as the mirror above, so the fidelity check
-                        // compares like with like (mirror facts vs real facts).
+                        // §NB2: same oracle as run_bo's native solve above, so the fidelity check
+                        // compares like with like (shipped facts vs a fresh real solve).
                         Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts))
                     }
                     Err(_) => None,
@@ -935,7 +935,7 @@ mod run {
                         if real.is_some() { "ok" } else { "decline" },
                     );
                     row.set(
-                        "mirror_matches_real",
+                        "real_matches_model",
                         (real == model).to_string(),
                     );
                 }
@@ -1172,6 +1172,87 @@ fn verify_to_fixpoint_is_thin_wrapper() {
         })
         .unwrap_or_else(|e| e.raise());
     }
+}
+
+/// §NB5-M counter contract (Codex RE-4 fold): pins native `RoundStats` so a counter regression can
+/// NOT pass the suite silently. The retired mirror-fidelity tests + the parity-window dual-compute
+/// asserted these counters; the wrapper-thinness test guards only the model, so this is now the sole
+/// counter guard. Covers accept-no-commit, accept-with-commit, sink-drop, and source-drop; the
+/// decline paths (rounds carried on `None`) are structural (rounds only increments inside the loop)
+/// and were checked in the NB5-M review (RE-3).
+#[test]
+fn nb5m_native_round_stats_contract() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{RoundStats, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    fn stats_of(code: &str) -> RoundStats {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true).1
+        })
+        .unwrap_or_else(|e| e.raise())
+    }
+    // (a) accept-first-model, no commit.
+    let accept = stats_of("unsafe fn f(p: *mut i32) -> *mut i32 { let q = p; q }");
+    assert_eq!(accept.rounds, 1, "accept: one round");
+    assert_eq!(accept.commits_conflict, 0, "accept: no commits");
+    assert_eq!(accept.commits_per_round, vec![0], "accept: [0]");
+    assert_eq!(accept.dropped_sinks, 0, "accept: no sinks");
+    assert_eq!(accept.dropped_sources, 0, "accept: no sources");
+    // (b) accept WITH a conflict CASCADE: `x = id(p)` is a live Ref requirer invalidated by the write
+    // through the base `b = p` (A′), committed `¬ref` over two commit rounds + the accepting round.
+    let commit = stats_of(
+        "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+         unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }",
+    );
+    assert_eq!(commit.rounds, 3, "cascade: 2 commit rounds + accepting round");
+    assert_eq!(commit.commits_conflict, 2, "cascade: two commits");
+    assert_eq!(commit.commits_per_round, vec![1, 1, 0], "cascade: one commit/round then accept");
+    assert_eq!(commit.dropped_sinks, 0);
+    assert_eq!(commit.dropped_sources, 0);
+    // (c) sink drop: the delete-node witness commits 3 conflicts, then the final solve leaks its two
+    // free sinks. `dropped_sources == 0` here guards the `record_dropped` is_sink split (a regression
+    // counting the 2 sinks as sources would make this 2). Genuine source-leak COUNTING
+    // (`dropped_sources > 0`) is exercised across the corpus and was verified at the NB5-M parity gate.
+    let sink = stats_of(DELETE_NODE_WITNESS);
+    assert_eq!(sink.rounds, 2);
+    assert_eq!(sink.commits_conflict, 3);
+    assert_eq!(sink.commits_per_round, vec![3, 0]);
+    assert_eq!(sink.dropped_sinks, 2, "delete-node leaks its two free sinks");
+    assert_eq!(sink.dropped_sources, 0, "the two dropped selectors are BOTH sinks (is_sink split)");
+    // (d) POSITIVE source drop (Codex RR-2): `&raw mut p` escapes the address of a malloc'd local,
+    // so the alloc cannot be proven Owning; the eager `¬ref(source)` round-1 model surfaces one
+    // conflict, committed into the accepting round-2 model, and the final solve DROPS the source
+    // selector. This is the ONLY shape that pins `dropped_sources > 0` (the others pin it at 0).
+    let source = stats_of(
+        "unsafe extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; } \
+         pub unsafe fn leak() -> *mut *mut core::ffi::c_void { let mut p = malloc(8); &raw mut p }",
+    );
+    assert_eq!(source.rounds, 2, "source-drop: eager ¬ref round-1 + accepting round-2");
+    assert_eq!(source.commits_conflict, 1, "source-drop: one commit");
+    assert_eq!(source.commits_per_round, vec![1, 0]);
+    assert_eq!(source.dropped_sinks, 0, "no free in this shape");
+    assert_eq!(source.dropped_sources, 1, "the leaked alloc drops its source selector (POSITIVE)");
 }
 
 /// §NB-F stage 1 (option (a), approved at the NB-R gate) — the CAUSAL flip:
