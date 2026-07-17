@@ -632,15 +632,21 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
 
-        // §NB4-4c-Q (amendment 4d): pin z3's random seeds for the collateral mode BEFORE the first z3
-        // context is created (`Optimize::new` → `Context::thread_local`, and `Z3_global_param_set` does
-        // not affect already-created contexts). Each corpus program runs in a FRESH worker process
-        // (`boc1_run_one`), so this bites per program. Determinism is confirmed EMPIRICALLY by the
-        // variance spot-check (amendment 4f); the pin + version stamp are provenance. No-op off-mode.
-        if std::env::var_os("CRAT_BOC1_COLLATERAL").is_some() {
-            z3::set_global_param("smt.random_seed", "0");
-            z3::set_global_param("sat.random_seed", "0");
-        }
+        // §NB5-Z (2026-07-17): pin z3's random seeds GLOBALLY — for EVERY BO sweep run, not just the
+        // collateral mode (NB4-4c-Q had this `CRAT_BOC1_COLLATERAL`-gated). This MUST run before the
+        // first z3 context is built: z3 0.19's `Context` is a per-thread `thread_local!` created once as
+        // `Context::new(&Config::new())` and reused, and `set_global_param` only feeds a context created
+        // AFTER it fires. So the pin belongs at the fresh worker-process entry (here, top of `run_bo`,
+        // before any z3 op) — NOT in the solver: `solver.rs:146`'s `Optimize::new` runs only after the
+        // ownership analysis and BO SSA have already built this thread's context, where the pin would be
+        // a no-op. Each corpus program is a FRESH `boc1_run_one` process, so this bites per program.
+        // Expected behavior-neutral (z3's default seed is already 0); the pin's value is the explicit
+        // cross-VERSION contract, held with the `z3_full_version` stamp below — any tie-break drift is
+        // recorded at the NB5-Z re-baseline. In-process test determinism is inherent (one shared
+        // thread-local context) and needs no pin — see `nb5z_solve_run_to_run_deterministic`.
+        z3::set_global_param("smt.random_seed", "0");
+        z3::set_global_param("sat.random_seed", "0");
+        row.set("z3_full_version", z3::full_version().to_string());
 
         let program = collect_program(tcx);
         row.set("fn_count", program.functions.len());
@@ -1020,7 +1026,6 @@ mod run {
         // because FIELD collateral is invisible at depth-0.
         if std::env::var_os("CRAT_BOC1_COLLATERAL").is_some() {
             let t = Instant::now();
-            row.set("z3_full_version", z3::full_version().to_string());
             let cm = measure_collateral(&program, &slots, &origins, &mut_facts);
             row.set("nb4c_collateral_status", cm.status);
             row.set("nb4c_overincl_raw", cm.overincl_raw);

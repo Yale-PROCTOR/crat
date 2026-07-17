@@ -11264,6 +11264,49 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         );
     }
 
+    /// §NB5-Z (2026-07-17): z3 determinism regression-guard. Two independent in-process BO solves of
+    /// the same fixture must produce byte-identical models. This holds INHERENTLY in-process: z3 0.19's
+    /// default `Context` is a `thread_local!` built ONCE per thread (`Context::new(&Config::new())`) and
+    /// cloned/reused for the thread's life, so both solves share one random seed. So this is a
+    /// determinism REGRESSION-GUARD, not a "fixed nondeterminism" RED (NB5-Z rider, correction #3). The
+    /// z3 seed pin's real value is the cross-VERSION contract — the sweep-worker `set_global_param` plus
+    /// the `z3_full_version` stamp — which a single-version suite cannot exercise, so this test does not
+    /// claim to. It locks in-process determinism so a future solver/z3 change cannot silently reintroduce
+    /// run-to-run drift.
+    #[test]
+    fn nb5z_solve_run_to_run_deterministic() {
+        run_compiler(
+            "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; } \
+             unsafe fn f(p: *mut i32) -> *mut i32 { let mut q = op(p); q = p; q }",
+            |tcx| {
+                let solve = || {
+                    let program = collect_program(tcx);
+                    let f = function_by_name(&program, "f");
+                    let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                    let slots = CrateSlots::build(&program);
+                    let crate_ctxt = CrateCtxt::new(&program);
+                    let facts = MutFacts::from_program(&program);
+                    let solver = KindSolver::new(&slots);
+                    let (_s, sel) = emit_crate_ownership_constraints(
+                        &crate_ctxt,
+                        &slots,
+                        &compute_origins(&program),
+                        &solver,
+                    )
+                    .expect("emission");
+                    add_coherence(&solver, &slots, f, &body);
+                    verify_to_fixpoint(&program, &slots, &solver, &sel, &facts).expect("accepts")
+                };
+                let m1 = solve();
+                let m2 = solve();
+                assert_eq!(
+                    m1, m2,
+                    "NB5-Z: two independent in-process solves must be identical (determinism guard)"
+                );
+            },
+        );
+    }
+
     /// §NB4-4c-Q RED (item-4 sizing gate, 2026-07-17): the coherence-collateral measurement, validated
     /// against the INDEPENDENT multi-agent derivation (user ruling 2026-07-17). Exercises the EXACT
     /// harness code (`bo_c1::measure_collateral`) the corpus sweep runs.
