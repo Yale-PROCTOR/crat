@@ -299,8 +299,8 @@ mod run {
         borrow_ownership::{
             CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::{
-                model_accepts, slotref_key, verify_to_fixpoint, verify_to_fixpoint_counting,
-                with_capture,
+                RepairMode, model_accepts, slotref_key, verify_to_fixpoint,
+                verify_to_fixpoint_counting, with_capture,
             },
             coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
@@ -608,19 +608,24 @@ mod run {
     /// Then TWO leave-one-out passes over the distinct commit set `C`, both EXHAUSTIVE (no sampling —
     /// the base is emitted once and every probe reuses it via `push_scope`/`pop_scope`, so even brotli's
     /// full `C` is affordable):
-    /// - **Independent** (`na_indep_overpins`): each `ci` tested against the full `C\{ci}`. This is the
-    ///   original metric — an OVER-COUNT diagnostic, NOT a bound: two commits that are *alternative*
-    ///   repairs are BOTH reported though only one Ref is jointly recoverable (Codex F1). Reported for
-    ///   continuity with the pre-redesign partial; do NOT gate on it.
+    /// - **Independent** (`na_indep_overpins`): each `ci` tested against the full `C\{ci}`. NOT a bound
+    ///   and INCOMPARABLE with the gate number — it OVER-counts alternative-repair pairs (both reported
+    ///   though only one Ref is jointly recoverable, Codex F1) AND UNDER-counts joint recoveries (a slot
+    ///   removable only while other removed slots stay `Ref` is missed, since independent demotes them
+    ///   all — e.g. coherence-equated slots; this is why `na_overpins` can EXCEED `na_indep_overpins`,
+    ///   as on libtree 3 → 7). A labeled diagnostic for continuity with the pre-redesign partial; do
+    ///   NOT gate on it and do NOT assume any ≤/≥ relation to `na_overpins`.
     /// - **Witnessed-joint greedy** (`na_overpins` — THE gate number): in ROUND ORDER (rider 3), retain
-    ///   all commits and test removing each given the CURRENT retained set; a successful removal is made
-    ///   PERMANENT. The removed set is JOINTLY removable by construction, certified by a final witness
-    ///   solve (`na_joint_witnessed`) — a TRUE lower bound on recoverable Refs. CAVEAT (rider 2): still
-    ///   blind to joint-ONLY pins (neither member individually removable given the retained set — greedy
-    ///   never enters), so "close the line" still carries "joint-only headroom unmeasured". Greedy is
-    ///   order-dependent: this is A witnessed lower bound, not THE maximum removable set; round order is
-    ///   the diagnostic choice (late-round commits sit on more accumulation — the round DISTRIBUTION of
-    ///   the removed set is a first-class output).
+    ///   all commits and test removing each given the CURRENT retained set (already-removed commits left
+    ///   un-demoted, so removability is tested GIVEN the recovered set); a success is made PERMANENT. The
+    ///   removed set is certified JOINTLY recoverable by a final witness solve (`na_joint_witnessed`:
+    ///   demote ONLY the final retained set → every removed slot `Ref` + accept) — a TRUE lower bound on
+    ///   recoverable Refs, sound regardless of any push/pop tie-breaking (the witness is the certificate).
+    ///   CAVEAT (rider 2): still blind to joint-ONLY pins (neither member individually removable given
+    ///   the retained set — greedy never enters), so "close the line" still carries "joint-only headroom
+    ///   unmeasured". Order-dependent: A witnessed lower bound, not THE maximum removable set; round order
+    ///   is the diagnostic choice (late-round commits sit on more accumulation — the round DISTRIBUTION
+    ///   of the removed set is a first-class output).
     ///
     /// Emits per-program counts + the `NAOVERPIN` slot inventory for the witnessed-joint set (rider 4:
     /// runs under the seed-pinned worker env; the push/pop reuse is classification-only).
@@ -681,7 +686,8 @@ mod run {
         }
         row.set("na_indep_overpins", indep_overpins);
 
-        // --- Witnessed-joint greedy (THE gate number), round order. ---
+        // --- Witnessed-joint greedy (THE gate number), round order. Buffer the removed set; the
+        // NAOVERPIN inventory + na_overpins publish ONLY after the joint witness certifies it (F1). ---
         let mut retained = vec![true; n];
         let mut removed: Vec<(SlotRef, usize)> = Vec::new();
         for i in 0..n {
@@ -692,35 +698,45 @@ mod run {
             if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
                 retained[i] = false;
                 removed.push(commit_set[i]);
-                // Grep-able RED inventory (the `NBRCORE` pattern): one line per witnessed over-pin.
-                eprintln!(
-                    "NAOVERPIN {program_name} {} round={}",
-                    fmt_slot(program, slots, commit_set[i].0),
-                    commit_set[i].1
-                );
             }
         }
-        row.set("na_overpins", removed.len());
 
-        // Certify the JOINT property: one solve with ONLY the final retained set demoted must leave every
-        // removed slot `Ref` and accept. `na_joint_witnessed=false` would mean the greedy's sequential
-        // removals are not jointly realizable — a bug to investigate before trusting the count.
+        // F1 (Codex): certify the JOINT property FAIL-CLOSED before publishing anything. HARD-PIN every
+        // removed slot `Ref` (not a passive optimum inspection — tie-breaking could otherwise miss a
+        // valid witness), demote ONLY the final retained set, and require an ACCEPTING model. On success
+        // the removed set is provably jointly recoverable → publish the gate number + inventory + `ok`.
+        // On failure (a sequential-removal hole, or the pins are UNSAT) the gate metric is SUPPRESSED and
+        // the status is `witness-failed` — a never-silent, never-trusted uncertified count.
         let final_demote: Vec<SlotRef> = (0..n).filter(|&j| retained[j]).map(|j| slots_only[j]).collect();
         base.push_scope();
+        for &(s, _) in &removed {
+            base.assume(s, SlotKind::Ref);
+        }
         for &d in &final_demote {
             base.add_borrow_exclusion(Some(d), &[]);
         }
         let witnessed = match base.model_kinds_relaxing(&selectors) {
-            Some(m) => {
-                removed.iter().all(|(s, _)| m.get(s) == Some(&SlotKind::Ref))
-                    && model_accepts(program, slots, &m, is_mutable)
-            }
+            // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
+            // only acceptance remains to check.
+            Some(m) => model_accepts(program, slots, &m, is_mutable),
+            // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
         };
         base.pop_scope();
         row.set("na_joint_witnessed", witnessed);
 
-        // Round distribution of the WITNESSED-JOINT set (rider 3: first-class output).
+        if !witnessed {
+            // Fail-closed: suppress the gate metric; do NOT emit `na_overpins` or the inventory.
+            row.set("na_status", "witness-failed");
+            return;
+        }
+
+        // Certified. Publish the gate number, the RED inventory, and the round distribution.
+        row.set("na_overpins", removed.len());
+        for &(s, r) in &removed {
+            // Grep-able RED inventory (the `NBRCORE` pattern): one line per CERTIFIED over-pin.
+            eprintln!("NAOVERPIN {program_name} {} round={r}", fmt_slot(program, slots, s));
+        }
         let mut by_round: FxHashMap<usize, usize> = FxHashMap::default();
         for &(_, r) in &removed {
             *by_round.entry(r).or_default() += 1;
@@ -1202,10 +1218,18 @@ mod run {
         // captured commit set → the over-pin count = L2 headroom (a LOWER BOUND). MEASUREMENT-ONLY, off
         // by default; the `captured` events are `Some` only under the same gate.
         if let Some(events) = captured {
-            let t = Instant::now();
-            run_necessity_audit(&program, &slots, &origins, &mut_facts, &model, &events, &mut row);
-            row.set("t_necessity_s", secs(t.elapsed()));
-            phase("necessity_done", t0);
+            // F3 (Codex): the audit measures Mode-A's commit set, and `with_capture` only records in the
+            // Mode-A commit branch — so under any other `CRAT_BO_REPAIR` the events would be empty and the
+            // audit would report a plausible-but-meaningless zero. Refuse it with an explicit status and no
+            // numeric audit fields, rather than contaminating a comparative sweep.
+            if rstats.repair != RepairMode::ModeA {
+                row.set("na_status", "wrong-repair-mode");
+            } else {
+                let t = Instant::now();
+                run_necessity_audit(&program, &slots, &origins, &mut_facts, &model, &events, &mut row);
+                row.set("t_necessity_s", secs(t.elapsed()));
+                phase("necessity_done", t0);
+            }
         }
 
         // §NB4-4c-Q collateral measurement (CRAT_BOC1_COLLATERAL=1): size the coherence-collateral
@@ -3012,19 +3036,21 @@ fn nb5l2_probe_finds_natural_accumulation_overpin() {
     .unwrap_or_else(|e| e.raise())
 }
 
-/// §NB5-L2 — the witnessed-joint greedy (the gate metric) is a TRUE lower bound: it NEVER exceeds the
-/// independent count, and its removed set is JOINTLY realizable (`na_joint_witnessed=true` — one solve
-/// with only the retained set demoted leaves every removed slot `Ref` and accepts). This is rider 1's
-/// ablation control. A fixture with `na_indep_overpins > na_overpins` would exhibit the
-/// substitutable-pair OVER-COUNT Codex flagged (two alternative repairs, only one jointly recoverable).
-/// EMPIRICALLY, on these shapes the two counts are EQUAL: under the A′ discipline each residual conflict
-/// routes to a unique requirer demotion, so alternative-repair pairs do not arise — the greedy makes the
-/// count a PROVABLE lower bound (via the witness) that the independent sum was not, even though it does
-/// not change the number here. (Greedy ≤ independent is asserted; strict `<` is not, precisely because
-/// no substitutable pair is constructible in these fixtures — that fact itself is the ablation result.)
+/// §NB5-L2 — the witnessed-joint greedy set is a CERTIFIED lower bound: `na_joint_witnessed=true`
+/// (one solve with only the retained set demoted leaves EVERY removed slot `Ref` and accepts), and the
+/// count is bounded by `|C|`. The certificate — NOT any relation to the independent count — is the
+/// soundness property: whatever set the greedy commits to, the witness proves it is jointly recoverable.
+///
+/// Greedy and independent are INCOMPARABLE (do not assert `joint ≤ indep`): independent demotes ALL
+/// other commits at once, so it MISSES a slot recoverable only while other removed slots stay `Ref`
+/// (e.g. coherence-equated slots — demoting the partner forces the slot `¬ref`, but keeping it `Ref`
+/// does not). The greedy, un-demoting removals as it goes, captures those JOINT recoveries — so
+/// `joint > indep` occurs at corpus scale (libtree: indep 3, witnessed-joint 7, all certified). It can
+/// also be `<` if the greedy order spends a removal that blocks two others. The witness is what makes
+/// the count sound regardless of direction; the independent count is a labeled diagnostic only.
 #[cfg(test)]
 #[test]
-fn nb5l2_greedy_witnessed_joint_le_independent() {
+fn nb5l2_greedy_witnessed_joint_certified() {
     let fixtures: [(&str, &str); 3] = [
         (
             "single_req_cascade",
@@ -3053,21 +3079,70 @@ fn nb5l2_greedy_witnessed_joint_le_independent() {
                 row.get(k).unwrap_or_else(|| panic!("{tag}: audit did not emit {k}")).to_string()
             };
             assert_eq!(get("na_status"), "ok", "{tag}: audit status");
-            // The witnessed-joint removed set must be JOINTLY realizable (the lower-bound certificate).
+            // The CERTIFICATE: the greedy removed set is jointly realizable (all removed Ref + accept).
             assert_eq!(
                 get("na_joint_witnessed"),
                 "true",
                 "{tag}: the greedy removed set must be jointly witnessed (all removed Ref + accept)"
             );
-            let indep: usize = get("na_indep_overpins").parse().unwrap();
             let joint: usize = get("na_overpins").parse().unwrap();
             let total: usize = get("na_commits_total").parse().unwrap();
-            assert!(
-                joint <= indep,
-                "{tag}: witnessed-joint ({joint}) must not exceed independent ({indep})"
-            );
             assert!(joint <= total, "{tag}: witnessed-joint ({joint}) must be <= |C| ({total})");
+            // Both counts are emitted (rider 5) — the independent as a labeled diagnostic.
+            assert!(row.get("na_indep_overpins").is_some(), "{tag}: independent count must be emitted");
         })
         .unwrap_or_else(|e| e.raise())
     }
+}
+
+/// §NB5-L2 (Codex F3) — the audit capture is Mode-A-ONLY: under `CRAT_BO_REPAIR=lemmas` the CEGAR loop
+/// takes the `Lemmas` branch, which does NOT record commit events, so `with_capture` returns empty. The
+/// `run_bo` guard rests on this — it refuses `repair != ModeA` with `na_status=wrong-repair-mode` rather
+/// than publishing a plausible-but-meaningless zero audit. Mode-A on the same fixture DOES capture.
+#[cfg(test)]
+#[test]
+fn nb5l2_capture_is_mode_a_only() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{self, RepairMode, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let run_mode = |mode: RepairMode| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) =
+                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver).expect("emit");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            let ((_model, stats), events) = RepairMode::with_override(mode, || {
+                borrow_verify::with_capture(|| {
+                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+                })
+            });
+            (stats.repair, events)
+        };
+        let (mode_a_repair, mode_a_events) = run_mode(RepairMode::ModeA);
+        assert_eq!(mode_a_repair, RepairMode::ModeA, "Mode-A run must stamp ModeA");
+        assert!(!mode_a_events.is_empty(), "Mode-A must capture commits on a conflict fixture");
+        let (lemmas_repair, lemmas_events) = run_mode(RepairMode::Lemmas);
+        assert_eq!(lemmas_repair, RepairMode::Lemmas, "Lemmas run must stamp Lemmas");
+        assert!(
+            lemmas_events.is_empty(),
+            "Lemmas must capture NO commit events — the audit is Mode-A-only (got {} events)",
+            lemmas_events.len()
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
 }

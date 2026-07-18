@@ -603,7 +603,14 @@ pub(crate) fn model_accepts(
         },
         is_mutable,
     );
+    // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
+    // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
+    // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a
+    // fail-closed STOP — §NB5-L2 Codex F2). A probe model CAN reach a non-`Ref`-local residual (unlike
+    // the live loop), where `representative` returns `None` and the naive "no committable owner" check
+    // would MIS-accept; including `guard_slots_are_ref` rejects it, matching the loop exactly.
     residual_nonref_field(&conflicts, model).is_none()
+        && guard_slots_are_ref(&conflicts, model)
         && conflicts.values().flatten().all(|c| representative(c, model).is_none())
 }
 
