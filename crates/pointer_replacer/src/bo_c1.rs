@@ -676,15 +676,23 @@ mod run {
         let slots_only: Vec<SlotRef> = commit_set.iter().map(|(s, _)| *s).collect();
         let program_name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
-        // --- Independent pass (over-count diagnostic; each ci vs the FULL C\{ci}). ---
-        let mut indep_overpins = 0usize;
-        for i in 0..n {
-            let demote: Vec<SlotRef> = (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
-            if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
-                indep_overpins += 1;
+        // --- Independent pass (over-count diagnostic; each ci vs the FULL C\{ci}). It is exactly `n`
+        // extra solves on top of the greedy pass, so for the largest programs it is the difference
+        // between feasible and not. `CRAT_BOC1_NA_GREEDY_ONLY` skips it (the GATE metric is the greedy
+        // witnessed-joint below; independent is only a labeled diagnostic — rider 5's "continuity" is
+        // about the small/mid programs, which keep both passes). Emits `na_indep_overpins=skipped`. ---
+        if std::env::var_os("CRAT_BOC1_NA_GREEDY_ONLY").is_some() {
+            row.set("na_indep_overpins", "skipped");
+        } else {
+            let mut indep_overpins = 0usize;
+            for i in 0..n {
+                let demote: Vec<SlotRef> = (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
+                if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                    indep_overpins += 1;
+                }
             }
+            row.set("na_indep_overpins", indep_overpins);
         }
-        row.set("na_indep_overpins", indep_overpins);
 
         // --- Witnessed-joint greedy (THE gate number), round order. Buffer the removed set; the
         // NAOVERPIN inventory + na_overpins publish ONLY after the joint witness certifies it (F1). ---
