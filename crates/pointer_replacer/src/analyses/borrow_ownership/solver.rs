@@ -384,6 +384,20 @@ impl KindSolver {
         );
     }
 
+    /// §NB5-L2 — push a solver scope. Hard clauses asserted after `push_scope` are removed by the
+    /// matching `pop_scope`; the soft objective (added in `build`, before any push) persists. The
+    /// commit-necessity audit uses this to reuse ONE emitted base across all leave-one-out probes:
+    /// `push_scope` → `add_borrow_exclusion(C\{ci})` → `model_kinds_relaxing` → `pop_scope`. Only the
+    /// non-tracked production solve path uses it (the audit builds `KindSolver::new`).
+    pub(crate) fn push_scope(&self) {
+        self.solver.push();
+    }
+
+    /// §NB5-L2 — backtrack one scope (see `push_scope`). Precondition: balanced with `push_scope`.
+    pub(crate) fn pop_scope(&self) {
+        self.solver.pop();
+    }
+
     /// §NB4-4c — assert `¬own(slot)`: a monotone ownership-exclusion clause, the companion to
     /// `add_borrow_exclusion` (`¬ref`). Together (`¬ref ∧ ¬own`) they pin an unknown-poisoned slot
     /// to `Raw` by one-hot — the may-overwrite/may-retain case where a bare `¬ref` would leave an

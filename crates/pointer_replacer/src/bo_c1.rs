@@ -480,26 +480,75 @@ mod run {
 
     /// §NB5-L2 commit-necessity probe verdict for one leave-one-out.
     pub(crate) enum ProbeOutcome {
-        /// The re-solve without this commit ACCEPTS with `slot_i` still `Ref` — the commit was an
-        /// over-pin (L2 headroom: a context-conditioned single-literal lemma could keep it `Ref`).
+        /// The re-solve without this commit ACCEPTS with `slot_i` still `Ref` — the commit was
+        /// removable (given the other demotions asserted on the base).
         OverPin,
         /// The re-solve declined, or left `slot_i` non-`Ref`, or failed to accept — counted necessary.
         Necessary,
     }
 
-    /// §NB5-L2 commit-necessity probe — leave-one-out over Mode-A's commit set (the ratified Q2
-    /// MECHANISM: ONE solve + ONE validate, NOT a CEGAR re-run). Rebuilds `run_bo`'s EXACT base solver
-    /// — `emit_crate_ownership_constraints(origins)` with the REAL seed (NOT `solve_with_demotion`'s
-    /// `&empty`) → `add_coherence` per fn → `constrain_field_ownership` (the field constraints the loop
-    /// adds before its first solve) — asserts `¬ref(c)` for every `c ∈ commit_set \ {commit_set[i]}`,
-    /// does ONE `model_kinds_relaxing` solve, then ONE `model_accepts` validate. `commit_set[i]` is an
-    /// OVER-PIN iff that model ACCEPTS and leaves `slot_i` `Ref`; otherwise NECESSARY.
+    /// §NB5-L2 — build `run_bo`'s EXACT solver base ONCE: `emit_crate_ownership_constraints(origins)`
+    /// with the REAL seed (NOT `solve_with_demotion`'s `&empty`) → `add_coherence` per fn →
+    /// `constrain_field_ownership` (the field constraints the loop adds before its first solve). The
+    /// audit reuses this base across every probe via `push_scope`/`pop_scope`, so brotli's ~683-commit
+    /// exhaustive leave-one-out pays the emit cost once, not per probe. `None` on emit error.
+    fn build_probe_base(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+    ) -> Option<(KindSolver, Selectors)> {
+        let crate_ctxt = CrateCtxt::new(program);
+        let solver = KindSolver::new(slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
+        for &g in &program.functions {
+            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, slots, g, &body);
+        }
+        constrain_field_ownership(&solver, slots, program);
+        Some((solver, selectors))
+    }
+
+    /// §NB5-L2 — the leave-one-out primitive on a PREBUILT base (the ratified Q2 MECHANISM: ONE solve +
+    /// ONE validate, NOT a CEGAR re-run). Pushes a scope, asserts `¬ref(d)` for every `d ∈ demote`,
+    /// solves ONCE, validates ONCE, then pops — so the base is untouched for the next probe. Returns
+    /// true iff the model ACCEPTS (`model_accepts`) AND leaves `target` `Ref` (dropping `target`'s
+    /// commit still accepts with `target` a borrow).
     ///
-    /// Rider 3: this fresh solve may relax selectors differently than the anchor's fixpoint did — the
-    /// classification uses ONLY (accept ∧ `slot_i`==`Ref`), never the probe model's other numbers.
-    /// Both arms UNDERCOUNT (Q1: joint over-pins are invisible to leave-*one*-out; Q2: this single
-    /// solve does not search alternative commit sets, so a "necessary" verdict may hide an over-pin
-    /// reachable another way) — SAME direction, so the over-pin count is a consistent LOWER BOUND.
+    /// Rider 4 (push/pop determinism): reusing the incremental solver may tie-break OTHER slots
+    /// differently than a fresh `KindSolver` would, and `model_kinds_relaxing` may relax selectors
+    /// differently than the anchor fixpoint did. Neither matters: this is a CLASSIFICATION only
+    /// (accept ∧ `target`==`Ref`), never a model comparison — so do NOT "fix" it to fresh solves for a
+    /// parity that is irrelevant here.
+    fn probe_accepts_with_ref(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        base: &KindSolver,
+        selectors: &Selectors,
+        is_mutable: impl MutProvider + Copy,
+        demote: &[SlotRef],
+        target: SlotRef,
+    ) -> bool {
+        base.push_scope();
+        for &d in demote {
+            base.add_borrow_exclusion(Some(d), &[]);
+        }
+        let verdict = match base.model_kinds_relaxing(selectors) {
+            Some(model) => {
+                model.get(&target) == Some(&SlotKind::Ref)
+                    && model_accepts(program, slots, &model, is_mutable)
+            }
+            // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
+            None => false,
+        };
+        base.pop_scope();
+        verdict
+    }
+
+    /// §NB5-L2 — single-shot leave-one-out (build base + one probe). The audit driver builds the base
+    /// once and calls `probe_accepts_with_ref` directly; this wrapper keeps the calibration-test API
+    /// (`commit_set`, `i`) rebuilding the base per call, which is fine at test scale. `commit_set[i]` is
+    /// an OVER-PIN iff a solve over `commit_set \ {commit_set[i]}` accepts with `slot_i` `Ref`.
     pub(crate) fn necessity_probe(
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
@@ -508,31 +557,15 @@ mod run {
         commit_set: &[SlotRef],
         i: usize,
     ) -> ProbeOutcome {
-        let ci = commit_set[i];
-        let crate_ctxt = CrateCtxt::new(program);
-        let solver = KindSolver::new(slots);
-        let Ok((_stats, selectors)) =
-            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver)
-        else {
-            // Emit error: cannot establish an over-pin ⇒ conservatively NECESSARY (undercount side).
+        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
             return ProbeOutcome::Necessary;
         };
-        for &g in &program.functions {
-            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, slots, g, &body);
-        }
-        constrain_field_ownership(&solver, slots, program);
-        for (j, &c) in commit_set.iter().enumerate() {
-            if j != i {
-                solver.add_borrow_exclusion(Some(c), &[]);
-            }
-        }
-        let Some(model) = solver.model_kinds_relaxing(&selectors) else {
-            // UNSAT even without `ci` ⇒ `ci` is not the reason it would decline; NECESSARY.
-            return ProbeOutcome::Necessary;
-        };
-        let slot_i_ref = model.get(&ci) == Some(&SlotKind::Ref);
-        if slot_i_ref && model_accepts(program, slots, &model, is_mutable) {
+        let demote: Vec<SlotRef> = commit_set
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &c)| (j != i).then_some(c))
+            .collect();
+        if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, commit_set[i]) {
             ProbeOutcome::OverPin
         } else {
             ProbeOutcome::Necessary
@@ -570,14 +603,32 @@ mod run {
     /// `CRAT_BOC1_NECESSITY_AUDIT`; called from `run_bo`). FULL-ANCHOR first: the audit's baseline IS
     /// `run_bo`'s own accepted `model`, so only measure if it accepted, assert it satisfies
     /// `model_accepts` (anti-drift), and record `na_anchor_nref[_d0]` for the post-run cross-check
-    /// against the merged NB5-L `mode_a` sweep row. Then leave-one-out each commit (Q3: exhaustive for
-    /// ≤ `SAMPLE_CAP`, else a deterministic stratified-by-round systematic sample). Emits per-program
-    /// counts + the `NAOVERPIN` slot inventory (rider 4: runs under the seed-pinned worker env).
-    fn run_necessity_audit(
+    /// against the merged NB5-L `mode_a` sweep row.
+    ///
+    /// Then TWO leave-one-out passes over the distinct commit set `C`, both EXHAUSTIVE (no sampling —
+    /// the base is emitted once and every probe reuses it via `push_scope`/`pop_scope`, so even brotli's
+    /// full `C` is affordable):
+    /// - **Independent** (`na_indep_overpins`): each `ci` tested against the full `C\{ci}`. This is the
+    ///   original metric — an OVER-COUNT diagnostic, NOT a bound: two commits that are *alternative*
+    ///   repairs are BOTH reported though only one Ref is jointly recoverable (Codex F1). Reported for
+    ///   continuity with the pre-redesign partial; do NOT gate on it.
+    /// - **Witnessed-joint greedy** (`na_overpins` — THE gate number): in ROUND ORDER (rider 3), retain
+    ///   all commits and test removing each given the CURRENT retained set; a successful removal is made
+    ///   PERMANENT. The removed set is JOINTLY removable by construction, certified by a final witness
+    ///   solve (`na_joint_witnessed`) — a TRUE lower bound on recoverable Refs. CAVEAT (rider 2): still
+    ///   blind to joint-ONLY pins (neither member individually removable given the retained set — greedy
+    ///   never enters), so "close the line" still carries "joint-only headroom unmeasured". Greedy is
+    ///   order-dependent: this is A witnessed lower bound, not THE maximum removable set; round order is
+    ///   the diagnostic choice (late-round commits sit on more accumulation — the round DISTRIBUTION of
+    ///   the removed set is a first-class output).
+    ///
+    /// Emits per-program counts + the `NAOVERPIN` slot inventory for the witnessed-joint set (rider 4:
+    /// runs under the seed-pinned worker env; the push/pop reuse is classification-only).
+    pub(crate) fn run_necessity_audit(
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
-        mut_facts: &MutFacts,
+        is_mutable: impl MutProvider + Copy,
         model: &Option<FxHashMap<SlotRef, SlotKind>>,
         events: &[(SlotRef, usize)],
         row: &mut Row,
@@ -588,13 +639,14 @@ mod run {
             return;
         };
         assert!(
-            model_accepts(program, slots, model, mut_facts),
+            model_accepts(program, slots, model, is_mutable),
             "necessity audit: the anchor's accepted model must satisfy model_accepts (drift STOP)"
         );
         let (anchor_nref, anchor_nref_d0) = count_refs(model, slots);
         row.set("na_anchor_nref", anchor_nref);
         row.set("na_anchor_nref_d0", anchor_nref_d0);
-        // Distinct commit set C (dedup by slot, keep the FIRST round each slot was committed).
+        // Distinct commit set C (dedup by slot, keep the FIRST round each slot was committed), then
+        // ROUND ORDER (round, slotref_key) — the greedy processing order (rider 3), deterministic.
         let mut seen = FxHashSet::default();
         let mut commit_set: Vec<(SlotRef, usize)> = Vec::new();
         for &(s, r) in events {
@@ -602,42 +654,77 @@ mod run {
                 commit_set.push((s, r));
             }
         }
-        row.set("na_commits_total", commit_set.len());
-        if commit_set.is_empty() {
+        commit_set.sort_by(|a, b| (a.1, slotref_key(&a.0)).cmp(&(b.1, slotref_key(&b.0))));
+        let n = commit_set.len();
+        row.set("na_commits_total", n);
+        if n == 0 {
             row.set("na_status", "no-commits");
+            row.set("na_indep_overpins", 0);
             row.set("na_overpins", 0);
             return;
         }
-        // Deterministic order: (round, slotref_key). Round-sorted ⇒ systematic sampling ≈ stratified
-        // by round (rider 2). SAMPLE_CAP bounds brotli's ~683 commits (Q3).
-        const SAMPLE_CAP: usize = 200;
-        commit_set.sort_by(|a, b| (a.1, slotref_key(&a.0)).cmp(&(b.1, slotref_key(&b.0))));
-        let total = commit_set.len();
-        let sampled = total > SAMPLE_CAP;
-        let indices: Vec<usize> = if sampled {
-            let step = (total / SAMPLE_CAP).max(1);
-            (0..total).step_by(step).take(SAMPLE_CAP).collect()
-        } else {
-            (0..total).collect()
+        // Emit the probe base ONCE; every probe reuses it via push/pop (rider 4 / cost).
+        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
+            row.set("na_status", "base-error");
+            return;
         };
-        row.set("na_sampled", sampled);
-        row.set("na_sample_n", indices.len());
         let slots_only: Vec<SlotRef> = commit_set.iter().map(|(s, _)| *s).collect();
         let program_name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
-        let mut overpins = 0usize;
-        let mut by_round: FxHashMap<usize, usize> = FxHashMap::default();
-        for &idx in &indices {
-            if let ProbeOutcome::OverPin =
-                necessity_probe(program, slots, origins, mut_facts, &slots_only, idx)
-            {
-                overpins += 1;
-                let (slot, round) = commit_set[idx];
-                *by_round.entry(round).or_default() += 1;
-                // Grep-able RED inventory (the `NBRCORE` pattern): one line per over-pin slot.
-                eprintln!("NAOVERPIN {program_name} {} round={round}", fmt_slot(program, slots, slot));
+
+        // --- Independent pass (over-count diagnostic; each ci vs the FULL C\{ci}). ---
+        let mut indep_overpins = 0usize;
+        for i in 0..n {
+            let demote: Vec<SlotRef> = (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
+            if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                indep_overpins += 1;
             }
         }
-        row.set("na_overpins", overpins);
+        row.set("na_indep_overpins", indep_overpins);
+
+        // --- Witnessed-joint greedy (THE gate number), round order. ---
+        let mut retained = vec![true; n];
+        let mut removed: Vec<(SlotRef, usize)> = Vec::new();
+        for i in 0..n {
+            // Demote every STILL-retained commit except the candidate; the already-removed commits are
+            // left un-demoted (Ref-eligible), so removability is tested GIVEN the recovered set.
+            let demote: Vec<SlotRef> =
+                (0..n).filter(|&j| j != i && retained[j]).map(|j| slots_only[j]).collect();
+            if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                retained[i] = false;
+                removed.push(commit_set[i]);
+                // Grep-able RED inventory (the `NBRCORE` pattern): one line per witnessed over-pin.
+                eprintln!(
+                    "NAOVERPIN {program_name} {} round={}",
+                    fmt_slot(program, slots, commit_set[i].0),
+                    commit_set[i].1
+                );
+            }
+        }
+        row.set("na_overpins", removed.len());
+
+        // Certify the JOINT property: one solve with ONLY the final retained set demoted must leave every
+        // removed slot `Ref` and accept. `na_joint_witnessed=false` would mean the greedy's sequential
+        // removals are not jointly realizable — a bug to investigate before trusting the count.
+        let final_demote: Vec<SlotRef> = (0..n).filter(|&j| retained[j]).map(|j| slots_only[j]).collect();
+        base.push_scope();
+        for &d in &final_demote {
+            base.add_borrow_exclusion(Some(d), &[]);
+        }
+        let witnessed = match base.model_kinds_relaxing(&selectors) {
+            Some(m) => {
+                removed.iter().all(|(s, _)| m.get(s) == Some(&SlotKind::Ref))
+                    && model_accepts(program, slots, &m, is_mutable)
+            }
+            None => removed.is_empty(),
+        };
+        base.pop_scope();
+        row.set("na_joint_witnessed", witnessed);
+
+        // Round distribution of the WITNESSED-JOINT set (rider 3: first-class output).
+        let mut by_round: FxHashMap<usize, usize> = FxHashMap::default();
+        for &(_, r) in &removed {
+            *by_round.entry(r).or_default() += 1;
+        }
         let mut rounds: Vec<(usize, usize)> = by_round.into_iter().collect();
         rounds.sort();
         row.set(
@@ -2799,10 +2886,8 @@ fn nb5l2_anchor<'tcx>(
         crate::analyses::borrow_ownership::solver::SlotRef,
         crate::analyses::borrow_ownership::SlotKind,
     >,
-    Vec<crate::analyses::borrow_ownership::solver::SlotRef>,
+    Vec<(crate::analyses::borrow_ownership::solver::SlotRef, usize)>,
 ) {
-    use rustc_hash::FxHashSet;
-
     use crate::analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{self, verify_to_fixpoint_counting},
@@ -2810,7 +2895,7 @@ fn nb5l2_anchor<'tcx>(
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
         origins::compute_origins,
-        solver::{KindSolver, SlotRef},
+        solver::KindSolver,
     };
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
@@ -2832,10 +2917,15 @@ fn nb5l2_anchor<'tcx>(
         borrow_verify::model_accepts(&program, &slots, &model, true),
         "anchor's accepted model must satisfy model_accepts (drift check)"
     );
-    let mut seen = FxHashSet::default();
-    let commit_set: Vec<SlotRef> =
-        events.iter().map(|(s, _)| *s).filter(|s| seen.insert(*s)).collect();
-    (program, slots, origins, model, commit_set)
+    (program, slots, origins, model, events)
+}
+
+/// §NB5-L2 — distinct commit set (dedup by slot, first-seen order) from the raw `(slot, round)` events.
+#[cfg(test)]
+fn nb5l2_distinct(events: &[(crate::analyses::borrow_ownership::solver::SlotRef, usize)])
+    -> Vec<crate::analyses::borrow_ownership::solver::SlotRef> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    events.iter().map(|(s, _)| *s).filter(|s| seen.insert(*s)).collect()
 }
 
 /// §NB5-L2 — calibrate the probe's two verdicts deterministically on `single_req_cascade`.
@@ -2852,7 +2942,8 @@ fn nb5l2_probe_necessary_and_injected_overpin() {
     let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
                 unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let (program, slots, origins, model, commit_set) = nb5l2_anchor(tcx);
+        let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
+        let commit_set = nb5l2_distinct(&events);
         assert!(!commit_set.is_empty(), "cascade must yield >=1 Mode-A commit");
         // NECESSARY arm: singleton probe of any real commit → empty leave-one-out → conflict returns.
         let singleton = [commit_set[0]];
@@ -2898,7 +2989,8 @@ fn nb5l2_probe_finds_natural_accumulation_overpin() {
     let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
                 unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
-        let (program, slots, origins, _model, commit_set) = nb5l2_anchor(tcx);
+        let (program, slots, origins, _model, events) = nb5l2_anchor(tcx);
+        let commit_set = nb5l2_distinct(&events);
         assert!(commit_set.len() >= 2, "cascade must yield >=2 commits (got {})", commit_set.len());
         let (mut overpins, mut necessary) = (0usize, 0usize);
         for i in 0..commit_set.len() {
@@ -2918,4 +3010,64 @@ fn nb5l2_probe_finds_natural_accumulation_overpin() {
         );
     })
     .unwrap_or_else(|e| e.raise())
+}
+
+/// §NB5-L2 — the witnessed-joint greedy (the gate metric) is a TRUE lower bound: it NEVER exceeds the
+/// independent count, and its removed set is JOINTLY realizable (`na_joint_witnessed=true` — one solve
+/// with only the retained set demoted leaves every removed slot `Ref` and accepts). This is rider 1's
+/// ablation control. A fixture with `na_indep_overpins > na_overpins` would exhibit the
+/// substitutable-pair OVER-COUNT Codex flagged (two alternative repairs, only one jointly recoverable).
+/// EMPIRICALLY, on these shapes the two counts are EQUAL: under the A′ discipline each residual conflict
+/// routes to a unique requirer demotion, so alternative-repair pairs do not arise — the greedy makes the
+/// count a PROVABLE lower bound (via the witness) that the independent sum was not, even though it does
+/// not change the number here. (Greedy ≤ independent is asserted; strict `<` is not, precisely because
+/// no substitutable pair is constructible in these fixtures — that fact itself is the ablation result.)
+#[cfg(test)]
+#[test]
+fn nb5l2_greedy_witnessed_joint_le_independent() {
+    let fixtures: [(&str, &str); 3] = [
+        (
+            "single_req_cascade",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }",
+        ),
+        (
+            "two_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let base = id(p); let a = id(base); let b = id(base); \
+             let w = p; *w = 9; *a + *b }",
+        ),
+        (
+            "asymmetric",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let a = id(p); let b = id(p); let d = id(b); \
+             *a = 1; *b = 2; *d = 3; let w = p; *w = 4; *a + *b + *d }",
+        ),
+    ];
+    for (tag, code) in fixtures {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
+            let mut row = report::Row::default();
+            run::run_necessity_audit(&program, &slots, &origins, true, &Some(model), &events, &mut row);
+            let get = |k: &str| {
+                row.get(k).unwrap_or_else(|| panic!("{tag}: audit did not emit {k}")).to_string()
+            };
+            assert_eq!(get("na_status"), "ok", "{tag}: audit status");
+            // The witnessed-joint removed set must be JOINTLY realizable (the lower-bound certificate).
+            assert_eq!(
+                get("na_joint_witnessed"),
+                "true",
+                "{tag}: the greedy removed set must be jointly witnessed (all removed Ref + accept)"
+            );
+            let indep: usize = get("na_indep_overpins").parse().unwrap();
+            let joint: usize = get("na_overpins").parse().unwrap();
+            let total: usize = get("na_commits_total").parse().unwrap();
+            assert!(
+                joint <= indep,
+                "{tag}: witnessed-joint ({joint}) must not exceed independent ({indep})"
+            );
+            assert!(joint <= total, "{tag}: witnessed-joint ({joint}) must be <= |C| ({total})");
+        })
+        .unwrap_or_else(|e| e.raise())
+    }
 }
