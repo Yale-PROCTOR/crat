@@ -103,7 +103,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.into_iter());
-            let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            let (writes, nonnulls, raw) =
+                new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            self.raw_writes.extend(raw);
             if !self.is_merged {
                 new_state.add_nonnulls(nonnulls.into_iter());
             }
@@ -215,8 +217,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
                     new_state.add_reads(reads.into_iter());
-                    let (writes, nonnulls) =
+                    let (writes, nonnulls, raw) =
                         new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+                    self.raw_writes.extend(raw);
                     if !self.is_merged {
                         new_state.add_nonnulls(nonnulls.into_iter());
                     }
@@ -293,22 +296,25 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 &mut writes,
             )
         };
+        let mut raw_writes = vec![];
         let (mut new_states, writess): (Vec<_>, Vec<_>) = vs
             .into_iter()
             .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
-                let (writes, nonnulls) = new_state.add_writes(
+                let (writes, nonnulls, raw) = new_state.add_writes(
                     writes.iter().cloned().chain(writes_ret),
                     &self.ptr_params_inv,
                 );
+                raw_writes.push(raw);
                 if !self.is_merged {
                     new_state.add_nonnulls(nonnulls.into_iter());
                 }
                 (new_state, writes)
             })
             .unzip();
+        self.raw_writes.extend(raw_writes.into_iter().flatten());
 
         if !nulls.is_empty() {
             assert!(new_states.len() == nulls.len());
@@ -348,9 +354,21 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
 
         let mut ptr_maps = BTreeMap::new();
+        let mut null_maps = BTreeMap::new();
         for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
             if let Some(idx) = param.ptrv.get_arg() {
                 ptr_maps.insert(idx, arg.ptrv.clone());
+                if let AbsPtr::Set(ptrs) = &arg.ptrv
+                    && ptrs.len() == 1
+                {
+                    let ptr = ptrs.first().unwrap();
+                    if let Some((path, false)) = AbsPath::from_place(ptr, &self.ptr_params)
+                        && path.projections.is_empty()
+                        && let Some(caller_arg) = self.ptr_params_inv.get(&path.base)
+                    {
+                        null_maps.insert(idx, (path, *caller_arg));
+                    }
+                }
             }
         }
 
@@ -361,10 +379,53 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             reads.extend(reads2);
         }
 
+        // Reflect all callee writes through pointer arguments, including those suppressed
+        // by reads in the callee: writes to caller locals are recorded for
+        // find_nullable_params, and writes to caller params are propagated to this
+        // function's raw_writes
+        let mut propagated = BTreeSet::new();
+        for write in summary.raw_writes.iter() {
+            let idx = write.base.index() - 1;
+            let Some(AbsPtr::Set(ptrs)) = args.get(idx).map(|a| &a.ptrv) else {
+                continue;
+            };
+            for ptr in ptrs {
+                match ptr.base {
+                    AbsBase::Local(l) => {
+                        self.call_local_writes
+                            .entry(location)
+                            .or_default()
+                            .insert(l);
+                    }
+                    AbsBase::Arg(_) => {
+                        let (mut path, array_access) =
+                            some_or!(AbsPath::from_place(ptr, &self.ptr_params), continue);
+                        if array_access {
+                            continue;
+                        }
+                        path.projections.extend(write.projections.clone());
+                        propagated.insert(path);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.raw_writes.extend(propagated);
+
         let mut states = vec![];
         let mut ret_writes = BTreeSet::new();
         for return_state in summary.return_states.values() {
             let mut state = state.clone();
+            // A callee return state whose null facts contradict the caller's is infeasible
+            // at this call site
+            let infeasible = null_maps.iter().any(|(callee_arg, (_, caller_arg))| {
+                (return_state.nulls.is_null(*callee_arg) && state.nulls.is_nonnull(*caller_arg))
+                    || (return_state.nulls.is_nonnull(*callee_arg)
+                        && state.nulls.is_null(*caller_arg))
+            });
+            if infeasible {
+                continue;
+            }
             let ret_v = return_state.local.get(Local::ZERO);
             for (p, a) in &ptr_maps {
                 let v = return_state.args.get(*p).subst(&ptr_maps);
@@ -419,13 +480,27 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
 
-            let (callee_writes, callee_nonnull_cands) =
+            let (callee_writes, callee_nonnull_cands, raw1) =
                 state.add_writes(callee_writes.into_iter(), &self.ptr_params_inv);
-            let (writes, nonnulls) = state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            let (writes, nonnulls, raw2) =
+                state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            self.raw_writes.extend(raw1);
+            self.raw_writes.extend(raw2);
 
             if !self.is_merged {
                 state.add_nonnulls(nonnulls.into_iter());
                 state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
+            }
+
+            for (callee_arg, (path, caller_arg)) in &null_maps {
+                let n = if return_state.nulls.is_null(*callee_arg) {
+                    AbsNull::null()
+                } else if return_state.nulls.is_nonnull(*callee_arg) {
+                    AbsNull::nonnull()
+                } else {
+                    continue;
+                };
+                state.add_null(path.clone(), *caller_arg, n);
             }
 
             ret_writes.extend(callee_writes.into_iter().chain(writes));

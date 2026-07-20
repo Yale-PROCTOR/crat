@@ -54,6 +54,8 @@ pub type FunctionSummaries = FxHashMap<String, FunctionSummary>;
 pub struct FunctionSummary {
     pub init_state: AbsState,
     pub return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+    /// All attempted writes, including those suppressed by reads/excludes
+    pub raw_writes: BTreeSet<AbsPath>,
     pub has_side_effects: bool,
 }
 
@@ -61,11 +63,13 @@ impl FunctionSummary {
     fn new(
         init_state: AbsState,
         return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+        raw_writes: BTreeSet<AbsPath>,
         has_side_effects: bool,
     ) -> Self {
         Self {
             init_state,
             return_states,
+            raw_writes,
             has_side_effects,
         }
     }
@@ -74,6 +78,7 @@ impl FunctionSummary {
         Self {
             init_state: AbsState::bot(),
             return_states: BTreeMap::new(),
+            raw_writes: BTreeSet::new(),
             has_side_effects: false,
         }
     }
@@ -97,8 +102,13 @@ impl FunctionSummary {
                 (k, v)
             })
             .collect();
+        let raw_writes = self
+            .raw_writes
+            .union(&other.raw_writes)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let has_side_effects = self.has_side_effects || other.has_side_effects;
-        Self::new(init_state, return_states, has_side_effects)
+        Self::new(init_state, return_states, raw_writes, has_side_effects)
     }
 
     fn ord(&self, other: &Self) -> bool {
@@ -508,7 +518,12 @@ pub fn analyze(
 
                 has_side_effects = has_side_effects || analyzer.check_global_writes();
 
-                let summary = FunctionSummary::new(init_state, return_states, has_side_effects);
+                let summary = FunctionSummary::new(
+                    init_state,
+                    return_states,
+                    std::mem::take(&mut analyzer.raw_writes),
+                    has_side_effects,
+                );
                 results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
                 ptr_params_inv_map.insert(*def_id, analyzer.ptr_params_inv);
@@ -675,6 +690,9 @@ pub struct Analyzer<'a, 'tcx> {
     pub ptr_params: IndexVec<ArgIdx, Local>,
     pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
+    pub call_local_writes: BTreeMap<Location, BTreeSet<Local>>,
+    /// All attempted writes, including those suppressed by reads/excludes
+    pub raw_writes: BTreeSet<AbsPath>,
     pub pre_context: PreAnalysisContext<'a>,
     pub indirect_assigns: BTreeSet<Local>,
     pub is_merged: bool,
@@ -713,6 +731,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             ptr_params: IndexVec::new(),
             ptr_params_inv: FxHashMap::default(),
             call_args: BTreeMap::new(),
+            call_local_writes: BTreeMap::new(),
+            raw_writes: BTreeSet::new(),
             pre_context,
             indirect_assigns: BTreeSet::new(),
             is_merged: false,
@@ -1036,6 +1056,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let check = |block, locs: &BTreeSet<_>, diff_locs| {
                 let mut local_writes = BTreeSet::new();
                 locs.iter().all(|loc| {
+                    // Callee writes through pointer arguments to caller locals are
+                    // side effects if the locals are used later
+                    if let Some(lws) = self.call_local_writes.get(loc) {
+                        local_writes.extend(lws.iter().copied());
+                    }
                     let Some(writes) = writes_map.get(loc) else {
                         return true;
                     };
@@ -1416,6 +1441,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut call_info_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
             self.call_args.clear();
+            self.call_local_writes.clear();
+            self.raw_writes.clear();
             while let Some(label) = work_list.pop() {
                 let state = states
                     .get(&label.location)

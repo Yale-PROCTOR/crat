@@ -118,12 +118,15 @@ impl AbsState {
         &mut self,
         paths: I,
         ptr_params_inv: &FxHashMap<Local, ArgIdx>,
-    ) -> (BTreeSet<AbsPath>, BTreeSet<Local>) {
+    ) -> (BTreeSet<AbsPath>, BTreeSet<Local>, BTreeSet<AbsPath>) {
         let mut res = BTreeSet::new();
         let mut nonnull_cands = BTreeSet::new();
+        // All attempted writes, including those suppressed by reads/excludes
+        let mut raw = BTreeSet::new();
         let mut locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
 
         for path in paths {
+            raw.insert(path.clone());
             if !self.reads.contains(&path) && !self.excludes.contains(&path) {
                 let l = path.base;
                 let arg = ptr_params_inv.get(&l).unwrap();
@@ -136,7 +139,7 @@ impl AbsState {
             }
         }
 
-        (res, nonnull_cands)
+        (res, nonnull_cands, raw)
     }
 
     pub fn add_null(&mut self, path: AbsPath, arg: ArgIdx, n: AbsNull) {
