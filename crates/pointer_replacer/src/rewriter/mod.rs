@@ -3,7 +3,7 @@ use points_to::andersen;
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{ItemKind, OwnerNode};
+use rustc_hir::{HirId, ItemKind, OwnerNode};
 use rustc_middle::{
     mir::Local,
     ty::{self, TyCtxt},
@@ -43,7 +43,19 @@ mod lifetimes;
 mod struct_array_field_pre;
 mod transform;
 
+pub use decision::{PtrKind, SigDecision, SigDecisions};
 pub use epoch_split::rewrite_epoch_split;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PointerDecisionOptions {
+    pub assume_nonnegative_offsets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialPointerDecisions {
+    pub signatures: SigDecisions,
+    pub bindings: FxHashMap<HirId, PtrKind>,
+}
 
 pub struct Analysis {
     #[allow(dead_code)]
@@ -101,6 +113,59 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
+    let (input, analysis_results, fn_ptr_groups, fn_ptr_rewrite) =
+        analyze(config, PointerDecisionOptions::default(), tcx);
+
+    let diagnostics = diagnostics::DecisionDiagnostics::from_env();
+    let mut visitor = TransformVisitor::new(
+        config,
+        &input,
+        &analysis_results,
+        ast_to_hir,
+        fn_ptr_groups,
+        fn_ptr_rewrite,
+        diagnostics,
+    );
+    visitor.visit_crate(&mut krate);
+
+    // add SliceCursor module to the crate if it was used
+    let slice_cursor_used = visitor.slice_cursor.get();
+    let mut code = pprust::crate_to_string_for_macros(&krate);
+    if slice_cursor_used {
+        code.push('\n');
+        code.push_str(slice_cursor_mod_str());
+    }
+
+    visitor.emit_diagnostics();
+
+    (code, visitor.bytemuck_dependency())
+}
+
+pub fn initial_pointer_decisions(
+    config: &Config,
+    options: PointerDecisionOptions,
+    tcx: TyCtxt<'_>,
+) -> InitialPointerDecisions {
+    let (input, analysis, fn_ptr_groups, _) = analyze(config, options, tcx);
+    let lifetime_plans = lifetimes::LifetimePlans::new(&input, &analysis);
+    let signatures = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
+    let bindings = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
+    InitialPointerDecisions {
+        signatures,
+        bindings,
+    }
+}
+
+fn analyze<'tcx>(
+    config: &Config,
+    options: PointerDecisionOptions,
+    tcx: TyCtxt<'tcx>,
+) -> (
+    RustProgram<'tcx>,
+    Analysis,
+    FnPtrGroups,
+    FnPtrRewriteDecision,
+) {
     let input = collect_input(tcx);
     let arena = typed_arena::Arena::new();
     let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
@@ -136,9 +201,13 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     let promoted_shared_ref_result = source_var_groups
         .postprocess_promoted_mut_refs(borrow_promotion_result.shared_locals.clone());
     let fatness_result = analyses::type_qualifier::foster::fatness::fatness_analysis(&input);
-    let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
-    offset_sign_result.access_signs =
-        source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+    let offset_sign_result = if options.assume_nonnegative_offsets {
+        OffsetSignResult::default()
+    } else {
+        let mut result = analyses::offset_sign::sign::offset_sign_analysis(&input);
+        result.access_signs = source_var_groups.postprocess_offset_signs(result.access_signs);
+        result
+    };
     let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
@@ -171,30 +240,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         &tss,
         &fn_ptr_groups,
     );
-
-    let diagnostics = diagnostics::DecisionDiagnostics::from_env();
-    let mut visitor = TransformVisitor::new(
-        config,
-        &input,
-        &analysis_results,
-        ast_to_hir,
-        fn_ptr_groups,
-        fn_ptr_rewrite,
-        diagnostics,
-    );
-    visitor.visit_crate(&mut krate);
-
-    // add SliceCursor module to the crate if it was used
-    let slice_cursor_used = visitor.slice_cursor.get();
-    let mut code = pprust::crate_to_string_for_macros(&krate);
-    if slice_cursor_used {
-        code.push('\n');
-        code.push_str(slice_cursor_mod_str());
-    }
-
-    visitor.emit_diagnostics();
-
-    (code, visitor.bytemuck_dependency())
+    (input, analysis_results, fn_ptr_groups, fn_ptr_rewrite)
 }
 
 pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {

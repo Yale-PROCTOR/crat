@@ -43,7 +43,6 @@ pub struct ThirToMir {
     /// is an If, there are multiple statements, one for each branch.
     ///
     /// For `Break`, the locations of possibly *multiple* statements, just like for `Return`.
-    /// Currently, only the case without a value is supported.
     pub expr_to_locs: FxHashMap<ExprId, Locations>,
 
     /// THIR `Block` to MIR basic blocks
@@ -478,10 +477,14 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
             }
 
             ExprKind::Break { value, .. } => {
-                // TODO: handle break with value
-                assert!(value.is_none());
-                if let Some(loc) = ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit()) {
-                    ctx.thir_to_mir.expr_to_locs.insert(expr_id, smallvec![loc]);
+                let locs = if let Some(value) = value {
+                    ctx.find_control_value_locations(value)
+                } else {
+                    ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit())
+                        .map(|loc| smallvec![loc])
+                };
+                if let Some(locs) = locs {
+                    ctx.thir_to_mir.expr_to_locs.insert(expr_id, locs);
                 } else {
                     ctx.print_debug("Break", expr.span.into());
                 }
@@ -489,23 +492,7 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
             ExprKind::Continue { .. } => {}
             ExprKind::Return { value } => {
                 let locs = if let Some(value) = value {
-                    let mut values = smallvec![];
-                    find_return_values(value, &thir, &mut values);
-                    let mut locs = smallvec![];
-                    for v in &values {
-                        let loc = if matches!(thir[*v].kind, ExprKind::Call { .. }) {
-                            ctx.find_call_location(*v)
-                                .or_else(|| ctx.find_transmute_location(*v))
-                        } else {
-                            ctx.find_rvalue_location(*v, |_| true)
-                        };
-                        locs.push(some_or!(loc, break));
-                    }
-                    if locs.len() == values.len() {
-                        Some(locs)
-                    } else {
-                        None
-                    }
+                    ctx.find_control_value_locations(value)
                 } else {
                     ctx.find_assign_ty_location(expr_id, |ty| ty.is_unit())
                         .map(|loc| smallvec![loc])
@@ -690,18 +677,18 @@ fn unique_continue_of_block(expr_id: ExprId, thir: &Thir<'_>) -> Option<ExprId> 
     Some(expr_id)
 }
 
-fn find_return_values(expr: ExprId, thir: &Thir<'_>, values: &mut SmallVec<[ExprId; 1]>) {
+fn find_control_values(expr: ExprId, thir: &Thir<'_>, values: &mut SmallVec<[ExprId; 1]>) {
     let expr = unwrap_expr(expr, thir);
     match thir[expr].kind {
         ExprKind::If { then, else_opt, .. } => {
-            find_return_values(then, thir, values);
-            find_return_values(else_opt.unwrap(), thir, values);
+            find_control_values(then, thir, values);
+            find_control_values(else_opt.unwrap(), thir, values);
         }
         ExprKind::Block { block } => {
             let block = &thir.blocks[block];
             // `block.expr` can be `None` when a statement in the block diverges.
             if let Some(expr) = block.expr {
-                find_return_values(expr, thir, values);
+                find_control_values(expr, thir, values);
             }
         }
         _ => {
@@ -905,6 +892,22 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             let TerminatorKind::Call { destination, .. } = k else { return false };
             destination.ty(&self.body.local_decls, self.tcx).ty == self.thir[expr_id].ty
         })
+    }
+
+    fn find_control_value_locations(&self, value: ExprId) -> Option<Locations> {
+        let mut values = smallvec![];
+        find_control_values(value, self.thir, &mut values);
+        let mut locations = smallvec![];
+        for value in values {
+            let location = if matches!(self.thir[value].kind, ExprKind::Call { .. }) {
+                self.find_call_location(value)
+                    .or_else(|| self.find_transmute_location(value))
+            } else {
+                self.find_rvalue_location(value, |_| true)
+            }?;
+            locations.push(location);
+        }
+        Some(locations)
     }
 
     fn find_transmute_location(&self, expr_id: ExprId) -> Option<Location> {

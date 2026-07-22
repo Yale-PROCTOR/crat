@@ -60,21 +60,24 @@ impl<'tcx> AstToHirMapper<'tcx> {
     ) {
         let mut i = 0;
         for hitem in hitems {
-            if !expanded
-                && self
-                    .tcx
-                    .is_automatically_derived(hitem.owner_id.to_def_id())
-            {
-                continue;
+            if !expanded {
+                let hitem = self.tcx.hir_item(*hitem);
+                if hitem.span.is_dummy()
+                    || self
+                        .tcx
+                        .is_automatically_derived(hitem.owner_id.to_def_id())
+                {
+                    continue;
+                }
             }
             let item = items[i].as_mut();
             let hitem = self.tcx.hir_item(*hitem);
-            self.map_item_to_item(item, hitem);
+            self.map_item_to_item(item, hitem, expanded);
             i += 1;
         }
     }
 
-    fn map_item_to_item(&mut self, item: &mut Item, hitem: &hir::Item<'tcx>) {
+    fn map_item_to_item(&mut self, item: &mut Item, hitem: &hir::Item<'tcx>, expanded: bool) {
         self.add_global(&mut item.id, hitem.owner_id.def_id);
         match &mut item.kind {
             ItemKind::ExternCrate(symbol, ident) => {
@@ -150,8 +153,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 let ModKind::Loaded(items, _, _, _) = mod_kind else { panic!() };
                 let hir::ItemKind::Mod(hident, hmod) = hitem.kind else { panic!() };
                 assert_eq!(*ident, hident);
-                // We assume that submodules exist only in expanded ASTs.
-                self.map_items_to_items(items, hmod.item_ids, true);
+                self.map_items_to_items(items, hmod.item_ids, expanded);
             }
             ItemKind::ForeignMod(ForeignMod { items, .. }) => {
                 let hir::ItemKind::ForeignMod { items: hitems, .. } = hitem.kind else { panic!() };
@@ -1028,7 +1030,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
             StmtKind::Item(item) => {
                 let hir::StmtKind::Item(item_id) = hstmt.kind else { panic!() };
                 let hitem = self.tcx.hir_item(item_id);
-                self.map_item_to_item(item, hitem);
+                self.map_item_to_item(item, hitem, true);
             }
             StmtKind::Expr(expr) => {
                 let hir::StmtKind::Expr(hexpr) = hstmt.kind else { panic!() };

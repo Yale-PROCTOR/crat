@@ -332,6 +332,40 @@ fn test_expr_loop() {
 }
 
 #[test]
+fn test_thir_to_mir_valued_break() {
+    compilation::run_compiler_on_str(
+        "fn f(flag: bool) -> i32 { loop { break if flag { 1 } else { 2 }; } }",
+        |tcx| {
+            let def_id = tcx
+                .hir_free_items()
+                .find_map(|item_id| {
+                    let item = tcx.hir_item(item_id);
+                    matches!(item.kind, hir::ItemKind::Fn { ident, .. } if ident.as_str() == "f")
+                        .then_some(item.owner_id.def_id)
+                })
+                .unwrap();
+            let mapping = map_thir_to_mir(def_id, false, tcx);
+            let (thir, _) = tcx.thir_body(def_id).unwrap();
+            let thir = thir.borrow();
+            let valued_breaks = thir
+                .exprs
+                .iter_enumerated()
+                .filter(|(_, expr)| {
+                    matches!(
+                        expr.kind,
+                        rustc_middle::thir::ExprKind::Break { value: Some(_), .. }
+                    )
+                })
+                .map(|(expr_id, _)| expr_id)
+                .collect::<Vec<_>>();
+            assert_eq!(valued_breaks.len(), 1);
+            assert_eq!(mapping.expr_to_locs[&valued_breaks[0]].len(), 2);
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_expr_match() {
     run_test(
         "
