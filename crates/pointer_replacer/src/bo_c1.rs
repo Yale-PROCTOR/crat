@@ -3140,7 +3140,7 @@ fn nb5l2_anchor<'tcx>(
 ) {
     use crate::analyses::borrow_ownership::{
         CrateCtxt,
-        borrow_verify::{self, verify_to_fixpoint_counting},
+        borrow_verify::{self, RepairMode, verify_to_fixpoint_counting},
         coherence::add_coherence,
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
@@ -3158,8 +3158,10 @@ fn nb5l2_anchor<'tcx>(
         let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
         add_coherence(&solver, &slots, g, &body);
     }
-    let ((model, _stats), events) = borrow_verify::with_capture(|| {
-        verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+    let ((model, _stats), events) = RepairMode::with_override(RepairMode::ModeA, || {
+        borrow_verify::with_capture(|| {
+            verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+        })
     });
     let model = model.expect("fixture must accept under Mode-A");
     // FULL-anchor anti-drift: the accepted model must satisfy model_accepts.
