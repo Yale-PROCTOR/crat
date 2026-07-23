@@ -112,6 +112,7 @@ impl ItemRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GenerationErrorKind {
     EmptyStatement,
+    FunctionLocalItem,
     NonBlockMatchArm,
     NestedControlPayload,
     AstHirMismatch,
@@ -392,6 +393,17 @@ struct Labeler<'a> {
 
 impl MutVisitor for Labeler<'_> {
     fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+        if let StmtKind::Item(item) = &stmt.kind {
+            self.error.get_or_insert_with(|| GenerationError {
+                kind: GenerationErrorKind::FunctionLocalItem,
+                function_path: self.function_path.to_owned(),
+                message: format!(
+                    "function-local {} items are unsupported",
+                    local_item_kind(item)
+                ),
+            });
+            return smallvec![stmt];
+        }
         if matches!(stmt.kind, StmtKind::Empty) {
             self.error.get_or_insert_with(|| GenerationError {
                 kind: GenerationErrorKind::EmptyStatement,
@@ -500,31 +512,27 @@ fn apply_target_signature(
 }
 
 fn is_supported_two_argument_main_0(function: &rustc_ast::Fn) -> bool {
-    function.ident.name.as_str() == "main_0"
-        && matches!(function.sig.header.safety, Safety::Unsafe(_))
-        && function.sig.decl.inputs.len() == 2
-        && normalized_type_string(&function.sig.decl.inputs[0].ty) == "core::ffi::c_int"
-        && normalized_type_string(&function.sig.decl.inputs[1].ty) == "*mut *mut core::ffi::c_char"
-        && matches!(
-            &function.sig.decl.output,
-            FnRetTy::Ty(ty) if normalized_type_string(ty) == "core::ffi::c_int"
-        )
+    function.ident.name.as_str() == "main_0" && function.sig.decl.inputs.len() == 2
 }
 
-fn normalized_type_string(ty: &Ty) -> String {
-    let mut ty = ty.clone();
-    TypeParenRemover.visit_ty(&mut ty);
-    pprust::ty_to_string(&ty)
-}
-
-struct TypeParenRemover;
-
-impl MutVisitor for TypeParenRemover {
-    fn visit_ty(&mut self, ty: &mut Ty) {
-        while let TyKind::Paren(inner) = &ty.kind {
-            *ty = (**inner).clone();
-        }
-        mut_visit::walk_ty(self, ty);
+fn local_item_kind(item: &Item) -> &'static str {
+    match item.kind {
+        ItemKind::Const(..) => "const",
+        ItemKind::Static(..) => "static",
+        ItemKind::Fn(..) => "function",
+        ItemKind::TyAlias(..) => "type alias",
+        ItemKind::Struct(..) => "struct",
+        ItemKind::Enum(..) => "enum",
+        ItemKind::Union(..) => "union",
+        ItemKind::Mod(..) => "module",
+        ItemKind::Use(..) => "use",
+        ItemKind::ExternCrate(..) => "extern crate",
+        ItemKind::ForeignMod(..) => "foreign",
+        ItemKind::Trait(..) => "trait",
+        ItemKind::Impl(..) => "impl",
+        ItemKind::MacroDef(..) => "macro definition",
+        ItemKind::MacCall(..) => "macro invocation",
+        _ => "other",
     }
 }
 

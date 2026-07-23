@@ -5,15 +5,13 @@ use std::{
 
 use rustc_ast::{
     AttrKind, Attribute, BindingMode, BlockCheckMode, ByRef, Crate, Expr, ExprKind, FnRetTy,
-    GenericParamKind, Item, ItemKind, Local, LocalKind, Mutability, Pat, PatKind, Stmt, StmtKind,
-    Ty, TyKind,
+    GenericParamKind, Item, ItemKind, Local, LocalKind, Pat, PatKind, Stmt, StmtKind, Ty, TyKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
-use smallvec::SmallVec;
 
 const SCHEMA_VERSION: u64 = 1;
 const TEMP_PREFIX: &str = "proctor_temp_var_";
@@ -340,9 +338,18 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id
         ));
     }
+    if let Some(item) = scan.items.first() {
+        return Err(format!(
+            "Expected skeleton for `{}` (item {}) contains a function-local {} item{}; every function-local item is unsupported.",
+            entry.name,
+            entry.id,
+            item.kind,
+            label_context(item.label)
+        ));
+    }
     if let Some(attribute) = scan.body_attributes.first() {
         return Err(format!(
-            "Expected skeleton for `{}` (item {}) contains unsupported body attribute `{}`{}; only canonical statement labels and exact attributes on local `const`/`static` items are allowed.",
+            "Expected skeleton for `{}` (item {}) contains unsupported body attribute `{}`{}; only canonical statement labels are allowed.",
             entry.name,
             entry.id,
             attribute.attribute,
@@ -365,20 +372,6 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
                 entry.name, entry.id, occurrence.label
             ));
         }
-    }
-    if let Some(item) = scan
-        .items
-        .iter()
-        .find(|item| !matches!(item.kind.as_str(), "const" | "static"))
-    {
-        let label = item
-            .label
-            .map(|label| format!(" at label {label}"))
-            .unwrap_or_default();
-        return Err(format!(
-            "Expected skeleton for `{}` (item {}) contains a function-local {} item{label}; only function-local `const` and `static` items are supported.",
-            entry.name, entry.id, item.kind
-        ));
     }
     validate_expected_block(body).map_err(|detail| {
         format!(
@@ -419,10 +412,12 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
         .generics
         .params
         .iter()
-        .any(|parameter| !parameter.bounds.is_empty())
-        || !function.generics.where_clause.predicates.is_empty()
+        .any(|parameter| !parameter.attrs.is_empty() || !parameter.bounds.is_empty())
+        || function.generics.where_clause.has_where_token
     {
-        return Err("generic bounds and where clauses are unsupported");
+        return Err(
+            "lifetime parameter attributes, generic bounds, and where clauses are unsupported",
+        );
     }
     Ok(())
 }
@@ -447,21 +442,10 @@ fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
             }
             Ok(())
         }
-        StmtKind::Item(item) => match &item.kind {
-            ItemKind::Const(constant) => {
-                if let Some(initializer) = &constant.expr {
-                    validate_expected_exact_item_expression(initializer)?;
-                }
-                Ok(())
-            }
-            ItemKind::Static(static_item) => {
-                if let Some(initializer) = &static_item.expr {
-                    validate_expected_exact_item_expression(initializer)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        },
+        StmtKind::Item(item) => Err(format!(
+            "function-local {} items are unsupported",
+            local_item_kind(item)
+        )),
         StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
             ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => {
                 validate_expected_payload(value)
@@ -470,36 +454,6 @@ fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
         },
         StmtKind::MacCall(_) => Ok(()),
         StmtKind::Empty => Err("empty statements are unsupported".to_owned()),
-    }
-}
-
-fn validate_expected_exact_item_expression(expression: &Expr) -> Result<(), String> {
-    struct MatchArmFinder {
-        invalid_arm: Option<usize>,
-    }
-
-    impl<'ast> Visitor<'ast> for MatchArmFinder {
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            if let ExprKind::Match(_, arms, _) = &expression.kind
-                && let Some((index, _)) = arms.iter().enumerate().find(|(_, arm)| {
-                    !arm.body
-                        .as_ref()
-                        .is_some_and(|body| matches!(body.kind, ExprKind::Block(..)))
-                })
-            {
-                self.invalid_arm.get_or_insert(index);
-                return;
-            }
-            visit::walk_expr(self, expression);
-        }
-    }
-
-    let mut finder = MatchArmFinder { invalid_arm: None };
-    finder.visit_expr(expression);
-    if let Some(index) = finder.invalid_arm {
-        Err(format!("match arm {index} must have a block body"))
-    } else {
-        Ok(())
     }
 }
 
@@ -799,10 +753,6 @@ fn suppress_dependent_cascades(
         "existing_binding_mode_mismatch",
         "local_type_mismatch",
         "local_type_presence_mismatch",
-        "missing_existing_item",
-        "duplicate_existing_item",
-        "existing_item_location_mismatch",
-        "existing_item_structure_mismatch",
         "unexpected_nested_item",
         "temporary_outside_expansion_group",
     ];
@@ -877,6 +827,19 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
     let expected_params = &expected_fn.sig.decl.inputs;
     let result_params = &result_fn.sig.decl.inputs;
     let mut errors = vec![];
+    let expected_generics = lifetime_generic_declaration(&expected_fn.generics);
+    let result_generics = lifetime_generic_declaration(&result_fn.generics);
+    if expected_generics != result_generics {
+        errors.push(error(
+            "generic_parameter_mismatch",
+            function_message(
+                expected,
+                format!(
+                    "expected lifetime-generic declaration `{expected_generics}` but observed `{result_generics}`; copy the target skeleton's complete lifetime-generic declaration"
+                ),
+            ),
+        ));
+    }
     if expected_params.len() != result_params.len() {
         errors.push(error(
             "parameter_count_mismatch",
@@ -940,6 +903,13 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
         ));
     }
     errors
+}
+
+fn lifetime_generic_declaration(generics: &rustc_ast::Generics) -> String {
+    let mut item = utils::item!("fn __proctor_generic_probe() {{}}");
+    let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
+    function.generics = generics.clone();
+    pprust::item_to_string(&item)
 }
 
 fn simple_pattern_name(pat: &Pat) -> Option<&str> {
@@ -1018,7 +988,6 @@ struct BindingDecl {
     by_ref: bool,
     explicit_type: Option<String>,
     label: Option<u32>,
-    inside_exact_item: bool,
     order: usize,
 }
 
@@ -1026,10 +995,7 @@ struct BindingDecl {
 struct NestedItemDecl {
     name: String,
     kind: String,
-    anchor: String,
     label: Option<u32>,
-    normalized: String,
-    order: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1058,7 +1024,6 @@ struct BodyScanner {
     unlabeled_statements: Vec<String>,
     skip_expr_attrs: bool,
     root_attribute_spans: HashSet<(u32, u32)>,
-    exact_item_depth: usize,
     next_declaration_order: usize,
 }
 
@@ -1078,7 +1043,6 @@ impl BodyScanner {
             unlabeled_statements: vec![],
             skip_expr_attrs: false,
             root_attribute_spans: HashSet::new(),
-            exact_item_depth: 0,
             next_declaration_order: 0,
         }
     }
@@ -1125,7 +1089,6 @@ impl BodyScanner {
                 by_ref,
                 explicit_type: explicit_type.map(canonical_type),
                 label: self.current_label,
-                inside_exact_item: self.exact_item_depth > 0,
                 order: self.next_declaration_order,
             });
             self.next_declaration_order += 1;
@@ -1234,35 +1197,11 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             .map(|ident| ident.to_string())
             .unwrap_or_else(|| "<anonymous>".to_owned());
         self.items.push(NestedItemDecl {
-            name: name.clone(),
+            name,
             kind: kind.to_owned(),
-            anchor: self.path(),
             label: self.current_label,
-            normalized: normalized_local_item(item),
-            order: self.next_declaration_order,
         });
         self.next_declaration_order += 1;
-        match &item.kind {
-            ItemKind::Const(constant) => {
-                if let Some(expr) = &constant.expr {
-                    self.exact_item_depth += 1;
-                    self.with_path(format!("const `{name}` initializer"), |this| {
-                        this.visit_expr(expr)
-                    });
-                    self.exact_item_depth -= 1;
-                }
-            }
-            ItemKind::Static(static_item) => {
-                if let Some(expr) = &static_item.expr {
-                    self.exact_item_depth += 1;
-                    self.with_path(format!("static `{name}` initializer"), |this| {
-                        this.visit_expr(expr)
-                    });
-                    self.exact_item_depth -= 1;
-                }
-            }
-            _ => {}
-        }
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
@@ -1373,9 +1312,6 @@ impl<'ast> Visitor<'ast> for BodyScanner {
     }
 
     fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
-        if self.exact_item_depth > 0 {
-            return;
-        }
         collect_temp_symbols(&mac.args.tokens, &mut |name| {
             self.macro_temporaries.push(TempReference {
                 name,
@@ -1564,61 +1500,15 @@ fn local_item_kind(item: &Item) -> &'static str {
         ItemKind::Struct(..) => "struct",
         ItemKind::Enum(..) => "enum",
         ItemKind::Union(..) => "union",
+        ItemKind::Mod(..) => "module",
         ItemKind::Use(..) => "use",
+        ItemKind::ExternCrate(..) => "extern crate",
+        ItemKind::ForeignMod(..) => "foreign",
+        ItemKind::Trait(..) => "trait",
+        ItemKind::Impl(..) => "impl",
         ItemKind::MacroDef(..) => "macro definition",
         ItemKind::MacCall(..) => "macro invocation",
         _ => "other",
-    }
-}
-
-fn normalized_local_item(item: &Item) -> String {
-    let mut item = item.clone();
-    LocalItemNormalizer.visit_item(&mut item);
-    pprust::item_to_string(&item)
-}
-
-struct LocalItemNormalizer;
-
-impl MutVisitor for LocalItemNormalizer {
-    fn visit_item(&mut self, item: &mut Item) {
-        item.attrs
-            .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor));
-        mut_visit::walk_item(self, item);
-    }
-
-    fn visit_expr(&mut self, expr: &mut Expr) {
-        expr.attrs
-            .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor));
-        mut_visit::walk_expr(self, expr);
-    }
-
-    fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
-        match &mut stmt.kind {
-            StmtKind::Let(local) => local
-                .attrs
-                .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor)),
-            StmtKind::Item(item) => item
-                .attrs
-                .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor)),
-            StmtKind::Expr(expr) | StmtKind::Semi(expr) => expr
-                .attrs
-                .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor)),
-            StmtKind::MacCall(mac) => mac
-                .attrs
-                .retain(|attr| matches!(parse_label_attribute(attr), LabelAttribute::NotProctor)),
-            StmtKind::Empty => {}
-        }
-        mut_visit::walk_flat_map_stmt(self, stmt)
-    }
-
-    fn visit_pat(&mut self, pat: &mut Pat) {
-        if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind {
-            *mutability = Mutability::Not;
-            if let ByRef::Yes(reference_mutability) = by_ref {
-                *reference_mutability = Mutability::Not;
-            }
-        }
-        mut_visit::walk_pat(self, pat);
     }
 }
 
@@ -1679,11 +1569,7 @@ fn validate_declarations(
             .filter_map(|parameter| simple_pattern_name(&parameter.pat)),
     );
 
-    for expected_binding in expected_scan
-        .bindings
-        .iter()
-        .filter(|binding| !binding.inside_exact_item)
-    {
+    for expected_binding in &expected_scan.bindings {
         let exact = result_scan
             .bindings
             .iter()
@@ -1722,7 +1608,6 @@ fn validate_declarations(
                         && !expected_scan
                             .bindings
                             .iter()
-                            .filter(|binding| !binding.inside_exact_item)
                             .any(|candidate| same_binding_position(candidate, result))
                 })
                 .map(|(index, _)| index)
@@ -1840,9 +1725,6 @@ fn validate_declarations(
         if matched_result_bindings.contains(&index) {
             continue;
         }
-        if result_binding.inside_exact_item {
-            continue;
-        }
         if expected_names.contains(result_binding.name.as_str()) {
             temporary_errors.push(error(
                 "invalid_generated_binding_name",
@@ -1869,156 +1751,21 @@ fn validate_declarations(
         }
     }
 
-    enum ItemAssociation {
-        Exact(usize),
-        Duplicate(Vec<usize>),
-        Unmatched,
-    }
-
-    let mut associations = vec![];
-    let mut matched_result_items = HashSet::new();
-    for expected_item in &expected_scan.items {
-        let exact = result_scan
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                item.name == expected_item.name
-                    && item.label == expected_item.label
-                    && item.anchor == expected_item.anchor
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let association = match exact.as_slice() {
-            [] => ItemAssociation::Unmatched,
-            [index] => ItemAssociation::Exact(*index),
-            _ => ItemAssociation::Duplicate(exact),
-        };
-        match &association {
-            ItemAssociation::Exact(index) => {
-                matched_result_items.insert(*index);
-            }
-            ItemAssociation::Duplicate(indices) => {
-                matched_result_items.extend(indices);
-            }
-            ItemAssociation::Unmatched => {}
-        }
-        associations.push(association);
-    }
-
-    for (expected_index, expected_item) in expected_scan.items.iter().enumerate() {
-        let index = match &associations[expected_index] {
-            ItemAssociation::Exact(index) => *index,
-            ItemAssociation::Duplicate(indices) => {
-                expected_errors.push((expected_item.order, error(
-                    "duplicate_existing_item",
-                    function_message(
-                        expected,
-                        format!(
-                            "existing local item `{}` is declared more than once{}; preserve it exactly once",
-                            expected_item.name,
-                            label_context(expected_item.label)
-                        ),
-                    ),
-                )));
-                debug_assert!(indices.len() > 1);
-                continue;
-            }
-            ItemAssociation::Unmatched => {
-                let same_name = result_scan
-                    .items
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, item)| {
-                        !matched_result_items.contains(index) && item.name == expected_item.name
-                    })
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                if same_name.is_empty() {
-                    expected_errors.push((
-                        expected_item.order,
-                        error(
-                            "missing_existing_item",
-                            function_message(
-                                expected,
-                                format!(
-                                    "existing local item `{}`{} is missing; restore it exactly",
-                                    expected_item.name,
-                                    label_context(expected_item.label)
-                                ),
-                            ),
-                        ),
-                    ));
-                    continue;
-                }
-                if same_name.len() > 1 {
-                    expected_errors.push((expected_item.order, error(
-                        "duplicate_existing_item",
-                        function_message(
-                            expected,
-                            format!(
-                                "existing local item `{}` is declared more than once; preserve it exactly once",
-                                expected_item.name
-                            ),
-                        ),
-                    )));
-                    matched_result_items.extend(same_name);
-                    continue;
-                }
-                let index = same_name[0];
-                matched_result_items.insert(index);
-                let observed = &result_scan.items[index];
-                expected_errors.push((expected_item.order, error(
-                    "existing_item_location_mismatch",
-                    function_message(
-                        expected,
-                        format!(
-                            "local item `{}` expected {} in `{}` but was observed {} in `{}`; restore its original expansion group and structural role",
-                            expected_item.name,
-                            label_context(expected_item.label),
-                            expected_item.anchor,
-                            label_context(observed.label),
-                            observed.anchor
-                        ),
-                    ),
-                )));
-                continue;
-            }
-        };
-        let observed = &result_scan.items[index];
-        if expected_item.normalized != observed.normalized {
-            expected_errors.push((expected_item.order, error(
-                "existing_item_structure_mismatch",
-                function_message(
-                    expected,
-                    format!(
-                        "local item `{}`{} differs from the target skeleton; preserve its kind, attributes, type, static mutability, and initializer exactly. Expected `{}`, observed `{}`",
-                        expected_item.name,
-                        label_context(expected_item.label),
-                        expected_item.normalized,
-                        observed.normalized
-                    ),
-                ),
-            )));
-        }
-    }
     expected_errors.sort_by_key(|(order, _)| *order);
     errors.extend(expected_errors.into_iter().map(|(_, error)| error));
-    for (index, item) in result_scan.items.iter().enumerate() {
-        if !matched_result_items.contains(&index) {
-            errors.push(error(
-                "unexpected_nested_item",
-                function_message(
-                    expected,
-                    format!(
-                        "unexpected function-local {} item `{}`{} was introduced; remove every new nested item",
-                        item.kind,
-                        item.name,
-                        label_context(item.label)
-                    ),
+    for item in &result_scan.items {
+        errors.push(error(
+            "unexpected_nested_item",
+            function_message(
+                expected,
+                format!(
+                    "unexpected function-local {} item `{}`{} was introduced; every function-local item is unsupported",
+                    item.kind,
+                    item.name,
+                    label_context(item.label)
                 ),
-            ));
-        }
+            ),
+        ));
     }
 }
 
@@ -3148,9 +2895,7 @@ fn validate_temporaries(
         .bindings
         .iter()
         .filter(|binding| {
-            !binding.inside_exact_item
-                && is_temp_name(&binding.name)
-                && !expected_names.contains(binding.name.as_str())
+            is_temp_name(&binding.name) && !expected_names.contains(binding.name.as_str())
         })
         .collect::<Vec<_>>();
     let mut counts = HashMap::<&str, usize>::new();

@@ -8,9 +8,12 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
 extern crate smallvec;
+extern crate thin_vec;
 
+mod item_replacer;
 mod skeleton;
 mod validator;
 
+pub use item_replacer::*;
 pub use skeleton::*;
 pub use validator::*;
