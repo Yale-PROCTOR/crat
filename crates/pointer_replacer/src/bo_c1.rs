@@ -5,7 +5,7 @@
 //! (tests.rs `collect_program` → `CrateSlots::build` → `CrateCtxt::new` →
 //! `KindSolver::new` → `emit_crate_ownership_constraints` → per-fn
 //! `add_coherence` → fixpoint with `is_mutable = true`) over the CROWN/Laertes
-//! benchmark programs in `benchmarks/rs/`, and reports per program: wall-clock,
+//! benchmark programs in `benchmarks/rs-crown/`, and reports per program: wall-clock,
 //! CEGAR rounds + commits, Ref/Raw/Owning counts, leaked sources, and
 //! decline/timeout/oom/panic classification. Also runs the production borrow
 //! baseline (`demote_pointers_iterative_with_fields` from all-Ref, the same
@@ -1914,33 +1914,220 @@ fn boc1_run_one() {
 // Orchestrator (spawns one worker process per program × mode).
 // ---------------------------------------------------------------------------
 
-/// CROWN/Laertes corpus present under `benchmarks/rs/`, smallest-first.
-/// (crown_name, dir_name, total .rs SLOC, is_extra). `uthash` is NOT in the
-/// CROWN 20 — kept as a marked extra. `lodepng` is the benchmark where CROWN
-/// lost to Laertes (key point of comparison for C3).
-const CORPUS: &[(&str, &str, usize, bool)] = &[
-    ("bst", "bst", 96, false),
-    ("avl", "avl", 121, false),
-    ("ht", "ht", 271, false),
-    ("buffer", "buffer-0.4.0", 1157, false),
-    ("quadtree", "quadtree-0.1.0", 1167, false),
-    ("urlparser", "urlparser", 1366, false),
-    ("robotfindskitten", "robotfindskitten", 1511, false),
-    ("genann", "genann-1.0.0", 1888, false),
-    ("rgba", "rgba", 2141, false),
-    ("libtree", "libtree-3.1.1", 2638, false),
-    ("libcsv", "libcsv", 3102, false),
-    ("json.h", "json.h", 3838, false),
-    ("lil", "lil", 5616, false),
-    ("bzip2", "bzip2", 14129, false),
-    ("lodepng", "lodepng", 14306, false),
-    ("heman", "heman", 15189, false),
-    ("libzahl", "libzahl-1.0", 17604, false),
-    ("tulipindicators", "tulipindicators", 24175, false),
-    ("binn", "binn-3.0", 64385, false),
-    ("uthash", "uthash", 82289, true),
-    ("brotli", "brotli-1.0.9", 129451, false),
+/// Evaluation corpus under `benchmarks/rs-crown/`, smallest-first by measured Rust SLOC.
+/// SLOC is cloc 2.00's `code` total over each program's `.rs` files, excluding `build.rs` and
+/// `target/`, with duplicate files counted. The development boundary is inclusive of brotli.
+#[derive(Clone, Copy, Debug)]
+struct CorpusProgram {
+    name: &'static str,
+    lib_root: &'static str,
+    sloc: usize,
+}
+
+impl CorpusProgram {
+    fn input_path(self, root: &std::path::Path) -> std::path::PathBuf {
+        root.join("benchmarks/rs-crown")
+            .join(self.name)
+            .join(self.lib_root)
+    }
+}
+
+const BROTLI_SLOC: usize = 537_692;
+
+const fn is_resource_deferred(sloc: usize) -> bool {
+    sloc > BROTLI_SLOC
+}
+
+const CORPUS: &[CorpusProgram] = &[
+    CorpusProgram {
+        name: "bst",
+        lib_root: "lib.rs",
+        sloc: 102,
+    },
+    CorpusProgram {
+        name: "avl",
+        lib_root: "lib.rs",
+        sloc: 133,
+    },
+    CorpusProgram {
+        name: "ht",
+        lib_root: "lib.rs",
+        sloc: 251,
+    },
+    CorpusProgram {
+        name: "libcsv",
+        lib_root: "lib.rs",
+        sloc: 963,
+    },
+    CorpusProgram {
+        name: "buffer",
+        lib_root: "lib.rs",
+        sloc: 1_104,
+    },
+    CorpusProgram {
+        name: "quadtree",
+        lib_root: "lib.rs",
+        sloc: 1_184,
+    },
+    CorpusProgram {
+        name: "urlparser",
+        lib_root: "lib.rs",
+        sloc: 1_363,
+    },
+    CorpusProgram {
+        name: "robotfindskitten",
+        lib_root: "lib.rs",
+        sloc: 1_476,
+    },
+    CorpusProgram {
+        name: "rgba",
+        lib_root: "lib.rs",
+        sloc: 1_823,
+    },
+    CorpusProgram {
+        name: "genann",
+        lib_root: "lib.rs",
+        sloc: 2_302,
+    },
+    CorpusProgram {
+        name: "libtree",
+        lib_root: "lib.rs",
+        sloc: 2_578,
+    },
+    CorpusProgram {
+        name: "json.h",
+        lib_root: "lib.rs",
+        sloc: 3_847,
+    },
+    CorpusProgram {
+        name: "binn",
+        lib_root: "lib.rs",
+        sloc: 4_413,
+    },
+    CorpusProgram {
+        name: "libzahl",
+        lib_root: "lib.rs",
+        sloc: 4_642,
+    },
+    CorpusProgram {
+        name: "lil",
+        lib_root: "lib.rs",
+        sloc: 5_638,
+    },
+    CorpusProgram {
+        name: "heman",
+        lib_root: "lib.rs",
+        sloc: 13_750,
+    },
+    CorpusProgram {
+        name: "bzip2",
+        lib_root: "c2rust-lib.rs",
+        sloc: 13_967,
+    },
+    CorpusProgram {
+        name: "lodepng",
+        lib_root: "lib.rs",
+        sloc: 14_140,
+    },
+    CorpusProgram {
+        name: "tulipindicators",
+        lib_root: "c2rust-lib.rs",
+        sloc: 19_760,
+    },
+    CorpusProgram {
+        name: "brotli",
+        lib_root: "lib.rs",
+        sloc: BROTLI_SLOC,
+    },
 ];
+
+#[test]
+fn rs_crown_catalog_contract() {
+    let expected = [
+        ("bst", "lib.rs", 102),
+        ("avl", "lib.rs", 133),
+        ("ht", "lib.rs", 251),
+        ("libcsv", "lib.rs", 963),
+        ("buffer", "lib.rs", 1_104),
+        ("quadtree", "lib.rs", 1_184),
+        ("urlparser", "lib.rs", 1_363),
+        ("robotfindskitten", "lib.rs", 1_476),
+        ("rgba", "lib.rs", 1_823),
+        ("genann", "lib.rs", 2_302),
+        ("libtree", "lib.rs", 2_578),
+        ("json.h", "lib.rs", 3_847),
+        ("binn", "lib.rs", 4_413),
+        ("libzahl", "lib.rs", 4_642),
+        ("lil", "lib.rs", 5_638),
+        ("heman", "lib.rs", 13_750),
+        ("bzip2", "c2rust-lib.rs", 13_967),
+        ("lodepng", "lib.rs", 14_140),
+        ("tulipindicators", "c2rust-lib.rs", 19_760),
+        ("brotli", "lib.rs", 537_692),
+    ];
+    let actual: Vec<_> = CORPUS
+        .iter()
+        .map(|program| (program.name, program.lib_root, program.sloc))
+        .collect();
+
+    assert_eq!(CORPUS.len(), 20);
+    assert_eq!(actual.as_slice(), expected.as_slice());
+    assert_eq!(BROTLI_SLOC, 537_692);
+    assert!(!is_resource_deferred(BROTLI_SLOC));
+    assert!(is_resource_deferred(BROTLI_SLOC + 1));
+    assert!(CORPUS
+        .iter()
+        .all(|program| !is_resource_deferred(program.sloc)));
+
+    let root = orchestrate::workspace_root();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        assert!(
+            input.is_file(),
+            "missing rs-crown input for {}: {input:?}",
+            program.name
+        );
+        assert!(input.starts_with(root.join("benchmarks/rs-crown")));
+
+        let expected_root = if matches!(program.name, "bzip2" | "tulipindicators") {
+            "c2rust-lib.rs"
+        } else {
+            "lib.rs"
+        };
+        assert_eq!(
+            input.file_name().and_then(|name| name.to_str()),
+            Some(expected_root)
+        );
+    }
+}
+
+#[test]
+fn rs_crown_report_contract() {
+    let mut row = report::Row::default();
+    row.set("program", "bst");
+    row.set("status", "ok");
+    row.set("repair", "mode_a");
+    row.set("z3_full_version", "test-version");
+    row.set("sources_leaked_sel", 1);
+    row.set("sinks_leaked", 2);
+    row.set("s23_stores_owned", 3);
+    row.set("s23_owning_model", 4);
+
+    let rendered = render_report(&[row]);
+    assert!(rendered.contains("repair=mode_a; smt.random_seed=0; sat.random_seed=0"));
+    assert!(rendered.contains("z3_full_version=test-version"));
+    for column in [
+        "sources_leaked_sel",
+        "sinks_leaked",
+        "s23_stores_owned",
+        "s23_owning_model",
+    ] {
+        assert!(
+            rendered.contains(column),
+            "missing report column {column}:\n{rendered}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod orchestrate {
@@ -2180,61 +2367,70 @@ fn boc1_corpus() {
     let mut raw_rows: Vec<Row> = Vec::new();
     let mut merged: Vec<Row> = Vec::new();
 
-    for &(crown_name, dir_name, sloc, extra) in CORPUS {
+    for &program in CORPUS {
         if let Some(only) = &only
-            && !only.iter().any(|p| p == crown_name || p == dir_name)
+            && !only.iter().any(|p| p == program.name)
         {
             continue;
         }
-        let input = root.join("benchmarks/rs").join(dir_name).join("c2rust-lib.rs");
+        let input = program.input_path(&root);
         assert!(input.is_file(), "missing crate root {input:?}");
 
-        eprintln!("[boc1] {crown_name} ({dir_name}, {sloc} SLOC): bo mode...");
-        let bo = run_child(crown_name, &input, "bo", timeout);
-
         let mut m = Row::default();
-        m.set("program", crown_name);
-        m.set("dir", dir_name);
-        m.set("sloc", sloc);
-        if extra {
-            m.set("extra", "yes");
-        }
-        m.set("status", &bo.status);
-        m.set("wall_s", format!("{:.1}", bo.wall_s));
-        if let Some(row) = &bo.row {
-            for (k, v) in &row.0 {
-                if !matches!(k.as_str(), "program" | "mode" | "status") {
-                    m.set(k, v);
-                }
-            }
-            raw_rows.push(row.clone());
-        }
-        if !bo.note.is_empty() {
-            m.set("note", &bo.note);
-        }
+        m.set("program", program.name);
+        m.set("dir", program.name);
+        m.set("sloc", program.sloc);
 
-        if prod_enabled {
-            eprintln!("[boc1] {crown_name}: prod mode...");
-            let prod = run_child(crown_name, &input, "prod", prod_timeout);
-            m.set("prod_status", &prod.status);
-            m.set("prod_wall_s", format!("{:.1}", prod.wall_s));
-            if let Some(row) = &prod.row {
-                for key in ["n_slots_d0", "n_demoted_prod", "n_ref_prod", "t_prod_s"] {
-                    if let Some(v) = row.get(key) {
-                        m.set(key, v);
+        if is_resource_deferred(program.sloc) {
+            m.set("status", "resource-deferred");
+            m.set("note", format!("sloc_gt_brotli_{BROTLI_SLOC}"));
+            eprintln!(
+                "[boc1] {} ({}, {} SLOC): resource-deferred (> brotli {})",
+                program.name, program.lib_root, program.sloc, BROTLI_SLOC
+            );
+        } else {
+            eprintln!(
+                "[boc1] {} ({}, {} SLOC): bo mode...",
+                program.name, program.lib_root, program.sloc
+            );
+            let bo = run_child(program.name, &input, "bo", timeout);
+            m.set("status", &bo.status);
+            m.set("wall_s", format!("{:.1}", bo.wall_s));
+            if let Some(row) = &bo.row {
+                for (k, v) in &row.0 {
+                    if !matches!(k.as_str(), "program" | "mode" | "status") {
+                        m.set(k, v);
                     }
                 }
                 raw_rows.push(row.clone());
             }
-            if let (Some(bo_ref), Some(prod_ref)) = (
-                m.get("n_ref_d0").and_then(|v| v.parse::<i64>().ok()),
-                m.get("n_ref_prod").and_then(|v| v.parse::<i64>().ok()),
-            ) {
-                m.set("d_ref_d0", bo_ref - prod_ref);
+            if !bo.note.is_empty() {
+                m.set("note", &bo.note);
+            }
+
+            if prod_enabled {
+                eprintln!("[boc1] {}: prod mode...", program.name);
+                let prod = run_child(program.name, &input, "prod", prod_timeout);
+                m.set("prod_status", &prod.status);
+                m.set("prod_wall_s", format!("{:.1}", prod.wall_s));
+                if let Some(row) = &prod.row {
+                    for key in ["n_slots_d0", "n_demoted_prod", "n_ref_prod", "t_prod_s"] {
+                        if let Some(v) = row.get(key) {
+                            m.set(key, v);
+                        }
+                    }
+                    raw_rows.push(row.clone());
+                }
+                if let (Some(bo_ref), Some(prod_ref)) = (
+                    m.get("n_ref_d0").and_then(|v| v.parse::<i64>().ok()),
+                    m.get("n_ref_prod").and_then(|v| v.parse::<i64>().ok()),
+                ) {
+                    m.set("d_ref_d0", bo_ref - prod_ref);
+                }
             }
         }
 
-        eprintln!("[boc1] {crown_name}: {}", report::to_kv_line(&m));
+        eprintln!("[boc1] {}: {}", program.name, report::to_kv_line(&m));
         merged.push(m);
 
         // Persist incrementally so partial sweeps still leave artifacts. Line 1 is the
@@ -2268,6 +2464,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "n_raw",
         "n_own",
         "n_ref_d0",
+        "n_own_d0",
         "n_ref_shared_d0",
         "n_ref_mut_d0",
         "mut_facts",
@@ -2276,27 +2473,48 @@ fn render_report(merged: &[report::Row]) -> String {
         "d_ref_d0",
         "sources_total",
         "sources_leaked",
+        "sources_leaked_sel",
         "sinks_total",
         "sinks_leaked",
+        "s23_stores_owned",
+        "s23_owning_model",
+        "s23_blocked",
         "decline_reason",
         "core_families",
         "core_minimized",
         "prod_status",
     ];
-    let mut out = String::from("# C1-lite BO corpus report\n\n");
+    let repair = merged
+        .iter()
+        .find_map(|row| row.get("repair"))
+        .unwrap_or("pending");
+    let z3_version = merged
+        .iter()
+        .find_map(|row| row.get("z3_full_version"))
+        .unwrap_or("pending");
+    let deferred = CORPUS
+        .iter()
+        .filter(|program| is_resource_deferred(program.sloc))
+        .count();
+    let mut out = String::from("# rs-crown BO baseline report\n\n");
+    out.push_str(&format!(
+        "Run contract: repair={repair}; smt.random_seed=0; sat.random_seed=0; \
+         z3_full_version={z3_version}.\n\n\
+         Corpus: the 20 programs in `benchmarks/rs-crown/`, smallest-first by Rust SLOC. \
+         Brotli is the inclusive development boundary at {BROTLI_SLOC} SLOC; \
+         resource-deferred means strictly greater than brotli ({deferred} programs in this catalog).\n\n"
+    ));
     out.push_str(
-        "Corpus: CROWN 20 (Laertes set) present in `benchmarks/rs/`, smallest-first, plus \
-         `uthash` as a marked extra. Name mapping: binn→binn-3.0, buffer→buffer-0.4.0, \
-         quadtree→quadtree-0.1.0, genann→genann-1.0.0, libtree→libtree-3.1.1, \
-         libzahl→libzahl-1.0, brotli→brotli-1.0.9 (others 1:1). `lodepng` is the benchmark \
-         where CROWN lost to Laertes — key for the C3 head-to-head.\n\n\
-         `d_ref_d0` = BO depth-0 local Ref count minus the production baseline's \
+        "`d_ref_d0` = BO depth-0 local Ref count minus the optional production baseline's \
          (`demote_pointers_iterative_with_fields` from all-Ref, same accounting). \
          `decline_reason` separates non-source UNSAT from z3 Unknown (harness-side \
          phase-1 replay). `sources_total`/`sources_leaked` count malloc-source SLOTS \
          (propagation-closed over copies/moves/casts, so one allocation can contribute \
          several slots, e.g. its `free` call-arg temp); a slot is leaked when its final \
-         kind is not Owning. `commits_conflict` counts exclusion assertions exactly as the real \
+         kind is not Owning. `sources_leaked_sel` and `sinks_leaked` count dropped source/sink \
+         SELECTORS. `s23_stores_owned` counts field owning-store candidates; \
+         `s23_owning_model` counts those emerging Owning in an accepted model. \
+         `commits_conflict` counts exclusion assertions exactly as the real \
          loop's `committed` does — the same slot can be committed by several conflicts \
          in one round, so this is commit OPERATIONS, not unique slots. `d_ref_d0` is a \
          Ref-count delta, not a pure borrow-precision delta: BO's non-Ref includes \
