@@ -298,11 +298,14 @@ mod run {
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
             CrateCtxt, SafeMonoMode, SlotKind,
-            borrow_verify::verify_to_fixpoint,
-            coherence::{add_coherence, field_ownership_candidates},
+            borrow_verify::{
+                RepairMode, model_accepts, slotref_key, verify_to_fixpoint,
+                verify_to_fixpoint_counting, with_capture,
+            },
+            coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
             emit_crate_ownership_constraints,
-            mutability_facts::{MutFacts, MutFactsMode},
+            mutability_facts::{MutFacts, MutFactsMode, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
             solver::{KindSolver, Selectors, SlotRef},
@@ -473,6 +476,286 @@ mod run {
             nref_mu as i64 - nref_full as i64,
             nref_d0_mu as i64 - nref_d0_full as i64,
         )
+    }
+
+    /// §NB5-L2 commit-necessity probe verdict for one leave-one-out.
+    pub(crate) enum ProbeOutcome {
+        /// The re-solve without this commit ACCEPTS with `slot_i` still `Ref` — the commit was
+        /// removable (given the other demotions asserted on the base).
+        OverPin,
+        /// The re-solve declined, or left `slot_i` non-`Ref`, or failed to accept — counted necessary.
+        Necessary,
+    }
+
+    /// §NB5-L2 — build `run_bo`'s EXACT solver base ONCE: `emit_crate_ownership_constraints(origins)`
+    /// with the REAL seed (NOT `solve_with_demotion`'s `&empty`) → `add_coherence` per fn →
+    /// `constrain_field_ownership` (the field constraints the loop adds before its first solve). The
+    /// audit reuses this base across every probe via `push_scope`/`pop_scope`, so brotli's ~683-commit
+    /// exhaustive leave-one-out pays the emit cost once, not per probe. `None` on emit error.
+    fn build_probe_base(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+    ) -> Option<(KindSolver, Selectors)> {
+        let crate_ctxt = CrateCtxt::new(program);
+        let solver = KindSolver::new(slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
+        for &g in &program.functions {
+            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, slots, g, &body);
+        }
+        constrain_field_ownership(&solver, slots, program);
+        Some((solver, selectors))
+    }
+
+    /// §NB5-L2 — the leave-one-out primitive on a PREBUILT base (the ratified Q2 MECHANISM: ONE solve +
+    /// ONE validate, NOT a CEGAR re-run). Pushes a scope, asserts `¬ref(d)` for every `d ∈ demote`,
+    /// solves ONCE, validates ONCE, then pops — so the base is untouched for the next probe. Returns
+    /// true iff the model ACCEPTS (`model_accepts`) AND leaves `target` `Ref` (dropping `target`'s
+    /// commit still accepts with `target` a borrow).
+    ///
+    /// Rider 4 (push/pop determinism): reusing the incremental solver may tie-break OTHER slots
+    /// differently than a fresh `KindSolver` would, and `model_kinds_relaxing` may relax selectors
+    /// differently than the anchor fixpoint did. Neither matters: this is a CLASSIFICATION only
+    /// (accept ∧ `target`==`Ref`), never a model comparison — so do NOT "fix" it to fresh solves for a
+    /// parity that is irrelevant here.
+    fn probe_accepts_with_ref(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        base: &KindSolver,
+        selectors: &Selectors,
+        is_mutable: impl MutProvider + Copy,
+        demote: &[SlotRef],
+        target: SlotRef,
+    ) -> bool {
+        base.push_scope();
+        for &d in demote {
+            base.add_borrow_exclusion(Some(d), &[]);
+        }
+        let verdict = match base.model_kinds_relaxing(selectors) {
+            Some(model) => {
+                model.get(&target) == Some(&SlotKind::Ref)
+                    && model_accepts(program, slots, &model, is_mutable)
+            }
+            // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
+            None => false,
+        };
+        base.pop_scope();
+        verdict
+    }
+
+    /// §NB5-L2 — single-shot leave-one-out (build base + one probe). The audit driver builds the base
+    /// once and calls `probe_accepts_with_ref` directly; this wrapper keeps the calibration-test API
+    /// (`commit_set`, `i`) rebuilding the base per call, which is fine at test scale. `commit_set[i]` is
+    /// an OVER-PIN iff a solve over `commit_set \ {commit_set[i]}` accepts with `slot_i` `Ref`.
+    pub(crate) fn necessity_probe(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+        is_mutable: impl MutProvider + Copy,
+        commit_set: &[SlotRef],
+        i: usize,
+    ) -> ProbeOutcome {
+        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
+            return ProbeOutcome::Necessary;
+        };
+        let demote: Vec<SlotRef> = commit_set
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &c)| (j != i).then_some(c))
+            .collect();
+        if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, commit_set[i]) {
+            ProbeOutcome::OverPin
+        } else {
+            ProbeOutcome::Necessary
+        }
+    }
+
+    /// §NB5-L2 — format a slot for the over-pin inventory: `def_path::_local@dN` (locals) /
+    /// `def_path::fieldK@dN` (struct fields). The L2 RED inventory reads these back.
+    fn fmt_slot(program: &crate::utils::rustc::RustProgram, slots: &CrateSlots, s: SlotRef) -> String {
+        match s {
+            SlotRef::Local(fn_did, sid) => {
+                let sl = slots.fn_local_slots.get(&fn_did).map(|u| *u.slot(sid));
+                let (local, depth) = match sl.map(|s| (s.owner, s.depth)) {
+                    Some((SlotOwner::Local(l), d)) => (l.as_u32(), d),
+                    other => (u32::MAX, other.map_or(0, |(_, d)| d)),
+                };
+                format!("{}::_{}@d{}", program.tcx.def_path_str(fn_did.to_def_id()), local, depth)
+            }
+            SlotRef::Field(sid) => {
+                let sl = slots.field_slots.slot(sid);
+                match sl.owner {
+                    SlotOwner::Field(f) => format!(
+                        "{}::field{}@d{}",
+                        program.tcx.def_path_str(f.struct_did.to_def_id()),
+                        f.field_index,
+                        sl.depth
+                    ),
+                    SlotOwner::Local(_) => format!("field?@d{}", sl.depth),
+                }
+            }
+        }
+    }
+
+    /// §NB5-L2 commit-necessity audit driver — measure the L2 headroom Mode-A leaves (env-gated by
+    /// `CRAT_BOC1_NECESSITY_AUDIT`; called from `run_bo`). FULL-ANCHOR first: the audit's baseline IS
+    /// `run_bo`'s own accepted `model`, so only measure if it accepted, assert it satisfies
+    /// `model_accepts` (anti-drift), and record `na_anchor_nref[_d0]` for the post-run cross-check
+    /// against the merged NB5-L `mode_a` sweep row.
+    ///
+    /// Then TWO leave-one-out passes over the distinct commit set `C`, both EXHAUSTIVE (no sampling —
+    /// the base is emitted once and every probe reuses it via `push_scope`/`pop_scope`, so even brotli's
+    /// full `C` is affordable):
+    /// - **Independent** (`na_indep_overpins`): each `ci` tested against the full `C\{ci}`. NOT a bound
+    ///   and INCOMPARABLE with the gate number — it OVER-counts alternative-repair pairs (both reported
+    ///   though only one Ref is jointly recoverable, Codex F1) AND UNDER-counts joint recoveries (a slot
+    ///   removable only while other removed slots stay `Ref` is missed, since independent demotes them
+    ///   all — e.g. coherence-equated slots; this is why `na_overpins` can EXCEED `na_indep_overpins`,
+    ///   as on libtree 3 → 7). A labeled diagnostic for continuity with the pre-redesign partial; do
+    ///   NOT gate on it and do NOT assume any ≤/≥ relation to `na_overpins`.
+    /// - **Witnessed-joint greedy** (`na_overpins` — THE gate number): in ROUND ORDER (rider 3), retain
+    ///   all commits and test removing each given the CURRENT retained set (already-removed commits left
+    ///   un-demoted, so removability is tested GIVEN the recovered set); a success is made PERMANENT. The
+    ///   removed set is certified JOINTLY recoverable by a final witness solve (`na_joint_witnessed`:
+    ///   demote ONLY the final retained set → every removed slot `Ref` + accept) — a TRUE lower bound on
+    ///   recoverable Refs, sound regardless of any push/pop tie-breaking (the witness is the certificate).
+    ///   CAVEAT (rider 2): still blind to joint-ONLY pins (neither member individually removable given
+    ///   the retained set — greedy never enters), so "close the line" still carries "joint-only headroom
+    ///   unmeasured". Order-dependent: A witnessed lower bound, not THE maximum removable set; round order
+    ///   is the diagnostic choice (late-round commits sit on more accumulation — the round DISTRIBUTION
+    ///   of the removed set is a first-class output).
+    ///
+    /// Emits per-program counts + the `NAOVERPIN` slot inventory for the witnessed-joint set (rider 4:
+    /// runs under the seed-pinned worker env; the push/pop reuse is classification-only).
+    pub(crate) fn run_necessity_audit(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+        is_mutable: impl MutProvider + Copy,
+        model: &Option<FxHashMap<SlotRef, SlotKind>>,
+        events: &[(SlotRef, usize)],
+        row: &mut Row,
+    ) {
+        // FULL-ANCHOR: no anchor model ⇒ nothing to measure; surface it, never a silent skip.
+        let Some(model) = model else {
+            row.set("na_status", "anchor-declined");
+            return;
+        };
+        assert!(
+            model_accepts(program, slots, model, is_mutable),
+            "necessity audit: the anchor's accepted model must satisfy model_accepts (drift STOP)"
+        );
+        let (anchor_nref, anchor_nref_d0) = count_refs(model, slots);
+        row.set("na_anchor_nref", anchor_nref);
+        row.set("na_anchor_nref_d0", anchor_nref_d0);
+        // Distinct commit set C (dedup by slot, keep the FIRST round each slot was committed), then
+        // ROUND ORDER (round, slotref_key) — the greedy processing order (rider 3), deterministic.
+        let mut seen = FxHashSet::default();
+        let mut commit_set: Vec<(SlotRef, usize)> = Vec::new();
+        for &(s, r) in events {
+            if seen.insert(s) {
+                commit_set.push((s, r));
+            }
+        }
+        commit_set.sort_by(|a, b| (a.1, slotref_key(&a.0)).cmp(&(b.1, slotref_key(&b.0))));
+        let n = commit_set.len();
+        row.set("na_commits_total", n);
+        if n == 0 {
+            row.set("na_status", "no-commits");
+            row.set("na_indep_overpins", 0);
+            row.set("na_overpins", 0);
+            return;
+        }
+        // Emit the probe base ONCE; every probe reuses it via push/pop (rider 4 / cost).
+        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
+            row.set("na_status", "base-error");
+            return;
+        };
+        let slots_only: Vec<SlotRef> = commit_set.iter().map(|(s, _)| *s).collect();
+        let program_name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+
+        // --- Independent pass (over-count diagnostic; each ci vs the FULL C\{ci}). It is exactly `n`
+        // extra solves on top of the greedy pass, so for the largest programs it is the difference
+        // between feasible and not. `CRAT_BOC1_NA_GREEDY_ONLY` skips it (the GATE metric is the greedy
+        // witnessed-joint below; independent is only a labeled diagnostic — rider 5's "continuity" is
+        // about the small/mid programs, which keep both passes). Emits `na_indep_overpins=skipped`. ---
+        if std::env::var_os("CRAT_BOC1_NA_GREEDY_ONLY").is_some() {
+            row.set("na_indep_overpins", "skipped");
+        } else {
+            let mut indep_overpins = 0usize;
+            for i in 0..n {
+                let demote: Vec<SlotRef> = (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
+                if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                    indep_overpins += 1;
+                }
+            }
+            row.set("na_indep_overpins", indep_overpins);
+        }
+
+        // --- Witnessed-joint greedy (THE gate number), round order. Buffer the removed set; the
+        // NAOVERPIN inventory + na_overpins publish ONLY after the joint witness certifies it (F1). ---
+        let mut retained = vec![true; n];
+        let mut removed: Vec<(SlotRef, usize)> = Vec::new();
+        for i in 0..n {
+            // Demote every STILL-retained commit except the candidate; the already-removed commits are
+            // left un-demoted (Ref-eligible), so removability is tested GIVEN the recovered set.
+            let demote: Vec<SlotRef> =
+                (0..n).filter(|&j| j != i && retained[j]).map(|j| slots_only[j]).collect();
+            if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                retained[i] = false;
+                removed.push(commit_set[i]);
+            }
+        }
+
+        // F1 (Codex): certify the JOINT property FAIL-CLOSED before publishing anything. HARD-PIN every
+        // removed slot `Ref` (not a passive optimum inspection — tie-breaking could otherwise miss a
+        // valid witness), demote ONLY the final retained set, and require an ACCEPTING model. On success
+        // the removed set is provably jointly recoverable → publish the gate number + inventory + `ok`.
+        // On failure (a sequential-removal hole, or the pins are UNSAT) the gate metric is SUPPRESSED and
+        // the status is `witness-failed` — a never-silent, never-trusted uncertified count.
+        let final_demote: Vec<SlotRef> = (0..n).filter(|&j| retained[j]).map(|j| slots_only[j]).collect();
+        base.push_scope();
+        for &(s, _) in &removed {
+            base.assume(s, SlotKind::Ref);
+        }
+        for &d in &final_demote {
+            base.add_borrow_exclusion(Some(d), &[]);
+        }
+        let witnessed = match base.model_kinds_relaxing(&selectors) {
+            // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
+            // only acceptance remains to check.
+            Some(m) => model_accepts(program, slots, &m, is_mutable),
+            // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
+            None => removed.is_empty(),
+        };
+        base.pop_scope();
+        row.set("na_joint_witnessed", witnessed);
+
+        if !witnessed {
+            // Fail-closed: suppress the gate metric; do NOT emit `na_overpins` or the inventory.
+            row.set("na_status", "witness-failed");
+            return;
+        }
+
+        // Certified. Publish the gate number, the RED inventory, and the round distribution.
+        row.set("na_overpins", removed.len());
+        for &(s, r) in &removed {
+            // Grep-able RED inventory (the `NBRCORE` pattern): one line per CERTIFIED over-pin.
+            eprintln!("NAOVERPIN {program_name} {} round={r}", fmt_slot(program, slots, s));
+        }
+        let mut by_round: FxHashMap<usize, usize> = FxHashMap::default();
+        for &(_, r) in &removed {
+            *by_round.entry(r).or_default() += 1;
+        }
+        let mut rounds: Vec<(usize, usize)> = by_round.into_iter().collect();
+        rounds.sort();
+        row.set(
+            "na_overpins_by_round",
+            rounds.iter().map(|(r, c)| format!("{r}:{c}")).collect::<Vec<_>>().join("/"),
+        );
+        row.set("na_status", "ok");
     }
 
     /// BO mode: the exact `assert_ownership_parity` construction, with the native fixpoint loop's
@@ -745,10 +1028,21 @@ mod run {
         // §NB5-M: native fork counters (the bo_c1 mirror is RETIRED — parity was proven at the NB5-M
         // gate, byte-identical to the NB5-Z baseline on all 19 both profiles). `verify_to_fixpoint_counting`
         // is the single CEGAR loop; `verify_to_fixpoint` is its model-only wrapper.
-        let (model, rstats) =
-            crate::analyses::borrow_ownership::borrow_verify::verify_to_fixpoint_counting(
-                &program, &slots, &solver, &selectors, &mut_facts,
-            );
+        // §NB5-L2: under `CRAT_BOC1_NECESSITY_AUDIT`, wrap the SAME solve in `with_capture` so Mode-A's
+        // `(slot, round)` commits are recorded — a side-channel, so `(model, rstats)` are byte-identical
+        // to the non-audit branch (the sweep numbers do not move whether or not the audit is on).
+        let audit = std::env::var_os("CRAT_BOC1_NECESSITY_AUDIT").is_some();
+        let ((model, rstats), captured) = if audit {
+            let (mr, events) = with_capture(|| {
+                verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
+            });
+            (mr, Some(events))
+        } else {
+            (
+                verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts),
+                None,
+            )
+        };
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
 
@@ -925,6 +1219,24 @@ mod run {
                 }
                 row.set("s23_owning_model", s23_owning_model);
                 row.set("s23_fields_raw", s23_fields_raw);
+            }
+        }
+
+        // §NB5-L2 commit-necessity audit (CRAT_BOC1_NECESSITY_AUDIT=1): leave-one-out over Mode-A's
+        // captured commit set → the over-pin count = L2 headroom (a LOWER BOUND). MEASUREMENT-ONLY, off
+        // by default; the `captured` events are `Some` only under the same gate.
+        if let Some(events) = captured {
+            // F3 (Codex): the audit measures Mode-A's commit set, and `with_capture` only records in the
+            // Mode-A commit branch — so under any other `CRAT_BO_REPAIR` the events would be empty and the
+            // audit would report a plausible-but-meaningless zero. Refuse it with an explicit status and no
+            // numeric audit fields, rather than contaminating a comparative sweep.
+            if rstats.repair != RepairMode::ModeA {
+                row.set("na_status", "wrong-repair-mode");
+            } else {
+                let t = Instant::now();
+                run_necessity_audit(&program, &slots, &origins, &mut_facts, &model, &events, &mut row);
+                row.set("t_necessity_s", secs(t.elapsed()));
+                phase("necessity_done", t0);
             }
         }
 
@@ -2807,6 +3119,256 @@ fn nb5l_cap_exhaustion_declines_not_panics() {
         }))
         .is_err();
         assert!(panicked, "Mode-A cap-exhaustion must PANIC (its linear bound is proven)");
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// §NB5-L2 commit-necessity audit — helper: run Mode-A to fixpoint capturing the distinct commit set
+/// `C` (dedup by slot, first-seen order) and the accepted model. Panics if the fixture declines.
+#[cfg(test)]
+fn nb5l2_anchor<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+) -> (
+    crate::utils::rustc::RustProgram<'tcx>,
+    crate::analyses::borrow_ownership::crate_slots::CrateSlots,
+    crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+    rustc_hash::FxHashMap<
+        crate::analyses::borrow_ownership::solver::SlotRef,
+        crate::analyses::borrow_ownership::SlotKind,
+    >,
+    Vec<(crate::analyses::borrow_ownership::solver::SlotRef, usize)>,
+) {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{self, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    let program = collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let origins = compute_origins(&program);
+    let crate_ctxt = CrateCtxt::new(&program);
+    let solver = KindSolver::new(&slots);
+    let (_s, sel) =
+        emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver).expect("emit");
+    for &g in &program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+        add_coherence(&solver, &slots, g, &body);
+    }
+    let ((model, _stats), events) = borrow_verify::with_capture(|| {
+        verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+    });
+    let model = model.expect("fixture must accept under Mode-A");
+    // FULL-anchor anti-drift: the accepted model must satisfy model_accepts.
+    assert!(
+        borrow_verify::model_accepts(&program, &slots, &model, true),
+        "anchor's accepted model must satisfy model_accepts (drift check)"
+    );
+    (program, slots, origins, model, events)
+}
+
+/// §NB5-L2 — distinct commit set (dedup by slot, first-seen order) from the raw `(slot, round)` events.
+#[cfg(test)]
+fn nb5l2_distinct(events: &[(crate::analyses::borrow_ownership::solver::SlotRef, usize)])
+    -> Vec<crate::analyses::borrow_ownership::solver::SlotRef> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    events.iter().map(|(s, _)| *s).filter(|s| seen.insert(*s)).collect()
+}
+
+/// §NB5-L2 — calibrate the probe's two verdicts deterministically on `single_req_cascade`.
+/// NECESSARY arm (singleton probe): probing `[ci]` at index 0 leaves the EMPTY commit set, so the
+/// re-solve reproduces the anchor's round-1 (pre-commit) state — which HAD a conflict (Mode-A
+/// committed ≥1), so it does NOT accept → NECESSARY. Guaranteed for any `ci`, no `|C|` dependence.
+/// OVER-PIN arm (injected): append a surviving-`Ref` slot (∉ `C`) to the FULL commit set and probe it
+/// — leaving it out keeps the real `C`, so the re-solve reproduces the anchor's ACCEPTING state with
+/// that slot `Ref` → OVER-PIN. Both arms fire; the OverPin assertion cannot pass vacuously.
+#[cfg(test)]
+#[test]
+fn nb5l2_probe_necessary_and_injected_overpin() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
+        let commit_set = nb5l2_distinct(&events);
+        assert!(!commit_set.is_empty(), "cascade must yield >=1 Mode-A commit");
+        // NECESSARY arm: singleton probe of any real commit → empty leave-one-out → conflict returns.
+        let singleton = [commit_set[0]];
+        assert!(
+            matches!(
+                run::necessity_probe(&program, &slots, &origins, true, &singleton, 0),
+                run::ProbeOutcome::Necessary
+            ),
+            "singleton probe of a genuine commit must be NECESSARY (∅ leave-one-out re-exposes the \
+             round-1 conflict)"
+        );
+        // OVER-PIN arm: inject a surviving-Ref slot (∉ C) as a spurious commit on the FULL set.
+        let injected = model
+            .iter()
+            .filter(|(_, k)| **k == SlotKind::Ref)
+            .map(|(s, _)| *s)
+            .find(|s| !commit_set.contains(s))
+            .expect("fixture must leave >=1 surviving Ref slot outside C");
+        let mut with_spurious = commit_set.clone();
+        with_spurious.push(injected);
+        let spurious_idx = with_spurious.len() - 1;
+        assert!(
+            matches!(
+                run::necessity_probe(&program, &slots, &origins, true, &with_spurious, spurious_idx),
+                run::ProbeOutcome::OverPin
+            ),
+            "a spurious ¬ref on a surviving Ref slot must probe OVER-PIN (dropping it still accepts, \
+             slot Ref)"
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// §NB5-L2 — the probe finds a GENUINE accumulation over-pin (not just an injected one).
+/// `single_req_cascade` drives Mode-A to `|C|=2`: the round-1 commit induces a second, but demoting
+/// only the second (keeping the first `Ref`) still accepts — so the first is a real over-pin. This is
+/// exactly the L2 headroom the audit measures, and it pins that a natural Mode-A commit set contains
+/// over-pins the probe detects. At least one real commit must probe OVER-PIN and at least one NECESSARY
+/// (an all-necessary or all-over-pin verdict here would signal the probe collapsed a distinction).
+#[cfg(test)]
+#[test]
+fn nb5l2_probe_finds_natural_accumulation_overpin() {
+    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let (program, slots, origins, _model, events) = nb5l2_anchor(tcx);
+        let commit_set = nb5l2_distinct(&events);
+        assert!(commit_set.len() >= 2, "cascade must yield >=2 commits (got {})", commit_set.len());
+        let (mut overpins, mut necessary) = (0usize, 0usize);
+        for i in 0..commit_set.len() {
+            match run::necessity_probe(&program, &slots, &origins, true, &commit_set, i) {
+                run::ProbeOutcome::OverPin => overpins += 1,
+                run::ProbeOutcome::Necessary => necessary += 1,
+            }
+        }
+        assert!(
+            overpins >= 1,
+            "the cascade must contain >=1 natural accumulation over-pin (found {overpins})"
+        );
+        assert!(
+            necessary >= 1,
+            "the cascade must retain >=1 necessary commit (found {necessary}) — else the probe \
+             collapsed the distinction"
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// §NB5-L2 — the witnessed-joint greedy set is a CERTIFIED lower bound: `na_joint_witnessed=true`
+/// (one solve with only the retained set demoted leaves EVERY removed slot `Ref` and accepts), and the
+/// count is bounded by `|C|`. The certificate — NOT any relation to the independent count — is the
+/// soundness property: whatever set the greedy commits to, the witness proves it is jointly recoverable.
+///
+/// Greedy and independent are INCOMPARABLE (do not assert `joint ≤ indep`): independent demotes ALL
+/// other commits at once, so it MISSES a slot recoverable only while other removed slots stay `Ref`
+/// (e.g. coherence-equated slots — demoting the partner forces the slot `¬ref`, but keeping it `Ref`
+/// does not). The greedy, un-demoting removals as it goes, captures those JOINT recoveries — so
+/// `joint > indep` occurs at corpus scale (libtree: indep 3, witnessed-joint 7, all certified). It can
+/// also be `<` if the greedy order spends a removal that blocks two others. The witness is what makes
+/// the count sound regardless of direction; the independent count is a labeled diagnostic only.
+#[cfg(test)]
+#[test]
+fn nb5l2_greedy_witnessed_joint_certified() {
+    let fixtures: [(&str, &str); 3] = [
+        (
+            "single_req_cascade",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }",
+        ),
+        (
+            "two_requirer",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let base = id(p); let a = id(base); let b = id(base); \
+             let w = p; *w = 9; *a + *b }",
+        ),
+        (
+            "asymmetric",
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+             unsafe fn f(p: *mut i32) -> i32 { let a = id(p); let b = id(p); let d = id(b); \
+             *a = 1; *b = 2; *d = 3; let w = p; *w = 4; *a + *b + *d }",
+        ),
+    ];
+    for (tag, code) in fixtures {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
+            let mut row = report::Row::default();
+            run::run_necessity_audit(&program, &slots, &origins, true, &Some(model), &events, &mut row);
+            let get = |k: &str| {
+                row.get(k).unwrap_or_else(|| panic!("{tag}: audit did not emit {k}")).to_string()
+            };
+            assert_eq!(get("na_status"), "ok", "{tag}: audit status");
+            // The CERTIFICATE: the greedy removed set is jointly realizable (all removed Ref + accept).
+            assert_eq!(
+                get("na_joint_witnessed"),
+                "true",
+                "{tag}: the greedy removed set must be jointly witnessed (all removed Ref + accept)"
+            );
+            let joint: usize = get("na_overpins").parse().unwrap();
+            let total: usize = get("na_commits_total").parse().unwrap();
+            assert!(joint <= total, "{tag}: witnessed-joint ({joint}) must be <= |C| ({total})");
+            // Both counts are emitted (rider 5) — the independent as a labeled diagnostic.
+            assert!(row.get("na_indep_overpins").is_some(), "{tag}: independent count must be emitted");
+        })
+        .unwrap_or_else(|e| e.raise())
+    }
+}
+
+/// §NB5-L2 (Codex F3) — the audit capture is Mode-A-ONLY: under `CRAT_BO_REPAIR=lemmas` the CEGAR loop
+/// takes the `Lemmas` branch, which does NOT record commit events, so `with_capture` returns empty. The
+/// `run_bo` guard rests on this — it refuses `repair != ModeA` with `na_status=wrong-repair-mode` rather
+/// than publishing a plausible-but-meaningless zero audit. Mode-A on the same fixture DOES capture.
+#[cfg(test)]
+#[test]
+fn nb5l2_capture_is_mode_a_only() {
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{self, RepairMode, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    let code = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+                unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let run_mode = |mode: RepairMode| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_s, sel) =
+                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver).expect("emit");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            let ((_model, stats), events) = RepairMode::with_override(mode, || {
+                borrow_verify::with_capture(|| {
+                    verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+                })
+            });
+            (stats.repair, events)
+        };
+        let (mode_a_repair, mode_a_events) = run_mode(RepairMode::ModeA);
+        assert_eq!(mode_a_repair, RepairMode::ModeA, "Mode-A run must stamp ModeA");
+        assert!(!mode_a_events.is_empty(), "Mode-A must capture commits on a conflict fixture");
+        let (lemmas_repair, lemmas_events) = run_mode(RepairMode::Lemmas);
+        assert_eq!(lemmas_repair, RepairMode::Lemmas, "Lemmas run must stamp Lemmas");
+        assert!(
+            lemmas_events.is_empty(),
+            "Lemmas must capture NO commit events — the audit is Mode-A-only (got {} events)",
+            lemmas_events.len()
+        );
     })
     .unwrap_or_else(|e| e.raise())
 }
