@@ -12,7 +12,7 @@
 //! for a Round-0 (all-Ref) candidacy; partial candidacy that encodes demotions also
 //! needs the `tree_borrow_local` union replay the demotion loop performs (BB2).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::mir::Local;
@@ -111,6 +111,33 @@ impl RepairMode {
         let _restore = Restore(REPAIR_OVERRIDE.with(|c| c.replace(Some(mode))));
         f()
     }
+}
+
+thread_local! {
+    /// §NB5-L2 commit-necessity audit — when `Some`, the CEGAR loop's **Mode-A** commit records every
+    /// `(committed slot, round)` pair here. `None` (the default) = OFF, zero overhead on the sweep/suite
+    /// path. Only the audit driver (`bo_c1::run::run_necessity_audit`) turns it on, via `with_capture`.
+    /// Mode-A ONLY: the audit measures the shipped repair mode; the `Lemmas` branch (dead axis) is not
+    /// captured. Nesting is unsupported (the audit never nests).
+    static AUDIT_CAPTURE: RefCell<Option<Vec<(SlotRef, usize)>>> = const { RefCell::new(None) };
+}
+
+/// §NB5-L2 — run `f` while CAPTURING Mode-A's `(slot, round)` commit events, returning
+/// `(f's result, the captured events in commit order)`. Panic-safe drop-guard (like
+/// `RepairMode::with_override`): the prior capture state is restored on exit including on unwind, so a
+/// panicking anchor run never leaks a live buffer onto the thread. The event order is the loop's
+/// natural commit order; the audit dedups to the distinct commit SET itself.
+pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)>) {
+    struct Restore(Option<Vec<(SlotRef, usize)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AUDIT_CAPTURE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(AUDIT_CAPTURE.with(|c| c.replace(Some(Vec::new()))));
+    let out = f();
+    let captured = AUDIT_CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    (out, captured)
 }
 
 /// A borrow conflict edge with its owners translated to BO `SlotRef`s. `Field` owners
@@ -471,6 +498,14 @@ pub(crate) fn verify_to_fixpoint_counting(
                         solver.add_borrow_exclusion(Some(slot), &[]);
                         committed += 1;
                         stats.commits_conflict += 1;
+                        // §NB5-L2 audit capture (gated; `None` = off, zero cost). Record `(slot, round)`
+                        // — `stats.rounds` is this round (incremented at the loop top). Rider 2: the round
+                        // is retained for the audit's stratification + over-pin-by-round diagnostic.
+                        AUDIT_CAPTURE.with(|c| {
+                            if let Some(buf) = c.borrow_mut().as_mut() {
+                                buf.push((slot, stats.rounds));
+                            }
+                        });
                     }
                 }
             }
@@ -542,6 +577,43 @@ pub(crate) fn verify_to_fixpoint_counting(
     }
 }
 
+/// §NB5-L2 (commit-necessity audit) — does `model` ACCEPT, i.e. is it a Mode-A fixpoint? True iff one
+/// more validate round would commit nothing: no residual conflict names a non-`Ref` FIELD
+/// (`residual_nonref_field` — the field-decline) AND every residual conflict's A′ `representative` is
+/// `None` (no committable `Ref` owner, so `committed` would be 0). This is EXACTLY
+/// `verify_to_fixpoint_counting`'s accept condition, factored out so the audit's "one solve + one
+/// validate" classification shares the loop's accept semantics rather than a re-derived twin that could
+/// drift — the `is_ref`/`is_raw` replay closures are byte-identical to the loop's (BB3-b for locals,
+/// exact-`Raw` for fields, §NB5-F2). The anchor asserts `model_accepts(accepted_model)`; the
+/// calibration tests (`nb5l2_probe_necessary_and_injected_overpin`,
+/// `nb5l2_probe_finds_natural_accumulation_overpin`) pin both classification arms.
+pub(crate) fn model_accepts(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+) -> bool {
+    let conflicts = revalidate_replaying(
+        program,
+        slots,
+        |s| model.get(&s) == Some(&SlotKind::Ref),
+        |s| match s {
+            SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
+            SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
+        },
+        is_mutable,
+    );
+    // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
+    // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
+    // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a
+    // fail-closed STOP — §NB5-L2 Codex F2). A probe model CAN reach a non-`Ref`-local residual (unlike
+    // the live loop), where `representative` returns `None` and the naive "no committable owner" check
+    // would MIS-accept; including `guard_slots_are_ref` rejects it, matching the loop exactly.
+    residual_nonref_field(&conflicts, model).is_none()
+        && guard_slots_are_ref(&conflicts, model)
+        && conflicts.values().flatten().all(|c| representative(c, model).is_none())
+}
+
 /// Pick the slot of a residual conflict to commit `¬ref` on (Mode A).
 ///
 /// §NB4-4a **A′ — live-requirer discharge.** Demoting a slot discharges an edge only if it
@@ -608,7 +680,7 @@ fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -
 /// §NB5-L rider 3 — a stable total-order key for a `SlotRef` (`SlotRef: !Ord`, because `LocalDefId`
 /// is not; `SlotId` IS orderable). Variant tag orders `Field < Local`; within each, by the
 /// underlying id(s). Used ONLY to canonicalize the `Lemmas` emission order (Mode-A stays on FxHash).
-fn slotref_key(s: &SlotRef) -> (u8, u32, usize) {
+pub(crate) fn slotref_key(s: &SlotRef) -> (u8, u32, usize) {
     match s {
         SlotRef::Field(sid) => (0, 0, sid.index()),
         SlotRef::Local(did, sid) => (1, did.local_def_index.as_u32(), sid.index()),
