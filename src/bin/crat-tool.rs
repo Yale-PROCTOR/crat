@@ -19,6 +19,12 @@ enum Command {
         output: PathBuf,
         input: PathBuf,
     },
+    Validate {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 fn main() {
@@ -39,6 +45,11 @@ fn main() {
                     });
             let json = tools::skeletons_to_json(&records).unwrap();
             std::fs::write(output, json).unwrap();
+        }
+        Command::Validate { input, output } => {
+            let request = std::fs::read_to_string(input).unwrap();
+            let response = tools::validate_json(&request);
+            std::fs::write(output, response).unwrap();
         }
     }
 }
