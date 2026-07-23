@@ -59,7 +59,11 @@ fn assert_skeleton(source: &str, path: &str, expected: &str) {
         let records = make_skeletons(source, tcx).unwrap();
         assert_eq!(
             canonical_item(&function(&records, path).annotated_skeleton),
-            canonical_item(expected)
+            {
+                let mut expected = utils::ast::parse_crate(expected.to_owned());
+                TargetBindingMutator.visit_crate(&mut expected);
+                pprust::item_to_string(&expected.items[0])
+            }
         );
     })
     .unwrap();
@@ -238,7 +242,9 @@ fn json_round_trip_preserves_embedded_rust_text() {
     assert_eq!(&before, function(&round_trip, "text"));
     assert_eq!(before.source_signature, "pub unsafe fn text() -> usize");
     assert!(
-        before.annotated_skeleton.contains("let s: &str = todo!();"),
+        before
+            .annotated_skeleton
+            .contains("let mut s: &str = todo!();"),
         "{}",
         before.annotated_skeleton
     );
@@ -428,7 +434,10 @@ fn function_records_sanitize_prompt_only_header_tokens_and_split_signatures() {
         function.source_signature,
         "pub unsafe fn add(x: i32, y: i32) -> i32"
     );
-    assert_eq!(function.target_signature, function.source_signature);
+    assert_eq!(
+        function.target_signature,
+        "pub unsafe fn add(mut x: i32, mut y: i32) -> i32"
+    );
     assert!(!function.annotated_source.contains("no_mangle"));
     assert!(!function.annotated_source.contains("extern"));
 }
@@ -735,7 +744,7 @@ fn replaces_leaf_expression_payloads_with_todo() {
     let source = "unsafe fn callee(_x: i32) {} pub unsafe fn f() -> i32 { let x = 1; callee(x); println!(\"{x}\"); -x + 2 }";
     let records = generate(source);
     let skeleton = &function(&records, "f").annotated_skeleton;
-    assert!(skeleton.contains("let x: i32 = todo!();"));
+    assert!(skeleton.contains("let mut x: i32 = todo!();"));
     assert_eq!(skeleton.matches("todo!()").count(), 4);
     assert_eq!(labels(skeleton), [0, 1, 2, 3]);
     assert_skeleton(
@@ -751,15 +760,15 @@ fn materializes_inferred_types_for_simple_bindings() {
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
     for declaration in [
-        "let b: bool = todo!();",
-        "let i: i32 = todo!();",
-        "let u: u64 = todo!();",
-        "let n: f32 = todo!();",
-        "let c: char = todo!();",
-        "let t: (i32, u8) = todo!();",
-        "let a: [u16; 3] = todo!();",
-        "let r: &i32 = todo!();",
-        "let l: Local = todo!();",
+        "let mut b: bool = todo!();",
+        "let mut i: i32 = todo!();",
+        "let mut u: u64 = todo!();",
+        "let mut n: f32 = todo!();",
+        "let mut c: char = todo!();",
+        "let mut t: (i32, u8) = todo!();",
+        "let mut a: [u16; 3] = todo!();",
+        "let mut r: &i32 = todo!();",
+        "let mut l: Local = todo!();",
     ] {
         assert!(
             skeleton.contains(declaration),
@@ -779,8 +788,8 @@ fn preserves_mutability_declarations_and_existing_types() {
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
     assert!(skeleton.contains("let mut a: i32 = todo!();"));
-    assert!(skeleton.contains("let x: T;"));
-    assert!(skeleton.contains("let y: Count = todo!();"));
+    assert!(skeleton.contains("let mut x: T;"));
+    assert!(skeleton.contains("let mut y: Count = todo!();"));
     assert_eq!(skeleton.matches("todo!()").count(), 4);
     assert_skeleton(
         source,
@@ -794,7 +803,7 @@ fn holes_assignments_and_preserves_return_and_break_roles() {
     let source = "pub unsafe fn f(mut x: i32) -> i32 { x = 1; x += 2; let y = loop { break x; }; return y; }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("let y: i32 = loop"));
+    assert!(skeleton.contains("let mut y: i32 = loop"));
     assert!(skeleton.contains("break todo!();"));
     assert!(skeleton.contains("return todo!();"));
     assert_skeleton(
@@ -841,8 +850,8 @@ fn preserves_if_let_and_while_let_patterns() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = value { sink(x); } while let Some(x) = value { sink(x); value = None; } }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("if let Some(x) = todo!()"));
-    assert!(skeleton.contains("while let Some(x) = todo!()"));
+    assert!(skeleton.contains("if let Some(mut x) = todo!()"));
+    assert!(skeleton.contains("while let Some(mut x) = todo!()"));
     assert_skeleton(
         source,
         "f",
@@ -856,7 +865,7 @@ fn preserves_while_for_and_loop_constructs() {
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
     assert!(skeleton.contains("'w: while todo!()"));
-    assert!(skeleton.contains("for (x, y) in todo!()"));
+    assert!(skeleton.contains("for (mut x, mut y) in todo!()"));
     assert!(skeleton.contains("'l: loop"));
     assert_skeleton(
         source,
@@ -872,7 +881,7 @@ fn preserves_match_arms_patterns_guards_and_order() {
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_skeleton), (0..=11).collect::<Vec<_>>());
     let skeleton = compact(&f.annotated_skeleton);
-    assert!(skeleton.contains("E::Tuple(x) if todo!()"));
+    assert!(skeleton.contains("E::Tuple(mut x) if todo!()"));
     assert!(skeleton.contains("1..=3 =>"));
     assert_skeleton(
         source,
@@ -888,7 +897,7 @@ fn preserves_let_else_and_plain_nested_blocks() {
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_skeleton), [0, 1, 2, 3, 4, 5]);
     let skeleton = compact(&f.annotated_skeleton);
-    assert!(skeleton.contains("let Some(x): Option<i32> = todo!() else"));
+    assert!(skeleton.contains("let Some(mut x): Option<i32> = todo!() else"));
     assert!(skeleton.contains("return todo!();"));
     assert_skeleton(
         source,
@@ -986,10 +995,13 @@ fn keeps_non_pointer_signature_types_unchanged() {
         "struct S { x: i32 } pub unsafe fn f(a: i32, b: (u8, bool), c: [i16; 2], s: S) -> (S, usize) { (s, a as usize + b.0 as usize + c[0] as usize) }",
     );
     let f = function(&records, "f");
-    assert_eq!(f.source_signature, f.target_signature);
+    assert_eq!(
+        f.source_signature,
+        "pub unsafe fn f(a: i32, b: (u8, bool), c: [i16; 2], s: S) -> (S, usize)"
+    );
     assert_eq!(
         f.target_signature,
-        "pub unsafe fn f(a: i32, b: (u8, bool), c: [i16; 2], s: S) -> (S, usize)"
+        "pub unsafe fn f(mut a: i32, mut b: (u8, bool), mut c: [i16; 2], mut s: S)\n-> (S, usize)"
     );
 }
 
@@ -1003,17 +1015,17 @@ fn selects_shared_and_mutable_scalar_references() {
     assert!(
         function(&records, "read_param")
             .target_signature
-            .contains("p: &i32")
+            .contains("mut p: &i32")
     );
     assert!(
         function(&records, "write_local")
             .annotated_skeleton
-            .contains("let p: &mut i32")
+            .contains("let mut p: &mut i32")
     );
     assert!(
         function(&records, "read_local")
             .annotated_skeleton
-            .contains("let p: &i32")
+            .contains("let mut p: &i32")
     );
 }
 
@@ -1026,11 +1038,11 @@ fn selects_optional_references_when_null_is_observable() {
     let records = generate(optional_reference_fixture());
     assert_eq!(
         function(&records, "read").target_signature,
-        "pub unsafe fn read(p: Option<&i32>) -> i32"
+        "pub unsafe fn read(mut p: Option<&i32>) -> i32"
     );
     assert_eq!(
         function(&records, "write").target_signature,
-        "pub unsafe fn write(p: Option<&mut i32>)"
+        "pub unsafe fn write(mut p: Option<&mut i32>)"
     );
 }
 
@@ -1044,12 +1056,12 @@ fn selects_shared_and_mutable_slices_for_array_borrows() {
     assert!(
         function(&records, "read_array")
             .annotated_skeleton
-            .contains("let p: &[i32]")
+            .contains("let mut p: &[i32]")
     );
     assert!(
         function(&records, "write_array")
             .annotated_skeleton
-            .contains("let p: &mut [i32]")
+            .contains("let mut p: &mut [i32]")
     );
     assert!(!skeletons_to_json(&records).unwrap().contains("SliceCursor"));
 }
@@ -1060,12 +1072,12 @@ fn promotes_array_derived_locals_to_explicit_slices() {
     assert!(
         function(&records, "read_array")
             .annotated_skeleton
-            .contains("let p: &[i32] = todo!();")
+            .contains("let mut p: &[i32] = todo!();")
     );
     assert!(
         function(&records, "write_array")
             .annotated_skeleton
-            .contains("let p: &mut [i32] = todo!();")
+            .contains("let mut p: &mut [i32] = todo!();")
     );
 }
 
@@ -1081,7 +1093,7 @@ fn selects_scalar_box_types_from_ownership_analysis() {
     assert!(
         alloc
             .annotated_skeleton
-            .contains("let p: Box<i32> = todo!();")
+            .contains("let mut p: Box<i32> = todo!();")
     );
 }
 
@@ -1100,7 +1112,7 @@ fn selects_boxed_slice_types_from_ownership_and_fatness() {
     assert!(
         alloc
             .annotated_skeleton
-            .contains("let p: Box<[i32]> = todo!();")
+            .contains("let mut p: Box<[i32]> = todo!();")
     );
 }
 
@@ -1111,11 +1123,11 @@ fn adds_named_lifetimes_for_returned_borrows() {
     );
     assert_eq!(
         function(&records, "id").target_signature,
-        "pub unsafe fn id<'a>(x: &'a mut i32) -> &'a mut i32"
+        "pub unsafe fn id<'a>(mut x: &'a mut i32) -> &'a mut i32"
     );
     assert_eq!(
         function(&records, "wrap").target_signature,
-        "pub unsafe fn wrap<'a>(y: &'a mut i32) -> &'a mut i32"
+        "pub unsafe fn wrap<'a>(mut y: &'a mut i32) -> &'a mut i32"
     );
 }
 
@@ -1126,13 +1138,16 @@ fn preserves_nullable_returned_borrow_relationships() {
     );
     for path in ["maybe", "maybe_local"] {
         let signature = &function(&records, path).target_signature;
-        assert!(signature.contains("x: Option<&'a mut i32>"), "{signature}");
+        assert!(
+            signature.contains("mut x: Option<&'a mut i32>"),
+            "{signature}"
+        );
         assert!(signature.contains("-> Option<&'a mut i32>"), "{signature}");
     }
     assert!(
         function(&records, "maybe_local")
             .annotated_skeleton
-            .contains("let r: Option<&mut i32>")
+            .contains("let mut r: Option<&mut i32>")
     );
 }
 
@@ -1153,14 +1168,14 @@ fn keeps_required_raw_pointers_raw() {
     assert!(
         function(&records, "keep_alias_raw")
             .target_signature
-            .contains("a: *mut i32, b: *mut i32"),
+            .contains("mut a: *mut i32, mut b: *mut i32"),
         "{}",
         function(&records, "keep_alias_raw").target_signature
     );
     assert!(
         function(&records, "global_escape")
             .annotated_skeleton
-            .contains("let p: *mut *mut i32")
+            .contains("let mut p: *mut *mut i32")
     );
 }
 
@@ -1197,7 +1212,7 @@ fn uses_initial_decisions_before_rewriter_fallback_demotion() {
     let records = generate(source);
     assert_eq!(
         function(&records, "tree_print_helper").target_signature,
-        "pub unsafe fn tree_print_helper(tree: &mut crate::Tree, root_id: i32)"
+        "pub unsafe fn tree_print_helper(mut tree: &mut crate::Tree, mut root_id: i32)"
     );
     let rewritten = run_compiler_on_str(source, |tcx| {
         pointer_replacer::replace_local_borrows(&pointer_replacer::Config::default(), tcx).0
@@ -1317,8 +1332,8 @@ fn selects_optional_boxes_at_local_call_boundaries() {
             .ends_with("-> Option<Box<i32>>")
     );
     let skeleton = &function(&records, "foo").annotated_skeleton;
-    assert!(skeleton.contains("let p: Box<i32>"));
-    assert!(skeleton.contains("let q: Option<Box<i32>>"));
+    assert!(skeleton.contains("let mut p: Box<i32>"));
+    assert!(skeleton.contains("let mut q: Option<Box<i32>>"));
 }
 
 fn tools_cursor_fixture() -> &'static str {
@@ -1373,17 +1388,17 @@ fn tools_mode_disables_conservative_slice_cursors_without_changing_crat_default(
     let records = generate(source);
     assert_eq!(
         function(&records, "read_at").target_signature,
-        "pub unsafe fn read_at(p: &[i32], offset: isize) -> i32"
+        "pub unsafe fn read_at(mut p: &[i32], mut offset: isize) -> i32"
     );
     assert!(
         function(&records, "read_at")
             .annotated_skeleton
-            .contains("let nonnegative: isize")
+            .contains("let mut nonnegative: isize")
     );
     assert!(
         function(&records, "caller")
             .annotated_skeleton
-            .contains("let values: [i32; 4]")
+            .contains("let mut values: [i32; 4]")
     );
 }
 
@@ -1418,6 +1433,209 @@ fn comprehensive_fixture_emits_consistent_records() {
     assert_eq!(
         labels(&function(&records, "helper").annotated_skeleton),
         [0, 1, 2, 3, 4, 5]
+    );
+}
+
+#[test]
+fn target_parameters_and_simple_locals_are_mutable() {
+    let source = r#"pub unsafe fn f(input: i32, mut existing: i32) -> i32 {
+    let value = input;
+    let mut total: i32 = existing;
+    total += value;
+    total
+}"#;
+    let record = function(&generate(source), "f").clone();
+    assert_skeleton(
+        source,
+        "f",
+        r#"pub unsafe fn f(mut input: i32, mut existing: i32) -> i32 {
+    let mut value: i32 = todo!();
+    let mut total: i32 = todo!();
+    todo!();
+    todo!()
+}"#,
+    );
+    assert!(record.annotated_source.contains("let value = input;"));
+    assert!(!record.annotated_source.contains("let mut value"));
+}
+
+#[test]
+fn wildcards_remain_wildcards_and_source_is_unchanged() {
+    let source = r#"pub unsafe fn f(pair: (i32, i32)) {
+    let (_, value) = pair;
+    let _ = value;
+}"#;
+    let record = function(&generate(source), "f").clone();
+    assert_skeleton(
+        source,
+        "f",
+        r#"pub unsafe fn f(mut pair: (i32, i32)) {
+    let (_, mut value) = todo!();
+    let _ = todo!();
+}"#,
+    );
+    assert!(record.annotated_source.contains("let (_, value) = pair;"));
+}
+
+#[test]
+fn all_nested_pattern_binding_kinds_become_mutable() {
+    let source = r#"enum E { Pair(i32, i32), Struct { x: i32 }, Unit }
+enum Choice { Left(i32), Right(i32) }
+pub unsafe fn f(
+    pair: (i32, i32),
+    mut opt: Option<(i32, i32)>,
+    values: [(i32, i32); 1],
+    value: E,
+    choice: Choice,
+) {
+    const LOCAL: i32 = { let inner_const = 1; inner_const };
+    static STATE: i32 = { let inner_static = 2; inner_static };
+    let ref borrowed = pair;
+    let _ = borrowed;
+    let whole @ (a, b) = pair;
+    let Some((c, d)): Option<(i32, i32)> = opt else { return; };
+    if let Some((e, f)) = opt { let _ = e + f; }
+    while let Some((g, h)) = opt { opt = None; let _ = g + h; }
+    for (i, j) in values { let _ = i + j; }
+    match value {
+        E::Pair(k, l) => { let _ = k + l; }
+        E::Struct { x: m } => { let _ = m; }
+        E::Unit => {}
+    }
+    match choice {
+        Choice::Left(n) | Choice::Right(n) => { let _ = n; }
+    }
+    let _ = (whole, a, b, c, d);
+}"#;
+    let records = generate(source);
+    let skeleton = &function(&records, "f").annotated_skeleton;
+    for fragment in [
+        "mut pair: (i32, i32)",
+        "let mut inner_const = 1;",
+        "let mut inner_static = 2;",
+        "let ref mut borrowed",
+        "let mut whole @ (mut a, mut b)",
+        "Some((mut c, mut d))",
+        "Some((mut e, mut f))",
+        "Some((mut g, mut h))",
+        "for (mut i, mut j)",
+        "E::Pair(mut k, mut l)",
+        "x: mut m",
+        "Choice::Left(mut n) | Choice::Right(mut n)",
+    ] {
+        assert!(
+            skeleton.contains(fragment),
+            "missing `{fragment}` in {skeleton}"
+        );
+    }
+
+    let ref_mut = generate(
+        "pub unsafe fn ref_mut_source(mut value: i32) { let ref mut borrowed = value; let _ = borrowed; }",
+    );
+    assert!(
+        function(&ref_mut, "ref_mut_source")
+            .annotated_skeleton
+            .contains("let ref mut borrowed")
+    );
+}
+
+#[test]
+fn safe_source_functions_get_unsafe_target_headers() {
+    let records = generate(
+        "pub fn safe(input: i32) -> i32 { let value = input; value } pub unsafe fn already_unsafe(input: i32) -> i32 { input }",
+    );
+    let safe = function(&records, "safe");
+    assert_eq!(safe.source_signature, "pub fn safe(input: i32) -> i32");
+    assert_eq!(
+        safe.target_signature,
+        "pub unsafe fn safe(mut input: i32) -> i32"
+    );
+    assert!(safe.annotated_source.starts_with("pub fn safe"));
+    assert!(safe.annotated_skeleton.starts_with("pub unsafe fn safe"));
+    assert_eq!(
+        function(&records, "already_unsafe").target_signature,
+        "pub unsafe fn already_unsafe(mut input: i32) -> i32"
+    );
+}
+
+#[test]
+fn every_free_function_named_main_is_omitted_without_body_inspection() {
+    let records = generate(
+        r#"pub fn main() { let ignored = 1; core::mem::drop(ignored); }
+unsafe fn main_0() -> core::ffi::c_int { 0 }
+mod nested {
+    pub fn main() { panic!("also omitted"); }
+    pub unsafe fn helper() -> i32 { 1 }
+}
+mod raw {
+    pub fn r#main() {}
+    pub unsafe fn helper() -> i32 { 2 }
+}"#,
+    );
+    assert_paths(
+        &records,
+        &[
+            ("main_0", ItemKindName::Fn),
+            ("nested::helper", ItemKindName::Fn),
+            ("raw::helper", ItemKindName::Fn),
+        ],
+    );
+}
+
+#[test]
+fn supported_main_0_forms_are_generated_with_the_fixed_argv_override() {
+    let zero = generate(
+        "unsafe fn main_0() -> core::ffi::c_int { 0 } pub fn main() { unsafe { ::std::process::exit(main_0() as i32) } }",
+    );
+    assert_eq!(zero.len(), 1);
+    assert_eq!(
+        function(&zero, "main_0").target_signature,
+        "unsafe fn main_0() -> core::ffi::c_int"
+    );
+
+    let source = r#"unsafe fn main_0(
+    mut argc: core::ffi::c_int,
+    mut argv: *mut *mut core::ffi::c_char,
+) -> core::ffi::c_int {
+    if argc > 0 { **argv as core::ffi::c_int } else { 0 }
+}
+pub fn main() {
+    let mut command_line_args: Vec<*mut core::ffi::c_char> = Vec::new();
+    for arg in ::std::env::args() {
+        command_line_args.push(::std::ffi::CString::new(arg).unwrap().into_raw());
+    }
+    command_line_args.push(::core::ptr::null_mut());
+    unsafe {
+        ::std::process::exit(main_0(
+            (command_line_args.len() - 1) as core::ffi::c_int,
+            command_line_args.as_mut_ptr() as *mut *mut core::ffi::c_char,
+        ) as i32)
+    }
+}"#;
+    let records = generate(source);
+    assert_eq!(records.len(), 1);
+    let main_0 = function(&records, "main_0");
+    assert_eq!(
+        main_0.source_signature,
+        "unsafe fn main_0(mut argc: core::ffi::c_int,\nmut argv: *mut *mut core::ffi::c_char) -> core::ffi::c_int"
+    );
+    assert_eq!(
+        main_0.target_signature,
+        "unsafe fn main_0(mut argc: core::ffi::c_int, mut argv: &mut [&mut [i8]])\n-> core::ffi::c_int"
+    );
+
+    let parenthesized = generate(
+        r#"unsafe fn main_0(
+    argc: (core::ffi::c_int),
+    argv: (*mut *mut core::ffi::c_char),
+) -> (core::ffi::c_int) {
+    0
+}"#,
+    );
+    assert!(
+        function(&parenthesized, "main_0")
+            .target_signature
+            .contains("mut argv: &mut [&mut [i8]]")
     );
 }
 
