@@ -714,13 +714,6 @@ fn source_and_skeleton_have_identical_label_trees() {
 }
 
 #[test]
-fn labels_item_statements_inside_function_bodies() {
-    let records = generate("pub unsafe fn f() -> i32 { const LOCAL: i32 = 3; let x = LOCAL; x }");
-    assert_eq!(records.len(), 1);
-    assert_eq!(labels(&function(&records, "f").annotated_source), [0, 1, 2]);
-}
-
-#[test]
 fn rejects_top_level_empty_statement_in_function() {
     let error = generate_error("pub unsafe fn f() { ; }");
     assert_eq!(error.kind, GenerationErrorKind::EmptyStatement);
@@ -737,6 +730,63 @@ fn rejects_nested_empty_statement() {
     let error = generate_error("pub unsafe fn f(flag: bool) { if flag { loop { ; } } }");
     assert_eq!(error.kind, GenerationErrorKind::EmptyStatement);
     assert_eq!(error.function_path, "f");
+}
+
+#[test]
+fn phase_1_rejects_local_const_and_static_recursively() {
+    for (source, kind) in [
+        (
+            r#"pub unsafe fn f() -> i32 {
+                const LOCAL: i32 = { let inner = 1; inner };
+                LOCAL
+            }"#,
+            "const",
+        ),
+        (
+            r#"pub unsafe fn f(flag: bool) -> i32 {
+                if flag {
+                    static mut STATE: i32 = { let inner = 1; inner };
+                    STATE
+                } else {
+                    0
+                }
+            }"#,
+            "static",
+        ),
+    ] {
+        let error = generate_error(source);
+        assert_eq!(error.kind, GenerationErrorKind::FunctionLocalItem);
+        assert_eq!(error.function_path, "f");
+        assert!(error.message.contains(kind));
+    }
+}
+
+#[test]
+fn phase_1_rejects_representative_other_local_items() {
+    for (source, kind) in [
+        ("pub unsafe fn f() { fn local() {} }", "function"),
+        ("pub unsafe fn f() { type Local = i32; }", "type alias"),
+        ("pub unsafe fn f() { struct Local; }", "struct"),
+        ("pub unsafe fn f() { enum Local { Variant } }", "enum"),
+        ("pub unsafe fn f() { union Local { field: i32 } }", "union"),
+        ("pub unsafe fn f() { mod local {} }", "module"),
+        ("pub unsafe fn f() { use core::mem; }", "use"),
+        (
+            "pub unsafe fn f() { unsafe extern \"C\" { fn local(); } }",
+            "foreign",
+        ),
+        ("pub unsafe fn f() { trait Local {} }", "trait"),
+        ("struct Local; pub unsafe fn f() { impl Local {} }", "impl"),
+        (
+            "pub unsafe fn f() { macro_rules! local { () => {} } }",
+            "macro definition",
+        ),
+    ] {
+        let error = generate_error(source);
+        assert_eq!(error.kind, GenerationErrorKind::FunctionLocalItem);
+        assert_eq!(error.function_path, "f");
+        assert!(error.message.contains(kind), "{source}: {}", error.message);
+    }
 }
 
 #[test]
@@ -1488,8 +1538,6 @@ pub unsafe fn f(
     value: E,
     choice: Choice,
 ) {
-    const LOCAL: i32 = { let inner_const = 1; inner_const };
-    static STATE: i32 = { let inner_static = 2; inner_static };
     let ref borrowed = pair;
     let _ = borrowed;
     let whole @ (a, b) = pair;
@@ -1511,8 +1559,6 @@ pub unsafe fn f(
     let skeleton = &function(&records, "f").annotated_skeleton;
     for fragment in [
         "mut pair: (i32, i32)",
-        "let mut inner_const = 1;",
-        "let mut inner_static = 2;",
         "let ref mut borrowed",
         "let mut whole @ (mut a, mut b)",
         "Some((mut c, mut d))",
@@ -1637,6 +1683,17 @@ pub fn main() {
             .target_signature
             .contains("mut argv: &mut [&mut [i8]]")
     );
+
+    let arity_only = generate(
+        r#"unsafe fn main_0(first: usize, second: *const u8) -> bool {
+            let _ = (first, second);
+            false
+        }"#,
+    );
+    let target = &function(&arity_only, "main_0").target_signature;
+    assert!(target.contains("mut first: usize"));
+    assert!(target.contains("mut second: &mut [&mut [i8]]"));
+    assert!(target.contains("-> bool"));
 }
 
 #[test]

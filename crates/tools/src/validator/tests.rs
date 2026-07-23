@@ -206,6 +206,8 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe fn f<T>(x: T) { #[proctor(0)] return; }",
         "unsafe fn f<'a: 'static>(x: &'a i32) { #[proctor(0)] return; }",
         "unsafe fn f<'a>(x: &'a i32) where 'a: 'static { #[proctor(0)] return; }",
+        "unsafe fn f<#[allow(unused)] 'a>(x: &'a i32) { #[proctor(0)] return; }",
+        "unsafe fn f<'a>(x: &'a i32) where { #[proctor(0)] return; }",
         "async unsafe fn f() { #[proctor(0)] return; }",
         "const unsafe fn f() { #[proctor(0)] return; }",
         "unsafe extern \"C\" fn f(x: i32, mut args: ...) { #[proctor(0)] return; }",
@@ -380,11 +382,156 @@ fn explicit_lifetime_names_in_types_are_enforced() {
     assert_eq!(
         codes(&response),
         [
+            "generic_parameter_mismatch",
             "parameter_type_mismatch",
             "parameter_type_mismatch",
             "return_type_mismatch"
         ]
     );
+}
+
+#[test]
+fn matching_lifetime_generic_declaration_is_valid() {
+    assert_valid(
+        r#"unsafe fn f<'input, 'output>(
+            mut input: &'input i32,
+            mut fallback: &'output i32,
+        ) -> &'input i32 {
+            #[proctor(0)] todo!()
+        }"#,
+        r#"pub extern "C" fn f<'input, 'output>(
+            input: &'input i32,
+            fallback: &'output i32,
+        ) -> &'input i32 {
+            #[proctor(0)] let _ = fallback;
+            #[proctor(0)] input
+        }"#,
+    );
+}
+
+#[test]
+fn omitted_lifetime_declaration_is_rejected_even_when_types_match() {
+    assert_codes(
+        r#"unsafe fn f<'a>(mut input: &'a i32) -> &'a i32 {
+            #[proctor(0)] todo!()
+        }"#,
+        r#"unsafe fn f(input: &'a i32) -> &'a i32 {
+            #[proctor(0)] input
+        }"#,
+        &["generic_parameter_mismatch"],
+    );
+}
+
+#[test]
+fn added_or_renamed_lifetime_is_rejected() {
+    let skeleton = r#"unsafe fn f<'a>(mut input: &'a i32) -> &'a i32 {
+        #[proctor(0)] todo!()
+    }"#;
+    for transformation in [
+        r#"unsafe fn f<'a, 'unused>(input: &'a i32) -> &'a i32 {
+            #[proctor(0)] input
+        }"#,
+        r#"unsafe fn f<'b>(input: &'a i32) -> &'a i32 {
+            #[proctor(0)] input
+        }"#,
+    ] {
+        assert_codes(skeleton, transformation, &["generic_parameter_mismatch"]);
+    }
+}
+
+#[test]
+fn lifetime_parameter_order_is_exact() {
+    assert_codes(
+        "unsafe fn f<'a, 'b>() { #[proctor(0)] return; }",
+        "unsafe fn f<'b, 'a>() { #[proctor(0)] return; }",
+        &["generic_parameter_mismatch"],
+    );
+}
+
+#[test]
+fn attributes_bounds_type_const_and_where_generics_are_rejected() {
+    let skeleton = r#"unsafe fn f<'a>(mut input: &'a i32) -> &'a i32 {
+        #[proctor(0)] todo!()
+    }"#;
+    for transformation in [
+        "unsafe fn f<'a: 'static>(input: &'a i32) -> &'a i32 { #[proctor(0)] input }",
+        "unsafe fn f<#[allow(unused)] 'a>(input: &'a i32) -> &'a i32 { #[proctor(0)] input }",
+        "unsafe fn f<'a, T>(input: &'a i32) -> &'a i32 { #[proctor(0)] input }",
+        "unsafe fn f<'a, const N: usize>(input: &'a i32) -> &'a i32 { #[proctor(0)] input }",
+        "unsafe fn f<'a>(input: &'a i32) -> &'a i32 where 'a: 'static { #[proctor(0)] input }",
+        "unsafe fn f<'a>(input: &'a i32) -> &'a i32 where { #[proctor(0)] input }",
+    ] {
+        assert_codes(skeleton, transformation, &["generic_parameter_mismatch"]);
+    }
+}
+
+#[test]
+fn generic_mismatch_aggregates_in_request_order() {
+    let request = ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![
+            ExpectedFunction {
+                id: 7,
+                name: "first".to_owned(),
+                skeleton: "unsafe fn first<'a>(mut input: &'a i32) -> &'a i32 { #[proctor(0)] todo!() }".to_owned(),
+            },
+            ExpectedFunction {
+                id: 8,
+                name: "second".to_owned(),
+                skeleton: "unsafe fn second<'x, 'y>(mut input: &'x i32, mut fallback: &'y i32) -> &'x i32 { #[proctor(0)] todo!() }".to_owned(),
+            },
+        ],
+        transformation: r#"
+unsafe fn second<'y, 'x>(input: &'x i32, fallback: &'y i32) -> &'x i32 {
+    #[proctor(0)] let _ = fallback;
+    #[proctor(0)] input
+}
+unsafe fn first(input: &'a i32) -> &'a i32 {
+    #[proctor(0)] input
+}"#
+        .to_owned(),
+    };
+    let ValidationResponse::Invalid { failures } = validate(&request) else {
+        panic!("expected generic mismatches");
+    };
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.name.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.errors[0].code == "generic_parameter_mismatch")
+    );
+    assert_eq!(
+        validation_response_to_json(&validate(&request)).unwrap(),
+        validation_response_to_json(&validate(&request)).unwrap()
+    );
+}
+
+#[test]
+fn phase_2_rejects_every_local_item() {
+    for skeleton in [
+        "unsafe fn f() { #[proctor(0)] const LOCAL: i32 = 1; }",
+        "unsafe fn f() { #[proctor(0)] { #[proctor(1)] static mut STATE: i32 = 1; } }",
+    ] {
+        assert_codes(skeleton, "unsafe fn f() {}", &["invalid_expected_skeleton"]);
+    }
+    let skeleton = "unsafe fn f() { #[proctor(0)] return; }";
+    for transformation in [
+        r#"unsafe fn f() {
+            #[proctor(0)] const LOCAL: i32 = {
+                let ordinary_name = 1;
+                ordinary_name
+            };
+        }"#,
+        "unsafe fn f() { #[proctor(0)] static mut STATE: i32 = 1; }",
+    ] {
+        assert_codes(skeleton, transformation, &["unexpected_nested_item"]);
+    }
 }
 
 #[test]
@@ -949,218 +1096,6 @@ fn same_spelling_bindings_in_distinct_scopes_keep_identity() {
 }
 
 #[test]
-fn nested_items_are_preserved_and_new_items_are_rejected() {
-    let skeleton = r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] todo!()
-}"#;
-    assert_valid(
-        skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-    );
-    assert_code(
-        skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] consume(1);
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] STATE
-}"#,
-        "missing_existing_item",
-    );
-    assert_code(
-        skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(0)] const EXTRA: i32 = 3;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + EXTRA
-}"#,
-        "unexpected_nested_item",
-    );
-    assert_code(
-        skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 9;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-        "existing_item_structure_mismatch",
-    );
-    assert_code(
-        skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(1)] fn extra() {}
-#[proctor(2)] LOCAL + STATE
-}"#,
-        "unexpected_nested_item",
-    );
-
-    assert_valid(
-        r#"unsafe fn f(mut flag: bool) {
-#[proctor(0)] if todo!() {
-#[proctor(1)] const X: i32 = 1;
-} else {
-#[proctor(2)] const X: i32 = 2;
-}
-}"#,
-        r#"unsafe fn f(flag: bool) {
-#[proctor(0)] if flag {
-#[proctor(1)] const X: i32 = 1;
-} else {
-#[proctor(2)] const X: i32 = 2;
-}
-}"#,
-    );
-
-    let initializer_skeleton = r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = {
-#[proctor(1)] let mut inner = 1;
-#[proctor(2)] inner
-};
-#[proctor(3)] todo!()
-}"#;
-    assert_valid(
-        initializer_skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = {
-#[proctor(1)] let inner = 1;
-#[proctor(2)] inner
-};
-#[proctor(3)] LOCAL
-}"#,
-    );
-    assert_codes(
-        initializer_skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = {
-#[proctor(1)] let inner = 1;
-#[proctor(1)] let proctor_temp_var_0 = 2;
-#[proctor(2)] inner
-};
-#[proctor(3)] LOCAL
-}"#,
-        &["existing_item_structure_mismatch"],
-    );
-    assert_codes(
-        initializer_skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = {
-#[proctor(1)] let renamed = 1;
-#[proctor(2)] renamed
-};
-#[proctor(3)] LOCAL
-}"#,
-        &["existing_item_structure_mismatch"],
-    );
-
-    let attributed_skeleton = r#"unsafe fn f() -> i32 {
-#[proctor(0)] #[allow(dead_code)] const LOCAL: i32 = 1;
-#[proctor(1)] todo!()
-}"#;
-    assert_valid(
-        attributed_skeleton,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] #[allow(dead_code)] const LOCAL: i32 = 1;
-#[proctor(1)] LOCAL
-}"#,
-    );
-    for transformation in [
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] LOCAL
-}"#,
-        r#"unsafe fn f() -> i32 {
-#[proctor(0)] #[allow(unused_variables)] const LOCAL: i32 = 1;
-#[proctor(1)] LOCAL
-}"#,
-    ] {
-        assert_codes(
-            attributed_skeleton,
-            transformation,
-            &["existing_item_structure_mismatch"],
-        );
-    }
-
-    for (transformation, code) in [
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(0)] const LOCAL: i32 = 2;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "duplicate_existing_item",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] consume(1);
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] const LOCAL: i32 = 1;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "existing_item_location_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i64 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] STATE
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] static LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 7;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i64 = 2;
-#[proctor(2)] LOCAL
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-        (
-            r#"unsafe fn f() -> i32 {
-#[proctor(0)] #[allow(dead_code)] const LOCAL: i32 = 1;
-#[proctor(1)] static mut STATE: i32 = 2;
-#[proctor(2)] LOCAL + STATE
-}"#,
-            "existing_item_structure_mismatch",
-        ),
-    ] {
-        assert_codes(skeleton, transformation, &[code]);
-    }
-}
-
-#[test]
 fn temporaries_are_local_to_one_expansion_group() {
     assert_valid(
         "unsafe fn f(mut p: Option<&i32>) -> i32 { #[proctor(0)] let mut x: i32 = todo!(); #[proctor(1)] todo!() }",
@@ -1495,18 +1430,6 @@ fn independent_errors_are_aggregated_in_stable_order() {
     };
     assert!(failures[0].errors[0].message.contains("label 1"));
     assert!(failures[0].errors[1].message.contains("label 2"));
-
-    assert_codes(
-        r#"unsafe fn f() {
-#[proctor(0)] const LOCAL: i32 = 1;
-#[proctor(1)] let mut value: i32 = todo!();
-}"#,
-        r#"unsafe fn f() {
-#[proctor(0)] return;
-#[proctor(1)] return;
-}"#,
-        &["missing_existing_item", "missing_existing_binding"],
-    );
 
     for transformation in [
         r#"unsafe fn f() {
