@@ -8,6 +8,7 @@ use std::ops::Range;
 
 pub(crate) mod boundary_table;
 pub(crate) mod borrow_engine;
+pub(crate) mod l2;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
 mod domain;

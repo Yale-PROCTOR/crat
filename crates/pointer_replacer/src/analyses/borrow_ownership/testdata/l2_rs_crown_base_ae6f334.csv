@@ -1,0 +1,23 @@
+# base_sha=ae6f334eca78cbaa254bfb3afc65e3c31130153d
+# source=official rs-crown baseline, re-anchored unchanged by the ae6f334 Mode-A necessity audit
+program,n_ref,n_ref_d0
+bst,11,11
+avl,12,12
+ht,89,83
+libcsv,352,330
+buffer,955,949
+quadtree,729,716
+urlparser,1264,1264
+robotfindskitten,406,314
+rgba,516,514
+genann,1655,1548
+libtree,1532,1391
+json.h,774,772
+binn,1742,1703
+libzahl,2349,2286
+lil,3090,2560
+heman,4460,4389
+bzip2,4925,4565
+lodepng,5808,5416
+tulipindicators,6487,5612
+brotli,15654,15024
