@@ -642,6 +642,7 @@ fn verify_l2_to_fixpoint_counting(
         }
     };
     record_dropped(&mut stats, selectors, &dropped);
+    let mut diagnostic_slots = diagnostics_enabled.then(Vec::new);
 
     loop {
         stats.rounds += 1;
@@ -657,6 +658,7 @@ fn verify_l2_to_fixpoint_counting(
         );
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
             stats.field_conflict_decline = Some(field);
+            emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
             return (None, stats);
         }
         assert!(
@@ -687,6 +689,7 @@ fn verify_l2_to_fixpoint_counting(
                     "L2 planner/fixpoint validation-round counters diverged"
                 );
                 stats.commits_per_round.push(0);
+                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 return (Some(model), stats);
             }
             L2RoundPlan::Continue {
@@ -708,11 +711,16 @@ fn verify_l2_to_fixpoint_counting(
                     "L2 planner/fixpoint validation-round counters diverged"
                 );
                 record_l2_decline(&mut stats, validation_round, reason, diagnostics_enabled);
+                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 return (None, stats);
             }
         };
 
         for action in &actions {
+            if let Some(slots) = diagnostic_slots.as_mut() {
+                slots.push(action.target);
+                slots.extend(action.peers.iter().copied());
+            }
             solver.add_l2_commit(action);
             emit_l2_action_diagnostic(action, diagnostics_enabled);
         }
@@ -731,6 +739,7 @@ fn verify_l2_to_fixpoint_counting(
                     L2DeclineReason::Solver(L2SolverDecline::Unsat),
                     diagnostics_enabled,
                 );
+                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 return (None, stats);
             }
             L2SolveResult::Unknown => {
@@ -740,9 +749,36 @@ fn verify_l2_to_fixpoint_counting(
                     L2DeclineReason::Solver(L2SolverDecline::Unknown),
                     diagnostics_enabled,
                 );
+                emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                 return (None, stats);
             }
         }
+    }
+}
+
+fn emit_l2_final_diagnostics(
+    slots: Option<&mut Vec<SlotRef>>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) {
+    let Some(slots) = slots else {
+        return;
+    };
+    slots.sort_by_key(|slot| l2::SlotKey::of(*slot));
+    slots.dedup();
+    for &slot in slots.iter() {
+        let kind = match model
+            .get(&slot)
+            .copied()
+            .expect("every emitted L2 diagnostic slot must exist in the solved model")
+        {
+            SlotKind::Ref => "ref",
+            SlotKind::Raw => "raw",
+            SlotKind::Owning => "owning",
+        };
+        eprintln!(
+            "[bo-l2] event=l2_final|slot={}|kind={kind}",
+            l2::slotref_diagnostic(slot)
+        );
     }
 }
 
