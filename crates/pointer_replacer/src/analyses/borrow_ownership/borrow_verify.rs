@@ -698,6 +698,64 @@ pub(crate) fn verify_to_fixpoint_counting(
 /// L2 feature-on validate/re-solve loop. This is deliberately separate from
 /// the feature-off branch above: disabled Mode-A retains its original conflict
 /// iteration, assertion order, cap, and `add_borrow_exclusion` calls.
+#[derive(Clone)]
+struct L2ActiveDiagnosticClause {
+    sequence: usize,
+    committed_round: usize,
+    action: CommitAction,
+}
+
+#[derive(Default)]
+struct L2TransitionDiagnostics {
+    active: Vec<L2ActiveDiagnosticClause>,
+    previous_model: Option<FxHashMap<SlotRef, SlotKind>>,
+}
+
+impl L2TransitionDiagnostics {
+    fn emit_round(
+        &self,
+        validation_round: usize,
+        planner: &Planner,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) {
+        eprintln!(
+            "[bo-l2] event=l2_round_state|round={validation_round}|active_clauses={}",
+            self.active.len()
+        );
+        let previous_model = self.previous_model.as_ref().unwrap_or(model);
+        for clause in &self.active {
+            eprintln!(
+                "[bo-l2] {}",
+                l2::clause_state_diagnostic(
+                    &clause.action,
+                    clause.sequence,
+                    clause.committed_round,
+                    validation_round,
+                    previous_model,
+                    model,
+                    |slot| planner.lifecycle(slot),
+                )
+            );
+        }
+    }
+
+    fn record_actions(
+        &mut self,
+        committed_round: usize,
+        actions: &[CommitAction],
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) {
+        self.previous_model = Some(model.clone());
+        for action in actions {
+            self.active.push(L2ActiveDiagnosticClause {
+                sequence: self.active.len() + 1,
+                committed_round,
+                action: action.clone(),
+            });
+        }
+    }
+}
+
 fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -706,6 +764,8 @@ fn verify_l2_to_fixpoint_counting(
     is_mutable: impl MutProvider + Copy,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     let diagnostics_enabled = l2::diagnostics_enabled_from_env();
+    let mut transition_diagnostics =
+        l2::transition_diagnostics_enabled_from_env().then(L2TransitionDiagnostics::default);
     let slot_count = slots
         .fn_local_slots
         .values()
@@ -747,6 +807,9 @@ fn verify_l2_to_fixpoint_counting(
 
     loop {
         stats.rounds += 1;
+        if let Some(diagnostics) = &transition_diagnostics {
+            diagnostics.emit_round(stats.rounds, &planner, &model);
+        }
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
@@ -830,6 +893,9 @@ fn verify_l2_to_fixpoint_counting(
             }
             solver.add_l2_commit(action);
             emit_l2_action_diagnostic(action, diagnostics_enabled);
+        }
+        if let Some(diagnostics) = &mut transition_diagnostics {
+            diagnostics.record_actions(stats.rounds, &actions, &model);
         }
         stats.commits_conflict += actions.len();
         stats.commits_per_round.push(actions.len());

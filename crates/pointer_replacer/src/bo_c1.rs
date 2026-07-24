@@ -626,7 +626,7 @@ mod run {
             },
             coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
-            emit_crate_ownership_constraints,
+            emit_crate_ownership_constraints, l2,
             mutability_facts::{MutFacts, MutFactsMode, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
@@ -641,6 +641,16 @@ mod run {
 
     fn phase(name: &str, since: Instant) {
         eprintln!("BOC1PHASE {name} t={:.2}", since.elapsed().as_secs_f64());
+    }
+
+    fn certified_context_enabled() -> bool {
+        const ENV: &str = "CRAT_BOC1_L2_CERTIFIED_CONTEXT";
+        match std::env::var(ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
     }
 
     // ───────────────────────── §NB4-4c-Q collateral measurement (item-4 sizing) ─────────────────────
@@ -1155,6 +1165,115 @@ mod run {
         row.set("na_status", "ok");
     }
 
+    /// D2 witness-only replay of the audit's final certification step.
+    ///
+    /// The certified inventory supplies the already-reviewed `removed` set, so
+    /// this skips both leave-one-out passes: hard-pin those slots `Ref`, demote
+    /// every other captured Mode-A commit, invoke the existing relaxing solver
+    /// once, and validate the resulting model with the audit's exact
+    /// `model_accepts` predicate.
+    fn run_certified_context(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+        is_mutable: impl MutProvider + Copy,
+        events: &[(SlotRef, usize)],
+        row: &mut Row,
+    ) {
+        assert!(
+            !l2::enabled_from_env(),
+            "certified-context replay must capture the Mode-A feature-off commit set"
+        );
+        assert!(
+            l2::diagnostics_enabled_from_env(),
+            "certified-context replay requires CRAT_POINTER_DECISION_DIAGNOSTICS"
+        );
+
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").expect("certified-context worker requires program name");
+        let expected = super::l2_red_gate::targets_for(&program_name);
+        assert!(
+            !expected.is_empty(),
+            "certified-context replay has no certified targets for {program_name}"
+        );
+        let expected_names: FxHashSet<String> =
+            expected.iter().map(|target| target.slot.clone()).collect();
+
+        let mut seen = FxHashSet::default();
+        let mut commit_set = events
+            .iter()
+            .copied()
+            .filter(|(slot, _)| seen.insert(*slot))
+            .collect::<Vec<_>>();
+        commit_set.sort_by(|a, b| (a.1, slotref_key(&a.0)).cmp(&(b.1, slotref_key(&b.0))));
+
+        let mut removed = Vec::new();
+        let mut retained = Vec::new();
+        let mut found_names = FxHashSet::default();
+        for &(slot, _) in &commit_set {
+            let name = fmt_slot(program, slots, slot);
+            if expected_names.contains(&name) {
+                assert!(
+                    found_names.insert(name),
+                    "duplicate certified-context target in Mode-A commit set"
+                );
+                removed.push(slot);
+            } else {
+                retained.push(slot);
+            }
+        }
+        assert_eq!(
+            found_names, expected_names,
+            "certified-context targets do not match the captured Mode-A commit set"
+        );
+
+        let (base, selectors) =
+            build_probe_base(program, slots, origins).expect("certified-context probe base");
+        base.push_scope();
+        for &slot in &removed {
+            base.assume(slot, SlotKind::Ref);
+        }
+        for &slot in &retained {
+            base.add_borrow_exclusion(Some(slot), &[]);
+        }
+        let before_checks = base.check_sat_count();
+        let witness = base.model_kinds_relaxing(&selectors);
+        let witness_checks = base.check_sat_count() - before_checks;
+        base.pop_scope();
+
+        let witness = witness.expect("certified-context hard-pinned witness must be SAT");
+        assert!(
+            removed
+                .iter()
+                .all(|slot| witness.get(slot) == Some(&SlotKind::Ref)),
+            "certified-context witness violated a hard Ref pin"
+        );
+        assert!(
+            model_accepts(program, slots, &witness, is_mutable),
+            "certified-context hard-pinned witness must pass audit acceptance"
+        );
+
+        let mut witness_slots = witness.keys().copied().collect::<Vec<_>>();
+        witness_slots.sort_by_key(slotref_key);
+        for slot in witness_slots {
+            let kind = match witness[&slot] {
+                SlotKind::Ref => "ref",
+                SlotKind::Raw => "raw",
+                SlotKind::Owning => "owning",
+            };
+            eprintln!(
+                "[bo-l2] event=l2_certified_kind|program={program_name}|slot={}|slot_key={}|kind={kind}",
+                fmt_slot(program, slots, slot),
+                l2::slotref_diagnostic(slot),
+            );
+        }
+        row.set("l2_certified_context", "ok");
+        row.set("l2_certified_targets", removed.len());
+        row.set("l2_certified_demoted", retained.len());
+        row.set("l2_certified_solve_calls", 1);
+        row.set("l2_certified_check_sat", witness_checks);
+    }
+
     /// BO mode: the exact `assert_ownership_parity` construction, with the native fixpoint loop's
     /// round/commit counts (`verify_to_fixpoint_counting`), per-phase timings, and the model readout
     /// (kind tallies + leaked sources).
@@ -1429,7 +1548,12 @@ mod run {
         // `(slot, round)` commits are recorded — a side-channel, so `(model, rstats)` are byte-identical
         // to the non-audit branch (the sweep numbers do not move whether or not the audit is on).
         let audit = std::env::var_os("CRAT_BOC1_NECESSITY_AUDIT").is_some();
-        let ((model, rstats), captured) = if audit {
+        let certified_context = certified_context_enabled();
+        assert!(
+            !(audit && certified_context),
+            "necessity audit and certified-context witness-only replay are mutually exclusive"
+        );
+        let ((model, rstats), captured) = if audit || certified_context {
             let (mr, events) = with_capture(|| {
                 verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
             });
@@ -1642,6 +1766,18 @@ mod run {
             // numeric audit fields, rather than contaminating a comparative sweep.
             if rstats.repair != RepairMode::ModeA {
                 row.set("na_status", "wrong-repair-mode");
+            } else if certified_context {
+                let t = Instant::now();
+                run_certified_context(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &events,
+                    &mut row,
+                );
+                row.set("t_certified_context_s", secs(t.elapsed()));
+                phase("certified_context_done", t0);
             } else {
                 let t = Instant::now();
                 run_necessity_audit(&program, &slots, &origins, &mut_facts, &model, &events, &mut row);
