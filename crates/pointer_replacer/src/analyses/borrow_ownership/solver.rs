@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
 use rustc_hash::FxHashMap;
@@ -9,6 +9,10 @@ use z3::{Model, Optimize, SatResult, ast::Bool};
 use super::{
     SlotKind,
     crate_slots::CrateSlots,
+    l2::{
+        CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
+        RECURRENCE_ESCALATION_CORE_FAMILY,
+    },
     slots::{SlotId, SlotUniverse},
     ssa::constraint::{Database, Gen, Var},
 };
@@ -101,6 +105,8 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "field-and",
     "field-forbid",
     "link-own",
+    GUARDED_COMMIT_CORE_FAMILY,
+    RECURRENCE_ESCALATION_CORE_FAMILY,
     "borrow-exclusion",
     // §NB4-4c: `¬own(slot)` demotion companion to `borrow-exclusion`. No substring overlap with
     // the `own-*` families or `borrow-exclusion` (first-containment matching stays unambiguous).
@@ -124,6 +130,7 @@ pub struct KindSolver {
     solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
     tracker: Option<CoreTracker>,
+    check_sat_count: Cell<usize>,
 }
 
 impl KindSolver {
@@ -170,6 +177,7 @@ impl KindSolver {
             solver,
             vars,
             tracker,
+            check_sat_count: Cell::new(0),
         }
     }
 
@@ -384,6 +392,48 @@ impl KindSolver {
         );
     }
 
+    /// L2 context-conditioned single-literal commit. The planner supplies a
+    /// forbid-only clause whose negative `ref` literals are pinned directly by
+    /// the RED contract; this method binds that representation to the solver's
+    /// hard-assertion and tracked-core path without changing Mode-A's existing
+    /// `add_borrow_exclusion` emission.
+    pub(crate) fn add_l2_commit(&self, action: &CommitAction) {
+        let expected_family = match action.kind {
+            CommitActionKind::GuardedCommit | CommitActionKind::UnconditionalCommit => {
+                GUARDED_COMMIT_CORE_FAMILY
+            }
+            CommitActionKind::RecurrenceEscalation => RECURRENCE_ESCALATION_CORE_FAMILY,
+        };
+        assert_eq!(
+            action.core_family, expected_family,
+            "L2 action kind/core-family mismatch"
+        );
+        assert!(
+            !action.clause.forbidden_refs.is_empty(),
+            "L2 forbid clause must contain its target"
+        );
+
+        let literals = action
+            .clause
+            .forbidden_refs
+            .iter()
+            .map(|slot| {
+                let vars = self
+                    .vars
+                    .get(slot)
+                    .unwrap_or_else(|| panic!("unknown L2 slot: {slot:?}"));
+                !&vars.ref_
+            })
+            .collect::<Vec<_>>();
+        let refs = literals.iter().collect::<Vec<_>>();
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("{expected_family}({})", action.diagnostic_label),
+            &Bool::or(&refs),
+        );
+    }
+
     /// §NB5-L2 — push a solver scope. Hard clauses asserted after `push_scope` are removed by the
     /// matching `pop_scope`; the soft objective (added in `build`, before any push) persists. The
     /// commit-necessity audit uses this to reuse ONE emitted base across all leave-one-out probes:
@@ -452,7 +502,17 @@ impl KindSolver {
             self.tracker.is_none(),
             "tracked KindSolver must not enter check() (constraints are track-gated)"
         );
-        self.solver.check(&[])
+        self.check_with_assumptions(&[])
+    }
+
+    pub(crate) fn check_sat_count(&self) -> usize {
+        self.check_sat_count.get()
+    }
+
+    fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
+        self.check_sat_count
+            .set(self.check_sat_count.get().saturating_add(1));
+        self.solver.check(assumptions)
     }
 
     pub(crate) fn optimize(&self) -> &Optimize {
@@ -522,7 +582,7 @@ impl KindSolver {
 
         // Phase 1: drop conflicting selectors until SAT (or give up).
         loop {
-            match self.solver.check(&assumptions) {
+            match self.check_with_assumptions(&assumptions) {
                 SatResult::Sat => break,
                 SatResult::Unsat => {
                     let core = self.solver.get_unsat_core();
@@ -553,7 +613,7 @@ impl KindSolver {
         let mut i = 0;
         while i < leaked.len() {
             assumptions.push(leaked[i].clone());
-            if self.solver.check(&assumptions) == SatResult::Sat {
+            if self.check_with_assumptions(&assumptions) == SatResult::Sat {
                 leaked.swap_remove(i);
             } else {
                 assumptions.pop();
@@ -562,9 +622,80 @@ impl KindSolver {
         }
 
         // Final SAT model under the maximal-retention assumption set.
-        match self.solver.check(&assumptions) {
+        match self.check_with_assumptions(&assumptions) {
             SatResult::Sat => Some((self.read_kinds(&self.solver.get_model()?), leaked)),
             _ => None,
+        }
+    }
+
+    /// L2 reporting solve. Unlike the legacy `Option` API, this preserves the
+    /// fail-closed distinction between non-selector UNSAT and Z3 Unknown so the
+    /// feature-on loop can emit the ruled diagnostic without altering the
+    /// feature-off solver path.
+    pub(crate) fn model_kinds_relaxing_reporting_l2(
+        &self,
+        selectors: &Selectors,
+    ) -> L2SolveResult {
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
+        );
+        let mut assumptions = selectors.all().to_vec();
+        let mut leaked = Vec::new();
+
+        loop {
+            match self.check_with_assumptions(&assumptions) {
+                SatResult::Sat => break,
+                SatResult::Unsat => {
+                    let core = self.solver.get_unsat_core();
+                    let in_core = |selector: &Bool| core.iter().any(|item| item == selector);
+                    let Some(index) = assumptions
+                        .iter()
+                        .position(|selector| selectors.is_sink(selector) && in_core(selector))
+                        .or_else(|| assumptions.iter().position(in_core))
+                    else {
+                        return L2SolveResult::Unsat;
+                    };
+                    leaked.push(assumptions.swap_remove(index));
+                }
+                SatResult::Unknown => return L2SolveResult::Unknown,
+            }
+        }
+
+        let mut final_model_ready = true;
+        let mut index = 0;
+        while index < leaked.len() {
+            assumptions.push(leaked[index].clone());
+            match self.check_with_assumptions(&assumptions) {
+                SatResult::Sat => {
+                    leaked.swap_remove(index);
+                    final_model_ready = true;
+                }
+                SatResult::Unsat => {
+                    assumptions.pop();
+                    index += 1;
+                    final_model_ready = false;
+                }
+                SatResult::Unknown => return L2SolveResult::Unknown,
+            }
+        }
+
+        let final_outcome = if final_model_ready {
+            SatResult::Sat
+        } else {
+            self.check_with_assumptions(&assumptions)
+        };
+        match final_outcome {
+            SatResult::Sat => self
+                .solver
+                .get_model()
+                .map(|model| L2SolveResult::Sat {
+                    kinds: self.read_kinds(&model),
+                    dropped: leaked,
+                })
+                .unwrap_or(L2SolveResult::Unknown),
+            SatResult::Unsat => L2SolveResult::Unsat,
+            SatResult::Unknown => L2SolveResult::Unknown,
         }
     }
 
@@ -583,6 +714,15 @@ impl KindSolver {
         }
         kinds
     }
+}
+
+pub(crate) enum L2SolveResult {
+    Sat {
+        kinds: FxHashMap<SlotRef, SlotKind>,
+        dropped: Vec<Bool>,
+    },
+    Unsat,
+    Unknown,
 }
 
 fn add_universe<F>(

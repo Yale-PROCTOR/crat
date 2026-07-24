@@ -489,9 +489,15 @@ mod l2_red_gate {
                     .is_some_and(|delta| delta < 0)
             })
             .count();
+        let check_sat = rows
+            .iter()
+            .filter_map(|row| row.get("check_sat_count"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
         format!(
             "L2RED accepted={accepted}/{} found={found}/{expected} recovered={recovered}/{expected} \
-             n_ref={n_ref}/{base_n_ref} delta={} per_program_regressions={regressions}",
+             n_ref={n_ref}/{base_n_ref} delta={} per_program_regressions={regressions} \
+             check_sat={check_sat}",
             rows.len(),
             n_ref as i64 - base_n_ref as i64,
         )
@@ -542,6 +548,10 @@ mod l2_red_gate {
                 row.get("z3_full_version"),
                 Some("4.15.4.0"),
                 "L2 RED row did not use the frozen Z3 version: {row:?}"
+            );
+            assert!(
+                usize_field(row, "check_sat_count") > 0,
+                "L2 RED row did not report solver check-sat activity: {row:?}"
             );
         }
 
@@ -1435,6 +1445,7 @@ mod run {
         row.set("repair", rstats.repair.label());
         row.set("rounds", rstats.rounds);
         row.set("commits_conflict", rstats.commits_conflict);
+        row.set("check_sat_count", solver.check_sat_count());
         row.set(
             "commits_per_round",
             rstats
@@ -1479,7 +1490,10 @@ mod run {
                 // §NB5-L (Codex MEDIUM): a `Lemmas` cap-exhaustion decline is a relaxed-SAT model that
                 // hit the round cap — NOT an UNSAT. Intercept it FIRST so `decline_reason` (a
                 // selector-core replay) does not mislabel it `sat-in-replay` and hide the cap exhaustion.
-                if rstats.cap_exhausted {
+                if let Some(reason) = &rstats.l2_decline {
+                    row.set("decline_reason", "l2");
+                    row.set("l2_decline", reason.diagnostic_label(rstats.rounds));
+                } else if rstats.cap_exhausted {
                     row.set("decline_reason", "cap-exhausted");
                 } else if let Some(field_slot) = rstats.field_conflict_decline {
                     row.set("decline_reason", "field-conflict");
@@ -3256,6 +3270,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "t_origins_s",
         "rounds",
         "commits_conflict",
+        "check_sat_count",
         "slots_total",
         "n_ref",
         "n_raw",
@@ -3282,6 +3297,7 @@ fn render_report(merged: &[report::Row]) -> String {
         "s23_owning_model",
         "s23_blocked",
         "decline_reason",
+        "l2_decline",
         "core_families",
         "core_minimized",
         "prod_status",
