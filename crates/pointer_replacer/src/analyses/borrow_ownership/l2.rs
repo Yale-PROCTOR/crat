@@ -1,9 +1,9 @@
 //! L2 context-conditioned single-literal commit planning.
 //!
-//! This module is an inert RED-phase contract. Nothing in the production
-//! borrow-verification or solver paths calls it yet. The tests below pin the
-//! approved guard, lifecycle, termination, and deterministic-diagnostic
-//! behavior before that wiring is implemented.
+//! The planner is pure bookkeeping over one solved model. The production
+//! borrow-verification path translates residual conflicts into observations,
+//! asks the planner for a same-round batch, then emits the returned forbid-only
+//! clauses through the solver's tracked hard-assertion choke point.
 
 use rustc_hash::FxHashMap;
 
@@ -16,8 +16,7 @@ pub(crate) const RECURRENCE_ESCALATION_CORE_FAMILY: &str = "l2-recurrence-escala
 /// the read-only conflict adapter.
 pub(crate) type FnKey = u32;
 
-/// Feature switch resolved once by the future `verify_to_fixpoint_counting`
-/// integration. There is intentionally no production caller in the RED phase.
+/// Feature switch resolved once by `verify_to_fixpoint_counting`.
 pub(crate) fn enabled_from_env() -> bool {
     match std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("0") => false,
@@ -207,8 +206,8 @@ pub(crate) enum RoundPlan {
     },
 }
 
-/// Per-fixpoint-invocation L2 state. Its future implementation must advance
-/// every selected slot monotonically through `Unseen → Guarded → Permanent`.
+/// Per-fixpoint-invocation L2 state. Every selected slot advances monotonically
+/// through `Unseen → Guarded → Permanent`.
 pub(crate) struct Planner {
     slot_count: usize,
     validation_rounds: usize,
@@ -244,17 +243,212 @@ impl Planner {
 
     /// Plan one post-solve validation round.
     ///
-    /// RED-phase contract only: GREEN fills this body without changing the test
-    /// assertions below, then the integration phase may call it from Mode-A's
-    /// feature-on branch.
     pub(crate) fn plan_round(
         &mut self,
-        _solver_outcome: SolverOutcome,
-        _observations: &[ConflictObservation],
-        _model: &FxHashMap<SlotRef, SlotKind>,
+        solver_outcome: SolverOutcome,
+        observations: &[ConflictObservation],
+        model: &FxHashMap<SlotRef, SlotKind>,
     ) -> RoundPlan {
-        unimplemented!("L2 RED contract: round planning is not implemented")
+        match solver_outcome {
+            SolverOutcome::Unsat => {
+                return RoundPlan::Decline {
+                    validation_round: self.validation_rounds,
+                    reason: DeclineReason::Solver(SolverDecline::Unsat),
+                };
+            }
+            SolverOutcome::Unknown => {
+                return RoundPlan::Decline {
+                    validation_round: self.validation_rounds,
+                    reason: DeclineReason::Solver(SolverDecline::Unknown),
+                };
+            }
+            SolverOutcome::Sat => {}
+        }
+
+        self.validation_rounds += 1;
+        let validation_round = self.validation_rounds;
+        let cap = self.validation_cap();
+        if validation_round > cap {
+            return RoundPlan::Decline {
+                validation_round,
+                reason: DeclineReason::ValidationCap {
+                    cap,
+                    attempted_round: validation_round,
+                },
+            };
+        }
+        if observations.is_empty() {
+            return RoundPlan::Accept { validation_round };
+        }
+
+        let mut candidates = Vec::with_capacity(observations.len());
+        for observation in observations {
+            let mut participants = observation
+                .issuer
+                .into_iter()
+                .chain(observation.requirers.iter().copied())
+                .collect::<Vec<_>>();
+            participants.push(observation.target);
+            canonicalize_slots(&mut participants);
+            if let Some(&slot) = participants
+                .iter()
+                .find(|slot| model.get(slot) != Some(&SlotKind::Ref))
+            {
+                return RoundPlan::Decline {
+                    validation_round,
+                    reason: DeclineReason::ParticipantNotRef { slot },
+                };
+            }
+
+            let mut peers = participants;
+            peers.retain(|slot| *slot != observation.target);
+            let mut requirers = observation.requirers.clone();
+            canonicalize_slots(&mut requirers);
+            let edge = EdgeKey {
+                fn_key: observation.fn_key,
+                issuer: observation.issuer.map(SlotKey::of),
+                requirers: requirers.into_iter().map(SlotKey::of).collect(),
+            };
+            candidates.push(Candidate {
+                target: observation.target,
+                peers,
+                edge,
+            });
+        }
+
+        candidates.sort_by(|a, b| a.key().cmp(&b.key()));
+        candidates.dedup_by(|a, b| {
+            SlotKey::of(a.target) == SlotKey::of(b.target)
+                && slot_keys(&a.peers) == slot_keys(&b.peers)
+        });
+
+        let mut actions = Vec::new();
+        let mut cursor = 0;
+        while cursor < candidates.len() {
+            let target = candidates[cursor].target;
+            let target_key = SlotKey::of(target);
+            let end = candidates[cursor..]
+                .iter()
+                .position(|candidate| SlotKey::of(candidate.target) != target_key)
+                .map_or(candidates.len(), |offset| cursor + offset);
+            let epoch = &candidates[cursor..end];
+
+            match self.lifecycle(target) {
+                Lifecycle::Unseen => {
+                    if let Some(unconditional) =
+                        epoch.iter().find(|candidate| candidate.peers.is_empty())
+                    {
+                        actions.push(unconditional.action(
+                            CommitActionKind::UnconditionalCommit,
+                            GUARDED_COMMIT_CORE_FAMILY,
+                        ));
+                        self.lifecycle.insert(target, Lifecycle::Permanent);
+                    } else {
+                        actions.extend(epoch.iter().map(|candidate| {
+                            candidate.action(
+                                CommitActionKind::GuardedCommit,
+                                GUARDED_COMMIT_CORE_FAMILY,
+                            )
+                        }));
+                        self.lifecycle.insert(target, Lifecycle::Guarded);
+                    }
+                }
+                Lifecycle::Guarded => {
+                    actions.push(epoch[0].action(
+                        CommitActionKind::RecurrenceEscalation,
+                        RECURRENCE_ESCALATION_CORE_FAMILY,
+                    ));
+                    self.lifecycle.insert(target, Lifecycle::Permanent);
+                }
+                Lifecycle::Permanent => {
+                    return RoundPlan::Decline {
+                        validation_round,
+                        reason: DeclineReason::PermanentRetarget { target },
+                    };
+                }
+            }
+            cursor = end;
+        }
+
+        actions.sort_by(|a, b| a.diagnostic_key.cmp(&b.diagnostic_key));
+        RoundPlan::Continue {
+            validation_round,
+            actions,
+        }
     }
+}
+
+#[derive(Clone)]
+struct Candidate {
+    target: SlotRef,
+    peers: Vec<SlotRef>,
+    edge: EdgeKey,
+}
+
+impl Candidate {
+    fn key(&self) -> (SlotKey, Vec<SlotKey>, &EdgeKey) {
+        (SlotKey::of(self.target), slot_keys(&self.peers), &self.edge)
+    }
+
+    fn action(&self, kind: CommitActionKind, core_family: &'static str) -> CommitAction {
+        let diagnostic_key = DiagnosticKey {
+            target: SlotKey::of(self.target),
+            peers: slot_keys(&self.peers),
+            edge: self.edge.clone(),
+        };
+        let mut forbidden_refs = if kind == CommitActionKind::GuardedCommit {
+            self.peers.clone()
+        } else {
+            Vec::new()
+        };
+        forbidden_refs.push(self.target);
+        let diagnostic_label = diagnostic_label(kind, &diagnostic_key);
+        CommitAction {
+            target: self.target,
+            peers: self.peers.clone(),
+            clause: ForbidClause { forbidden_refs },
+            edge: self.edge.clone(),
+            kind,
+            core_family,
+            diagnostic_key,
+            diagnostic_label,
+        }
+    }
+}
+
+fn canonicalize_slots(slots: &mut Vec<SlotRef>) {
+    slots.sort_by_key(|slot| SlotKey::of(*slot));
+    slots.dedup();
+}
+
+fn slot_keys(slots: &[SlotRef]) -> Vec<SlotKey> {
+    slots.iter().copied().map(SlotKey::of).collect()
+}
+
+fn diagnostic_label(kind: CommitActionKind, key: &DiagnosticKey) -> String {
+    let peers = key
+        .peers
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    let edge_issuer = key
+        .edge
+        .issuer
+        .map_or_else(|| "none".to_owned(), SlotKey::diagnostic);
+    let edge_requirers = key
+        .edge
+        .requirers
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "event=l2_commit|kind={}|target={}|peers={peers}|edge_fn={}|edge_issuer={edge_issuer}|edge_requirers={edge_requirers}",
+        kind.diagnostic(),
+        key.target.diagnostic(),
+        key.edge.fn_key,
+    )
 }
 
 #[cfg(test)]
