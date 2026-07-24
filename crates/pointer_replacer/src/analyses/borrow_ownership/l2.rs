@@ -37,6 +37,24 @@ pub(crate) fn diagnostics_enabled_from_env() -> bool {
     )
 }
 
+/// Extra D1 forensics layered on R7. This is resolved only inside the
+/// feature-on L2 loop, so feature-off does not inspect the variable or allocate
+/// transition state.
+pub(crate) fn transition_diagnostics_enabled_from_env() -> bool {
+    const ENV: &str = "CRAT_BO_L2_TRANSITION_DIAGNOSTICS";
+    let enabled = match std::env::var(ENV).as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+        Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+    };
+    assert!(
+        !enabled || diagnostics_enabled_from_env(),
+        "{ENV}=1 requires CRAT_POINTER_DECISION_DIAGNOSTICS"
+    );
+    enabled
+}
+
 /// A residual borrow-conflict edge translated wholly into BO slots.
 ///
 /// `target` is the unchanged Mode-A A′ representative. `issuer`,
@@ -218,6 +236,16 @@ pub(crate) enum Lifecycle {
     Permanent,
 }
 
+impl Lifecycle {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Unseen => "unseen",
+            Self::Guarded => "guarded",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitActionKind {
     GuardedCommit,
@@ -253,6 +281,157 @@ pub(crate) struct CommitAction {
     pub(crate) core_family: &'static str,
     pub(crate) diagnostic_key: DiagnosticKey,
     pub(crate) diagnostic_label: String,
+}
+
+/// R7-only snapshot of one already-asserted L2 clause at a later validation
+/// round. Every literal records its current kind, Boolean value, transition
+/// from the preceding solved model, and whether that slot is itself governed
+/// by an L2 guarded/permanent lifecycle.
+pub(crate) fn clause_state_diagnostic(
+    action: &CommitAction,
+    clause_sequence: usize,
+    committed_round: usize,
+    validation_round: usize,
+    previous_model: &FxHashMap<SlotRef, SlotKind>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    lifecycle: impl Fn(SlotRef) -> Lifecycle,
+) -> String {
+    #[derive(Clone, Copy)]
+    enum Role {
+        TargetNegative,
+        PeerNegative,
+        PeerPositive,
+    }
+
+    impl Role {
+        fn diagnostic(self) -> &'static str {
+            match self {
+                Self::TargetNegative => "target-neg",
+                Self::PeerNegative => "peer-neg",
+                Self::PeerPositive => "peer-pos",
+            }
+        }
+
+        fn literal_value(self, kind: SlotKind) -> bool {
+            match self {
+                Self::TargetNegative | Self::PeerNegative => kind != SlotKind::Ref,
+                Self::PeerPositive => kind == SlotKind::Ref,
+            }
+        }
+    }
+
+    fn kind_diagnostic(kind: SlotKind) -> &'static str {
+        match kind {
+            SlotKind::Ref => "ref",
+            SlotKind::Raw => "raw",
+            SlotKind::Owning => "owning",
+        }
+    }
+
+    let mut literals = action
+        .clause
+        .negative_refs
+        .iter()
+        .copied()
+        .map(|slot| {
+            (
+                slot,
+                if slot == action.target {
+                    Role::TargetNegative
+                } else {
+                    Role::PeerNegative
+                },
+            )
+        })
+        .chain(
+            action
+                .clause
+                .positive_refs
+                .iter()
+                .copied()
+                .map(|slot| (slot, Role::PeerPositive)),
+        )
+        .collect::<Vec<_>>();
+    literals.sort_by_key(|(slot, role)| {
+        let role_order = match role {
+            Role::TargetNegative => 0,
+            Role::PeerNegative => 1,
+            Role::PeerPositive => 2,
+        };
+        (SlotKey::of(*slot), role_order)
+    });
+
+    let literal_records = literals
+        .iter()
+        .map(|&(slot, role)| {
+            let kind = *model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("L2 clause-state model is missing {slot:?}"));
+            format!(
+                "{}@{}@{}@{}@{}",
+                slotref_diagnostic(slot),
+                role.diagnostic(),
+                kind_diagnostic(kind),
+                role.literal_value(kind),
+                lifecycle(slot).diagnostic(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let transition_records = literals
+        .iter()
+        .map(|&(slot, role)| {
+            let before = *previous_model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("previous L2 clause-state model is missing {slot:?}"));
+            let after = *model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("L2 clause-state model is missing {slot:?}"));
+            (
+                before != after,
+                format!(
+                    "{}@{}@{}>{}@{}",
+                    slotref_diagnostic(slot),
+                    role.diagnostic(),
+                    kind_diagnostic(before),
+                    kind_diagnostic(after),
+                    lifecycle(slot).diagnostic(),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let guard_context = if action.kind != CommitActionKind::GuardedCommit {
+        "unconditional"
+    } else if action.peer_witnesses.iter().all(|witness| {
+        model.get(&witness.slot)
+            == Some(&match witness.kind {
+                WitnessedKind::Ref => SlotKind::Ref,
+                WitnessedKind::Raw => SlotKind::Raw,
+            })
+    }) {
+        "held"
+    } else {
+        "departed"
+    };
+
+    format!(
+        "event=l2_clause_state|round={validation_round}|clause={clause_sequence}|\
+         committed_round={committed_round}|commit_kind={}|target={}|target_lifecycle={}|\
+         guard_context={guard_context}|literals={}|transitions={}|changed={}",
+        action.kind.diagnostic(),
+        slotref_diagnostic(action.target),
+        lifecycle(action.target).diagnostic(),
+        literal_records.join(","),
+        transition_records
+            .iter()
+            .map(|(_, record)| record.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        transition_records
+            .iter()
+            .filter_map(|(changed, record)| changed.then_some(record.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1310,6 +1489,40 @@ mod tests {
         .into_iter()
         .collect();
         assert_accept(persistent.plan_round(SolverOutcome::Sat, &[], &escalated_model));
+    }
+
+    #[test]
+    fn l2_transition_diagnostic_records_values_transitions_and_peer_lifecycle() {
+        let (target, peer) = (field(20), field(21));
+        let mut planner = Planner::new(2);
+        let before = ref_model(&[target, peer]);
+        let action = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                7,
+                target,
+                Some(peer),
+                vec![target],
+            )],
+            &before,
+        ))
+        .remove(0);
+        let after = [(target, SlotKind::Raw), (peer, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            clause_state_diagnostic(&action, 1, 1, 2, &before, &after, |slot| if slot == peer {
+                Lifecycle::Permanent
+            } else {
+                planner.lifecycle(slot)
+            },),
+            "event=l2_clause_state|round=2|clause=1|committed_round=1|commit_kind=guarded|\
+             target=field:20|target_lifecycle=guarded|guard_context=departed|\
+             literals=field:20@target-neg@raw@true@guarded,field:21@peer-neg@raw@true@permanent|\
+             transitions=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent|\
+             changed=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent"
+        );
     }
 
     #[test]
