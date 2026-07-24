@@ -39,15 +39,16 @@ pub(crate) fn diagnostics_enabled_from_env() -> bool {
 
 /// A residual borrow-conflict edge translated wholly into BO slots.
 ///
-/// `target` is the unchanged Mode-A A′ representative. `issuer` and
-/// `requirers` retain the complete edge attribution; the planner derives the
-/// guard from the participants that are `Ref` in `model`.
+/// `target` is the unchanged Mode-A A′ representative. `issuer`,
+/// `requirers`, and `invalidators` retain the complete mapped edge
+/// attribution; the planner records each participant's kind in `model`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConflictObservation {
     pub(crate) fn_key: FnKey,
     pub(crate) target: SlotRef,
     pub(crate) issuer: Option<SlotRef>,
     pub(crate) requirers: Vec<SlotRef>,
+    pub(crate) invalidators: Vec<SlotRef>,
 }
 
 impl ConflictObservation {
@@ -62,7 +63,13 @@ impl ConflictObservation {
             target,
             issuer,
             requirers,
+            invalidators: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_invalidators(mut self, invalidators: Vec<SlotRef>) -> Self {
+        self.invalidators = invalidators;
+        self
     }
 }
 
@@ -105,6 +112,32 @@ pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
     SlotKey::of(slot).diagnostic()
 }
 
+/// Explicit, stable per-peer witnessed kinds for the env-gated R7 record.
+///
+/// `diagnostic_label` retains the pinned legacy all-Ref form used by the RED
+/// determinism test and tracked core labels; the emitted R7 line appends this
+/// field so every action records polarity without an implicit convention.
+pub(crate) fn witnessed_peers_diagnostic(action: &CommitAction) -> String {
+    let owning_keys = slot_keys(&action.owning_peers);
+    action
+        .peers
+        .iter()
+        .map(|slot| {
+            let key = SlotKey::of(*slot);
+            if owning_keys.contains(&key) {
+                return format!("{}:owning", key.diagnostic());
+            }
+            let witness = action
+                .peer_witnesses
+                .iter()
+                .find(|witness| witness.slot == *slot)
+                .expect("every non-Owning R7 peer has witnessed polarity");
+            format!("{}:{}", key.diagnostic(), witness.kind.diagnostic())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Canonical identity of the conflict edge that spawned a commit.
 ///
 /// The function key is required even for field-only fixtures: the same field
@@ -116,6 +149,12 @@ pub(crate) struct EdgeKey {
     pub(crate) requirers: Vec<SlotKey>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct EdgeAttribution {
+    pub(crate) edge: EdgeKey,
+    pub(crate) invalidators: Vec<SlotKey>,
+}
+
 /// Canonical R7 diagnostic identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DiagnosticKey {
@@ -124,23 +163,50 @@ pub(crate) struct DiagnosticKey {
     pub(crate) edge: EdgeKey,
 }
 
-/// A forbid-only L2 clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum WitnessedKind {
+    Ref,
+    Raw,
+}
+
+impl WitnessedKind {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Ref => "ref",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerWitness {
+    pub(crate) slot: SlotRef,
+    pub(crate) kind: WitnessedKind,
+}
+
+/// One witnessed-context L2 clause.
 ///
-/// Every member denotes a negative `¬ref(slot)` literal. The target is stored
-/// last, after the canonical peer literals, so this representation cannot
-/// express a positive safety claim.
+/// `negative_refs` contains Ref-witnessed peers plus the fixed target.
+/// `positive_refs` contains Raw-witnessed peers. The target remains negative
+/// in every shape, so all-Raw always satisfies the clause.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ForbidClause {
-    pub(crate) forbidden_refs: Vec<SlotRef>,
+    pub(crate) negative_refs: Vec<SlotRef>,
+    pub(crate) positive_refs: Vec<SlotRef>,
 }
 
 impl ForbidClause {
     pub(crate) fn is_satisfied_by(&self, model: &FxHashMap<SlotRef, SlotKind>) -> bool {
-        self.forbidden_refs.iter().any(|slot| {
+        self.negative_refs.iter().any(|slot| {
             *model
                 .get(slot)
                 .unwrap_or_else(|| panic!("forbid-clause model is missing {slot:?}"))
                 != SlotKind::Ref
+        }) || self.positive_refs.iter().any(|slot| {
+            *model
+                .get(slot)
+                .unwrap_or_else(|| panic!("forbid-clause model is missing {slot:?}"))
+                == SlotKind::Ref
         })
     }
 }
@@ -178,8 +244,11 @@ pub(crate) struct CommitAction {
     /// reappearing context for R7 even though the emitted assertion is
     /// unconditional.
     pub(crate) peers: Vec<SlotRef>,
+    pub(crate) peer_witnesses: Vec<PeerWitness>,
+    pub(crate) owning_peers: Vec<SlotRef>,
     pub(crate) clause: ForbidClause,
     pub(crate) edge: EdgeKey,
+    pub(crate) edge_attributions: Vec<EdgeAttribution>,
     pub(crate) kind: CommitActionKind,
     pub(crate) core_family: &'static str,
     pub(crate) diagnostic_key: DiagnosticKey,
@@ -280,7 +349,6 @@ impl Planner {
     }
 
     /// Plan one post-solve validation round.
-    ///
     pub(crate) fn plan_round(
         &mut self,
         solver_outcome: SolverOutcome,
@@ -321,46 +389,79 @@ impl Planner {
 
         let mut candidates = Vec::with_capacity(observations.len());
         for observation in observations {
+            if model.get(&observation.target) != Some(&SlotKind::Ref) {
+                return RoundPlan::Decline {
+                    validation_round,
+                    reason: DeclineReason::ParticipantNotRef {
+                        slot: observation.target,
+                    },
+                };
+            }
+
             let mut participants = observation
                 .issuer
                 .into_iter()
                 .chain(observation.requirers.iter().copied())
+                .chain(observation.invalidators.iter().copied())
                 .collect::<Vec<_>>();
-            participants.push(observation.target);
             canonicalize_slots(&mut participants);
-            if let Some(&slot) = participants
-                .iter()
-                .find(|slot| model.get(slot) != Some(&SlotKind::Ref))
-            {
-                return RoundPlan::Decline {
-                    validation_round,
-                    reason: DeclineReason::ParticipantNotRef { slot },
-                };
+            participants.retain(|slot| *slot != observation.target);
+
+            let mut peer_witnesses = Vec::new();
+            let mut owning_peers = Vec::new();
+            for &slot in &participants {
+                match model.get(&slot) {
+                    Some(SlotKind::Ref) => peer_witnesses.push(PeerWitness {
+                        slot,
+                        kind: WitnessedKind::Ref,
+                    }),
+                    Some(SlotKind::Raw) => peer_witnesses.push(PeerWitness {
+                        slot,
+                        kind: WitnessedKind::Raw,
+                    }),
+                    Some(SlotKind::Owning) => owning_peers.push(slot),
+                    None => {
+                        return RoundPlan::Decline {
+                            validation_round,
+                            reason: DeclineReason::ParticipantNotRef { slot },
+                        };
+                    }
+                }
             }
 
-            let mut peers = participants;
-            peers.retain(|slot| *slot != observation.target);
             let mut requirers = observation.requirers.clone();
             canonicalize_slots(&mut requirers);
+            let mut invalidators = observation.invalidators.clone();
+            canonicalize_slots(&mut invalidators);
             let edge = EdgeKey {
                 fn_key: observation.fn_key,
                 issuer: observation.issuer.map(SlotKey::of),
                 requirers: requirers.into_iter().map(SlotKey::of).collect(),
             };
-            let peer_keys = slot_keys(&peers);
             candidates.push(Candidate {
                 target: observation.target,
-                peers,
-                peer_keys,
-                edge,
+                peers: participants,
+                peer_witnesses,
+                owning_peers,
+                edge_attributions: vec![EdgeAttribution {
+                    edge,
+                    invalidators: invalidators.into_iter().map(SlotKey::of).collect(),
+                }],
             });
         }
 
         candidates.sort_by(|a, b| a.key().cmp(&b.key()));
-        candidates.dedup_by(|a, b| {
-            SlotKey::of(a.target) == SlotKey::of(b.target)
-                && a.peer_keys == b.peer_keys
-        });
+        let mut merged_candidates: Vec<Candidate> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if let Some(previous) = merged_candidates.last_mut()
+                && previous.same_clause(&candidate)
+            {
+                previous.merge_attribution(candidate);
+            } else {
+                merged_candidates.push(candidate);
+            }
+        }
+        let candidates = merged_candidates;
 
         let mut actions = Vec::new();
         let mut cursor = 0;
@@ -376,7 +477,7 @@ impl Planner {
             match self.lifecycle(target) {
                 Lifecycle::Unseen => {
                     if let Some(unconditional) =
-                        epoch.iter().find(|candidate| candidate.peers.is_empty())
+                        epoch.iter().find(|candidate| candidate.is_unconditional())
                     {
                         actions.push(unconditional.action(
                             CommitActionKind::UnconditionalCommit,
@@ -385,10 +486,8 @@ impl Planner {
                         self.lifecycle.insert(target, Lifecycle::Permanent);
                     } else {
                         actions.extend(epoch.iter().map(|candidate| {
-                            candidate.action(
-                                CommitActionKind::GuardedCommit,
-                                GUARDED_COMMIT_CORE_FAMILY,
-                            )
+                            candidate
+                                .action(CommitActionKind::GuardedCommit, GUARDED_COMMIT_CORE_FAMILY)
                         }));
                         self.lifecycle.insert(target, Lifecycle::Guarded);
                     }
@@ -422,33 +521,100 @@ impl Planner {
 struct Candidate {
     target: SlotRef,
     peers: Vec<SlotRef>,
-    peer_keys: Vec<SlotKey>,
-    edge: EdgeKey,
+    peer_witnesses: Vec<PeerWitness>,
+    owning_peers: Vec<SlotRef>,
+    edge_attributions: Vec<EdgeAttribution>,
 }
 
 impl Candidate {
-    fn key(&self) -> (SlotKey, &[SlotKey], &EdgeKey) {
-        (SlotKey::of(self.target), &self.peer_keys, &self.edge)
+    fn witnessed_keys(&self) -> Vec<(SlotKey, WitnessedKind)> {
+        self.peer_witnesses
+            .iter()
+            .map(|witness| (SlotKey::of(witness.slot), witness.kind))
+            .collect()
+    }
+
+    fn is_unconditional(&self) -> bool {
+        self.peers.is_empty() || !self.owning_peers.is_empty()
+    }
+
+    fn clause_key(&self) -> Vec<(SlotKey, WitnessedKind)> {
+        if self.is_unconditional() {
+            Vec::new()
+        } else {
+            self.witnessed_keys()
+        }
+    }
+
+    fn key(&self) -> (SlotKey, Vec<(SlotKey, WitnessedKind)>, &EdgeAttribution) {
+        (
+            SlotKey::of(self.target),
+            self.clause_key(),
+            self.edge_attributions
+                .first()
+                .expect("every L2 candidate retains its spawning edge"),
+        )
+    }
+
+    fn same_clause(&self, other: &Self) -> bool {
+        SlotKey::of(self.target) == SlotKey::of(other.target)
+            && self.clause_key() == other.clause_key()
+    }
+
+    fn merge_attribution(&mut self, other: Self) {
+        self.peers.extend(other.peers);
+        canonicalize_slots(&mut self.peers);
+        self.peer_witnesses.extend(other.peer_witnesses);
+        self.peer_witnesses
+            .sort_by_key(|witness| SlotKey::of(witness.slot));
+        self.peer_witnesses
+            .dedup_by_key(|witness| SlotKey::of(witness.slot));
+        self.owning_peers.extend(other.owning_peers);
+        canonicalize_slots(&mut self.owning_peers);
+        self.edge_attributions.extend(other.edge_attributions);
+        self.edge_attributions.sort();
+        self.edge_attributions.dedup();
     }
 
     fn action(&self, kind: CommitActionKind, core_family: &'static str) -> CommitAction {
+        let primary_attribution = self
+            .edge_attributions
+            .first()
+            .expect("every L2 action retains a canonical spawning edge");
         let diagnostic_key = DiagnosticKey {
             target: SlotKey::of(self.target),
-            peers: self.peer_keys.clone(),
-            edge: self.edge.clone(),
+            peers: slot_keys(&self.peers),
+            edge: primary_attribution.edge.clone(),
         };
-        let mut forbidden_refs = if kind == CommitActionKind::GuardedCommit {
-            self.peers.clone()
-        } else {
-            Vec::new()
-        };
-        forbidden_refs.push(self.target);
-        let diagnostic_label = diagnostic_label(kind, &diagnostic_key);
+        let mut negative_refs = Vec::new();
+        let mut positive_refs = Vec::new();
+        if kind == CommitActionKind::GuardedCommit && !self.is_unconditional() {
+            for witness in &self.peer_witnesses {
+                match witness.kind {
+                    WitnessedKind::Ref => negative_refs.push(witness.slot),
+                    WitnessedKind::Raw => positive_refs.push(witness.slot),
+                }
+            }
+        }
+        negative_refs.push(self.target);
+        let diagnostic_label = diagnostic_label(
+            kind,
+            &diagnostic_key,
+            &self.peer_witnesses,
+            &self.owning_peers,
+            &self.edge_attributions,
+        );
         CommitAction {
             target: self.target,
             peers: self.peers.clone(),
-            clause: ForbidClause { forbidden_refs },
-            edge: self.edge.clone(),
+            peer_witnesses: self.peer_witnesses.clone(),
+            owning_peers: self.owning_peers.clone(),
+            clause: ForbidClause {
+                negative_refs,
+                positive_refs,
+            },
+            edge: primary_attribution.edge.clone(),
+            edge_attributions: self.edge_attributions.clone(),
             kind,
             core_family,
             diagnostic_key,
@@ -466,11 +632,38 @@ fn slot_keys(slots: &[SlotRef]) -> Vec<SlotKey> {
     slots.iter().copied().map(SlotKey::of).collect()
 }
 
-fn diagnostic_label(kind: CommitActionKind, key: &DiagnosticKey) -> String {
+fn diagnostic_label(
+    kind: CommitActionKind,
+    key: &DiagnosticKey,
+    peer_witnesses: &[PeerWitness],
+    owning_peers: &[SlotRef],
+    edge_attributions: &[EdgeAttribution],
+) -> String {
+    let explicit_polarity = kind == CommitActionKind::RecurrenceEscalation
+        || !owning_peers.is_empty()
+        || peer_witnesses
+            .iter()
+            .any(|witness| witness.kind == WitnessedKind::Raw);
+    let owning_keys = slot_keys(owning_peers);
     let peers = key
         .peers
         .iter()
-        .map(|slot| slot.diagnostic())
+        .map(|slot| {
+            if owning_keys.contains(slot) {
+                return format!("{}:owning", slot.diagnostic());
+            }
+            let witness = peer_witnesses
+                .iter()
+                .find(|witness| SlotKey::of(witness.slot) == *slot)
+                .expect("every non-Owning diagnostic peer has witnessed polarity");
+            if explicit_polarity {
+                format!("{}:{}", slot.diagnostic(), witness.kind.diagnostic())
+            } else {
+                // Legacy all-Ref guarded labels remain byte-identical. In this
+                // compact form an unsuffixed peer is unambiguously Ref.
+                slot.diagnostic()
+            }
+        })
         .collect::<Vec<_>>()
         .join(",");
     let edge_issuer = key
@@ -484,11 +677,68 @@ fn diagnostic_label(kind: CommitActionKind, key: &DiagnosticKey) -> String {
         .map(|slot| slot.diagnostic())
         .collect::<Vec<_>>()
         .join(",");
-    format!(
+    let mut label = format!(
         "event=l2_commit|kind={}|target={}|peers={peers}|edge_fn={}|edge_issuer={edge_issuer}|edge_requirers={edge_requirers}",
         kind.diagnostic(),
         key.target.diagnostic(),
         key.edge.fn_key,
+    );
+    let primary_invalidators = edge_attributions
+        .first()
+        .expect("every diagnostic has a primary edge attribution")
+        .invalidators
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !primary_invalidators.is_empty() {
+        label.push_str("|edge_invalidators=");
+        label.push_str(&primary_invalidators);
+    }
+    if !owning_peers.is_empty() {
+        label.push_str("|degraded_reason=owning_participant|owning_peers=");
+        label.push_str(
+            &owning_keys
+                .iter()
+                .map(|slot| slot.diagnostic())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if edge_attributions.len() > 1 {
+        label.push_str("|edge_attributions=");
+        label.push_str(
+            &edge_attributions
+                .iter()
+                .map(edge_attribution_diagnostic)
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+    label
+}
+
+fn edge_attribution_diagnostic(attribution: &EdgeAttribution) -> String {
+    let issuer = attribution
+        .edge
+        .issuer
+        .map_or_else(|| "none".to_owned(), SlotKey::diagnostic);
+    let requirers = attribution
+        .edge
+        .requirers
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    let invalidators = attribution
+        .invalidators
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}@{issuer}@{requirers}@{invalidators}",
+        attribution.edge.fn_key
     )
 }
 
@@ -525,10 +775,6 @@ mod tests {
             .collect()
     }
 
-    /// Mini-RED seam for §7. The current observation shape cannot carry an
-    /// invalidating-access witness, so RED deliberately drops it here. GREEN-2
-    /// rebinds this helper to the real BO-owned witness field; the assertions
-    /// below remain unchanged.
     fn observation_with_invalidators(
         fn_key: FnKey,
         target: SlotRef,
@@ -536,8 +782,7 @@ mod tests {
         requirers: Vec<SlotRef>,
         invalidators: Vec<SlotRef>,
     ) -> ConflictObservation {
-        let _ = invalidators;
-        ConflictObservation::new(fn_key, target, issuer, requirers)
+        ConflictObservation::new(fn_key, target, issuer, requirers).with_invalidators(invalidators)
     }
 
     fn continue_actions(plan: RoundPlan) -> Vec<CommitAction> {
@@ -556,14 +801,8 @@ mod tests {
 
     #[test]
     fn l2_red_guard_uses_exact_edge_peers_and_empty_guard_is_unconditional() {
-        let (target, outside, peer_a, peer_b, peer_c, invalidator) = (
-            field(1),
-            field(99),
-            field(4),
-            field(3),
-            field(2),
-            field(5),
-        );
+        let (target, outside, peer_a, peer_b, peer_c, invalidator) =
+            (field(1), field(99), field(4), field(3), field(2), field(5));
         let model = [
             (target, SlotKind::Ref),
             (outside, SlotKind::Ref),
@@ -650,12 +889,7 @@ mod tests {
                 18,
                 issuerless_target,
                 None,
-                vec![
-                    issuerless_b,
-                    issuerless_target,
-                    issuerless_a,
-                    issuerless_b,
-                ],
+                vec![issuerless_b, issuerless_target, issuerless_a, issuerless_b],
             )],
             &ref_model(&[issuerless_target, issuerless_a, issuerless_b]),
         ));
@@ -666,9 +900,11 @@ mod tests {
             "an issuer-less edge derives its guard exactly from its other requirers"
         );
         assert!(
-            !issuerless_actions[0].clause.is_satisfied_by(
-                &ref_model(&[issuerless_target, issuerless_a, issuerless_b])
-            ),
+            !issuerless_actions[0].clause.is_satisfied_by(&ref_model(&[
+                issuerless_target,
+                issuerless_a,
+                issuerless_b
+            ])),
             "an all-Ref witnessed context keeps the target commit active"
         );
         assert_eq!(
@@ -840,12 +1076,8 @@ mod tests {
         let (target, peer_a, peer_b, peer_c) = (field(10), field(11), field(12), field(13));
         let model = ref_model(&[target, peer_a, peer_b, peer_c]);
         let edge_a = ConflictObservation::new(4, target, Some(peer_a), vec![target]);
-        let edge_a_same_clause = ConflictObservation::new(
-            5,
-            target,
-            Some(peer_a),
-            vec![peer_a, target, peer_a],
-        );
+        let edge_a_same_clause =
+            ConflictObservation::new(5, target, Some(peer_a), vec![peer_a, target, peer_a]);
         let edge_b = ConflictObservation::new(4, target, Some(peer_b), vec![target]);
         let observations = vec![
             edge_b.clone(),
@@ -945,13 +1177,8 @@ mod tests {
         );
 
         let mut raw_witness_discharged = Planner::new(24);
-        let raw_witness_conflict = observation_with_invalidators(
-            9,
-            target,
-            Some(issuer),
-            vec![target],
-            vec![invalidator],
-        );
+        let raw_witness_conflict =
+            observation_with_invalidators(9, target, Some(issuer), vec![target], vec![invalidator]);
         let raw_witness_model = [
             (target, SlotKind::Ref),
             (issuer, SlotKind::Ref),
@@ -1024,8 +1251,12 @@ mod tests {
             std::slice::from_ref(&conflict),
             &first_model,
         ));
-        let retargeted =
-            ConflictObservation::new(8, target, Some(replacement), vec![target, replacement, target]);
+        let retargeted = ConflictObservation::new(
+            8,
+            target,
+            Some(replacement),
+            vec![target, replacement, target],
+        );
         let recurrence_model = [
             (target, SlotKind::Ref),
             (issuer, SlotKind::Raw),
@@ -1058,9 +1289,9 @@ mod tests {
             "an escalation records the canonical reappearing (target, peers, edge) key"
         );
         assert!(
-            recurrence[0].diagnostic_label.contains(
-                "event=l2_commit|kind=escalation|target=field:20|peers=field:22:ref"
-            ),
+            recurrence[0]
+                .diagnostic_label
+                .contains("event=l2_commit|kind=escalation|target=field:20|peers=field:22:ref"),
             "the escalation diagnostic records the reappearing peer polarity: {}",
             recurrence[0].diagnostic_label
         );
@@ -1076,8 +1307,8 @@ mod tests {
             (issuer, SlotKind::Raw),
             (replacement, SlotKind::Ref),
         ]
-            .into_iter()
-            .collect();
+        .into_iter()
+        .collect();
         assert_accept(persistent.plan_round(SolverOutcome::Sat, &[], &escalated_model));
     }
 

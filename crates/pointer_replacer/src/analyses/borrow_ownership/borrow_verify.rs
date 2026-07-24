@@ -141,7 +141,9 @@ pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)
     }
     let _restore = Restore(AUDIT_CAPTURE.with(|c| c.replace(Some(Vec::new()))));
     let out = f();
-    let captured = AUDIT_CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    let captured = AUDIT_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
     (out, captured)
 }
 
@@ -151,6 +153,12 @@ pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)
 pub(crate) struct SlotConflict {
     pub issuer: Option<SlotRef>,
     pub requirers: Vec<SlotRef>,
+}
+
+#[derive(Clone, Debug)]
+struct WitnessedSlotConflict {
+    conflict: SlotConflict,
+    invalidators: Vec<SlotRef>,
 }
 
 /// Run the production borrow verifier with a ref-candidacy where a pointer local is a
@@ -251,6 +259,95 @@ pub(crate) fn revalidate_replaying(
     };
 
     map_edges_to_slots(slots, edges)
+}
+
+/// L2-only replay adapter carrying the invalidating access roots captured by
+/// the BO fork. The ordinary replay adapter above remains byte-for-byte on its
+/// existing shape and performs no L2 collection.
+fn revalidate_replaying_witnessed(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_raw: impl Fn(SlotRef) -> bool,
+    is_mutable: impl MutProvider + Copy,
+) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
+    let is_ref = &is_ref;
+    let is_raw = &is_raw;
+    let cand = move |fn_did| {
+        let universe = slots.fn_local_slots.get(&fn_did);
+        move |local: Local| {
+            universe
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot_id| is_ref(SlotRef::Local(fn_did, slot_id)))
+        }
+    };
+    let raw = move |fn_did| {
+        let universe = slots.fn_local_slots.get(&fn_did);
+        move |local: Local| {
+            universe
+                .and_then(|u| u.slot_for_local_depth(local, 0))
+                .is_some_and(|slot_id| is_raw(SlotRef::Local(fn_did, slot_id)))
+        }
+    };
+    let mutab = move |fn_did| move |local: Local| is_mutable.is_mutable(fn_did, local);
+    let raw_fields: Vec<borrow::StructFieldSlot> = (0..slots.field_slots.len())
+        .map(SlotId::from_usize)
+        .filter(|&sid| slots.field_slots.slot(sid).depth == 0 && is_raw(SlotRef::Field(sid)))
+        .filter_map(|sid| match slots.field_slots.slot(sid).owner {
+            SlotOwner::Field(f) => Some(borrow::StructFieldSlot {
+                struct_did: f.struct_did,
+                field_index: f.field_index,
+            }),
+            SlotOwner::Local(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        super::borrow_engine::ForkEngineMode::current(),
+        super::borrow_engine::ForkEngineMode::Fork,
+        "L2 witnessed invalidator capture requires CRAT_BO_FORK_ENGINE=fork (or the unset fork default)"
+    );
+    let edges = super::borrow_engine::borrow_conflicts_replaying_witnessed(
+        program,
+        cand,
+        raw,
+        mutab,
+        &raw_fields,
+    );
+
+    edges
+        .into_iter()
+        .map(|(fn_did, fn_edges)| {
+            let translated = fn_edges
+                .into_iter()
+                .map(|witnessed| {
+                    let edge = witnessed.edge;
+                    let mut invalidators = witnessed
+                        .invalidators
+                        .into_iter()
+                        .filter_map(|local| {
+                            owner_to_slot(slots, fn_did, ProvenanceOwner::Local(local))
+                        })
+                        .collect::<Vec<_>>();
+                    invalidators.sort_by_key(slotref_key);
+                    invalidators.dedup();
+                    WitnessedSlotConflict {
+                        conflict: SlotConflict {
+                            issuer: edge
+                                .issuer
+                                .and_then(|owner| owner_to_slot(slots, fn_did, owner)),
+                            requirers: edge
+                                .requirers
+                                .into_iter()
+                                .filter_map(|owner| owner_to_slot(slots, fn_did, owner))
+                                .collect(),
+                        },
+                        invalidators,
+                    }
+                })
+                .collect();
+            (fn_did, translated)
+        })
+        .collect()
 }
 
 /// Translate borrow `ConflictEdge`s (keyed by function) into BO `SlotConflict`s,
@@ -398,7 +495,10 @@ pub(crate) struct RoundStats {
 }
 
 fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool]) {
-    stats.dropped_sinks = dropped.iter().filter(|item| selectors.is_sink(item)).count();
+    stats.dropped_sinks = dropped
+        .iter()
+        .filter(|item| selectors.is_sink(item))
+        .count();
     stats.dropped_sources = dropped.len() - stats.dropped_sinks;
 }
 
@@ -538,8 +638,9 @@ pub(crate) fn verify_to_fixpoint_counting(
                     .iter()
                     .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
                     .collect();
-                ordered
-                    .sort_by(|(da, ca), (db, cb)| conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb)));
+                ordered.sort_by(|(da, ca), (db, cb)| {
+                    conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb))
+                });
                 for (_did, conflict) in ordered {
                     let menu = a_prime_menu(conflict, &model);
                     if !menu.is_empty() {
@@ -646,7 +747,7 @@ fn verify_l2_to_fixpoint_counting(
 
     loop {
         stats.rounds += 1;
-        let conflicts = revalidate_replaying(
+        let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
             |slot| model.get(&slot) == Some(&SlotKind::Ref),
@@ -656,31 +757,37 @@ fn verify_l2_to_fixpoint_counting(
             },
             is_mutable,
         );
-        if let Some(field) = residual_nonref_field(&conflicts, &model) {
-            stats.field_conflict_decline = Some(field);
-            emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
-            return (None, stats);
+        let mut observations = Vec::new();
+        for (did, conflicts) in &conflicts {
+            for witnessed in conflicts {
+                let Some(target) = representative(&witnessed.conflict, &model) else {
+                    if let Some(field) = witnessed
+                        .conflict
+                        .issuer
+                        .into_iter()
+                        .chain(witnessed.conflict.requirers.iter().copied())
+                        .find(|slot| {
+                            matches!(slot, SlotRef::Field(_))
+                                && model.get(slot) != Some(&SlotKind::Ref)
+                        })
+                    {
+                        stats.field_conflict_decline = Some(field);
+                        emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
+                        return (None, stats);
+                    }
+                    continue;
+                };
+                observations.push(
+                    ConflictObservation::new(
+                        did.local_def_index.as_u32(),
+                        target,
+                        witnessed.conflict.issuer,
+                        witnessed.conflict.requirers.clone(),
+                    )
+                    .with_invalidators(witnessed.invalidators.clone()),
+                );
+            }
         }
-        assert!(
-            guard_slots_are_ref(&conflicts, &model),
-            "every residual conflict LOCAL slot must be Ref in the current model (fields decline above)"
-        );
-
-        let observations = conflicts
-            .iter()
-            .flat_map(|(did, conflicts)| {
-                conflicts.iter().filter_map(|conflict| {
-                    representative(conflict, &model).map(|target| {
-                        ConflictObservation::new(
-                            did.local_def_index.as_u32(),
-                            target,
-                            conflict.issuer,
-                            conflict.requirers.clone(),
-                        )
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
 
         let actions = match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
             L2RoundPlan::Accept { validation_round } => {
@@ -784,7 +891,11 @@ fn emit_l2_final_diagnostics(
 
 fn emit_l2_action_diagnostic(action: &CommitAction, enabled: bool) {
     if enabled {
-        eprintln!("[bo-l2] {}", action.diagnostic_label);
+        eprintln!(
+            "[bo-l2] {}|witnessed_peers={}",
+            action.diagnostic_label,
+            l2::witnessed_peers_diagnostic(action)
+        );
     }
 }
 
@@ -834,7 +945,10 @@ pub(crate) fn model_accepts(
     // would MIS-accept; including `guard_slots_are_ref` rejects it, matching the loop exactly.
     residual_nonref_field(&conflicts, model).is_none()
         && guard_slots_are_ref(&conflicts, model)
-        && conflicts.values().flatten().all(|c| representative(c, model).is_none())
+        && conflicts
+            .values()
+            .flatten()
+            .all(|c| representative(c, model).is_none())
 }
 
 /// Pick the slot of a residual conflict to commit `¬ref` on (Mode A).
@@ -861,7 +975,10 @@ pub(crate) fn model_accepts(
 /// every conflict reaching here has a committable `Ref` owner (`Local` OR field). A residual `Local`
 /// owner is always `Ref` anyway: `borrow_conflicts_replaying`'s inert-ness invariant keeps non-witness
 /// `Raw` locals out of residual edges. The `None` arm is kept defensive (e.g. an empty edge).
-fn representative(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Option<SlotRef> {
+fn representative(
+    conflict: &SlotConflict,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<SlotRef> {
     // §NB5-L: Mode-A's single pick is the FIRST member of the A′ menu (byte-identical refactor —
     // `find` returned the first satisfying element in both A′ branches, and `a_prime_menu`'s
     // order-preserving de-dup never changes the first element).
@@ -939,7 +1056,11 @@ fn round_cap(slots: &CrateSlots) -> usize {
         return c;
     }
     let n: usize = slots.field_slots.len()
-        + slots.fn_local_slots.values().map(|u| u.len()).sum::<usize>();
+        + slots
+            .fn_local_slots
+            .values()
+            .map(|u| u.len())
+            .sum::<usize>();
     n + 8
 }
 
@@ -999,7 +1120,11 @@ fn guard_slots_are_ref(
 /// local's depth-0 slot; a `Field` owner (§NB5-F) maps to the global struct-field slot's
 /// depth-0 slot in `field_slots` (already built + solver-encoded). `SlotRef`'s variant
 /// disambiguates the two per-universe `SlotId` spaces, so there is no id collision.
-fn owner_to_slot(slots: &CrateSlots, fn_did: LocalDefId, owner: ProvenanceOwner) -> Option<SlotRef> {
+fn owner_to_slot(
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    owner: ProvenanceOwner,
+) -> Option<SlotRef> {
     match owner {
         ProvenanceOwner::Local(local) => {
             let slot_id = slots
@@ -1045,11 +1170,21 @@ mod nb5l_a_prime_menu_tests {
     #[test]
     fn a_prime_menu_excludes_issuer_when_live_requirer() {
         let (i, r1, r2) = (field(0), field(1), field(2));
-        let conflict = SlotConflict { issuer: Some(i), requirers: vec![r1, r2] };
+        let conflict = SlotConflict {
+            issuer: Some(i),
+            requirers: vec![r1, r2],
+        };
         let m = model(&[(i, SlotKind::Ref), (r1, SlotKind::Ref), (r2, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
-        assert!(!menu.contains(&i), "A′ must NOT offer the issuer when a live Ref requirer exists");
-        assert_eq!(menu, vec![r1, r2], "menu = exactly the Ref requirers beyond the issuer");
+        assert!(
+            !menu.contains(&i),
+            "A′ must NOT offer the issuer when a live Ref requirer exists"
+        );
+        assert_eq!(
+            menu,
+            vec![r1, r2],
+            "menu = exactly the Ref requirers beyond the issuer"
+        );
         // Mode-A's single pick is the menu's first element (the byte-identical refactor).
         assert_eq!(representative(&conflict, &m), Some(r1));
     }
@@ -1059,10 +1194,17 @@ mod nb5l_a_prime_menu_tests {
     #[test]
     fn a_prime_menu_offers_issuer_when_no_requirer_beyond() {
         let i = field(0);
-        let conflict = SlotConflict { issuer: Some(i), requirers: vec![i] };
+        let conflict = SlotConflict {
+            issuer: Some(i),
+            requirers: vec![i],
+        };
         let m = model(&[(i, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
-        assert_eq!(menu, vec![i], "issuer offered (order-preserving de-dup) when no requirer beyond");
+        assert_eq!(
+            menu,
+            vec![i],
+            "issuer offered (order-preserving de-dup) when no requirer beyond"
+        );
         assert_eq!(representative(&conflict, &m), Some(i));
     }
 
@@ -1071,7 +1213,10 @@ mod nb5l_a_prime_menu_tests {
     #[test]
     fn a_prime_menu_ignores_non_ref_requirer() {
         let (i, r) = (field(0), field(1));
-        let conflict = SlotConflict { issuer: Some(i), requirers: vec![r] };
+        let conflict = SlotConflict {
+            issuer: Some(i),
+            requirers: vec![r],
+        };
         let m = model(&[(i, SlotKind::Ref), (r, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
     }

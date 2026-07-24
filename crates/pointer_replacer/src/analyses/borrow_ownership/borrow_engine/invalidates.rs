@@ -8,9 +8,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::{
     mir::{
-        Body, CopyNonOverlapping, InlineAsmOperand, Local, Location, NonDivergingIntrinsic, Operand,
-        Place, PlaceElem, PlaceRef, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
-        visit::Visitor,
+        Body, CopyNonOverlapping, InlineAsmOperand, Local, Location, NonDivergingIntrinsic,
+        Operand, Place, PlaceElem, PlaceRef, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorKind, visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -24,12 +24,61 @@ use crate::analyses::borrow::{Borrower, ProvenanceOwner, ProvenanceSet};
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
+/// L2-only side witness for one invalidation insertion attempt.
+///
+/// The ordinary `Invalidates` matrix remains the sole input to the borrow
+/// fixpoint. This parallel record is populated only by
+/// `compute_invalidates_capturing` from the exact access being checked; it is
+/// never read back into invalidation generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvalidationAccess {
+    pub(crate) point: PointIndex,
+    pub(crate) loan: Loan,
+    pub(crate) accessor: Local,
+}
+
 pub fn compute_invalidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
+) -> Invalidates {
+    compute_invalidates_inner(tcx, body, borrow_set, provenance_set, location_map, None)
+}
+
+/// Compute the unchanged invalidation facts while also retaining the access
+/// local responsible for each conflicting insertion attempt.
+///
+/// Only the L2 feature-on replay calls this entry point. Feature-off callers
+/// continue through `compute_invalidates`, which supplies `None` and therefore
+/// performs no side allocation or collection.
+pub(crate) fn compute_invalidates_capturing<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+) -> (Invalidates, Vec<InvalidationAccess>) {
+    let mut accesses = Vec::new();
+    let invalidates = compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        Some(&mut accesses),
+    );
+    (invalidates, accesses)
+}
+
+fn compute_invalidates_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    accesses: Option<&mut Vec<InvalidationAccess>>,
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
 
@@ -42,6 +91,7 @@ pub fn compute_invalidates<'tcx>(
 
     LoanInvalidatesGenerator {
         facts: &mut invalidates,
+        accesses,
         tcx,
         body,
         borrow_set,
@@ -172,6 +222,8 @@ pub(crate) fn route_compose<'tcx>(
 
 struct LoanInvalidatesGenerator<'g, 'tcx> {
     facts: &'g mut Invalidates,
+    /// L2-only write-side capture. `None` on every feature-off path.
+    accesses: Option<&'g mut Vec<InvalidationAccess>>,
     tcx: TyCtxt<'tcx>,
     body: &'g Body<'tcx>,
     borrow_set: &'g BorrowSet<'tcx>,
@@ -202,6 +254,17 @@ pub(crate) enum AccessKind {
 }
 
 impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
+    fn insert_invalidation(&mut self, point: PointIndex, loan: Loan, accessor: Local) {
+        self.facts.insert(point, loan);
+        if let Some(accesses) = self.accesses.as_mut() {
+            accesses.push(InvalidationAccess {
+                point,
+                loan,
+                accessor,
+            });
+        }
+    }
+
     fn deeply_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
         self.check_access_for_conflict(location, place, AccessDepth::Deep, kind);
     }
@@ -238,7 +301,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     access_depth,
                     PlaceConflictBias::Overlap,
                 ) {
-                    self.facts.insert(point_index, loan);
+                    self.insert_invalidation(point_index, loan, place.local);
                 }
             }
         }
@@ -300,18 +363,13 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 "NB4-R routing walk exceeded the per-site cap ({cap}); visited discipline regressed"
             );
             // Compose onto the edge's borrowed place, or fall back to whole-cell on a type mismatch.
-            let (routed, routed_depth) = match route_compose(
-                self.tcx,
-                self.body,
-                edge_borrowed,
-                rest,
-                deref_ty,
-            ) {
-                RoutedCompose::Composed(p) => (p, access_depth),
-                // type-changing cast: `L.borrowed ++ rest` would be ill-typed ⇒ whole cell, Deep
-                // (sound over-approximation; §4 ruling — whole-cell, never a silent Disjoint).
-                RoutedCompose::WholeCell(p) => (p, AccessDepth::Deep)
-            };
+            let (routed, routed_depth) =
+                match route_compose(self.tcx, self.body, edge_borrowed, rest, deref_ty) {
+                    RoutedCompose::Composed(p) => (p, access_depth),
+                    // type-changing cast: `L.borrowed ++ rest` would be ill-typed ⇒ whole cell, Deep
+                    // (sound over-approximation; §4 ruling — whole-cell, never a silent Disjoint).
+                    RoutedCompose::WholeCell(p) => (p, AccessDepth::Deep),
+                };
             if let Some(borrows_for_base) = self.borrow_set.local_map.row(base) {
                 for loan in borrows_for_base.iter() {
                     let borrow_data = &self.borrow_set.loans[loan];
@@ -337,7 +395,7 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         routed_depth,
                         PlaceConflictBias::Overlap,
                     ) {
-                        self.facts.insert(point_index, loan);
+                        self.insert_invalidation(point_index, loan, place.local);
                     }
                 }
             }
