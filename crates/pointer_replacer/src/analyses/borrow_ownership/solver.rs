@@ -1,5 +1,7 @@
-use std::cell::{Cell, RefCell};
-use std::ops::Range;
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+};
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
@@ -66,9 +68,10 @@ impl CoreTracker {
     /// Mint a fresh track literal for one hard constraint and record its label.
     fn record(&self, label: String) -> Bool {
         let track = Bool::fresh_const("nbr_track");
-        self.entries
-            .borrow_mut()
-            .push((track.clone(), format!("{}::{}", self.context.borrow(), label)));
+        self.entries.borrow_mut().push((
+            track.clone(),
+            format!("{}::{}", self.context.borrow(), label),
+        ));
         track
     }
 
@@ -393,8 +396,9 @@ impl KindSolver {
     }
 
     /// L2 context-conditioned single-literal commit. The planner supplies a
-    /// forbid-only clause whose negative `ref` literals are pinned directly by
-    /// the RED contract; this method binds that representation to the solver's
+    /// witnessed-context clause. Ref-witnessed peers and the target contribute
+    /// negative `ref` literals; Raw-witnessed peers contribute positive `ref`
+    /// literals. This method binds that representation to the solver's
     /// hard-assertion and tracked-core path without changing Mode-A's existing
     /// `add_borrow_exclusion` emission.
     pub(crate) fn add_l2_commit(&self, action: &CommitAction) {
@@ -409,13 +413,13 @@ impl KindSolver {
             "L2 action kind/core-family mismatch"
         );
         assert!(
-            !action.clause.forbidden_refs.is_empty(),
-            "L2 forbid clause must contain its target"
+            action.clause.negative_refs.contains(&action.target),
+            "L2 clause must contain its negative target literal"
         );
 
-        let literals = action
+        let mut literals = action
             .clause
-            .forbidden_refs
+            .negative_refs
             .iter()
             .map(|slot| {
                 let vars = self
@@ -425,6 +429,13 @@ impl KindSolver {
                 !&vars.ref_
             })
             .collect::<Vec<_>>();
+        literals.extend(action.clause.positive_refs.iter().map(|slot| {
+            let vars = self
+                .vars
+                .get(slot)
+                .unwrap_or_else(|| panic!("unknown L2 slot: {slot:?}"));
+            vars.ref_.clone()
+        }));
         let refs = literals.iter().collect::<Vec<_>>();
         assert_hard(
             &self.solver,
@@ -632,10 +643,7 @@ impl KindSolver {
     /// fail-closed distinction between non-selector UNSAT and Z3 Unknown so the
     /// feature-on loop can emit the ruled diagnostic without altering the
     /// feature-off solver path.
-    pub(crate) fn model_kinds_relaxing_reporting_l2(
-        &self,
-        selectors: &Selectors,
-    ) -> L2SolveResult {
+    pub(crate) fn model_kinds_relaxing_reporting_l2(&self, selectors: &Selectors) -> L2SolveResult {
         assert!(
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
@@ -987,7 +995,12 @@ impl Database for BoOwnDatabase<'_> {
         let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, y]));
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, z]));
-        assert_hard(self.optimize, self.tracker, label, &Bool::or(&[x, &!y, &!z]));
+        assert_hard(
+            self.optimize,
+            self.tracker,
+            label,
+            &Bool::or(&[x, &!y, &!z]),
+        );
     }
 
     fn record_source_sink(&mut self) {
