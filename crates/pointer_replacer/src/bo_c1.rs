@@ -279,6 +279,318 @@ mod provenance {
     }
 }
 
+/// §L2 RED — frozen base counts and the certified 26-slot recovery inventory.
+///
+/// This is test-harness-only. It reads accepted Mode-A models but never changes
+/// the solver, validation loop, or emitted output.
+mod l2_red_gate {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{CorpusProgram, report::Row};
+
+    const BASE: &str =
+        include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_base_ae6f334.csv");
+    const TARGETS: &str =
+        include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_targets.csv");
+    pub const ENV: &str = "CRAT_BOC1_L2_RED_GATE";
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BaseRow {
+        pub program: String,
+        pub n_ref: usize,
+        pub n_ref_d0: usize,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Target {
+        pub program: String,
+        pub slot: String,
+        pub audit_round: usize,
+    }
+
+    pub fn enabled() -> bool {
+        match std::env::var(ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    fn data_lines(input: &str) -> impl Iterator<Item = &str> {
+        input
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    }
+
+    pub fn bases() -> Vec<BaseRow> {
+        let mut lines = data_lines(BASE);
+        assert_eq!(
+            lines.next(),
+            Some("program,n_ref,n_ref_d0"),
+            "L2 RED base fixture header drifted"
+        );
+        lines
+            .map(|line| {
+                let fields: Vec<&str> = line.split(',').collect();
+                assert_eq!(fields.len(), 3, "malformed L2 RED base row: {line}");
+                BaseRow {
+                    program: fields[0].to_string(),
+                    n_ref: fields[1]
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid n_ref in L2 RED base row: {line}")),
+                    n_ref_d0: fields[2]
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid n_ref_d0 in L2 RED base row: {line}")),
+                }
+            })
+            .collect()
+    }
+
+    pub fn targets() -> Vec<Target> {
+        let mut lines = data_lines(TARGETS);
+        assert_eq!(
+            lines.next(),
+            Some("program,slot,audit_round"),
+            "L2 RED target fixture header drifted"
+        );
+        lines
+            .map(|line| {
+                let fields: Vec<&str> = line.split(',').collect();
+                assert_eq!(fields.len(), 3, "malformed L2 RED target row: {line}");
+                Target {
+                    program: fields[0].to_string(),
+                    slot: fields[1].to_string(),
+                    audit_round: fields[2]
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid audit round in L2 RED target row: {line}")),
+                }
+            })
+            .collect()
+    }
+
+    pub fn base_for(program: &str) -> BaseRow {
+        bases()
+            .into_iter()
+            .find(|row| row.program == program)
+            .unwrap_or_else(|| panic!("L2 RED base fixture has no row for {program}"))
+    }
+
+    pub fn targets_for(program: &str) -> Vec<Target> {
+        targets()
+            .into_iter()
+            .filter(|target| target.program == program)
+            .collect()
+    }
+
+    pub fn assert_fixtures(corpus: &[CorpusProgram]) {
+        let bases = bases();
+        let corpus_names: Vec<&str> = corpus.iter().map(|program| program.name).collect();
+        let base_names: Vec<&str> = bases.iter().map(|row| row.program.as_str()).collect();
+        assert_eq!(
+            base_names, corpus_names,
+            "L2 RED base fixture must cover the exact frozen corpus in catalog order"
+        );
+        assert_eq!(
+            bases.iter().map(|row| row.n_ref).sum::<usize>(),
+            52_810,
+            "L2 RED aggregate base n_ref drifted"
+        );
+        assert_eq!(
+            bases.iter().map(|row| row.n_ref_d0).sum::<usize>(),
+            49_459,
+            "L2 RED aggregate base n_ref_d0 drifted"
+        );
+
+        let targets = targets();
+        assert_eq!(targets.len(), 26, "L2 RED inventory must remain certified N=26");
+        let mut seen = BTreeSet::new();
+        let mut by_program = BTreeMap::<String, usize>::new();
+        let mut by_round = BTreeMap::<usize, usize>::new();
+        for target in &targets {
+            assert!(
+                corpus_names.contains(&target.program.as_str()),
+                "L2 RED target names unknown program {}",
+                target.program
+            );
+            assert!(
+                seen.insert((target.program.clone(), target.slot.clone())),
+                "duplicate L2 RED target {}/{}",
+                target.program,
+                target.slot
+            );
+            *by_program.entry(target.program.clone()).or_default() += 1;
+            *by_round.entry(target.audit_round).or_default() += 1;
+        }
+        assert_eq!(
+            by_program.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("binn".to_string(), 7),
+                ("bzip2".to_string(), 5),
+                ("libtree".to_string(), 7),
+                ("lodepng".to_string(), 7),
+            ],
+            "L2 RED inventory program split drifted"
+        );
+        assert_eq!(
+            by_round.into_iter().collect::<Vec<_>>(),
+            vec![(1, 18), (2, 7), (3, 1)],
+            "L2 RED inventory audit-round split drifted"
+        );
+    }
+
+    fn usize_field(row: &Row, key: &str) -> usize {
+        row.get(key)
+            .unwrap_or_else(|| panic!("L2 RED row missing {key}: {row:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("L2 RED row has non-numeric {key}: {row:?}"))
+    }
+
+    fn signed_field(row: &Row, key: &str) -> i64 {
+        row.get(key)
+            .unwrap_or_else(|| panic!("L2 RED row missing {key}: {row:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("L2 RED row has non-numeric {key}: {row:?}"))
+    }
+
+    pub fn summary(rows: &[Row]) -> String {
+        let accepted = rows.iter().filter(|row| row.get("status") == Some("ok")).count();
+        let found = rows
+            .iter()
+            .filter_map(|row| row.get("l2_targets_found"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
+        let expected = rows
+            .iter()
+            .filter_map(|row| row.get("l2_targets_expected"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
+        let recovered = rows
+            .iter()
+            .filter_map(|row| row.get("l2_targets_ref"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
+        let n_ref = rows
+            .iter()
+            .filter_map(|row| row.get("n_ref"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
+        let base_n_ref = rows
+            .iter()
+            .filter_map(|row| row.get("l2_base_n_ref"))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .sum::<usize>();
+        let regressions = rows
+            .iter()
+            .filter(|row| {
+                row.get("l2_n_ref_delta")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .is_some_and(|delta| delta < 0)
+            })
+            .count();
+        format!(
+            "L2RED accepted={accepted}/{} found={found}/{expected} recovered={recovered}/{expected} \
+             n_ref={n_ref}/{base_n_ref} delta={} per_program_regressions={regressions}",
+            rows.len(),
+            n_ref as i64 - base_n_ref as i64,
+        )
+    }
+
+    pub fn assert_results(rows: &[Row], corpus: &[CorpusProgram]) {
+        assert_eq!(
+            rows.len(),
+            corpus.len(),
+            "L2 RED must run the complete frozen rs-crown corpus"
+        );
+        let actual_names: Vec<&str> = rows
+            .iter()
+            .map(|row| row.get("program").expect("L2 RED row has program"))
+            .collect();
+        let expected_names: Vec<&str> = corpus.iter().map(|program| program.name).collect();
+        assert_eq!(
+            actual_names, expected_names,
+            "L2 RED corpus order/content drifted"
+        );
+
+        let non_accepts: Vec<(&str, &str)> = rows
+            .iter()
+            .filter_map(|row| {
+                let status = row.get("status").unwrap_or("missing");
+                (status != "ok").then(|| (row.get("program").unwrap_or("missing"), status))
+            })
+            .collect();
+        assert!(
+            non_accepts.is_empty(),
+            "L2 RED requires 20/20 accepted Mode-A rows; non-accepts={non_accepts:?}"
+        );
+        for row in rows {
+            assert_eq!(row.get("repair"), Some("mode_a"), "L2 RED row is not Mode-A: {row:?}");
+            assert_eq!(row.get("l2_feature"), Some("on"), "L2 flag did not reach worker: {row:?}");
+            assert_eq!(row.get("l2_diag"), Some("raw"), "L2 diagnostics did not reach worker: {row:?}");
+            assert_eq!(
+                row.get("safe_mono"),
+                Some("per_site"),
+                "L2 RED row did not use the frozen per-site safety profile: {row:?}"
+            );
+            assert_eq!(
+                row.get("mut_facts"),
+                Some("on"),
+                "L2 RED row did not use the frozen mutability-facts profile: {row:?}"
+            );
+            assert_eq!(
+                row.get("z3_full_version"),
+                Some("4.15.4.0"),
+                "L2 RED row did not use the frozen Z3 version: {row:?}"
+            );
+        }
+
+        let expected_targets = rows
+            .iter()
+            .map(|row| usize_field(row, "l2_targets_expected"))
+            .sum::<usize>();
+        assert_eq!(expected_targets, 26, "L2 RED target denominator drifted");
+        let found_targets = rows
+            .iter()
+            .map(|row| usize_field(row, "l2_targets_found"))
+            .sum::<usize>();
+        assert_eq!(
+            found_targets, expected_targets,
+            "L2 RED inventory slot missing or renamed; re-anchor is required"
+        );
+
+        let actual_n_ref = rows.iter().map(|row| usize_field(row, "n_ref")).sum::<usize>();
+        let base_n_ref = rows
+            .iter()
+            .map(|row| usize_field(row, "l2_base_n_ref"))
+            .sum::<usize>();
+        assert_eq!(base_n_ref, 52_810, "L2 RED aggregate base n_ref drifted");
+        assert!(
+            actual_n_ref >= base_n_ref,
+            "L2 RED violates the corpus-wide n_ref non-regression gate: \
+             actual={actual_n_ref} base={base_n_ref}"
+        );
+        let reported_delta = rows
+            .iter()
+            .map(|row| signed_field(row, "l2_n_ref_delta"))
+            .sum::<i64>();
+        assert_eq!(
+            reported_delta,
+            actual_n_ref as i64 - base_n_ref as i64,
+            "L2 RED per-program n_ref deltas do not sum to the aggregate delta"
+        );
+
+        let recovered = rows
+            .iter()
+            .map(|row| usize_field(row, "l2_targets_ref"))
+            .sum::<usize>();
+        assert!(
+            recovered >= 22,
+            "L2 RED: recovered {recovered}/26; implementation merge bar is 22/26"
+        );
+    }
+}
+
 
 // §NB4-4c-Q: re-export the collateral measurement so the RED shape tests (in `tests.rs`, outside this
 // private module) validate the EXACT harness code the sweep runs, not a copy.
@@ -574,7 +886,11 @@ mod run {
 
     /// §NB5-L2 — format a slot for the over-pin inventory: `def_path::_local@dN` (locals) /
     /// `def_path::fieldK@dN` (struct fields). The L2 RED inventory reads these back.
-    fn fmt_slot(program: &crate::utils::rustc::RustProgram, slots: &CrateSlots, s: SlotRef) -> String {
+    pub(super) fn fmt_slot(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        s: SlotRef,
+    ) -> String {
         match s {
             SlotRef::Local(fn_did, sid) => {
                 let sl = slots.fn_local_slots.get(&fn_did).map(|u| *u.slot(sid));
@@ -597,6 +913,74 @@ mod run {
                 }
             }
         }
+    }
+
+    fn record_l2_red_inventory(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+        repair: RepairMode,
+        n_ref: usize,
+        row: &mut Row,
+    ) {
+        if !super::l2_red_gate::enabled() {
+            return;
+        }
+        assert!(
+            crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "L2 RED gate requires CRAT_BO_L2_GUARDED_COMMITS=1"
+        );
+        assert_eq!(repair, RepairMode::ModeA, "L2 RED gate is Mode-A-only");
+        let diagnostics = std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS")
+            .expect("L2 RED gate requires decision diagnostics");
+        assert_eq!(
+            diagnostics, "raw",
+            "L2 RED gate requires CRAT_POINTER_DECISION_DIAGNOSTICS=raw"
+        );
+        assert_eq!(
+            crate::rewriter::diagnostics::DiagnosticsMode::from_env_value(Some(&diagnostics)),
+            crate::rewriter::diagnostics::DiagnosticsMode::Raw,
+        );
+
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").expect("L2 RED worker requires CRAT_BOC1_NAME");
+        let expected = super::l2_red_gate::targets_for(&program_name);
+        let mut model_by_name = FxHashMap::default();
+        for (&slot, &kind) in model {
+            let name = fmt_slot(program, slots, slot);
+            assert!(
+                model_by_name.insert(name.clone(), kind).is_none(),
+                "L2 RED model has duplicate canonical slot {name}"
+            );
+        }
+
+        let mut found = 0usize;
+        let mut recovered = 0usize;
+        for target in &expected {
+            let Some(kind) = model_by_name.get(&target.slot).copied() else {
+                continue;
+            };
+            found += 1;
+            recovered += usize::from(kind == SlotKind::Ref);
+            let kind = match kind {
+                SlotKind::Ref => "ref",
+                SlotKind::Raw => "raw",
+                SlotKind::Owning => "owning",
+            };
+            eprintln!(
+                "L2TARGET program={} slot={} audit_round={} kind={kind}",
+                target.program, target.slot, target.audit_round
+            );
+        }
+
+        let base = super::l2_red_gate::base_for(&program_name);
+        row.set("l2_feature", "on");
+        row.set("l2_diag", "raw");
+        row.set("l2_targets_expected", expected.len());
+        row.set("l2_targets_found", found);
+        row.set("l2_targets_ref", recovered);
+        row.set("l2_base_n_ref", base.n_ref);
+        row.set("l2_n_ref_delta", n_ref as i64 - base.n_ref as i64);
     }
 
     /// §NB5-L2 commit-necessity audit driver — measure the L2 headroom Mode-A leaves (env-gated by
@@ -1219,6 +1603,14 @@ mod run {
                 }
                 row.set("s23_owning_model", s23_owning_model);
                 row.set("s23_fields_raw", s23_fields_raw);
+                record_l2_red_inventory(
+                    &program,
+                    &slots,
+                    m,
+                    rstats.repair,
+                    n_ref,
+                    &mut row,
+                );
             }
         }
 
@@ -2650,6 +3042,96 @@ fn boc1_corpus() {
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+    let l2_gate = l2_red_gate::enabled();
+    if l2_gate {
+        l2_red_gate::assert_fixtures(CORPUS);
+        for name in [
+            "CRAT_BO_SAFE_MONO",
+            "CRAT_BO_MUT_FACTS",
+            "CRAT_BO_FORK_ENGINE",
+            "CRAT_NB4R_ROUTING",
+        ] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "L2 RED requires the frozen base contract with {name} unset"
+            );
+        }
+        assert_eq!(
+            crate::analyses::borrow_ownership::SafeMonoMode::current(),
+            crate::analyses::borrow_ownership::SafeMonoMode::PerSite,
+            "L2 RED requires the frozen per-site safety profile"
+        );
+        assert_eq!(
+            crate::analyses::borrow_ownership::mutability_facts::MutFactsMode::current(),
+            crate::analyses::borrow_ownership::mutability_facts::MutFactsMode::On,
+            "L2 RED requires the frozen mutability-facts profile"
+        );
+        assert_eq!(
+            crate::analyses::borrow_ownership::borrow_engine::ForkEngineMode::current(),
+            crate::analyses::borrow_ownership::borrow_engine::ForkEngineMode::Fork,
+            "L2 RED requires the frozen fork-engine profile"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+            Ok("1"),
+            "L2 RED requires CRAT_BO_L2_GUARDED_COMMITS=1"
+        );
+        assert!(
+            crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "L2 RED feature flag did not resolve on"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_REPAIR").as_deref(),
+            Ok("mode_a"),
+            "L2 RED requires CRAT_BO_REPAIR=mode_a"
+        );
+        assert_eq!(
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::current(),
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::ModeA,
+        );
+        assert_eq!(
+            std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS").as_deref(),
+            Ok("raw"),
+            "L2 RED requires CRAT_POINTER_DECISION_DIAGNOSTICS=raw"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_TIMEOUT_SECS").as_deref(),
+            Ok("900"),
+            "L2 RED requires the official 900-second worker timeout"
+        );
+        assert_eq!(
+            timeout,
+            Duration::from_secs(900),
+            "L2 RED effective timeout drifted"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "L2 RED requires the official 8192-MiB memory cap"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_PROD").as_deref(),
+            Ok("0"),
+            "L2 RED must run only the Mode-A BO worker"
+        );
+        assert!(!prod_enabled, "L2 RED production-baseline child must be disabled");
+        assert!(
+            only.is_none(),
+            "L2 RED must not set CRAT_BOC1_PROGRAMS; run all 20 frozen programs"
+        );
+        assert_eq!(CORPUS.len(), 20, "L2 RED frozen corpus size drifted");
+        assert_eq!(
+            CORPUS.last().map(|program| program.name),
+            Some("brotli"),
+            "L2 RED must include brotli as the final development-boundary row"
+        );
+        assert!(
+            CORPUS
+                .iter()
+                .all(|program| !is_resource_deferred(program.sloc)),
+            "L2 RED cannot resource-defer any frozen rs-crown program"
+        );
+    }
 
     fs::create_dir_all(out_dir().join("logs")).expect("create out dir");
 
@@ -2758,6 +3240,9 @@ fn boc1_corpus() {
     }
 
     println!("\n{}", render_report(&merged));
+    if l2_gate {
+        l2_red_gate::assert_results(&merged, CORPUS);
+    }
 }
 
 #[cfg(test)]
@@ -2783,6 +3268,11 @@ fn render_report(merged: &[report::Row]) -> String {
         "mut_default_fires",
         "n_ref_prod",
         "d_ref_d0",
+        "l2_base_n_ref",
+        "l2_n_ref_delta",
+        "l2_targets_expected",
+        "l2_targets_found",
+        "l2_targets_ref",
         "sources_total",
         "sources_leaked",
         "sources_leaked_sel",
@@ -2835,6 +3325,11 @@ fn render_report(merged: &[report::Row]) -> String {
          `t_total_s` in the CSV/JSONL is the child-measured time.\n\n",
     );
     out.push_str(&report::render_markdown(merged, &cols));
+    if merged.iter().any(|row| row.get("l2_feature") == Some("on")) {
+        out.push_str("\n\n");
+        out.push_str(&l2_red_gate::summary(merged));
+        out.push('\n');
+    }
     out
 }
 
@@ -3373,4 +3868,399 @@ fn nb5l2_capture_is_mode_a_only() {
         );
     })
     .unwrap_or_else(|e| e.raise())
+}
+
+// ---------------------------------------------------------------------------
+// §L2 RED — feature-off base golden captured at ae6f334.
+// ---------------------------------------------------------------------------
+
+const L2_FEATURE_OFF_BASE_SHA: &str = "ae6f334eca78cbaa254bfb3afc65e3c31130153d";
+const L2_FEATURE_OFF_OUTPUT_LEN: usize = 212;
+const L2_FEATURE_OFF_OUTPUT_SHA256: &str =
+    "7e625bb8120839583f7cf64d19c6b87a342d2525bca5bf36dfc115e4a003a17a";
+const L2_FEATURE_OFF_SOURCE_DROP: &str =
+    include_str!("analyses/borrow_ownership/testdata/l2_feature_off_source_drop.rs");
+const L2_FEATURE_OFF_SINK_DROP: &str =
+    include_str!("analyses/borrow_ownership/testdata/l2_feature_off_sink_drop.rs");
+
+fn l2_feature_off_capture_program(fixture: &str, source: &str) -> String {
+    use std::fmt::Write;
+
+    use crate::analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{RepairMode, model_accepts, verify_to_fixpoint_counting},
+        coherence::add_coherence,
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut rendered = String::new();
+
+        for (mutability, mut_facts) in [
+            ("from_program", MutFacts::from_program(&program)),
+            ("all_mut", MutFacts::all_mut()),
+        ] {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_emission, selectors) =
+                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                    .expect("L2 feature-off golden emission");
+            for &fn_did in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+                add_coherence(&solver, &slots, fn_did, &body);
+            }
+
+            let (model, stats) = RepairMode::with_override(RepairMode::ModeA, || {
+                verify_to_fixpoint_counting(
+                    &program,
+                    &slots,
+                    &solver,
+                    &selectors,
+                    &mut_facts,
+                )
+            });
+            let model = model.unwrap_or_else(|| {
+                panic!("{fixture}/{mutability}: base Mode-A must accept")
+            });
+            let accepted = model_accepts(&program, &slots, &model, &mut_facts);
+            assert!(
+                accepted,
+                "{fixture}/{mutability}: accepted model must satisfy model_accepts"
+            );
+
+            let (reported_model, dropped) = solver
+                .model_kinds_relaxing_reporting(&selectors)
+                .unwrap_or_else(|| {
+                    panic!("{fixture}/{mutability}: reporting solve must remain SAT")
+                });
+            assert_eq!(
+                reported_model, model,
+                "{fixture}/{mutability}: reporting solve must reproduce the accepted model"
+            );
+
+            let dropped_selectors = l2_feature_off_dropped_selectors(&selectors, &dropped);
+            assert_eq!(
+                stats.dropped_sources,
+                dropped_selectors
+                    .iter()
+                    .filter(|selector| selector.starts_with("source:"))
+                    .count(),
+                "{fixture}/{mutability}: source-drop counter/reporting mismatch"
+            );
+            assert_eq!(
+                stats.dropped_sinks,
+                dropped_selectors
+                    .iter()
+                    .filter(|selector| selector.starts_with("sink:"))
+                    .count(),
+                "{fixture}/{mutability}: sink-drop counter/reporting mismatch"
+            );
+
+            let mut kinds: Vec<(String, _)> = model
+                .iter()
+                .map(|(&slot, &kind)| (run::fmt_slot(&program, &slots, slot), kind))
+                .collect();
+            kinds.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+            writeln!(rendered, "case={fixture}/{mutability}").unwrap();
+            writeln!(rendered, "accepted={accepted}").unwrap();
+            writeln!(rendered, "stats.repair={}", stats.repair.label()).unwrap();
+            writeln!(rendered, "stats.rounds={}", stats.rounds).unwrap();
+            writeln!(
+                rendered,
+                "stats.commits_conflict={}",
+                stats.commits_conflict
+            )
+            .unwrap();
+            writeln!(
+                rendered,
+                "stats.commits_per_round={:?}",
+                stats.commits_per_round
+            )
+            .unwrap();
+            writeln!(
+                rendered,
+                "stats.dropped_sources={}",
+                stats.dropped_sources
+            )
+            .unwrap();
+            writeln!(rendered, "stats.dropped_sinks={}", stats.dropped_sinks).unwrap();
+            let field_decline = stats
+                .field_conflict_decline
+                .map(|slot| run::fmt_slot(&program, &slots, slot))
+                .unwrap_or_else(|| "-".to_string());
+            writeln!(
+                rendered,
+                "stats.field_conflict_decline={field_decline}"
+            )
+            .unwrap();
+            writeln!(rendered, "stats.cap_exhausted={}", stats.cap_exhausted).unwrap();
+            writeln!(
+                rendered,
+                "dropped_selectors={}",
+                if dropped_selectors.is_empty() {
+                    "-".to_string()
+                } else {
+                    dropped_selectors.join(",")
+                }
+            )
+            .unwrap();
+            for (slot, kind) in kinds {
+                writeln!(rendered, "model.{slot}={kind:?}").unwrap();
+            }
+            writeln!(rendered, "end_case").unwrap();
+        }
+
+        rendered
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+fn l2_feature_off_dropped_selectors(
+    selectors: &crate::analyses::borrow_ownership::solver::Selectors,
+    dropped: &[z3::ast::Bool],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for literal in dropped {
+        if let Some(index) = selectors
+            .sources()
+            .iter()
+            .position(|selector| selector == literal)
+        {
+            names.push(format!("source:{index}"));
+        } else if let Some(index) = selectors
+            .sinks()
+            .iter()
+            .position(|selector| selector == literal)
+        {
+            names.push(format!("sink:{index}"));
+        } else {
+            panic!("L2 feature-off reporting solve returned an unknown selector");
+        }
+    }
+    names.sort();
+    names
+}
+
+fn l2_feature_off_capture() -> (String, String, crate::BytemuckDependency) {
+    use std::{fmt::Write, process::Command};
+
+    let rustc = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .expect("query rustc version for L2 base golden");
+    assert!(rustc.status.success(), "rustc --version must succeed");
+    let rustc = String::from_utf8(rustc.stdout)
+        .expect("rustc version must be UTF-8")
+        .trim()
+        .to_string();
+
+    let mut snapshot = String::new();
+    writeln!(snapshot, "base.sha={L2_FEATURE_OFF_BASE_SHA}").unwrap();
+    writeln!(snapshot, "toolchain.rustc={rustc}").unwrap();
+    writeln!(snapshot, "z3.full_version={}", z3::full_version()).unwrap();
+    writeln!(snapshot, "z3.smt.random_seed=0").unwrap();
+    writeln!(snapshot, "z3.sat.random_seed=0").unwrap();
+    snapshot.push_str(&l2_feature_off_capture_program(
+        "source_drop",
+        L2_FEATURE_OFF_SOURCE_DROP,
+    ));
+    snapshot.push_str(&l2_feature_off_capture_program(
+        "sink_drop",
+        L2_FEATURE_OFF_SINK_DROP,
+    ));
+    let (output, bytemuck) = ::utils::compilation::run_compiler_on_str(
+        L2_FEATURE_OFF_SOURCE_DROP,
+        |tcx| crate::replace_local_borrows(&crate::Config::default(), tcx),
+    )
+    .unwrap_or_else(|error| error.raise());
+    writeln!(snapshot, "rewrite.source_drop.bytemuck={bytemuck:?}").unwrap();
+    (snapshot, output, bytemuck)
+}
+
+fn l2_decode_hex(encoded: &str) -> Vec<u8> {
+    fn nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("L2 feature-off golden contains non-hex byte {byte:?}"),
+        }
+    }
+
+    let digits: Vec<u8> = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert_eq!(
+        digits.len() % 2,
+        0,
+        "L2 feature-off golden contains an odd number of hex digits"
+    );
+    digits
+        .chunks_exact(2)
+        .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+        .collect()
+}
+
+fn l2_sha256_hex(input: &[u8]) -> String {
+    const ROUND: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut state = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = u64::try_from(input.len())
+        .expect("L2 feature-off golden length fits u64")
+        .checked_mul(8)
+        .expect("L2 feature-off golden bit length fits u64");
+    let mut padded = input.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (word, bytes) in words[..16].iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes(bytes.try_into().expect("four-byte SHA-256 word"));
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let temp1 = h
+                .wrapping_add(sum1)
+                .wrapping_add(choose)
+                .wrapping_add(ROUND[index])
+                .wrapping_add(words[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, value) in state
+            .iter_mut()
+            .zip([a, b, c, d, e, f, g, h])
+        {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+
+    state
+        .iter()
+        .map(|word| format!("{word:08x}"))
+        .collect()
+}
+
+#[test]
+fn l2_red_feature_off_matches_base_ae6f334() {
+    let explicit_off = match std::env::var("CRAT_BO_L2_GUARDED_COMMITS") {
+        Ok(value) => {
+            assert_eq!(
+                value, "0",
+                "the feature-off base-golden test requires CRAT_BO_L2_GUARDED_COMMITS=0"
+            );
+            true
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("CRAT_BO_L2_GUARDED_COMMITS is not valid Unicode: {error}"),
+    };
+    assert!(
+        !crate::analyses::borrow_ownership::l2::enabled_from_env(),
+        "CRAT_BO_L2_GUARDED_COMMITS=0 must resolve feature-off"
+    );
+    // The exact RED evidence command sets the feature flag explicitly and filters
+    // this test into a fresh, single-threaded process. Pin both seeds before its
+    // first z3 operation, matching the official Mode-A worker contract. An
+    // ordinary full-suite run leaves the flag absent and retains z3's defaults,
+    // avoiding a process-global write in the parallel runner.
+    if explicit_off {
+        z3::set_global_param("smt.random_seed", "0");
+        z3::set_global_param("sat.random_seed", "0");
+    }
+
+    let (actual_snapshot, actual_output, actual_bytemuck) = l2_feature_off_capture();
+    assert_eq!(
+        actual_snapshot,
+        include_str!("analyses/borrow_ownership/testdata/l2_feature_off_base_ae6f334.snap"),
+        "feature-off Mode-A semantics drifted from the approved ae6f334 base"
+    );
+    assert_eq!(
+        actual_bytemuck,
+        crate::BytemuckDependency::None,
+        "source-drop BytemuckDependency drifted from the approved ae6f334 base"
+    );
+    // Storage-encoding contract: the authoritative 212-byte capture is hex so
+    // editors, Git, and CI cannot normalize its terminal byte. Never normalize
+    // either side or replace this with raw-text include_bytes!: both alternatives
+    // weaken the exact base anchor.
+    let golden_output = l2_decode_hex(include_str!(
+        "analyses/borrow_ownership/testdata/l2_feature_off_base_ae6f334.output.hex"
+    ));
+    assert_eq!(
+        l2_sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "L2 feature-off SHA-256 helper failed its standard empty-input vector"
+    );
+    assert_eq!(
+        golden_output.len(),
+        L2_FEATURE_OFF_OUTPUT_LEN,
+        "encoded feature-off golden no longer decodes to the authoritative capture length"
+    );
+    assert_eq!(
+        l2_sha256_hex(&golden_output),
+        L2_FEATURE_OFF_OUTPUT_SHA256,
+        "encoded feature-off golden no longer matches the captured artifact's SHA-256"
+    );
+    assert_eq!(
+        actual_output.as_bytes(),
+        golden_output,
+        "feature-off generated output is not byte-identical to the approved ae6f334 base"
+    );
 }
