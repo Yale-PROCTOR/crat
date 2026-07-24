@@ -22,9 +22,14 @@ use z3::ast::Bool;
 use super::{
     SlotKind,
     crate_slots::CrateSlots,
+    l2::{
+        self, CommitAction, ConflictObservation, DeclineReason as L2DeclineReason, Planner,
+        RoundPlan as L2RoundPlan, SolverDecline as L2SolverDecline,
+        SolverOutcome as L2SolverOutcome,
+    },
     mutability_facts::MutProvider,
     slots::{SlotId, SlotOwner},
-    solver::{KindSolver, Selectors, SlotRef},
+    solver::{KindSolver, L2SolveResult, Selectors, SlotRef},
 };
 use crate::{
     analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
@@ -387,6 +392,14 @@ pub(crate) struct RoundStats {
     /// otherwise mislabel this relaxed-SAT decline as `sat-in-replay` and hide the cap exhaustion. Never
     /// set under `ModeA` (that path panics — its linear bound is proven).
     pub cap_exhausted: bool,
+    /// L2 feature-on controlled decline. The legacy feature-off Mode-A and
+    /// Lemmas paths leave this unset.
+    pub l2_decline: Option<L2DeclineReason>,
+}
+
+fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool]) {
+    stats.dropped_sinks = dropped.iter().filter(|item| selectors.is_sink(item)).count();
+    stats.dropped_sources = dropped.len() - stats.dropped_sinks;
 }
 
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
@@ -407,25 +420,29 @@ pub(crate) fn verify_to_fixpoint_counting(
         solver.tracker().is_none(),
         "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
     );
+    let l2_enabled = l2::enabled_from_env();
+    let repair = RepairMode::current();
+    if l2_enabled {
+        assert_eq!(
+            repair,
+            RepairMode::ModeA,
+            "CRAT_BO_L2_GUARDED_COMMITS=1 requires CRAT_BO_REPAIR=mode_a (or the unset Mode-A default)"
+        );
+        return verify_l2_to_fixpoint_counting(program, slots, solver, selectors, is_mutable);
+    }
     let cap = round_cap(slots);
     // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
     super::coherence::constrain_field_ownership(solver, slots, program);
-    // §NB-F: classify a dropped-selector set into leak counts (native counter, was the mirror's).
-    let record_dropped = |stats: &mut RoundStats, dropped: &[Bool]| {
-        stats.dropped_sinks = dropped.iter().filter(|d| selectors.is_sink(d)).count();
-        stats.dropped_sources = dropped.len() - stats.dropped_sinks;
-    };
     let mut stats = RoundStats::default();
     // §NB5-L guard 1 — resolve the repair strategy ONCE per invocation into a local; NO mid-loop
     // re-reads, so the whole fixpoint runs one consistent strategy. Guard 3 stamps it into `stats`.
-    let repair = RepairMode::current();
     stats.repair = repair;
     let Some((mut model, dropped)) = solver.model_kinds_relaxing_reporting(selectors) else {
         return (None, stats);
     };
-    record_dropped(&mut stats, &dropped);
+    record_dropped(&mut stats, selectors, &dropped);
     for _ in 0..cap {
         stats.rounds += 1;
         let conflicts = revalidate_replaying(
@@ -546,7 +563,7 @@ pub(crate) fn verify_to_fixpoint_counting(
         }
         model = match solver.model_kinds_relaxing_reporting(selectors) {
             Some((m, dropped)) => {
-                record_dropped(&mut stats, &dropped);
+                record_dropped(&mut stats, selectors, &dropped);
                 m
             }
             None => return (None, stats),
@@ -575,6 +592,176 @@ pub(crate) fn verify_to_fixpoint_counting(
             (None, stats)
         }
     }
+}
+
+/// L2 feature-on validate/re-solve loop. This is deliberately separate from
+/// the feature-off branch above: disabled Mode-A retains its original conflict
+/// iteration, assertion order, cap, and `add_borrow_exclusion` calls.
+fn verify_l2_to_fixpoint_counting(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let diagnostics_enabled = l2::diagnostics_enabled_from_env();
+    let slot_count = slots
+        .fn_local_slots
+        .values()
+        .try_fold(slots.field_slots.len(), |count, universe| {
+            count.checked_add(universe.len())
+        })
+        .expect("L2 registered-slot count overflow");
+    let mut planner = Planner::new(slot_count);
+
+    super::coherence::constrain_field_ownership(solver, slots, program);
+    let mut stats = RoundStats {
+        repair: RepairMode::ModeA,
+        ..RoundStats::default()
+    };
+
+    let (mut model, dropped) = match solver.model_kinds_relaxing_reporting_l2(selectors) {
+        L2SolveResult::Sat { kinds, dropped } => (kinds, dropped),
+        L2SolveResult::Unsat => {
+            record_l2_decline(
+                &mut stats,
+                planner.validation_rounds(),
+                L2DeclineReason::Solver(L2SolverDecline::Unsat),
+                diagnostics_enabled,
+            );
+            return (None, stats);
+        }
+        L2SolveResult::Unknown => {
+            record_l2_decline(
+                &mut stats,
+                planner.validation_rounds(),
+                L2DeclineReason::Solver(L2SolverDecline::Unknown),
+                diagnostics_enabled,
+            );
+            return (None, stats);
+        }
+    };
+    record_dropped(&mut stats, selectors, &dropped);
+
+    loop {
+        stats.rounds += 1;
+        let conflicts = revalidate_replaying(
+            program,
+            slots,
+            |slot| model.get(&slot) == Some(&SlotKind::Ref),
+            |slot| match slot {
+                SlotRef::Field(_) => model.get(&slot) == Some(&SlotKind::Raw),
+                SlotRef::Local(..) => model.get(&slot) != Some(&SlotKind::Ref),
+            },
+            is_mutable,
+        );
+        if let Some(field) = residual_nonref_field(&conflicts, &model) {
+            stats.field_conflict_decline = Some(field);
+            return (None, stats);
+        }
+        assert!(
+            guard_slots_are_ref(&conflicts, &model),
+            "every residual conflict LOCAL slot must be Ref in the current model (fields decline above)"
+        );
+
+        let observations = conflicts
+            .iter()
+            .flat_map(|(did, conflicts)| {
+                conflicts.iter().filter_map(|conflict| {
+                    representative(conflict, &model).map(|target| {
+                        ConflictObservation::new(
+                            did.local_def_index.as_u32(),
+                            target,
+                            conflict.issuer,
+                            conflict.requirers.clone(),
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let actions = match planner.plan_round(L2SolverOutcome::Sat, &observations, &model) {
+            L2RoundPlan::Accept { validation_round } => {
+                assert_eq!(
+                    stats.rounds, validation_round,
+                    "L2 planner/fixpoint validation-round counters diverged"
+                );
+                stats.commits_per_round.push(0);
+                return (Some(model), stats);
+            }
+            L2RoundPlan::Continue {
+                validation_round,
+                actions,
+            } => {
+                assert_eq!(
+                    stats.rounds, validation_round,
+                    "L2 planner/fixpoint validation-round counters diverged"
+                );
+                actions
+            }
+            L2RoundPlan::Decline {
+                validation_round,
+                reason,
+            } => {
+                assert_eq!(
+                    stats.rounds, validation_round,
+                    "L2 planner/fixpoint validation-round counters diverged"
+                );
+                record_l2_decline(&mut stats, validation_round, reason, diagnostics_enabled);
+                return (None, stats);
+            }
+        };
+
+        for action in &actions {
+            solver.add_l2_commit(action);
+            emit_l2_action_diagnostic(action, diagnostics_enabled);
+        }
+        stats.commits_conflict += actions.len();
+        stats.commits_per_round.push(actions.len());
+
+        match solver.model_kinds_relaxing_reporting_l2(selectors) {
+            L2SolveResult::Sat { kinds, dropped } => {
+                model = kinds;
+                record_dropped(&mut stats, selectors, &dropped);
+            }
+            L2SolveResult::Unsat => {
+                record_l2_decline(
+                    &mut stats,
+                    planner.validation_rounds(),
+                    L2DeclineReason::Solver(L2SolverDecline::Unsat),
+                    diagnostics_enabled,
+                );
+                return (None, stats);
+            }
+            L2SolveResult::Unknown => {
+                record_l2_decline(
+                    &mut stats,
+                    planner.validation_rounds(),
+                    L2DeclineReason::Solver(L2SolverDecline::Unknown),
+                    diagnostics_enabled,
+                );
+                return (None, stats);
+            }
+        }
+    }
+}
+
+fn emit_l2_action_diagnostic(action: &CommitAction, enabled: bool) {
+    if enabled {
+        eprintln!("[bo-l2] {}", action.diagnostic_label);
+    }
+}
+
+fn record_l2_decline(
+    stats: &mut RoundStats,
+    validation_round: usize,
+    reason: L2DeclineReason,
+    diagnostics_enabled: bool,
+) {
+    if diagnostics_enabled {
+        eprintln!("[bo-l2] {}", reason.diagnostic_label(validation_round));
+    }
+    stats.l2_decline = Some(reason);
 }
 
 /// §NB5-L2 (commit-necessity audit) — does `model` ACCEPT, i.e. is it a Mode-A fixpoint? True iff one

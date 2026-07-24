@@ -26,6 +26,17 @@ pub(crate) fn enabled_from_env() -> bool {
     }
 }
 
+/// R7 uses the existing decision-diagnostics switch as its sole output gate.
+/// Match that switch's established off values; every other valid string uses
+/// its raw-compatible behavior.
+pub(crate) fn diagnostics_enabled_from_env() -> bool {
+    let value = std::env::var("CRAT_POINTER_DECISION_DIAGNOSTICS").ok();
+    !matches!(
+        crate::rewriter::diagnostics::DiagnosticsMode::from_env_value(value.as_deref()),
+        crate::rewriter::diagnostics::DiagnosticsMode::Off
+    )
+}
+
 /// A residual borrow-conflict edge translated wholly into BO slots.
 ///
 /// `target` is the unchanged Mode-A A′ representative. `issuer` and
@@ -191,6 +202,28 @@ pub(crate) enum DeclineReason {
     PermanentRetarget { target: SlotRef },
 }
 
+impl DeclineReason {
+    pub(crate) fn diagnostic_label(&self, validation_round: usize) -> String {
+        let detail = match self {
+            Self::Solver(SolverDecline::Unsat) => "reason=solver-unsat".to_owned(),
+            Self::Solver(SolverDecline::Unknown) => "reason=solver-unknown".to_owned(),
+            Self::ValidationCap {
+                cap,
+                attempted_round,
+            } => format!("reason=validation-cap|cap={cap}|attempted_round={attempted_round}"),
+            Self::ParticipantNotRef { slot } => format!(
+                "reason=participant-not-ref|slot={}",
+                SlotKey::of(*slot).diagnostic()
+            ),
+            Self::PermanentRetarget { target } => format!(
+                "reason=permanent-retarget|target={}",
+                SlotKey::of(*target).diagnostic()
+            ),
+        };
+        format!("event=l2_decline|round={validation_round}|{detail}")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RoundPlan {
     Accept {
@@ -309,9 +342,11 @@ impl Planner {
                 issuer: observation.issuer.map(SlotKey::of),
                 requirers: requirers.into_iter().map(SlotKey::of).collect(),
             };
+            let peer_keys = slot_keys(&peers);
             candidates.push(Candidate {
                 target: observation.target,
                 peers,
+                peer_keys,
                 edge,
             });
         }
@@ -319,7 +354,7 @@ impl Planner {
         candidates.sort_by(|a, b| a.key().cmp(&b.key()));
         candidates.dedup_by(|a, b| {
             SlotKey::of(a.target) == SlotKey::of(b.target)
-                && slot_keys(&a.peers) == slot_keys(&b.peers)
+                && a.peer_keys == b.peer_keys
         });
 
         let mut actions = Vec::new();
@@ -382,18 +417,19 @@ impl Planner {
 struct Candidate {
     target: SlotRef,
     peers: Vec<SlotRef>,
+    peer_keys: Vec<SlotKey>,
     edge: EdgeKey,
 }
 
 impl Candidate {
-    fn key(&self) -> (SlotKey, Vec<SlotKey>, &EdgeKey) {
-        (SlotKey::of(self.target), slot_keys(&self.peers), &self.edge)
+    fn key(&self) -> (SlotKey, &[SlotKey], &EdgeKey) {
+        (SlotKey::of(self.target), &self.peer_keys, &self.edge)
     }
 
     fn action(&self, kind: CommitActionKind, core_family: &'static str) -> CommitAction {
         let diagnostic_key = DiagnosticKey {
             target: SlotKey::of(self.target),
-            peers: slot_keys(&self.peers),
+            peers: self.peer_keys.clone(),
             edge: self.edge.clone(),
         };
         let mut forbidden_refs = if kind == CommitActionKind::GuardedCommit {
@@ -453,10 +489,15 @@ fn diagnostic_label(kind: CommitActionKind, key: &DiagnosticKey) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rustc_middle::mir::Local;
     use rustc_span::def_id::{DefIndex, LocalDefId};
 
     use super::*;
-    use crate::analyses::borrow_ownership::slots::SlotId;
+    use crate::analyses::borrow_ownership::{
+        crate_slots::CrateSlots,
+        slots::{SlotId, SlotUniverse},
+        solver::KindSolver,
+    };
 
     fn field(index: usize) -> SlotRef {
         SlotRef::Field(SlotId::from_usize(index))
@@ -992,6 +1033,57 @@ mod tests {
                 "event=l2_commit|kind=guarded|target=local:8:2|peers=field:40|edge_fn=12|edge_issuer=field:40|edge_requirers=local:8:2",
             ],
             "different function owners cannot collide in the R7 local-slot identity"
+        );
+    }
+
+    #[test]
+    fn l2_red_solver_emission_uses_forbid_clause_and_core_family() {
+        let (target, peer) = (field(0), field(1));
+        let mut planner = Planner::new(2);
+        let action = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                1,
+                target,
+                Some(peer),
+                vec![target],
+            )],
+            &ref_model(&[target, peer]),
+        ))
+        .pop()
+        .expect("one guarded action");
+
+        let mut field_slots = SlotUniverse::default();
+        field_slots.register_local(Local::from_u32(1), 2);
+        let slots = CrateSlots {
+            field_slots,
+            fn_local_slots: FxHashMap::default(),
+        };
+
+        let solver = KindSolver::new(&slots);
+        solver.assume(peer, SlotKind::Ref);
+        solver.add_l2_commit(&action);
+        let model = solver.model_kinds().expect("guarded L2 model");
+        assert_eq!(model.get(&peer), Some(&SlotKind::Ref));
+        assert_ne!(
+            model.get(&target),
+            Some(&SlotKind::Ref),
+            "when the peer stays Ref, the emitted implication must force ¬ref(target)"
+        );
+
+        let tracked = KindSolver::new_tracked(&slots);
+        tracked.add_l2_commit(&action);
+        let tracker = tracked.tracker().expect("tracked L2 solver");
+        assert!(
+            tracker
+                .tracks()
+                .iter()
+                .filter_map(|track| tracker.label_of(track))
+                .any(|label| {
+                    label.contains(GUARDED_COMMIT_CORE_FAMILY)
+                        && label.contains(&action.diagnostic_label)
+                }),
+            "the real L2 clause must pass through assert_hard under its ruled core family"
         );
     }
 }
