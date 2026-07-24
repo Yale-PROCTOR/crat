@@ -100,6 +100,11 @@ impl SlotKey {
     }
 }
 
+/// Canonical `SlotRef` encoding shared by L2 action and final-kind diagnostics.
+pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
+    SlotKey::of(slot).diagnostic()
+}
+
 /// Canonical identity of the conflict edge that spawned a commit.
 ///
 /// The function key is required even for field-only fixtures: the same field

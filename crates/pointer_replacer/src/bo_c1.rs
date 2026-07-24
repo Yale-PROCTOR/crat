@@ -959,7 +959,7 @@ mod run {
         for (&slot, &kind) in model {
             let name = fmt_slot(program, slots, slot);
             assert!(
-                model_by_name.insert(name.clone(), kind).is_none(),
+                model_by_name.insert(name.clone(), (slot, kind)).is_none(),
                 "L2 RED model has duplicate canonical slot {name}"
             );
         }
@@ -967,7 +967,7 @@ mod run {
         let mut found = 0usize;
         let mut recovered = 0usize;
         for target in &expected {
-            let Some(kind) = model_by_name.get(&target.slot).copied() else {
+            let Some((slot, kind)) = model_by_name.get(&target.slot).copied() else {
                 continue;
             };
             found += 1;
@@ -978,8 +978,11 @@ mod run {
                 SlotKind::Owning => "owning",
             };
             eprintln!(
-                "L2TARGET program={} slot={} audit_round={} kind={kind}",
-                target.program, target.slot, target.audit_round
+                "L2TARGET program={} slot={} slot_key={} audit_round={} kind={kind}",
+                target.program,
+                target.slot,
+                crate::analyses::borrow_ownership::l2::slotref_diagnostic(slot),
+                target.audit_round
             );
         }
 
@@ -1515,6 +1518,7 @@ mod run {
                 // would not be UNSAT).
                 if rstats.field_conflict_decline.is_none()
                     && !rstats.cap_exhausted
+                    && rstats.l2_decline.is_none()
                     && std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
                     let t = Instant::now();
                     match super::explain::explain_unsat(tcx) {
