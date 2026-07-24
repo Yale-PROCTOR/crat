@@ -525,6 +525,21 @@ mod tests {
             .collect()
     }
 
+    /// Mini-RED seam for §7. The current observation shape cannot carry an
+    /// invalidating-access witness, so RED deliberately drops it here. GREEN-2
+    /// rebinds this helper to the real BO-owned witness field; the assertions
+    /// below remain unchanged.
+    fn observation_with_invalidators(
+        fn_key: FnKey,
+        target: SlotRef,
+        issuer: Option<SlotRef>,
+        requirers: Vec<SlotRef>,
+        invalidators: Vec<SlotRef>,
+    ) -> ConflictObservation {
+        let _ = invalidators;
+        ConflictObservation::new(fn_key, target, issuer, requirers)
+    }
+
     fn continue_actions(plan: RoundPlan) -> Vec<CommitAction> {
         match plan {
             RoundPlan::Continue { actions, .. } => actions,
@@ -541,25 +556,45 @@ mod tests {
 
     #[test]
     fn l2_red_guard_uses_exact_edge_peers_and_empty_guard_is_unconditional() {
-        let (target, outside, peer_a, peer_b, peer_c) =
-            (field(1), field(99), field(4), field(3), field(2));
-        let model = ref_model(&[target, outside, peer_a, peer_b, peer_c]);
-        let observation = ConflictObservation::new(
+        let (target, outside, peer_a, peer_b, peer_c, invalidator) = (
+            field(1),
+            field(99),
+            field(4),
+            field(3),
+            field(2),
+            field(5),
+        );
+        let model = [
+            (target, SlotKind::Ref),
+            (outside, SlotKind::Ref),
+            (peer_a, SlotKind::Ref),
+            (peer_b, SlotKind::Ref),
+            (peer_c, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect();
+        let observation = observation_with_invalidators(
             17,
             target,
             Some(peer_a),
             vec![target, peer_b, peer_a, target, peer_c, peer_b],
+            vec![invalidator],
         );
         let mut planner = Planner::new(100);
 
-        let actions =
-            continue_actions(planner.plan_round(SolverOutcome::Sat, &[observation], &model));
+        let plan = planner.plan_round(SolverOutcome::Sat, &[observation], &model);
+        assert!(
+            matches!(&plan, RoundPlan::Continue { .. }),
+            "a Raw-witnessed invalidator is guard context, not a decline: {plan:?}"
+        );
+        let actions = continue_actions(plan);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].target, target);
         assert_eq!(
             actions[0].peers,
-            vec![peer_c, peer_b, peer_a],
-            "guard is exactly the sorted, duplicate-free edge participants minus target"
+            vec![peer_c, peer_b, peer_a, invalidator],
+            "guard is the sorted, duplicate-free issuer/requirers/invalidators minus target"
         );
         assert!(
             !actions[0].peers.contains(&outside),
@@ -567,21 +602,43 @@ mod tests {
         );
         assert_eq!(actions[0].kind, CommitActionKind::GuardedCommit);
         assert_eq!(actions[0].core_family, GUARDED_COMMIT_CORE_FAMILY);
-        assert_eq!(
-            actions[0].clause.forbidden_refs,
-            vec![peer_c, peer_b, peer_a, target],
-            "the clause is exactly ¬peer_c ∨ ¬peer_b ∨ ¬peer_a ∨ ¬target"
+        assert!(
+            !actions[0].clause.is_satisfied_by(&model),
+            "the witnessed context persists, so target=Ref must violate the commit"
         );
-        let all_raw = actions[0]
-            .clause
-            .forbidden_refs
-            .iter()
-            .copied()
+        let mut raw_departed_to_ref = model.clone();
+        raw_departed_to_ref.insert(invalidator, SlotKind::Ref);
+        assert!(
+            actions[0].clause.is_satisfied_by(&raw_departed_to_ref),
+            "a Raw-witnessed invalidator becoming Ref must deactivate the commit"
+        );
+        let mut ref_departed_to_raw = model.clone();
+        ref_departed_to_raw.insert(peer_a, SlotKind::Raw);
+        assert!(
+            actions[0].clause.is_satisfied_by(&ref_departed_to_raw),
+            "a Ref-witnessed participant becoming Raw must deactivate the commit"
+        );
+        let all_raw = [target, peer_a, peer_b, peer_c, invalidator]
+            .into_iter()
             .map(|slot| (slot, SlotKind::Raw))
             .collect();
         assert!(
             actions[0].clause.is_satisfied_by(&all_raw),
-            "the all-Raw assignment must satisfy every forbid-only L2 clause"
+            "the target's negative literal keeps mixed-polarity clauses all-Raw satisfiable"
+        );
+        assert!(
+            actions[0]
+                .diagnostic_label
+                .contains("peers=field:2:ref,field:3:ref,field:4:ref,field:5:raw"),
+            "R7 must record every peer's witnessed polarity: {}",
+            actions[0].diagnostic_label
+        );
+        assert!(
+            actions[0]
+                .diagnostic_label
+                .contains("edge_invalidators=field:5"),
+            "R7 must record the mapped invalidating-access witness: {}",
+            actions[0].diagnostic_label
         );
         assert_eq!(planner.lifecycle(target), Lifecycle::Guarded);
 
@@ -608,9 +665,11 @@ mod tests {
             vec![issuerless_a, issuerless_b],
             "an issuer-less edge derives its guard exactly from its other requirers"
         );
-        assert_eq!(
-            issuerless_actions[0].clause.forbidden_refs,
-            vec![issuerless_a, issuerless_b, issuerless_target]
+        assert!(
+            !issuerless_actions[0].clause.is_satisfied_by(
+                &ref_model(&[issuerless_target, issuerless_a, issuerless_b])
+            ),
+            "an all-Ref witnessed context keeps the target commit active"
         );
         assert_eq!(
             issuerless_actions[0].edge,
@@ -642,63 +701,119 @@ mod tests {
         assert!(actions[0].peers.is_empty());
         assert_eq!(actions[0].kind, CommitActionKind::UnconditionalCommit);
         assert_eq!(actions[0].core_family, GUARDED_COMMIT_CORE_FAMILY);
-        assert_eq!(actions[0].clause.forbidden_refs, vec![lone_target]);
+        assert!(
+            !actions[0]
+                .clause
+                .is_satisfied_by(&ref_model(&[lone_target])),
+            "the participant-free commit must forbid target=Ref"
+        );
+        assert!(
+            actions[0]
+                .clause
+                .is_satisfied_by(&[(lone_target, SlotKind::Raw)].into_iter().collect()),
+            "the participant-free commit must retain the all-Raw model"
+        );
         assert_eq!(
             empty_guard_planner.lifecycle(lone_target),
             Lifecycle::Permanent
         );
 
-        for non_ref_kind in [SlotKind::Raw, SlotKind::Owning] {
-            let mut fail_closed = Planner::new(2);
-            let non_ref_model = [(target, SlotKind::Ref), (peer_a, non_ref_kind)]
-                .into_iter()
-                .collect();
-            assert_eq!(
-                fail_closed.plan_round(
-                    SolverOutcome::Sat,
-                    &[ConflictObservation::new(
-                        17,
-                        target,
-                        Some(peer_a),
-                        vec![target],
-                    )],
-                    &non_ref_model,
-                ),
-                RoundPlan::Decline {
-                    validation_round: 1,
-                    reason: DeclineReason::ParticipantNotRef { slot: peer_a },
-                },
-                "a mapped non-Ref edge participant must fail closed"
-            );
-        }
-
-        for non_ref_kind in [SlotKind::Raw, SlotKind::Owning] {
-            let mut fail_closed = Planner::new(3);
-            let non_ref_model = [
-                (target, SlotKind::Ref),
-                (peer_a, SlotKind::Ref),
-                (peer_b, non_ref_kind),
-            ]
+        let mut raw_guard = Planner::new(2);
+        let raw_model = [(target, SlotKind::Ref), (peer_a, SlotKind::Raw)]
             .into_iter()
             .collect();
-            assert_eq!(
-                fail_closed.plan_round(
-                    SolverOutcome::Sat,
-                    &[ConflictObservation::new(
-                        17,
-                        target,
-                        Some(peer_a),
-                        vec![target, peer_b],
-                    )],
-                    &non_ref_model,
-                ),
-                RoundPlan::Decline {
-                    validation_round: 1,
-                    reason: DeclineReason::ParticipantNotRef { slot: peer_b },
-                },
-                "a mapped non-Ref requirer must fail closed"
-            );
-        }
+        let raw_plan = raw_guard.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                target,
+                Some(peer_a),
+                vec![target],
+            )],
+            &raw_model,
+        );
+        assert!(
+            matches!(&raw_plan, RoundPlan::Continue { .. }),
+            "a mapped Raw peer must produce a witnessed-polarity guard: {raw_plan:?}"
+        );
+        let raw_actions = continue_actions(raw_plan);
+        assert_eq!(raw_actions[0].kind, CommitActionKind::GuardedCommit);
+        assert!(
+            !raw_actions[0].clause.is_satisfied_by(&raw_model),
+            "Raw witness + Ref target keeps the commit active"
+        );
+        assert!(
+            raw_actions[0].clause.is_satisfied_by(
+                &[(target, SlotKind::Ref), (peer_a, SlotKind::Ref)]
+                    .into_iter()
+                    .collect()
+            ),
+            "Raw to Ref departure deactivates the commit"
+        );
+
+        let mut owning_degrades = Planner::new(3);
+        let owning_model = [
+            (target, SlotKind::Ref),
+            (peer_a, SlotKind::Ref),
+            (peer_b, SlotKind::Owning),
+        ]
+        .into_iter()
+        .collect();
+        let owning_plan = owning_degrades.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                target,
+                Some(peer_a),
+                vec![target, peer_b],
+            )],
+            &owning_model,
+        );
+        assert!(
+            matches!(&owning_plan, RoundPlan::Continue { .. }),
+            "Owning peers degrade this edge to Mode-A rather than declining: {owning_plan:?}"
+        );
+        let owning_actions = continue_actions(owning_plan);
+        assert_eq!(owning_actions.len(), 1);
+        assert_eq!(
+            owning_actions[0].kind,
+            CommitActionKind::UnconditionalCommit
+        );
+        assert_eq!(
+            owning_degrades.lifecycle(target),
+            Lifecycle::Permanent,
+            "an Owning-degraded edge installs Mode-A's permanent target pin"
+        );
+        assert!(
+            owning_actions[0]
+                .diagnostic_label
+                .contains("degraded_reason=owning_participant"),
+            "R7 must identify why the edge degraded: {}",
+            owning_actions[0].diagnostic_label
+        );
+        assert!(
+            owning_actions[0]
+                .diagnostic_label
+                .contains("owning_peers=field:3"),
+            "R7 must identify every Owning peer: {}",
+            owning_actions[0].diagnostic_label
+        );
+        assert!(
+            !owning_actions[0].clause.is_satisfied_by(&owning_model),
+            "the degraded unconditional commit must forbid target=Ref"
+        );
+        assert!(
+            owning_actions[0].clause.is_satisfied_by(
+                &[
+                    (target, SlotKind::Raw),
+                    (peer_a, SlotKind::Raw),
+                    (peer_b, SlotKind::Raw),
+                ]
+                .into_iter()
+                .collect()
+            ),
+            "the Owning-degraded unconditional form must retain all-Raw"
+        );
 
         let mut missing_participant = Planner::new(2);
         assert_eq!(
@@ -807,7 +922,8 @@ mod tests {
 
     #[test]
     fn l2_red_deactivation_accepts_only_when_hazard_disappears_otherwise_escalates() {
-        let (target, issuer, replacement) = (field(20), field(21), field(22));
+        let (target, issuer, replacement, invalidator) =
+            (field(20), field(21), field(22), field(23));
         let conflict = ConflictObservation::new(7, target, Some(issuer), vec![target]);
         let first_model = ref_model(&[target, issuer]);
 
@@ -826,6 +942,80 @@ mod tests {
             discharged.lifecycle(target),
             Lifecycle::Guarded,
             "acceptance validates the recovered Ref; it need not pin the slot"
+        );
+
+        let mut raw_witness_discharged = Planner::new(24);
+        let raw_witness_conflict = observation_with_invalidators(
+            9,
+            target,
+            Some(issuer),
+            vec![target],
+            vec![invalidator],
+        );
+        let raw_witness_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect();
+        let raw_witness_plan = raw_witness_discharged.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_witness_model,
+        );
+        assert!(
+            matches!(&raw_witness_plan, RoundPlan::Continue { .. }),
+            "a Raw invalidation witness must create a guard, not decline: {raw_witness_plan:?}"
+        );
+        let raw_witness_actions = continue_actions(raw_witness_plan);
+        assert_eq!(
+            raw_witness_actions[0].peers,
+            vec![issuer, invalidator],
+            "the guard must retain both the Ref issuer and Raw invalidator"
+        );
+        assert!(
+            !raw_witness_actions[0]
+                .clause
+                .is_satisfied_by(&raw_witness_model),
+            "the exact witnessed context keeps target=Ref forbidden"
+        );
+        assert!(
+            raw_witness_actions[0]
+                .diagnostic_label
+                .contains("peers=field:21:ref,field:23:raw"),
+            "R7 must retain the opposite peer polarities: {}",
+            raw_witness_actions[0].diagnostic_label
+        );
+        assert!(
+            raw_witness_actions[0]
+                .diagnostic_label
+                .contains("edge_invalidators=field:23"),
+            "R7 must retain the mapped invalidator: {}",
+            raw_witness_actions[0].diagnostic_label
+        );
+        let raw_departed_to_ref = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Ref),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            raw_witness_actions[0]
+                .clause
+                .is_satisfied_by(&raw_departed_to_ref),
+            "promoting the Raw-witnessed invalidator to Ref must deactivate the commit"
+        );
+        assert_accept(raw_witness_discharged.plan_round(
+            SolverOutcome::Sat,
+            &[],
+            &raw_departed_to_ref,
+        ));
+        assert_eq!(
+            raw_witness_discharged.lifecycle(target),
+            Lifecycle::Guarded,
+            "joint restoration may recover the target without a permanent pin"
         );
 
         let mut persistent = Planner::new(23);
@@ -867,10 +1057,19 @@ mod tests {
             },
             "an escalation records the canonical reappearing (target, peers, edge) key"
         );
-        assert_eq!(
-            recurrence[0].diagnostic_label,
-            "event=l2_commit|kind=escalation|target=field:20|peers=field:22|edge_fn=8|edge_issuer=field:22|edge_requirers=field:20,field:22",
-            "the escalation diagnostic is stable and machine-parseable"
+        assert!(
+            recurrence[0].diagnostic_label.contains(
+                "event=l2_commit|kind=escalation|target=field:20|peers=field:22:ref"
+            ),
+            "the escalation diagnostic records the reappearing peer polarity: {}",
+            recurrence[0].diagnostic_label
+        );
+        assert!(
+            recurrence[0]
+                .diagnostic_label
+                .contains("edge_fn=8|edge_issuer=field:22|edge_requirers=field:20,field:22"),
+            "the escalation diagnostic retains the canonical spawning edge: {}",
+            recurrence[0].diagnostic_label
         );
         let escalated_model = [
             (target, SlotKind::Raw),
