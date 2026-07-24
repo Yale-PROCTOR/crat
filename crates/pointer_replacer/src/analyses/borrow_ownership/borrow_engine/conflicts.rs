@@ -30,6 +30,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct WitnessedConflictEdge {
     pub(crate) edge: ConflictEdge,
+    pub(crate) loan: usize,
     pub(crate) invalidators: Vec<Local>,
 }
 
@@ -170,6 +171,7 @@ fn extract_witnessed_conflict_edges(
         .zip(invalid_loans.iter())
         .map(|(edge, loan)| WitnessedConflictEdge {
             edge,
+            loan: loan.index(),
             invalidators: invalidators_by_loan.remove(&loan).unwrap_or_default(),
         })
         .collect()

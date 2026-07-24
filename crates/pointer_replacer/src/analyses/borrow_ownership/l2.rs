@@ -130,6 +130,40 @@ pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
     SlotKey::of(slot).diagnostic()
 }
 
+/// R7 identity for one validation conflict before commit planning. The loan
+/// index is retained only here; it does not enter clause identity, ordering, or
+/// solver semantics.
+pub(crate) fn conflict_witness_diagnostic(
+    validation_round: usize,
+    fn_key: FnKey,
+    loan: usize,
+    target: SlotRef,
+    issuer: Option<SlotRef>,
+    requirers: &[SlotRef],
+    invalidators: &[SlotRef],
+) -> String {
+    let mut requirers = requirers.to_vec();
+    canonicalize_slots(&mut requirers);
+    let mut invalidators = invalidators.to_vec();
+    canonicalize_slots(&mut invalidators);
+    let issuer = issuer.map_or_else(|| "none".to_owned(), slotref_diagnostic);
+    format!(
+        "event=l2_conflict_witness|round={validation_round}|target={}|edge_fn={fn_key}|loan={loan}|\
+         edge_issuer={issuer}|edge_requirers={}|edge_invalidators={}",
+        slotref_diagnostic(target),
+        requirers
+            .into_iter()
+            .map(slotref_diagnostic)
+            .collect::<Vec<_>>()
+            .join(","),
+        invalidators
+            .into_iter()
+            .map(slotref_diagnostic)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 /// Explicit, stable per-peer witnessed kinds for the env-gated R7 record.
 ///
 /// `diagnostic_label` retains the pinned legacy all-Ref form used by the RED
@@ -1522,6 +1556,23 @@ mod tests {
              literals=field:20@target-neg@raw@true@guarded,field:21@peer-neg@raw@true@permanent|\
              transitions=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent|\
              changed=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent"
+        );
+    }
+
+    #[test]
+    fn l2_conflict_diagnostic_retains_loan_and_invalidator_identity() {
+        assert_eq!(
+            conflict_witness_diagnostic(
+                4,
+                12,
+                9,
+                field(20),
+                Some(field(21)),
+                &[field(22), field(20)],
+                &[field(23)],
+            ),
+            "event=l2_conflict_witness|round=4|target=field:20|edge_fn=12|loan=9|\
+             edge_issuer=field:21|edge_requirers=field:20,field:22|edge_invalidators=field:23"
         );
     }
 
