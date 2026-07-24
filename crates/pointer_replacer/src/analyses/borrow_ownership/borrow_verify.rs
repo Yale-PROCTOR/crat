@@ -158,6 +158,7 @@ pub(crate) struct SlotConflict {
 #[derive(Clone, Debug)]
 struct WitnessedSlotConflict {
     conflict: SlotConflict,
+    loan: usize,
     invalidators: Vec<SlotRef>,
 }
 
@@ -320,6 +321,7 @@ fn revalidate_replaying_witnessed(
             let translated = fn_edges
                 .into_iter()
                 .map(|witnessed| {
+                    let loan = witnessed.loan;
                     let edge = witnessed.edge;
                     let mut invalidators = witnessed
                         .invalidators
@@ -341,6 +343,7 @@ fn revalidate_replaying_witnessed(
                                 .filter_map(|owner| owner_to_slot(slots, fn_did, owner))
                                 .collect(),
                         },
+                        loan,
                         invalidators,
                     }
                 })
@@ -849,6 +852,20 @@ fn verify_l2_to_fixpoint_counting(
                     )
                     .with_invalidators(witnessed.invalidators.clone()),
                 );
+                if diagnostics_enabled {
+                    eprintln!(
+                        "[bo-l2] {}",
+                        l2::conflict_witness_diagnostic(
+                            stats.rounds,
+                            did.local_def_index.as_u32(),
+                            witnessed.loan,
+                            target,
+                            witnessed.conflict.issuer,
+                            &witnessed.conflict.requirers,
+                            &witnessed.invalidators,
+                        )
+                    );
+                }
             }
         }
 
