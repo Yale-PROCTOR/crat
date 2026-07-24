@@ -239,6 +239,7 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
 
             if self.config.remove_extern_c
                 && !is_exposed_fn
+                && !sig.decl.c_variadic()
                 && !self
                     .ast_to_hir
                     .global_map

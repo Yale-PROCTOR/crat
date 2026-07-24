@@ -511,3 +511,12 @@ fn main() {
 "#;
     run_extern_c_test(code, &["extern \"C\" fn f"], &["extern \"C\" fn g"]);
 }
+
+#[test]
+fn test_extern_c_variadic_preserved() {
+    let code = r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn f(_: i32, ...) {}
+"#;
+    run_extern_c_test(code, &["extern \"C\" fn f"], &[]);
+}
