@@ -31,6 +31,7 @@ use crate::{
 pub(crate) struct WitnessedConflictEdge {
     pub(crate) edge: ConflictEdge,
     pub(crate) loan: usize,
+    pub(crate) loan_location: crate::analyses::borrow_ownership::l2::MirLocationKey,
     pub(crate) invalidators: Vec<Local>,
 }
 
@@ -169,10 +170,17 @@ fn extract_witnessed_conflict_edges(
     extract_conflict_edges(inference, provenance_set, invalid_loans)
         .into_iter()
         .zip(invalid_loans.iter())
-        .map(|(edge, loan)| WitnessedConflictEdge {
-            edge,
-            loan: loan.index(),
-            invalidators: invalidators_by_loan.remove(&loan).unwrap_or_default(),
+        .map(|(edge, loan)| {
+            let location = inference.borrow_set.loans[loan].location();
+            WitnessedConflictEdge {
+                edge,
+                loan: loan.index(),
+                loan_location: crate::analyses::borrow_ownership::l2::MirLocationKey::new(
+                    location.block.index() as u32,
+                    location.statement_index,
+                ),
+                invalidators: invalidators_by_loan.remove(&loan).unwrap_or_default(),
+            }
         })
         .collect()
 }

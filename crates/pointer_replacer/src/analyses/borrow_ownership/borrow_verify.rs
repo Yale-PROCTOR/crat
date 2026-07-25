@@ -25,7 +25,7 @@ use super::{
     l2::{
         self, CommitAction, ConflictObservation, DeclineReason as L2DeclineReason, Planner,
         RoundPlan as L2RoundPlan, SolverDecline as L2SolverDecline,
-        SolverOutcome as L2SolverOutcome,
+        SolverOutcome as L2SolverOutcome, StableLoanKey,
     },
     mutability_facts::MutProvider,
     slots::{SlotId, SlotOwner},
@@ -159,6 +159,7 @@ pub(crate) struct SlotConflict {
 struct WitnessedSlotConflict {
     conflict: SlotConflict,
     loan: usize,
+    stable_loan_key: Option<StableLoanKey>,
     invalidators: Vec<SlotRef>,
 }
 
@@ -322,7 +323,11 @@ fn revalidate_replaying_witnessed(
                 .into_iter()
                 .map(|witnessed| {
                     let loan = witnessed.loan;
+                    let loan_location = witnessed.loan_location;
                     let edge = witnessed.edge;
+                    let issuer = edge
+                        .issuer
+                        .and_then(|owner| owner_to_slot(slots, fn_did, owner));
                     let mut invalidators = witnessed
                         .invalidators
                         .into_iter()
@@ -334,9 +339,7 @@ fn revalidate_replaying_witnessed(
                     invalidators.dedup();
                     WitnessedSlotConflict {
                         conflict: SlotConflict {
-                            issuer: edge
-                                .issuer
-                                .and_then(|owner| owner_to_slot(slots, fn_did, owner)),
+                            issuer,
                             requirers: edge
                                 .requirers
                                 .into_iter()
@@ -344,6 +347,13 @@ fn revalidate_replaying_witnessed(
                                 .collect(),
                         },
                         loan,
+                        stable_loan_key: issuer.map(|issuer| {
+                            StableLoanKey::new(
+                                fn_did.local_def_index.as_u32(),
+                                issuer,
+                                loan_location,
+                            )
+                        }),
                         invalidators,
                     }
                 })
@@ -843,18 +853,30 @@ fn verify_l2_to_fixpoint_counting(
                     }
                     continue;
                 };
-                observations.push(
-                    ConflictObservation::new(
-                        did.local_def_index.as_u32(),
-                        target,
-                        witnessed.conflict.issuer,
-                        witnessed.conflict.requirers.clone(),
-                    )
-                    .with_invalidators(witnessed.invalidators.clone()),
-                );
+                let mut observation = ConflictObservation::new(
+                    did.local_def_index.as_u32(),
+                    target,
+                    witnessed.conflict.issuer,
+                    witnessed.conflict.requirers.clone(),
+                )
+                .with_invalidators(witnessed.invalidators.clone());
+                if let Some(stable_loan_key) = witnessed.stable_loan_key {
+                    observation = observation.with_loan_identity(witnessed.loan, stable_loan_key);
+                }
+                observations.push(observation);
                 if diagnostics_enabled {
-                    eprintln!(
-                        "[bo-l2] {}",
+                    let record = if let Some(stable_loan_key) = witnessed.stable_loan_key {
+                        l2::conflict_witness_diagnostic_stable(
+                            stats.rounds,
+                            did.local_def_index.as_u32(),
+                            witnessed.loan,
+                            stable_loan_key,
+                            target,
+                            witnessed.conflict.issuer,
+                            &witnessed.conflict.requirers,
+                            &witnessed.invalidators,
+                        )
+                    } else {
                         l2::conflict_witness_diagnostic(
                             stats.rounds,
                             did.local_def_index.as_u32(),
@@ -864,7 +886,8 @@ fn verify_l2_to_fixpoint_counting(
                             &witnessed.conflict.requirers,
                             &witnessed.invalidators,
                         )
-                    );
+                    };
+                    eprintln!("[bo-l2] {}", record);
                 }
             }
         }
