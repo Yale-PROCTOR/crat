@@ -61,7 +61,7 @@ fn assert_skeleton(source: &str, path: &str, expected: &str) {
             canonical_item(&function(&records, path).annotated_skeleton),
             {
                 let mut expected = utils::ast::parse_crate(expected.to_owned());
-                TargetBindingMutator.visit_crate(&mut expected);
+                PresentationBindingNormalizer.visit_crate(&mut expected);
                 pprust::item_to_string(&expected.items[0])
             }
         );
@@ -432,7 +432,7 @@ fn function_records_sanitize_prompt_only_header_tokens_and_split_signatures() {
     let function = function(&records, "add");
     assert_eq!(
         function.source_signature,
-        "pub unsafe fn add(x: i32, y: i32) -> i32"
+        "pub unsafe fn add(mut x: i32, mut y: i32) -> i32"
     );
     assert_eq!(
         function.target_signature,
@@ -1047,7 +1047,7 @@ fn keeps_non_pointer_signature_types_unchanged() {
     let f = function(&records, "f");
     assert_eq!(
         f.source_signature,
-        "pub unsafe fn f(a: i32, b: (u8, bool), c: [i16; 2], s: S) -> (S, usize)"
+        "pub unsafe fn f(mut a: i32, mut b: (u8, bool), mut c: [i16; 2], mut s: S)\n-> (S, usize)"
     );
     assert_eq!(
         f.target_signature,
@@ -1487,7 +1487,7 @@ fn comprehensive_fixture_emits_consistent_records() {
 }
 
 #[test]
-fn target_parameters_and_simple_locals_are_mutable() {
+fn source_and_target_parameters_and_simple_locals_are_mutable() {
     let source = r#"pub unsafe fn f(input: i32, mut existing: i32) -> i32 {
     let value = input;
     let mut total: i32 = existing;
@@ -1505,12 +1505,21 @@ fn target_parameters_and_simple_locals_are_mutable() {
     todo!()
 }"#,
     );
-    assert!(record.annotated_source.contains("let value = input;"));
-    assert!(!record.annotated_source.contains("let mut value"));
+    assert_eq!(
+        record.source_signature,
+        "pub unsafe fn f(mut input: i32, mut existing: i32) -> i32"
+    );
+    assert_eq!(record.source_signature, record.target_signature);
+    assert!(record.annotated_source.contains("let mut value = input;"));
+    assert!(
+        record
+            .annotated_source
+            .contains("let mut total: i32 = existing;")
+    );
 }
 
 #[test]
-fn wildcards_remain_wildcards_and_source_is_unchanged() {
+fn wildcards_remain_wildcards() {
     let source = r#"pub unsafe fn f(pair: (i32, i32)) {
     let (_, value) = pair;
     let _ = value;
@@ -1524,11 +1533,21 @@ fn wildcards_remain_wildcards_and_source_is_unchanged() {
     let _ = todo!();
 }"#,
     );
-    assert!(record.annotated_source.contains("let (_, value) = pair;"));
+    assert_eq!(
+        record.source_signature,
+        "pub unsafe fn f(mut pair: (i32, i32))"
+    );
+    assert_eq!(record.source_signature, record.target_signature);
+    assert!(
+        record
+            .annotated_source
+            .contains("let (_, mut value) = pair;")
+    );
+    assert!(record.annotated_source.contains("let _ = value;"));
 }
 
 #[test]
-fn all_nested_pattern_binding_kinds_become_mutable() {
+fn non_ref_bindings_are_normalized_and_reference_modes_are_preserved() {
     let source = r#"enum E { Pair(i32, i32), Struct { x: i32 }, Unit }
 enum Choice { Left(i32), Right(i32) }
 pub unsafe fn f(
@@ -1556,33 +1575,38 @@ pub unsafe fn f(
     let _ = (whole, a, b, c, d);
 }"#;
     let records = generate(source);
-    let skeleton = &function(&records, "f").annotated_skeleton;
-    for fragment in [
-        "mut pair: (i32, i32)",
-        "let ref mut borrowed",
-        "let mut whole @ (mut a, mut b)",
-        "Some((mut c, mut d))",
-        "Some((mut e, mut f))",
-        "Some((mut g, mut h))",
-        "for (mut i, mut j)",
-        "E::Pair(mut k, mut l)",
-        "x: mut m",
-        "Choice::Left(mut n) | Choice::Right(mut n)",
-    ] {
-        assert!(
-            skeleton.contains(fragment),
-            "missing `{fragment}` in {skeleton}"
-        );
+    let record = function(&records, "f");
+    for rendering in [&record.annotated_source, &record.annotated_skeleton] {
+        for fragment in [
+            "mut pair: (i32, i32)",
+            "mut opt: Option<(i32, i32)>",
+            "mut values: [(i32, i32); 1]",
+            "mut value: E",
+            "mut choice: Choice",
+            "let ref borrowed",
+            "let mut whole @ (mut a, mut b)",
+            "Some((mut c, mut d))",
+            "Some((mut e, mut f))",
+            "Some((mut g, mut h))",
+            "for (mut i, mut j)",
+            "E::Pair(mut k, mut l)",
+            "x: mut m",
+            "Choice::Left(mut n) | Choice::Right(mut n)",
+        ] {
+            assert!(
+                rendering.contains(fragment),
+                "missing `{fragment}` in {rendering}"
+            );
+        }
+        assert!(!rendering.contains("let ref mut borrowed"));
     }
 
     let ref_mut = generate(
         "pub unsafe fn ref_mut_source(mut value: i32) { let ref mut borrowed = value; let _ = borrowed; }",
     );
-    assert!(
-        function(&ref_mut, "ref_mut_source")
-            .annotated_skeleton
-            .contains("let ref mut borrowed")
-    );
+    let ref_mut = function(&ref_mut, "ref_mut_source");
+    assert!(ref_mut.annotated_source.contains("let ref mut borrowed"));
+    assert!(ref_mut.annotated_skeleton.contains("let ref mut borrowed"));
 }
 
 #[test]
@@ -1591,13 +1615,22 @@ fn safe_source_functions_get_unsafe_target_headers() {
         "pub fn safe(input: i32) -> i32 { let value = input; value } pub unsafe fn already_unsafe(input: i32) -> i32 { input }",
     );
     let safe = function(&records, "safe");
-    assert_eq!(safe.source_signature, "pub fn safe(input: i32) -> i32");
+    assert_eq!(safe.source_signature, "pub fn safe(mut input: i32) -> i32");
     assert_eq!(
         safe.target_signature,
         "pub unsafe fn safe(mut input: i32) -> i32"
     );
     assert!(safe.annotated_source.starts_with("pub fn safe"));
+    assert!(safe.annotated_source.contains("let mut value = input;"));
     assert!(safe.annotated_skeleton.starts_with("pub unsafe fn safe"));
+    assert!(
+        safe.annotated_skeleton
+            .contains("let mut value: i32 = todo!();")
+    );
+    assert_eq!(
+        function(&records, "already_unsafe").source_signature,
+        "pub unsafe fn already_unsafe(mut input: i32) -> i32"
+    );
     assert_eq!(
         function(&records, "already_unsafe").target_signature,
         "pub unsafe fn already_unsafe(mut input: i32) -> i32"
