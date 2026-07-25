@@ -223,18 +223,19 @@ mod report {
 /// It never changes either ownership analysis; the corpus workers only export their existing
 /// solidified results through this surface when the measurement flag is enabled.
 mod ownership_yield {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::Path,
+    };
 
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum OwnerClass {
         Local,
         Field,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct SlotRecord {
         pub key: String,
         pub owner: OwnerClass,
@@ -269,25 +270,509 @@ mod ownership_yield {
         pub production_status: String,
         pub bo_wall_s: f64,
         pub production_wall_s: Option<f64>,
+        pub production_andersen_s: Option<f64>,
+        pub production_output_params_s: Option<f64>,
+        pub production_ownership_s: Option<f64>,
+        pub production_solidify_s: Option<f64>,
         pub production_cap_s: u64,
         pub production_failure: Option<String>,
+        pub bo: SideCounts,
         pub comparison: Option<Comparison>,
     }
 
-    pub fn compare(_bo: &[SlotRecord], _production: &[SlotRecord]) -> Result<Comparison, String> {
-        Ok(Comparison::default())
+    fn indexed<'a>(
+        records: &'a [SlotRecord],
+        side: &str,
+    ) -> Result<BTreeMap<&'a str, &'a SlotRecord>, String> {
+        let mut indexed = BTreeMap::new();
+        for record in records {
+            if indexed.insert(record.key.as_str(), record).is_some() {
+                return Err(format!("duplicate {side} canonical key: {}", record.key));
+            }
+        }
+        Ok(indexed)
     }
 
-    pub fn snapshot_jsonl(_records: &[SlotRecord]) -> String {
-        String::new()
+    fn counts(records: &[SlotRecord]) -> SideCounts {
+        let mut counts = SideCounts::default();
+        for record in records.iter().filter(|record| record.owning) {
+            let by_depth = match record.owner {
+                OwnerClass::Local => &mut counts.local_owning_by_depth,
+                OwnerClass::Field => &mut counts.field_owning_by_depth,
+            };
+            *by_depth.entry(record.depth).or_default() += 1;
+            counts.total_owning += 1;
+        }
+        counts
     }
 
-    pub fn parse_snapshot_jsonl(_input: &str) -> Result<Vec<SlotRecord>, String> {
-        Ok(Vec::new())
+    pub fn side_counts(records: &[SlotRecord]) -> SideCounts {
+        counts(records)
     }
 
-    pub fn render_summary_csv(_rows: &[ProgramSummary]) -> String {
-        "program,bo_status,production_status\n".to_string()
+    pub fn enabled() -> bool {
+        const ENV: &str = "CRAT_BOC1_OWNERSHIP_YIELD";
+        match std::env::var(ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    pub fn write_worker_snapshot(records: &[SlotRecord]) -> Result<(), String> {
+        let path = std::env::var("CRAT_BOC1_YIELD_SNAPSHOT")
+            .map_err(|error| format!("CRAT_BOC1_YIELD_SNAPSHOT: {error}"))?;
+        fs::write(&path, snapshot_tsv(records))
+            .map_err(|error| format!("write ownership-yield snapshot {path}: {error}"))
+    }
+
+    pub fn read_worker_snapshot(path: &Path) -> Result<Vec<SlotRecord>, String> {
+        let input = fs::read_to_string(path)
+            .map_err(|error| format!("read ownership-yield snapshot {}: {error}", path.display()))?;
+        parse_snapshot_tsv(&input)
+    }
+
+    pub fn compare(bo: &[SlotRecord], production: &[SlotRecord]) -> Result<Comparison, String> {
+        let bo_index = indexed(bo, "BO")?;
+        let production_index = indexed(production, "production")?;
+
+        if let Some(record) = bo.iter().find(|record| record.forced_output) {
+            return Err(format!(
+                "BO record cannot be forced-output classified: {}",
+                record.key
+            ));
+        }
+        if let Some(record) = production
+            .iter()
+            .find(|record| record.forced_output && !record.owning)
+        {
+            return Err(format!(
+                "production forced-output record is not Owning: {}",
+                record.key
+            ));
+        }
+
+        for (&key, bo_record) in &bo_index {
+            let Some(production_record) = production_index.get(key) else {
+                continue;
+            };
+            if (bo_record.owner, bo_record.depth)
+                != (production_record.owner, production_record.depth)
+            {
+                return Err(format!(
+                    "canonical key metadata mismatch for {key}: BO={:?}@d{} production={:?}@d{}",
+                    bo_record.owner,
+                    bo_record.depth,
+                    production_record.owner,
+                    production_record.depth
+                ));
+            }
+        }
+
+        let keys: BTreeSet<&str> =
+            bo_index.keys().chain(production_index.keys()).copied().collect();
+        let mut bo_only_owning = Vec::new();
+        let mut production_only_owning = Vec::new();
+        for key in keys {
+            let bo_owning = bo_index.get(key).is_some_and(|record| record.owning);
+            let production_owning = production_index
+                .get(key)
+                .is_some_and(|record| record.owning);
+            match (bo_owning, production_owning) {
+                (true, false) => bo_only_owning.push(key.to_string()),
+                (false, true) => production_only_owning.push(key.to_string()),
+                _ => {}
+            }
+        }
+
+        let production_forced_output =
+            production.iter().filter(|record| record.forced_output).count();
+        let production_counts = counts(production);
+        Ok(Comparison {
+            bo: counts(bo),
+            production_without_forced: production_counts
+                .total_owning
+                .checked_sub(production_forced_output)
+                .ok_or_else(|| {
+                    "production forced-output count exceeds total Owning count".to_string()
+                })?,
+            production: production_counts,
+            production_forced_output,
+            bo_only_owning,
+            production_only_owning,
+            bo_universe_only: bo_index
+                .keys()
+                .filter(|key| !production_index.contains_key(**key))
+                .map(|key| (*key).to_string())
+                .collect(),
+            production_universe_only: production_index
+                .keys()
+                .filter(|key| !bo_index.contains_key(**key))
+                .map(|key| (*key).to_string())
+                .collect(),
+        })
+    }
+
+    fn hex_encode(input: &str) -> String {
+        input
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn hex_decode(input: &str) -> Result<String, String> {
+        if !input.len().is_multiple_of(2) {
+            return Err("odd-length hex key".to_string());
+        }
+        let bytes = input
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair =
+                    std::str::from_utf8(pair).map_err(|error| format!("hex key UTF-8: {error}"))?;
+                u8::from_str_radix(pair, 16).map_err(|error| format!("hex key byte: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        String::from_utf8(bytes).map_err(|error| format!("decoded key UTF-8: {error}"))
+    }
+
+    pub fn snapshot_tsv(records: &[SlotRecord]) -> String {
+        let mut records = records.to_vec();
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut out = String::from("key_hex\towner\tdepth\towning\tforced_output\n");
+        for record in records {
+            let owner = match record.owner {
+                OwnerClass::Local => "local",
+                OwnerClass::Field => "field",
+            };
+            out.push_str(&format!(
+                "{}\t{owner}\t{}\t{}\t{}\n",
+                hex_encode(&record.key),
+                record.depth,
+                u8::from(record.owning),
+                u8::from(record.forced_output)
+            ));
+        }
+        out
+    }
+
+    pub fn parse_snapshot_tsv(input: &str) -> Result<Vec<SlotRecord>, String> {
+        let mut records = input
+            .lines()
+            .skip(1)
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() != 5 {
+                    return Err(format!(
+                        "snapshot line {} has {} fields, expected 5",
+                        index + 2,
+                        fields.len()
+                    ));
+                }
+                let owner = match fields[1] {
+                    "local" => OwnerClass::Local,
+                    "field" => OwnerClass::Field,
+                    other => {
+                        return Err(format!("snapshot line {} owner: {other}", index + 2));
+                    }
+                };
+                let parse_bool = |value: &str, name: &str| match value {
+                    "0" => Ok(false),
+                    "1" => Ok(true),
+                    other => Err(format!(
+                        "snapshot line {} {name}: {other}",
+                        index + 2
+                    )),
+                };
+                Ok(SlotRecord {
+                    key: hex_decode(fields[0])?,
+                    owner,
+                    depth: fields[2]
+                        .parse()
+                        .map_err(|error| format!("snapshot line {} depth: {error}", index + 2))?,
+                    owning: parse_bool(fields[3], "owning")?,
+                    forced_output: parse_bool(fields[4], "forced_output")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        indexed(&records, "snapshot")?;
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(records)
+    }
+
+    fn depth(counts: &BTreeMap<u8, usize>, exact: u8) -> usize {
+        counts.get(&exact).copied().unwrap_or(0)
+    }
+
+    fn depth_3_plus(counts: &BTreeMap<u8, usize>) -> usize {
+        counts
+            .iter()
+            .filter(|(depth, _)| **depth >= 3)
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    fn csv_cell(value: &str) -> String {
+        if value.chars().any(|ch| matches!(ch, ',' | '"' | '\n')) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn opt_f64(value: Option<f64>) -> String {
+        value.map(|value| format!("{value:.3}")).unwrap_or_default()
+    }
+
+    pub fn render_summary_csv(rows: &[ProgramSummary]) -> String {
+        let mut out = String::from(
+            "program,bo_status,production_status,bo_wall_s,production_wall_s,\
+             production_cap_s,production_andersen_s,production_output_params_s,\
+             production_ownership_s,production_solidify_s,bo_local_own_d0,\
+             bo_local_own_d1,bo_local_own_d2,bo_local_own_d3_plus,bo_field_own,\
+             bo_total_own,production_local_own_d0,production_local_own_d1,\
+             production_local_own_d2,production_local_own_d3_plus,\
+             production_field_own,production_total_own,production_forced_output,\
+             production_total_without_forced,bo_only_owning,production_only_owning,\
+             bo_universe_only,production_universe_only,note\n",
+        );
+        for row in rows {
+            let comparison = row.comparison.as_ref();
+            let bo = &row.bo;
+            let production = comparison.map(|comparison| &comparison.production);
+            let note = row
+                .production_failure
+                .as_ref()
+                .map(|reason| {
+                    format!(
+                        "production: failed ({reason}, cap {}s)",
+                        row.production_cap_s
+                    )
+                })
+                .unwrap_or_default();
+            let cells = [
+                csv_cell(&row.program),
+                csv_cell(&row.bo_status),
+                csv_cell(&row.production_status),
+                format!("{:.3}", row.bo_wall_s),
+                opt_f64(row.production_wall_s),
+                row.production_cap_s.to_string(),
+                opt_f64(row.production_andersen_s),
+                opt_f64(row.production_output_params_s),
+                opt_f64(row.production_ownership_s),
+                opt_f64(row.production_solidify_s),
+                depth(&bo.local_owning_by_depth, 0).to_string(),
+                depth(&bo.local_owning_by_depth, 1).to_string(),
+                depth(&bo.local_owning_by_depth, 2).to_string(),
+                depth_3_plus(&bo.local_owning_by_depth).to_string(),
+                bo.field_owning_by_depth.values().sum::<usize>().to_string(),
+                bo.total_owning.to_string(),
+                production
+                    .map(|counts| depth(&counts.local_owning_by_depth, 0))
+                    .unwrap_or(0)
+                    .to_string(),
+                production
+                    .map(|counts| depth(&counts.local_owning_by_depth, 1))
+                    .unwrap_or(0)
+                    .to_string(),
+                production
+                    .map(|counts| depth(&counts.local_owning_by_depth, 2))
+                    .unwrap_or(0)
+                    .to_string(),
+                production
+                    .map(|counts| depth_3_plus(&counts.local_owning_by_depth))
+                    .unwrap_or(0)
+                    .to_string(),
+                production
+                    .map(|counts| counts.field_owning_by_depth.values().sum())
+                    .unwrap_or(0usize)
+                    .to_string(),
+                production
+                    .map(|counts| counts.total_owning)
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.production_forced_output)
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.production_without_forced)
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.bo_only_owning.len())
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.production_only_owning.len())
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.bo_universe_only.len())
+                    .unwrap_or(0)
+                    .to_string(),
+                comparison
+                    .map(|comparison| comparison.production_universe_only.len())
+                    .unwrap_or(0)
+                    .to_string(),
+                csv_cell(&note),
+            ];
+            out.push_str(&cells.join(","));
+            out.push('\n');
+        }
+        out
+    }
+
+    pub fn render_deltas_tsv(rows: &[ProgramSummary]) -> String {
+        let mut out = String::from("program\tclassification\tkey_hex\tkey\n");
+        for row in rows {
+            let Some(comparison) = &row.comparison else {
+                continue;
+            };
+            for (classification, keys) in [
+                ("bo_only_owning", &comparison.bo_only_owning),
+                (
+                    "production_only_owning",
+                    &comparison.production_only_owning,
+                ),
+                ("bo_universe_only", &comparison.bo_universe_only),
+                (
+                    "production_universe_only",
+                    &comparison.production_universe_only,
+                ),
+            ] {
+                for key in keys {
+                    out.push_str(&format!(
+                        "{}\t{classification}\t{}\t{}\n",
+                        row.program,
+                        hex_encode(key),
+                        key
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn counts_label(counts: &BTreeMap<u8, usize>) -> String {
+        if counts.is_empty() {
+            return "—".to_string();
+        }
+        counts
+            .iter()
+            .map(|(depth, count)| format!("d{depth}:{count}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn sample(keys: &[String]) -> String {
+        if keys.is_empty() {
+            return "—".to_string();
+        }
+        keys.iter().take(5).cloned().collect::<Vec<_>>().join("<br>")
+    }
+
+    pub fn render_markdown(rows: &[ProgramSummary]) -> String {
+        let mut out = String::from(
+            "# PRIMARY ownership yield: production vs BO\n\n\
+             Forced output-parameter subtraction is set arithmetic over structurally forced \
+             depth-0 production keys, not a counterfactual re-solve.\n\n\
+             ## Counts and timing\n\n\
+             | program | BO locals by depth | BO fields by depth | BO total | BO wall s | \
+             production status | production locals by depth | production fields by depth | \
+             production total | forced output | production without forced | production wall s | \
+             Andersen s | output-param s | ownership solve s | solidify s |\n\
+             |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for row in rows {
+            let (
+                production_locals,
+                production_fields,
+                production_total,
+                production_forced,
+                production_without_forced,
+            ) = row
+                .comparison
+                .as_ref()
+                .map(|comparison| {
+                    (
+                        counts_label(&comparison.production.local_owning_by_depth),
+                        counts_label(&comparison.production.field_owning_by_depth),
+                        comparison.production.total_owning.to_string(),
+                        comparison.production_forced_output.to_string(),
+                        comparison.production_without_forced.to_string(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "—".to_string(),
+                        "—".to_string(),
+                        "—".to_string(),
+                        "—".to_string(),
+                        "—".to_string(),
+                    )
+                });
+            let production_status = row
+                .production_failure
+                .as_ref()
+                .map(|reason| {
+                    format!(
+                        "failed ({reason}, cap {}s)",
+                        row.production_cap_s
+                    )
+                })
+                .unwrap_or_else(|| row.production_status.clone());
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                row.program,
+                counts_label(&row.bo.local_owning_by_depth),
+                counts_label(&row.bo.field_owning_by_depth),
+                row.bo.total_owning,
+                row.bo_wall_s,
+                production_status,
+                production_locals,
+                production_fields,
+                production_total,
+                production_forced,
+                production_without_forced,
+                opt_f64(row.production_wall_s),
+                opt_f64(row.production_andersen_s),
+                opt_f64(row.production_output_params_s),
+                opt_f64(row.production_ownership_s),
+                opt_f64(row.production_solidify_s),
+            ));
+        }
+        out.push_str(
+            "\n## Delta and universe samples\n\n\
+             Full sorted sets are in `ownership-yield-deltas.tsv`; samples are capped at five keys \
+             per direction and program.\n\n\
+             | program | BO-only Owning | production-only Owning | BO-universe-only | \
+             production-universe-only |\n\
+             |---|---|---|---|---|\n",
+        );
+        for row in rows {
+            if let Some(comparison) = &row.comparison {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n",
+                    row.program,
+                    sample(&comparison.bo_only_owning),
+                    sample(&comparison.production_only_owning),
+                    sample(&comparison.bo_universe_only),
+                    sample(&comparison.production_universe_only),
+                ));
+            } else {
+                let reason = row.production_failure.as_deref().unwrap_or("unknown");
+                out.push_str(&format!(
+                    "| {} | excluded: production failed ({reason}) | excluded | excluded | excluded |\n",
+                    row.program
+                ));
+            }
+        }
+        out
     }
 
     #[cfg(test)]
@@ -363,10 +848,10 @@ mod ownership_yield {
                 slot("a::field0@d0", OwnerClass::Field, 0, true, false),
             ];
             let right = vec![left[1].clone(), left[0].clone()];
-            let encoded = snapshot_jsonl(&left);
-            assert_eq!(encoded, snapshot_jsonl(&right));
+            let encoded = snapshot_tsv(&left);
+            assert_eq!(encoded, snapshot_tsv(&right));
             assert!(encoded.ends_with('\n'));
-            assert_eq!(parse_snapshot_jsonl(&encoded).expect("parse"), right);
+            assert_eq!(parse_snapshot_tsv(&encoded).expect("parse"), right);
         }
 
         #[test]
@@ -377,8 +862,13 @@ mod ownership_yield {
                 production_status: "timeout".to_string(),
                 bo_wall_s: 551.9,
                 production_wall_s: Some(1800.2),
+                production_andersen_s: None,
+                production_output_params_s: None,
+                production_ownership_s: None,
+                production_solidify_s: None,
                 production_cap_s: 1800,
                 production_failure: Some("timeout".to_string()),
+                bo: SideCounts::default(),
                 comparison: None,
             }]);
             assert!(csv.contains("brotli,ok,timeout"));
@@ -785,11 +1275,16 @@ pub(crate) use run::{CollateralMeasurement, measure_collateral};
 mod run {
     use std::time::{Duration, Instant};
 
+    use points_to::andersen;
     use rustc_hash::{FxHashMap, FxHashSet};
-    use rustc_middle::ty::TyCtxt;
+    use rustc_middle::ty::{TyCtxt, TyKind};
     use z3::{SatResult, ast::Bool};
 
-    use super::{collect_program, report::Row};
+    use super::{
+        collect_program,
+        ownership_yield::{self, OwnerClass, SlotRecord},
+        report::Row,
+    };
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
@@ -815,6 +1310,72 @@ mod run {
 
     fn phase(name: &str, since: Instant) {
         eprintln!("BOC1PHASE {name} t={:.2}", since.elapsed().as_secs_f64());
+    }
+
+    fn local_key(tcx: TyCtxt<'_>, fn_did: rustc_span::def_id::LocalDefId, local: usize, depth: u8) -> String {
+        format!(
+            "{}::_{}@d{depth}",
+            tcx.def_path_str(fn_did.to_def_id()),
+            local
+        )
+    }
+
+    fn field_key(
+        tcx: TyCtxt<'_>,
+        struct_did: rustc_span::def_id::LocalDefId,
+        field_index: usize,
+        depth: u8,
+    ) -> String {
+        format!(
+            "{}::field{field_index}@d{depth}",
+            tcx.def_path_str(struct_did.to_def_id())
+        )
+    }
+
+    fn bo_slot_records(
+        tcx: TyCtxt<'_>,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> Vec<SlotRecord> {
+        let mut records = Vec::with_capacity(model.len());
+        for (&slot_ref, &kind) in model {
+            let (key, owner, depth) = match slot_ref {
+                SlotRef::Local(fn_did, slot_id) => {
+                    let slot = slots
+                        .fn_local_slots
+                        .get(&fn_did)
+                        .unwrap_or_else(|| panic!("missing BO local universe for {fn_did:?}"))
+                        .slot(slot_id);
+                    let SlotOwner::Local(local) = slot.owner else {
+                        panic!("local SlotRef has non-local owner: {slot_ref:?}");
+                    };
+                    (
+                        local_key(tcx, fn_did, local.index(), slot.depth),
+                        OwnerClass::Local,
+                        slot.depth,
+                    )
+                }
+                SlotRef::Field(slot_id) => {
+                    let slot = slots.field_slots.slot(slot_id);
+                    let SlotOwner::Field(field) = slot.owner else {
+                        panic!("field SlotRef has non-field owner: {slot_ref:?}");
+                    };
+                    (
+                        field_key(tcx, field.struct_did, field.field_index, slot.depth),
+                        OwnerClass::Field,
+                        slot.depth,
+                    )
+                }
+            };
+            records.push(SlotRecord {
+                key,
+                owner,
+                depth,
+                owning: kind == SlotKind::Owning,
+                forced_output: false,
+            });
+        }
+        records
     }
 
     fn certified_context_enabled() -> bool {
@@ -1919,6 +2480,12 @@ mod run {
                 }
                 row.set("s23_owning_model", s23_owning_model);
                 row.set("s23_fields_raw", s23_fields_raw);
+                if ownership_yield::enabled() {
+                    let records = bo_slot_records(tcx, &slots, m);
+                    ownership_yield::write_worker_snapshot(&records)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    row.set("ownership_yield_snapshot", records.len());
+                }
                 record_l2_red_inventory(
                     &program,
                     &slots,
@@ -2132,6 +2699,159 @@ mod run {
         }
         row.set("n_demoted_prod", prod_slots.len());
         row.set("n_ref_prod", n_slots_d0 - prod_slots.len());
+        row.set("status", "ok");
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row
+    }
+
+    /// Registered PRIMARY ownership-yield reference: run the real production ownership pipeline,
+    /// solidify it without modification, and export its declaration-level universe for comparison
+    /// with BO. This is selected only by the measurement-specific corpus mode; the existing
+    /// production-borrow reference above remains unchanged.
+    pub fn run_prod_ownership(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        use crate::analyses::{
+            output_params::compute_output_params,
+            ownership::{
+                AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
+                solidify::SolidifiedOwnershipSchemes,
+                whole_program::WholeProgramAnalysis,
+            },
+            type_qualifier::foster::mutability::mutability_analysis,
+        };
+
+        fn records(
+            program: &crate::utils::rustc::RustProgram<'_>,
+            solidified: &SolidifiedOwnershipSchemes,
+            output_params: &crate::analyses::output_params::OutputParams,
+        ) -> Vec<SlotRecord> {
+            let tcx = program.tcx;
+            let mut records = Vec::new();
+            for &fn_did in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+                let result = solidified.fn_results(&fn_did.to_def_id());
+                for local in body.local_decls.indices() {
+                    for (depth, ownership) in result.local_result(local).iter().enumerate() {
+                        let depth =
+                            u8::try_from(depth).expect("production local pointer depth exceeds u8");
+                        records.push(SlotRecord {
+                            key: local_key(tcx, fn_did, local.index(), depth),
+                            owner: OwnerClass::Local,
+                            depth,
+                            owning: ownership.is_owning(),
+                            forced_output: depth == 0
+                                && output_params
+                                    .get(&fn_did)
+                                    .is_some_and(|params| params.contains(local)),
+                        });
+                    }
+                }
+            }
+
+            for &struct_did in &program.structs {
+                let ty = tcx.type_of(struct_did).skip_binder();
+                let TyKind::Adt(adt_def, _) = ty.kind() else {
+                    continue;
+                };
+                for (field_index, _) in adt_def.all_fields().enumerate() {
+                    for (depth, ownership) in solidified
+                        .struct_field_result(&struct_did.to_def_id(), field_index)
+                        .iter()
+                        .enumerate()
+                    {
+                        let depth =
+                            u8::try_from(depth).expect("production field pointer depth exceeds u8");
+                        records.push(SlotRecord {
+                            key: field_key(tcx, struct_did, field_index, depth),
+                            owner: OwnerClass::Field,
+                            depth,
+                            owning: ownership.is_owning(),
+                            forced_output: false,
+                        });
+                    }
+                }
+            }
+            records
+        }
+
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("z3_full_version", z3::full_version().to_string());
+        let program = collect_program(tcx);
+        row.set("fn_count", program.functions.len());
+        row.set("struct_count", program.structs.len());
+
+        let t = Instant::now();
+        for &fn_did in &program.functions {
+            let _ = tcx.mir_drops_elaborated_and_const_checked(fn_did);
+        }
+        row.set("t_mir_s", secs(t.elapsed()));
+        phase("mir_done", t0);
+
+        let t = Instant::now();
+        let arena = typed_arena::Arena::new();
+        let type_shapes = ::utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+        let andersen_config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: FxHashSet::default(),
+        };
+        let pre_points_to = andersen::pre_analyze(&andersen_config, &type_shapes, tcx);
+        let points_to =
+            andersen::analyze(&andersen_config, &pre_points_to, &type_shapes, tcx);
+        let aliases = crate::rewriter::find_param_aliases(&pre_points_to, &points_to, tcx);
+        row.set("t_andersen_s", secs(t.elapsed()));
+        phase("andersen_done", t0);
+
+        let t = Instant::now();
+        let mutability = mutability_analysis(&program);
+        let output_params = compute_output_params(&program, &mutability, &aliases);
+        row.set("t_output_params_s", secs(t.elapsed()));
+        row.set(
+            "forced_output_params",
+            output_params.values().map(|params| params.iter().count()).sum::<usize>(),
+        );
+        phase("output_params_done", t0);
+
+        let t = Instant::now();
+        let crate_ctxt = OwnershipCrateCtxt::new(&program);
+        let results =
+            match <WholeProgramAnalysis as AnalysisKind>::analyze(crate_ctxt, &output_params) {
+                Ok(results) => results,
+                Err(error) => {
+                    row.set("status", "ownership-error");
+                    row.set("err", format!("{error:#}"));
+                    row.set("t_ownership_s", secs(t.elapsed()));
+                    row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+                    return row;
+                }
+            };
+        row.set("t_ownership_s", secs(t.elapsed()));
+        phase("ownership_done", t0);
+
+        let t = Instant::now();
+        let solidified = results.solidify(&program);
+        row.set("t_solidify_s", secs(t.elapsed()));
+        phase("solidify_done", t0);
+
+        let records = records(&program, &solidified, &output_params);
+        let counts = ownership_yield::side_counts(&records);
+        let forced = records.iter().filter(|record| record.forced_output).count();
+        row.set("n_own_prod", counts.total_owning);
+        row.set(
+            "n_own_prod_fields",
+            counts.field_owning_by_depth.values().sum::<usize>(),
+        );
+        row.set("n_own_prod_forced_output", forced);
+        row.set(
+            "n_own_prod_without_forced",
+            counts
+                .total_owning
+                .checked_sub(forced)
+                .expect("forced output entries exceed production Owning count"),
+        );
+        ownership_yield::write_worker_snapshot(&records)
+            .unwrap_or_else(|error| panic!("{error}"));
+        row.set("ownership_yield_snapshot", records.len());
         row.set("status", "ok");
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
         row
@@ -2905,11 +3625,12 @@ fn boc1_run_one() {
     // tests (e.g. `origins_runs_once_per_program` calls `run_bo` directly), so pinning there would leak
     // this PROCESS-GLOBAL param into the PARALLEL test runner (Codex NB5-Z finding). `boc1_run_one` is
     // `#[ignore]` and spawned one-per-program as a fresh single-threaded process, so the pin fires once
-    // per program and never under the parallel suite. Gated to `bo` mode — NB5-Z's scope is BO
-    // determinism; `prod` is the frozen production reference, left untouched. Expected behavior-neutral
-    // (z3's default seed is already 0 — the NB5-Z re-baseline is byte-identical on both profiles); its
-    // value is the explicit cross-VERSION contract, recorded as the `z3_full_version` stamp on each BO row.
-    if mode == "bo" {
+    // per program and never under the parallel suite. The registered ownership-yield `prod-own`
+    // worker is solver-backed, so it shares the same explicit seed contract; the frozen
+    // production-borrow `prod` reference remains untouched. Expected behavior-neutral (z3's default
+    // seed is already 0); the value is recorded through each solver-backed row's
+    // `z3_full_version` stamp.
+    if matches!(mode.as_str(), "bo" | "prod-own") {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
     }
@@ -2920,6 +3641,7 @@ fn boc1_run_one() {
         match mode.as_str() {
             "bo" => run::run_bo(tcx, t_tcx),
             "prod" => run::run_prod(tcx, t_tcx),
+            "prod-own" => run::run_prod_ownership(tcx, t_tcx),
             other => panic!("unknown CRAT_BOC1_MODE `{other}`"),
         }
     });
@@ -3168,7 +3890,10 @@ mod orchestrate {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::report::{self, Row};
+    use super::{
+        ownership_yield,
+        report::{self, Row},
+    };
 
     pub struct ChildOutcome {
         /// Orchestrator-level classification: ok | decline | compile-error |
@@ -3195,6 +3920,12 @@ mod orchestrate {
         std::env::var("CRAT_BOC1_OUT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| workspace_root().join("target/boc1"))
+    }
+
+    pub fn yield_snapshot_path(program: &str, mode: &str) -> PathBuf {
+        out_dir()
+            .join("ownership-yield-snapshots")
+            .join(format!("{program}.{mode}.tsv"))
     }
 
     /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
@@ -3252,7 +3983,8 @@ mod orchestrate {
 
         let exe = std::env::current_exe().expect("current_exe");
         let t0 = Instant::now();
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(["bo_c1::boc1_run_one", "--exact", "--ignored", "--nocapture"])
             .env("CRAT_BOC1_INPUT", input)
             .env("CRAT_BOC1_MODE", mode)
@@ -3260,9 +3992,17 @@ mod orchestrate {
             .env("DIR", workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::from(out_file))
-            .stderr(Stdio::from(err_file))
-            .spawn()
-            .expect("spawn worker");
+            .stderr(Stdio::from(err_file));
+        if ownership_yield::enabled() {
+            let snapshot = yield_snapshot_path(program, mode);
+            fs::create_dir_all(snapshot.parent().expect("snapshot parent"))
+                .expect("create ownership-yield snapshot dir");
+            if snapshot.is_file() {
+                fs::remove_file(&snapshot).expect("remove stale ownership-yield snapshot");
+            }
+            command.env("CRAT_BOC1_YIELD_SNAPSHOT", snapshot);
+        }
+        let mut child = command.spawn().expect("spawn worker");
 
         let mut killed_for: Option<&str> = None;
         let status = loop {
@@ -3344,7 +4084,7 @@ fn boc1_corpus() {
     use std::fs;
     use std::time::Duration;
 
-    use orchestrate::{out_dir, run_child, workspace_root};
+    use orchestrate::{out_dir, run_child, workspace_root, yield_snapshot_path};
     use report::Row;
 
     let root = workspace_root();
@@ -3367,10 +4107,53 @@ fn boc1_corpus() {
             .unwrap_or(900),
     );
     let prod_enabled = std::env::var("CRAT_BOC1_PROD").map(|v| v != "0").unwrap_or(true);
+    let ownership_yield_enabled = ownership_yield::enabled();
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
     let l2_gate = l2_red_gate::enabled();
+    if ownership_yield_enabled {
+        assert!(prod_enabled, "ownership-yield measurement requires CRAT_BOC1_PROD=1");
+        assert_eq!(
+            std::env::var("CRAT_BO_REPAIR").as_deref(),
+            Ok("mode_a"),
+            "ownership-yield measurement requires Mode-A"
+        );
+        assert_eq!(
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::current(),
+            crate::analyses::borrow_ownership::borrow_verify::RepairMode::ModeA,
+            "ownership-yield measurement repair mode drifted"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+            Ok("0"),
+            "ownership-yield measurement requires L2 explicitly off"
+        );
+        assert!(
+            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "ownership-yield measurement resolved L2 on"
+        );
+        assert_eq!(
+            timeout,
+            Duration::from_secs(900),
+            "ownership-yield BO timeout must be 900 seconds"
+        );
+        assert_eq!(
+            prod_timeout,
+            Duration::from_secs(1800),
+            "ownership-yield production timeout must be 1800 seconds"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "ownership-yield measurement requires the 8192-MiB worker cap"
+        );
+        assert!(
+            only.is_none(),
+            "ownership-yield measurement must cover all 20 frozen programs"
+        );
+        assert_eq!(CORPUS.len(), 20, "ownership-yield frozen corpus size drifted");
+    }
     if l2_gate {
         l2_red_gate::assert_fixtures(CORPUS);
         for name in [
@@ -3488,6 +4271,8 @@ fn boc1_corpus() {
 
     let mut raw_rows: Vec<Row> = Vec::new();
     let mut merged: Vec<Row> = Vec::new();
+    let mut ownership_yield_rows: Vec<ownership_yield::ProgramSummary> = Vec::new();
+    let mut production_failures = 0usize;
 
     for &program in CORPUS {
         if let Some(only) = &only
@@ -3518,6 +4303,7 @@ fn boc1_corpus() {
             let bo = run_child(program.name, &input, "bo", timeout);
             m.set("status", &bo.status);
             m.set("wall_s", format!("{:.1}", bo.wall_s));
+            m.set("bo_wall_s", format!("{:.1}", bo.wall_s));
             if let Some(row) = &bo.row {
                 for (k, v) in &row.0 {
                     if !matches!(k.as_str(), "program" | "mode" | "status") {
@@ -3530,20 +4316,125 @@ fn boc1_corpus() {
                 m.set("note", &bo.note);
             }
 
+            let bo_records = ownership_yield_enabled.then(|| {
+                assert_eq!(
+                    bo.status, "ok",
+                    "ownership-yield BO worker failed for {}: status={} note={}",
+                    program.name, bo.status, bo.note
+                );
+                let row = bo.row.as_ref().unwrap_or_else(|| {
+                    panic!("ownership-yield BO row missing for {}", program.name)
+                });
+                let records =
+                    ownership_yield::read_worker_snapshot(&yield_snapshot_path(program.name, "bo"))
+                        .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                let counts = ownership_yield::side_counts(&records);
+                let row_n_own = row
+                    .get("n_own")
+                    .unwrap_or_else(|| panic!("{} BO row missing n_own", program.name))
+                    .parse::<usize>()
+                    .unwrap_or_else(|error| {
+                        panic!("{} BO n_own is not numeric: {error}", program.name)
+                    });
+                assert_eq!(
+                    counts.total_owning, row_n_own,
+                    "{} BO snapshot n_own disagrees with the official row",
+                    program.name
+                );
+                records
+            });
+
             if prod_enabled {
-                eprintln!("[boc1] {}: prod mode...", program.name);
-                let prod = run_child(program.name, &input, "prod", prod_timeout);
+                let prod_mode = if ownership_yield_enabled {
+                    "prod-own"
+                } else {
+                    "prod"
+                };
+                eprintln!("[boc1] {}: {prod_mode} mode...", program.name);
+                let prod = run_child(program.name, &input, prod_mode, prod_timeout);
                 m.set("prod_status", &prod.status);
                 m.set("prod_wall_s", format!("{:.1}", prod.wall_s));
                 if let Some(row) = &prod.row {
-                    for key in ["n_slots_d0", "n_demoted_prod", "n_ref_prod", "t_prod_s"] {
+                    let keys: &[&str] = if ownership_yield_enabled {
+                        &[
+                            "t_andersen_s",
+                            "t_output_params_s",
+                            "t_ownership_s",
+                            "t_solidify_s",
+                            "n_own_prod",
+                            "n_own_prod_fields",
+                            "n_own_prod_forced_output",
+                            "n_own_prod_without_forced",
+                        ]
+                    } else {
+                        &["n_slots_d0", "n_demoted_prod", "n_ref_prod", "t_prod_s"]
+                    };
+                    for key in keys {
                         if let Some(v) = row.get(key) {
                             m.set(key, v);
                         }
                     }
                     raw_rows.push(row.clone());
                 }
-                if let (Some(bo_ref), Some(prod_ref)) = (
+
+                if ownership_yield_enabled {
+                    let bo_records = bo_records.as_ref().expect("yield BO records");
+                    let bo_counts = ownership_yield::side_counts(bo_records);
+                    let parse_time = |key: &str| {
+                        prod.row
+                            .as_ref()
+                            .and_then(|row| row.get(key))
+                            .and_then(|value| value.parse::<f64>().ok())
+                    };
+                    let (production_failure, comparison) = if prod.status == "ok" {
+                        let production_records = ownership_yield::read_worker_snapshot(
+                            &yield_snapshot_path(program.name, "prod-own"),
+                        )
+                        .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                        let comparison =
+                            ownership_yield::compare(bo_records, &production_records)
+                                .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                        m.set("bo_only_owning", comparison.bo_only_owning.len());
+                        m.set(
+                            "production_only_owning",
+                            comparison.production_only_owning.len(),
+                        );
+                        m.set("bo_universe_only", comparison.bo_universe_only.len());
+                        m.set(
+                            "production_universe_only",
+                            comparison.production_universe_only.len(),
+                        );
+                        (None, Some(comparison))
+                    } else {
+                        production_failures += 1;
+                        let detail = prod
+                            .row
+                            .as_ref()
+                            .and_then(|row| row.get("err"))
+                            .map(|error| format!("{}:{error}", prod.status))
+                            .unwrap_or_else(|| prod.status.clone());
+                        m.set(
+                            "prod_failure",
+                            format!("{detail}_cap_{}s", prod_timeout.as_secs()),
+                        );
+                        (Some(detail), None)
+                    };
+                    ownership_yield_rows.push(ownership_yield::ProgramSummary {
+                        program: program.name.to_string(),
+                        bo_status: bo.status.clone(),
+                        production_status: prod.status.clone(),
+                        bo_wall_s: bo.wall_s,
+                        production_wall_s: Some(prod.wall_s),
+                        production_andersen_s: parse_time("t_andersen_s"),
+                        production_output_params_s: parse_time("t_output_params_s"),
+                        production_ownership_s: parse_time("t_ownership_s"),
+                        production_solidify_s: parse_time("t_solidify_s"),
+                        production_cap_s: prod_timeout.as_secs(),
+                        production_failure,
+                        bo: bo_counts,
+                        comparison,
+                    });
+                } else if let (Some(bo_ref), Some(prod_ref)) = (
                     m.get("n_ref_d0").and_then(|v| v.parse::<i64>().ok()),
                     m.get("n_ref_prod").and_then(|v| v.parse::<i64>().ok()),
                 ) {
@@ -3565,9 +4456,47 @@ fn boc1_corpus() {
         fs::write(out_dir().join("results.jsonl"), jsonl).expect("write jsonl");
         fs::write(out_dir().join("results.csv"), report::render_csv(&merged)).expect("write csv");
         fs::write(out_dir().join("report.md"), render_report(&merged)).expect("write report");
+        if ownership_yield_enabled {
+            fs::write(
+                out_dir().join("ownership-yield-summary.csv"),
+                ownership_yield::render_summary_csv(&ownership_yield_rows),
+            )
+            .expect("write ownership-yield summary");
+            fs::write(
+                out_dir().join("ownership-yield-deltas.tsv"),
+                ownership_yield::render_deltas_tsv(&ownership_yield_rows),
+            )
+            .expect("write ownership-yield deltas");
+            fs::write(
+                out_dir().join("ownership-yield-report.md"),
+                ownership_yield::render_markdown(&ownership_yield_rows),
+            )
+            .expect("write ownership-yield report");
+            assert!(
+                production_failures <= 5,
+                "ownership-yield production failed on {production_failures}/20 programs; \
+                 measurement design review required"
+            );
+        }
     }
 
     println!("\n{}", render_report(&merged));
+    if ownership_yield_enabled {
+        assert_eq!(
+            ownership_yield_rows.len(),
+            20,
+            "ownership-yield measurement did not produce 20 BO rows"
+        );
+        let bo_total = ownership_yield_rows
+            .iter()
+            .map(|row| row.bo.total_owning)
+            .sum::<usize>();
+        assert_eq!(
+            bo_total, 230,
+            "ownership-yield BO total diverged from the official rs-crown baseline"
+        );
+        println!("\n{}", ownership_yield::render_markdown(&ownership_yield_rows));
+    }
     if l2_gate {
         l2_red_gate::assert_results(&merged, CORPUS);
     }
