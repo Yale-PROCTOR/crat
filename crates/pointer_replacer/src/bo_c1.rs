@@ -2738,7 +2738,8 @@ mod run {
                             owner: OwnerClass::Local,
                             depth,
                             owning: ownership.is_owning(),
-                            forced_output: depth == 0
+                            forced_output: ownership.is_owning()
+                                && depth == 0
                                 && output_params
                                     .get(&fn_did)
                                     .is_some_and(|params| params.contains(local)),
