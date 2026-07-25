@@ -1,9 +1,10 @@
 #![feature(rustc_private)]
 
 use std::{
+    collections::HashSet,
     fs,
     fs::File,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use clap::{Parser, ValueEnum};
@@ -434,7 +435,11 @@ fn main() {
             Pass::Expand => {
                 let s = run_compiler_on_path(&file, |tcx| expander::expand(config.expand, tcx))
                     .unwrap();
-                remove_rs_files(&dir, true);
+                let preserved_bins = explicit_bin_paths(&dir).unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                });
+                remove_rs_files(&dir, true, &preserved_bins);
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Extern => {
@@ -654,15 +659,71 @@ fn clear_dir(path: &Path) {
     }
 }
 
-fn remove_rs_files(path: &Path, root: bool) {
+fn explicit_bin_paths(crate_root: &Path) -> Result<HashSet<PathBuf>, String> {
+    let manifest_path = crate_root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&manifest)
+        .map_err(|error| format!("cannot parse {}: {error}", manifest_path.display()))?;
+    let mut paths = HashSet::new();
+    let Some(bins) = manifest.get("bin").and_then(toml::Value::as_array) else {
+        return Ok(paths);
+    };
+    for bin in bins {
+        let Some(path) = bin.get("path") else {
+            continue;
+        };
+        let path = path
+            .as_str()
+            .ok_or_else(|| "explicit [[bin]].path must be a string".to_owned())?;
+        let path = normalize_in_crate_path(Path::new(path))?;
+        paths.insert(crate_root.join(path));
+    }
+    Ok(paths)
+}
+
+fn normalize_in_crate_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Err(format!(
+            "explicit [[bin]].path must be relative: {}",
+            path.display()
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "explicit [[bin]].path escapes the crate root: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => unreachable!(),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err("explicit [[bin]].path must name a source file".to_owned());
+    }
+    Ok(normalized)
+}
+
+fn remove_rs_files(path: &Path, root: bool, preserved: &HashSet<PathBuf>) {
     for entry in fs::read_dir(path).unwrap() {
         let entry_path = entry.unwrap().path();
         let name = entry_path.file_name().unwrap();
         if root && (name == "target" || name == "build.rs") {
             continue;
         }
-        if entry_path.is_dir() {
-            remove_rs_files(&entry_path, false);
+        if preserved.contains(&entry_path) {
+            continue;
+        }
+        let file_type = fs::symlink_metadata(&entry_path).unwrap().file_type();
+        if file_type.is_dir() && !file_type.is_symlink() {
+            remove_rs_files(&entry_path, false, preserved);
             if fs::read_dir(&entry_path).unwrap().next().is_none() {
                 fs::remove_dir(entry_path).unwrap();
             }

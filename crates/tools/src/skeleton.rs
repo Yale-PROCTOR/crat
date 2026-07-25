@@ -307,6 +307,7 @@ fn make_function_record(
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     annotate_function(&mut source, &surface.path)?;
+    PresentationBindingNormalizer.visit_item(&mut source);
     let mut skeleton = source.clone();
     apply_target_signature(&mut skeleton, surface.def_id, decisions, tcx);
     let mut skeletonizer = Skeletonizer {
@@ -320,8 +321,6 @@ fn make_function_record(
     if let Some(error) = skeletonizer.error {
         return Err(error);
     }
-    TargetBindingMutator.visit_item(&mut skeleton);
-
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&skeleton);
     let name = surface.item.kind.ident().unwrap().to_string();
@@ -536,17 +535,14 @@ fn local_item_kind(item: &Item) -> &'static str {
     }
 }
 
-struct TargetBindingMutator;
+struct PresentationBindingNormalizer;
 
-impl MutVisitor for TargetBindingMutator {
+impl MutVisitor for PresentationBindingNormalizer {
     fn visit_pat(&mut self, pat: &mut Pat) {
-        if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind {
-            match by_ref {
-                ByRef::No => *mutability = Mutability::Mut,
-                ByRef::Yes(reference_mutability) => {
-                    *reference_mutability = Mutability::Mut;
-                }
-            }
+        if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind
+            && *by_ref == ByRef::No
+        {
+            *mutability = Mutability::Mut;
         }
         mut_visit::walk_pat(self, pat);
     }
