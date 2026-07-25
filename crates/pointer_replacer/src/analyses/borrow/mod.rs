@@ -395,6 +395,12 @@ pub struct BorrowData<'tcx> {
     pub(crate) assigned: Borrower,
 }
 
+impl BorrowData<'_> {
+    pub(crate) fn location(&self) -> Location {
+        self.location
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Borrower {
     Assign(ProvenanceOwner),
