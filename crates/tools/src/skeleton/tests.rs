@@ -1017,20 +1017,122 @@ fn rejects_non_block_match_arm() {
 }
 
 #[test]
-fn rejects_control_nested_beneath_non_control_payloads() {
-    for (source, path) in [
-        (
-            "pub unsafe fn assign(flag: bool) { let mut value = None; value = Some(if flag { 1 } else { 2 }); let _ = value; }",
-            "assign",
-        ),
-        (
-            "pub unsafe fn wrapped_return(flag: bool) -> Option<i32> { return Some(if flag { 1 } else { 2 }); }",
-            "wrapped_return",
-        ),
+fn allows_restricted_conditionals_beneath_non_control_payloads() {
+    let source = "
+        pub unsafe fn assign(mut value: i32, flag: bool) {
+            value = 1 + if flag { 2 } else { 3 };
+        }
+        pub unsafe fn wrapped_return(flag: bool) -> Option<i32> {
+            return Some(if flag { 1 } else { 2 });
+        }
+        pub unsafe fn wrapped_let(flag: bool) -> i32 {
+            let value = Some(if flag { 1 } else { 2 });
+            value.unwrap()
+        }
+    ";
+    let records = generate(source);
+    for path in ["assign", "wrapped_return"] {
+        let function = function(&records, path);
+        assert_eq!(labels(&function.annotated_source), [0]);
+        assert_eq!(labels(&function.annotated_skeleton), [0]);
+        assert!(!function.annotated_skeleton.contains("if "));
+    }
+    let wrapped_let = function(&records, "wrapped_let");
+    assert_eq!(labels(&wrapped_let.annotated_source), [0, 1]);
+    assert_eq!(labels(&wrapped_let.annotated_skeleton), [0, 1]);
+    assert_skeleton(
+        source,
+        "assign",
+        "pub unsafe fn assign(mut value: i32, flag: bool) { todo!(); }",
+    );
+    assert_skeleton(
+        source,
+        "wrapped_return",
+        "pub unsafe fn wrapped_return(flag: bool) -> Option<i32> { return todo!(); }",
+    );
+    assert_skeleton(
+        source,
+        "wrapped_let",
+        "pub unsafe fn wrapped_let(flag: bool) -> i32 { let value: std::option::Option<i32> = todo!(); todo!() }",
+    );
+}
+
+#[test]
+fn allows_else_if_chains_and_recursive_branch_tail_conditionals() {
+    let source = "
+        pub unsafe fn chained(c1: bool, c2: bool) -> i32 {
+            let value = Some(if c1 { 1 } else if c2 { 2 } else { 3 });
+            value.unwrap()
+        }
+        pub unsafe fn nested(c1: bool, c2: bool) -> i32 {
+            let value = Some(if c1 {
+                1
+            } else {
+                if c2 { 2 } else { 3 }
+            });
+            value.unwrap()
+        }
+    ";
+    let records = generate(source);
+    for path in ["chained", "nested"] {
+        let function = function(&records, path);
+        assert_eq!(labels(&function.annotated_source), [0, 1]);
+        assert_eq!(labels(&function.annotated_skeleton), [0, 1]);
+        assert_eq!(function.annotated_source.matches("if ").count(), 2);
+        assert!(!function.annotated_skeleton.contains("if "));
+        assert_skeleton(
+            source,
+            path,
+            &format!(
+                "pub unsafe fn {path}(c1: bool, c2: bool) -> i32 {{ let value: std::option::Option<i32> = todo!(); todo!() }}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn opaque_restricted_conditionals_keep_original_dependencies() {
+    let source = "
+        unsafe fn branch_value() -> i32 { 1 }
+        pub unsafe fn f(flag: bool) -> i32 {
+            let value = Some(if flag { branch_value() } else { 0 });
+            value.unwrap()
+        }
+    ";
+    let records = generate(source);
+    let branch_id = record(&records, "branch_value").id();
+    assert!(function(&records, "f").dependencies.contains(&branch_id));
+}
+
+#[test]
+fn opaque_conditional_label_suppression_does_not_skip_body_validation() {
+    let local_item = generate_error(
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { { const LOCAL: i32 = 1; LOCAL } } else { 0 }); let _ = value; }",
+    );
+    assert_eq!(local_item.kind, GenerationErrorKind::FunctionLocalItem);
+    assert!(local_item.message.contains("const"));
+
+    let non_block_arm = generate_error(
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { match 0 { 0 => 1, _ => { 2 } } } else { 3 }); let _ = value; }",
+    );
+    assert_eq!(non_block_arm.kind, GenerationErrorKind::NonBlockMatchArm);
+}
+
+#[test]
+fn rejects_non_restricted_control_beneath_non_control_payloads() {
+    for source in [
+        "pub unsafe fn f(mut value: i32, flag: bool) { value = 1 + if flag { value += 1; 2 } else { 3 }; }",
+        "pub unsafe fn f(mut value: i32, c1: bool, c2: bool) { value = 1 + if c1 { if c2 { value += 1; 2 } else { 3 } } else { 4 }; }",
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { () }); let _ = value; }",
+        "pub unsafe fn f(value: Option<i32>) { let result = Some(if let Some(value) = value { value } else { 0 }); let _ = result; }",
+        "#![feature(let_chains)] pub unsafe fn f(value: Option<i32>) { let result = Some(if let Some(value) = value && value > 0 { value } else { 0 }); let _ = result; }",
+        "pub unsafe fn f() { let value = Some(loop { break 1; }); let _ = value; }",
+        "pub unsafe fn f(c1: bool, c2: bool) { let value = Some(if c1 { 1 + if c2 { 2 } else { 3 } } else { 4 }); let _ = value; }",
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { 1; } else { 2; }); let _ = value; }",
     ] {
         let error = generate_error(source);
         assert_eq!(error.kind, GenerationErrorKind::NestedControlPayload);
-        assert_eq!(error.function_path, path);
+        assert_eq!(error.function_path, "f");
         assert!(
             error
                 .message

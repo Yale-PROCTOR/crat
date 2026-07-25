@@ -5,11 +5,11 @@ use pointer_replacer::{
 };
 use rustc_ast::{
     AttrKind, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy, Item, ItemKind,
-    LocalKind, Mutability, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind, mut_visit,
+    LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind, mut_visit,
     mut_visit::MutVisitor, ptr::P, visit, visit::Visitor as _,
 };
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, HirId,
     def::{DefKind, Res},
@@ -306,7 +306,9 @@ fn make_function_record(
     let dependencies = collect_dependencies(hitem, item_ids, tcx);
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
-    annotate_function(&mut source, &surface.path)?;
+    validate_function_body(&source, &surface.path)?;
+    let opaque_nested_ifs = collect_opaque_nested_ifs(&source, &surface.path)?;
+    annotate_function(&mut source, &opaque_nested_ifs);
     PresentationBindingNormalizer.visit_item(&mut source);
     let mut skeleton = source.clone();
     apply_target_signature(&mut skeleton, surface.def_id, decisions, tcx);
@@ -314,13 +316,8 @@ fn make_function_record(
         ast_to_hir,
         decisions,
         tcx,
-        function_path: &surface.path,
-        error: None,
     };
     skeletonizer.visit_item(&mut skeleton);
-    if let Some(error) = skeletonizer.error {
-        return Err(error);
-    }
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&skeleton);
     let name = surface.item.kind.ident().unwrap().to_string();
@@ -384,14 +381,16 @@ fn render_annotated_item(item: &Item) -> String {
     output.join("\n")
 }
 
-struct Labeler<'a> {
-    next: u32,
+struct BodyValidator<'a> {
     function_path: &'a str,
     error: Option<GenerationError>,
 }
 
-impl MutVisitor for Labeler<'_> {
-    fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if self.error.is_some() {
+            return;
+        }
         if let StmtKind::Item(item) = &stmt.kind {
             self.error.get_or_insert_with(|| GenerationError {
                 kind: GenerationErrorKind::FunctionLocalItem,
@@ -401,7 +400,7 @@ impl MutVisitor for Labeler<'_> {
                     local_item_kind(item)
                 ),
             });
-            return smallvec![stmt];
+            return;
         }
         if matches!(stmt.kind, StmtKind::Empty) {
             self.error.get_or_insert_with(|| GenerationError {
@@ -409,14 +408,15 @@ impl MutVisitor for Labeler<'_> {
                 function_path: self.function_path.to_owned(),
                 message: "empty statement cannot be annotated".to_owned(),
             });
-            return smallvec![stmt];
+            return;
         }
-        stmt_attrs_mut(&mut stmt).extend(utils::attr!("#[proctor({})]", self.next));
-        self.next += 1;
-        mut_visit::walk_flat_map_stmt(self, stmt)
+        visit::walk_stmt(self, stmt);
     }
 
-    fn visit_expr(&mut self, expr: &mut Expr) {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if self.error.is_some() {
+            return;
+        }
         if let ExprKind::Match(_, arms, _) = &expr.kind {
             for arm in arms {
                 if !arm
@@ -433,6 +433,39 @@ impl MutVisitor for Labeler<'_> {
                 }
             }
         }
+        visit::walk_expr(self, expr);
+    }
+}
+
+fn validate_function_body(item: &Item, path: &str) -> Result<(), GenerationError> {
+    let mut validator = BodyValidator {
+        function_path: path,
+        error: None,
+    };
+    let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+    validator.visit_block(function.body.as_ref().unwrap());
+    validator.error.map_or(Ok(()), Err)
+}
+
+struct Labeler<'a> {
+    next: u32,
+    opaque_nested_ifs: &'a FxHashSet<NodeId>,
+}
+
+impl MutVisitor for Labeler<'_> {
+    fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+        if matches!(stmt.kind, StmtKind::Item(_) | StmtKind::Empty) {
+            return smallvec![stmt];
+        }
+        stmt_attrs_mut(&mut stmt).extend(utils::attr!("#[proctor({})]", self.next));
+        self.next += 1;
+        mut_visit::walk_flat_map_stmt(self, stmt)
+    }
+
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if self.opaque_nested_ifs.contains(&expr.id) {
+            return;
+        }
         mut_visit::walk_expr(self, expr);
     }
 }
@@ -447,15 +480,13 @@ fn stmt_attrs_mut(stmt: &mut Stmt) -> &mut rustc_ast::AttrVec {
     }
 }
 
-fn annotate_function(item: &mut Item, path: &str) -> Result<(), GenerationError> {
+fn annotate_function(item: &mut Item, opaque_nested_ifs: &FxHashSet<NodeId>) {
     let mut labeler = Labeler {
         next: 0,
-        function_path: path,
-        error: None,
+        opaque_nested_ifs,
     };
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
     labeler.visit_block(function.body.as_mut().unwrap());
-    labeler.error.map_or(Ok(()), Err)
 }
 
 fn apply_target_signature(
@@ -609,8 +640,6 @@ struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
     tcx: TyCtxt<'tcx>,
-    function_path: &'a str,
-    error: Option<GenerationError>,
 }
 
 impl MutVisitor for Skeletonizer<'_, '_> {
@@ -710,22 +739,206 @@ fn contains_control_expression(expr: &Expr) -> bool {
     finder.found
 }
 
-fn reject_nested_control(expr: &Expr, visitor: &mut Skeletonizer<'_, '_>) -> bool {
-    if !contains_control_expression(expr) {
+fn contains_let_expression(expr: &Expr) -> bool {
+    struct Finder {
+        found: bool,
+    }
+
+    impl<'ast> visit::Visitor<'ast> for Finder {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if matches!(expr.kind, ExprKind::Let(..)) {
+                self.found = true;
+                return;
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = Finder { found: false };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+fn is_restricted_conditional(expr: &Expr) -> bool {
+    let ExprKind::If(condition, then_block, Some(else_expr)) = &expr.kind else {
+        return false;
+    };
+    if contains_let_expression(condition) || contains_control_expression(condition) {
         return false;
     }
-    visitor.error.get_or_insert_with(|| GenerationError {
-        kind: GenerationErrorKind::NestedControlPayload,
-        function_path: visitor.function_path.to_owned(),
-        message: "control expression nested beneath a non-control payload".to_owned(),
-    });
-    true
+    restricted_branch(then_block)
+        && match &else_expr.kind {
+            ExprKind::If(..) => is_restricted_conditional(else_expr),
+            ExprKind::Block(block, _) => restricted_branch(block),
+            _ => false,
+        }
+}
+
+fn restricted_branch(block: &rustc_ast::Block) -> bool {
+    let [statement] = &block.stmts[..] else {
+        return false;
+    };
+    let StmtKind::Expr(tail) = &statement.kind else {
+        return false;
+    };
+    if is_preserved_expression(tail) {
+        is_restricted_conditional(tail)
+    } else {
+        !contains_control_expression(tail)
+    }
+}
+
+fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) -> bool {
+    struct Finder<'a, F> {
+        on_restricted: &'a mut F,
+        invalid: bool,
+    }
+
+    impl<'ast, F: FnMut(NodeId)> visit::Visitor<'ast> for Finder<'_, F> {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if self.invalid {
+                return;
+            }
+            if is_preserved_expression(expr) {
+                if is_restricted_conditional(expr) {
+                    (self.on_restricted)(expr.id);
+                } else {
+                    self.invalid = true;
+                }
+                return;
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = Finder {
+        on_restricted: &mut on_restricted,
+        invalid: false,
+    };
+    finder.visit_expr(expr);
+    finder.invalid
+}
+
+struct OpaqueNestedIfCollector<'a> {
+    function_path: &'a str,
+    opaque_nested_ifs: FxHashSet<NodeId>,
+    error: Option<GenerationError>,
+}
+
+impl OpaqueNestedIfCollector<'_> {
+    fn inspect_block(&mut self, block: &rustc_ast::Block) {
+        for statement in &block.stmts {
+            self.inspect_statement(statement);
+            if self.error.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn inspect_statement(&mut self, statement: &Stmt) {
+        match &statement.kind {
+            StmtKind::Let(local) => match &local.kind {
+                LocalKind::Decl => {}
+                LocalKind::Init(initializer) => self.inspect_payload(initializer),
+                LocalKind::InitElse(initializer, else_block) => {
+                    self.inspect_payload(initializer);
+                    self.inspect_block(else_block);
+                }
+            },
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => self.inspect_statement_expression(expr),
+            StmtKind::Item(_) | StmtKind::MacCall(_) | StmtKind::Empty => {}
+        }
+    }
+
+    fn inspect_statement_expression(&mut self, expr: &Expr) {
+        if is_preserved_expression(expr) {
+            self.inspect_control(expr);
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Ret(value) | ExprKind::Break(_, value) => {
+                if let Some(value) = value {
+                    self.inspect_payload(value);
+                }
+            }
+            ExprKind::Continue(_) => {}
+            _ => self.inspect_non_control(expr),
+        }
+    }
+
+    fn inspect_payload(&mut self, expr: &Expr) {
+        if is_preserved_expression(expr) {
+            self.inspect_control(expr);
+        } else {
+            self.inspect_non_control(expr);
+        }
+    }
+
+    fn inspect_non_control(&mut self, expr: &Expr) {
+        if inspect_nested_control(expr, |id| {
+            self.opaque_nested_ifs.insert(id);
+        }) {
+            self.error.get_or_insert_with(|| GenerationError {
+                kind: GenerationErrorKind::NestedControlPayload,
+                function_path: self.function_path.to_owned(),
+                message: "control expression nested beneath a non-control payload".to_owned(),
+            });
+        }
+    }
+
+    fn inspect_control(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::If(condition, then_block, else_expr) => {
+                self.inspect_non_control(condition);
+                self.inspect_block(then_block);
+                if let Some(else_expr) = else_expr {
+                    self.inspect_payload(else_expr);
+                }
+            }
+            ExprKind::While(condition, body, _) => {
+                self.inspect_non_control(condition);
+                self.inspect_block(body);
+            }
+            ExprKind::ForLoop { iter, body, .. } => {
+                self.inspect_non_control(iter);
+                self.inspect_block(body);
+            }
+            ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => self.inspect_block(body),
+            ExprKind::Match(scrutinee, arms, _) => {
+                self.inspect_non_control(scrutinee);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.inspect_non_control(guard);
+                    }
+                    self.inspect_payload(arm.body.as_ref().unwrap());
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn collect_opaque_nested_ifs(
+    item: &Item,
+    path: &str,
+) -> Result<FxHashSet<NodeId>, GenerationError> {
+    let mut collector = OpaqueNestedIfCollector {
+        function_path: path,
+        opaque_nested_ifs: FxHashSet::default(),
+        error: None,
+    };
+    let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+    collector.inspect_block(function.body.as_ref().unwrap());
+    match collector.error {
+        Some(error) => Err(error),
+        None => Ok(collector.opaque_nested_ifs),
+    }
 }
 
 fn skeletonize_payload(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_>) {
     if is_preserved_expression(expr) {
         skeletonize_control(expr, visitor);
-    } else if !reject_nested_control(expr, visitor) {
+    } else {
         replace_with_todo(expr);
     }
 }
@@ -746,10 +959,7 @@ fn skeletonize_statement_expr(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_
     }
 }
 
-fn skeletonize_condition(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_>) {
-    if reject_nested_control(expr, visitor) {
-        return;
-    }
+fn skeletonize_condition(expr: &mut Expr) {
     if let ExprKind::Let(_, value, _, _) = &mut expr.kind {
         **value = todo_expr();
     } else {
@@ -760,31 +970,25 @@ fn skeletonize_condition(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_>) {
 fn skeletonize_control(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_>) {
     match &mut expr.kind {
         ExprKind::If(condition, then_block, else_expr) => {
-            skeletonize_condition(condition, visitor);
+            skeletonize_condition(condition);
             visitor.visit_block(then_block);
             if let Some(else_expr) = else_expr {
                 skeletonize_payload(else_expr, visitor);
             }
         }
         ExprKind::While(condition, body, _) => {
-            skeletonize_condition(condition, visitor);
+            skeletonize_condition(condition);
             visitor.visit_block(body);
         }
         ExprKind::ForLoop { iter, body, .. } => {
-            if !reject_nested_control(iter, visitor) {
-                **iter = todo_expr();
-            }
+            **iter = todo_expr();
             visitor.visit_block(body);
         }
         ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => visitor.visit_block(body),
         ExprKind::Match(scrutinee, arms, _) => {
-            if !reject_nested_control(scrutinee, visitor) {
-                **scrutinee = todo_expr();
-            }
+            **scrutinee = todo_expr();
             for arm in arms {
-                if let Some(guard) = &mut arm.guard
-                    && !reject_nested_control(guard, visitor)
-                {
+                if let Some(guard) = &mut arm.guard {
                     **guard = todo_expr();
                 }
                 skeletonize_payload(arm.body.as_mut().unwrap(), visitor);
