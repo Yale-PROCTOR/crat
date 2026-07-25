@@ -217,6 +217,180 @@ mod report {
     }
 }
 
+/// Measurement-only comparison surface for the registered PRIMARY ownership-yield evaluation.
+///
+/// This module owns canonical report records and their deterministic comparison/serialization.
+/// It never changes either ownership analysis; the corpus workers only export their existing
+/// solidified results through this surface when the measurement flag is enabled.
+mod ownership_yield {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum OwnerClass {
+        Local,
+        Field,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SlotRecord {
+        pub key: String,
+        pub owner: OwnerClass,
+        pub depth: u8,
+        pub owning: bool,
+        pub forced_output: bool,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct SideCounts {
+        pub local_owning_by_depth: BTreeMap<u8, usize>,
+        pub field_owning_by_depth: BTreeMap<u8, usize>,
+        pub total_owning: usize,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Comparison {
+        pub bo: SideCounts,
+        pub production: SideCounts,
+        pub production_forced_output: usize,
+        pub production_without_forced: usize,
+        pub bo_only_owning: Vec<String>,
+        pub production_only_owning: Vec<String>,
+        pub bo_universe_only: Vec<String>,
+        pub production_universe_only: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct ProgramSummary {
+        pub program: String,
+        pub bo_status: String,
+        pub production_status: String,
+        pub bo_wall_s: f64,
+        pub production_wall_s: Option<f64>,
+        pub production_cap_s: u64,
+        pub production_failure: Option<String>,
+        pub comparison: Option<Comparison>,
+    }
+
+    pub fn compare(_bo: &[SlotRecord], _production: &[SlotRecord]) -> Result<Comparison, String> {
+        Ok(Comparison::default())
+    }
+
+    pub fn snapshot_jsonl(_records: &[SlotRecord]) -> String {
+        String::new()
+    }
+
+    pub fn parse_snapshot_jsonl(_input: &str) -> Result<Vec<SlotRecord>, String> {
+        Ok(Vec::new())
+    }
+
+    pub fn render_summary_csv(_rows: &[ProgramSummary]) -> String {
+        "program,bo_status,production_status\n".to_string()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn slot(
+            key: &str,
+            owner: OwnerClass,
+            depth: u8,
+            owning: bool,
+            forced_output: bool,
+        ) -> SlotRecord {
+            SlotRecord {
+                key: key.to_string(),
+                owner,
+                depth,
+                owning,
+                forced_output,
+            }
+        }
+
+        #[test]
+        fn ownership_yield_compares_exact_keys_depths_and_forced_entries() {
+            let bo = vec![
+                slot("crate::f::_1@d0", OwnerClass::Local, 0, true, false),
+                slot("crate::S::field0@d1", OwnerClass::Field, 1, true, false),
+                slot("crate::f::_9@d0", OwnerClass::Local, 0, false, false),
+            ];
+            let production = vec![
+                slot("crate::f::_1@d0", OwnerClass::Local, 0, true, true),
+                slot("crate::g::_2@d1", OwnerClass::Local, 1, true, false),
+                slot("crate::g::_7@d3", OwnerClass::Local, 3, false, false),
+            ];
+
+            let got = compare(&bo, &production).expect("comparison");
+            assert_eq!(got.bo.local_owning_by_depth, BTreeMap::from([(0, 1)]));
+            assert_eq!(got.bo.field_owning_by_depth, BTreeMap::from([(1, 1)]));
+            assert_eq!(
+                got.production.local_owning_by_depth,
+                BTreeMap::from([(0, 1), (1, 1)])
+            );
+            assert_eq!(got.bo.total_owning, 2);
+            assert_eq!(got.production.total_owning, 2);
+            assert_eq!(got.production_forced_output, 1);
+            assert_eq!(
+                got.production_without_forced, 1,
+                "set subtraction is structural, not a counterfactual re-solve"
+            );
+            assert_eq!(got.bo_only_owning, ["crate::S::field0@d1"]);
+            assert_eq!(got.production_only_owning, ["crate::g::_2@d1"]);
+            assert_eq!(got.bo_universe_only, ["crate::S::field0@d1", "crate::f::_9@d0"]);
+            assert_eq!(
+                got.production_universe_only,
+                ["crate::g::_2@d1", "crate::g::_7@d3"]
+            );
+        }
+
+        #[test]
+        fn ownership_yield_rejects_duplicate_canonical_keys() {
+            let duplicate = vec![
+                slot("crate::f::_1@d0", OwnerClass::Local, 0, true, false),
+                slot("crate::f::_1@d0", OwnerClass::Local, 0, false, false),
+            ];
+            let err = compare(&duplicate, &[]).expect_err("duplicate key must fail");
+            assert!(err.contains("duplicate BO canonical key"), "{err}");
+        }
+
+        #[test]
+        fn ownership_yield_snapshot_is_byte_stable_and_round_trips() {
+            let left = vec![
+                slot("z::_2@d1", OwnerClass::Local, 1, false, false),
+                slot("a::field0@d0", OwnerClass::Field, 0, true, false),
+            ];
+            let right = vec![left[1].clone(), left[0].clone()];
+            let encoded = snapshot_jsonl(&left);
+            assert_eq!(encoded, snapshot_jsonl(&right));
+            assert!(encoded.ends_with('\n'));
+            assert_eq!(parse_snapshot_jsonl(&encoded).expect("parse"), right);
+        }
+
+        #[test]
+        fn ownership_yield_summary_preserves_production_failure_and_cap() {
+            let csv = render_summary_csv(&[ProgramSummary {
+                program: "brotli".to_string(),
+                bo_status: "ok".to_string(),
+                production_status: "timeout".to_string(),
+                bo_wall_s: 551.9,
+                production_wall_s: Some(1800.2),
+                production_cap_s: 1800,
+                production_failure: Some("timeout".to_string()),
+                comparison: None,
+            }]);
+            assert!(csv.contains("brotli,ok,timeout"));
+            assert!(csv.contains("1800"));
+            assert!(
+                csv.contains("production: failed (timeout, cap 1800s)"),
+                "{csv}"
+            );
+        }
+    }
+}
+
 /// Provenance stamp for `results.jsonl` — a line-1 `{"_provenance":{...}}` object carrying
 /// the commit SHA a sweep was produced at, so a killed run that leaves a stale file cannot
 /// masquerade as current data (the phantom −97.7% regression postmortem, 2026-07-10). Pure
