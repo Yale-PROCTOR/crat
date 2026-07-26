@@ -881,6 +881,324 @@ mod ownership_yield {
     }
 }
 
+/// Measurement-only report contract for the source-selector leak diagnosis.
+///
+/// The official untracked solve remains authoritative for selector choices.
+/// A separate tracked reconstruction consumes these records with the choices
+/// imposed and extracts hard-family cores; nothing in this module changes a
+/// production solver decision.
+mod selector_leak_diagnosis {
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum SelectorClass {
+        Source,
+        Sink,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TracePhase {
+        Drop,
+        Reenable,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TraceOutcome {
+        Dropped,
+        Restored,
+        StayedDropped,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TraceEvent {
+        pub epoch: usize,
+        pub phase: TracePhase,
+        pub selector_index: usize,
+        pub class: SelectorClass,
+        pub active_before: Vec<usize>,
+        pub core_selectors: Vec<usize>,
+        pub outcome: TraceOutcome,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CommitEvent {
+        pub round: usize,
+        pub target: String,
+        pub issuer: Option<String>,
+        pub requirers: Vec<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OutParamTag {
+        Crosses,
+        DoesNotCross,
+        Untagged,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CoreRecord {
+        pub program: String,
+        pub selector_key: String,
+        pub phase: TracePhase,
+        pub raw_families: BTreeSet<String>,
+        pub minimized_families: BTreeSet<String>,
+        pub minimized: bool,
+        pub reenable_outcome: TraceOutcome,
+        pub out_param_tag: OutParamTag,
+        pub commit_origin: Option<String>,
+    }
+
+    pub fn capture_event(enabled: bool, event: TraceEvent) -> Vec<TraceEvent> {
+        let _ = (enabled, event);
+        unimplemented!("RED: selector trace capture is not implemented")
+    }
+
+    pub fn final_dropped(events: &[TraceEvent]) -> BTreeSet<usize> {
+        let _ = events;
+        unimplemented!("RED: subset-minimal re-enable accounting is not implemented")
+    }
+
+    pub fn selector_key(
+        program: &str,
+        class: SelectorClass,
+        overall_index: usize,
+        n_sources: usize,
+    ) -> String {
+        let _ = (program, class, overall_index, n_sources);
+        unimplemented!("RED: canonical selector keys are not implemented")
+    }
+
+    pub fn commits_for_epoch(epoch: usize, commits: &[CommitEvent]) -> Vec<CommitEvent> {
+        let _ = (epoch, commits);
+        unimplemented!("RED: original-round commit replay is not implemented")
+    }
+
+    pub fn validate_families<'a>(
+        labels: impl IntoIterator<Item = &'a str>,
+        known: &[&str],
+    ) -> Result<BTreeSet<String>, String> {
+        let _ = (labels, known);
+        unimplemented!("RED: hard-family validation is not implemented")
+    }
+
+    pub fn minimized_claim(core_len: usize, saw_unknown: bool, cap: usize) -> bool {
+        let _ = (core_len, saw_unknown, cap);
+        unimplemented!("RED: minimization honesty is not implemented")
+    }
+
+    pub fn borrow_commit_origin(
+        labels: &[String],
+        commits: &[CommitEvent],
+    ) -> Option<String> {
+        let _ = (labels, commits);
+        unimplemented!("RED: second-order borrow-commit attribution is not implemented")
+    }
+
+    pub fn render_records(records: &[CoreRecord]) -> (String, String) {
+        let _ = records;
+        unimplemented!("RED: classification/cross-tab rendering is not implemented")
+    }
+
+    pub fn cheap_out_param_tag(has_direct_selector_slot: bool, crosses_boundary: bool) -> OutParamTag {
+        let _ = (has_direct_selector_slot, crosses_boundary);
+        unimplemented!("RED: out-param tag policy is not implemented")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn event(
+            phase: TracePhase,
+            selector_index: usize,
+            class: SelectorClass,
+            outcome: TraceOutcome,
+        ) -> TraceEvent {
+            TraceEvent {
+                epoch: 0,
+                phase,
+                selector_index,
+                class,
+                active_before: vec![0, 1, 2],
+                core_selectors: vec![selector_index],
+                outcome,
+            }
+        }
+
+        #[test]
+        fn selector_leak_capture_disabled_is_inert() {
+            assert!(capture_event(
+                false,
+                event(
+                    TracePhase::Drop,
+                    0,
+                    SelectorClass::Source,
+                    TraceOutcome::Dropped,
+                ),
+            )
+            .is_empty());
+        }
+
+        #[test]
+        fn selector_leak_source_drop_and_reenable_outcome() {
+            let events = vec![
+                event(
+                    TracePhase::Drop,
+                    0,
+                    SelectorClass::Source,
+                    TraceOutcome::Dropped,
+                ),
+                event(
+                    TracePhase::Reenable,
+                    0,
+                    SelectorClass::Source,
+                    TraceOutcome::StayedDropped,
+                ),
+                event(
+                    TracePhase::Drop,
+                    1,
+                    SelectorClass::Source,
+                    TraceOutcome::Dropped,
+                ),
+                event(
+                    TracePhase::Reenable,
+                    1,
+                    SelectorClass::Source,
+                    TraceOutcome::Restored,
+                ),
+            ];
+            assert_eq!(final_dropped(&events), BTreeSet::from([0]));
+        }
+
+        #[test]
+        fn selector_leak_mixed_trace_records_sink_first() {
+            let first = event(
+                TracePhase::Drop,
+                2,
+                SelectorClass::Sink,
+                TraceOutcome::Dropped,
+            );
+            assert_eq!(capture_event(true, first.clone()), vec![first]);
+        }
+
+        #[test]
+        fn selector_leak_canonical_keys_preserve_partition_and_order() {
+            assert_eq!(
+                selector_key("binn", SelectorClass::Source, 1, 2),
+                "binn/source:1"
+            );
+            assert_eq!(
+                selector_key("binn", SelectorClass::Sink, 4, 2),
+                "binn/sink:2"
+            );
+        }
+
+        #[test]
+        fn selector_leak_rejects_unrecognized_hard_families() {
+            let known = ["safe-mono", "borrow-exclusion"];
+            assert_eq!(
+                validate_families(
+                    ["f::safe-mono(a=>b)", "replay::borrow-exclusion(x,[])"],
+                    &known,
+                )
+                .unwrap(),
+                BTreeSet::from(["borrow-exclusion".to_string(), "safe-mono".to_string()])
+            );
+            assert!(
+                validate_families(["f::fatness"], &known)
+                    .unwrap_err()
+                    .contains("unrecognized")
+            );
+        }
+
+        #[test]
+        fn selector_leak_replays_commits_at_original_round_boundary() {
+            let commits = vec![
+                CommitEvent {
+                    round: 2,
+                    target: "f:1".to_string(),
+                    issuer: Some("f:2".to_string()),
+                    requirers: vec!["f:3".to_string()],
+                },
+                CommitEvent {
+                    round: 1,
+                    target: "g:4".to_string(),
+                    issuer: None,
+                    requirers: vec![],
+                },
+            ];
+            assert!(commits_for_epoch(0, &commits).is_empty());
+            assert_eq!(commits_for_epoch(1, &commits), vec![commits[1].clone()]);
+            assert_eq!(commits_for_epoch(2, &commits), vec![commits[0].clone()]);
+        }
+
+        #[test]
+        fn selector_leak_minimization_claim_respects_cap_and_unknown() {
+            assert!(minimized_claim(50, false, 50));
+            assert!(!minimized_claim(51, false, 50));
+            assert!(!minimized_claim(10, true, 50));
+        }
+
+        #[test]
+        fn selector_leak_borrow_commit_traces_one_conflict_hop() {
+            let commits = vec![CommitEvent {
+                round: 1,
+                target: "Local(f,9)".to_string(),
+                issuer: Some("Local(f,2)".to_string()),
+                requirers: vec!["Local(f,3)".to_string()],
+            }];
+            let labels = vec![
+                "round-1::borrow-exclusion(Some(Local(f,9)),[])".to_string(),
+                "emit::safe-mono(Local(f,9)=>Local(f,8))".to_string(),
+            ];
+            let origin = borrow_commit_origin(&labels, &commits).expect("commit origin");
+            assert!(origin.contains("target=Local(f,9)"));
+            assert!(origin.contains("issuer=Local(f,2)"));
+            assert!(origin.contains("requirers=Local(f,3)"));
+        }
+
+        #[test]
+        fn selector_leak_renderer_and_out_param_untagged_fallback() {
+            let record = CoreRecord {
+                program: "bst".to_string(),
+                selector_key: "bst/source:0".to_string(),
+                phase: TracePhase::Reenable,
+                raw_families: BTreeSet::from([
+                    "borrow-exclusion".to_string(),
+                    "safe-mono".to_string(),
+                ]),
+                minimized_families: BTreeSet::from(["borrow-exclusion".to_string()]),
+                minimized: true,
+                reenable_outcome: TraceOutcome::StayedDropped,
+                out_param_tag: cheap_out_param_tag(false, true),
+                commit_origin: Some("target=x issuer=y".to_string()),
+            };
+            assert_eq!(record.out_param_tag, OutParamTag::Untagged);
+            assert_eq!(
+                cheap_out_param_tag(true, true),
+                OutParamTag::Crosses
+            );
+            assert_eq!(
+                cheap_out_param_tag(true, false),
+                OutParamTag::DoesNotCross
+            );
+            let (rows, cross_tab) = render_records(&[record]);
+            for needle in [
+                "bst/source:0",
+                "borrow-exclusion",
+                "safe-mono",
+                "stayed-dropped",
+                "untagged",
+                "target=x issuer=y",
+            ] {
+                assert!(rows.contains(needle), "missing {needle}: {rows}");
+            }
+            assert!(cross_tab.contains("family,bst,total"));
+            assert!(cross_tab.contains("borrow-exclusion,1,1"));
+        }
+    }
+}
+
 /// Provenance stamp for `results.jsonl` — a line-1 `{"_provenance":{...}}` object carrying
 /// the commit SHA a sweep was produced at, so a killed run that leaves a stale file cannot
 /// masquerade as current data (the phantom −97.7% regression postmortem, 2026-07-10). Pure
