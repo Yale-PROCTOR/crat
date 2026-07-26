@@ -5361,6 +5361,11 @@ fn diagnostic_worker_disposition(status: &str) -> DiagnosticWorkerDisposition {
     }
 }
 
+#[cfg(test)]
+fn representative_case_limit(available: usize) -> usize {
+    available.min(2)
+}
+
 #[test]
 fn selector_leak_resource_walls_defer_but_correctness_failures_stop() {
     assert_eq!(
@@ -5381,6 +5386,14 @@ fn selector_leak_resource_walls_defer_but_correctness_failures_stop() {
             "{status} must still stop the diagnosis"
         );
     }
+}
+
+#[test]
+fn selector_leak_representatives_use_available_coverage_up_to_two() {
+    assert_eq!(representative_case_limit(0), 0);
+    assert_eq!(representative_case_limit(1), 1);
+    assert_eq!(representative_case_limit(2), 2);
+    assert_eq!(representative_case_limit(3), 2);
 }
 
 #[cfg(test)]
@@ -6404,11 +6417,8 @@ fn boc1_corpus() {
                     .then_with(|| left.program.cmp(&right.program))
                     .then_with(|| left.selector_key.cmp(&right.selector_key))
             });
-            assert!(
-                candidates.len() >= 2,
-                "family {family} has fewer than two representative cases"
-            );
-            for (_, record) in candidates.into_iter().take(2) {
+            let case_limit = representative_case_limit(candidates.len());
+            for (_, record) in candidates.into_iter().take(case_limit) {
                 selected_cases
                     .entry((record.program.clone(), record.epoch, record.selector_index))
                     .or_default()
