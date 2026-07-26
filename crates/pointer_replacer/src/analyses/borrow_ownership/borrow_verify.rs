@@ -125,6 +125,17 @@ thread_local! {
     /// Mode-A ONLY: the audit measures the shipped repair mode; the `Lemmas` branch (dead axis) is not
     /// captured. Nesting is unsupported (the audit never nests).
     static AUDIT_CAPTURE: RefCell<Option<Vec<(SlotRef, usize)>>> = const { RefCell::new(None) };
+    /// Diagnosis-only detailed origin for each Mode-A commit. Kept separate
+    /// from the frozen necessity-audit tuple surface.
+    static SELECTOR_CORE_COMMIT_CAPTURE: RefCell<Option<Vec<ModeACommitTrace>>> =
+        const { RefCell::new(None) };
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModeACommitTrace {
+    pub target: SlotRef,
+    pub round: usize,
+    pub conflict: SlotConflict,
 }
 
 /// §NB5-L2 — run `f` while CAPTURING Mode-A's `(slot, round)` commit events, returning
@@ -145,6 +156,27 @@ pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)
         .with(|c| c.borrow_mut().take())
         .unwrap_or_default();
     (out, captured)
+}
+
+/// Diagnosis-only detailed twin of `with_capture`. It records the originating
+/// conflict edge for the second-order attribution of any tracked
+/// `borrow-exclusion` core member.
+pub(crate) fn with_mode_a_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<ModeACommitTrace>) {
+    struct Restore(Option<Vec<ModeACommitTrace>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let output = f();
+    let trace = SELECTOR_CORE_COMMIT_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (output, trace)
 }
 
 /// A borrow conflict edge with its owners translated to BO `SlotRef`s. `Field` owners
@@ -634,6 +666,15 @@ pub(crate) fn verify_to_fixpoint_counting(
                         AUDIT_CAPTURE.with(|c| {
                             if let Some(buf) = c.borrow_mut().as_mut() {
                                 buf.push((slot, stats.rounds));
+                            }
+                        });
+                        SELECTOR_CORE_COMMIT_CAPTURE.with(|capture| {
+                            if let Some(events) = capture.borrow_mut().as_mut() {
+                                events.push(ModeACommitTrace {
+                                    target: slot,
+                                    round: stats.rounds,
+                                    conflict: conflict.clone(),
+                                });
                             }
                         });
                     }

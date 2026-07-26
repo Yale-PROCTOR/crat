@@ -129,6 +129,70 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "sink-selector",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorTracePhase {
+    Drop,
+    Reenable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorTraceOutcome {
+    Dropped,
+    Restored,
+    StayedDropped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectorTraceEvent {
+    pub epoch: usize,
+    pub phase: SelectorTracePhase,
+    pub selector_index: usize,
+    pub active_before: Vec<usize>,
+    pub core_selectors: Vec<usize>,
+    pub outcome: SelectorTraceOutcome,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SelectorEpochTrace {
+    pub events: Vec<SelectorTraceEvent>,
+    pub final_dropped: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SelectorTrace {
+    pub n_sources: usize,
+    pub total: usize,
+    pub epochs: Vec<SelectorEpochTrace>,
+}
+
+thread_local! {
+    /// Diagnosis-only selector retraction trace. `None` is the default and
+    /// performs no allocation, collection, or sorting on the production path.
+    static SELECTOR_TRACE_CAPTURE: RefCell<Option<SelectorTrace>> = const { RefCell::new(None) };
+}
+
+/// Run an untracked solve while recording its actual selector drop/re-enable
+/// decisions. The returned model is the exact result of `f`; the side channel
+/// is write-only and cannot influence the choice policy.
+pub(crate) fn with_selector_trace<T>(f: impl FnOnce() -> T) -> (T, SelectorTrace) {
+    struct Restore(Option<SelectorTrace>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SELECTOR_TRACE_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore = Restore(
+        SELECTOR_TRACE_CAPTURE.with(|capture| capture.replace(Some(SelectorTrace::default()))),
+    );
+    let output = f();
+    let trace = SELECTOR_TRACE_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (output, trace)
+}
+
 pub struct KindSolver {
     solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
@@ -590,6 +654,20 @@ impl KindSolver {
         );
         let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         let mut leaked: Vec<Bool> = Vec::new();
+        let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let trace = capture.as_mut()?;
+            if trace.epochs.is_empty() {
+                trace.n_sources = selectors.n_sources;
+                trace.total = selectors.all.len();
+            } else {
+                assert_eq!(trace.n_sources, selectors.n_sources);
+                assert_eq!(trace.total, selectors.all.len());
+            }
+            let epoch = trace.epochs.len();
+            trace.epochs.push(SelectorEpochTrace::default());
+            Some(epoch)
+        });
 
         // Phase 1: drop conflicting selectors until SAT (or give up).
         loop {
@@ -611,6 +689,23 @@ impl KindSolver {
                         .iter()
                         .position(|s| selectors.is_sink(s) && in_core(s))
                         .or_else(|| assumptions.iter().position(|s| in_core(s)))?;
+                    if let Some(epoch) = trace_epoch {
+                        let selector_index = selectors
+                            .index_of(&assumptions[idx])
+                            .expect("active selector belongs to selector universe");
+                        SELECTOR_TRACE_CAPTURE.with(|capture| {
+                            let mut capture = capture.borrow_mut();
+                            let trace = capture.as_mut().expect("selector trace active");
+                            trace.epochs[epoch].events.push(SelectorTraceEvent {
+                                epoch,
+                                phase: SelectorTracePhase::Drop,
+                                selector_index,
+                                active_before: selectors.indices_of(&assumptions),
+                                core_selectors: selectors.indices_of(&core),
+                                outcome: SelectorTraceOutcome::Dropped,
+                            });
+                        });
+                    }
                     leaked.push(assumptions.swap_remove(idx));
                 }
                 SatResult::Unknown => return None,
@@ -623,13 +718,51 @@ impl KindSolver {
         // system SAT proves that allocation did not need to be leaked.
         let mut i = 0;
         while i < leaked.len() {
+            let selector = leaked[i].clone();
             assumptions.push(leaked[i].clone());
-            if self.check_with_assumptions(&assumptions) == SatResult::Sat {
-                leaked.swap_remove(i);
-            } else {
-                assumptions.pop();
-                i += 1;
+            let outcome = self.check_with_assumptions(&assumptions);
+            if let Some(epoch) = trace_epoch {
+                let selector_index = selectors
+                    .index_of(&selector)
+                    .expect("leaked selector belongs to selector universe");
+                let core = (outcome == SatResult::Unsat)
+                    .then(|| self.solver.get_unsat_core())
+                    .unwrap_or_default();
+                SELECTOR_TRACE_CAPTURE.with(|capture| {
+                    let mut capture = capture.borrow_mut();
+                    let trace = capture.as_mut().expect("selector trace active");
+                    trace.epochs[epoch].events.push(SelectorTraceEvent {
+                        epoch,
+                        phase: SelectorTracePhase::Reenable,
+                        selector_index,
+                        active_before: selectors.indices_of(&assumptions),
+                        core_selectors: selectors.indices_of(&core),
+                        outcome: if outcome == SatResult::Sat {
+                            SelectorTraceOutcome::Restored
+                        } else {
+                            SelectorTraceOutcome::StayedDropped
+                        },
+                    });
+                });
             }
+            match outcome {
+                SatResult::Sat => {
+                    leaked.swap_remove(i);
+                }
+                SatResult::Unsat => {
+                    assumptions.pop();
+                    i += 1;
+                }
+                SatResult::Unknown => return None,
+            }
+        }
+
+        if let Some(epoch) = trace_epoch {
+            SELECTOR_TRACE_CAPTURE.with(|capture| {
+                let mut capture = capture.borrow_mut();
+                let trace = capture.as_mut().expect("selector trace active");
+                trace.epochs[epoch].final_dropped = selectors.indices_of(&leaked);
+            });
         }
 
         // Final SAT model under the maximal-retention assumption set.
@@ -950,6 +1083,17 @@ impl Selectors {
     /// same basis as the relax loop's selector matching.
     pub(crate) fn is_sink(&self, literal: &Bool) -> bool {
         self.sinks().iter().any(|s| s == literal)
+    }
+
+    pub(crate) fn index_of(&self, literal: &Bool) -> Option<usize> {
+        self.all.iter().position(|selector| selector == literal)
+    }
+
+    fn indices_of(&self, literals: &[Bool]) -> Vec<usize> {
+        literals
+            .iter()
+            .filter_map(|literal| self.index_of(literal))
+            .collect()
     }
 }
 
