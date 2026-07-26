@@ -12,6 +12,7 @@ use crate::analyses::{
     borrow_ownership::{
         call_graph::Monotonicity,
         ptr::Measurable,
+        solver::{with_own_assume_site, OwnAssumeSite},
         ssa::{
             constraint::{infer::InferMode, Database, GlobalAssumptions, Var},
             consume::Consume,
@@ -340,14 +341,16 @@ where
     Analysis: AnalysisKind<'infercx, 'db, 'tcx>,
 {
     fn unknown_call(&mut self, destination: Option<Consume<Range<Var>>>, args: &CallArgs) {
-        if let Some(dest) = destination {
-            <Analysis as InferMode>::borrow(self, dest);
-        }
-        for arg in args {
-            if let Some((arg, _)) = arg.clone() {
-                <Analysis as InferMode>::lend(self, arg);
+        with_own_assume_site(OwnAssumeSite::OpaqueCallArg, || {
+            if let Some(dest) = destination {
+                <Analysis as InferMode>::borrow(self, dest);
             }
-        }
+            for arg in args {
+                if let Some((arg, _)) = arg.clone() {
+                    <Analysis as InferMode>::lend(self, arg);
+                }
+            }
+        });
     }
 }
 
