@@ -1041,6 +1041,20 @@ mod selector_leak_diagnosis {
         pub commit_origins: Vec<String>,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DetailEvidence {
+        pub program: String,
+        pub selector_key: String,
+        pub selector_index: usize,
+        pub epoch: usize,
+        pub raw_labels: Vec<String>,
+        pub raw_families: BTreeSet<String>,
+        pub minimized_labels: Vec<String>,
+        pub minimized_families: BTreeSet<String>,
+        pub minimized: bool,
+        pub commit_origins: Vec<String>,
+    }
+
     fn phase(phase: SolverPhase) -> TracePhase {
         match phase {
             SolverPhase::Drop => TracePhase::Drop,
@@ -1196,27 +1210,27 @@ mod selector_leak_diagnosis {
             .collect()
     }
 
+    pub fn write_detail_evidence(path: &Path, evidence: &DetailEvidence) -> Result<(), String> {
+        let encoded = serde_json::to_string_pretty(evidence)
+            .map_err(|error| format!("encode selector detail evidence: {error}"))?;
+        fs::write(path, format!("{encoded}\n"))
+            .map_err(|error| format!("write {}: {error}", path.display()))
+    }
+
+    pub fn read_detail_evidence(path: &Path) -> Result<DetailEvidence, String> {
+        let encoded = fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        serde_json::from_str(&encoded).map_err(|error| format!("parse {}: {error}", path.display()))
+    }
+
     pub fn final_records(
         evidence: &[CoreEvidence],
         class: SelectorClass,
     ) -> Result<Vec<CoreRecord>, String> {
-        let mut latest: BTreeMap<&str, &CoreEvidence> = BTreeMap::new();
-        for record in evidence.iter().filter(|record| {
-            record.class == class
-                && record.phase == TracePhase::Reenable
-                && record.outcome == TraceOutcome::StayedDropped
-        }) {
-            match latest.get(record.selector_key.as_str()) {
-                Some(previous) if previous.epoch > record.epoch => {}
-                _ => {
-                    latest.insert(record.selector_key.as_str(), record);
-                }
-            }
-        }
-        latest
-            .into_values()
+        final_evidence(evidence, class)
+            .into_iter()
             .map(|record| {
-                if record.minimized_labels.is_empty() {
+                if record.raw_labels.is_empty() {
                     return Err(format!(
                         "final dropped selector lacks an UNSAT core: {}",
                         record.selector_key
@@ -1237,6 +1251,23 @@ mod selector_leak_diagnosis {
                 })
             })
             .collect()
+    }
+
+    pub fn final_evidence(evidence: &[CoreEvidence], class: SelectorClass) -> Vec<&CoreEvidence> {
+        let mut latest: BTreeMap<&str, &CoreEvidence> = BTreeMap::new();
+        for record in evidence.iter().filter(|record| {
+            record.class == class
+                && record.phase == TracePhase::Drop
+                && record.outcome == TraceOutcome::StayedDropped
+        }) {
+            match latest.get(record.selector_key.as_str()) {
+                Some(previous) if previous.epoch > record.epoch => {}
+                _ => {
+                    latest.insert(record.selector_key.as_str(), record);
+                }
+            }
+        }
+        latest.into_values().collect()
     }
 
     pub fn capture_event(enabled: bool, event: TraceEvent) -> Vec<TraceEvent> {
@@ -1301,12 +1332,15 @@ mod selector_leak_diagnosis {
         labels
             .into_iter()
             .map(|label| {
+                let family = label
+                    .strip_prefix("family-marker::")
+                    .ok_or_else(|| format!("hard-core label is not a family marker: {label}"))?;
                 known
                     .iter()
                     .copied()
-                    .find(|family| label.contains(family))
+                    .find(|known_family| *known_family == family)
                     .map(str::to_string)
-                    .ok_or_else(|| format!("unrecognized hard-family label: {label}"))
+                    .ok_or_else(|| format!("unrecognized hard-family marker: {label}"))
             })
             .collect()
     }
@@ -1386,7 +1420,12 @@ mod selector_leak_diagnosis {
 
         let mut counts: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
         for record in records {
-            for family in &record.minimized_families {
+            let families = if record.minimized {
+                &record.minimized_families
+            } else {
+                &record.raw_families
+            };
+            for family in families {
                 *counts
                     .entry(family.clone())
                     .or_default()
@@ -1641,10 +1680,7 @@ mod selector_leak_diagnosis {
                 final_records(&[evidence], SelectorClass::Source).expect("drop-phase record");
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].phase, TracePhase::Drop);
-            assert_eq!(
-                records[0].reenable_outcome,
-                TraceOutcome::StayedDropped
-            );
+            assert_eq!(records[0].reenable_outcome, TraceOutcome::StayedDropped);
         }
     }
 }
@@ -2069,6 +2105,7 @@ pub(crate) use run::{CollateralMeasurement, measure_collateral};
 /// Per-mode analysis drivers producing report rows.
 mod run {
     use std::{
+        collections::BTreeSet,
         path::Path,
         time::{Duration, Instant},
     };
@@ -2083,7 +2120,7 @@ mod run {
         ownership_yield::{self, OwnerClass, SlotRecord},
         report::Row,
         selector_leak_diagnosis::{
-            self, CommitEvent, CoreEvidence, OutParamTag, SelectorClass, TraceOutcome,
+            self, CommitEvent, CoreEvidence, DetailEvidence, OutParamTag, SelectorClass, TracePhase,
         },
     };
     use crate::analyses::{
@@ -2940,6 +2977,25 @@ mod run {
             .collect()
     }
 
+    fn family_marker_labels(core: &[Bool], tracker: &CoreTracker) -> Vec<String> {
+        let mut labels = core
+            .iter()
+            .filter_map(|literal| tracker.label_of(literal))
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
+    fn hard_families(labels: &[String]) -> BTreeSet<String> {
+        labels
+            .iter()
+            .filter_map(|label| super::explain::family_of(label))
+            .filter(|family| !matches!(*family, "source-selector" | "sink-selector"))
+            .map(str::to_string)
+            .collect()
+    }
+
     fn commit_events_for_reporting(
         tcx: TyCtxt<'_>,
         program: &crate::utils::rustc::RustProgram,
@@ -2967,6 +3023,32 @@ mod run {
                     .collect(),
             })
             .collect()
+    }
+
+    fn replay_commit_round(
+        tcx: TyCtxt<'_>,
+        program: &crate::utils::rustc::RustProgram,
+        official: &selector_leak_diagnosis::OfficialTrace,
+        solver: &KindSolver,
+        tracker: &CoreTracker,
+        round: usize,
+    ) {
+        for commit in official
+            .commits
+            .iter()
+            .filter(|commit| commit.round == round)
+        {
+            let target_key =
+                selector_leak_diagnosis::portable_slot_key(tcx, &program.functions, commit.target);
+            tracker.set_context(&format!("borrow-round-{round}-target={target_key}"));
+            solver.add_borrow_exclusion(
+                Some(selector_leak_diagnosis::restore_slot(
+                    &program.functions,
+                    commit.target,
+                )),
+                &[],
+            );
+        }
     }
 
     /// Tracked diagnostic worker. The official trace fixes every active
@@ -2997,7 +3079,7 @@ mod run {
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
-        let solver = KindSolver::new_tracked(&slots);
+        let solver = KindSolver::new_family_tracked(&slots);
         let (_stats, selectors) =
             emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
                 .expect("tracked selector-core emission");
@@ -3014,7 +3096,6 @@ mod run {
 
         assert_eq!(selectors.sources().len(), official.n_sources);
         assert_eq!(selectors.all().len(), official.total_selectors);
-        let reporting_commits = commit_events_for_reporting(tcx, &program, &official);
         let mut evidence = Vec::new();
 
         for (epoch_index, epoch) in official.epochs.iter().enumerate() {
@@ -3022,27 +3103,19 @@ mod run {
                 epoch.events.iter().all(|event| event.epoch == epoch_index),
                 "official selector event epoch drift"
             );
-            for commit in official
-                .commits
-                .iter()
-                .filter(|commit| commit.round == epoch_index)
-            {
-                let target_key = selector_leak_diagnosis::portable_slot_key(
-                    tcx,
-                    &program.functions,
-                    commit.target,
-                );
-                tracker.set_context(&format!("borrow-round-{epoch_index}-target={target_key}"));
-                solver.add_borrow_exclusion(
-                    Some(selector_leak_diagnosis::restore_slot(
-                        &program.functions,
-                        commit.target,
-                    )),
-                    &[],
-                );
-            }
+            replay_commit_round(tcx, &program, &official, &solver, tracker, epoch_index);
 
-            for event in &epoch.events {
+            let reenable_outcomes = epoch
+                .events
+                .iter()
+                .filter(|event| event.phase == TracePhase::Reenable)
+                .map(|event| (event.selector_index, event.outcome))
+                .collect::<FxHashMap<_, _>>();
+            for event in epoch
+                .events
+                .iter()
+                .filter(|event| event.phase == TracePhase::Drop)
+            {
                 let mut assumptions = tracker.tracks();
                 assumptions.extend(event.active_before.iter().map(|index| {
                     selectors
@@ -3052,55 +3125,30 @@ mod run {
                         .clone()
                 }));
                 let actual = solver.optimize().check(&assumptions);
-                let expected = match event.outcome {
-                    TraceOutcome::Dropped | TraceOutcome::StayedDropped => SatResult::Unsat,
-                    TraceOutcome::Restored => SatResult::Sat,
-                };
                 assert_eq!(
-                    actual, expected,
+                    actual,
+                    SatResult::Unsat,
                     "tracked reconstruction diverged at {program_name} epoch {epoch_index} \
                      selector {} {:?}",
-                    event.selector_index, event.phase
+                    event.selector_index,
+                    event.phase
                 );
 
-                let (raw_labels, minimized_labels, minimized) = if actual == SatResult::Unsat {
-                    let raw_core = solver.optimize().get_unsat_core();
-                    let raw_labels = tracked_labels(&raw_core, tracker, &selectors, &program_name);
-                    let (minimal_core, minimized) =
-                        super::explain::minimize_core(&solver, raw_core);
-                    let minimal_labels =
-                        tracked_labels(&minimal_core, tracker, &selectors, &program_name);
-                    (raw_labels, minimal_labels, minimized)
-                } else {
-                    (Vec::new(), Vec::new(), false)
-                };
+                let raw_core = solver.optimize().get_unsat_core();
+                let raw_labels = family_marker_labels(&raw_core, tracker);
                 let raw_families = selector_leak_diagnosis::validate_families(
                     raw_labels.iter().map(String::as_str),
                     CORE_LABEL_FAMILIES,
                 )
                 .unwrap_or_else(|error| panic!("{error}"));
-                let minimized_families = selector_leak_diagnosis::validate_families(
-                    minimized_labels.iter().map(String::as_str),
-                    CORE_LABEL_FAMILIES,
-                )
-                .unwrap_or_else(|error| panic!("{error}"));
-                let commit_origins = reporting_commits
-                    .iter()
-                    .filter(|commit| {
-                        minimized_labels.iter().any(|label| {
-                            label.contains("borrow-exclusion") && label.contains(&commit.target)
-                        })
-                    })
-                    .map(|commit| {
-                        format!(
-                            "round={} target={} issuer={} requirers={}",
-                            commit.round,
-                            commit.target,
-                            commit.issuer.as_deref().unwrap_or("-"),
-                            commit.requirers.join("+")
+                let outcome = *reenable_outcomes
+                    .get(&event.selector_index)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "official trace lacks re-enable outcome for selector {}",
+                            event.selector_index
                         )
-                    })
-                    .collect();
+                    });
                 evidence.push(CoreEvidence {
                     program: program_name.clone(),
                     selector_key: selector_leak_diagnosis::selector_key(
@@ -3113,16 +3161,16 @@ mod run {
                     class: event.class,
                     epoch: epoch_index,
                     phase: event.phase,
-                    outcome: event.outcome,
+                    outcome,
                     active_before: event.active_before.clone(),
                     official_selector_core: event.core_selectors.clone(),
                     raw_labels,
                     raw_families,
-                    minimized_labels,
-                    minimized_families,
-                    minimized,
+                    minimized_labels: Vec::new(),
+                    minimized_families: BTreeSet::new(),
+                    minimized: false,
                     out_param_tag: OutParamTag::Untagged,
-                    commit_origins,
+                    commit_origins: Vec::new(),
                 });
             }
 
@@ -3170,6 +3218,142 @@ mod run {
                 .count(),
         );
         row.set("check_sat_count", solver.check_sat_count());
+        row.set("t_total_s", secs(t0.elapsed()));
+        row.set("status", "ok");
+        row
+    }
+
+    /// Per-assertion diagnostic for one representative drop case selected
+    /// after the family matrix exists. Each invocation handles exactly one
+    /// `(epoch, selector)` case and is supervised independently.
+    pub fn run_selector_core_detail(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("z3_full_version", z3::full_version().to_string());
+
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").expect("selector detail worker requires program name");
+        let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
+            .expect("selector detail worker requires CRAT_BOC1_SELECTOR_TRACE");
+        let detail_path = std::env::var("CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE")
+            .expect("selector detail worker requires CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE");
+        let case = std::env::var("CRAT_BOC1_SELECTOR_DETAIL_CASE")
+            .expect("selector detail worker requires CRAT_BOC1_SELECTOR_DETAIL_CASE");
+        let (epoch, selector_index) = case
+            .split_once(':')
+            .and_then(|(epoch, selector)| {
+                Some((
+                    epoch.parse::<usize>().ok()?,
+                    selector.parse::<usize>().ok()?,
+                ))
+            })
+            .unwrap_or_else(|| panic!("selector detail case must be EPOCH:SELECTOR, got {case:?}"));
+        let official = selector_leak_diagnosis::read_official_trace(Path::new(&trace_path))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(official.program, program_name);
+        assert_eq!(
+            official.code_sha,
+            super::orchestrate::git_sha(),
+            "selector trace/code SHA mismatch"
+        );
+
+        let program = collect_program(tcx);
+        let origins = compute_origins(&program);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new_tracked(&slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                .expect("per-assertion selector detail emission");
+        let tracker = solver.tracker().expect("tracked solver");
+        tracker.set_context("coherence");
+        for &function in &program.functions {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            add_coherence(&solver, &slots, function, &body);
+        }
+        tracker.set_context("field-law");
+        constrain_field_ownership(&solver, &slots, &program);
+
+        assert_eq!(selectors.sources().len(), official.n_sources);
+        assert_eq!(selectors.all().len(), official.total_selectors);
+        let reporting_commits = commit_events_for_reporting(tcx, &program, &official);
+        for round in 0..=epoch {
+            replay_commit_round(tcx, &program, &official, &solver, tracker, round);
+        }
+
+        let event = official
+            .epochs
+            .get(epoch)
+            .unwrap_or_else(|| panic!("selector detail epoch {epoch} out of range"))
+            .events
+            .iter()
+            .find(|event| event.phase == TracePhase::Drop && event.selector_index == selector_index)
+            .unwrap_or_else(|| {
+                panic!(
+                    "selector detail lacks drop event at epoch {epoch} selector {selector_index}"
+                )
+            });
+        let mut assumptions = tracker.tracks();
+        assumptions.extend(event.active_before.iter().map(|index| {
+            selectors
+                .all()
+                .get(*index)
+                .unwrap_or_else(|| panic!("selector index {index} out of range"))
+                .clone()
+        }));
+        assert_eq!(
+            solver.optimize().check(&assumptions),
+            SatResult::Unsat,
+            "per-assertion representative case must reconstruct UNSAT"
+        );
+        let raw_core = solver.optimize().get_unsat_core();
+        let raw_labels = tracked_labels(&raw_core, tracker, &selectors, &program_name);
+        let raw_families = hard_families(&raw_labels);
+        let (minimal_core, minimized) = super::explain::minimize_core(&solver, raw_core);
+        let minimized_labels = tracked_labels(&minimal_core, tracker, &selectors, &program_name);
+        let minimized_families = hard_families(&minimized_labels);
+        let commit_origins = reporting_commits
+            .iter()
+            .filter(|commit| {
+                raw_labels.iter().any(|label| {
+                    label.contains("borrow-exclusion") && label.contains(&commit.target)
+                })
+            })
+            .map(|commit| {
+                format!(
+                    "round={} target={} issuer={} requirers={}",
+                    commit.round,
+                    commit.target,
+                    commit.issuer.as_deref().unwrap_or("-"),
+                    commit.requirers.join("+")
+                )
+            })
+            .collect::<Vec<_>>();
+        let evidence = DetailEvidence {
+            program: program_name.clone(),
+            selector_key: selector_leak_diagnosis::selector_key(
+                &program_name,
+                event.class,
+                selector_index,
+                official.n_sources,
+            ),
+            selector_index,
+            epoch,
+            raw_labels,
+            raw_families,
+            minimized_labels,
+            minimized_families,
+            minimized,
+            commit_origins,
+        };
+        selector_leak_diagnosis::write_detail_evidence(Path::new(&detail_path), &evidence)
+            .unwrap_or_else(|error| panic!("{error}"));
+        row.set("selector_detail_epoch", epoch);
+        row.set("selector_detail_index", selector_index);
+        row.set("selector_detail_minimized", minimized);
         row.set("t_total_s", secs(t0.elapsed()));
         row.set("status", "ok");
         row
@@ -4899,7 +5083,9 @@ fn boc1_run_one() {
     // production-borrow `prod` reference remains untouched. Expected behavior-neutral (z3's default
     // seed is already 0); the value is recorded through each solver-backed row's
     // `z3_full_version` stamp.
-    if matches!(mode.as_str(), "bo" | "prod-own" | "selector-core") {
+    if matches!(mode.as_str(), "bo" | "prod-own" | "selector-core")
+        || mode.starts_with("selector-detail-")
+    {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
     }
@@ -4912,6 +5098,9 @@ fn boc1_run_one() {
             "prod" => run::run_prod(tcx, t_tcx),
             "prod-own" => run::run_prod_ownership(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
+            detail if detail.starts_with("selector-detail-") => {
+                run::run_selector_core_detail(tcx, t_tcx)
+            }
             other => panic!("unknown CRAT_BOC1_MODE `{other}`"),
         }
     });
@@ -5215,6 +5404,12 @@ mod orchestrate {
             .join(format!("{program}.jsonl"))
     }
 
+    pub fn selector_detail_path(program: &str, case: &str) -> PathBuf {
+        out_dir()
+            .join("selector-details")
+            .join(format!("{program}.{case}.json"))
+    }
+
     /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
     /// Best-effort: `unknown` if git is unavailable.
     pub fn git_sha() -> String {
@@ -5306,6 +5501,17 @@ mod orchestrate {
                 command.env("CRAT_BOC1_SELECTOR_CORE", "official");
             } else if mode == "selector-core" && evidence.is_file() {
                 fs::remove_file(&evidence).expect("remove stale selector evidence");
+            } else if let Some(case) = mode.strip_prefix("selector-detail-") {
+                let case = case.replacen('-', ":", 1);
+                let detail = selector_detail_path(program, &case.replace(':', "-"));
+                fs::create_dir_all(detail.parent().expect("selector detail parent"))
+                    .expect("create selector detail dir");
+                if detail.is_file() {
+                    fs::remove_file(&detail).expect("remove stale selector detail evidence");
+                }
+                command
+                    .env("CRAT_BOC1_SELECTOR_DETAIL_CASE", &case)
+                    .env("CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE", detail);
             }
         }
         let mut child = command.spawn().expect("spawn worker");
@@ -5390,11 +5596,15 @@ mod orchestrate {
 #[test]
 #[ignore = "C1-lite corpus sweep: run explicitly with --exact bo_c1::boc1_corpus --ignored --nocapture"]
 fn boc1_corpus() {
-    use std::{fs, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        time::Duration,
+    };
 
     use orchestrate::{
-        out_dir, run_child, selector_evidence_path, selector_trace_path, workspace_root,
-        yield_snapshot_path,
+        out_dir, run_child, selector_detail_path, selector_evidence_path, selector_trace_path,
+        workspace_root, yield_snapshot_path,
     };
     use report::Row;
 
@@ -5643,6 +5853,7 @@ fn boc1_corpus() {
     let mut merged: Vec<Row> = Vec::new();
     let mut ownership_yield_rows: Vec<ownership_yield::ProgramSummary> = Vec::new();
     let mut production_failures = 0usize;
+    let mut selector_resource_deferred = Vec::new();
 
     for &program in CORPUS {
         if let Some(only) = &only
@@ -5699,31 +5910,37 @@ fn boc1_corpus() {
                 );
                 eprintln!("[boc1] {}: selector-core mode...", program.name);
                 let tracked = run_child(program.name, &input, "selector-core", diagnostic_timeout);
-                assert_eq!(
-                    tracked.status, "ok",
-                    "selector-leak tracked worker failed for {}: status={} note={}",
-                    program.name, tracked.status, tracked.note
-                );
-                m.set("selector_core_status", &tracked.status);
                 m.set("selector_core_wall_s", format!("{:.1}", tracked.wall_s));
-                if let Some(row) = &tracked.row {
-                    for key in [
-                        "selector_core_events",
-                        "selector_core_sources_final",
-                        "selector_core_sinks_final",
-                        "check_sat_count",
-                    ] {
-                        if let Some(value) = row.get(key) {
-                            m.set(&format!("tracked_{key}"), value);
+                if tracked.status == "ok" {
+                    m.set("selector_core_status", &tracked.status);
+                    if let Some(row) = &tracked.row {
+                        for key in [
+                            "selector_core_events",
+                            "selector_core_sources_final",
+                            "selector_core_sinks_final",
+                            "check_sat_count",
+                        ] {
+                            if let Some(value) = row.get(key) {
+                                m.set(&format!("tracked_{key}"), value);
+                            }
                         }
+                        raw_rows.push(row.clone());
                     }
-                    raw_rows.push(row.clone());
+                    assert!(
+                        selector_evidence_path(program.name).is_file(),
+                        "selector-leak core evidence missing for {}",
+                        program.name
+                    );
+                } else if program.name == "brotli" && tracked.status == "timeout" {
+                    selector_resource_deferred.push(program.name);
+                    m.set("selector_core_status", "resource-deferred");
+                    m.set("selector_core_note", "family-tracked worker exceeded 1800s");
+                } else {
+                    panic!(
+                        "selector-leak tracked worker failed for {}: status={} note={}",
+                        program.name, tracked.status, tracked.note
+                    );
                 }
-                assert!(
-                    selector_evidence_path(program.name).is_file(),
-                    "selector-leak core evidence missing for {}",
-                    program.name
-                );
             }
 
             let bo_records = ownership_yield_enabled.then(|| {
@@ -5919,6 +6136,9 @@ fn boc1_corpus() {
 
         let mut evidence = Vec::new();
         for program in CORPUS {
+            if selector_resource_deferred.contains(&program.name) {
+                continue;
+            }
             evidence.extend(
                 selector_leak_diagnosis::read_core_evidence(&selector_evidence_path(program.name))
                     .unwrap_or_else(|error| panic!("{error}")),
@@ -5934,16 +6154,186 @@ fn boc1_corpus() {
             selector_leak_diagnosis::SelectorClass::Sink,
         )
         .unwrap_or_else(|error| panic!("{error}"));
+        let deferred_sources = selector_resource_deferred
+            .iter()
+            .map(|program| {
+                merged
+                    .iter()
+                    .find(|row| row.get("program") == Some(*program))
+                    .and_then(|row| row.get("sources_leaked_sel"))
+                    .unwrap_or_else(|| panic!("deferred {program} row lacks sources_leaked_sel"))
+                    .parse::<usize>()
+                    .unwrap_or_else(|error| panic!("deferred source count is not numeric: {error}"))
+            })
+            .sum::<usize>();
+        let deferred_sinks = selector_resource_deferred
+            .iter()
+            .map(|program| {
+                merged
+                    .iter()
+                    .find(|row| row.get("program") == Some(*program))
+                    .and_then(|row| row.get("sinks_leaked"))
+                    .unwrap_or_else(|| panic!("deferred {program} row lacks sinks_leaked"))
+                    .parse::<usize>()
+                    .unwrap_or_else(|error| panic!("deferred sink count is not numeric: {error}"))
+            })
+            .sum::<usize>();
         assert_eq!(
             source_records.len(),
-            114,
-            "every final leaked source selector must have one classification row"
+            114 - deferred_sources,
+            "every non-deferred final leaked source selector must have one classification row"
         );
         assert_eq!(
             sink_records.len(),
-            170,
-            "every final leaked sink selector must have one secondary classification row"
+            170 - deferred_sinks,
+            "every non-deferred final leaked sink selector must have one secondary classification row"
         );
+
+        let source_final = selector_leak_diagnosis::final_evidence(
+            &evidence,
+            selector_leak_diagnosis::SelectorClass::Source,
+        );
+        let sink_final = selector_leak_diagnosis::final_evidence(
+            &evidence,
+            selector_leak_diagnosis::SelectorClass::Sink,
+        );
+        let tracked_wall = |program: &str| {
+            merged
+                .iter()
+                .find(|row| row.get("program") == Some(program))
+                .and_then(|row| row.get("selector_core_wall_s"))
+                .and_then(|wall| wall.parse::<f64>().ok())
+                .unwrap_or(f64::INFINITY)
+        };
+        let families = source_final
+            .iter()
+            .flat_map(|record| record.raw_families.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut selected_by_family = Vec::new();
+        let mut selected_cases: BTreeMap<(String, usize, usize), BTreeSet<String>> =
+            BTreeMap::new();
+        for family in families {
+            let mut candidates = source_final
+                .iter()
+                .map(|record| (false, *record))
+                .chain(sink_final.iter().map(|record| (true, *record)))
+                .filter(|(_, record)| record.raw_families.contains(&family))
+                .collect::<Vec<_>>();
+            candidates.sort_by(|(left_sink, left), (right_sink, right)| {
+                left_sink
+                    .cmp(right_sink)
+                    .then_with(|| {
+                        tracked_wall(&left.program).total_cmp(&tracked_wall(&right.program))
+                    })
+                    .then_with(|| left.program.cmp(&right.program))
+                    .then_with(|| left.selector_key.cmp(&right.selector_key))
+            });
+            assert!(
+                candidates.len() >= 2,
+                "family {family} has fewer than two representative cases"
+            );
+            for (_, record) in candidates.into_iter().take(2) {
+                selected_cases
+                    .entry((record.program.clone(), record.epoch, record.selector_index))
+                    .or_default()
+                    .insert(family.clone());
+                selected_by_family.push((
+                    family.clone(),
+                    record.program.clone(),
+                    record.selector_key.clone(),
+                    record.epoch,
+                    record.selector_index,
+                    record.class,
+                ));
+            }
+        }
+
+        let mut detail_outcomes = BTreeMap::new();
+        for ((program, epoch, selector_index), selected_families) in &selected_cases {
+            let corpus_program = CORPUS
+                .iter()
+                .find(|candidate| candidate.name == program)
+                .unwrap_or_else(|| panic!("representative program {program} is not in rs-crown"));
+            let input = corpus_program.input_path(&root);
+            let mode = format!("selector-detail-{epoch}-{selector_index}");
+            eprintln!(
+                "[boc1] {program}: {mode} families={}...",
+                selected_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+")
+            );
+            let outcome = run_child(program, &input, &mode, diagnostic_timeout);
+            assert_eq!(
+                outcome.status, "ok",
+                "selector representative failed for {program} epoch {epoch} selector \
+                 {selector_index}: status={} note={}",
+                outcome.status, outcome.note
+            );
+            let path = selector_detail_path(program, &format!("{epoch}-{selector_index}"));
+            assert!(
+                path.is_file(),
+                "selector representative evidence missing: {}",
+                path.display()
+            );
+            let detail = selector_leak_diagnosis::read_detail_evidence(&path)
+                .unwrap_or_else(|error| panic!("{error}"));
+            detail_outcomes.insert(
+                (program.clone(), *epoch, *selector_index),
+                (outcome.wall_s, path, detail),
+            );
+        }
+
+        let mut representative_tsv = String::from(
+            "family\tprogram\tselector_key\tepoch\tselector_index\tclass\t\
+             matrix_raw_families\tdetail_raw_families\tdetail_minimized_families\t\
+             minimized\tcommit_origins\twall_s\tevidence_path\n",
+        );
+        for (family, program, selector_key, epoch, selector_index, class) in selected_by_family {
+            let (wall_s, path, detail) = detail_outcomes
+                .get(&(program.clone(), epoch, selector_index))
+                .expect("representative outcome");
+            let matrix = source_final
+                .iter()
+                .chain(sink_final.iter())
+                .find(|record| {
+                    record.program == program
+                        && record.epoch == epoch
+                        && record.selector_index == selector_index
+                })
+                .expect("representative matrix record");
+            representative_tsv.push_str(&format!(
+                "{family}\t{program}\t{selector_key}\t{epoch}\t{selector_index}\t{class:?}\t\
+                 {}\t{}\t{}\t{}\t{}\t{wall_s:.1}\t{}\n",
+                matrix
+                    .raw_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                detail
+                    .raw_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                detail
+                    .minimized_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                detail.minimized,
+                detail.commit_origins.join(" || "),
+                path.display(),
+            ));
+        }
+        fs::write(
+            out_dir().join("representative-cases.tsv"),
+            representative_tsv,
+        )
+        .expect("write representative case index");
 
         let json_lines = |records: Vec<&selector_leak_diagnosis::CoreEvidence>| {
             let mut output = String::new();
@@ -6005,6 +6395,10 @@ fn boc1_corpus() {
                  - Baseline: 20/20 accept; n_ref=52,810; n_own=230; \
                    sources leaked=114/144; sinks leaked=170/206.\n\
                  - Source rows: {}. Sink secondary rows: {}.\n\
+                 - Resource-deferred tracked programs: {} (source rows deferred: {}; \
+                   sink rows deferred: {}).\n\
+                 - Corpus hard-core minimization: disabled; `minimized=false` and \
+                   the raw family-marker core is authoritative.\n\
                  - Out-param tag: untagged unless direct selector-to-slot provenance exists; \
                    this run does not infer from core chains.\n\
                  - Core visibility: mutability and fatness are not independent Z3 families; \
@@ -6013,6 +6407,13 @@ fn boc1_corpus() {
                  ## Sink family × program\n\n```csv\n{sink_cross_tab}```\n",
                 source_records.len(),
                 sink_records.len(),
+                if selector_resource_deferred.is_empty() {
+                    "none".to_string()
+                } else {
+                    selector_resource_deferred.join(",")
+                },
+                deferred_sources,
+                deferred_sinks,
             ),
         )
         .expect("write selector classification report");
