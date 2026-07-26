@@ -952,6 +952,7 @@ dependencies = [
  "points_to",
  "regex",
  "serde",
+ "serde_json",
  "similar",
  "tracing",
  "typed-arena",

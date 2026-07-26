@@ -93,7 +93,13 @@ mod report {
     pub fn sanitize(v: &str) -> String {
         let mut s: String = v
             .chars()
-            .map(|c| if c.is_whitespace() || c == '"' || c == '=' { '_' } else { c })
+            .map(|c| {
+                if c.is_whitespace() || c == '"' || c == '=' {
+                    '_'
+                } else {
+                    c
+                }
+            })
             .collect();
         s.truncate(120);
         s
@@ -202,15 +208,24 @@ mod report {
             sparse.set("program", "brotli");
             sparse.set("mode", "bo");
             sparse.set("status", "timeout");
-            let md = render_markdown(&[full.clone(), sparse.clone()], &["program", "status", "rounds"]);
+            let md = render_markdown(
+                &[full.clone(), sparse.clone()],
+                &["program", "status", "rounds"],
+            );
             assert!(md.contains("| bst | ok | 3 |"));
-            assert!(md.contains("| brotli | timeout | - |"), "missing cells render `-`:\n{md}");
+            assert!(
+                md.contains("| brotli | timeout | - |"),
+                "missing cells render `-`:\n{md}"
+            );
             let json = to_json_line(&full);
             assert!(json.contains("\"rounds\":3"), "numbers unquoted: {json}");
             assert!(json.contains("\"status\":\"ok\""), "strings quoted: {json}");
             let csv = render_csv(&[full, sparse]);
             let mut lines = csv.lines();
-            assert_eq!(lines.next(), Some("program,mode,status,rounds,t_fixpoint_s"));
+            assert_eq!(
+                lines.next(),
+                Some("program,mode,status,rounds,t_fixpoint_s")
+            );
             assert_eq!(lines.next(), Some("bst,bo,ok,3,0.500"));
             assert_eq!(lines.next(), Some("brotli,bo,timeout,,"));
         }
@@ -328,8 +343,9 @@ mod ownership_yield {
     }
 
     pub fn read_worker_snapshot(path: &Path) -> Result<Vec<SlotRecord>, String> {
-        let input = fs::read_to_string(path)
-            .map_err(|error| format!("read ownership-yield snapshot {}: {error}", path.display()))?;
+        let input = fs::read_to_string(path).map_err(|error| {
+            format!("read ownership-yield snapshot {}: {error}", path.display())
+        })?;
         parse_snapshot_tsv(&input)
     }
 
@@ -370,8 +386,11 @@ mod ownership_yield {
             }
         }
 
-        let keys: BTreeSet<&str> =
-            bo_index.keys().chain(production_index.keys()).copied().collect();
+        let keys: BTreeSet<&str> = bo_index
+            .keys()
+            .chain(production_index.keys())
+            .copied()
+            .collect();
         let mut bo_only_owning = Vec::new();
         let mut production_only_owning = Vec::new();
         for key in keys {
@@ -386,8 +405,10 @@ mod ownership_yield {
             }
         }
 
-        let production_forced_output =
-            production.iter().filter(|record| record.forced_output).count();
+        let production_forced_output = production
+            .iter()
+            .filter(|record| record.forced_output)
+            .count();
         let production_counts = counts(production);
         Ok(Comparison {
             bo: counts(bo),
@@ -483,10 +504,7 @@ mod ownership_yield {
                 let parse_bool = |value: &str, name: &str| match value {
                     "0" => Ok(false),
                     "1" => Ok(true),
-                    other => Err(format!(
-                        "snapshot line {} {name}: {other}",
-                        index + 2
-                    )),
+                    other => Err(format!("snapshot line {} {name}: {other}", index + 2)),
                 };
                 Ok(SlotRecord {
                     key: hex_decode(fields[0])?,
@@ -635,10 +653,7 @@ mod ownership_yield {
             };
             for (classification, keys) in [
                 ("bo_only_owning", &comparison.bo_only_owning),
-                (
-                    "production_only_owning",
-                    &comparison.production_only_owning,
-                ),
+                ("production_only_owning", &comparison.production_only_owning),
                 ("bo_universe_only", &comparison.bo_universe_only),
                 (
                     "production_universe_only",
@@ -673,7 +688,11 @@ mod ownership_yield {
         if keys.is_empty() {
             return "—".to_string();
         }
-        keys.iter().take(5).cloned().collect::<Vec<_>>().join("<br>")
+        keys.iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("<br>")
     }
 
     pub fn render_markdown(rows: &[ProgramSummary]) -> String {
@@ -719,12 +738,7 @@ mod ownership_yield {
             let production_status = row
                 .production_failure
                 .as_ref()
-                .map(|reason| {
-                    format!(
-                        "failed ({reason}, cap {}s)",
-                        row.production_cap_s
-                    )
-                })
+                .map(|reason| format!("failed ({reason}, cap {}s)", row.production_cap_s))
                 .unwrap_or_else(|| row.production_status.clone());
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
@@ -824,7 +838,10 @@ mod ownership_yield {
             );
             assert_eq!(got.bo_only_owning, ["crate::S::field0@d1"]);
             assert_eq!(got.production_only_owning, ["crate::g::_2@d1"]);
-            assert_eq!(got.bo_universe_only, ["crate::S::field0@d1", "crate::f::_9@d0"]);
+            assert_eq!(
+                got.bo_universe_only,
+                ["crate::S::field0@d1", "crate::f::_9@d0"]
+            );
             assert_eq!(
                 got.production_universe_only,
                 ["crate::g::_2@d1", "crate::g::_7@d3"]
@@ -888,28 +905,54 @@ mod ownership_yield {
 /// imposed and extracts hard-family cores; nothing in this module changes a
 /// production solver decision.
 mod selector_leak_diagnosis {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::Path,
+    };
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    use serde::{Deserialize, Serialize};
+
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::ModeACommitTrace,
+        slots::SlotId,
+        solver::{
+            SelectorTrace, SelectorTraceOutcome as SolverOutcome,
+            SelectorTracePhase as SolverPhase, SlotRef,
+        },
+    };
+
+    pub const ENV: &str = "CRAT_BOC1_SELECTOR_LEAK_DIAG";
+
+    pub fn enabled() -> bool {
+        match std::env::var(ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     pub enum SelectorClass {
         Source,
         Sink,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum TracePhase {
         Drop,
         Reenable,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum TraceOutcome {
         Dropped,
         Restored,
         StayedDropped,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct TraceEvent {
         pub epoch: usize,
         pub phase: TracePhase,
@@ -920,7 +963,7 @@ mod selector_leak_diagnosis {
         pub outcome: TraceOutcome,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct CommitEvent {
         pub round: usize,
         pub target: String,
@@ -928,14 +971,14 @@ mod selector_leak_diagnosis {
         pub requirers: Vec<String>,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum OutParamTag {
         Crosses,
         DoesNotCross,
         Untagged,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct CoreRecord {
         pub program: String,
         pub selector_key: String,
@@ -948,14 +991,273 @@ mod selector_leak_diagnosis {
         pub commit_origin: Option<String>,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PortableSlot {
+        Field { slot: usize },
+        Local { function: usize, slot: usize },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PortableCommit {
+        pub round: usize,
+        pub target: PortableSlot,
+        pub issuer: Option<PortableSlot>,
+        pub requirers: Vec<PortableSlot>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct EpochTrace {
+        pub events: Vec<TraceEvent>,
+        pub final_dropped: Vec<usize>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct OfficialTrace {
+        pub program: String,
+        pub code_sha: String,
+        pub n_sources: usize,
+        pub total_selectors: usize,
+        pub epochs: Vec<EpochTrace>,
+        pub commits: Vec<PortableCommit>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CoreEvidence {
+        pub program: String,
+        pub selector_key: String,
+        pub selector_index: usize,
+        pub class: SelectorClass,
+        pub epoch: usize,
+        pub phase: TracePhase,
+        pub outcome: TraceOutcome,
+        pub active_before: Vec<usize>,
+        pub official_selector_core: Vec<usize>,
+        pub raw_labels: Vec<String>,
+        pub raw_families: BTreeSet<String>,
+        pub minimized_labels: Vec<String>,
+        pub minimized_families: BTreeSet<String>,
+        pub minimized: bool,
+        pub out_param_tag: OutParamTag,
+        pub commit_origins: Vec<String>,
+    }
+
+    fn phase(phase: SolverPhase) -> TracePhase {
+        match phase {
+            SolverPhase::Drop => TracePhase::Drop,
+            SolverPhase::Reenable => TracePhase::Reenable,
+        }
+    }
+
+    fn outcome(outcome: SolverOutcome) -> TraceOutcome {
+        match outcome {
+            SolverOutcome::Dropped => TraceOutcome::Dropped,
+            SolverOutcome::Restored => TraceOutcome::Restored,
+            SolverOutcome::StayedDropped => TraceOutcome::StayedDropped,
+        }
+    }
+
+    fn portable_slot(functions: &[rustc_span::def_id::LocalDefId], slot: SlotRef) -> PortableSlot {
+        match slot {
+            SlotRef::Field(slot) => PortableSlot::Field { slot: slot.index() },
+            SlotRef::Local(function, slot) => PortableSlot::Local {
+                function: functions
+                    .iter()
+                    .position(|candidate| *candidate == function)
+                    .unwrap_or_else(|| panic!("commit references foreign function {function:?}")),
+                slot: slot.index(),
+            },
+        }
+    }
+
+    pub fn restore_slot(
+        functions: &[rustc_span::def_id::LocalDefId],
+        slot: PortableSlot,
+    ) -> SlotRef {
+        match slot {
+            PortableSlot::Field { slot } => SlotRef::Field(SlotId::from_usize(slot)),
+            PortableSlot::Local { function, slot } => SlotRef::Local(
+                *functions
+                    .get(function)
+                    .unwrap_or_else(|| panic!("portable function index {function} out of range")),
+                SlotId::from_usize(slot),
+            ),
+        }
+    }
+
+    pub fn portable_slot_key(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        functions: &[rustc_span::def_id::LocalDefId],
+        slot: PortableSlot,
+    ) -> String {
+        match slot {
+            PortableSlot::Field { slot } => format!("field:{slot}"),
+            PortableSlot::Local { function, slot } => {
+                let did = functions
+                    .get(function)
+                    .unwrap_or_else(|| panic!("portable function index {function} out of range"));
+                format!("{}:{slot}", tcx.def_path_str(did.to_def_id()))
+            }
+        }
+    }
+
+    pub fn official_trace(
+        program: &str,
+        code_sha: &str,
+        functions: &[rustc_span::def_id::LocalDefId],
+        trace: SelectorTrace,
+        commits: Vec<ModeACommitTrace>,
+    ) -> OfficialTrace {
+        let epochs = trace
+            .epochs
+            .into_iter()
+            .map(|epoch| EpochTrace {
+                events: epoch
+                    .events
+                    .into_iter()
+                    .map(|event| TraceEvent {
+                        epoch: event.epoch,
+                        phase: phase(event.phase),
+                        selector_index: event.selector_index,
+                        class: if event.selector_index < trace.n_sources {
+                            SelectorClass::Source
+                        } else {
+                            SelectorClass::Sink
+                        },
+                        active_before: event.active_before,
+                        core_selectors: event.core_selectors,
+                        outcome: outcome(event.outcome),
+                    })
+                    .collect(),
+                final_dropped: epoch.final_dropped,
+            })
+            .collect();
+        let commits = commits
+            .into_iter()
+            .map(|commit| PortableCommit {
+                round: commit.round,
+                target: portable_slot(functions, commit.target),
+                issuer: commit
+                    .conflict
+                    .issuer
+                    .map(|slot| portable_slot(functions, slot)),
+                requirers: commit
+                    .conflict
+                    .requirers
+                    .into_iter()
+                    .map(|slot| portable_slot(functions, slot))
+                    .collect(),
+            })
+            .collect();
+        OfficialTrace {
+            program: program.to_string(),
+            code_sha: code_sha.to_string(),
+            n_sources: trace.n_sources,
+            total_selectors: trace.total,
+            epochs,
+            commits,
+        }
+    }
+
+    pub fn write_official_trace(path: &Path, trace: &OfficialTrace) -> Result<(), String> {
+        let encoded = serde_json::to_string_pretty(trace)
+            .map_err(|error| format!("encode official selector trace: {error}"))?;
+        fs::write(path, format!("{encoded}\n"))
+            .map_err(|error| format!("write {}: {error}", path.display()))
+    }
+
+    pub fn read_official_trace(path: &Path) -> Result<OfficialTrace, String> {
+        let encoded = fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        serde_json::from_str(&encoded).map_err(|error| format!("parse {}: {error}", path.display()))
+    }
+
+    pub fn write_core_evidence(path: &Path, evidence: &[CoreEvidence]) -> Result<(), String> {
+        let mut output = String::new();
+        for record in evidence {
+            output.push_str(
+                &serde_json::to_string(record)
+                    .map_err(|error| format!("encode selector core evidence: {error}"))?,
+            );
+            output.push('\n');
+        }
+        fs::write(path, output).map_err(|error| format!("write {}: {error}", path.display()))
+    }
+
+    pub fn read_core_evidence(path: &Path) -> Result<Vec<CoreEvidence>, String> {
+        let input = fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        input
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|error| format!("parse {}: {error}", path.display()))
+            })
+            .collect()
+    }
+
+    pub fn final_records(
+        evidence: &[CoreEvidence],
+        class: SelectorClass,
+    ) -> Result<Vec<CoreRecord>, String> {
+        let mut latest: BTreeMap<&str, &CoreEvidence> = BTreeMap::new();
+        for record in evidence.iter().filter(|record| {
+            record.class == class
+                && record.phase == TracePhase::Reenable
+                && record.outcome == TraceOutcome::StayedDropped
+        }) {
+            match latest.get(record.selector_key.as_str()) {
+                Some(previous) if previous.epoch > record.epoch => {}
+                _ => {
+                    latest.insert(record.selector_key.as_str(), record);
+                }
+            }
+        }
+        latest
+            .into_values()
+            .map(|record| {
+                if record.minimized_labels.is_empty() {
+                    return Err(format!(
+                        "final dropped selector lacks an UNSAT core: {}",
+                        record.selector_key
+                    ));
+                }
+                let commits =
+                    (!record.commit_origins.is_empty()).then(|| record.commit_origins.join(" || "));
+                Ok(CoreRecord {
+                    program: record.program.clone(),
+                    selector_key: record.selector_key.clone(),
+                    phase: record.phase,
+                    raw_families: record.raw_families.clone(),
+                    minimized_families: record.minimized_families.clone(),
+                    minimized: record.minimized,
+                    reenable_outcome: record.outcome,
+                    out_param_tag: record.out_param_tag,
+                    commit_origin: commits,
+                })
+            })
+            .collect()
+    }
+
     pub fn capture_event(enabled: bool, event: TraceEvent) -> Vec<TraceEvent> {
-        let _ = (enabled, event);
-        unimplemented!("RED: selector trace capture is not implemented")
+        enabled.then_some(event).into_iter().collect()
     }
 
     pub fn final_dropped(events: &[TraceEvent]) -> BTreeSet<usize> {
-        let _ = events;
-        unimplemented!("RED: subset-minimal re-enable accounting is not implemented")
+        let mut dropped = BTreeSet::new();
+        for event in events {
+            match (event.phase, event.outcome) {
+                (TracePhase::Drop, TraceOutcome::Dropped)
+                | (TracePhase::Reenable, TraceOutcome::StayedDropped) => {
+                    dropped.insert(event.selector_index);
+                }
+                (TracePhase::Reenable, TraceOutcome::Restored) => {
+                    dropped.remove(&event.selector_index);
+                }
+                _ => {}
+            }
+        }
+        dropped
     }
 
     pub fn selector_key(
@@ -964,44 +1266,162 @@ mod selector_leak_diagnosis {
         overall_index: usize,
         n_sources: usize,
     ) -> String {
-        let _ = (program, class, overall_index, n_sources);
-        unimplemented!("RED: canonical selector keys are not implemented")
+        match class {
+            SelectorClass::Source => {
+                assert!(
+                    overall_index < n_sources,
+                    "source index outside source partition"
+                );
+                format!("{program}/source:{overall_index}")
+            }
+            SelectorClass::Sink => {
+                assert!(
+                    overall_index >= n_sources,
+                    "sink index inside source partition"
+                );
+                format!("{program}/sink:{}", overall_index - n_sources)
+            }
+        }
     }
 
     pub fn commits_for_epoch(epoch: usize, commits: &[CommitEvent]) -> Vec<CommitEvent> {
-        let _ = (epoch, commits);
-        unimplemented!("RED: original-round commit replay is not implemented")
+        let mut matching = commits
+            .iter()
+            .filter(|commit| commit.round == epoch)
+            .cloned()
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| left.target.cmp(&right.target));
+        matching
     }
 
     pub fn validate_families<'a>(
         labels: impl IntoIterator<Item = &'a str>,
         known: &[&str],
     ) -> Result<BTreeSet<String>, String> {
-        let _ = (labels, known);
-        unimplemented!("RED: hard-family validation is not implemented")
+        labels
+            .into_iter()
+            .map(|label| {
+                known
+                    .iter()
+                    .copied()
+                    .find(|family| label.contains(family))
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("unrecognized hard-family label: {label}"))
+            })
+            .collect()
     }
 
     pub fn minimized_claim(core_len: usize, saw_unknown: bool, cap: usize) -> bool {
-        let _ = (core_len, saw_unknown, cap);
-        unimplemented!("RED: minimization honesty is not implemented")
+        core_len <= cap && !saw_unknown
     }
 
-    pub fn borrow_commit_origin(
-        labels: &[String],
-        commits: &[CommitEvent],
-    ) -> Option<String> {
-        let _ = (labels, commits);
-        unimplemented!("RED: second-order borrow-commit attribution is not implemented")
+    pub fn borrow_commit_origin(labels: &[String], commits: &[CommitEvent]) -> Option<String> {
+        if !labels
+            .iter()
+            .any(|label| label.contains("borrow-exclusion"))
+        {
+            return None;
+        }
+        let commit = commits.iter().find(|commit| {
+            labels
+                .iter()
+                .any(|label| label.contains("borrow-exclusion") && label.contains(&commit.target))
+        })?;
+        Some(format!(
+            "round={} target={} issuer={} requirers={}",
+            commit.round,
+            commit.target,
+            commit.issuer.as_deref().unwrap_or("-"),
+            commit.requirers.join("+")
+        ))
     }
 
     pub fn render_records(records: &[CoreRecord]) -> (String, String) {
-        let _ = records;
-        unimplemented!("RED: classification/cross-tab rendering is not implemented")
+        let programs = records
+            .iter()
+            .map(|record| record.program.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut rows = String::from(
+            "program,selector_key,phase,raw_families,minimized_families,minimized,\
+             reenable_outcome,out_param_tag,commit_origin\n",
+        );
+        for record in records {
+            let phase = match record.phase {
+                TracePhase::Drop => "drop",
+                TracePhase::Reenable => "reenable",
+            };
+            let outcome = match record.reenable_outcome {
+                TraceOutcome::Dropped => "dropped",
+                TraceOutcome::Restored => "restored",
+                TraceOutcome::StayedDropped => "stayed-dropped",
+            };
+            let out_param = match record.out_param_tag {
+                OutParamTag::Crosses => "crosses",
+                OutParamTag::DoesNotCross => "does-not-cross",
+                OutParamTag::Untagged => "untagged",
+            };
+            rows.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{}\n",
+                record.program,
+                record.selector_key,
+                phase,
+                record
+                    .raw_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                record
+                    .minimized_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                record.minimized,
+                outcome,
+                out_param,
+                record.commit_origin.as_deref().unwrap_or("-"),
+            ));
+        }
+
+        let mut counts: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
+        for record in records {
+            for family in &record.minimized_families {
+                *counts
+                    .entry(family.clone())
+                    .or_default()
+                    .entry(record.program.as_str())
+                    .or_default() += 1;
+            }
+        }
+        let mut cross_tab = format!(
+            "family,{},total\n",
+            programs.iter().copied().collect::<Vec<_>>().join(",")
+        );
+        for (family, by_program) in counts {
+            let mut total = 0usize;
+            cross_tab.push_str(&family);
+            for program in &programs {
+                let count = by_program.get(program).copied().unwrap_or(0);
+                total += count;
+                cross_tab.push_str(&format!(",{count}"));
+            }
+            cross_tab.push_str(&format!(",{total}\n"));
+        }
+        (rows, cross_tab)
     }
 
-    pub fn cheap_out_param_tag(has_direct_selector_slot: bool, crosses_boundary: bool) -> OutParamTag {
-        let _ = (has_direct_selector_slot, crosses_boundary);
-        unimplemented!("RED: out-param tag policy is not implemented")
+    pub fn cheap_out_param_tag(
+        has_direct_selector_slot: bool,
+        crosses_boundary: bool,
+    ) -> OutParamTag {
+        if !has_direct_selector_slot {
+            OutParamTag::Untagged
+        } else if crosses_boundary {
+            OutParamTag::Crosses
+        } else {
+            OutParamTag::DoesNotCross
+        }
     }
 
     #[cfg(test)]
@@ -1027,16 +1447,18 @@ mod selector_leak_diagnosis {
 
         #[test]
         fn selector_leak_capture_disabled_is_inert() {
-            assert!(capture_event(
-                false,
-                event(
-                    TracePhase::Drop,
-                    0,
-                    SelectorClass::Source,
-                    TraceOutcome::Dropped,
-                ),
-            )
-            .is_empty());
+            assert!(
+                capture_event(
+                    false,
+                    event(
+                        TracePhase::Drop,
+                        0,
+                        SelectorClass::Source,
+                        TraceOutcome::Dropped,
+                    ),
+                )
+                .is_empty()
+            );
         }
 
         #[test]
@@ -1174,14 +1596,8 @@ mod selector_leak_diagnosis {
                 commit_origin: Some("target=x issuer=y".to_string()),
             };
             assert_eq!(record.out_param_tag, OutParamTag::Untagged);
-            assert_eq!(
-                cheap_out_param_tag(true, true),
-                OutParamTag::Crosses
-            );
-            assert_eq!(
-                cheap_out_param_tag(true, false),
-                OutParamTag::DoesNotCross
-            );
+            assert_eq!(cheap_out_param_tag(true, true), OutParamTag::Crosses);
+            assert_eq!(cheap_out_param_tag(true, false), OutParamTag::DoesNotCross);
             let (rows, cross_tab) = render_records(&[record]);
             for needle in [
                 "bst/source:0",
@@ -1244,14 +1660,20 @@ mod provenance {
             let l = line("d2c4f828abcdef", false, 1_700_000_000);
             assert!(l.starts_with("{\"_provenance\":"), "line-1 object: {l}");
             assert_eq!(parse_sha(&l).as_deref(), Some("d2c4f828abcdef"));
-            assert!(line("abc", true, 1).contains("\"dirty\":true"), "dirty flag carried");
+            assert!(
+                line("abc", true, 1).contains("\"dirty\":true"),
+                "dirty flag carried"
+            );
             // A data row is not a provenance stamp.
             assert_eq!(parse_sha("{\"program\":\"bst\",\"mode\":\"bo\"}"), None);
             // Fresh (SHA matches) → keep; no file → keep.
             assert_eq!(stale_verdict(Some(&l), "d2c4f828abcdef"), None);
             assert_eq!(stale_verdict(None, "d2c4f828abcdef"), None);
             // SHA mismatch → move aside under the STALE file's short SHA.
-            assert_eq!(stale_verdict(Some(&l), "ffffffffffff").as_deref(), Some("d2c4f828"));
+            assert_eq!(
+                stale_verdict(Some(&l), "ffffffffffff").as_deref(),
+                Some("d2c4f828")
+            );
             // Pre-guard file (no stamp) → move aside as `nostamp` (the phantom-regression case).
             assert_eq!(
                 stale_verdict(Some("{\"program\":\"bst\"}"), "d2c4f828abcdef").as_deref(),
@@ -1344,9 +1766,9 @@ mod l2_red_gate {
                 Target {
                     program: fields[0].to_string(),
                     slot: fields[1].to_string(),
-                    audit_round: fields[2]
-                        .parse()
-                        .unwrap_or_else(|_| panic!("invalid audit round in L2 RED target row: {line}")),
+                    audit_round: fields[2].parse().unwrap_or_else(|_| {
+                        panic!("invalid audit round in L2 RED target row: {line}")
+                    }),
                 }
             })
             .collect()
@@ -1386,7 +1808,11 @@ mod l2_red_gate {
         );
 
         let targets = targets();
-        assert_eq!(targets.len(), 26, "L2 RED inventory must remain certified N=26");
+        assert_eq!(
+            targets.len(),
+            26,
+            "L2 RED inventory must remain certified N=26"
+        );
         let mut seen = BTreeSet::new();
         let mut by_program = BTreeMap::<String, usize>::new();
         let mut by_round = BTreeMap::<usize, usize>::new();
@@ -1437,7 +1863,10 @@ mod l2_red_gate {
     }
 
     pub fn summary(rows: &[Row]) -> String {
-        let accepted = rows.iter().filter(|row| row.get("status") == Some("ok")).count();
+        let accepted = rows
+            .iter()
+            .filter(|row| row.get("status") == Some("ok"))
+            .count();
         let found = rows
             .iter()
             .filter_map(|row| row.get("l2_targets_found"))
@@ -1513,9 +1942,21 @@ mod l2_red_gate {
             "L2 RED requires 20/20 accepted Mode-A rows; non-accepts={non_accepts:?}"
         );
         for row in rows {
-            assert_eq!(row.get("repair"), Some("mode_a"), "L2 RED row is not Mode-A: {row:?}");
-            assert_eq!(row.get("l2_feature"), Some("on"), "L2 flag did not reach worker: {row:?}");
-            assert_eq!(row.get("l2_diag"), Some("raw"), "L2 diagnostics did not reach worker: {row:?}");
+            assert_eq!(
+                row.get("repair"),
+                Some("mode_a"),
+                "L2 RED row is not Mode-A: {row:?}"
+            );
+            assert_eq!(
+                row.get("l2_feature"),
+                Some("on"),
+                "L2 flag did not reach worker: {row:?}"
+            );
+            assert_eq!(
+                row.get("l2_diag"),
+                Some("raw"),
+                "L2 diagnostics did not reach worker: {row:?}"
+            );
             assert_eq!(
                 row.get("safe_mono"),
                 Some("per_site"),
@@ -1551,7 +1992,10 @@ mod l2_red_gate {
             "L2 RED inventory slot missing or renamed; re-anchor is required"
         );
 
-        let actual_n_ref = rows.iter().map(|row| usize_field(row, "n_ref")).sum::<usize>();
+        let actual_n_ref = rows
+            .iter()
+            .map(|row| usize_field(row, "n_ref"))
+            .sum::<usize>();
         let base_n_ref = rows
             .iter()
             .map(|row| usize_field(row, "l2_base_n_ref"))
@@ -1583,7 +2027,6 @@ mod l2_red_gate {
     }
 }
 
-
 // §NB4-4c-Q: re-export the collateral measurement so the RED shape tests (in `tests.rs`, outside this
 // private module) validate the EXACT harness code the sweep runs, not a copy.
 #[cfg(test)]
@@ -1591,7 +2034,10 @@ pub(crate) use run::{CollateralMeasurement, measure_collateral};
 
 /// Per-mode analysis drivers producing report rows.
 mod run {
-    use std::time::{Duration, Instant};
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
 
     use points_to::andersen;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -1602,6 +2048,9 @@ mod run {
         collect_program,
         ownership_yield::{self, OwnerClass, SlotRecord},
         report::Row,
+        selector_leak_diagnosis::{
+            self, CommitEvent, CoreEvidence, OutParamTag, SelectorClass, TraceOutcome,
+        },
     };
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
@@ -1609,7 +2058,7 @@ mod run {
             CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::{
                 RepairMode, model_accepts, slotref_key, verify_to_fixpoint,
-                verify_to_fixpoint_counting, with_capture,
+                verify_to_fixpoint_counting, with_capture, with_mode_a_commit_trace,
             },
             coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
@@ -1617,7 +2066,10 @@ mod run {
             mutability_facts::{MutFacts, MutFactsMode, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
-            solver::{KindSolver, Selectors, SlotRef},
+            solver::{
+                CORE_LABEL_FAMILIES, CoreTracker, KindSolver, Selectors, SlotRef,
+                with_selector_trace,
+            },
             sources::collect_malloc_source_slots,
         },
     };
@@ -1630,7 +2082,12 @@ mod run {
         eprintln!("BOC1PHASE {name} t={:.2}", since.elapsed().as_secs_f64());
     }
 
-    fn local_key(tcx: TyCtxt<'_>, fn_did: rustc_span::def_id::LocalDefId, local: usize, depth: u8) -> String {
+    fn local_key(
+        tcx: TyCtxt<'_>,
+        fn_did: rustc_span::def_id::LocalDefId,
+        local: usize,
+        depth: u8,
+    ) -> String {
         format!(
             "{}::_{}@d{depth}",
             tcx.def_path_str(fn_did.to_def_id()),
@@ -1775,7 +2232,10 @@ mod run {
             solver.add_borrow_exclusion(Some(*slot), &[]);
         }
         for &g in &program.functions {
-            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(g)
+                .borrow();
             add_coherence(&solver, slots, g, &body);
         }
         verify_to_fixpoint(program, slots, &solver, &selectors, mut_facts)
@@ -1799,18 +2259,26 @@ mod run {
         let full_vec = collect_no_borrow_origin_slots(origins, slots);
         let full_set: FxHashSet<SlotRef> = full_vec.iter().copied().collect();
         let raw_set: FxHashSet<SlotRef> =
-            collect_overincluded_modeled_origin_slots(origins, slots, false).into_iter().collect();
+            collect_overincluded_modeled_origin_slots(origins, slots, false)
+                .into_iter()
+                .collect();
         let mit_set: FxHashSet<SlotRef> =
-            collect_overincluded_modeled_origin_slots(origins, slots, true).into_iter().collect();
-        let upper_set: FxHashSet<SlotRef> =
-            collect_upperbound_overincluded_slots(origins, slots).into_iter().collect();
+            collect_overincluded_modeled_origin_slots(origins, slots, true)
+                .into_iter()
+                .collect();
+        let upper_set: FxHashSet<SlotRef> = collect_upperbound_overincluded_slots(origins, slots)
+            .into_iter()
+            .collect();
         assert!(
             raw_set.is_subset(&full_set)
                 && mit_set.is_subset(&full_set)
                 && upper_set.is_subset(&full_set),
             "NB4-4c-Q: an over-inclusion set ⊄ FULL demotion set (mapping drift)"
         );
-        assert!(mit_set.is_subset(&upper_set), "NB4-4c-Q: mitigated ⊄ upper (invariant)");
+        assert!(
+            mit_set.is_subset(&upper_set),
+            "NB4-4c-Q: mitigated ⊄ upper (invariant)"
+        );
         let (n_raw, n_mit, n_upper) = (raw_set.len(), mit_set.len(), upper_set.len());
         let build = |status, nf: Option<usize>, nd0, cm, cdm, cu, cdu| CollateralMeasurement {
             status,
@@ -1835,11 +2303,23 @@ mod run {
         };
         let (nref_full, nref_d0_full) = count_refs(&full_model, slots);
         let minus = |exclude: &FxHashSet<SlotRef>| -> Option<(usize, usize)> {
-            let v: Vec<SlotRef> = full_vec.iter().copied().filter(|s| !exclude.contains(s)).collect();
+            let v: Vec<SlotRef> = full_vec
+                .iter()
+                .copied()
+                .filter(|s| !exclude.contains(s))
+                .collect();
             solve_with_demotion(program, slots, &v, mut_facts).map(|m| count_refs(&m, slots))
         };
         let Some((nref_mu, nref_d0_mu)) = minus(&upper_set) else {
-            return build("real-decline", Some(nref_full), Some(nref_d0_full), 0, 0, 0, 0);
+            return build(
+                "real-decline",
+                Some(nref_full),
+                Some(nref_d0_full),
+                0,
+                0,
+                0,
+                0,
+            );
         };
         // MINUS_mit: reuse FULL if `mit` empty, reuse `upper`'s solve if the sets are equal, else solve.
         let (nref_mm, nref_d0_mm) = if mit_set.is_empty() {
@@ -1849,7 +2329,17 @@ mod run {
         } else {
             match minus(&mit_set) {
                 Some(x) => x,
-                None => return build("real-decline", Some(nref_full), Some(nref_d0_full), 0, 0, 0, 0),
+                None => {
+                    return build(
+                        "real-decline",
+                        Some(nref_full),
+                        Some(nref_d0_full),
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                }
             }
         };
         build(
@@ -1887,7 +2377,10 @@ mod run {
         let (_stats, selectors) =
             emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
         for &g in &program.functions {
-            let body = program.tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(g)
+                .borrow();
             add_coherence(&solver, slots, g, &body);
         }
         constrain_field_ownership(&solver, slots, program);
@@ -1950,7 +2443,15 @@ mod run {
             .enumerate()
             .filter_map(|(j, &c)| (j != i).then_some(c))
             .collect();
-        if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, commit_set[i]) {
+        if probe_accepts_with_ref(
+            program,
+            slots,
+            &base,
+            &selectors,
+            is_mutable,
+            &demote,
+            commit_set[i],
+        ) {
             ProbeOutcome::OverPin
         } else {
             ProbeOutcome::Necessary
@@ -1971,7 +2472,12 @@ mod run {
                     Some((SlotOwner::Local(l), d)) => (l.as_u32(), d),
                     other => (u32::MAX, other.map_or(0, |(_, d)| d)),
                 };
-                format!("{}::_{}@d{}", program.tcx.def_path_str(fn_did.to_def_id()), local, depth)
+                format!(
+                    "{}::_{}@d{}",
+                    program.tcx.def_path_str(fn_did.to_def_id()),
+                    local,
+                    depth
+                )
             }
             SlotRef::Field(sid) => {
                 let sl = slots.field_slots.slot(sid);
@@ -2134,7 +2640,8 @@ mod run {
             return;
         };
         let slots_only: Vec<SlotRef> = commit_set.iter().map(|(s, _)| *s).collect();
-        let program_name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
         // --- Independent pass (over-count diagnostic; each ci vs the FULL C\{ci}). It is exactly `n`
         // extra solves on top of the greedy pass, so for the largest programs it is the difference
@@ -2146,8 +2653,17 @@ mod run {
         } else {
             let mut indep_overpins = 0usize;
             for i in 0..n {
-                let demote: Vec<SlotRef> = (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
-                if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+                let demote: Vec<SlotRef> =
+                    (0..n).filter(|&j| j != i).map(|j| slots_only[j]).collect();
+                if probe_accepts_with_ref(
+                    program,
+                    slots,
+                    &base,
+                    &selectors,
+                    is_mutable,
+                    &demote,
+                    slots_only[i],
+                ) {
                     indep_overpins += 1;
                 }
             }
@@ -2161,9 +2677,19 @@ mod run {
         for i in 0..n {
             // Demote every STILL-retained commit except the candidate; the already-removed commits are
             // left un-demoted (Ref-eligible), so removability is tested GIVEN the recovered set.
-            let demote: Vec<SlotRef> =
-                (0..n).filter(|&j| j != i && retained[j]).map(|j| slots_only[j]).collect();
-            if probe_accepts_with_ref(program, slots, &base, &selectors, is_mutable, &demote, slots_only[i]) {
+            let demote: Vec<SlotRef> = (0..n)
+                .filter(|&j| j != i && retained[j])
+                .map(|j| slots_only[j])
+                .collect();
+            if probe_accepts_with_ref(
+                program,
+                slots,
+                &base,
+                &selectors,
+                is_mutable,
+                &demote,
+                slots_only[i],
+            ) {
                 retained[i] = false;
                 removed.push(commit_set[i]);
             }
@@ -2175,7 +2701,10 @@ mod run {
         // the removed set is provably jointly recoverable → publish the gate number + inventory + `ok`.
         // On failure (a sequential-removal hole, or the pins are UNSAT) the gate metric is SUPPRESSED and
         // the status is `witness-failed` — a never-silent, never-trusted uncertified count.
-        let final_demote: Vec<SlotRef> = (0..n).filter(|&j| retained[j]).map(|j| slots_only[j]).collect();
+        let final_demote: Vec<SlotRef> = (0..n)
+            .filter(|&j| retained[j])
+            .map(|j| slots_only[j])
+            .collect();
         base.push_scope();
         for &(s, _) in &removed {
             base.assume(s, SlotKind::Ref);
@@ -2203,7 +2732,10 @@ mod run {
         row.set("na_overpins", removed.len());
         for &(s, r) in &removed {
             // Grep-able RED inventory (the `NBRCORE` pattern): one line per CERTIFIED over-pin.
-            eprintln!("NAOVERPIN {program_name} {} round={r}", fmt_slot(program, slots, s));
+            eprintln!(
+                "NAOVERPIN {program_name} {} round={r}",
+                fmt_slot(program, slots, s)
+            );
         }
         let mut by_round: FxHashMap<usize, usize> = FxHashMap::default();
         for &(_, r) in &removed {
@@ -2213,7 +2745,11 @@ mod run {
         rounds.sort();
         row.set(
             "na_overpins_by_round",
-            rounds.iter().map(|(r, c)| format!("{r}:{c}")).collect::<Vec<_>>().join("/"),
+            rounds
+                .iter()
+                .map(|(r, c)| format!("{r}:{c}"))
+                .collect::<Vec<_>>()
+                .join("/"),
         );
         row.set("na_status", "ok");
     }
@@ -2234,7 +2770,7 @@ mod run {
         row: &mut Row,
     ) {
         assert!(
-            !l2::enabled_from_env(),
+            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
             "certified-context replay must capture the Mode-A feature-off commit set"
         );
         assert!(
@@ -2242,8 +2778,8 @@ mod run {
             "certified-context replay requires CRAT_POINTER_DECISION_DIAGNOSTICS"
         );
 
-        let program_name =
-            std::env::var("CRAT_BOC1_NAME").expect("certified-context worker requires program name");
+        let program_name = std::env::var("CRAT_BOC1_NAME")
+            .expect("certified-context worker requires program name");
         let expected = super::l2_red_gate::targets_for(&program_name);
         assert!(
             !expected.is_empty(),
@@ -2327,6 +2863,284 @@ mod run {
         row.set("l2_certified_check_sat", witness_checks);
     }
 
+    fn tracked_label(
+        literal: &Bool,
+        tracker: &CoreTracker,
+        selectors: &Selectors,
+        program_name: &str,
+    ) -> String {
+        if let Some(label) = tracker.label_of(literal) {
+            return label;
+        }
+        let index = selectors.index_of(literal).unwrap_or_else(|| {
+            panic!("tracked core contains an unrecognized assumption: {literal}")
+        });
+        let class = if index < selectors.sources().len() {
+            SelectorClass::Source
+        } else {
+            SelectorClass::Sink
+        };
+        format!(
+            "{}({})",
+            match class {
+                SelectorClass::Source => "source-selector",
+                SelectorClass::Sink => "sink-selector",
+            },
+            selector_leak_diagnosis::selector_key(
+                program_name,
+                class,
+                index,
+                selectors.sources().len(),
+            )
+        )
+    }
+
+    fn tracked_labels(
+        core: &[Bool],
+        tracker: &CoreTracker,
+        selectors: &Selectors,
+        program_name: &str,
+    ) -> Vec<String> {
+        core.iter()
+            .map(|literal| tracked_label(literal, tracker, selectors, program_name))
+            .collect()
+    }
+
+    fn commit_events_for_reporting(
+        tcx: TyCtxt<'_>,
+        program: &crate::utils::rustc::RustProgram,
+        trace: &selector_leak_diagnosis::OfficialTrace,
+    ) -> Vec<CommitEvent> {
+        trace
+            .commits
+            .iter()
+            .map(|commit| CommitEvent {
+                round: commit.round,
+                target: selector_leak_diagnosis::portable_slot_key(
+                    tcx,
+                    &program.functions,
+                    commit.target,
+                ),
+                issuer: commit.issuer.map(|slot| {
+                    selector_leak_diagnosis::portable_slot_key(tcx, &program.functions, slot)
+                }),
+                requirers: commit
+                    .requirers
+                    .iter()
+                    .map(|slot| {
+                        selector_leak_diagnosis::portable_slot_key(tcx, &program.functions, *slot)
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Tracked diagnostic worker. The official trace fixes every active
+    /// selector set and Mode-A commit boundary; this worker only extracts the
+    /// corresponding hard core.
+    pub fn run_selector_core(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("z3_full_version", z3::full_version().to_string());
+
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").expect("selector-core worker requires program name");
+        let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
+            .expect("selector-core worker requires CRAT_BOC1_SELECTOR_TRACE");
+        let evidence_path = std::env::var("CRAT_BOC1_SELECTOR_EVIDENCE")
+            .expect("selector-core worker requires CRAT_BOC1_SELECTOR_EVIDENCE");
+        let official = selector_leak_diagnosis::read_official_trace(Path::new(&trace_path))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(official.program, program_name);
+        assert_eq!(
+            official.code_sha,
+            super::orchestrate::git_sha(),
+            "selector trace/code SHA mismatch"
+        );
+
+        let program = collect_program(tcx);
+        let origins = compute_origins(&program);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new_tracked(&slots);
+        let (_stats, selectors) =
+            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                .expect("tracked selector-core emission");
+        let tracker = solver.tracker().expect("tracked solver");
+        tracker.set_context("coherence");
+        for &function in &program.functions {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            add_coherence(&solver, &slots, function, &body);
+        }
+        tracker.set_context("field-law");
+        constrain_field_ownership(&solver, &slots, &program);
+
+        assert_eq!(selectors.sources().len(), official.n_sources);
+        assert_eq!(selectors.all().len(), official.total_selectors);
+        let reporting_commits = commit_events_for_reporting(tcx, &program, &official);
+        let mut evidence = Vec::new();
+
+        for (epoch_index, epoch) in official.epochs.iter().enumerate() {
+            assert!(
+                epoch.events.iter().all(|event| event.epoch == epoch_index),
+                "official selector event epoch drift"
+            );
+            for commit in official
+                .commits
+                .iter()
+                .filter(|commit| commit.round == epoch_index)
+            {
+                let target_key = selector_leak_diagnosis::portable_slot_key(
+                    tcx,
+                    &program.functions,
+                    commit.target,
+                );
+                tracker.set_context(&format!("borrow-round-{epoch_index}-target={target_key}"));
+                solver.add_borrow_exclusion(
+                    Some(selector_leak_diagnosis::restore_slot(
+                        &program.functions,
+                        commit.target,
+                    )),
+                    &[],
+                );
+            }
+
+            for event in &epoch.events {
+                let mut assumptions = tracker.tracks();
+                assumptions.extend(event.active_before.iter().map(|index| {
+                    selectors
+                        .all()
+                        .get(*index)
+                        .unwrap_or_else(|| panic!("selector index {index} out of range"))
+                        .clone()
+                }));
+                let actual = solver.optimize().check(&assumptions);
+                let expected = match event.outcome {
+                    TraceOutcome::Dropped | TraceOutcome::StayedDropped => SatResult::Unsat,
+                    TraceOutcome::Restored => SatResult::Sat,
+                };
+                assert_eq!(
+                    actual, expected,
+                    "tracked reconstruction diverged at {program_name} epoch {epoch_index} \
+                     selector {} {:?}",
+                    event.selector_index, event.phase
+                );
+
+                let (raw_labels, minimized_labels, minimized) = if actual == SatResult::Unsat {
+                    let raw_core = solver.optimize().get_unsat_core();
+                    let raw_labels = tracked_labels(&raw_core, tracker, &selectors, &program_name);
+                    let (minimal_core, minimized) =
+                        super::explain::minimize_core(&solver, raw_core);
+                    let minimal_labels =
+                        tracked_labels(&minimal_core, tracker, &selectors, &program_name);
+                    (raw_labels, minimal_labels, minimized)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+                let raw_families = selector_leak_diagnosis::validate_families(
+                    raw_labels.iter().map(String::as_str),
+                    CORE_LABEL_FAMILIES,
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+                let minimized_families = selector_leak_diagnosis::validate_families(
+                    minimized_labels.iter().map(String::as_str),
+                    CORE_LABEL_FAMILIES,
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
+                let commit_origins = reporting_commits
+                    .iter()
+                    .filter(|commit| {
+                        minimized_labels.iter().any(|label| {
+                            label.contains("borrow-exclusion") && label.contains(&commit.target)
+                        })
+                    })
+                    .map(|commit| {
+                        format!(
+                            "round={} target={} issuer={} requirers={}",
+                            commit.round,
+                            commit.target,
+                            commit.issuer.as_deref().unwrap_or("-"),
+                            commit.requirers.join("+")
+                        )
+                    })
+                    .collect();
+                evidence.push(CoreEvidence {
+                    program: program_name.clone(),
+                    selector_key: selector_leak_diagnosis::selector_key(
+                        &program_name,
+                        event.class,
+                        event.selector_index,
+                        official.n_sources,
+                    ),
+                    selector_index: event.selector_index,
+                    class: event.class,
+                    epoch: epoch_index,
+                    phase: event.phase,
+                    outcome: event.outcome,
+                    active_before: event.active_before.clone(),
+                    official_selector_core: event.core_selectors.clone(),
+                    raw_labels,
+                    raw_families,
+                    minimized_labels,
+                    minimized_families,
+                    minimized,
+                    out_param_tag: OutParamTag::Untagged,
+                    commit_origins,
+                });
+            }
+
+            let dropped = epoch
+                .final_dropped
+                .iter()
+                .copied()
+                .collect::<FxHashSet<_>>();
+            let mut final_assumptions = tracker.tracks();
+            final_assumptions.extend(
+                selectors
+                    .all()
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !dropped.contains(index))
+                    .map(|(_, selector)| selector.clone()),
+            );
+            assert_eq!(
+                solver.optimize().check(&final_assumptions),
+                SatResult::Sat,
+                "tracked final retained set must be SAT at epoch {epoch_index}"
+            );
+        }
+
+        selector_leak_diagnosis::write_core_evidence(Path::new(&evidence_path), &evidence)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let final_dropped = official
+            .epochs
+            .last()
+            .map(|epoch| epoch.final_dropped.as_slice())
+            .unwrap_or_default();
+        row.set("selector_core_events", evidence.len());
+        row.set(
+            "selector_core_sources_final",
+            final_dropped
+                .iter()
+                .filter(|index| **index < official.n_sources)
+                .count(),
+        );
+        row.set(
+            "selector_core_sinks_final",
+            final_dropped
+                .iter()
+                .filter(|index| **index >= official.n_sources)
+                .count(),
+        );
+        row.set("check_sat_count", solver.check_sat_count());
+        row.set("t_total_s", secs(t0.elapsed()));
+        row.set("status", "ok");
+        row
+    }
+
     /// BO mode: the exact `assert_ownership_parity` construction, with the native fixpoint loop's
     /// round/commit counts (`verify_to_fixpoint_counting`), per-phase timings, and the model readout
     /// (kind tallies + leaked sources).
@@ -2358,20 +3172,29 @@ mod run {
         // signature slots 1:1, so origin_slots == the signature-slot count (ratio 1.0). `subset_edges`
         // reports the transitive-closure size (the real space concern at brotli scale). Both are
         // read-only over the still-UNINJECTED summaries — no effect on the replay / n_ref.
-        row.set("origin_slots", origins.values().map(|s| s.slots.len()).sum::<usize>());
+        row.set(
+            "origin_slots",
+            origins.values().map(|s| s.slots.len()).sum::<usize>(),
+        );
         row.set(
             "origin_subset_edges",
             origins
                 .values()
                 .map(|s| {
-                    s.subset.rows().map(|r| s.subset.row(r).map_or(0, |b| b.iter().count())).sum::<usize>()
+                    s.subset
+                        .rows()
+                        .map(|r| s.subset.row(r).map_or(0, |b| b.iter().count()))
+                        .sum::<usize>()
                 })
                 .sum::<usize>(),
         );
         // §NB3-3c-i F5 (Codex): the other retained-footprint dimension besides slots/subset edges is
         // the poisoned-slot set. (Storage is no longer a separate matrix — it folds into subset, F4 —
         // so there is no separate storage-edge count to report.)
-        row.set("origin_unknown_slots", origins.values().map(|s| s.unknown.count()).sum::<usize>());
+        row.set(
+            "origin_unknown_slots",
+            origins.values().map(|s| s.unknown.count()).sum::<usize>(),
+        );
 
         // §NB4-4c SEED-SIZE GATE (amendment 1): compute-only poisoned-slot tiers + untabled-extern
         // histogram, then return BEFORE the emit/solve. Sizes the F2 arg/field extensions so the
@@ -2383,20 +3206,22 @@ mod run {
         //                                      bridge is the deferred RED-5 spike, not needed for sizing)
         //   `untabled_externs`              = "name:ptr_arg_calls" histogram, top 12 by frequency
         if std::env::var_os("CRAT_BOC1_SEED_SIZE").is_some() {
+            use rustc_hash::{FxHashMap, FxHashSet};
+            use rustc_middle::mir::TerminatorKind;
+
             use crate::analyses::borrow_ownership::{
                 boundary_table::{self, Matcher},
                 origins::collect_no_borrow_origin_slots,
             };
-            use rustc_hash::{FxHashMap, FxHashSet};
-            use rustc_middle::mir::TerminatorKind;
 
             let slots = CrateSlots::build(&program);
             // The full no-borrow-origin set (base signature slots + mapped fields). Decompose it into
             // the two tiers so they don't double-count (the diagnostic's job is to isolate the field
             // extension): `poison_base` = unique Local members, `poison_field` = unique mapped
             // `SlotRef::Field` members. `all` (both) is the membership set the arg0-tier delta checks.
-            let all: FxHashSet<SlotRef> =
-                collect_no_borrow_origin_slots(&origins, &slots).into_iter().collect();
+            let all: FxHashSet<SlotRef> = collect_no_borrow_origin_slots(&origins, &slots)
+                .into_iter()
+                .collect();
             let base: FxHashSet<SlotRef> = all
                 .iter()
                 .copied()
@@ -2405,7 +3230,9 @@ mod run {
             row.set("poison_base", base.len());
             row.set(
                 "poison_field",
-                all.iter().filter(|s| matches!(s, SlotRef::Field(_))).count(),
+                all.iter()
+                    .filter(|s| matches!(s, SlotRef::Field(_)))
+                    .count(),
             );
 
             // c2rust emits cross-module *local* callees as `extern "C"` DECLARATIONS (ForeignItems
@@ -2517,7 +3344,11 @@ mod run {
         let slots = CrateSlots::build(&program);
         row.set("t_slots_s", secs(t.elapsed()));
         let slots_total: usize = slots.field_slots.len()
-            + slots.fn_local_slots.values().map(|u| u.len()).sum::<usize>();
+            + slots
+                .fn_local_slots
+                .values()
+                .map(|u| u.len())
+                .sum::<usize>();
         row.set("slots_total", slots_total);
         phase("slots_done", t0);
 
@@ -2545,9 +3376,22 @@ mod run {
                 collect_overincluded_modeled_origin_slots, collect_upperbound_overincluded_slots,
             };
             let dedup = |v: Vec<SlotRef>| v.into_iter().collect::<FxHashSet<_>>().len();
-            row.set("nb4c_overincl_raw", dedup(collect_overincluded_modeled_origin_slots(&origins, &slots, false)));
-            row.set("nb4c_overincl_mit", dedup(collect_overincluded_modeled_origin_slots(&origins, &slots, true)));
-            row.set("nb4c_overincl_upper", dedup(collect_upperbound_overincluded_slots(&origins, &slots)));
+            row.set(
+                "nb4c_overincl_raw",
+                dedup(collect_overincluded_modeled_origin_slots(
+                    &origins, &slots, false,
+                )),
+            );
+            row.set(
+                "nb4c_overincl_mit",
+                dedup(collect_overincluded_modeled_origin_slots(
+                    &origins, &slots, true,
+                )),
+            );
+            row.set(
+                "nb4c_overincl_upper",
+                dedup(collect_upperbound_overincluded_slots(&origins, &slots)),
+            );
             row.set("status", "collateral-count");
             return row;
         }
@@ -2602,11 +3446,43 @@ mod run {
         // to the non-audit branch (the sweep numbers do not move whether or not the audit is on).
         let audit = std::env::var_os("CRAT_BOC1_NECESSITY_AUDIT").is_some();
         let certified_context = certified_context_enabled();
+        let selector_core_capture = match std::env::var("CRAT_BOC1_SELECTOR_CORE").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("official") => true,
+            Ok(other) => panic!(
+                "CRAT_BOC1_SELECTOR_CORE must be 0 or official in the BO worker, got {other:?}"
+            ),
+            Err(error) => panic!("CRAT_BOC1_SELECTOR_CORE is not valid Unicode: {error}"),
+        };
         assert!(
-            !(audit && certified_context),
-            "necessity audit and certified-context witness-only replay are mutually exclusive"
+            [audit, certified_context, selector_core_capture]
+                .into_iter()
+                .filter(|enabled| *enabled)
+                .count()
+                <= 1,
+            "necessity audit, certified-context replay, and selector-core capture are mutually exclusive"
         );
-        let ((model, rstats), captured) = if audit || certified_context {
+        let ((model, rstats), captured) = if selector_core_capture {
+            let ((model_and_stats, commit_trace), selector_trace) = with_selector_trace(|| {
+                with_mode_a_commit_trace(|| {
+                    verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
+                })
+            });
+            let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
+                .expect("official selector-core worker requires CRAT_BOC1_SELECTOR_TRACE");
+            let program_name = std::env::var("CRAT_BOC1_NAME")
+                .expect("official selector-core worker requires CRAT_BOC1_NAME");
+            let trace = selector_leak_diagnosis::official_trace(
+                &program_name,
+                &super::orchestrate::git_sha(),
+                &program.functions,
+                selector_trace,
+                commit_trace,
+            );
+            selector_leak_diagnosis::write_official_trace(Path::new(&trace_path), &trace)
+                .unwrap_or_else(|error| panic!("{error}"));
+            (model_and_stats, None)
+        } else if audit || certified_context {
             let (mr, events) = with_capture(|| {
                 verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
             });
@@ -2682,7 +3558,11 @@ mod run {
                     {
                         row.set(
                             "decline_field",
-                            format!("{}::field{}", tcx.def_path_str(f.struct_did.to_def_id()), f.field_index),
+                            format!(
+                                "{}::field{}",
+                                tcx.def_path_str(f.struct_did.to_def_id()),
+                                f.field_index
+                            ),
                         );
                     }
                 } else {
@@ -2696,16 +3576,16 @@ mod run {
                 if rstats.field_conflict_decline.is_none()
                     && !rstats.cap_exhausted
                     && rstats.l2_decline.is_none()
-                    && std::env::var("CRAT_BOC1_EXPLAIN").map(|v| v == "1").unwrap_or(false) {
+                    && std::env::var("CRAT_BOC1_EXPLAIN")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                {
                     let t = Instant::now();
                     match super::explain::explain_unsat(tcx) {
                         super::explain::Explained::Unsat { core, minimized } => {
                             row.set("core_size", core.len());
                             row.set("core_minimized", minimized);
-                            row.set(
-                                "core_families",
-                                super::explain::family_histogram(&core),
-                            );
+                            row.set("core_families", super::explain::family_histogram(&core));
                             for label in &core {
                                 eprintln!("NBRCORE {label}");
                             }
@@ -2804,14 +3684,7 @@ mod run {
                         .unwrap_or_else(|error| panic!("{error}"));
                     row.set("ownership_yield_snapshot", records.len());
                 }
-                record_l2_red_inventory(
-                    &program,
-                    &slots,
-                    m,
-                    rstats.repair,
-                    n_ref,
-                    &mut row,
-                );
+                record_l2_red_inventory(&program, &slots, m, rstats.repair, n_ref, &mut row);
             }
         }
 
@@ -2827,19 +3700,14 @@ mod run {
                 row.set("na_status", "wrong-repair-mode");
             } else if certified_context {
                 let t = Instant::now();
-                run_certified_context(
-                    &program,
-                    &slots,
-                    &origins,
-                    &mut_facts,
-                    &events,
-                    &mut row,
-                );
+                run_certified_context(&program, &slots, &origins, &mut_facts, &events, &mut row);
                 row.set("t_certified_context_s", secs(t.elapsed()));
                 phase("certified_context_done", t0);
             } else {
                 let t = Instant::now();
-                run_necessity_audit(&program, &slots, &origins, &mut_facts, &model, &events, &mut row);
+                run_necessity_audit(
+                    &program, &slots, &origins, &mut_facts, &model, &events, &mut row,
+                );
                 row.set("t_necessity_s", secs(t.elapsed()));
                 phase("necessity_done", t0);
             }
@@ -2886,7 +3754,10 @@ mod run {
         // compare. Doubles the solve cost — off by default; the orchestrator
         // does not set it. Same mitigation as the fixture equivalence tests,
         // extended to real inputs on demand.
-        if std::env::var("CRAT_BOC1_CHECK_REAL").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("CRAT_BOC1_CHECK_REAL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             let t = Instant::now();
             let real = {
                 let crate_ctxt = CrateCtxt::new(&program);
@@ -2901,7 +3772,9 @@ mod run {
                         }
                         // §NB2: same oracle as run_bo's native solve above, so the fidelity check
                         // compares like with like (shipped facts vs a fresh real solve).
-                        Some(verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts))
+                        Some(verify_to_fixpoint(
+                            &program, &slots, &solver, &selectors, &mut_facts,
+                        ))
                     }
                     Err(_) => None,
                 }
@@ -2910,14 +3783,8 @@ mod run {
             match real {
                 None => row.set("real_status", "emit-error"),
                 Some(real) => {
-                    row.set(
-                        "real_status",
-                        if real.is_some() { "ok" } else { "decline" },
-                    );
-                    row.set(
-                        "real_matches_model",
-                        (real == model).to_string(),
-                    );
+                    row.set("real_status", if real.is_some() { "ok" } else { "decline" });
+                    row.set("real_matches_model", (real == model).to_string());
                 }
             }
             row.set("t_check_real_s", secs(t.elapsed()));
@@ -3031,8 +3898,7 @@ mod run {
             output_params::compute_output_params,
             ownership::{
                 AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
-                solidify::SolidifiedOwnershipSchemes,
-                whole_program::WholeProgramAnalysis,
+                solidify::SolidifiedOwnershipSchemes, whole_program::WholeProgramAnalysis,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         };
@@ -3115,8 +3981,7 @@ mod run {
             c_exposed_fns: FxHashSet::default(),
         };
         let pre_points_to = andersen::pre_analyze(&andersen_config, &type_shapes, tcx);
-        let points_to =
-            andersen::analyze(&andersen_config, &pre_points_to, &type_shapes, tcx);
+        let points_to = andersen::analyze(&andersen_config, &pre_points_to, &type_shapes, tcx);
         let aliases = crate::rewriter::find_param_aliases(&pre_points_to, &points_to, tcx);
         row.set("t_andersen_s", secs(t.elapsed()));
         phase("andersen_done", t0);
@@ -3127,7 +3992,10 @@ mod run {
         row.set("t_output_params_s", secs(t.elapsed()));
         row.set(
             "forced_output_params",
-            output_params.values().map(|params| params.iter().count()).sum::<usize>(),
+            output_params
+                .values()
+                .map(|params| params.iter().count())
+                .sum::<usize>(),
         );
         phase("output_params_done", t0);
 
@@ -3168,8 +4036,7 @@ mod run {
                 .checked_sub(forced)
                 .expect("forced output entries exceed production Owning count"),
         );
-        ownership_yield::write_worker_snapshot(&records)
-            .unwrap_or_else(|error| panic!("{error}"));
+        ownership_yield::write_worker_snapshot(&records).unwrap_or_else(|error| panic!("{error}"));
         row.set("ownership_yield_snapshot", records.len());
         row.set("status", "ok");
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
@@ -3357,16 +4224,26 @@ fn nb5m_native_round_stats_contract() {
     // path now RESTORES (field loan disabled → accept with the field Raw; see
     // `nb5f2_field_conflict_restores`); `field_conflict_decline` stays reachable only as the backstop
     // for genuinely un-dischargeable field residuals.
-    assert_eq!(accept.field_conflict_decline, None, "accept: no field-conflict decline");
+    assert_eq!(
+        accept.field_conflict_decline, None,
+        "accept: no field-conflict decline"
+    );
     // (b) accept WITH a conflict CASCADE: `x = id(p)` is a live Ref requirer invalidated by the write
     // through the base `b = p` (A′), committed `¬ref` over two commit rounds + the accepting round.
     let commit = stats_of(
         "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
          unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }",
     );
-    assert_eq!(commit.rounds, 3, "cascade: 2 commit rounds + accepting round");
+    assert_eq!(
+        commit.rounds, 3,
+        "cascade: 2 commit rounds + accepting round"
+    );
     assert_eq!(commit.commits_conflict, 2, "cascade: two commits");
-    assert_eq!(commit.commits_per_round, vec![1, 1, 0], "cascade: one commit/round then accept");
+    assert_eq!(
+        commit.commits_per_round,
+        vec![1, 1, 0],
+        "cascade: one commit/round then accept"
+    );
     assert_eq!(commit.dropped_sinks, 0);
     assert_eq!(commit.dropped_sources, 0);
     // (c) sink drop: the delete-node witness commits 3 conflicts, then the final solve leaks its two
@@ -3377,8 +4254,14 @@ fn nb5m_native_round_stats_contract() {
     assert_eq!(sink.rounds, 2);
     assert_eq!(sink.commits_conflict, 3);
     assert_eq!(sink.commits_per_round, vec![3, 0]);
-    assert_eq!(sink.dropped_sinks, 2, "delete-node leaks its two free sinks");
-    assert_eq!(sink.dropped_sources, 0, "the two dropped selectors are BOTH sinks (is_sink split)");
+    assert_eq!(
+        sink.dropped_sinks, 2,
+        "delete-node leaks its two free sinks"
+    );
+    assert_eq!(
+        sink.dropped_sources, 0,
+        "the two dropped selectors are BOTH sinks (is_sink split)"
+    );
     // (d) POSITIVE source drop (Codex RR-2): `&raw mut p` escapes the address of a malloc'd local,
     // so the alloc cannot be proven Owning; the eager `¬ref(source)` round-1 model surfaces one
     // conflict, committed into the accepting round-2 model, and the final solve DROPS the source
@@ -3387,11 +4270,17 @@ fn nb5m_native_round_stats_contract() {
         "unsafe extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; } \
          pub unsafe fn leak() -> *mut *mut core::ffi::c_void { let mut p = malloc(8); &raw mut p }",
     );
-    assert_eq!(source.rounds, 2, "source-drop: eager ¬ref round-1 + accepting round-2");
+    assert_eq!(
+        source.rounds, 2,
+        "source-drop: eager ¬ref round-1 + accepting round-2"
+    );
     assert_eq!(source.commits_conflict, 1, "source-drop: one commit");
     assert_eq!(source.commits_per_round, vec![1, 0]);
     assert_eq!(source.dropped_sinks, 0, "no free in this shape");
-    assert_eq!(source.dropped_sources, 1, "the leaked alloc drops its source selector (POSITIVE)");
+    assert_eq!(
+        source.dropped_sources, 1,
+        "the leaked alloc drops its source selector (POSITIVE)"
+    );
 }
 
 /// §NB5-F — field-universe expansion makes struct-field borrow conflicts visible to the BO
@@ -3441,7 +4330,11 @@ fn nb5f2_field_conflict_restores() {
             }
             let field_name = |id: SlotId| match slots.field_slots.slot(id).owner {
                 SlotOwner::Field(f) => {
-                    format!("{}::field{}", tcx.item_name(f.struct_did.to_def_id()), f.field_index)
+                    format!(
+                        "{}::field{}",
+                        tcx.item_name(f.struct_did.to_def_id()),
+                        f.field_index
+                    )
                 }
                 SlotOwner::Local(_) => "LOCAL-owner(bug)".to_string(),
             };
@@ -3457,7 +4350,10 @@ fn nb5f2_field_conflict_restores() {
                     }
                 }
             }
-            Outcome { accepted: model.is_some(), field_kinds }
+            Outcome {
+                accepted: model.is_some(),
+                field_kinds,
+            }
         })
         .unwrap_or_else(|e| e.raise())
     }
@@ -3465,28 +4361,32 @@ fn nb5f2_field_conflict_restores() {
     // (1) PURE field conflict (the F fixture, flipped): `h.p` borrows `x`, `x = 1` invalidates that
     // loan, `*h.p` uses it after. Under F this DECLINED (field requirer un-dischargeable); under F2 the
     // demotion loop disables `Holder::field0`'s loan → the conflict clears → ACCEPT with the field Raw.
-    let o = run(
-        "struct Holder { p: *mut i32 } \
+    let o = run("struct Holder { p: *mut i32 } \
          unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
-         h.p = &raw mut x; x = 1; *h.p = 2; }",
-    );
-    assert!(o.accepted, "F2: pure field conflict must now ACCEPT (field loan disabled), not decline");
+         h.p = &raw mut x; x = 1; *h.p = 2; }");
     assert!(
-        o.field_kinds.contains(&("Holder::field0".to_string(), SlotKind::Raw)),
+        o.accepted,
+        "F2: pure field conflict must now ACCEPT (field loan disabled), not decline"
+    );
+    assert!(
+        o.field_kinds
+            .contains(&("Holder::field0".to_string(), SlotKind::Raw)),
         "F2: the restored field settles Raw (its loan was disabled); got {:?}",
         o.field_kinds
     );
 
     // (2) MIXED edge (local `v` + field `h.p` both alias `x`, both written after): under F2 the field
     // is disabled AND the local `v` demotes on its own path → ACCEPT with the field Raw.
-    let o = run(
-        "struct Holder { p: *mut i32 } \
+    let o = run("struct Holder { p: *mut i32 } \
          unsafe fn f() { let mut x = 0i32; let mut h = Holder { p: core::ptr::null_mut() }; \
-         let v = &raw mut x; h.p = &raw mut x; x = 1; *h.p = 2; *v = 3; }",
-    );
-    assert!(o.accepted, "F2: mixed local+field conflict must now ACCEPT, not decline");
+         let v = &raw mut x; h.p = &raw mut x; x = 1; *h.p = 2; *v = 3; }");
     assert!(
-        o.field_kinds.contains(&("Holder::field0".to_string(), SlotKind::Raw)),
+        o.accepted,
+        "F2: mixed local+field conflict must now ACCEPT, not decline"
+    );
+    assert!(
+        o.field_kinds
+            .contains(&("Holder::field0".to_string(), SlotKind::Raw)),
         "F2: the restored field settles Raw; got {:?}",
         o.field_kinds
     );
@@ -3526,6 +4426,8 @@ fn nb5f2_field_conflict_restores() {
 #[test]
 #[ignore = "S2-3 diagnostic probe (compute-only); run explicitly"]
 fn s23_owning_blocker_probe() {
+    use z3::{SatResult, ast::Bool};
+
     use crate::analyses::borrow_ownership::{
         CrateCtxt,
         coherence::{add_coherence, constrain_field_ownership},
@@ -3535,7 +4437,6 @@ fn s23_owning_blocker_probe() {
         slots::{SlotId, SlotOwner},
         solver::{KindSolver, SlotRef},
     };
-    use z3::{SatResult, ast::Bool};
     ::utils::compilation::run_compiler_on_str(
         "unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); } \
          struct H { p: *mut i32 } \
@@ -3613,8 +4514,13 @@ fn nbf_sink_retractable_delete_node() {
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
-        let (_s, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver).expect("emission");
+        let (_s, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &crate::analyses::borrow_ownership::origins::compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
         for &g in &program.functions {
             let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
             add_coherence(&solver, &slots, g, &body);
@@ -3669,6 +4575,38 @@ mod explain {
     /// raw core is returned for histogram use only.
     pub const MINIMIZE_CAP: usize = 50;
 
+    /// NB-R's existing destructive drop-restore minimizer, shared by the
+    /// selector-core reconstruction. The boolean is true only for a
+    /// rechecked, 1-minimal core; oversized and Unknown-tainted cores remain
+    /// honest raw-core evidence.
+    pub(super) fn minimize_core(solver: &KindSolver, mut core: Vec<Bool>) -> (Vec<Bool>, bool) {
+        if core.len() > MINIMIZE_CAP {
+            return (core, false);
+        }
+        let mut saw_unknown = false;
+        let mut index = 0;
+        while index < core.len() {
+            let mut candidate = core.clone();
+            candidate.swap_remove(index);
+            match solver.optimize().check(&candidate) {
+                SatResult::Unsat => {
+                    core = candidate;
+                }
+                SatResult::Sat => index += 1,
+                SatResult::Unknown => {
+                    saw_unknown = true;
+                    index += 1;
+                }
+            }
+        }
+        assert_eq!(
+            solver.optimize().check(&core),
+            SatResult::Unsat,
+            "minimized core must re-check UNSAT on its own"
+        );
+        (core, !saw_unknown)
+    }
+
     /// Build the full tracked BO system over the crate (emission + coherence +
     /// the §9.10.2 field law — exactly what the real pipeline has asserted by
     /// the time of its FIRST solve inside `verify_to_fixpoint`, which is where
@@ -3678,9 +4616,13 @@ mod explain {
         let slots = CrateSlots::build(&program);
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new_tracked(&slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &crate::analyses::borrow_ownership::origins::compute_origins(&program), &solver)
-                .expect("NB-R: tracked emission");
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &crate::analyses::borrow_ownership::origins::compute_origins(&program),
+            &solver,
+        )
+        .expect("NB-R: tracked emission");
         let tracker = solver.tracker().expect("new_tracked");
         tracker.set_context("coherence");
         for &g in &program.functions {
@@ -3700,41 +4642,7 @@ mod explain {
             SatResult::Sat => Explained::Sat,
             SatResult::Unknown => Explained::Unknown,
             SatResult::Unsat => {
-                let mut core: Vec<Bool> = solver.optimize().get_unsat_core();
-                let minimized = if core.len() <= MINIMIZE_CAP {
-                    // Destructive drop-restore minimization: keep a literal
-                    // only if removing it makes the rest SAT (i.e. it is
-                    // load-bearing). z3 cores are NOT minimal (the in-repo
-                    // relaxing loop documents this) — an unminimized set
-                    // would over-report the contradiction. Codex F3: an
-                    // Unknown on a candidate keeps the literal but forfeits
-                    // the 1-minimality claim (`minimized` = false then).
-                    let mut saw_unknown = false;
-                    let mut i = 0;
-                    while i < core.len() {
-                        let mut candidate = core.clone();
-                        candidate.swap_remove(i);
-                        match solver.optimize().check(&candidate) {
-                            SatResult::Unsat => {
-                                core = candidate; // literal was redundant; slot i
-                                // now holds the (unvisited) former last element.
-                            }
-                            SatResult::Sat => i += 1,
-                            SatResult::Unknown => {
-                                saw_unknown = true;
-                                i += 1;
-                            }
-                        }
-                    }
-                    assert_eq!(
-                        solver.optimize().check(&core),
-                        SatResult::Unsat,
-                        "minimized core must re-check UNSAT on its own"
-                    );
-                    !saw_unknown
-                } else {
-                    false
-                };
+                let (core, minimized) = minimize_core(&solver, solver.optimize().get_unsat_core());
                 let labels = core
                     .iter()
                     .map(|literal| {
@@ -3813,7 +4721,10 @@ fn nbr_core_extraction_delete_node() {
     ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
         match explain::explain_unsat(tcx) {
             explain::Explained::Unsat { core, minimized } => {
-                assert!(!core.is_empty(), "an UNSAT explanation must name constraints");
+                assert!(
+                    !core.is_empty(),
+                    "an UNSAT explanation must name constraints"
+                );
                 assert!(
                     minimized,
                     "the witness-scale core must go through drop-restore minimization \
@@ -3853,14 +4764,23 @@ fn nbr_witness_core_family_regression() {
             panic!("witness must be UNSAT");
         };
         assert!(minimized);
-        eprintln!("NBFOBS regression histogram: {}", explain::family_histogram(&core));
+        eprintln!(
+            "NBFOBS regression histogram: {}",
+            explain::family_histogram(&core)
+        );
         assert_eq!(
             explain::family_histogram(&core),
             "kind-equate:4/link-own:2/own-equal:2/own-assume:1/own-linear:1/sink-selector:1",
             "the witness diagnosis changed — re-derive the root-cause analysis"
         );
-        let trues = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=true)")).count();
-        let falses = core.iter().filter(|l| l.contains("own-assume") && l.ends_with("=false)")).count();
+        let trues = core
+            .iter()
+            .filter(|l| l.contains("own-assume") && l.ends_with("=true)"))
+            .count();
+        let falses = core
+            .iter()
+            .filter(|l| l.contains("own-assume") && l.ends_with("=false)"))
+            .count();
         // §NB-F re-derivation: the sink-owning pole is now the retractable
         // `sink-selector` literal (asserted in the histogram above), so the
         // remaining hard own-assume is the version-zero alone.
@@ -3905,17 +4825,14 @@ fn nbr_print_witness_core() {
 fn nbr_tracked_solver_guard_panics() {
     use crate::analyses::borrow_ownership::{crate_slots::CrateSlots, solver::KindSolver};
 
-    ::utils::compilation::run_compiler_on_str(
-        "pub unsafe fn f(p: *mut i32) { *p = 1; }",
-        |tcx| {
-            let program = collect_program(tcx);
-            let slots = CrateSlots::build(&program);
-            let solver = KindSolver::new_tracked(&slots);
-            let _ = solver.model_kinds_relaxing(
-                &crate::analyses::borrow_ownership::solver::Selectors::new(Vec::new(), Vec::new()),
-            );
-        },
-    )
+    ::utils::compilation::run_compiler_on_str("pub unsafe fn f(p: *mut i32) { *p = 1; }", |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let solver = KindSolver::new_tracked(&slots);
+        let _ = solver.model_kinds_relaxing(
+            &crate::analyses::borrow_ownership::solver::Selectors::new(Vec::new(), Vec::new()),
+        );
+    })
     .unwrap_or_else(|e| e.raise());
 }
 
@@ -3926,8 +4843,7 @@ fn nbr_tracked_solver_guard_panics() {
 #[test]
 #[ignore = "C1-lite worker: spawned per program by boc1_corpus (needs CRAT_BOC1_INPUT)"]
 fn boc1_run_one() {
-    use std::path::Path;
-    use std::time::Instant;
+    use std::{path::Path, time::Instant};
 
     let Ok(input) = std::env::var("CRAT_BOC1_INPUT") else {
         eprintln!("BOC1 worker: CRAT_BOC1_INPUT unset; no-op (did you mean boc1_corpus?)");
@@ -3949,7 +4865,7 @@ fn boc1_run_one() {
     // production-borrow `prod` reference remains untouched. Expected behavior-neutral (z3's default
     // seed is already 0); the value is recorded through each solver-backed row's
     // `z3_full_version` stamp.
-    if matches!(mode.as_str(), "bo" | "prod-own") {
+    if matches!(mode.as_str(), "bo" | "prod-own" | "selector-core") {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
     }
@@ -3961,6 +4877,7 @@ fn boc1_run_one() {
             "bo" => run::run_bo(tcx, t_tcx),
             "prod" => run::run_prod(tcx, t_tcx),
             "prod-own" => run::run_prod_ownership(tcx, t_tcx),
+            "selector-core" => run::run_selector_core(tcx, t_tcx),
             other => panic!("unknown CRAT_BOC1_MODE `{other}`"),
         }
     });
@@ -4148,9 +5065,11 @@ fn rs_crown_catalog_contract() {
     assert_eq!(BROTLI_SLOC, 537_692);
     assert!(!is_resource_deferred(BROTLI_SLOC));
     assert!(is_resource_deferred(BROTLI_SLOC + 1));
-    assert!(CORPUS
-        .iter()
-        .all(|program| !is_resource_deferred(program.sloc)));
+    assert!(
+        CORPUS
+            .iter()
+            .all(|program| !is_resource_deferred(program.sloc))
+    );
 
     let root = orchestrate::workspace_root();
     for program in CORPUS {
@@ -4204,14 +5123,17 @@ fn rs_crown_report_contract() {
 
 #[cfg(test)]
 mod orchestrate {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
 
     use super::{
         ownership_yield,
         report::{self, Row},
+        selector_leak_diagnosis,
     };
 
     pub struct ChildOutcome {
@@ -4245,6 +5167,18 @@ mod orchestrate {
         out_dir()
             .join("ownership-yield-snapshots")
             .join(format!("{program}.{mode}.tsv"))
+    }
+
+    pub fn selector_trace_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("selector-traces")
+            .join(format!("{program}.official.json"))
+    }
+
+    pub fn selector_evidence_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("selector-cores")
+            .join(format!("{program}.jsonl"))
     }
 
     /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
@@ -4321,6 +5255,25 @@ mod orchestrate {
             }
             command.env("CRAT_BOC1_YIELD_SNAPSHOT", snapshot);
         }
+        if selector_leak_diagnosis::enabled() {
+            let trace = selector_trace_path(program);
+            let evidence = selector_evidence_path(program);
+            fs::create_dir_all(trace.parent().expect("selector trace parent"))
+                .expect("create selector trace dir");
+            fs::create_dir_all(evidence.parent().expect("selector evidence parent"))
+                .expect("create selector evidence dir");
+            command
+                .env("CRAT_BOC1_SELECTOR_TRACE", &trace)
+                .env("CRAT_BOC1_SELECTOR_EVIDENCE", &evidence);
+            if mode == "bo" {
+                if trace.is_file() {
+                    fs::remove_file(&trace).expect("remove stale selector trace");
+                }
+                command.env("CRAT_BOC1_SELECTOR_CORE", "official");
+            } else if mode == "selector-core" && evidence.is_file() {
+                fs::remove_file(&evidence).expect("remove stale selector evidence");
+            }
+        }
         let mut child = command.spawn().expect("spawn worker");
 
         let mut killed_for: Option<&str> = None;
@@ -4373,7 +5326,10 @@ mod orchestrate {
                 None => "crash".to_string(),
             }
         };
-        let note = if matches!(classification.as_str(), "timeout" | "oom-kill" | "panic" | "crash") {
+        let note = if matches!(
+            classification.as_str(),
+            "timeout" | "oom-kill" | "panic" | "crash"
+        ) {
             let tail: String = stderr
                 .lines()
                 .rev()
@@ -4400,10 +5356,12 @@ mod orchestrate {
 #[test]
 #[ignore = "C1-lite corpus sweep: run explicitly with --exact bo_c1::boc1_corpus --ignored --nocapture"]
 fn boc1_corpus() {
-    use std::fs;
-    use std::time::Duration;
+    use std::{fs, time::Duration};
 
-    use orchestrate::{out_dir, run_child, workspace_root, yield_snapshot_path};
+    use orchestrate::{
+        out_dir, run_child, selector_evidence_path, selector_trace_path, workspace_root,
+        yield_snapshot_path,
+    };
     use report::Row;
 
     let root = workspace_root();
@@ -4425,14 +5383,66 @@ fn boc1_corpus() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(900),
     );
-    let prod_enabled = std::env::var("CRAT_BOC1_PROD").map(|v| v != "0").unwrap_or(true);
+    let diagnostic_timeout = Duration::from_secs(
+        std::env::var("CRAT_BOC1_DIAG_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800),
+    );
+    let prod_enabled = std::env::var("CRAT_BOC1_PROD")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let ownership_yield_enabled = ownership_yield::enabled();
+    let selector_leak_diag = selector_leak_diagnosis::enabled();
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
     let l2_gate = l2_red_gate::enabled();
+    if selector_leak_diag {
+        assert_eq!(
+            std::env::var("CRAT_BO_REPAIR").as_deref(),
+            Ok("mode_a"),
+            "selector-leak diagnosis requires Mode-A"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+            Ok("0"),
+            "selector-leak diagnosis requires L2 explicitly off"
+        );
+        assert!(
+            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "selector-leak diagnosis resolved L2 on"
+        );
+        assert_eq!(
+            timeout,
+            Duration::from_secs(900),
+            "selector-leak official worker timeout must be 900 seconds"
+        );
+        assert_eq!(
+            diagnostic_timeout,
+            Duration::from_secs(1800),
+            "selector-leak tracked worker timeout must be 1800 seconds"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "selector-leak diagnosis requires the 8192-MiB worker cap"
+        );
+        assert!(
+            !prod_enabled,
+            "selector-leak diagnosis must disable production workers"
+        );
+        assert!(
+            only.is_none(),
+            "selector-leak diagnosis must cover all 20 frozen programs"
+        );
+        assert_eq!(CORPUS.len(), 20);
+    }
     if ownership_yield_enabled {
-        assert!(prod_enabled, "ownership-yield measurement requires CRAT_BOC1_PROD=1");
+        assert!(
+            prod_enabled,
+            "ownership-yield measurement requires CRAT_BOC1_PROD=1"
+        );
         assert_eq!(
             std::env::var("CRAT_BO_REPAIR").as_deref(),
             Ok("mode_a"),
@@ -4471,7 +5481,11 @@ fn boc1_corpus() {
             only.is_none(),
             "ownership-yield measurement must cover all 20 frozen programs"
         );
-        assert_eq!(CORPUS.len(), 20, "ownership-yield frozen corpus size drifted");
+        assert_eq!(
+            CORPUS.len(),
+            20,
+            "ownership-yield frozen corpus size drifted"
+        );
     }
     if l2_gate {
         l2_red_gate::assert_fixtures(CORPUS);
@@ -4544,7 +5558,10 @@ fn boc1_corpus() {
             Ok("0"),
             "L2 RED must run only the Mode-A BO worker"
         );
-        assert!(!prod_enabled, "L2 RED production-baseline child must be disabled");
+        assert!(
+            !prod_enabled,
+            "L2 RED production-baseline child must be disabled"
+        );
         assert!(
             only.is_none(),
             "L2 RED must not set CRAT_BOC1_PROGRAMS; run all 20 frozen programs"
@@ -4635,6 +5652,46 @@ fn boc1_corpus() {
                 m.set("note", &bo.note);
             }
 
+            if selector_leak_diag {
+                assert_eq!(
+                    bo.status, "ok",
+                    "selector-leak official worker failed for {}: status={} note={}",
+                    program.name, bo.status, bo.note
+                );
+                assert!(
+                    selector_trace_path(program.name).is_file(),
+                    "selector-leak official trace missing for {}",
+                    program.name
+                );
+                eprintln!("[boc1] {}: selector-core mode...", program.name);
+                let tracked = run_child(program.name, &input, "selector-core", diagnostic_timeout);
+                assert_eq!(
+                    tracked.status, "ok",
+                    "selector-leak tracked worker failed for {}: status={} note={}",
+                    program.name, tracked.status, tracked.note
+                );
+                m.set("selector_core_status", &tracked.status);
+                m.set("selector_core_wall_s", format!("{:.1}", tracked.wall_s));
+                if let Some(row) = &tracked.row {
+                    for key in [
+                        "selector_core_events",
+                        "selector_core_sources_final",
+                        "selector_core_sinks_final",
+                        "check_sat_count",
+                    ] {
+                        if let Some(value) = row.get(key) {
+                            m.set(&format!("tracked_{key}"), value);
+                        }
+                    }
+                    raw_rows.push(row.clone());
+                }
+                assert!(
+                    selector_evidence_path(program.name).is_file(),
+                    "selector-leak core evidence missing for {}",
+                    program.name
+                );
+            }
+
             let bo_records = ownership_yield_enabled.then(|| {
                 assert_eq!(
                     bo.status, "ok",
@@ -4710,9 +5767,8 @@ fn boc1_corpus() {
                             &yield_snapshot_path(program.name, "prod-own"),
                         )
                         .unwrap_or_else(|error| panic!("{}: {error}", program.name));
-                        let comparison =
-                            ownership_yield::compare(bo_records, &production_records)
-                                .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                        let comparison = ownership_yield::compare(bo_records, &production_records)
+                            .unwrap_or_else(|error| panic!("{}: {error}", program.name));
                         m.set("bo_only_owning", comparison.bo_only_owning.len());
                         m.set(
                             "production_only_owning",
@@ -4799,6 +5855,135 @@ fn boc1_corpus() {
         }
     }
 
+    if selector_leak_diag {
+        let parse_total = |key: &str| {
+            merged
+                .iter()
+                .map(|row| {
+                    row.get(key)
+                        .unwrap_or_else(|| panic!("selector-leak row missing {key}"))
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| {
+                            panic!("selector-leak {key} is not numeric: {error}")
+                        })
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(
+            merged.len(),
+            20,
+            "selector-leak sweep must cover 20 programs"
+        );
+        assert!(
+            merged.iter().all(|row| row.get("status") == Some("ok")),
+            "selector-leak official worker declined"
+        );
+        assert_eq!(parse_total("n_ref"), 52_810);
+        assert_eq!(parse_total("n_own"), 230);
+        assert_eq!(parse_total("sources_leaked_sel"), 114);
+        assert_eq!(parse_total("sinks_leaked"), 170);
+
+        let mut evidence = Vec::new();
+        for program in CORPUS {
+            evidence.extend(
+                selector_leak_diagnosis::read_core_evidence(&selector_evidence_path(program.name))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            );
+        }
+        let source_records = selector_leak_diagnosis::final_records(
+            &evidence,
+            selector_leak_diagnosis::SelectorClass::Source,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let sink_records = selector_leak_diagnosis::final_records(
+            &evidence,
+            selector_leak_diagnosis::SelectorClass::Sink,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            source_records.len(),
+            114,
+            "every final leaked source selector must have one classification row"
+        );
+        assert_eq!(
+            sink_records.len(),
+            170,
+            "every final leaked sink selector must have one secondary classification row"
+        );
+
+        let json_lines = |records: Vec<&selector_leak_diagnosis::CoreEvidence>| {
+            let mut output = String::new();
+            for record in records {
+                output.push_str(&serde_json::to_string(record).expect("encode combined evidence"));
+                output.push('\n');
+            }
+            output
+        };
+        fs::write(
+            out_dir().join("selector-drop-events.jsonl"),
+            json_lines(
+                evidence
+                    .iter()
+                    .filter(|record| record.phase == selector_leak_diagnosis::TracePhase::Drop)
+                    .collect(),
+            ),
+        )
+        .expect("write selector drop events");
+        fs::write(
+            out_dir().join("selector-reenable-events.jsonl"),
+            json_lines(
+                evidence
+                    .iter()
+                    .filter(|record| record.phase == selector_leak_diagnosis::TracePhase::Reenable)
+                    .collect(),
+            ),
+        )
+        .expect("write selector re-enable events");
+        let (source_csv, source_cross_tab) =
+            selector_leak_diagnosis::render_records(&source_records);
+        let (sink_csv, sink_cross_tab) = selector_leak_diagnosis::render_records(&sink_records);
+        fs::write(
+            out_dir().join("source-selector-classification.csv"),
+            &source_csv,
+        )
+        .expect("write source selector classifications");
+        fs::write(
+            out_dir().join("sink-selector-classification.csv"),
+            &sink_csv,
+        )
+        .expect("write sink selector classifications");
+        fs::write(
+            out_dir().join("family-program-crosstab.csv"),
+            &source_cross_tab,
+        )
+        .expect("write source family/program cross-tab");
+        fs::write(
+            out_dir().join("sink-family-program-crosstab.csv"),
+            &sink_cross_tab,
+        )
+        .expect("write sink family/program cross-tab");
+        fs::write(
+            out_dir().join("classification-report.md"),
+            format!(
+                "# Source-selector leak core classification\n\n\
+                 - Contract: Mode-A, L2 off, smt.random_seed=0, sat.random_seed=0, \
+                   official 900 s / tracked 1800 s, 8192 MiB, serialized.\n\
+                 - Baseline: 20/20 accept; n_ref=52,810; n_own=230; \
+                   sources leaked=114/144; sinks leaked=170/206.\n\
+                 - Source rows: {}. Sink secondary rows: {}.\n\
+                 - Out-param tag: untagged unless direct selector-to-slot provenance exists; \
+                   this run does not infer from core chains.\n\
+                 - Core visibility: mutability and fatness are not independent Z3 families; \
+                   their influence can appear only indirectly through replay-generated commits.\n\n\
+                 ## Source family × program\n\n```csv\n{source_cross_tab}```\n\n\
+                 ## Sink family × program\n\n```csv\n{sink_cross_tab}```\n",
+                source_records.len(),
+                sink_records.len(),
+            ),
+        )
+        .expect("write selector classification report");
+    }
+
     println!("\n{}", render_report(&merged));
     if ownership_yield_enabled {
         assert_eq!(
@@ -4814,7 +5999,10 @@ fn boc1_corpus() {
             bo_total, 230,
             "ownership-yield BO total diverged from the official rs-crown baseline"
         );
-        println!("\n{}", ownership_yield::render_markdown(&ownership_yield_rows));
+        println!(
+            "\n{}",
+            ownership_yield::render_markdown(&ownership_yield_rows)
+        );
     }
     if l2_gate {
         l2_red_gate::assert_results(&merged, CORPUS);
@@ -4980,10 +6168,19 @@ fn nb5l_lemma_ref_subset_mode_a_on_fixtures() {
                 let (model, stats) = RepairMode::with_override(mode, || {
                     verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
                 });
-                assert_eq!(stats.repair, mode, "mode-stamp (guard 3) must record the active repair");
-                Outcome { model: model.expect("fixture must accept under both modes") }
+                assert_eq!(
+                    stats.repair, mode,
+                    "mode-stamp (guard 3) must record the active repair"
+                );
+                Outcome {
+                    model: model.expect("fixture must accept under both modes"),
+                }
             };
-            (solve(RepairMode::ModeA), solve(RepairMode::Lemmas), max_menu)
+            (
+                solve(RepairMode::ModeA),
+                solve(RepairMode::Lemmas),
+                max_menu,
+            )
         })
         .unwrap_or_else(|e| e.raise())
     }
@@ -5015,7 +6212,10 @@ fn nb5l_lemma_ref_subset_mode_a_on_fixtures() {
         ),
     ];
     let ref_of = |m: &FxHashMap<SlotRef, SlotKind>| -> FxHashSet<SlotRef> {
-        m.iter().filter(|(_, k)| **k == SlotKind::Ref).map(|(s, _)| *s).collect()
+        m.iter()
+            .filter(|(_, k)| **k == SlotKind::Ref)
+            .map(|(s, _)| *s)
+            .collect()
     };
     let mut max_menu_seen = 0usize;
     for (tag, code) in shapes {
@@ -5068,9 +6268,14 @@ fn nb5l_high_arity_lemmas_converges_no_panic() {
         solver::{KindSolver, SlotRef},
     };
     let n = 32usize; // 32 aliases + x ⇒ a 33-distinct-requirer single-loan edge.
-    let aliases: String =
-        (0..n).map(|i| format!("let a{i} = id(x);")).collect::<Vec<_>>().join(" ");
-    let uses: String = (0..n).map(|i| format!("*a{i}")).collect::<Vec<_>>().join(" + ");
+    let aliases: String = (0..n)
+        .map(|i| format!("let a{i} = id(x);"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let uses: String = (0..n)
+        .map(|i| format!("*a{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
     let code = format!(
         "unsafe fn id(p: *mut i32) -> *mut i32 {{ p }} \
          unsafe fn f(p: *mut i32) -> i32 {{ let bb = p; let x = id(p); {aliases} *bb = 5; {uses} + *x }}"
@@ -5177,21 +6382,28 @@ fn nb5l_cap_exhaustion_declines_not_panics() {
         };
         // Sanity: the fixture needs >1 round, else cap=1 would not exhaust.
         let (_m, natural) = solve(RepairMode::ModeA, 999);
-        assert!(natural.rounds > 1, "fixture must need >1 round (got {})", natural.rounds);
+        assert!(
+            natural.rounds > 1,
+            "fixture must need >1 round (got {})",
+            natural.rounds
+        );
         // Lemmas at cap=1 ⇒ controlled decline, tagged cap_exhausted (NOT a panic, NOT mislabeled).
         let (model, stats) = solve(RepairMode::Lemmas, 1);
         assert!(
             model.is_none() && stats.cap_exhausted,
             "Lemmas cap-exhaustion must be a tagged decline (model={:?}, cap_exhausted={})",
-            model.is_some(), stats.cap_exhausted
+            model.is_some(),
+            stats.cap_exhausted
         );
         // Mode-A at cap=1 ⇒ PANIC (proven linear bound; a hit is a real bug). Drop-guards restore the
         // cap/mode on unwind, so this does not leak state into later tests.
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solve(RepairMode::ModeA, 1)
-        }))
-        .is_err();
-        assert!(panicked, "Mode-A cap-exhaustion must PANIC (its linear bound is proven)");
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve(RepairMode::ModeA, 1)))
+                .is_err();
+        assert!(
+            panicked,
+            "Mode-A cap-exhaustion must PANIC (its linear bound is proven)"
+        );
     })
     .unwrap_or_else(|e| e.raise())
 }
@@ -5247,10 +6459,15 @@ fn nb5l2_anchor<'tcx>(
 
 /// §NB5-L2 — distinct commit set (dedup by slot, first-seen order) from the raw `(slot, round)` events.
 #[cfg(test)]
-fn nb5l2_distinct(events: &[(crate::analyses::borrow_ownership::solver::SlotRef, usize)])
-    -> Vec<crate::analyses::borrow_ownership::solver::SlotRef> {
+fn nb5l2_distinct(
+    events: &[(crate::analyses::borrow_ownership::solver::SlotRef, usize)],
+) -> Vec<crate::analyses::borrow_ownership::solver::SlotRef> {
     let mut seen = rustc_hash::FxHashSet::default();
-    events.iter().map(|(s, _)| *s).filter(|s| seen.insert(*s)).collect()
+    events
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| seen.insert(*s))
+        .collect()
 }
 
 /// §NB5-L2 — calibrate the probe's two verdicts deterministically on `single_req_cascade`.
@@ -5316,7 +6533,11 @@ fn nb5l2_probe_finds_natural_accumulation_overpin() {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let (program, slots, origins, _model, events) = nb5l2_anchor(tcx);
         let commit_set = nb5l2_distinct(&events);
-        assert!(commit_set.len() >= 2, "cascade must yield >=2 commits (got {})", commit_set.len());
+        assert!(
+            commit_set.len() >= 2,
+            "cascade must yield >=2 commits (got {})",
+            commit_set.len()
+        );
         let (mut overpins, mut necessary) = (0usize, 0usize);
         for i in 0..commit_set.len() {
             match run::necessity_probe(&program, &slots, &origins, true, &commit_set, i) {
@@ -5375,9 +6596,19 @@ fn nb5l2_greedy_witnessed_joint_certified() {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
             let mut row = report::Row::default();
-            run::run_necessity_audit(&program, &slots, &origins, true, &Some(model), &events, &mut row);
+            run::run_necessity_audit(
+                &program,
+                &slots,
+                &origins,
+                true,
+                &Some(model),
+                &events,
+                &mut row,
+            );
             let get = |k: &str| {
-                row.get(k).unwrap_or_else(|| panic!("{tag}: audit did not emit {k}")).to_string()
+                row.get(k)
+                    .unwrap_or_else(|| panic!("{tag}: audit did not emit {k}"))
+                    .to_string()
             };
             assert_eq!(get("na_status"), "ok", "{tag}: audit status");
             // The CERTIFICATE: the greedy removed set is jointly realizable (all removed Ref + accept).
@@ -5388,9 +6619,15 @@ fn nb5l2_greedy_witnessed_joint_certified() {
             );
             let joint: usize = get("na_overpins").parse().unwrap();
             let total: usize = get("na_commits_total").parse().unwrap();
-            assert!(joint <= total, "{tag}: witnessed-joint ({joint}) must be <= |C| ({total})");
+            assert!(
+                joint <= total,
+                "{tag}: witnessed-joint ({joint}) must be <= |C| ({total})"
+            );
             // Both counts are emitted (rider 5) — the independent as a labeled diagnostic.
-            assert!(row.get("na_indep_overpins").is_some(), "{tag}: independent count must be emitted");
+            assert!(
+                row.get("na_indep_overpins").is_some(),
+                "{tag}: independent count must be emitted"
+            );
         })
         .unwrap_or_else(|e| e.raise())
     }
@@ -5422,7 +6659,8 @@ fn nb5l2_capture_is_mode_a_only() {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_s, sel) =
-                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver).expect("emit");
+                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                    .expect("emit");
             for &g in &program.functions {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                 add_coherence(&solver, &slots, g, &body);
@@ -5435,10 +6673,21 @@ fn nb5l2_capture_is_mode_a_only() {
             (stats.repair, events)
         };
         let (mode_a_repair, mode_a_events) = run_mode(RepairMode::ModeA);
-        assert_eq!(mode_a_repair, RepairMode::ModeA, "Mode-A run must stamp ModeA");
-        assert!(!mode_a_events.is_empty(), "Mode-A must capture commits on a conflict fixture");
+        assert_eq!(
+            mode_a_repair,
+            RepairMode::ModeA,
+            "Mode-A run must stamp ModeA"
+        );
+        assert!(
+            !mode_a_events.is_empty(),
+            "Mode-A must capture commits on a conflict fixture"
+        );
         let (lemmas_repair, lemmas_events) = run_mode(RepairMode::Lemmas);
-        assert_eq!(lemmas_repair, RepairMode::Lemmas, "Lemmas run must stamp Lemmas");
+        assert_eq!(
+            lemmas_repair,
+            RepairMode::Lemmas,
+            "Lemmas run must stamp Lemmas"
+        );
         assert!(
             lemmas_events.is_empty(),
             "Lemmas must capture NO commit events — the audit is Mode-A-only (got {} events)",
@@ -5496,17 +6745,10 @@ fn l2_feature_off_capture_program(fixture: &str, source: &str) -> String {
             }
 
             let (model, stats) = RepairMode::with_override(RepairMode::ModeA, || {
-                verify_to_fixpoint_counting(
-                    &program,
-                    &slots,
-                    &solver,
-                    &selectors,
-                    &mut_facts,
-                )
+                verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
             });
-            let model = model.unwrap_or_else(|| {
-                panic!("{fixture}/{mutability}: base Mode-A must accept")
-            });
+            let model =
+                model.unwrap_or_else(|| panic!("{fixture}/{mutability}: base Mode-A must accept"));
             let accepted = model_accepts(&program, &slots, &model, &mut_facts);
             assert!(
                 accepted,
@@ -5563,22 +6805,13 @@ fn l2_feature_off_capture_program(fixture: &str, source: &str) -> String {
                 stats.commits_per_round
             )
             .unwrap();
-            writeln!(
-                rendered,
-                "stats.dropped_sources={}",
-                stats.dropped_sources
-            )
-            .unwrap();
+            writeln!(rendered, "stats.dropped_sources={}", stats.dropped_sources).unwrap();
             writeln!(rendered, "stats.dropped_sinks={}", stats.dropped_sinks).unwrap();
             let field_decline = stats
                 .field_conflict_decline
                 .map(|slot| run::fmt_slot(&program, &slots, slot))
                 .unwrap_or_else(|| "-".to_string());
-            writeln!(
-                rendered,
-                "stats.field_conflict_decline={field_decline}"
-            )
-            .unwrap();
+            writeln!(rendered, "stats.field_conflict_decline={field_decline}").unwrap();
             writeln!(rendered, "stats.cap_exhausted={}", stats.cap_exhausted).unwrap();
             writeln!(
                 rendered,
@@ -5654,11 +6887,11 @@ fn l2_feature_off_capture() -> (String, String, crate::BytemuckDependency) {
         "sink_drop",
         L2_FEATURE_OFF_SINK_DROP,
     ));
-    let (output, bytemuck) = ::utils::compilation::run_compiler_on_str(
-        L2_FEATURE_OFF_SOURCE_DROP,
-        |tcx| crate::replace_local_borrows(&crate::Config::default(), tcx),
-    )
-    .unwrap_or_else(|error| error.raise());
+    let (output, bytemuck) =
+        ::utils::compilation::run_compiler_on_str(L2_FEATURE_OFF_SOURCE_DROP, |tcx| {
+            crate::replace_local_borrows(&crate::Config::default(), tcx)
+        })
+        .unwrap_or_else(|error| error.raise());
     writeln!(snapshot, "rewrite.source_drop.bytemuck={bytemuck:?}").unwrap();
     (snapshot, output, bytemuck)
 }
@@ -5690,17 +6923,16 @@ fn l2_decode_hex(encoded: &str) -> Vec<u8> {
 
 fn l2_sha256_hex(input: &[u8]) -> String {
     const ROUND: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut state = [
         0x6a09e667u32,
@@ -5762,18 +6994,12 @@ fn l2_sha256_hex(input: &[u8]) -> String {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        for (slot, value) in state
-            .iter_mut()
-            .zip([a, b, c, d, e, f, g, h])
-        {
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *slot = slot.wrapping_add(value);
         }
     }
 
-    state
-        .iter()
-        .map(|word| format!("{word:08x}"))
-        .collect()
+    state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 #[test]
