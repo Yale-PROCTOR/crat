@@ -49,6 +49,13 @@ struct KindVars {
 pub(crate) struct CoreTracker {
     entries: RefCell<Vec<(Bool, String)>>,
     context: RefCell<String>,
+    granularity: CoreTrackingGranularity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreTrackingGranularity {
+    Assertion,
+    Family,
 }
 
 impl CoreTracker {
@@ -56,6 +63,15 @@ impl CoreTracker {
         CoreTracker {
             entries: RefCell::new(Vec::new()),
             context: RefCell::new(String::from("init")),
+            granularity: CoreTrackingGranularity::Assertion,
+        }
+    }
+
+    fn new_family() -> Self {
+        CoreTracker {
+            entries: RefCell::new(Vec::new()),
+            context: RefCell::new(String::from("init")),
+            granularity: CoreTrackingGranularity::Family,
         }
     }
 
@@ -67,6 +83,23 @@ impl CoreTracker {
 
     /// Mint a fresh track literal for one hard constraint and record its label.
     fn record(&self, label: String) -> Bool {
+        if self.granularity == CoreTrackingGranularity::Family {
+            let family = core_label_family(&label)
+                .unwrap_or_else(|| panic!("unrecognized hard-constraint family: {label}"));
+            if let Some((track, _)) = self
+                .entries
+                .borrow()
+                .iter()
+                .find(|(_, existing)| existing.strip_prefix("family-marker::") == Some(family))
+            {
+                return track.clone();
+            }
+            let track = Bool::fresh_const("selector_family_track");
+            self.entries
+                .borrow_mut()
+                .push((track.clone(), format!("family-marker::{family}")));
+            return track;
+        }
         let track = Bool::fresh_const("nbr_track");
         self.entries.borrow_mut().push((
             track.clone(),
@@ -128,6 +161,13 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     // "source-selector" — first-containment matching stays unambiguous).
     "sink-selector",
 ];
+
+fn core_label_family(label: &str) -> Option<&'static str> {
+    CORE_LABEL_FAMILIES
+        .iter()
+        .copied()
+        .find(|family| label.contains(family))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectorTracePhase {
@@ -210,6 +250,13 @@ impl KindSolver {
     /// `CoreTracker`); production solve paths refuse it.
     pub(crate) fn new_tracked(slots: &CrateSlots) -> Self {
         Self::build(slots, Some(CoreTracker::new()))
+    }
+
+    /// Corpus selector-leak diagnostic constructor: all hard constraints in
+    /// one `CORE_LABEL_FAMILIES` family share a single assumption marker.
+    /// This preserves family membership while avoiding per-assertion tracking.
+    pub(crate) fn new_family_tracked(slots: &CrateSlots) -> Self {
+        Self::build(slots, Some(CoreTracker::new_family()))
     }
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
