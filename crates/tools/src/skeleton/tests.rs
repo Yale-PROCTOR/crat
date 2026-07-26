@@ -221,6 +221,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "target_signature",
             "needs_transformation",
             "statements_requiring_transformation",
+            "foreign_function_names",
             "signature_dependencies",
             "dependencies"
         ]
@@ -1911,27 +1912,142 @@ fn empty_statement_error_prevents_partial_output() {
 }
 
 #[test]
-fn small_skeleton_json_matches_inline_golden() {
-    let source = "pub unsafe fn f() -> i32 { 1 }";
+fn existing_function_records_and_helpers_adopt_the_final_shape() {
+    let source = r#"pub unsafe fn scalar(value: i32) -> i32 {
+    value + 1
+}"#;
     let records = generate(source);
     assert_eq!(
         skeletons_to_json(&records).unwrap(),
         r#"[
   {
     "id": 0,
-    "path": "f",
+    "path": "scalar",
     "kind": "Fn",
-    "name": "f",
-    "annotated_source": "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    1\n}",
-    "annotated_skeleton": "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    1\n}",
-    "source_signature": "pub unsafe fn f() -> i32",
-    "target_signature": "pub unsafe fn f() -> i32",
+    "name": "scalar",
+    "annotated_source": "pub unsafe fn scalar(mut value: i32) -> i32 {\n    #[proctor(0)]\n    (value + 1)\n}",
+    "annotated_skeleton": "pub unsafe fn scalar(mut value: i32) -> i32 {\n    #[proctor(0)]\n    (value + 1)\n}",
+    "source_signature": "pub unsafe fn scalar(mut value: i32) -> i32",
+    "target_signature": "pub unsafe fn scalar(mut value: i32) -> i32",
     "needs_transformation": false,
     "statements_requiring_transformation": [],
+    "foreign_function_names": [],
     "signature_dependencies": [],
     "dependencies": []
   }
 ]"#
+    );
+}
+
+#[test]
+fn collects_per_function_names_sorted_deduplicated_and_resolved() {
+    let records = generate(
+        r#"#![feature(extern_types)]
+
+unsafe extern "C" {
+    fn strlen(text: *const core::ffi::c_char) -> usize;
+    fn free(pointer: *mut core::ffi::c_void);
+    fn transitive_foreign(value: i32) -> i32;
+    fn unused_foreign(value: i32) -> i32;
+    static FOREIGN_COUNTER: i32;
+    type ForeignOpaque;
+}
+
+use strlen as c_strlen;
+
+pub unsafe extern "C" fn local_abi(value: i32) -> i32 {
+    transitive_foreign(value)
+}
+
+pub mod parser {
+    pub unsafe fn scan(
+        pointer: *mut core::ffi::c_void,
+        text: *const core::ffi::c_char,
+    ) -> usize {
+        crate::free(pointer);
+        let first = crate::c_strlen(text);
+        let second = crate::strlen(text);
+        let _ = crate::FOREIGN_COUNTER;
+        let _: Option<*mut crate::ForeignOpaque> = None;
+        let _ = crate::local_abi(first as i32);
+        first + second + core::mem::size_of::<usize>()
+    }
+
+    pub unsafe fn release(pointer: *mut core::ffi::c_void) {
+        crate::free(pointer);
+        crate::free(pointer);
+    }
+
+    pub unsafe fn scalar(value: i32) -> i32 {
+        crate::local_abi(value)
+    }
+}"#,
+    );
+
+    assert_eq!(
+        function(&records, "local_abi").foreign_function_names,
+        ["transitive_foreign"]
+    );
+    assert_eq!(
+        function(&records, "parser::scan").foreign_function_names,
+        ["free", "strlen"]
+    );
+    assert_eq!(
+        function(&records, "parser::release").foreign_function_names,
+        ["free"]
+    );
+    assert!(
+        function(&records, "parser::scalar")
+            .foreign_function_names
+            .is_empty()
+    );
+
+    assert!(function(&records, "local_abi").dependencies.is_empty());
+    assert_eq!(function(&records, "parser::scan").dependencies, [0]);
+    assert!(
+        function(&records, "parser::release")
+            .dependencies
+            .is_empty()
+    );
+    assert_eq!(function(&records, "parser::scalar").dependencies, [0]);
+}
+
+#[test]
+fn handles_link_name_callable_reference_and_dependency_metadata() {
+    let records = generate(
+        r#"unsafe extern "C" {
+    #[link_name = "strlen"]
+    fn c_strlen(text: *const core::ffi::c_char) -> usize;
+}
+
+pub unsafe fn length(text: *const core::ffi::c_char) -> usize {
+    c_strlen(text)
+}
+
+pub unsafe fn hold_callable() {
+    let callable = c_strlen;
+    let _ = callable;
+}"#,
+    );
+    assert_eq!(
+        function(&records, "length").foreign_function_names,
+        ["c_strlen"]
+    );
+    assert_eq!(
+        function(&records, "hold_callable").foreign_function_names,
+        ["c_strlen"]
+    );
+
+    let dependency_records = generate(
+        r#"extern crate libc;
+
+pub unsafe fn dependency_free(pointer: *mut libc::c_void) {
+    libc::free(pointer);
+}"#,
+    );
+    assert_eq!(
+        function(&dependency_records, "dependency_free").foreign_function_names,
+        ["free"]
     );
 }
 
