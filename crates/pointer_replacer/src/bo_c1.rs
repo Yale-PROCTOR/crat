@@ -7925,7 +7925,25 @@ fn boc1_corpus() {
         assert_eq!(parse_total("n_ref"), 52_810);
         assert_eq!(parse_total("n_own"), 230);
         assert_eq!(parse_total("sources_leaked_sel"), 114);
-        assert_eq!(parse_total("sources_total"), 144);
+        let source_selector_total = merged
+            .iter()
+            .map(|row| {
+                let emissions = row
+                    .get("source_sink_emissions")
+                    .expect("diagnostic row missing source_sink_emissions")
+                    .parse::<usize>()
+                    .expect("source_sink_emissions is numeric");
+                let sinks = row
+                    .get("sinks_total")
+                    .expect("diagnostic row missing sinks_total")
+                    .parse::<usize>()
+                    .expect("sinks_total is numeric");
+                emissions
+                    .checked_sub(sinks)
+                    .expect("sink selectors cannot exceed total selector emissions")
+            })
+            .sum::<usize>();
+        assert_eq!(source_selector_total, 144);
         assert_eq!(parse_total("sinks_leaked"), 170);
         assert_eq!(parse_total("sinks_total"), 206);
 
