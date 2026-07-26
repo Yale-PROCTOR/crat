@@ -50,6 +50,7 @@ pub struct FunctionRecord {
     pub target_signature: String,
     pub needs_transformation: bool,
     pub statements_requiring_transformation: Vec<u32>,
+    pub foreign_function_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
 }
@@ -346,6 +347,7 @@ fn make_function_record(
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
     let signature_dependencies = collect_signature_dependencies(hitem, item_ids, tcx);
     let dependencies = collect_dependencies(hitem, item_ids, tcx);
+    let foreign_function_names = collect_foreign_function_names(hitem, tcx);
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     validate_function_body(&source, &surface.path)?;
@@ -385,6 +387,7 @@ fn make_function_record(
         statements_requiring_transformation: statements_requiring_transformation
             .into_iter()
             .collect(),
+        foreign_function_names,
         signature_dependencies,
         dependencies,
     }))
@@ -1631,6 +1634,48 @@ fn collect_signature_dependencies<'tcx>(
         _ => {}
     }
     visitor.dependencies.into_iter().collect()
+}
+
+struct ForeignFunctionVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    names: BTreeSet<String>,
+}
+
+impl ForeignFunctionVisitor<'_> {
+    fn add_res(&mut self, res: Res) {
+        let Res::Def(DefKind::Fn, def_id) = res else {
+            return;
+        };
+        if self.tcx.is_foreign_item(def_id) {
+            self.names.insert(self.tcx.item_name(def_id).to_string());
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for ForeignFunctionVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_path(&mut self, path: &hir::Path<'tcx>, _hir_id: HirId) {
+        self.add_res(path.res);
+        intravisit::walk_path(self, path);
+    }
+}
+
+fn collect_foreign_function_names<'tcx>(
+    item: &'tcx hir::Item<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Vec<String> {
+    let hir::ItemKind::Fn { body, .. } = item.kind else { unreachable!() };
+    let mut visitor = ForeignFunctionVisitor {
+        tcx,
+        names: BTreeSet::new(),
+    };
+    visitor.visit_body(tcx.hir_body(body));
+    visitor.names.into_iter().collect()
 }
 
 #[cfg(test)]
