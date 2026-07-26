@@ -102,6 +102,102 @@ fn amendment_2_preserved_parent_is_opaque_after_outer_alignment() {
 }
 
 #[test]
+fn amendment_2_preserved_restricted_conditional_coexists_with_transformed_control() {
+    let skeleton = r#"
+unsafe fn f(flag: bool, pointer: *mut i32, value: i32) -> i32 {
+    #[proctor(0)]
+    let conditional: i32 = value + (if flag { -1 } else { 1 });
+    #[proctor(1)]
+    if flag {
+        #[proctor(2)]
+        (*pointer = value);
+    } else {
+        #[proctor(3)]
+        return conditional;
+    }
+    #[proctor(4)]
+    conditional
+}
+"#;
+    let transformation = r#"
+unsafe fn f(flag: bool, pointer: *mut i32, value: i32) -> i32 {
+    #[proctor(0)]
+    let conditional: i32 = value + (if flag { 99 } else { 100 });
+    #[proctor(1)]
+    if flag {
+        #[proctor(2)]
+        (*pointer = value + 1);
+    } else {
+        #[proctor(3)]
+        return -200;
+    }
+    #[proctor(4)]
+    300
+}
+"#;
+    assert_eq!(
+        validate(&preservation_request(skeleton, vec![1, 2], transformation)),
+        ValidationResponse::Valid
+    );
+}
+
+#[test]
+fn amendment_2_transformed_label_does_not_relax_nested_control_validation() {
+    let skeleton = "unsafe fn f(flag: bool, value: i32) -> i32 { #[proctor(0)] value + (if flag { -1 } else { 1 }) }";
+    assert_eq!(
+        codes(&validate(&preservation_request(
+            skeleton,
+            vec![0],
+            skeleton
+        ))),
+        ["invalid_expected_skeleton"]
+    );
+}
+
+#[test]
+fn amendment_2_opaque_restricted_conditional_rejects_inner_labels() {
+    let skeleton = "unsafe fn f(flag: bool, value: i32) -> i32 { #[proctor(0)] value + (if flag { #[proctor(1)] -1 } else { 1 }) }";
+    assert_eq!(
+        codes(&validate(&preservation_request(skeleton, vec![], skeleton))),
+        ["invalid_expected_skeleton"]
+    );
+}
+
+#[test]
+fn amendment_2_opaque_control_operand_rejects_inner_labels() {
+    let skeleton = "unsafe fn f(a: bool) -> i32 { #[proctor(0)] if 1 + (if a { #[proctor(99)] 2 } else { 3 }) > 0 { #[proctor(1)] 1 } else { #[proctor(2)] 2 } }";
+    assert_eq!(
+        codes(&validate(&preservation_request(skeleton, vec![], skeleton))),
+        ["invalid_expected_skeleton"]
+    );
+}
+
+#[test]
+fn amendment_2_unlabeled_restricted_conditionals_are_valid_control_operands() {
+    for skeleton in [
+        "unsafe fn f(a: bool) -> i32 { #[proctor(0)] if 1 + (if a { 2 } else { 3 }) > 0 { #[proctor(1)] 1 } else { #[proctor(2)] 2 } }",
+        "unsafe fn f(a: bool) { #[proctor(0)] while 1 + (if a { 2 } else { 3 }) > 0 { #[proctor(1)] break; } }",
+        "unsafe fn f(a: bool) { #[proctor(0)] for _value in 0..(if a { 1 } else { 2 }) { #[proctor(1)] continue; } }",
+        "unsafe fn f(a: bool) -> i32 { #[proctor(0)] match (if a { 1 } else { 2 }) { value if (if a { true } else { false }) => { #[proctor(1)] value }, _ => { #[proctor(2)] 0 } } }",
+    ] {
+        assert_eq!(
+            validate(&preservation_request(skeleton, vec![], skeleton)),
+            ValidationResponse::Valid,
+            "{skeleton}"
+        );
+    }
+}
+
+#[test]
+fn amendment_2_bare_assignment_labels_are_statement_roots() {
+    let skeleton = "unsafe fn f(mut values: (i32, i32), value: i32) { #[proctor(0)] values.0 = value; #[proctor(1)] values.1 += 1; }";
+    assert_eq!(
+        validate(&preservation_request(skeleton, vec![0, 1], skeleton)),
+        ValidationResponse::Valid
+    );
+}
+
+#[test]
 fn amendment_2_preserved_child_requires_unique_control_anchor() {
     let skeleton = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 1; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
     let valid = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] let proctor_temp_var_0 = flag; #[proctor(0)] if proctor_temp_var_0 { #[proctor(1)] let nested: i32 = 99; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";

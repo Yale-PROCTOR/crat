@@ -203,6 +203,121 @@ fn amendment_2_replacement_discards_preserved_groups_without_validator() {
 }
 
 #[test]
+fn amendment_2_preserved_restricted_conditional_has_only_its_outer_label() {
+    let source =
+        "pub unsafe fn f(value: i32) -> i32 { return value + (if value > 0 { -1 } else { 1 }); }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            "unsafe fn f(value: i32) -> i32 { #[proctor(0)] return value + (if value > 0 { -1 } else { 1 }); }",
+            vec![],
+        )],
+        transformation:
+            "unsafe fn f(value: i32) -> i32 { #[proctor(0)] return value + (if value > 0 { 99 } else { 100 }); }"
+                .to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("return value + (if value > 0 { -1 } else { 1 })"));
+    assert!(!text.contains("99"));
+    assert!(!text.contains("100"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_restricted_conditional_does_not_hide_other_label_subtrees() {
+    let source = r#"
+pub unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
+    let conditional = value + (if flag { -1 } else { 1 });
+    if flag {
+        *pointer = value;
+    }
+    conditional
+}
+"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            r#"
+unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
+    #[proctor(0)]
+    let mut conditional: i32 = value + (if flag { -1 } else { 1 });
+    #[proctor(1)]
+    if flag {
+        #[proctor(2)]
+        *pointer = value;
+    }
+    #[proctor(3)]
+    conditional
+}
+"#,
+            vec![1, 2],
+        )],
+        transformation: r#"
+unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
+    #[proctor(0)]
+    let mut conditional: i32 = value + (if flag { 99 } else { 100 });
+    #[proctor(1)]
+    if flag {
+        #[proctor(2)]
+        *pointer = value + 1;
+    }
+    #[proctor(3)]
+    300
+}
+"#
+        .to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("value + (if flag { -1 } else { 1 })"));
+    assert!(text.contains("*pointer = value + 1"));
+    assert!(text.ends_with("conditional }"));
+    assert!(!text.contains("99"));
+    assert!(!text.contains("100"));
+    assert!(!text.contains("300"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_replacement_accepts_bare_assignment_labels() {
+    let source = r#"
+pub struct State {
+    pub first: i32,
+    pub second: i32,
+}
+pub unsafe fn f(mut state: State, value: i32) -> State {
+    state.first = value;
+    state.second += 1;
+    state
+}
+"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            "unsafe fn f(mut state: State, value: i32) -> State { #[proctor(0)] state.first = value; #[proctor(1)] state.second += 2; #[proctor(2)] state }",
+            vec![0, 1],
+        )],
+        transformation: "unsafe fn f(mut state: State, value: i32) -> State { #[proctor(0)] state.first = value + 1; #[proctor(1)] state.second += 2; #[proctor(2)] state }".to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("state.first = value + 1"));
+    assert!(text.contains("state.second += 2"));
+    assert!(!text.contains("proctor"));
+    compile(&output);
+}
+
+#[test]
 fn amendment_2_replacement_restores_every_preserved_validator_group() {
     let source = r#"
 pub unsafe fn validate_me(flag: bool, mut pointer: *mut i32) -> i32 {
