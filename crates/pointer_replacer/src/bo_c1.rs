@@ -5345,6 +5345,45 @@ fn rs_crown_report_contract() {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticWorkerDisposition {
+    Complete,
+    ResourceDeferred,
+    CorrectnessFailure,
+}
+
+#[cfg(test)]
+fn diagnostic_worker_disposition(status: &str) -> DiagnosticWorkerDisposition {
+    match status {
+        "ok" => DiagnosticWorkerDisposition::Complete,
+        "timeout" | "oom-kill" => DiagnosticWorkerDisposition::ResourceDeferred,
+        _ => DiagnosticWorkerDisposition::CorrectnessFailure,
+    }
+}
+
+#[test]
+fn selector_leak_resource_walls_defer_but_correctness_failures_stop() {
+    assert_eq!(
+        diagnostic_worker_disposition("ok"),
+        DiagnosticWorkerDisposition::Complete
+    );
+    for status in ["timeout", "oom-kill"] {
+        assert_eq!(
+            diagnostic_worker_disposition(status),
+            DiagnosticWorkerDisposition::ResourceDeferred,
+            "{status} is a resource wall, not a correctness stop"
+        );
+    }
+    for status in ["panic", "crash", "compile-error", "no-output"] {
+        assert_eq!(
+            diagnostic_worker_disposition(status),
+            DiagnosticWorkerDisposition::CorrectnessFailure,
+            "{status} must still stop the diagnosis"
+        );
+    }
+}
+
+#[cfg(test)]
 mod orchestrate {
     use std::{
         fs,
@@ -5455,11 +5494,21 @@ mod orchestrate {
     /// Spawn one worker (this test binary, `--exact bo_c1::boc1_run_one`) with
     /// file-redirected stdio; supervise with deadline + RSS cap; classify.
     pub fn run_child(program: &str, input: &Path, mode: &str, timeout: Duration) -> ChildOutcome {
+        run_child_labeled(program, input, mode, mode, timeout)
+    }
+
+    pub fn run_child_labeled(
+        program: &str,
+        input: &Path,
+        mode: &str,
+        log_label: &str,
+        timeout: Duration,
+    ) -> ChildOutcome {
         let mem_cap_kb = env_u64("CRAT_BOC1_MEM_MB", 8192) * 1024;
         let logs = out_dir().join("logs");
         fs::create_dir_all(&logs).expect("create log dir");
-        let out_path = logs.join(format!("{program}.{mode}.out"));
-        let err_path = logs.join(format!("{program}.{mode}.err"));
+        let out_path = logs.join(format!("{program}.{log_label}.out"));
+        let err_path = logs.join(format!("{program}.{log_label}.err"));
         let out_file = fs::File::create(&out_path).expect("create .out log");
         let err_file = fs::File::create(&err_path).expect("create .err log");
 
@@ -5603,8 +5652,8 @@ fn boc1_corpus() {
     };
 
     use orchestrate::{
-        out_dir, run_child, selector_detail_path, selector_evidence_path, selector_trace_path,
-        workspace_root, yield_snapshot_path,
+        out_dir, run_child, run_child_labeled, selector_detail_path, selector_evidence_path,
+        selector_trace_path, workspace_root, yield_snapshot_path,
     };
     use report::Row;
 
@@ -5853,6 +5902,7 @@ fn boc1_corpus() {
     let mut merged: Vec<Row> = Vec::new();
     let mut ownership_yield_rows: Vec<ownership_yield::ProgramSummary> = Vec::new();
     let mut production_failures = 0usize;
+    let mut selector_retry_queue = Vec::new();
     let mut selector_resource_deferred = Vec::new();
 
     for &program in CORPUS {
@@ -5910,36 +5960,51 @@ fn boc1_corpus() {
                 );
                 eprintln!("[boc1] {}: selector-core mode...", program.name);
                 let tracked = run_child(program.name, &input, "selector-core", diagnostic_timeout);
+                m.set(
+                    "selector_core_first_wall_s",
+                    format!("{:.1}", tracked.wall_s),
+                );
                 m.set("selector_core_wall_s", format!("{:.1}", tracked.wall_s));
-                if tracked.status == "ok" {
-                    m.set("selector_core_status", &tracked.status);
-                    if let Some(row) = &tracked.row {
-                        for key in [
-                            "selector_core_events",
-                            "selector_core_sources_final",
-                            "selector_core_sinks_final",
-                            "check_sat_count",
-                        ] {
-                            if let Some(value) = row.get(key) {
-                                m.set(&format!("tracked_{key}"), value);
+                match diagnostic_worker_disposition(&tracked.status) {
+                    DiagnosticWorkerDisposition::Complete => {
+                        m.set("selector_core_status", &tracked.status);
+                        if let Some(row) = &tracked.row {
+                            for key in [
+                                "selector_core_events",
+                                "selector_core_sources_final",
+                                "selector_core_sinks_final",
+                                "check_sat_count",
+                            ] {
+                                if let Some(value) = row.get(key) {
+                                    m.set(&format!("tracked_{key}"), value);
+                                }
                             }
+                            raw_rows.push(row.clone());
                         }
-                        raw_rows.push(row.clone());
+                        assert!(
+                            selector_evidence_path(program.name).is_file(),
+                            "selector-leak core evidence missing for {}",
+                            program.name
+                        );
                     }
-                    assert!(
-                        selector_evidence_path(program.name).is_file(),
-                        "selector-leak core evidence missing for {}",
-                        program.name
-                    );
-                } else if program.name == "brotli" && tracked.status == "timeout" {
-                    selector_resource_deferred.push(program.name);
-                    m.set("selector_core_status", "resource-deferred");
-                    m.set("selector_core_note", "family-tracked worker exceeded 1800s");
-                } else {
-                    panic!(
-                        "selector-leak tracked worker failed for {}: status={} note={}",
-                        program.name, tracked.status, tracked.note
-                    );
+                    DiagnosticWorkerDisposition::ResourceDeferred => {
+                        selector_retry_queue.push(program);
+                        m.set("selector_core_status", "resource-deferred-pending-retry");
+                        m.set(
+                            "selector_core_note",
+                            format!(
+                                "family-tracked worker hit {} at {}s",
+                                tracked.status,
+                                diagnostic_timeout.as_secs()
+                            ),
+                        );
+                    }
+                    DiagnosticWorkerDisposition::CorrectnessFailure => {
+                        panic!(
+                            "selector-leak tracked worker failed for {}: status={} note={}",
+                            program.name, tracked.status, tracked.note
+                        );
+                    }
                 }
             }
 
@@ -6107,6 +6172,94 @@ fn boc1_corpus() {
     }
 
     if selector_leak_diag {
+        let retry_timeout = Duration::from_secs(3600);
+        for program in selector_retry_queue {
+            let input = program.input_path(&root);
+            eprintln!(
+                "[boc1] {}: selector-core retry ({}s cap)...",
+                program.name,
+                retry_timeout.as_secs()
+            );
+            let tracked = run_child_labeled(
+                program.name,
+                &input,
+                "selector-core",
+                "selector-core-retry",
+                retry_timeout,
+            );
+            let m = merged
+                .iter_mut()
+                .find(|row| row.get("program") == Some(program.name))
+                .unwrap_or_else(|| panic!("selector retry row missing for {}", program.name));
+            let first_wall = m
+                .get("selector_core_first_wall_s")
+                .and_then(|wall| wall.parse::<f64>().ok())
+                .expect("selector first-attempt wall time");
+            m.set(
+                "selector_core_retry_wall_s",
+                format!("{:.1}", tracked.wall_s),
+            );
+            m.set(
+                "selector_core_wall_s",
+                format!("{:.1}", first_wall + tracked.wall_s),
+            );
+            match diagnostic_worker_disposition(&tracked.status) {
+                DiagnosticWorkerDisposition::Complete => {
+                    m.set("selector_core_status", "ok-after-retry");
+                    m.set("selector_core_note", "completed_on_3600s_retry");
+                    if let Some(row) = &tracked.row {
+                        for key in [
+                            "selector_core_events",
+                            "selector_core_sources_final",
+                            "selector_core_sinks_final",
+                            "check_sat_count",
+                        ] {
+                            if let Some(value) = row.get(key) {
+                                m.set(&format!("tracked_{key}"), value);
+                            }
+                        }
+                        raw_rows.push(row.clone());
+                    }
+                    assert!(
+                        selector_evidence_path(program.name).is_file(),
+                        "selector-leak retry evidence missing for {}",
+                        program.name
+                    );
+                }
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    selector_resource_deferred.push(program.name);
+                    m.set("selector_core_status", "resource-deferred-tracked");
+                    m.set(
+                        "selector_core_note",
+                        format!(
+                            "family-tracked worker hit {} at 1800s and {} at 3600s",
+                            m.get("selector_core_note").unwrap_or("resource-wall"),
+                            tracked.status
+                        ),
+                    );
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    panic!(
+                        "selector-leak tracked retry failed for {}: status={} note={}",
+                        program.name, tracked.status, tracked.note
+                    );
+                }
+            }
+
+            let mut jsonl = provenance::line(&sha, dirty, unix) + "\n";
+            for row in &raw_rows {
+                jsonl.push_str(&report::to_json_line(row));
+                jsonl.push('\n');
+            }
+            fs::write(out_dir().join("results.jsonl"), jsonl).expect("write retry jsonl");
+            fs::write(out_dir().join("results.csv"), report::render_csv(&merged))
+                .expect("write retry csv");
+            fs::write(out_dir().join("report.md"), render_report(&merged))
+                .expect("write retry report");
+        }
+    }
+
+    if selector_leak_diag {
         let parse_total = |key: &str| {
             merged
                 .iter()
@@ -6188,6 +6341,29 @@ fn boc1_corpus() {
             170 - deferred_sinks,
             "every non-deferred final leaked sink selector must have one secondary classification row"
         );
+        let mut program_status_csv = String::from(
+            "program,status,official_sources_leaked,covered_sources,official_sinks_leaked,\
+             covered_sinks,official_wall_s,tracked_first_wall_s,tracked_retry_wall_s,\
+             tracked_total_wall_s\n",
+        );
+        for row in &merged {
+            let program = row.get("program").expect("selector program");
+            let deferred = selector_resource_deferred.contains(&program);
+            let sources = row
+                .get("sources_leaked_sel")
+                .expect("selector source count");
+            let sinks = row.get("sinks_leaked").expect("selector sink count");
+            program_status_csv.push_str(&format!(
+                "{program},{},{sources},{},{sinks},{},{},{},{},{}\n",
+                row.get("selector_core_status").unwrap_or("missing"),
+                if deferred { "0" } else { sources },
+                if deferred { "0" } else { sinks },
+                row.get("bo_wall_s").unwrap_or("-"),
+                row.get("selector_core_first_wall_s").unwrap_or("-"),
+                row.get("selector_core_retry_wall_s").unwrap_or("-"),
+                row.get("selector_core_wall_s").unwrap_or("-"),
+            ));
+        }
 
         let source_final = selector_leak_diagnosis::final_evidence(
             &evidence,
@@ -6248,6 +6424,19 @@ fn boc1_corpus() {
             }
         }
 
+        enum DetailOutcome {
+            Complete {
+                wall_s: f64,
+                path: std::path::PathBuf,
+                detail: selector_leak_diagnosis::DetailEvidence,
+            },
+            ResourceDeferred {
+                wall_s: f64,
+                status: String,
+                note: String,
+            },
+        }
+
         let mut detail_outcomes = BTreeMap::new();
         for ((program, epoch, selector_index), selected_families) in &selected_cases {
             let corpus_program = CORPUS
@@ -6265,33 +6454,50 @@ fn boc1_corpus() {
                     .join("+")
             );
             let outcome = run_child(program, &input, &mode, diagnostic_timeout);
-            assert_eq!(
-                outcome.status, "ok",
-                "selector representative failed for {program} epoch {epoch} selector \
-                 {selector_index}: status={} note={}",
-                outcome.status, outcome.note
-            );
-            let path = selector_detail_path(program, &format!("{epoch}-{selector_index}"));
-            assert!(
-                path.is_file(),
-                "selector representative evidence missing: {}",
-                path.display()
-            );
-            let detail = selector_leak_diagnosis::read_detail_evidence(&path)
-                .unwrap_or_else(|error| panic!("{error}"));
+            let detail_outcome = match diagnostic_worker_disposition(&outcome.status) {
+                DiagnosticWorkerDisposition::Complete => {
+                    let path = selector_detail_path(program, &format!("{epoch}-{selector_index}"));
+                    assert!(
+                        path.is_file(),
+                        "selector representative evidence missing: {}",
+                        path.display()
+                    );
+                    let detail = selector_leak_diagnosis::read_detail_evidence(&path)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    DetailOutcome::Complete {
+                        wall_s: outcome.wall_s,
+                        path,
+                        detail,
+                    }
+                }
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    DetailOutcome::ResourceDeferred {
+                        wall_s: outcome.wall_s,
+                        status: outcome.status,
+                        note: outcome.note,
+                    }
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    panic!(
+                        "selector representative failed for {program} epoch {epoch} selector \
+                         {selector_index}: status={} note={}",
+                        outcome.status, outcome.note
+                    );
+                }
+            };
             detail_outcomes.insert(
                 (program.clone(), *epoch, *selector_index),
-                (outcome.wall_s, path, detail),
+                detail_outcome,
             );
         }
 
         let mut representative_tsv = String::from(
             "family\tprogram\tselector_key\tepoch\tselector_index\tclass\t\
              matrix_raw_families\tdetail_raw_families\tdetail_minimized_families\t\
-             minimized\tcommit_origins\twall_s\tevidence_path\n",
+             minimized\tcommit_origins\twall_s\tstatus\tnote\tevidence_path\n",
         );
         for (family, program, selector_key, epoch, selector_index, class) in selected_by_family {
-            let (wall_s, path, detail) = detail_outcomes
+            let outcome = detail_outcomes
                 .get(&(program.clone(), epoch, selector_index))
                 .expect("representative outcome");
             let matrix = source_final
@@ -6303,31 +6509,47 @@ fn boc1_corpus() {
                         && record.selector_index == selector_index
                 })
                 .expect("representative matrix record");
-            representative_tsv.push_str(&format!(
-                "{family}\t{program}\t{selector_key}\t{epoch}\t{selector_index}\t{class:?}\t\
-                 {}\t{}\t{}\t{}\t{}\t{wall_s:.1}\t{}\n",
-                matrix
-                    .raw_families
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                detail
-                    .raw_families
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                detail
-                    .minimized_families
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                detail.minimized,
-                detail.commit_origins.join(" || "),
-                path.display(),
-            ));
+            let matrix_families = matrix
+                .raw_families
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("+");
+            match outcome {
+                DetailOutcome::Complete {
+                    wall_s,
+                    path,
+                    detail,
+                } => representative_tsv.push_str(&format!(
+                    "{family}\t{program}\t{selector_key}\t{epoch}\t{selector_index}\t{class:?}\t\
+                     {matrix_families}\t{}\t{}\t{}\t{}\t{wall_s:.1}\tok\t-\t{}\n",
+                    detail
+                        .raw_families
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("+"),
+                    detail
+                        .minimized_families
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("+"),
+                    detail.minimized,
+                    detail.commit_origins.join(" || "),
+                    path.display(),
+                )),
+                DetailOutcome::ResourceDeferred {
+                    wall_s,
+                    status,
+                    note,
+                } => representative_tsv.push_str(&format!(
+                    "{family}\t{program}\t{selector_key}\t{epoch}\t{selector_index}\t{class:?}\t\
+                     {matrix_families}\t-\t-\tfalse\t-\t{wall_s:.1}\t\
+                     resource-deferred-{status}\t{}\t-\n",
+                    report::sanitize(note),
+                )),
+            }
         }
         fs::write(
             out_dir().join("representative-cases.tsv"),
@@ -6387,14 +6609,20 @@ fn boc1_corpus() {
         )
         .expect("write sink family/program cross-tab");
         fs::write(
+            out_dir().join("selector-program-status.csv"),
+            &program_status_csv,
+        )
+        .expect("write selector program status");
+        fs::write(
             out_dir().join("classification-report.md"),
             format!(
                 "# Source-selector leak core classification\n\n\
                  - Contract: Mode-A, L2 off, smt.random_seed=0, sat.random_seed=0, \
-                   official 900 s / tracked 1800 s, 8192 MiB, serialized.\n\
+                   official 900 s / tracked 1800 s, one serial tracked retry at 3600 s, \
+                   8192 MiB, serialized.\n\
                  - Baseline: 20/20 accept; n_ref=52,810; n_own=230; \
                    sources leaked=114/144; sinks leaked=170/206.\n\
-                 - Source rows: {}. Sink secondary rows: {}.\n\
+                 - Covered source rows: {}/114. Covered sink secondary rows: {}/170.\n\
                  - Resource-deferred tracked programs: {} (source rows deferred: {}; \
                    sink rows deferred: {}).\n\
                  - Corpus hard-core minimization: disabled; `minimized=false` and \
@@ -6403,8 +6631,16 @@ fn boc1_corpus() {
                    this run does not infer from core chains.\n\
                  - Core visibility: mutability and fatness are not independent Z3 families; \
                    their influence can appear only indirectly through replay-generated commits.\n\n\
+                 ## Per-program status\n\n```csv\n{program_status_csv}```\n\n\
                  ## Source family × program\n\n```csv\n{source_cross_tab}```\n\n\
-                 ## Sink family × program\n\n```csv\n{sink_cross_tab}```\n",
+                 ## Sink family × program\n\n```csv\n{sink_cross_tab}```\n\n\
+                 ## Limitations\n\n\
+                 The matrix is core-incidence under one marker per hard-constraint family. \
+                 A reserved follow-up, not run here, is removal-based necessity attribution \
+                 at each drop point: re-solve the untracked system with one family's constraints \
+                 removed and report that family necessary when the result becomes SAT. This could \
+                 cover resource-deferred programs at untracked speed while preserving the \
+                 family-incidence meaning of the matrix.\n",
                 source_records.len(),
                 sink_records.len(),
                 if selector_resource_deferred.is_empty() {
