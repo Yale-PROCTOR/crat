@@ -11,6 +11,7 @@ extern crate smallvec;
 extern crate thin_vec;
 
 mod item_replacer;
+mod preservation;
 mod skeleton;
 mod validator;
 

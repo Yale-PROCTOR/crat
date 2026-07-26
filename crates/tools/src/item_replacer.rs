@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
+use crate::preservation::{canonicalize_function_for_replacement, validate_preservation_metadata};
+
 const REPLACEMENT_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +42,9 @@ pub struct ReplacementItem {
     pub id: u64,
     pub path: String,
     pub name: String,
+    pub skeleton: String,
+    pub needs_transformation: bool,
+    pub statements_requiring_transformation: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +60,7 @@ pub enum ReplacementErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplacementError {
     pub kind: ReplacementErrorKind,
-    pub item: Option<ReplacementItem>,
+    pub item: Option<Box<ReplacementItem>>,
     pub message: String,
 }
 
@@ -85,7 +90,28 @@ pub fn replace_items(
     tcx: TyCtxt<'_>,
 ) -> Result<String, ReplacementError> {
     validate_request(request)?;
-    let transformations = parse_transformations(request)?;
+    let returned_transformations = parse_transformations(request)?;
+    let mut transformations = HashMap::new();
+    for requested in &request.items {
+        let expected = parse_replacement_skeleton(requested)?;
+        let returned = returned_transformations
+            .get(&requested.name)
+            .expect("request validation established the function set");
+        let canonical = canonicalize_function_for_replacement(
+            &expected,
+            returned,
+            requested.needs_transformation,
+            &requested.statements_requiring_transformation,
+        )
+        .map_err(|problem| {
+            item_error(
+                ReplacementErrorKind::InvalidTransformation,
+                requested,
+                format!("{}: {}", problem.code, problem.message),
+            )
+        })?;
+        transformations.insert(requested.name.clone(), canonical);
+    }
     let mut surface = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
     let ast_to_hir = map_surface_to_hir(&mut surface, tcx)?;
 
@@ -272,9 +298,46 @@ fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError
                 ),
             ));
         }
+        parse_replacement_skeleton(item)?;
     }
     parse_transformations(request)?;
     Ok(())
+}
+
+fn parse_replacement_skeleton(item: &ReplacementItem) -> Result<P<Item>, ReplacementError> {
+    let krate = parse_crate(&item.skeleton, ReplacementErrorKind::InvalidRequest)?;
+    if krate.items.len() != 1 || !matches!(krate.items[0].kind, ItemKind::Fn(..)) {
+        return Err(item_error(
+            ReplacementErrorKind::InvalidRequest,
+            item,
+            "replacement skeleton must contain exactly one free function".to_owned(),
+        ));
+    }
+    let skeleton = krate.items[0].clone();
+    let observed_name = skeleton.kind.ident().unwrap().to_string();
+    if observed_name != item.name {
+        return Err(item_error(
+            ReplacementErrorKind::InvalidRequest,
+            item,
+            format!(
+                "replacement skeleton defines `{observed_name}` instead of `{}`",
+                item.name
+            ),
+        ));
+    }
+    validate_preservation_metadata(
+        &skeleton,
+        item.needs_transformation,
+        &item.statements_requiring_transformation,
+    )
+    .map_err(|problem| {
+        item_error(
+            ReplacementErrorKind::InvalidRequest,
+            item,
+            format!("{}: {}", problem.code, problem.message),
+        )
+    })?;
+    Ok(skeleton)
 }
 
 fn valid_full_path(path: &str) -> Option<Vec<String>> {
@@ -1423,7 +1486,7 @@ fn rewrite_item_list(
         }
         if let Some(requested) = mains.get(&item.id) {
             item = fixed_main_item().map_err(|mut error| {
-                error.item = Some((*requested).clone());
+                error.item = Some(Box::new((*requested).clone()));
                 error
             })?;
         }
@@ -1517,7 +1580,7 @@ fn item_error(
 ) -> ReplacementError {
     ReplacementError {
         kind,
-        item: Some(item.clone()),
+        item: Some(Box::new(item.clone())),
         message,
     }
 }

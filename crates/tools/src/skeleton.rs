@@ -19,7 +19,11 @@ use rustc_middle::{
     hir::nested_filter,
     ty::{self, TyCtxt},
 };
-use rustc_span::{DUMMY_SP, Symbol, def_id::LocalDefId, sym};
+use rustc_span::{
+    DUMMY_SP, Symbol,
+    def_id::{DefId, LocalDefId},
+    sym,
+};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 
@@ -44,6 +48,8 @@ pub struct FunctionRecord {
     pub annotated_skeleton: String,
     pub source_signature: String,
     pub target_signature: String,
+    pub needs_transformation: bool,
+    pub statements_requiring_transformation: Vec<u32>,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
 }
@@ -134,7 +140,25 @@ struct SurfaceItem {
     kind: ItemKindName,
 }
 
+#[derive(Default)]
+struct PreservationDecisionOverrides {
+    changed_fields: FxHashSet<DefId>,
+    changed_local_signatures: FxHashSet<LocalDefId>,
+}
+
 pub fn make_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_skeletons_with_preservation_overrides(
+        source,
+        tcx,
+        &PreservationDecisionOverrides::default(),
+    )
+}
+
+fn make_skeletons_with_preservation_overrides(
+    source: &str,
+    tcx: TyCtxt<'_>,
+    preservation_overrides: &PreservationDecisionOverrides,
+) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
     let mut mapper = utils::ir::AstToHirMapper::new(tcx);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -171,7 +195,16 @@ pub fn make_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, 
 
     raw_items
         .into_iter()
-        .map(|item| make_record(item, &ast_to_hir, &item_ids, &decisions, tcx))
+        .map(|item| {
+            make_record(
+                item,
+                &ast_to_hir,
+                &item_ids,
+                &decisions,
+                preservation_overrides,
+                tcx,
+            )
+        })
         .collect()
 }
 
@@ -260,12 +293,20 @@ fn make_record(
     ast_to_hir: &utils::ir::AstToHir,
     item_ids: &FxHashMap<rustc_span::def_id::DefId, u64>,
     decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
     tcx: TyCtxt<'_>,
 ) -> Result<ItemRecord, GenerationError> {
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
     let dependencies = collect_dependencies(hitem, item_ids, tcx);
     match surface.kind {
-        ItemKindName::Fn => make_function_record(surface, ast_to_hir, item_ids, decisions, tcx),
+        ItemKindName::Fn => make_function_record(
+            surface,
+            ast_to_hir,
+            item_ids,
+            decisions,
+            preservation_overrides,
+            tcx,
+        ),
         ItemKindName::Static | ItemKindName::Const => {
             let signature_dependencies = collect_signature_dependencies(hitem, item_ids, tcx);
             let mut item = surface.item.clone();
@@ -299,6 +340,7 @@ fn make_function_record(
     ast_to_hir: &utils::ir::AstToHir,
     item_ids: &FxHashMap<rustc_span::def_id::DefId, u64>,
     decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
     tcx: TyCtxt<'_>,
 ) -> Result<ItemRecord, GenerationError> {
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
@@ -310,11 +352,20 @@ fn make_function_record(
     let opaque_nested_ifs = collect_opaque_nested_ifs(&source, &surface.path)?;
     annotate_function(&mut source, &opaque_nested_ifs);
     PresentationBindingNormalizer.visit_item(&mut source);
+    let statements_requiring_transformation = classify_function_statements(
+        &source,
+        &opaque_nested_ifs,
+        ast_to_hir,
+        decisions,
+        preservation_overrides,
+        tcx,
+    );
     let mut skeleton = source.clone();
     apply_target_signature(&mut skeleton, surface.def_id, decisions, tcx);
     let mut skeletonizer = Skeletonizer {
         ast_to_hir,
         decisions,
+        statements_requiring_transformation: &statements_requiring_transformation,
         tcx,
     };
     skeletonizer.visit_item(&mut skeleton);
@@ -330,6 +381,10 @@ fn make_function_record(
         annotated_skeleton: render_annotated_item(&skeleton),
         source_signature,
         target_signature,
+        needs_transformation: !statements_requiring_transformation.is_empty(),
+        statements_requiring_transformation: statements_requiring_transformation
+            .into_iter()
+            .collect(),
         signature_dependencies,
         dependencies,
     }))
@@ -636,48 +691,515 @@ fn target_type<'tcx>(
     utils::ast::parse_ty(rendered)
 }
 
+fn classify_function_statements(
+    item: &Item,
+    opaque_nested_ifs: &FxHashSet<NodeId>,
+    ast_to_hir: &utils::ir::AstToHir,
+    decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
+    tcx: TyCtxt<'_>,
+) -> BTreeSet<u32> {
+    let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+    let mut classifier = StatementClassifier {
+        ast_to_hir,
+        decisions,
+        preservation_overrides,
+        opaque_nested_ifs,
+        tcx,
+        transformed: BTreeSet::new(),
+    };
+    classifier.visit_block(
+        function
+            .body
+            .as_ref()
+            .expect("source-defined function has a body"),
+    );
+    classifier.transformed
+}
+
+struct StatementClassifier<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    decisions: &'a InitialPointerDecisions,
+    preservation_overrides: &'a PreservationDecisionOverrides,
+    opaque_nested_ifs: &'a FxHashSet<NodeId>,
+    tcx: TyCtxt<'tcx>,
+    transformed: BTreeSet<u32>,
+}
+
+impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        let label = statement_numeric_label(statement)
+            .expect("generation assigned every statement a label");
+        if !statement_is_preservable(
+            statement,
+            self.ast_to_hir,
+            self.decisions,
+            self.preservation_overrides,
+            self.tcx,
+        ) {
+            self.transformed.insert(label);
+        }
+        visit::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self.opaque_nested_ifs.contains(&expression.id) {
+            return;
+        }
+        visit::walk_expr(self, expression);
+    }
+}
+
+fn statement_is_preservable(
+    statement: &Stmt,
+    ast_to_hir: &utils::ir::AstToHir,
+    decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let mut surface = SurfacePreservationCheck {
+        ast_to_hir,
+        tcx,
+        preservable: true,
+    };
+    surface.visit_stmt(statement);
+    if !surface.preservable {
+        return false;
+    }
+    let Some(hir_node) = ast_to_hir.get_local_node(statement.id, tcx) else {
+        return false;
+    };
+    let owner = match hir_node {
+        hir::Node::Stmt(statement) => statement.hir_id.owner,
+        hir::Node::Expr(expression) => expression.hir_id.owner,
+        _ => return false,
+    };
+    let mut hir = HirPreservationCheck {
+        tcx,
+        decisions,
+        preservation_overrides,
+        owner,
+        direct_callee: None,
+        preservable: true,
+        sensitive_types: FxHashMap::default(),
+        visiting_types: FxHashSet::default(),
+    };
+    match hir_node {
+        hir::Node::Stmt(statement) => hir.visit_stmt(statement),
+        hir::Node::Expr(expression) => hir.visit_expr(expression),
+        _ => unreachable!(),
+    }
+    hir.preservable
+}
+
+struct SurfacePreservationCheck<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+    preservable: bool,
+}
+
+impl<'ast> visit::Visitor<'ast> for SurfacePreservationCheck<'_, '_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if !self.ast_to_hir.local_map.contains_key(&statement.id)
+            || matches!(statement.kind, StmtKind::MacCall(..))
+        {
+            self.preservable = false;
+        }
+        visit::walk_stmt(self, statement);
+    }
+
+    fn visit_local(&mut self, local: &'ast rustc_ast::Local) {
+        if self.ast_to_hir.get_let_stmt(local.id, self.tcx).is_none() {
+            self.preservable = false;
+        }
+        visit::walk_local(self, local);
+    }
+
+    fn visit_pat(&mut self, pattern: &'ast Pat) {
+        if self.ast_to_hir.get_pat(pattern.id, self.tcx).is_none() {
+            self.preservable = false;
+        }
+        visit::walk_pat(self, pattern);
+    }
+
+    fn visit_ty(&mut self, ty: &'ast Ty) {
+        if self.ast_to_hir.get_ty(ty.id, self.tcx).is_none() {
+            self.preservable = false;
+        }
+        visit::walk_ty(self, ty);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self.ast_to_hir.get_expr(expression.id, self.tcx).is_none()
+            || matches!(
+                expression.kind,
+                ExprKind::MacCall(..)
+                    | ExprKind::Closure(..)
+                    | ExprKind::InlineAsm(..)
+                    | ExprKind::Try(..)
+                    | ExprKind::Await(..)
+            )
+        {
+            self.preservable = false;
+        }
+        visit::walk_expr(self, expression);
+    }
+
+    fn visit_mac_call(&mut self, _mac: &'ast rustc_ast::MacCall) {
+        self.preservable = false;
+    }
+}
+
+struct HirPreservationCheck<'tcx, 'a> {
+    tcx: TyCtxt<'tcx>,
+    decisions: &'a InitialPointerDecisions,
+    preservation_overrides: &'a PreservationDecisionOverrides,
+    owner: hir::OwnerId,
+    direct_callee: Option<HirId>,
+    preservable: bool,
+    sensitive_types: FxHashMap<ty::Ty<'tcx>, bool>,
+    visiting_types: FxHashSet<ty::Ty<'tcx>>,
+}
+
+impl<'tcx> HirPreservationCheck<'tcx, '_> {
+    fn reject(&mut self) {
+        self.preservable = false;
+    }
+
+    fn check_type(&mut self, ty: ty::Ty<'tcx>) {
+        if self.type_is_sensitive(ty) {
+            self.reject();
+        }
+    }
+
+    fn type_is_sensitive(&mut self, ty: ty::Ty<'tcx>) -> bool {
+        if let Some(result) = self.sensitive_types.get(&ty) {
+            return *result;
+        }
+        if !self.visiting_types.insert(ty) {
+            return false;
+        }
+        let sensitive = match ty.kind() {
+            ty::TyKind::Bool
+            | ty::TyKind::Char
+            | ty::TyKind::Int(_)
+            | ty::TyKind::Uint(_)
+            | ty::TyKind::Float(_)
+            | ty::TyKind::Str
+            | ty::TyKind::Never => false,
+            ty::TyKind::RawPtr(..) => true,
+            ty::TyKind::Ref(_, inner, _) | ty::TyKind::Slice(inner) => {
+                self.type_is_sensitive(*inner)
+            }
+            ty::TyKind::Array(inner, _) => self.type_is_sensitive(*inner),
+            ty::TyKind::Tuple(types) => types.iter().any(|ty| self.type_is_sensitive(ty)),
+            ty::TyKind::Adt(definition, arguments) => {
+                let arguments_sensitive = arguments
+                    .types()
+                    .any(|argument| self.type_is_sensitive(argument));
+                arguments_sensitive
+                    || (definition.did().is_local()
+                        && definition.variants().iter().any(|variant| {
+                            variant.fields.iter().any(|field| {
+                                self.preservation_overrides
+                                    .changed_fields
+                                    .contains(&field.did)
+                                    || self.type_is_sensitive(field.ty(self.tcx, arguments))
+                            })
+                        }))
+            }
+            ty::TyKind::FnDef(def_id, arguments) => {
+                self.callable_signature_is_sensitive(*def_id, arguments)
+            }
+            ty::TyKind::FnPtr(signature, _) => signature
+                .skip_binder()
+                .inputs_and_output
+                .iter()
+                .any(|ty| self.type_is_sensitive(ty)),
+            ty::TyKind::Alias(..)
+            | ty::TyKind::Param(..)
+            | ty::TyKind::Bound(..)
+            | ty::TyKind::Placeholder(..)
+            | ty::TyKind::Infer(..)
+            | ty::TyKind::Error(..)
+            | ty::TyKind::Dynamic(..)
+            | ty::TyKind::Foreign(..)
+            | ty::TyKind::Closure(..)
+            | ty::TyKind::CoroutineClosure(..)
+            | ty::TyKind::Coroutine(..)
+            | ty::TyKind::CoroutineWitness(..)
+            | ty::TyKind::UnsafeBinder(..)
+            | ty::TyKind::Pat(..) => true,
+        };
+        self.visiting_types.remove(&ty);
+        self.sensitive_types.insert(ty, sensitive);
+        sensitive
+    }
+
+    fn callable_signature_is_sensitive(
+        &mut self,
+        def_id: DefId,
+        arguments: ty::GenericArgsRef<'tcx>,
+    ) -> bool {
+        self.tcx
+            .fn_sig(def_id)
+            .instantiate(self.tcx, arguments)
+            .skip_binder()
+            .inputs_and_output
+            .iter()
+            .any(|ty| self.type_is_sensitive(ty))
+    }
+
+    fn binding_changes(&self, hir_id: HirId) -> bool {
+        let Some(decision) = self.decisions.bindings.get(&hir_id).copied() else {
+            return false;
+        };
+        let source = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+        decision_changes_type(decision, source)
+    }
+
+    fn local_signature_changes(&self, def_id: LocalDefId) -> bool {
+        if self
+            .preservation_overrides
+            .changed_local_signatures
+            .contains(&def_id)
+        {
+            return true;
+        }
+        let signature = self.tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+        if self.tcx.item_name(def_id.to_def_id()).as_str() == "main_0"
+            && signature.inputs().len() == 2
+        {
+            return true;
+        }
+        let Some(decision) = self.decisions.signatures.data.get(&def_id) else {
+            return false;
+        };
+        decision
+            .input_decs
+            .iter()
+            .zip(signature.inputs())
+            .any(|(decision, source)| {
+                decision.is_some_and(|decision| decision_changes_type(decision, *source))
+            })
+            || decision
+                .output_dec
+                .is_some_and(|decision| decision_changes_type(decision, signature.output()))
+    }
+
+    fn check_callable(&mut self, def_id: DefId, arguments: ty::GenericArgsRef<'tcx>) {
+        if self.tcx.is_foreign_item(def_id) {
+            self.reject();
+            return;
+        }
+        let signature = self
+            .tcx
+            .fn_sig(def_id)
+            .instantiate(self.tcx, arguments)
+            .skip_binder();
+        if !def_id.is_local() && signature.safety.is_unsafe() {
+            self.reject();
+        }
+        if let Some(local) = def_id.as_local()
+            && self.local_signature_changes(local)
+        {
+            self.reject();
+        }
+        if signature
+            .inputs_and_output
+            .iter()
+            .any(|ty| self.type_is_sensitive(ty))
+        {
+            self.reject();
+        }
+    }
+
+    fn check_expression_types(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+        let typeck = self.tcx.typeck(self.owner);
+        self.check_type(typeck.expr_ty(expression));
+        self.check_type(typeck.expr_ty_adjusted(expression));
+        for adjustment in typeck.expr_adjustments(expression) {
+            self.check_type(adjustment.target);
+        }
+    }
+
+    fn check_overloaded_operation(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+        let typeck = self.tcx.typeck(self.owner);
+        if let Some(def_id) = typeck.type_dependent_def_id(expression.hir_id) {
+            let arguments = typeck.node_args(expression.hir_id);
+            self.check_callable(def_id, arguments);
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for HirPreservationCheck<'tcx, '_> {
+    fn visit_stmt(&mut self, statement: &'tcx hir::Stmt<'tcx>) {
+        if !self.preservable {
+            return;
+        }
+        intravisit::walk_stmt(self, statement);
+    }
+
+    fn visit_pat(&mut self, pattern: &'tcx hir::Pat<'tcx>) {
+        let typeck = self.tcx.typeck(self.owner);
+        self.check_type(typeck.node_type(pattern.hir_id));
+        if self.binding_changes(pattern.hir_id) {
+            self.reject();
+        }
+        intravisit::walk_pat(self, pattern);
+    }
+
+    fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, hir::AmbigArg>) {
+        self.check_type(self.tcx.typeck(self.owner).node_type(ty.hir_id));
+        intravisit::walk_ty(self, ty);
+    }
+
+    fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+        if !self.preservable {
+            return;
+        }
+        self.check_expression_types(expression);
+        let typeck = self.tcx.typeck(self.owner);
+        match expression.kind {
+            hir::ExprKind::Call(callee, arguments) => {
+                let callee_ty = typeck.expr_ty(callee);
+                let ty::TyKind::FnDef(def_id, generic_arguments) = callee_ty.kind() else {
+                    self.reject();
+                    return;
+                };
+                self.check_callable(*def_id, generic_arguments);
+                let previous = self.direct_callee.replace(callee.hir_id);
+                self.visit_expr(callee);
+                self.direct_callee = previous;
+                for argument in arguments {
+                    self.visit_expr(argument);
+                }
+                return;
+            }
+            hir::ExprKind::MethodCall(_, receiver, arguments, _) => {
+                let Some(def_id) = typeck.type_dependent_def_id(expression.hir_id) else {
+                    self.reject();
+                    return;
+                };
+                self.check_callable(def_id, typeck.node_args(expression.hir_id));
+                self.visit_expr(receiver);
+                for argument in arguments {
+                    self.visit_expr(argument);
+                }
+                return;
+            }
+            hir::ExprKind::Path(ref path) => {
+                match typeck.qpath_res(path, expression.hir_id) {
+                    Res::Local(hir_id) if self.binding_changes(hir_id) => self.reject(),
+                    Res::Def(
+                        DefKind::Static {
+                            mutability: hir::Mutability::Mut,
+                            ..
+                        },
+                        _,
+                    ) => self.reject(),
+                    _ => {}
+                }
+                if matches!(typeck.expr_ty(expression).kind(), ty::TyKind::FnDef(..))
+                    && self.direct_callee != Some(expression.hir_id)
+                {
+                    self.reject();
+                }
+            }
+            hir::ExprKind::Field(base, _) => {
+                let base_ty = typeck.expr_ty_adjusted(base).peel_refs();
+                if let ty::TyKind::Adt(definition, _) = base_ty.kind()
+                    && definition.is_union()
+                {
+                    self.reject();
+                }
+            }
+            hir::ExprKind::Closure(..) | hir::ExprKind::InlineAsm(..) => self.reject(),
+            hir::ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_)) => self.reject(),
+            hir::ExprKind::Binary(..)
+            | hir::ExprKind::Unary(..)
+            | hir::ExprKind::Index(..)
+            | hir::ExprKind::AssignOp(..) => self.check_overloaded_operation(expression),
+            _ => {}
+        }
+        intravisit::walk_expr(self, expression);
+    }
+}
+
+fn decision_changes_type(decision: PtrKind, source: ty::Ty<'_>) -> bool {
+    let ty::TyKind::RawPtr(_, source_mutability) = source.kind() else {
+        // Pointer replacement decisions are only materialized for source raw
+        // pointers. The analysis map can also contain propagated decisions for
+        // already-safe references, which do not change their source type.
+        return false;
+    };
+    match decision {
+        PtrKind::Raw(target_mutability) => target_mutability != source_mutability.is_mut(),
+        _ => true,
+    }
+}
+
 struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
+    statements_requiring_transformation: &'a BTreeSet<u32>,
     tcx: TyCtxt<'tcx>,
 }
 
 impl MutVisitor for Skeletonizer<'_, '_> {
     fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
-        match &mut stmt.kind {
-            StmtKind::Let(local) => {
-                if let PatKind::Ident(_, _, None) = local.pat.kind
-                    && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
+        let requires_transformation = statement_numeric_label(&stmt)
+            .is_none_or(|label| self.statements_requiring_transformation.contains(&label));
+        if let StmtKind::Let(local) = &mut stmt.kind
+            && let PatKind::Ident(_, _, None) = local.pat.kind
+            && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
+        {
+            let inferred = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+            let decision = inferred
+                .is_raw_ptr()
+                .then(|| self.decisions.bindings.get(&hir_id).copied())
+                .flatten();
+            let ty = match (decision, local.ty.as_deref()) {
+                (Some(kind), Some(ty)) if raw_decision_matches_inferred_type(kind, inferred) => {
+                    Some(ty.clone())
+                }
+                (Some(kind), _) => Some(target_type(inferred, kind, None, self.tcx)),
+                (None, Some(ty)) => Some(ty.clone()),
+                (None, None)
+                    if !matches!(
+                        inferred.kind(),
+                        ty::TyKind::FnDef(..)
+                            | ty::TyKind::FnPtr(..)
+                            | ty::TyKind::Closure(..)
+                            | ty::TyKind::CoroutineClosure(..)
+                            | ty::TyKind::Coroutine(..)
+                            | ty::TyKind::CoroutineWitness(..)
+                    ) =>
                 {
-                    let inferred = self.tcx.typeck(hir_id.owner).node_type(hir_id);
-                    let decision = inferred
-                        .is_raw_ptr()
-                        .then(|| self.decisions.bindings.get(&hir_id).copied())
-                        .flatten();
-                    let ty = match (decision, local.ty.as_deref()) {
-                        (Some(kind), Some(ty))
-                            if raw_decision_matches_inferred_type(kind, inferred) =>
-                        {
-                            ty.clone()
-                        }
-                        (Some(kind), _) => target_type(inferred, kind, None, self.tcx),
-                        (None, Some(ty)) => ty.clone(),
-                        (None, None) => utils::ast::parse_ty(inferred.to_string()),
-                    };
-                    local.ty = Some(P(ty));
+                    Some(utils::ast::parse_ty(inferred.to_string()))
                 }
-                match &mut local.kind {
-                    LocalKind::Decl => {}
-                    LocalKind::Init(init) => skeletonize_payload(init, self),
-                    LocalKind::InitElse(init, else_block) => {
-                        skeletonize_payload(init, self);
-                        self.visit_block(else_block);
-                    }
+                (None, None) => None,
+            };
+            local.ty = ty.map(P);
+        }
+        if !requires_transformation {
+            return smallvec![stmt];
+        }
+        match &mut stmt.kind {
+            StmtKind::Let(local) => match &mut local.kind {
+                LocalKind::Decl => {}
+                LocalKind::Init(init) => skeletonize_payload(init, self),
+                LocalKind::InitElse(init, else_block) => {
+                    skeletonize_payload(init, self);
+                    self.visit_block(else_block);
                 }
+            },
+            StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
+                skeletonize_statement_expr(expr, self);
             }
-            StmtKind::Expr(expr) | StmtKind::Semi(expr) => skeletonize_statement_expr(expr, self),
             StmtKind::Item(_) | StmtKind::Empty => {}
             StmtKind::MacCall(mac) => {
+                debug_assert!(requires_transformation);
                 let mut expr = todo_expr();
                 expr.attrs = std::mem::take(&mut mac.attrs);
                 stmt.kind = StmtKind::Semi(P(expr));
@@ -685,6 +1207,32 @@ impl MutVisitor for Skeletonizer<'_, '_> {
         }
         smallvec![stmt]
     }
+}
+
+fn statement_numeric_label(statement: &Stmt) -> Option<u32> {
+    let attributes = match &statement.kind {
+        StmtKind::Let(local) => &local.attrs,
+        StmtKind::Item(item) => &item.attrs,
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => &expression.attrs,
+        StmtKind::MacCall(mac) => &mac.attrs,
+        StmtKind::Empty => return None,
+    };
+    attributes.iter().find_map(|attribute| {
+        let AttrKind::Normal(normal) = &attribute.kind else {
+            return None;
+        };
+        let rendered = pprust::attribute_to_string(attribute);
+        (normal.item.path.segments.len() == 1
+            && normal.item.path.segments[0].ident.name.as_str() == "proctor")
+            .then(|| {
+                rendered
+                    .strip_prefix("#[proctor(")?
+                    .strip_suffix(")]")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .flatten()
+    })
 }
 
 fn todo_expr() -> Expr {

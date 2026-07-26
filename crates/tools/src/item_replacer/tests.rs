@@ -2,15 +2,105 @@ use utils::compilation::run_compiler_on_str;
 
 use super::*;
 
+fn replacement_item(id: u64, path: impl Into<String>, name: impl Into<String>) -> ReplacementItem {
+    let name = name.into();
+    ReplacementItem {
+        id,
+        path: path.into(),
+        skeleton: format!("unsafe fn {name}() {{}}"),
+        name,
+        needs_transformation: false,
+        statements_requiring_transformation: vec![],
+    }
+}
+
+fn preservation_item(
+    id: u64,
+    path: &str,
+    name: &str,
+    skeleton: &str,
+    transformed: Vec<u32>,
+) -> ReplacementItem {
+    ReplacementItem {
+        id,
+        path: path.to_owned(),
+        name: name.to_owned(),
+        skeleton: skeleton.to_owned(),
+        needs_transformation: !transformed.is_empty(),
+        statements_requiring_transformation: transformed,
+    }
+}
+
 fn request(path: &str, name: &str, transformation: &str) -> ReplacementRequest {
+    let mut item = replacement_item(7, path, name);
+    let transformation =
+        fully_annotated(transformation).unwrap_or_else(|| transformation.to_owned());
+    if transformation.contains("#[proctor(") {
+        item.skeleton = transformation.clone();
+    }
     ReplacementRequest {
         schema_version: 1,
-        items: vec![ReplacementItem {
-            id: 7,
-            path: path.to_owned(),
-            name: name.to_owned(),
-        }],
-        transformation: transformation.to_owned(),
+        items: vec![item],
+        transformation,
+    }
+}
+
+fn fully_annotated(source: &str) -> Option<String> {
+    struct TestLabeler {
+        next: u32,
+    }
+
+    impl MutVisitor for TestLabeler {
+        fn flat_map_stmt(&mut self, mut statement: Stmt) -> SmallVec<[Stmt; 1]> {
+            let attributes = match &mut statement.kind {
+                StmtKind::Let(local) => &mut local.attrs,
+                StmtKind::Item(item) => &mut item.attrs,
+                StmtKind::Expr(expression) | StmtKind::Semi(expression) => &mut expression.attrs,
+                StmtKind::MacCall(mac) => &mut mac.attrs,
+                StmtKind::Empty => return smallvec::smallvec![statement],
+            };
+            attributes.extend(utils::attr!("#[proctor({})]", self.next));
+            self.next += 1;
+            mut_visit::walk_flat_map_stmt(self, statement)
+        }
+    }
+
+    with_parse_session(|| {
+        let mut krate = parse_crate(source, ReplacementErrorKind::InvalidTransformation)?;
+        ProctorLabelRemover.visit_crate(&mut krate);
+        for item in &mut krate.items {
+            if let ItemKind::Fn(box function) = &mut item.kind {
+                TestLabeler { next: 0 }.visit_block(function.body.as_mut().unwrap());
+            }
+        }
+        Ok(pprust::crate_to_string_for_macros(&krate))
+    })
+    .ok()
+}
+
+fn request_with_items(mut items: Vec<ReplacementItem>, transformation: &str) -> ReplacementRequest {
+    let transformation = fully_annotated(transformation).unwrap();
+    with_parse_session(|| {
+        let krate = parse_crate(&transformation, ReplacementErrorKind::InvalidTransformation)?;
+        for requested in &mut items {
+            let item = krate
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind
+                        .ident()
+                        .is_some_and(|ident| ident.to_string() == requested.name)
+                })
+                .unwrap();
+            requested.skeleton = pprust::item_to_string(item);
+        }
+        Ok(())
+    })
+    .unwrap();
+    ReplacementRequest {
+        schema_version: 1,
+        items,
+        transformation,
     }
 }
 
@@ -82,7 +172,7 @@ pub fn main() { unsafe { ::std::process::exit(main_0() as i32) } }
 fn versioned_request_json_round_trip_preserves_rust() {
     let json = r#"{
   "schema_version": 1,
-  "items": [{"id":7,"path":"f","name":"f"}],
+  "items": [{"id":7,"path":"f","name":"f","skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statements_requiring_transformation":[0]}],
   "transformation": "unsafe fn f(value: i32) -> i32 {\n #[proctor(0)]\n value + 1\n}"
 }"#;
     let request = replacement_request_from_json(json).unwrap();
@@ -90,6 +180,218 @@ fn versioned_request_json_round_trip_preserves_rust() {
     assert!(request.transformation.contains("#[proctor(0)]"));
     let output = replace("pub unsafe fn f(value: i32) -> i32 { value }", &request).unwrap();
     assert!(compact(&output).contains("value + 1"));
+}
+
+#[test]
+fn amendment_2_replacement_discards_preserved_groups_without_validator() {
+    let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }",
+            vec![],
+        )],
+        transformation: "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let proctor_temp_var_0 = value * 100; #[proctor(0)] proctor_temp_var_0 }".to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    assert!(compact(&output).contains("value + 1"));
+    assert!(!output.contains("proctor_temp_var_0"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_replacement_restores_every_preserved_validator_group() {
+    let source = r#"
+pub unsafe fn validate_me(flag: bool, mut pointer: *mut i32) -> i32 {
+    let scalar = 1 + 2;
+    if flag {
+        let nested = 3 + 4;
+        *pointer = nested;
+    } else {
+        return scalar;
+    }
+    scalar
+}
+"#;
+    let skeleton = r#"
+unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
+    #[proctor(0)]
+    let scalar: i32 = 1 + 2;
+    #[proctor(1)]
+    if todo!() {
+        #[proctor(2)]
+        let nested: i32 = 3 + 4;
+        #[proctor(3)]
+        (*pointer = todo!());
+    } else {
+        #[proctor(4)]
+        return scalar;
+    }
+    #[proctor(5)]
+    scalar
+}
+"#;
+    let transformation = r#"
+unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
+    #[proctor(0)]
+    let scalar: i32 = 999;
+    #[proctor(1)]
+    if flag {
+        #[proctor(2)]
+        let nested: i32 = -100;
+        #[proctor(3)]
+        (*pointer = nested);
+    } else {
+        #[proctor(4)]
+        return -200;
+    }
+    #[proctor(5)]
+    300
+}
+"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "validate_me",
+            "validate_me",
+            skeleton,
+            vec![1, 3],
+        )],
+        transformation: transformation.to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    for canonical in ["1 + 2", "3 + 4", "return scalar", "} scalar }"] {
+        assert!(text.contains(canonical), "{text}");
+    }
+    for discarded in ["999", "-100", "-200", "300"] {
+        assert!(!text.contains(discarded), "{text}");
+    }
+    assert!(text.contains("*pointer = nested"));
+    assert!(!text.contains("proctor"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_replacement_rejects_extra_outer_groups_without_validator() {
+    let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
+    for transformation in [
+        "unsafe fn f(value: i32) -> i32 { attacker(); #[proctor(0)] 999 }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(99)] attacker(); #[proctor(0)] 999 }",
+    ] {
+        let request = ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(
+                7,
+                "f",
+                "f",
+                "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }",
+                vec![],
+            )],
+            transformation: transformation.to_owned(),
+        };
+        let error = replace(source, &request).unwrap_err();
+        assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
+    }
+}
+
+#[test]
+fn amendment_2_replacement_uses_immutable_skeleton_header() {
+    let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }",
+            vec![],
+        )],
+        transformation: "unsafe fn f(value: String) -> usize { #[proctor(0)] value.len() }"
+            .to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("unsafe fn f(value: i32) -> i32 { value + 1 }"));
+    assert!(!text.contains("String"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_fully_preserved_body_can_change_signature_and_create_wrapper() {
+    let source = "pub unsafe fn f(pointer: *mut i32) -> bool { pointer.is_null() }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            "unsafe fn f(pointer: Option<&i32>) -> bool { #[proctor(0)] pointer.is_none() }",
+            vec![],
+        )],
+        transformation: "unsafe fn f(pointer: Option<&i32>) -> bool { #[proctor(0)] false }"
+            .to_owned(),
+    };
+    let output = replace(source, &request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("unsafe fn __proctor_wrapper_f"), "{text}");
+    assert!(text.contains("pointer.is_none()"));
+    compile(&output);
+}
+
+#[test]
+fn amendment_2_metadata_failure_is_atomic() {
+    let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![ReplacementItem {
+            id: 7,
+            path: "f".to_owned(),
+            name: "f".to_owned(),
+            skeleton: "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }".to_owned(),
+            needs_transformation: false,
+            statements_requiring_transformation: vec![0],
+        }],
+        transformation: "unsafe fn f(value: i32) -> i32 { #[proctor(0)] 999 }".to_owned(),
+    };
+    let error = replace(source, &request).unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::InvalidRequest);
+    assert!(error.message.contains("inconsistent_preservation_metadata"));
+    assert_eq!(source, "pub unsafe fn f(value: i32) -> i32 { value + 1 }");
+}
+
+#[test]
+fn amendment_2_metadata_and_canonicalization_failures_are_atomic() {
+    let source = r#"
+pub unsafe fn f(flag: bool, pointer: *mut i32) {
+    if flag {
+        let nested: i32 = 1;
+        *pointer = nested;
+    } else {
+        return;
+    }
+}
+"#;
+    let skeleton = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 1; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
+    let valid = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 99; #[proctor(2)] (*pointer = 7); } else { #[proctor(3)] return; } }";
+    let misplaced = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(2)] (*pointer = 7); } else { #[proctor(1)] let nested: i32 = 99; #[proctor(3)] return; } }";
+    for (labels, transformation, expected_code) in [
+        (vec![0, 2, 99], valid, "unknown_transformation_label"),
+        (vec![2], valid, "open_preserved_parent"),
+        (vec![0, 2], misplaced, "descendant_location_mismatch"),
+    ] {
+        let request = ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "f", "f", skeleton, labels)],
+            transformation: transformation.to_owned(),
+        };
+        let error = replace(source, &request).unwrap_err();
+        assert!(error.message.contains(expected_code), "{}", error.message);
+    }
 }
 
 #[test]
@@ -165,11 +467,7 @@ fn unsupported_version_and_empty_items_are_rejected() {
     for request in [
         ReplacementRequest {
             schema_version: 2,
-            items: vec![ReplacementItem {
-                id: 7,
-                path: "f".to_owned(),
-                name: "f".to_owned(),
-            }],
+            items: vec![replacement_item(7, "f".to_owned(), "f".to_owned())],
             transformation: "unsafe fn f() {}".to_owned(),
         },
         ReplacementRequest {
@@ -197,11 +495,7 @@ fn duplicate_ids_paths_and_names_are_rejected_deterministically() {
             schema_version: 1,
             items: items
                 .into_iter()
-                .map(|(id, path, name)| ReplacementItem {
-                    id,
-                    path: path.to_owned(),
-                    name: name.to_owned(),
-                })
+                .map(|(id, path, name)| replacement_item(id, path, name))
                 .collect(),
             transformation: "unsafe fn f() {} unsafe fn g() {}".to_owned(),
         };
@@ -225,16 +519,8 @@ fn path_name_disagreement_and_invalid_paths_are_rejected() {
 fn transformation_must_be_exact_supported_requested_function_set() {
     let source = "pub unsafe fn f() {} pub unsafe fn g() {}";
     let items = vec![
-        ReplacementItem {
-            id: 7,
-            path: "f".to_owned(),
-            name: "f".to_owned(),
-        },
-        ReplacementItem {
-            id: 8,
-            path: "g".to_owned(),
-            name: "g".to_owned(),
-        },
+        replacement_item(7, "f".to_owned(), "f".to_owned()),
+        replacement_item(8, "g".to_owned(), "g".to_owned()),
     ];
     for transformation in [
         "unsafe fn f( {",
@@ -377,26 +663,16 @@ fn multiple_functions_match_by_name_and_replace_in_request_order() {
 pub unsafe fn first(value: i32) -> i32 { value }
 pub unsafe fn second(value: i32) -> i32 { value }
 "#;
-    let multi_request = ReplacementRequest {
-        schema_version: 1,
-        items: vec![
-            ReplacementItem {
-                id: 7,
-                path: "first".to_owned(),
-                name: "first".to_owned(),
-            },
-            ReplacementItem {
-                id: 8,
-                path: "second".to_owned(),
-                name: "second".to_owned(),
-            },
+    let multi_request = request_with_items(
+        vec![
+            replacement_item(7, "first".to_owned(), "first".to_owned()),
+            replacement_item(8, "second".to_owned(), "second".to_owned()),
         ],
-        transformation: r#"
+        r#"
 unsafe fn second(value: i32) -> i32 { #[proctor(0)] value + 2 }
 unsafe fn first(value: i32) -> i32 { #[proctor(0)] value + 1 }
-"#
-        .to_owned(),
-    };
+"#,
+    );
     let output = replace(source, &multi_request).unwrap();
     let text = compact(&output);
     assert!(text.find("value + 1").unwrap() < text.find("value + 2").unwrap());
@@ -490,26 +766,16 @@ mod m {
     pub unsafe fn f_0(value: *const i32) -> i32 { *value }
     pub unsafe fn caller(value: *const i32) -> i32 { f(value) + f_0(value) }
 }"#;
-    let collision_request = ReplacementRequest {
-        schema_version: 1,
-        items: vec![
-            ReplacementItem {
-                id: 7,
-                path: "m::f".to_owned(),
-                name: "f".to_owned(),
-            },
-            ReplacementItem {
-                id: 8,
-                path: "m::f_0".to_owned(),
-                name: "f_0".to_owned(),
-            },
+    let collision_request = request_with_items(
+        vec![
+            replacement_item(7, "m::f".to_owned(), "f".to_owned()),
+            replacement_item(8, "m::f_0".to_owned(), "f_0".to_owned()),
         ],
-        transformation: r#"
+        r#"
 unsafe fn f(value: &i32) -> i32 { #[proctor(0)] *value }
 unsafe fn f_0(value: &i32) -> i32 { #[proctor(0)] *value }
-"#
-        .to_owned(),
-    };
+"#,
+    );
     let output = replace(source, &collision_request).unwrap();
     let text = compact(&output);
     assert!(text.contains("crate::m::__proctor_wrapper_f_0(value)"));
@@ -1171,29 +1437,19 @@ pub unsafe fn odd(value: *const i32, n: i32) -> i32 {
 }
 pub unsafe fn caller(value: *const i32) -> i32 { even(value, 4) + odd(value, 3) }
 "#;
-    let scc_request = ReplacementRequest {
-        schema_version: 1,
-        items: vec![
-            ReplacementItem {
-                id: 7,
-                path: "even".to_owned(),
-                name: "even".to_owned(),
-            },
-            ReplacementItem {
-                id: 8,
-                path: "odd".to_owned(),
-                name: "odd".to_owned(),
-            },
+    let scc_request = request_with_items(
+        vec![
+            replacement_item(7, "even".to_owned(), "even".to_owned()),
+            replacement_item(8, "odd".to_owned(), "odd".to_owned()),
         ],
-        transformation: r#"
+        r#"
 unsafe fn odd(value: &i32, n: i32) -> i32 {
     #[proctor(0)] if n == 0 { *value } else { even(value, n - 1) }
 }
 unsafe fn even(value: &i32, n: i32) -> i32 {
     #[proctor(0)] if n == 0 { *value } else { odd(value, n - 1) }
-}"#
-        .to_owned(),
-    };
+}"#,
+    );
     let output = replace(source, &scc_request).unwrap();
     let text = compact(&output);
     assert!(text.contains("odd(value, n - 1)"));
@@ -1232,6 +1488,69 @@ pub unsafe fn top(value: *const i32) -> i32 { caller(value) }
     assert_eq!(count(&text, "crate::__proctor_wrapper_callee(value)"), 0);
     assert!(second.contains("__proctor_wrapper_callee"));
     compile(&second);
+}
+
+#[test]
+fn amendment_2_transformed_calls_cannot_restore_obsolete_wrapper_calls() {
+    let source = r#"
+pub unsafe fn callee(_pointer: *mut i32, value: i32) -> i32 {
+    value + 1
+}
+pub unsafe fn caller(pointer: *mut i32, value: i32) -> i32 {
+    callee(pointer, value)
+}
+"#;
+    let callee_request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "callee",
+            "callee",
+            "unsafe fn callee(mut _pointer: &mut i32, mut value: i32) -> i32 { #[proctor(0)] value + 1 }",
+            vec![],
+        )],
+        transformation:
+            "unsafe fn callee(mut _pointer: &mut i32, mut value: i32) -> i32 { #[proctor(0)] 999 }"
+                .to_owned(),
+    };
+    let after_callee = replace(source, &callee_request).unwrap();
+    assert!(compact(&after_callee).contains("crate::__proctor_wrapper_callee(pointer, value)"));
+
+    let caller_request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            8,
+            "caller",
+            "caller",
+            "unsafe fn caller(mut pointer: &mut i32, mut value: i32) -> i32 { #[proctor(0)] todo!() }",
+            vec![0],
+        )],
+        transformation: "unsafe fn caller(mut pointer: &mut i32, mut value: i32) -> i32 { #[proctor(0)] callee(pointer, value) }".to_owned(),
+    };
+    let output = replace(&after_callee, &caller_request).unwrap();
+    let text = compact(&output);
+    assert!(text.contains("unsafe fn caller(mut pointer: &mut i32, mut value: i32) -> i32"));
+    assert!(text.contains("callee(pointer, value)"));
+    assert!(!text.contains(
+        "unsafe fn caller(mut pointer: &mut i32, mut value: i32) -> i32 { crate::__proctor_wrapper_callee"
+    ));
+    compile(&output);
+
+    let scalar = r#"
+pub unsafe fn scalar_callee(value: i32) -> i32 { value + 1 }
+pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
+"#;
+    let unchanged = replace(
+        scalar,
+        &request(
+            "scalar_caller",
+            "scalar_caller",
+            "unsafe fn scalar_caller(value: i32) -> i32 { #[proctor(0)] scalar_callee(value) }",
+        ),
+    )
+    .unwrap();
+    assert!(!unchanged.contains("__proctor_wrapper"));
+    compile(&unchanged);
 }
 
 #[test]
@@ -1437,26 +1756,16 @@ pub unsafe fn good(value: *const i32) -> i32 { *value }
 pub unsafe fn bad(value: *mut i32) { let _ = value; }
 pub unsafe fn caller(value: *mut i32) -> i32 { good(value) + { bad(value); 0 } }
 "#;
-    let request = ReplacementRequest {
-        schema_version: 1,
-        items: vec![
-            ReplacementItem {
-                id: 7,
-                path: "good".to_owned(),
-                name: "good".to_owned(),
-            },
-            ReplacementItem {
-                id: 8,
-                path: "bad".to_owned(),
-                name: "bad".to_owned(),
-            },
+    let request = request_with_items(
+        vec![
+            replacement_item(7, "good".to_owned(), "good".to_owned()),
+            replacement_item(8, "bad".to_owned(), "bad".to_owned()),
         ],
-        transformation: r#"
+        r#"
 unsafe fn good(value: &i32) -> i32 { #[proctor(0)] *value }
 unsafe fn bad(value: Box<[i32]>) { #[proctor(0)] drop(value); }
-"#
-        .to_owned(),
-    };
+"#,
+    );
     let error = replace(source, &request).unwrap_err();
     assert_eq!(error.kind, ReplacementErrorKind::UnsupportedConversion);
     assert_eq!(error.item.unwrap().id, 8);
